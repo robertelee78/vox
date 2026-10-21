@@ -279,9 +279,16 @@ fn observe(
             Ok(changed)
         };
     }
-    let changes_projection =
-        writer.input_changes(&entry.skeleton.author_id, entry.skeleton.seq, &body)?;
-    let changes_order = changes_projection && !facts::Write::current_input_kind(&body);
+    let current = facts::Write::current_input_kind(&body);
+    let (updates_current, changes_projection) = if current {
+        writer.current_input_change(&entry.skeleton.author_id, entry.skeleton.seq, &body)?
+    } else {
+        (false, false)
+    };
+    // Canonical inputs are always ordered: only the checked fold can decide whether a signed
+    // action is authorized and changes the published meaning. Current single-writer facts never
+    // enter that order and wake only when their canonical value changes.
+    let changes_order = !current;
     if changes_order {
         writer.barrier(log);
     }
@@ -293,8 +300,8 @@ fn observe(
         changes_projection,
         changes_order,
     )?;
-    changed |= changes_projection;
-    if changes_projection {
+    changed |= changes_projection || changes_order;
+    if changes_order {
         writer.authority_input(
             &hash,
             &entry.skeleton.author_id,
@@ -304,7 +311,15 @@ fn observe(
             &body,
         )?;
         writer.observe_clock(&hash, clock)?;
-        writer.current_input(&entry.skeleton.author_id, entry.skeleton.seq, log, &body)?;
+    }
+    if updates_current {
+        writer.current_input(
+            &entry.skeleton.author_id,
+            entry.skeleton.seq,
+            log,
+            &body,
+            changes_projection,
+        )?;
     }
     Ok(changed)
 }

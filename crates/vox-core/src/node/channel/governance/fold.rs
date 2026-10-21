@@ -67,6 +67,71 @@ fn pair(left: &Digest32, right: &Digest32) -> [u8; 64] {
     key
 }
 
+fn xor_projection(projection: &mut Digest32, domain: &[u8], key: &[u8], value: &[u8]) {
+    let mut bytes = Vec::with_capacity(domain.len() + key.len() + value.len());
+    bytes.extend_from_slice(domain);
+    bytes.extend_from_slice(key);
+    bytes.extend_from_slice(value);
+    let token = crate::hash::sha256(&bytes);
+    for (held, token) in projection.iter_mut().zip(token) {
+        *held ^= token;
+    }
+}
+
+fn effect_token(projection: &mut Digest32, entry: &Entry) {
+    xor_projection(
+        projection,
+        b"vox/governance-projection/effect/v1",
+        &[],
+        &entry.entry_hash(),
+    );
+}
+
+fn admin_token(projection: &mut Digest32, target: &Digest32, grant: Grant, deny: u64) {
+    // Denied certificate history is diagnostic input, not an active roster projection. An
+    // unauthorized signed certificate therefore cannot revise the room merely by naming a new
+    // target.
+    if !grant.present {
+        return;
+    }
+    let mut e = Encoder::new();
+    grant.write(&mut e);
+    e.uint(deny);
+    xor_projection(
+        projection,
+        b"vox/governance-projection/admin/v1",
+        target,
+        &e.finish(),
+    );
+}
+
+fn previous_effect(writer: &Write<'_, '_>, kind: u64) -> Result<Option<Entry>> {
+    writer
+        .last(Table::EffectKinds, Some(kind_key(kind + 1, 0)))?
+        .filter(|(key, _)| key[..8] == kind.to_be_bytes())
+        .map(|(_, log)| writer.entry(log))
+        .transpose()
+}
+
+/// Compare the value a person sees, not its sequence, signer, signature or receipt. An
+/// authenticated same-value action stays in the immutable source log but does not become another
+/// effect/notice or a new projection revision.
+fn same_effect(previous: &GovBody, next: &GovBody, kind: u64) -> bool {
+    match (previous, next, kind) {
+        (GovBody::RoomName(a), GovBody::RoomName(b), NAME) => a.body.name == b.body.name,
+        (GovBody::PolicyUpdate(a), GovBody::PolicyUpdate(b), MESSAGES) => {
+            a.body.ttl_ms == b.body.ttl_ms
+        }
+        (GovBody::StepPolicyUpdate(a), GovBody::StepPolicyUpdate(b), STEPS) => a.ttl_ms == b.ttl_ms,
+        (GovBody::Lifecycle(_), GovBody::Lifecycle(_), END) => true,
+        (GovBody::Lifecycle(a), GovBody::Lifecycle(b), IDLE) => a.body.kind == b.body.kind,
+        (GovBody::RoomAnchors(a), GovBody::RoomAnchors(b), ANCHORS) => {
+            a.body.anchors == b.body.anchors
+        }
+        _ => false,
+    }
+}
+
 struct State {
     phase: u64,
     ordered: u64,
@@ -83,6 +148,7 @@ struct State {
     after_cert: Option<Digest32>,
     deny: u64,
     head_grant: Option<Grant>,
+    projection: Digest32,
 }
 impl State {
     fn new(writer: &Write<'_, '_>, now: u64) -> Self {
@@ -107,6 +173,7 @@ impl State {
             after_cert: None,
             deny: 1,
             head_grant: None,
+            projection: writer.projection(),
         }
     }
     fn load(writer: &Write<'_, '_>) -> Result<Option<Self>> {
@@ -114,7 +181,7 @@ impl State {
             return Ok(None);
         };
         let mut d = Decoder::new(&bytes);
-        if d.array()? != 16 || d.uint()? != 1 {
+        if d.array()? != 17 || d.uint()? != 2 {
             return Err(invalid("governance fold cursor format"));
         }
         let phase = d.uint()?;
@@ -136,6 +203,10 @@ impl State {
         let after_cert = read_option(&mut d)?;
         let deny = d.uint()?;
         let head_grant = read_grant(&mut d)?;
+        let projection = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("governance fold projection"))?;
         d.finish()?;
         if phase > DONE || from == 0 || generation == 0 || !(1..=5).contains(&deny) {
             return Err(invalid("governance fold cursor bounds"));
@@ -156,12 +227,13 @@ impl State {
             after_cert,
             deny,
             head_grant,
+            projection,
         }))
     }
     fn save(&self, writer: &mut Write<'_, '_>) -> Result<()> {
         let mut e = Encoder::new();
-        e.array(16)
-            .uint(1)
+        e.array(17)
+            .uint(2)
             .uint(self.phase)
             .uint(self.ordered)
             .uint(self.generation)
@@ -185,6 +257,7 @@ impl State {
         option(&mut e, self.after_cert);
         e.uint(self.deny);
         write_grant(&mut e, self.head_grant);
+        e.bytes(&self.projection);
         writer.save_cursor(Cursor::Evaluation, &e.finish())
     }
     fn clear_query(&mut self) {
@@ -374,6 +447,7 @@ fn clear_step(writer: &mut Write<'_, '_>, state: &mut State) -> Result<()> {
     let hash = entry.entry_hash();
     let kind =
         effect_kind(&GovEntry::body_bound_to(&entry)?).ok_or(invalid("governance effect kind"))?;
+    effect_token(&mut state.projection, &entry);
     writer.put(Table::EffectKinds, kind_key(kind, rank_from(&key)?), None)?;
     writer.put(Table::Effects, key, None)?;
     if let Some(record) = writer.get(Table::NoticeByHash, &hash_key(&hash))? {
@@ -402,6 +476,7 @@ fn action_step(
             writer.first(Table::ActionOrder, Some(rank_key(state.after_rank)))?
         else {
             if writer.head_ready() {
+                writer.projection_published(state.projection)?;
                 writer.evaluation_published(state.ordered)?;
                 state.phase = DONE;
             } else {
@@ -451,22 +526,30 @@ fn action_step(
         }
     };
     if authorized {
-        writer.put(Table::Effects, rank_key(state.after_rank), Some(state.log))?;
-        writer.put(
-            Table::EffectKinds,
-            kind_key(kind, state.after_rank),
-            Some(state.log),
-        )?;
-        if kind == NAME || kind == MESSAGES {
-            let clock = input
-                .clock(&hash)?
-                .ok_or(invalid("governance notice order missing"))?;
-            writer.put(Table::Notices, notice_key(clock, &hash), Some(state.log))?;
-            let old = writer.get(Table::NoticeByHash, &hash_key(&hash))?;
-            let mut e = Encoder::new();
-            e.array(2).uint(1).uint(clock);
-            let record = writer.save_record(old, &e.finish())?;
-            writer.put(Table::NoticeByHash, hash_key(&hash), Some(record))?;
+        let duplicate = previous_effect(writer, kind)?
+            .map(|previous| GovEntry::body_bound_to(&previous))
+            .transpose()?
+            .is_some_and(|previous| same_effect(&previous, &body, kind));
+        if !duplicate {
+            let effect_key = rank_key(state.after_rank);
+            effect_token(&mut state.projection, &entry);
+            writer.put(Table::Effects, effect_key, Some(state.log))?;
+            writer.put(
+                Table::EffectKinds,
+                kind_key(kind, state.after_rank),
+                Some(state.log),
+            )?;
+            if kind == NAME || kind == MESSAGES {
+                let clock = input
+                    .clock(&hash)?
+                    .ok_or(invalid("governance notice order missing"))?;
+                writer.put(Table::Notices, notice_key(clock, &hash), Some(state.log))?;
+                let old = writer.get(Table::NoticeByHash, &hash_key(&hash))?;
+                let mut e = Encoder::new();
+                e.array(2).uint(1).uint(clock);
+                let record = writer.save_record(old, &e.finish())?;
+                writer.put(Table::NoticeByHash, hash_key(&hash), Some(record))?;
+            }
         }
     }
     state.clear_query();
@@ -502,6 +585,7 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
     if state.target.is_none() {
         let Some((key, _)) = writer.first(Table::AllCerts, None)? else {
             writer.head_published(state.generation)?;
+            writer.projection_published(state.projection)?;
             writer.evaluation_published(state.ordered)?;
             state.phase = DONE;
             return Ok(());
@@ -526,6 +610,11 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
     }
     let key = hash_key(&target);
     let old = writer.get(Table::CurrentAuthority, &key)?;
+    if let Some(record) = old {
+        let (old_grant, old_deny) = current_authority_record(writer, record)?;
+        admin_token(&mut state.projection, &target, old_grant, old_deny);
+    }
+    admin_token(&mut state.projection, &target, grant, state.deny);
     let mut e = Encoder::new();
     e.array(4).uint(1).uint(state.generation);
     grant.write(&mut e);
@@ -549,6 +638,7 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
         }
         None => {
             writer.head_published(state.generation)?;
+            writer.projection_published(state.projection)?;
             writer.evaluation_published(state.ordered)?;
             state.phase = DONE;
         }
@@ -558,6 +648,22 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
     state.deny = 1;
     state.clear_query();
     Ok(())
+}
+
+fn current_authority_record(writer: &Write<'_, '_>, record: u64) -> Result<(Grant, u64)> {
+    let bytes = writer.record(record)?;
+    let mut d = Decoder::new(&bytes);
+    if d.array()? != 4 || d.uint()? != 1 {
+        return Err(invalid("governance current authority format"));
+    }
+    let _generation = d.uint()?;
+    let grant = Grant::read(&mut d)?;
+    let deny = d.uint()?;
+    d.finish()?;
+    if !(1..=5).contains(&deny) {
+        return Err(invalid("governance current authority denial"));
+    }
+    Ok((grant, deny))
 }
 
 fn classify_denial(writer: &Write<'_, '_>, state: &mut State, target: &Digest32) -> Result<bool> {

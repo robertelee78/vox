@@ -303,10 +303,12 @@ impl ChannelState {
                 changed = self.governance_display.revision != display.revision
                     || (!was_ready && consent_ready);
                 self.governance_display = display;
+                self.governance_ready = consent_ready;
             }
-            self.governance_ready = state.ready && consent_ready;
             Ok(GovernanceProgress {
-                ready: self.governance_ready,
+                // Irreversible work needs the current checked disk fold, not merely the retained
+                // last-good display that ordinary reads continue to show during a no-op replay.
+                ready: state.ready && consent_ready,
                 pending: state.pending || (state.ready && !consent_ready),
                 changed,
             })
@@ -386,6 +388,12 @@ impl ChannelState {
         self.governance_ready
             && (self.governance_display.valid_until == 0
                 || now < self.governance_display.valid_until)
+    }
+
+    /// The exact wall-clock boundary at which current authority must be re-evaluated. The actor
+    /// arms this deadline directly; periodic traffic is not a correctness wake.
+    pub(crate) fn governance_deadline(&self) -> Option<u64> {
+        (self.governance_display.valid_until != 0).then_some(self.governance_display.valid_until)
     }
 
     pub(in crate::node::channel) fn grants_policy(
@@ -523,7 +531,6 @@ impl ChannelState {
         // failed commit. This covers every publication path without polling a sealed header.
         if governance_changed {
             self.note_committed_consent(entry)?;
-            self.governance_ready = false;
         }
         if governance_changed {
             if let Ok(body) = GovEntry::body_bound_to(entry) {

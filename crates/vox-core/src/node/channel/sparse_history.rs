@@ -537,7 +537,6 @@ impl ChannelState {
         // publication paths, a sparse history caller does not poison the room on commit failure.
         if governance_changed {
             self.note_committed_consent(entry)?;
-            self.governance_ready = false;
         }
         self.entries.committed();
         self.next_log_id = log

@@ -8,7 +8,50 @@ pub(super) struct Maintenance {
     after: Option<Digest32>,
     again: bool,
     consent_after: BTreeMap<Digest32, Digest32>,
+    deadlines: BTreeMap<Digest32, u64>,
+    deadline_order: BTreeSet<(u64, Digest32)>,
     pub(super) removal: Option<Removal>,
+}
+
+impl Maintenance {
+    pub(super) fn next_deadline(&self) -> Option<u64> {
+        self.deadline_order.first().map(|(deadline, _)| *deadline)
+    }
+
+    pub(super) fn set_deadline(&mut self, room: Digest32, deadline: Option<u64>) {
+        if let Some(old) = self.deadlines.remove(&room) {
+            self.deadline_order.remove(&(old, room));
+        }
+        if let Some(deadline) = deadline {
+            self.deadlines.insert(room, deadline);
+            self.deadline_order.insert((deadline, room));
+        }
+    }
+
+    pub(super) fn wake_expired(&mut self, now: u64) {
+        let mut woke = false;
+        while let Some((deadline, room)) = self.deadline_order.first().copied() {
+            if deadline > now {
+                break;
+            }
+            self.deadline_order.remove(&(deadline, room));
+            self.deadlines.remove(&room);
+            woke = true;
+        }
+        self.pending |= woke;
+    }
+
+    fn retain_deadlines(&mut self, rooms: &BTreeSet<Digest32>) {
+        let stale: Vec<_> = self
+            .deadlines
+            .keys()
+            .filter(|room| !rooms.contains(*room))
+            .copied()
+            .collect();
+        for room in stale {
+            self.set_deadline(room, None);
+        }
+    }
 }
 
 pub(super) struct Removal {
@@ -179,6 +222,8 @@ impl Node {
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             self.governance_work.pending = false;
             self.governance_work.after = None;
+            self.governance_work.deadlines.clear();
+            self.governance_work.deadline_order.clear();
             return;
         };
         use std::ops::Bound::{Excluded, Unbounded};
@@ -192,6 +237,8 @@ impl Node {
             self.governance_work
                 .consent_after
                 .retain(|room, _| self.channels.contains_key(room));
+            let rooms = self.channels.keys().copied().collect();
+            self.governance_work.retain_deadlines(&rooms);
             self.governance_work.pending = std::mem::take(&mut self.governance_work.again);
             return;
         };
@@ -210,6 +257,10 @@ impl Node {
                 return;
             }
         };
+        if progress.ready {
+            self.governance_work
+                .set_deadline(room, channel.governance_deadline());
+        }
         self.governance_work.again |= progress.pending;
         match channel.legacy_cache_only(&store) {
             Ok(true) => {

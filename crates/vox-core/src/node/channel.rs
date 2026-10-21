@@ -509,6 +509,19 @@ pub const AUTHORS_HARD_LIMIT: usize = 2 * MAX_AUTHORS;
 /// durable and another event-driven turn continues it.
 pub const RENDER_BACKFILL_ROWS_PER_TURN: usize = governance::PAGE_ROWS;
 
+/// **Test-only**: while the named marker exists, retain an already durable render continuation
+/// without advancing it. Proofs use the shipped status command to distinguish "no work was
+/// queued" from a synchronous rescan that would otherwise finish before the command returns.
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_RENDER_ENV: &str = "VOX_TEST_HOLD_RENDER_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn render_backfill_held() -> bool {
+    std::env::var_os(TEST_HOLD_RENDER_ENV)
+        .filter(|path| !path.is_empty())
+        .is_some_and(|path| std::path::Path::new(&path).exists())
+}
+
 /// **Test-only**: a smaller room, so a proof fills one with a few members rather than 1,024. Its
 /// value is the most authors a room admits, from 1 to [`MAX_AUTHORS`]. Unset, empty, unparsable or
 /// out of range is [`MAX_AUTHORS`]: nothing in a real deployment sets it, and without the
@@ -7818,6 +7831,10 @@ impl ChannelState {
         now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Vec<Rendered>> {
+        #[cfg(feature = "test-knobs")]
+        if render_backfill_held() {
+            return Ok(Vec::new());
+        }
         let consent = match self.consent_facts() {
             Ok(facts) => {
                 self.backfill_refreshing = false;

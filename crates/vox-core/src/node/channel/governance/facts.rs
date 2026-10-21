@@ -16,13 +16,17 @@ use zeroize::Zeroizing;
 const KIND: SegmentKind = SegmentKind::GovernanceIndex;
 const HEADER: u64 = 0;
 const HEADER_BYTES: usize = 1024;
-/// The derived index's own format. 4 (v0.4.6, ADR-037 R2c): the control settlement queue.
+/// The derived index's own format. 5 adds the canonical projection fingerprint used to publish
+/// semantic revisions only after the authorized fold completes. 4 (v0.4.6, ADR-037 R2c) added
+/// the control settlement queue.
 /// A format-3 header (every release through v0.4.5) is read as is, with the new queue empty,
-/// and `prepare` fills that queue from the pending rows and reseals the header at 4: the
+/// and `prepare` fills that queue from the pending rows and reseals the header at the current
+/// version: the
 /// index is migrated in place, never rebuilt from the source log, so an upgrade does not pay a
 /// cold scan of a large store for a derived queue it can compute from the rows it already has.
-pub(super) const HEADER_VERSION: u64 = 4;
-const HEADER_VERSION_PREVIOUS: u64 = 3;
+pub(super) const HEADER_VERSION: u64 = 5;
+const HEADER_VERSION_WITH_CONTROL_QUEUE: u64 = 4;
+const HEADER_VERSION_BEFORE_CONTROL_QUEUE: u64 = 3;
 
 fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
@@ -119,9 +123,12 @@ pub(super) enum Table {
     /// settles on this queue alone, so content rows never hold the fold. Every row here is
     /// also in `PendingOrder`, the work queue; this one is worked first.
     ControlPending,
+    /// Latest authenticated sequence for each single-writer slot. Kept apart from its semantic
+    /// table so a newer repetition can block late older rows without revising the projected value.
+    CurrentHeads,
 }
 
-const TABLES: usize = Table::ControlPending as usize + 1;
+const TABLES: usize = Table::CurrentHeads as usize + 1;
 
 #[derive(Clone, Copy)]
 pub(super) enum Cursor {
@@ -147,6 +154,9 @@ struct Header {
     revision: u64,
     queue_serial: u64,
     display_revision: u64,
+    /// Rolling XOR of domain-separated canonical output rows. It is an equality token, not an
+    /// authority input: the checked Effects/ActiveAdmins trees remain the source of truth.
+    projection: Digest32,
     admin_clock: u64,
     evaluated: u64,
     ordered: u64,
@@ -173,6 +183,7 @@ impl Default for Header {
             revision: 0,
             queue_serial: 0,
             display_revision: 0,
+            projection: [0; 32],
             admin_clock: 0,
             evaluated: 0,
             ordered: 0,
@@ -213,13 +224,15 @@ fn read_hash(d: &mut Decoder<'_>) -> Result<Option<Digest32>> {
 /// The format a sealed header's plaintext was written at, if it reads as a header at all.
 pub(super) fn header_version(bytes: &[u8]) -> Option<u64> {
     let mut d = Decoder::new(bytes);
-    (d.array().ok()? == 22).then(|| d.uint().ok()).flatten()
+    matches!(d.array().ok()?, 22 | 23)
+        .then(|| d.uint().ok())
+        .flatten()
 }
 
 impl Header {
     fn bytes(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
-        e.array(22)
+        e.array(23)
             .uint(HEADER_VERSION)
             .uint(self.next)
             .array(TABLES);
@@ -238,6 +251,7 @@ impl Header {
             .uint(self.revision)
             .uint(self.queue_serial)
             .uint(self.display_revision)
+            .bytes(&self.projection)
             .uint(self.admin_clock)
             .uint(self.evaluated)
             .array(7);
@@ -263,17 +277,28 @@ impl Header {
             return Err(invalid("governance header size"));
         }
         let mut d = Decoder::new(bytes);
-        if d.array()? != 22 {
+        let arity = d.array()?;
+        if !matches!(arity, 22 | 23) {
             return Err(invalid("governance header format"));
         }
         let version = d.uint()?;
-        if version != HEADER_VERSION && version != HEADER_VERSION_PREVIOUS {
+        if !matches!(
+            version,
+            HEADER_VERSION
+                | HEADER_VERSION_WITH_CONTROL_QUEUE
+                | HEADER_VERSION_BEFORE_CONTROL_QUEUE
+        ) || (version == HEADER_VERSION && arity != 23)
+            || (version != HEADER_VERSION && arity != 22)
+        {
             return Err(invalid("governance header format"));
         }
         let next = d.uint()?;
         // Format 3 had every table but the control settlement queue, which is read as empty.
         let stored = d.array()?;
-        if stored != TABLES && !(version == HEADER_VERSION_PREVIOUS && stored == TABLES - 1) {
+        if stored != TABLES
+            && !(version == HEADER_VERSION_WITH_CONTROL_QUEUE && stored == TABLES - 1)
+            && !(version == HEADER_VERSION_BEFORE_CONTROL_QUEUE && stored == TABLES - 2)
+        {
             return Err(invalid("governance root count"));
         }
         let mut roots = [0; TABLES];
@@ -299,6 +324,13 @@ impl Header {
         let revision = d.uint()?;
         let queue_serial = d.uint()?;
         let display_revision = d.uint()?;
+        let projection = if version == HEADER_VERSION {
+            d.bytes()?
+                .try_into()
+                .map_err(|_| invalid("governance projection fingerprint"))?
+        } else {
+            [0; 32]
+        };
         let admin_clock = d.uint()?;
         let evaluated = d.uint()?;
         if d.array()? != 7 {
@@ -363,6 +395,7 @@ impl Header {
             revision,
             queue_serial,
             display_revision,
+            projection,
             admin_clock,
             evaluated,
             ordered,
@@ -973,57 +1006,141 @@ impl<'a, 'store> Write<'a, 'store> {
         self.put(table, key, Some(log))
     }
 
-    fn latest_changes(&self, table: Table, key: &session_tree::Key, seq: u64) -> Result<bool> {
-        let Some(old) = self.get(table, key)? else {
-            return Ok(true);
-        };
-        Ok(self.entry(old)?.skeleton.seq < seq)
+    fn current_entry(
+        &self,
+        table: Table,
+        key: &session_tree::Key,
+    ) -> Result<Option<crate::log::entry::Entry>> {
+        self.get(table, key)?.map(|log| self.entry(log)).transpose()
     }
 
-    /// Whether this authenticated body can change the current projection. Consent, presence and
-    /// service-share statements are single-writer registers, so a newly discovered older row is
-    /// still retained and authenticated but is not a display revision, canonical-fold input or
-    /// render-backfill trigger. Other governance bodies retain their canonical-history semantics.
-    pub(super) fn input_changes(
+    fn current_head_key(
+        author: &Digest32,
+        body: &crate::governance::entry::GovBody,
+    ) -> Option<session_tree::Key> {
+        use crate::governance::entry::GovBody;
+        let (domain, tail): (&[u8], &[u8]) = match body {
+            GovBody::ConsentGrant(value) => (b"consent", &value.body.target_id),
+            GovBody::ConsentRevocation(value) => (b"consent", &value.body.target_id),
+            GovBody::Presence(_) => (b"presence", &[]),
+            GovBody::ServiceShare(value) => (b"share", value.body.name.as_bytes()),
+            _ => return None,
+        };
+        let mut bytes = Vec::with_capacity(domain.len() + author.len() + tail.len());
+        bytes.extend_from_slice(b"vox/governance-current-head/v1");
+        bytes.extend_from_slice(domain);
+        bytes.extend_from_slice(author);
+        bytes.extend_from_slice(tail);
+        Some(hash_key(&crate::hash::sha256(&bytes)))
+    }
+
+    fn current_head(
+        &self,
+        author: &Digest32,
+        body: &crate::governance::entry::GovBody,
+        fallback: Option<&crate::log::entry::Entry>,
+    ) -> Result<u64> {
+        let key =
+            Self::current_head_key(author, body).ok_or(invalid("governance current head kind"))?;
+        self.current_entry(Table::CurrentHeads, &key).map(|entry| {
+            entry.as_ref().map_or_else(
+                || fallback.map_or(0, |entry| entry.skeleton.seq),
+                |entry| entry.skeleton.seq,
+            )
+        })
+    }
+
+    /// Whether this authenticated single-writer fact changes its canonical current value.
+    /// Sequence freshness alone is not a semantic change: a newer repetition of the same grant,
+    /// revocation, presence or share remains an immutable historical locator but neither replaces
+    /// the current slot nor revises the published projection. Likewise, an older row cannot
+    /// mutate the auxiliary reset/back/ever-revoked tables behind a newer current statement.
+    pub(super) fn current_input_change(
         &self,
         author: &Digest32,
         seq: u64,
         body: &crate::governance::entry::GovBody,
-    ) -> Result<bool> {
+    ) -> Result<(bool, bool)> {
         use crate::governance::entry::GovBody;
         match body {
             GovBody::ConsentGrant(c) if c.body.epoch == 0 => {
-                self.latest_changes(Table::Consent, &frontier(author, &c.body.target_id), seq)
+                let key = frontier(author, &c.body.target_id);
+                let reset = self
+                    .current_entry(Table::ConsentReset, &hash_key(author))?
+                    .map_or(0, |entry| entry.skeleton.seq);
+                let old = self.current_entry(Table::Consent, &key)?;
+                if self.current_head(author, body, old.as_ref())? >= seq {
+                    return Ok((false, false));
+                }
+                let Some(old) = old else {
+                    return Ok((true, seq > reset));
+                };
+                if seq <= reset {
+                    return Ok((true, false));
+                }
+                if old.skeleton.seq <= reset {
+                    return Ok((true, true));
+                }
+                Ok((
+                    true,
+                    !matches!(
+                        crate::governance::entry::GovEntry::body_bound_to(&old)?,
+                        GovBody::ConsentGrant(old) if old.body == c.body
+                    ),
+                ))
             }
             // A grant for another epoch has no current or historical effect in this index.
-            GovBody::ConsentGrant(_) => Ok(false),
+            GovBody::ConsentGrant(_) => Ok((false, false)),
             GovBody::ConsentRevocation(c) => {
-                let target = frontier(author, &c.body.target_id);
-                Ok(self.latest_changes(Table::EverRevoked, &target, seq)?
-                    || (c.body.epoch == 0 && self.latest_changes(Table::Consent, &target, seq)?))
+                let key = frontier(author, &c.body.target_id);
+                let ever = self.current_entry(Table::EverRevoked, &key)?;
+                let current = self.current_entry(Table::Consent, &key)?;
+                let fallback = current.as_ref().or(ever.as_ref());
+                let replaces = self.current_head(author, body, fallback)? < seq;
+                let ever_changes = ever.is_none();
+                if c.body.epoch != 0 {
+                    return Ok((replaces || ever_changes, false));
+                }
+                let already_current = current
+                    .as_ref()
+                    .filter(|old| old.skeleton.seq < seq)
+                    .map(crate::governance::entry::GovEntry::body_bound_to)
+                    .transpose()?
+                    .is_some_and(|old| matches!(old, GovBody::ConsentRevocation(_)));
+                Ok((replaces || ever_changes, replaces && !already_current))
             }
-            GovBody::Presence(p) => {
+            GovBody::Presence(_) => {
                 let author_key = hash_key(author);
-                Ok(self.latest_changes(Table::Presence, &author_key, seq)?
-                    || (p.body.here
-                        && (self.latest_changes(Table::Back, &author_key, seq)?
-                            || (p.body.epoch == 0
-                                && self.latest_changes(Table::ConsentReset, &author_key, seq)?))))
+                let old = self.current_entry(Table::Presence, &author_key)?;
+                if self.current_head(author, body, old.as_ref())? >= seq {
+                    return Ok((false, false));
+                }
+                let Some(_old) = old else {
+                    return Ok((true, true));
+                };
+                // Even an identical newer `here` statement can reset consent facts after rows
+                // between the two positions, so every current replacement is semantic.
+                Ok((true, true))
             }
             GovBody::ServiceShare(s) => {
                 let name = crate::hash::sha256(s.body.name.as_bytes());
-                let fingerprint =
-                    crate::governance::share::service_fingerprint(self.room, author, &s.body.name);
-                Ok(
-                    self.latest_changes(Table::Shares, &frontier(author, &name), seq)?
-                        || self.latest_changes(
-                            Table::ShareFingerprints,
-                            &frontier(author, &fingerprint),
-                            seq,
-                        )?,
-                )
+                let key = frontier(author, &name);
+                let old = self.current_entry(Table::Shares, &key)?;
+                if self.current_head(author, body, old.as_ref())? >= seq {
+                    return Ok((false, false));
+                }
+                let Some(old) = old else {
+                    return Ok((true, true));
+                };
+                Ok((
+                    true,
+                    !matches!(
+                        crate::governance::entry::GovEntry::body_bound_to(&old)?,
+                        GovBody::ServiceShare(old) if old.body == s.body
+                    ),
+                ))
             }
-            _ => Ok(true),
+            _ => Ok((false, false)),
         }
     }
 
@@ -1047,10 +1164,14 @@ impl<'a, 'store> Write<'a, 'store> {
         seq: u64,
         log: u64,
         body: &crate::governance::entry::GovBody,
+        changes_projection: bool,
     ) -> Result<()> {
         use crate::governance::entry::GovBody;
+        let head =
+            Self::current_head_key(author, body).ok_or(invalid("governance current head kind"))?;
+        self.latest(Table::CurrentHeads, head, seq, log)?;
         match body {
-            GovBody::ConsentGrant(c) if c.body.epoch == 0 => {
+            GovBody::ConsentGrant(c) if c.body.epoch == 0 && changes_projection => {
                 self.latest(
                     Table::Consent,
                     frontier(author, &c.body.target_id),
@@ -1065,7 +1186,7 @@ impl<'a, 'store> Write<'a, 'store> {
                     seq,
                     log,
                 )?;
-                if c.body.epoch == 0 {
+                if c.body.epoch == 0 && changes_projection {
                     self.latest(
                         Table::Consent,
                         frontier(author, &c.body.target_id),
@@ -1074,7 +1195,7 @@ impl<'a, 'store> Write<'a, 'store> {
                     )?;
                 }
             }
-            GovBody::Presence(p) => {
+            GovBody::Presence(p) if changes_projection => {
                 self.latest(Table::Presence, hash_key(author), seq, log)?;
                 if p.body.here {
                     self.latest(Table::Back, hash_key(author), seq, log)?;
@@ -1083,7 +1204,7 @@ impl<'a, 'store> Write<'a, 'store> {
                     }
                 }
             }
-            GovBody::ServiceShare(s) => {
+            GovBody::ServiceShare(s) if changes_projection => {
                 let name = crate::hash::sha256(s.body.name.as_bytes());
                 self.latest(Table::Shares, frontier(author, &name), seq, log)?;
                 let fingerprint =
@@ -1101,7 +1222,6 @@ impl<'a, 'store> Write<'a, 'store> {
     }
 
     pub(super) fn authority_changed(&mut self) -> Result<()> {
-        self.display_changed()?;
         self.header.authority_generation = self
             .header
             .authority_generation
@@ -1134,6 +1254,20 @@ impl<'a, 'store> Write<'a, 'store> {
     }
     pub(super) fn ordered_from(&self) -> u64 {
         self.header.ordered_from
+    }
+
+    pub(super) fn projection(&self) -> Digest32 {
+        self.header.projection
+    }
+
+    /// Publish one completed canonical output. Intermediate clear/rebuild steps never revise the
+    /// user-visible projection, and an authorized replay with identical meaning is a no-op.
+    pub(super) fn projection_published(&mut self, projection: Digest32) -> Result<()> {
+        if self.header.projection != projection {
+            self.header.projection = projection;
+            self.display_changed()?;
+        }
+        Ok(())
     }
 
     pub(super) fn expire_authority(&mut self, now: u64) -> Result<()> {
@@ -1170,7 +1304,6 @@ impl<'a, 'store> Write<'a, 'store> {
     }
 
     fn changed(&mut self) -> Result<()> {
-        self.display_changed()?;
         self.header.revision = self
             .header
             .revision

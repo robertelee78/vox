@@ -60,7 +60,38 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
     }
     let v: Value = serde_json::from_str(&report)
         .map_err(|e| AppError::Usage(format!("the node's report did not parse: {e}")))?;
-    print!("{}", render(&v));
+    validate_governance_status(&v)?;
+    print!("{}", render(&v)?);
+    Ok(())
+}
+
+/// The human renderer must not silently turn a missing or wrong-typed governance answer into
+/// revision zero or an idle backfill. JSON and human status are the same shipped contract.
+fn validate_governance_status(v: &Value) -> Result<(), AppError> {
+    let rooms = v
+        .get("rooms")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Usage("the node's report has no rooms array".into()))?;
+    for (index, room) in rooms.iter().enumerate() {
+        if room
+            .get("governance_revision")
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            return Err(AppError::Usage(format!(
+                "the node's report room {index} has no numeric governance_revision"
+            )));
+        }
+        if room
+            .get("render_backfill_pending")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
+            return Err(AppError::Usage(format!(
+                "the node's report room {index} has no boolean render_backfill_pending"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -123,7 +154,7 @@ fn render_anchors(v: &Value) -> String {
 }
 
 /// The report for a person.
-fn render(v: &Value) -> String {
+fn render(v: &Value) -> Result<String, AppError> {
     use std::fmt::Write as _;
     let now = v.get("now_ms").and_then(Value::as_u64).unwrap_or(0);
     let mut o = String::new();
@@ -194,7 +225,17 @@ fn render(v: &Value) -> String {
         }
     }
     let _ = writeln!(o, "\nrooms");
-    for r in arr("rooms") {
+    for (index, r) in arr("rooms").iter().enumerate() {
+        let governance_revision = r["governance_revision"].as_u64().ok_or_else(|| {
+            AppError::Usage(format!(
+                "the node's report room {index} has no numeric governance_revision"
+            ))
+        })?;
+        let render_backfill_pending = r["render_backfill_pending"].as_bool().ok_or_else(|| {
+            AppError::Usage(format!(
+                "the node's report room {index} has no boolean render_backfill_pending"
+            ))
+        })?;
         let _ = writeln!(
             o,
             "  {} {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}; governance revision {}, render backfill {}",
@@ -210,14 +251,8 @@ fn render(v: &Value) -> String {
             r.get("received_key_generations")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-            r.get("governance_revision")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            if r
-                .get("render_backfill_pending")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            governance_revision,
+            if render_backfill_pending {
                 "pending"
             } else {
                 "idle"
@@ -450,7 +485,7 @@ fn render(v: &Value) -> String {
         }
         o.push('\n');
     }
-    o
+    Ok(o)
 }
 
 /// One line per live tunnel (V210-81): who, which service, which way, how long it has been open

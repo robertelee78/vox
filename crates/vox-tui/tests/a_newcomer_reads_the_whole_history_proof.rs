@@ -248,7 +248,10 @@ fn said(dir: &Path, tag: &str) -> String {
 
 /// `vox room list` once the daemon's socket answers.
 fn attached(dir: &Path, tag: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(90);
+    // Runner-health bounds only. They are deliberately absent from every PRODUCT assertion.
+    const APPARATUS_ATTACH_WATCHDOG: Duration = Duration::from_secs(90);
+    const APPARATUS_ATTACH_RETRY_PACE: Duration = Duration::from_millis(200);
+    let deadline = Instant::now() + APPARATUS_ATTACH_WATCHDOG;
     let mut last = String::new();
     while Instant::now() < deadline {
         let (ok, out, err) = vox(dir, &["room", "list"], None);
@@ -256,10 +259,11 @@ fn attached(dir: &Path, tag: &str) -> String {
             return out;
         }
         last = err;
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(APPARATUS_ATTACH_RETRY_PACE);
     }
     panic!(
-        "PRODUCT: {tag}'s daemon never answered `vox room list` in 90 s: {last}\nits stderr: {}",
+        "APPARATUS: watchdog expired before {tag}'s daemon answered `vox room list`; the product \
+         supplied no latency contract for this runner: {last}\nits stderr: {}",
         said(dir, tag)
     );
 }
@@ -579,6 +583,50 @@ fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
                 "PRODUCT: {reader}'s room status has no boolean `render_backfill_pending`: {row}"
             )
         }),
+    }
+}
+
+/// Exact authenticated room-order hashes exposed by the shipped diagnostic command.
+fn room_hashes(dir: &Path, reader: &str, room: &str) -> std::collections::BTreeSet<String> {
+    let (ok, out, err) = vox(dir, &["room", "read", room, "--hashes"], None);
+    assert!(
+        ok,
+        "PRODUCT: {reader}'s `vox room read --hashes` failed for {room}: {out}{err}"
+    );
+    out.lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let hash = fields.next().unwrap_or_else(|| {
+                panic!("PRODUCT: {reader}'s room order contained an empty row: {out}")
+            });
+            let clock = fields.next().and_then(|clock| clock.parse::<u64>().ok());
+            assert!(
+                fields.next().is_none() && clock.is_some(),
+                "PRODUCT: {reader}'s room order row was malformed: {line:?}"
+            );
+            hash.to_owned()
+        })
+        .collect()
+}
+
+/// Wait for a shipped authority-dependent page to answer. Refreshing is the product's explicit
+/// retry result while the causal fold is in progress; any other refusal is a product red. The
+/// proof's outer watchdog, not a guessed local duration, detects an apparatus stall.
+fn wait_governance_current(dir: &Path, reader: &str, room: &str) {
+    loop {
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "read", room, "--json", "--notices", "--limit", "1"],
+            None,
+        );
+        if ok {
+            return;
+        }
+        assert!(
+            err.contains("governance") && err.contains("refreshing"),
+            "PRODUCT: {reader}'s authority-dependent room page failed for {room}: {out}{err}"
+        );
+        std::thread::yield_now();
     }
 }
 
@@ -1048,7 +1096,11 @@ fn key_before_consent_survives_a_restart(root: &Path) {
 #[test]
 #[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
 fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
-    test_knobs::require(&["VOX_TEST_FOLD_HOLD_FILE", "VOX_TEST_HOLD_PACKAGES_FILE"]);
+    test_knobs::require(&[
+        "VOX_TEST_FOLD_HOLD_FILE",
+        "VOX_TEST_HOLD_PACKAGES_FILE",
+        "VOX_TEST_HOLD_RENDER_FILE",
+    ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     key_before_consent_survives_a_restart(&tmp.path().join("key-before-consent"));
@@ -1092,6 +1144,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     let fold_hold = root.join("fx22-fold-hold");
     let carol_fold_hold = root.join("fx22-carol-fold-hold");
     let package_hold = root.join("fx22-package-hold");
+    let render_hold = root.join("fx22-render-hold");
     let fold_hold_path = fold_hold
         .to_str()
         .expect("APPARATUS: a UTF-8 fold-hold path")
@@ -1104,9 +1157,16 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         .to_str()
         .expect("APPARATUS: a UTF-8 package-hold path")
         .to_owned();
+    let render_hold_path = render_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 render-hold path")
+        .to_owned();
     let fold_knob = [("VOX_TEST_FOLD_HOLD_FILE", fold_hold_path.as_str())];
     let carol_fold_knob = [("VOX_TEST_FOLD_HOLD_FILE", carol_fold_hold_path.as_str())];
-    let package_knob = [("VOX_TEST_HOLD_PACKAGES_FILE", package_hold_path.as_str())];
+    let package_knob = [
+        ("VOX_TEST_HOLD_PACKAGES_FILE", package_hold_path.as_str()),
+        ("VOX_TEST_HOLD_RENDER_FILE", render_hold_path.as_str()),
+    ];
     let alice_daemon = daemon_env(&alice, "alice", &fold_knob);
     let carol_daemon = daemon_env(&carol, "carol", &carol_fold_knob);
     attached(&alice, "alice");
@@ -1269,6 +1329,26 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     );
     bob_before_key.stop();
 
+    // Stage one same-name action while the fold is still held and prove the command appended one
+    // exact authenticated room-order object. Command success alone is not the precondition: a
+    // mutant that returns success without the append has no new hash and fails here.
+    for room in &rooms {
+        let before = room_hashes(&alice, "alice", room);
+        let (ok, out, err) = vox(&alice, &["room", "rename", room, room], None);
+        assert!(
+            ok,
+            "PRODUCT: Alice's staged same-name room rename was refused for {room}: {out}{err}"
+        );
+        let after = room_hashes(&alice, "alice", room);
+        let appended: Vec<_> = after.difference(&before).collect();
+        assert_eq!(
+            appended.len(),
+            1,
+            "PRODUCT: Alice's successful same-name rename did not append exactly one \
+             authenticated room-order object for {room}: before {before:?}, after {after:?}"
+        );
+    }
+
     // With Bob offline, releasing Alice's fold makes the product append the consent and its
     // store-and-forward key package. No guessed log-count delta stands in for either object: the
     // observations after Alice stops prove Bob retained both.
@@ -1276,8 +1356,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
     std::fs::remove_file(&carol_fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
-    // Marker removal is apparatus, not a product wake. Renaming each room to its current name
-    // appends a real authenticated governance fact through the shipped command; its acceptance is
+    // Marker removal is apparatus, not a product wake. A second authenticated same-name action is
     // the causal event that resumes the released folds on Alice and, once synced, Carol.
     for room in &rooms {
         let (ok, out, err) = vox(&alice, &["room", "rename", room, room], None);
@@ -1355,6 +1434,8 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
          {duplicate_before:?}",
         rooms[0]
     );
+    std::fs::write(&render_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage render hold: {error}"));
     let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
     assert!(
         ok,
@@ -1380,8 +1461,36 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
          before {duplicate_before:?}, after {duplicate_after:?} (ADR-038 FX-22, #1007)",
         rooms[0]
     );
+    std::fs::remove_file(&render_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release render hold: {error}"));
     let _alice_daemon = daemon(&alice, "alice");
     attached(&alice, "alice");
+
+    // A same-value authenticated action exists in the immutable room order but is not a new
+    // canonical meaning. Wait on an authority-dependent shipped page so the equal revision below
+    // is observed after the exact row was folded, not before asynchronous work began.
+    let semantic_before = room_status(&alice, "alice", &rooms[0]);
+    let order_before = room_hashes(&alice, "alice", &rooms[0]);
+    let (ok, out, err) = vox(&alice, &["room", "rename", &rooms[0], &rooms[0]], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's semantic-no-op room rename was refused: {out}{err}"
+    );
+    let order_after = room_hashes(&alice, "alice", &rooms[0]);
+    assert_eq!(
+        order_after.difference(&order_before).count(),
+        1,
+        "PRODUCT: Alice's successful semantic-no-op rename did not append one authenticated row: \
+         before {order_before:?}, after {order_after:?}"
+    );
+    wait_governance_current(&alice, "alice", &rooms[0]);
+    let semantic_after = room_status(&alice, "alice", &rooms[0]);
+    assert_eq!(
+        semantic_after.governance_revision, semantic_before.governance_revision,
+        "PRODUCT: an authenticated same-name rename revised room {} despite leaving its canonical \
+         meaning unchanged: before {semantic_before:?}, after {semantic_after:?}",
+        rooms[0]
+    );
 
     // The exact post after Alice's revocation is a causal boundary: once Bob retains that
     // descendant, his doctor answer can no longer be an observation made before the revocation.

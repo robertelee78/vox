@@ -5970,7 +5970,22 @@ impl Node {
         // ready classes; each retains its own room cursor and yields after one bounded turn.
         let mut maintenance_next = 0u8;
         loop {
+            let governance_delay = self.governance_work.next_deadline().map(|deadline| {
+                Duration::from_millis(deadline.saturating_sub(self.now_ms().get()))
+            });
+            let governance_deadline = async move {
+                match governance_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(governance_deadline);
             tokio::select! {
+                () = &mut governance_deadline => {
+                    // Certificate expiry is its own causal wake. A quiet room does not wait for
+                    // the one-second actor tick, a command, or network traffic to invalidate it.
+                    self.governance_work.wake_expired(self.now_ms().get());
+                }
                 () = tokio::task::yield_now(), if self.governance_work.pending || self.room_preparation_work_ready() || (!self.legacy_cleanup_rooms.is_empty() && std::time::Instant::now() >= self.legacy_cleanup_due) || self.key_package_work_ready() => {
                     if self.apply_computer_keyring().await.is_err() { continue; }
                     for _ in 0..4 {
@@ -10397,7 +10412,6 @@ impl Node {
                                 None
                             }
                         };
-                        self.governance_work.pending = true;
                         self.settle_sparse_room(&channel_id).await;
                         // Head promotion advances the shared room generation inside the disk
                         // worker. Touch the room here so schedule observes it immediately and
@@ -18831,6 +18845,7 @@ impl Node {
     /// Publish a room only after both shared and local retention have been applied durably.
     async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
+        let governance_deadline = ch.governance_deadline();
         if ch.legacy_startup_cleanup_pending() {
             self.legacy_cleanup_rooms.entry(channel_id).or_insert(None);
             self.legacy_cleanup_due = std::time::Instant::now();
@@ -18840,6 +18855,8 @@ impl Node {
         self.remember_or_say(&ch);
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        self.governance_work
+            .set_deadline(channel_id, governance_deadline);
         // Preparation established current decisions and completed all pending narrowing.
         self.resume_leave(&channel_id).await;
         self.adopt_channel_anchors(&channel_id).await;
@@ -18878,6 +18895,7 @@ impl Node {
             }
         }
         self.key_package_rooms.remove(channel_id);
+        self.governance_work.set_deadline(*channel_id, None);
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
@@ -19395,6 +19413,7 @@ impl Node {
         }
         let mut name = String::new();
         self.key_package_rooms.remove(channel_id);
+        self.governance_work.set_deadline(*channel_id, None);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
             name = crate::node::resolver::room_shown(ch.name(), channel_id);

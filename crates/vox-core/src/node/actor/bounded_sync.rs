@@ -592,7 +592,9 @@ impl Node {
             }
             if returned.flow.published {
                 returned.flow.published = false;
-                self.governance_work.pending = true;
+                // Ordinary content publication has no governance work. The history worker's
+                // signed-kind result names the causal control publication that does.
+                self.governance_work.pending |= returned.flow.governance;
                 self.sched_rooms.insert(work.room);
                 // A bounded publication may have made an addressed key-package durable. Its
                 // catalog is authoritative even when the best-effort presentation event below

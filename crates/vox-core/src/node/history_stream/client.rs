@@ -1197,12 +1197,23 @@ impl Receiver {
             body,
             phase,
         };
-        let is_governance = record
-            .entry
-            .skeleton
-            .v2
-            .as_ref()
-            .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Governance);
+        let is_governance = record.entry.skeleton.v2.as_ref().map_or_else(
+            || {
+                record.entry.payload.as_deref().is_some_and(|payload| {
+                    matches!(
+                        crate::node::channel::classify_payload(payload),
+                        Ok(crate::log::entry::EntryKind::Governance)
+                    ) || crate::governance::step_policy::is_step_policy(payload)
+                })
+            },
+            |v2| {
+                matches!(
+                    v2.kind,
+                    crate::log::history::SignedEntryKind::Governance
+                        | crate::log::history::SignedEntryKind::StepPolicy
+                )
+            },
+        );
         let effect_result = |progress| -> LocalResult {
             match progress {
                 Effect::Progress => LocalResult::next(step),
