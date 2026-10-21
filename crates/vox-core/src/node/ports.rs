@@ -79,6 +79,8 @@ pub struct Attempt {
     pub fence: Arc<Fence>,
     /// Its place among the port's running sessions in `vox status`, removed when it drops.
     pub running: crate::node::status::Running,
+    /// Why it ran (ADR-038 FX-15, #996): counted on the lane when it completes.
+    pub reason: crate::node::status::RoundReason,
     /// Set only after a bounded inbound request has decoded the exact
     /// `Control/Head(peer)` query. If that peer departs while the response is in flight,
     /// lifecycle cleanup may retain this attempt long enough to return its semantic receipt;
@@ -263,6 +265,10 @@ pub struct Port {
     /// `own_seq` when this port last began an inventory exchange. While `own_seq` is past it,
     /// the port owes the peer an announcement, and a parked hinted continuation waits one round.
     pub announced_seq: u64,
+    /// `req_gen` as the periodic request (ADR-025 D7) last left it: while it is the newest
+    /// request and unconsumed, a round the port runs for it is a `periodic` round in
+    /// `vox status` (ADR-038 FX-15, #996).
+    pub periodic_req: u64,
 }
 
 impl Port {
@@ -285,6 +291,7 @@ impl Port {
             last_clean_out: None,
             own_seq: 0,
             announced_seq: 0,
+            periodic_req: 0,
         }
     }
 
@@ -313,6 +320,19 @@ impl Port {
     /// Raise a request (ADR-025 D2).
     pub fn raise(&mut self) {
         self.req_gen = self.req_gen.saturating_add(1);
+    }
+
+    /// Raise the periodic request (ADR-025 D7), remembered as such for `vox status`.
+    pub fn raise_periodic(&mut self) {
+        self.raise();
+        self.periodic_req = self.req_gen;
+    }
+
+    /// Whether the newest unconsumed request on this port is the periodic one: nothing else has
+    /// asked for a round since it came due.
+    #[must_use]
+    pub fn periodic_pending(&self) -> bool {
+        self.req_gen > self.req_done && self.periodic_req == self.req_gen
     }
 
     /// Whether the periodic request (ADR-025 D7) has anything to add at `now`: not while this

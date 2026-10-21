@@ -825,6 +825,13 @@ const COUNT_STILL_FOR: Duration = Duration::from_secs(1);
 /// Within this of the hook runs' end the count MUST have held still for [`COUNT_STILL_FOR`]; a
 /// count that never holds still is staging not achieved, not a verdict.
 const COUNT_STILL_WITHIN: Duration = Duration::from_secs(10);
+/// Live posts alice makes while bob fetches, each its own `vox room post`.
+const LIVE_POSTS: usize = 40;
+/// Rounds a lane may run in the window beyond the ones its live posts and periodic requests
+/// account for (ADR-038 FX-15, #996): the join's own rounds (the new port's first exchange, the
+/// new connection's, the member record's), the room's generation advancing as bob's rows land,
+/// and bob's few own heads (his join's entries). None of them scales with the minute.
+const ROUNDS_SLACK: u64 = 10;
 
 /// **The daemon answers the harness hook while it syncs** (ADR-038 FX-17; #981): alice holds a
 /// room with a [`BACKLOG`] of posts; bob joins, asks for the pages below his window as a reader
@@ -844,10 +851,25 @@ const COUNT_STILL_WITHIN: Duration = Duration::from_secs(10);
 /// on while `vox status` said 2, then 5: the length of his contiguous feed, which a late
 /// joiner's rows lie below.
 ///
-/// Mutants: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
+/// Mutant: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
 /// hook's greeting path) turns the first assertion red on the hook's own sentence; the
 /// contiguous feed's length restored as the room's count (`entry_count()` in `summary_of`)
 /// turns the FX-16 claim red on its two numbers.
+///
+/// **And the serving lane runs no round without a need `vox status` names** (ADR-038 FX-15;
+/// #996). As the minute closes, alice's lane toward bob is read from her `vox status --json`:
+/// its `reasons` MUST add up to `completed`, and her own rounds (every reason but `served`,
+/// bob's requests she answered) MUST be at most the periodic requests in the window plus two
+/// per live post (one announcement, one acknowledgement probe) plus [`ROUNDS_SLACK`]. Measured
+/// 2026-10-20 in this staging on two shipped daemons: her lane completed 1,296 rounds in 81 s,
+/// of which 1,257 were requests she answered for bob's catch-up (about six per row he fetched)
+/// and 39 her own; the 953 "rounds" the issue counted were such requests, which the status
+/// now names as `served`.
+///
+/// Mutants: a round counted without its reason turns the reasons claim red; the lane never
+/// recording a peer's acknowledgement (bob's word on alice's feed not noted, so `held_through`
+/// stays unknown and the settlement tick offers her head to him every second: FX-15's measured
+/// cause) turns the own-round bound red on its own number.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "a timing bound a person feels; two real vox daemons; optional, run it in release"]
@@ -906,6 +928,7 @@ fn a_daemon_answers_the_hook_while_syncing() {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let joined_at = Instant::now();
     let held_at_join = held(&bob, &room, PAGE).order.len();
     // Bob pages back through the backlog while the hook runs: each page below his oldest row is
     // asked for on demand, as the TUI or a reader does, so his daemon's lane is fetching.
@@ -944,7 +967,7 @@ fn a_daemon_answers_the_hook_while_syncing() {
     let burst_dir = alice.clone();
     let burst = std::thread::spawn(move || {
         let mut refused = Vec::new();
-        for i in 1..=40 {
+        for i in 1..=LIVE_POSTS {
             let (ok, out, err) = vox(
                 &burst_dir,
                 &["room", "post", &burst_room, &format!("live {i}")],
@@ -1010,6 +1033,16 @@ fn a_daemon_answers_the_hook_while_syncing() {
         .join()
         .unwrap_or_else(|_| panic!("APPARATUS: the burst thread panicked"));
     let held_after = held(&bob, &room, PAGE).order.len();
+    // The lanes' rounds and why each ran, read as the minute closes (ADR-038 FX-15, #996).
+    let worked = joined_at.elapsed();
+    let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
+    let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
+    let alice_lane = lane_why(&alice_status);
+    let bob_lane = lane_why(&bob_status);
+    println!(
+        "[proof] over {worked:?} since bob's join, alice's lane toward bob: {alice_lane}; bob's \
+         toward alice: {bob_lane}"
+    );
     let slowest = runs.iter().map(|(d, _, _)| *d).max().unwrap_or_default();
     // The hook must have talked to the daemon: its output names the room or its news, never
     // nothing. Without this the timing claim could pass on a hook that never asked.
@@ -1113,7 +1146,6 @@ fn a_daemon_answers_the_hook_while_syncing() {
         runs.iter().map(|(d, _, _)| *d).collect::<Vec<_>>(),
         said(&bob, "bob")
     );
-
     // ---- `vox status` counts the rows bob reads (ADR-038 FX-16; #995) ------------------------
     // The fetch is let settle first: the room's count is read until every reading over
     // [`COUNT_STILL_FOR`] is the same, within [`COUNT_STILL_WITHIN`] (else staging not
@@ -1168,6 +1200,96 @@ fn a_daemon_answers_the_hook_while_syncing() {
          rooms[].entries said {counted} (still for {COUNT_STILL_FOR:?}) and {counted_after:?} \
          after, while `vox room read --json` paged {paged} rows of the room"
     );
+
+    // ---- the serving lane ran no round without a need the status names (ADR-038 FX-15, #996) --
+    let periodic_rounds = worked.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1;
+    let live_posts = LIVE_POSTS as u64;
+    assert!(
+        alice_lane.reasons_total() == alice_lane.completed,
+        "PRODUCT: alice's `vox status` does not name why every round of her lane ran (ADR-038 \
+         FX-15, #996): the reasons add up to {} of {} completed; her lane: {alice_lane}",
+        alice_lane.reasons_total(),
+        alice_lane.completed
+    );
+    let own = alice_lane
+        .completed
+        .saturating_sub(alice_lane.reason("served"));
+    assert!(
+        own <= periodic_rounds + 2 * live_posts + ROUNDS_SLACK,
+        "PRODUCT: alice's lane toward a member catching up ran {own} rounds of her own over \
+         {worked:?} (ADR-038 FX-15, #996); one announcement and one acknowledgement probe per \
+         live post ({live_posts}), the periodic requests ({periodic_rounds}) and {ROUNDS_SLACK} \
+         more is every need the status names; her lane: {alice_lane}; bob asked for \
+         {pages_asked} pages\nalice's daemon said: {}",
+        said(&alice, "alice")
+    );
+}
+
+/// What a node's lanes did, summed over its peers, from `vox status --json`: the completed
+/// rounds and why each ran (ADR-038 FX-15, #996), the partial and failed ones, and each lane's
+/// last failure in its own words.
+struct LaneWhy {
+    completed: u64,
+    partial: u64,
+    failed: u64,
+    last_failure: Vec<String>,
+    reasons: std::collections::BTreeMap<String, u64>,
+}
+
+impl LaneWhy {
+    fn reason(&self, name: &str) -> u64 {
+        self.reasons.get(name).copied().unwrap_or(0)
+    }
+    fn reasons_total(&self) -> u64 {
+        self.reasons.values().sum()
+    }
+}
+
+impl std::fmt::Display for LaneWhy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "completed {} (why: {}) partial {} failed {} last_failure {:?}",
+            self.completed,
+            self.reasons
+                .iter()
+                .map(|(name, n)| format!("{name} {n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.partial,
+            self.failed,
+            self.last_failure
+        )
+    }
+}
+
+fn lane_why(status: &str) -> LaneWhy {
+    let v: serde_json::Value = serde_json::from_str(status)
+        .unwrap_or_else(|e| panic!("APPARATUS: `vox status --json` is not JSON: {e}: {status}"));
+    let lanes = v["sync"]
+        .as_array()
+        .unwrap_or_else(|| panic!("APPARATUS: `vox status --json` has no `sync` lanes: {status}"));
+    let mut out = LaneWhy {
+        completed: 0,
+        partial: 0,
+        failed: 0,
+        last_failure: Vec::new(),
+        reasons: std::collections::BTreeMap::new(),
+    };
+    for lane in lanes {
+        out.completed += lane["completed"].as_u64().unwrap_or(0);
+        out.partial += lane["partial"].as_u64().unwrap_or(0);
+        out.failed += lane["failed"].as_u64().unwrap_or(0);
+        if let Some(why) = lane["reasons"].as_object() {
+            for (name, n) in why {
+                *out.reasons.entry(name.clone()).or_insert(0) += n.as_u64().unwrap_or(0);
+            }
+        }
+        if let Some(f) = lane["last_failure"].as_str() {
+            out.last_failure.push(f.to_owned());
+        }
+    }
+    out
 }
 
 /// What `vox status --json` counts for the room under `rooms[].entries`: the rows the node shows

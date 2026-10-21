@@ -10437,7 +10437,10 @@ impl Node {
                         peer,
                         |counts| match result {
                             Ok(crate::node::history_stream::Status::Complete) => {
-                                counts.completed += 1
+                                counts.completed += 1;
+                                counts
+                                    .reasons
+                                    .count(crate::node::status::RoundReason::Served);
                             }
                             Ok(_) => counts.partial += 1,
                             Err(error) => {
@@ -14551,7 +14554,8 @@ impl Node {
                 port.out.is_none()
                     && (port.needs()
                         || self.bounded_sync.needs_port(key.0, key.1)
-                        || self.history_hints.pending(key.0, key.1))
+                        || self.history_hints.pending(key.0, key.1)
+                        || self.history_demand.ready_binding(key.0, key.1).is_some())
                     && (!port.backing_off(now) || port.busy_bypass(now))
                     && !self.publishing.contains(*key)
                     && self
@@ -14621,7 +14625,8 @@ impl Node {
         let eligible = port.out.is_none()
             && (port.needs()
                 || self.bounded_sync.needs_port(key.0, key.1)
-                || self.history_hints.pending(key.0, key.1))
+                || self.history_hints.pending(key.0, key.1)
+                || self.history_demand.ready_binding(key.0, key.1).is_some())
             && (!port.backing_off(now) || port.busy_bypass(now))
             && !self.publishing.contains(key)
             && self
@@ -14666,7 +14671,7 @@ impl Node {
                 std::time::Duration::from_secs(crate::node::syncstream::SYNC_INTERVAL_SECS / 2);
             for port in self.ports.values_mut() {
                 if port.periodic_due(at, fresh) {
-                    port.raise();
+                    port.raise_periodic();
                 }
             }
             self.discover_rooms.extend(self.channels.keys().copied());
@@ -14860,6 +14865,13 @@ impl Node {
             crate::node::status::SyncStep::Setup,
         );
         let stepper = running.stepper();
+        let reason = if port.announce_owed() {
+            crate::node::status::RoundReason::Announce
+        } else if port.periodic_pending() {
+            crate::node::status::RoundReason::Periodic
+        } else {
+            crate::node::status::RoundReason::Request
+        };
         port.out = Some(crate::node::ports::Attempt {
             token,
             dir: crate::node::ports::Dir::Out,
@@ -14870,6 +14882,7 @@ impl Node {
             fence: Arc::clone(&fence),
             running,
             departure_receipt: None,
+            reason,
         });
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
@@ -15012,6 +15025,7 @@ impl Node {
                 fence: Arc::clone(&fence),
                 running,
                 departure_receipt: None,
+                reason: crate::node::status::RoundReason::Served,
             },
         );
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
@@ -15076,12 +15090,17 @@ impl Node {
         };
         let o = &report.out;
         let progress = o.progress();
+        let reason = match attempt.dir {
+            crate::node::ports::Dir::In => crate::node::status::RoundReason::Served,
+            crate::node::ports::Dir::Out => attempt.reason,
+        };
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
             c.refused += u64::try_from(o.refused).unwrap_or(u64::MAX);
             match &report.fail {
                 None => {
                     if o.complete {
                         c.completed += 1;
+                        c.reasons.count(reason);
                     } else {
                         c.partial += 1;
                     }
@@ -15706,6 +15725,7 @@ impl Node {
                 fence: Arc::clone(&fence),
                 running,
                 departure_receipt: Some(Arc::clone(&departure_receipt)),
+                reason: crate::node::status::RoundReason::Served,
             },
         );
         let tx = self.net_tx.clone();
@@ -19636,6 +19656,11 @@ impl Node {
             // Only a peer that has not said it holds the own head is asked (ADR-038 FX-15):
             // asked of every connected peer on every tick, a quiet room ran a round per
             // peer per second that fetched nothing (the decider's daemon at 50–67% CPU).
+            // A member catching up on a backlog is not behind for more than a tick: its word
+            // is its committed window head, selected before the bodies arrive (#996, measured
+            // 2026-10-20 on two shipped daemons: a member fetching 200 rows over 45 s drew two
+            // offers in 80 s; the serving lane's 953 "rounds" were the requests it answered,
+            // about six per row fetched, which `vox status` now counts as `served`).
             let own_targets: Vec<Digest32> = match own_hint {
                 Some((_, _, size)) => self
                     .connected_peers()

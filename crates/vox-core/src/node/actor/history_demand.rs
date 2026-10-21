@@ -777,9 +777,10 @@ impl Node {
                         cancellation: dispatch.staging.context.cancellation(),
                         page: page_of(&dispatch.query),
                     });
-                    if let Some(port) = self.ports.get_mut(&(dispatch.room, dispatch.peer)) {
-                        port.raise();
-                    }
+                    // The page is a want of its own on its port (`port_eligible` reads
+                    // `ready_binding`), served on its own stream (#996). Raising the port here
+                    // outlived the page: the archive round consumed no request, so every page a
+                    // reader asked for ran a live inventory round after it that fetched nothing.
                     self.sched_rooms.insert(dispatch.room);
                     self.history_demand.ready = Some(dispatch);
                 }

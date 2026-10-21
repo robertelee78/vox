@@ -465,6 +465,27 @@ impl Controller {
         ArchiveTurn::Waiting
     }
 }
+/// Why a foreground round runs (ADR-038 FX-15, #996), from what selected it: the own head
+/// offered for acknowledgement, a head the peer told this node of (or the follow-up such a
+/// fetch needs), an own append owed to the peer, the periodic request, or another request.
+fn foreground_reason(
+    node: Digest32,
+    hint: Option<stream::HeadHint>,
+    required: bool,
+    announce_owed: bool,
+    periodic_pending: bool,
+) -> crate::node::status::RoundReason {
+    use crate::node::status::RoundReason;
+    match hint {
+        Some(hint) if hint.author == node => RoundReason::Offer,
+        Some(_) => RoundReason::Hint,
+        None if required => RoundReason::Hint,
+        None if announce_owed => RoundReason::Announce,
+        None if periodic_pending => RoundReason::Periodic,
+        None => RoundReason::Request,
+    }
+}
+
 impl Node {
     /// Retire every operation for a departed member except an already decoded
     /// `Control/Head(peer)` response. That response is bounded by its existing fence and
@@ -794,12 +815,14 @@ impl Node {
                     }
                     port.clear_backoff();
                 }
+                let reason = returned.flow.reason;
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
                     work.peer,
                     |counts| {
                         counts.completed += 1;
+                        counts.reasons.count(reason);
                         counts.backoff = None;
                     },
                 );
@@ -975,11 +998,15 @@ impl Node {
                 if raised {
                     self.sched_rooms.insert(work.room);
                 }
+                let reason = returned.flow.reason;
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
                     work.peer,
-                    |counts| counts.completed += 1,
+                    |counts| {
+                        counts.completed += 1;
+                        counts.reasons.count(reason);
+                    },
                 );
                 // A round the lane completed is a completed sync for `vox status` (PRD-001
                 // R35), as a session's clean report was before ADR-037. Without this every
@@ -1081,6 +1108,25 @@ impl Node {
                 .ports
                 .get(&(room, peer))
                 .is_some_and(crate::node::ports::Port::announce_owed);
+        // Why a round would run now (ADR-038 FX-15, #996): read before the flow is chosen,
+        // because choosing it consumes what it reads.
+        let (announce_owed, periodic_pending) = self
+            .ports
+            .get(&(room, peer))
+            .map_or((false, false), |port| {
+                (port.announce_owed(), port.periodic_pending())
+            });
+        // A reader's page is served on its own stream (#996): a port whose only want is that
+        // page runs the page, and no live round beside it. Before this the page's dispatch
+        // raised the port, and the raise outlived the page, so every page a reader asked for
+        // ran an inventory exchange after it that fetched nothing.
+        let page_only = self.history_demand.ready_binding(room, peer).is_some()
+            && !self.bounded_sync.needs_port(room, peer)
+            && !self.history_hints.pending(room, peer)
+            && !self
+                .ports
+                .get(&(room, peer))
+                .is_some_and(crate::node::ports::Port::needs);
         if announce_first {
             if let Some(parked) = self.bounded_sync.ready[0]
                 .take_if(|flow| flow.room == room && flow.peer == peer && !flow.inventory)
@@ -1225,7 +1271,8 @@ impl Node {
                             state_job.clone(),
                         )
                     } else {
-                        if self.bounded_sync.ready[0].is_some()
+                        if page_only
+                            || self.bounded_sync.ready[0].is_some()
                             || self.bounded_sync.running[0].is_some()
                         {
                             return false;
@@ -1253,6 +1300,13 @@ impl Node {
                         } else {
                             departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                         };
+                        let reason = foreground_reason(
+                            node,
+                            hint,
+                            required.is_some(),
+                            announce_owed,
+                            periodic_pending,
+                        );
                         match Flow::foreground(
                             room,
                             peer,
@@ -1269,7 +1323,10 @@ impl Node {
                             store.clone(),
                             state_job.clone(),
                         ) {
-                            Ok(flow) => flow,
+                            Ok(mut flow) => {
+                                flow.reason = reason;
+                                flow
+                            }
                             Err(_) => {
                                 if let Some(hint) = hint {
                                     self.history_hints
@@ -1280,7 +1337,8 @@ impl Node {
                         }
                     }
                 } else {
-                    if self.bounded_sync.ready[0].is_some()
+                    if page_only
+                        || self.bounded_sync.ready[0].is_some()
                         || self.bounded_sync.running[0].is_some()
                     {
                         return false;
@@ -1308,6 +1366,13 @@ impl Node {
                     } else {
                         departure_hint.or_else(|| self.history_hints.take(room, peer, node))
                     };
+                    let reason = foreground_reason(
+                        node,
+                        hint,
+                        required.is_some(),
+                        announce_owed,
+                        periodic_pending,
+                    );
                     match Flow::foreground(
                         room,
                         peer,
@@ -1324,7 +1389,10 @@ impl Node {
                         store.clone(),
                         state_job.clone(),
                     ) {
-                        Ok(flow) => flow,
+                        Ok(mut flow) => {
+                            flow.reason = reason;
+                            flow
+                        }
                         Err(_) => {
                             if let Some(hint) = hint {
                                 self.history_hints
@@ -1428,6 +1496,7 @@ impl Node {
             fence: fence.clone(),
             running,
             departure_receipt: None,
+            reason: flow.reason,
         });
         let archive = flow
             .archive_request

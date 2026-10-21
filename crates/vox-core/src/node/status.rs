@@ -1045,6 +1045,96 @@ impl BackoffKind {
     }
 }
 
+/// Why a sync round ran (ADR-038 FX-15, #996): the need `vox status` names for each completed
+/// round of a lane, so a round with no need a person can read is seen as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundReason {
+    /// This node offered its own head to the peer for acknowledgement (the settlement tick).
+    Offer,
+    /// A head the peer told this node of, and this node fetched: its inventory, or a third
+    /// party's head it named; the follow-ups such a fetch needs count here too.
+    Hint,
+    /// This node appended in the room and owed the peer the announcement (ADR-037 R7).
+    Announce,
+    /// The periodic request (ADR-025 D7), with nothing else pending on the port.
+    Periodic,
+    /// A reader's history page this node asked the peer for (`vox room read --history older`).
+    Page,
+    /// Another request raised on the port: the join, a new connection, the room's generation
+    /// advancing, `vox room sync`, a continuation re-raised.
+    Request,
+    /// A request the peer made that this node answered: the peer's round, not this node's.
+    Served,
+}
+
+impl RoundReason {
+    /// The name `vox status --json` prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Offer => "offer",
+            Self::Hint => "hint",
+            Self::Announce => "announce",
+            Self::Periodic => "periodic",
+            Self::Page => "page",
+            Self::Request => "request",
+            Self::Served => "served",
+        }
+    }
+}
+
+/// How many of a lane's completed rounds ran for each [`RoundReason`]; they add up to
+/// `completed`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoundReasons {
+    /// Own-head offers.
+    pub offer: u64,
+    /// The peer's hints.
+    pub hint: u64,
+    /// Own appends announced.
+    pub announce: u64,
+    /// Periodic requests.
+    pub periodic: u64,
+    /// A reader's pages.
+    pub page: u64,
+    /// Other requests.
+    pub request: u64,
+    /// The peer's requests this node answered.
+    pub served: u64,
+}
+
+impl RoundReasons {
+    /// Count one completed round that ran for `reason`.
+    pub fn count(&mut self, reason: RoundReason) {
+        let slot = match reason {
+            RoundReason::Offer => &mut self.offer,
+            RoundReason::Hint => &mut self.hint,
+            RoundReason::Announce => &mut self.announce,
+            RoundReason::Periodic => &mut self.periodic,
+            RoundReason::Page => &mut self.page,
+            RoundReason::Request => &mut self.request,
+            RoundReason::Served => &mut self.served,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// The JSON object `vox status --json` prints for `reasons`.
+    #[must_use]
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"offer\":{},\"hint\":{},\"announce\":{},\"periodic\":{},\"page\":{},\
+             \"request\":{},\"served\":{}}}",
+            self.offer,
+            self.hint,
+            self.announce,
+            self.periodic,
+            self.page,
+            self.request,
+            self.served
+        )
+    }
+}
+
 /// One `(room, peer)`'s counters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortCounters {
@@ -1056,6 +1146,8 @@ pub struct PortCounters {
     pub busy_refused: u64,
     /// Sessions (either direction) that completed with every requested entry received.
     pub completed: u64,
+    /// Why each of them ran (ADR-038 FX-15, #996): one count per `completed`.
+    pub reasons: RoundReasons,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,
     /// Sessions that failed.
@@ -1500,8 +1592,8 @@ impl SyncBook {
             let _ = write!(
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
-                 \"completed\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\"stale\":{},\
-                 \"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
+                 \"completed\":{},\"reasons\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\
+                 \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
                  \"running\":[{}]}}",
                 b32_encode(room),
                 b32_encode(peer),
@@ -1509,6 +1601,7 @@ impl SyncBook {
                 c.admitted,
                 c.busy_refused,
                 c.completed,
+                c.reasons.json(),
                 c.partial,
                 c.failed,
                 c.last_failure

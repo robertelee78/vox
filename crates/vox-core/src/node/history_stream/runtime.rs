@@ -126,6 +126,9 @@ pub(crate) struct Flow {
     /// (ADR-028 R-6). The actor records it, and the settlement tick stops offering the own
     /// head to a peer that holds it (ADR-038 FX-15).
     pub(crate) mine_held: Option<u64>,
+    /// Why this flow's rounds run (ADR-038 FX-15, #996), set when the actor selects it and
+    /// kept across its slices; counted on the lane when a round completes.
+    pub(crate) reason: crate::node::status::RoundReason,
     pub(crate) waiting: bool,
     pub(crate) published: bool,
     pub(crate) rendered: bool,
@@ -226,6 +229,7 @@ impl Flow {
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            reason: crate::node::status::RoundReason::Request,
             waiting: false,
             published: false,
             rendered: false,
@@ -336,6 +340,7 @@ impl Flow {
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            reason: crate::node::status::RoundReason::Page,
             waiting: false,
             published: false,
             rendered: false,

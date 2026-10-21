@@ -403,6 +403,21 @@ fn render(v: &Value) -> String {
             n(r, "skipped_at_cap"),
             n(r, "queued"),
         );
+        // Why each completed round ran (ADR-038 FX-15, #996): a round with no need a person
+        // can read here is the defect, not the load.
+        if let Some(why) = r.get("reasons").filter(|w| w.is_object()) {
+            let _ = write!(
+                o,
+                "; why: offer {} hint {} announce {} periodic {} page {} request {} served {}",
+                n(why, "offer"),
+                n(why, "hint"),
+                n(why, "announce"),
+                n(why, "periodic"),
+                n(why, "page"),
+                n(why, "request"),
+                n(why, "served"),
+            );
+        }
         if let Some(b) = r.get("backoff").filter(|b| !b.is_null()) {
             let _ = write!(
                 o,
