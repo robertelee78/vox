@@ -1718,6 +1718,59 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     let mut alice_restarted = daemon_env(&alice, "alice", &fold_knob);
     attached(&alice, "alice");
 
+    // Isolate the repeated-grant claim to Alice and Bob before taking any semantic or room-order
+    // baseline. A Presence rotation retries consent for every identity Alice still trusts. If
+    // offline Carol remained in that set, her equal regrant could own the next semantic revision
+    // or share Bob's row interval, so `reset + 1` and the final row would not identify Bob's
+    // grant. Removing Carol is a shipped user action; wait for its real rotation/regrant fold and
+    // prove the node-wide trust decision before the quiet two-member sequence begins.
+    let isolation_before = room_status(&alice, "alice", &rooms[0]);
+    let (ok, out, err) = vox(&alice, &["trust", "remove", &fps[2]], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice could not remove offline Carol before the isolated repeated-grant \
+         sequence: {out}{err}"
+    );
+    let (ok, trusted, err) = vox(&alice, &["trust", "list"], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's shipped trust list failed after removing Carol: {err}"
+    );
+    assert!(
+        !trusted
+            .lines()
+            .any(|line| line.trim_start().starts_with(&fps[2])),
+        "PRODUCT: after successful `vox trust remove`, Alice's shipped trust list still named \
+         Carol {}: {trusted}",
+        fps[2]
+    );
+    let isolation_revision = isolation_before
+        .governance_revision
+        .checked_add(2)
+        .expect("PRODUCT: Alice's governance revision overflowed while isolating Bob's grant");
+    let isolation_settled = wait_room_status(
+        &alice,
+        "alice",
+        &rooms[0],
+        false,
+        "Carol's removal did not publish its reset and the one Bob-only regrant",
+        |status| status.governance_revision >= isolation_revision,
+    );
+    assert_eq!(
+        isolation_settled.governance_revision, isolation_revision,
+        "PRODUCT: removing Carol from the three-member trusted-reader set did not publish exactly \
+         the one reset and one Bob-only regrant in quiet room {}: before {isolation_before:?}, \
+         settled {isolation_settled:?}",
+        rooms[0]
+    );
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "Carol's removal and the resulting Bob-only regrant never completed their bounded fold",
+    );
+    wait_trust_detail(&bob, "bob", &rooms[0], "alice", "you trust each other");
+
     // A same-value authenticated action exists in the immutable room order but is not a new
     // canonical meaning. Wait on an authority-dependent shipped page so the equal revision below
     // is observed after the exact row was folded, not before asynchronous work began.
