@@ -412,8 +412,14 @@ impl ChannelState {
         if entry.skeleton.v2.is_some() {
             return Ok(Some(false));
         }
+        // An entry of another room under this hash is a real integrity failure and stays one.
+        if entry.skeleton.channel_id != self.channel_id {
+            return Err(Error::MalformedAtRest(
+                "Session classification source unverified",
+            ));
+        }
         let author = entry.skeleton.author_id;
-        if self.legacy_target(transaction, hash, &author)?.is_none() {
+        if entry.skeleton.seq > self.dag.verified_head(&author) {
             return Ok(None);
         }
         let saved = match self.legacy_page(transaction, page_id(log, false)?)? {
@@ -485,12 +491,24 @@ impl ChannelState {
             .ok_or(Error::MalformedAtRest(
                 "Session classification source unpublished",
             ))?;
-        let Some(target) = self.legacy_target(transaction, &hash, &author)? else {
-            // Nothing to remember for a signed-format entry or one not yet verified
-            // (ADR-038 FX-33): the next pass classifies what it can.
-            return Ok(());
+        let Some(entry) = self.entry_at(transaction, &hash)? else {
+            return Err(Error::MalformedAtRest(
+                "Session classification target unverified",
+            ));
         };
-        drop(target);
+        // Nothing to remember for a signed-format entry, and nothing yet for one past its
+        // author's verified head (ADR-038 FX-33): the next pass classifies what it can. An entry
+        // of another room or author is a real integrity failure and stays one.
+        if entry.skeleton.v2.is_some()
+            || entry.skeleton.seq > self.dag.verified_head(&entry.skeleton.author_id)
+        {
+            return Ok(());
+        }
+        if entry.skeleton.channel_id != self.channel_id || entry.skeleton.author_id != author {
+            return Err(Error::MalformedAtRest(
+                "Session classification target unverified",
+            ));
+        }
         let id = page_id(log, false)?;
         let page = Page::Target {
             hash,
