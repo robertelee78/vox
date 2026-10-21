@@ -818,10 +818,13 @@ const HOOK_UNANSWERED: &str = "did not answer promptly";
 /// Hook runs during the load, a quarter second apart: about a minute of a harness at work, the
 /// time a late joiner's live window and the pages below it take to arrive (ADR-037 R1).
 const HOOK_RUNS: usize = 200;
-/// How long `vox status --json` is given to count rows `vox room read --json` already paged: the
-/// room is published a moment after its rows land, and a page may land between the two reads.
-/// Apparatus only: the count is read from the status, never waited into existence.
-const STATUS_AGREES_WITHIN: Duration = Duration::from_secs(3);
+/// How long the room's count in `vox status --json` must have held still (every reading the same)
+/// before it is compared with a paged read: the pages bob asked for last are let land. Apparatus
+/// only: the count is read from the status, never waited into agreement with the rows.
+const COUNT_STILL_FOR: Duration = Duration::from_secs(1);
+/// Within this of the hook runs' end the count MUST have held still for [`COUNT_STILL_FOR`]; a
+/// count that never holds still is staging not achieved, not a verdict.
+const COUNT_STILL_WITHIN: Duration = Duration::from_secs(10);
 
 /// **The daemon answers the harness hook while it syncs** (ADR-038 FX-17; #981): alice holds a
 /// room with a [`BACKLOG`] of posts; bob joins, asks for the pages below his window as a reader
@@ -834,11 +837,12 @@ const STATUS_AGREES_WITHIN: Duration = Duration::from_secs(3);
 /// (v0.4.7, four nodes working): `vox status` answered in 0.5 s and the hook said "did not
 /// answer promptly" twice in one session.
 ///
-/// **`vox status` counts the rows bob reads** (ADR-038 FX-16; #995): once the runs are over,
-/// `rooms[].entries` in bob's `vox status --json`, read before and after one paged `vox room
-/// read --json` of the room, MUST bound the rows that read paged. Found 2026-10-20 in this
-/// staging: bob read 14, 32, …, 115 rows as the minute went on while `vox status` said 2, then
-/// 5: the length of his contiguous feed, which a late joiner's rows lie below.
+/// **`vox status` counts the rows bob reads** (ADR-038 FX-16; #995): once the runs are over and
+/// the room's count in bob's `vox status --json` has held still for [`COUNT_STILL_FOR`],
+/// `rooms[].entries` MUST equal, exactly, the rows one paged `vox room read --json` of the room
+/// then pages. Found 2026-10-20 in this staging: bob read 14, 32, …, 115 rows as the minute went
+/// on while `vox status` said 2, then 5: the length of his contiguous feed, which a late
+/// joiner's rows lie below.
 ///
 /// Mutants: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
 /// hook's greeting path) turns the first assertion red on the hook's own sentence; the
@@ -1111,35 +1115,58 @@ fn a_daemon_answers_the_hook_while_syncing() {
     );
 
     // ---- `vox status` counts the rows bob reads (ADR-038 FX-16; #995) ------------------------
-    // Status, then the rows, then status again: a page bob asked for may still land between
-    // two reads, and the room is published a moment after its rows land, so the rows paged are
-    // bounded by the two counts, the second read again until it has caught up or
-    // [`STATUS_AGREES_WITHIN`] passed. The old count never over-counted, so the lower bound
-    // holds either way; the upper bound is the claim.
-    let counted_before = status_rows(&bob, &room);
-    let paged = held(&bob, &room, PAGE).rows as u64;
-    let asked = Instant::now();
-    let mut counted_after = status_rows(&bob, &room);
-    while counted_after.is_some_and(|n| n < paged) && asked.elapsed() < STATUS_AGREES_WITHIN {
-        std::thread::sleep(Duration::from_millis(200));
-        counted_after = status_rows(&bob, &room);
-    }
-    let (Some(counted_before), Some(counted_after)) = (counted_before, counted_after) else {
-        let (_, status, err) = vox(&bob, &["status", "--json"], None);
-        panic!(
-            "PRODUCT: bob's `vox status --json` does not count the room's rows under \
-             rooms[].entries (ADR-038 FX-16, #995); it said: {status}{err}"
+    // The fetch is let settle first: the room's count is read until every reading over
+    // [`COUNT_STILL_FOR`] is the same, within [`COUNT_STILL_WITHIN`] (else staging not
+    // achieved). Then the room is paged once, and the still count MUST equal the rows paged,
+    // exactly. One more reading after the page tells a page that landed between the still count
+    // and the read (apparatus) from a count that is not the rows (product).
+    let settling = Instant::now();
+    let mut still_since = Instant::now();
+    let mut counted = status_rows(&bob, &room);
+    loop {
+        let Some(count) = counted else {
+            let (_, status, err) = vox(&bob, &["status", "--json"], None);
+            panic!(
+                "PRODUCT: bob's `vox status --json` does not count the room's rows under \
+                 rooms[].entries (ADR-038 FX-16, #995); it said: {status}{err}"
+            );
+        };
+        if still_since.elapsed() >= COUNT_STILL_FOR {
+            break;
+        }
+        assert!(
+            settling.elapsed() < COUNT_STILL_WITHIN,
+            "APPARATUS: staging not achieved: bob's `vox status --json` count for the room did \
+             not hold still for {COUNT_STILL_FOR:?} within {COUNT_STILL_WITHIN:?} of the hook \
+             runs' end; it last said {count}"
         );
-    };
+        std::thread::sleep(Duration::from_millis(250));
+        let again = status_rows(&bob, &room);
+        if again != counted {
+            counted = again;
+            still_since = Instant::now();
+        }
+    }
+    let counted = counted.unwrap_or(0);
+    let paged = held(&bob, &room, PAGE).rows as u64;
+    let counted_after = status_rows(&bob, &room);
     println!(
-        "[proof] ADR-038 FX-16 / #995: bob's `vox status --json` counted {counted_before} rows \
-         for the room before `vox room read --json` paged {paged}, and {counted_after} after"
+        "[proof] ADR-038 FX-16 / #995: bob's `vox status --json` counted {counted} rows for the \
+         room, still for {COUNT_STILL_FOR:?}; `vox room read --json` then paged {paged}; the \
+         count read again: {counted_after:?}"
     );
+    if paged != counted && counted_after == Some(paged) {
+        panic!(
+            "APPARATUS: staging not achieved: a page landed between the still count and the \
+             read: bob's `vox status --json` counted {counted} rows, `vox room read --json` paged \
+             {paged}, and the count read again was {paged}"
+        );
+    }
     assert!(
-        counted_before <= paged && paged <= counted_after,
+        paged == counted,
         "PRODUCT: `vox status --json` does not count the rows bob reads (ADR-038 FX-16, #995): \
-         rooms[].entries said {counted_before} before and {counted_after} after `vox room read \
-         --json` paged {paged} rows of the room"
+         rooms[].entries said {counted} (still for {COUNT_STILL_FOR:?}) and {counted_after:?} \
+         after, while `vox room read --json` paged {paged} rows of the room"
     );
 }
 
