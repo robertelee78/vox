@@ -1326,11 +1326,50 @@ impl Drop for TailObserver {
 }
 
 #[cfg(feature = "optional-proofs")]
+fn charged_flow_hold_entries(hold: &Path) -> Vec<(u64, String, std::path::PathBuf)> {
+    let Some(parent) = hold.parent() else {
+        return Vec::new();
+    };
+    let Some(file) = hold.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{file}.entered.");
+    std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let actor = name
+                .to_str()?
+                .strip_prefix(&prefix)?
+                .split('.')
+                .next()?
+                .parse()
+                .ok()?;
+            let node = std::fs::read_to_string(entry.path()).ok()?;
+            Some((actor, node.trim().to_owned(), entry.path()))
+        })
+        .collect()
+}
+
+#[cfg(feature = "optional-proofs")]
 fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
     let hold = staged
         .live_hold
         .as_ref()
         .expect("APPARATUS: generation-accounting hold path was not staged");
+    // Earlier pool-pressure workers used the same compiled-out lane barrier. Only a marker
+    // created after this point can prove that the generation we retire owns the Flow mutex as
+    // well as a running charge.
+    for (_, _, marker) in charged_flow_hold_entries(hold) {
+        std::fs::remove_file(&marker).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not clear prior charged-flow marker {}: {error}",
+                marker.display()
+            )
+        });
+    }
     std::fs::File::create(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not create {}: {error}", hold.display()));
     let room = &staged.rooms[0];
@@ -1338,28 +1377,25 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
     let (peer_dir, peer_node, peer_name, _) = &staged.everyone[staged.hosted];
     stage_post(peer_dir, *peer_node, peer_name, room, target);
 
-    let (running_name, running_fingerprint) = loop {
-        let mut held = None;
-        for (dir, node, name, fingerprint) in &staged.everyone[1..staged.hosted] {
-            let shown = synced(dir, *node);
-            let value: serde_json::Value = serde_json::from_str(&shown.status)
-                .expect("PRODUCT: generation-accounting staging status was not JSON");
-            let live = value["lanes"]["bounded"]["running"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|round| round["lane"] == "live");
-            let charged = value["lanes"]["budget"]["flow_state"]["by_node"][fingerprint]
-                .as_u64()
-                .is_some_and(|count| count > 0);
-            if live && charged {
-                held = Some((*name, fingerprint.clone()));
-                break;
-            }
-        }
+    let entered_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    let (old_actor, running_name, running_fingerprint) = loop {
+        let entered = charged_flow_hold_entries(hold);
+        let held = entered.into_iter().find_map(|(actor, fingerprint, _)| {
+            // Keep the first two nodes free to create two independent successor needs after
+            // this actor is replaced. The population itself is source-derived above.
+            staged.everyone[vox_core::node::history_budget::ARCHIVE_JOBS..staged.hosted]
+                .iter()
+                .find(|(_, _, _, candidate)| *candidate == fingerprint)
+                .map(|(_, _, name, _)| (actor, *name, fingerprint))
+        });
         if let Some(held) = held {
             break held;
         }
+        assert!(
+            Instant::now() < entered_by,
+            "APPARATUS: no eligible shipped worker reached the charged-Flow barrier within the \
+             source-owned bounded-round contract"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
 
@@ -1375,6 +1411,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         !ok,
         "APPARATUS: the proof-only marker did not panic held actor {running_name}: {out}{err}"
     );
+    let retiring_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
         let shown = synced(&staged.host, Some(FX35_HOSTED[0]));
         let value: serde_json::Value = serde_json::from_str(&shown.status)
@@ -1385,89 +1422,160 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
             .flatten()
             .any(|actor| {
                 actor["node"] == running_fingerprint
+                    && actor["actor"] == old_actor
                     && actor["registered"] == false
                     && actor["in_use"] == 1
             });
         if old_retiring {
             break;
         }
+        assert!(
+            Instant::now() < retiring_by,
+            "PRODUCT: actor {old_actor} retired after owning a charged Flow, but shipped status \
+             did not retain its exact running charge: {}",
+            shown.status
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     unlock(&staged.host, running_name);
     attached_as(&staged.host, "host", Some(running_name));
-    let replacement = synced(&staged.host, Some(FX35_HOSTED[0]));
-    let replacement: serde_json::Value = serde_json::from_str(&replacement.status)
-        .expect("PRODUCT: generation-accounting status was not JSON");
-    let pool = &replacement["lanes"]["budget"]["flow_state"];
-    let generations: Vec<&serde_json::Value> = pool["actors"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|actor| actor["node"] == running_fingerprint)
-        .collect();
-    let old = generations
-        .iter()
-        .find(|actor| actor["registered"] == false && actor["in_use"] == 1);
-    let new = generations
-        .iter()
-        .find(|actor| actor["registered"] == true && actor["in_use"] == 0);
-    let old_actor = old.and_then(|actor| actor["actor"].as_u64());
-    let retiring = pool["retiring_nodes"]
-        .as_array()
-        .is_some_and(|nodes| nodes.iter().any(|node| node == &running_fingerprint));
-    let running_old = pool["running"].as_array().is_some_and(|rounds| {
-        rounds.iter().any(|round| {
-            round["node"] == running_fingerprint && round["actor"].as_u64() == old_actor
-        })
-    });
-    let by_node = pool["by_node"]
-        .as_object()
-        .expect("PRODUCT: generation-accounting status omitted by_node");
-    let expected_limit = vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY
-        .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * staged.hosted)
-        as u64;
-    let actor_sum: u64 = pool["actors"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|actor| actor["in_use"].as_u64())
-        .sum();
-    let running_count = pool["running"].as_array().map_or(0, Vec::len) as u64;
-    assert!(
-        generations.len() == 2
-            && old.is_some()
-            && new.is_some()
-            && retiring
-            && running_old
-            && by_node.len() == staged.hosted
-            && by_node
-                .get(&running_fingerprint)
-                .and_then(serde_json::Value::as_u64)
-                == Some(0)
-            && pool["in_use"].as_u64() == Some(actor_sum)
-            && running_count == actor_sum
-            && pool["limit"] == expected_limit,
-        "PRODUCT: `vox status --json` did not keep old and replacement actor generations exact \
-         without inflating the hosted-node pool limit: {}",
-        pool
-    );
+    // Two independent authors now give the replacement more than the one remaining shared
+    // slot. Its first worker reaches the charged-flow barrier; the second exact port must say
+    // NodeBusy. Replacing the actor may neither create two more slots nor misname this PoolFull.
+    for (index, text) in [
+        "generation-accounting-successor-one",
+        "generation-accounting-successor-two",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (dir, node, name, _) = &staged.everyone[index];
+        stage_post(dir, *node, name, &staged.rooms[index], text);
+    }
+
+    let replacement_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    loop {
+        let replacement = synced(&staged.host, Some(running_name));
+        let replacement: serde_json::Value = serde_json::from_str(&replacement.status)
+            .expect("PRODUCT: generation-accounting status was not JSON");
+        let pool = &replacement["lanes"]["budget"]["flow_state"];
+        let generations: Vec<&serde_json::Value> = pool["actors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|actor| actor["node"] == running_fingerprint)
+            .collect();
+        let old = generations.iter().find(|actor| {
+            actor["actor"] == old_actor && actor["registered"] == false && actor["in_use"] == 1
+        });
+        let new = generations
+            .iter()
+            .find(|actor| actor["registered"] == true && actor["in_use"] == 1);
+        let new_actor = new.and_then(|actor| actor["actor"].as_u64());
+        let retiring = pool["retiring_nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.iter().any(|node| node == &running_fingerprint));
+        let running_old = pool["running"].as_array().is_some_and(|rounds| {
+            rounds
+                .iter()
+                .any(|round| round["node"] == running_fingerprint && round["actor"] == old_actor)
+        });
+        let running_new = pool["running"].as_array().is_some_and(|rounds| {
+            rounds.iter().any(|round| {
+                round["node"] == running_fingerprint
+                    && new_actor.is_some_and(|actor| round["actor"] == actor)
+            })
+        });
+        let node_busy = replacement["lanes"]["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|port| port["start_reason"] == "flow_state_node_busy");
+        let pool_full = replacement["lanes"]["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|port| port["start_reason"] == "flow_state_pool_full");
+        let by_node = pool["by_node"]
+            .as_object()
+            .expect("PRODUCT: generation-accounting status omitted by_node");
+        let expected_limit = vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY
+            .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * staged.hosted)
+            as u64;
+        let actor_sum: u64 = pool["actors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|actor| actor["in_use"].as_u64())
+            .sum();
+        let running_count = pool["running"].as_array().map_or(0, Vec::len) as u64;
+        if old.is_some() && new.is_some() && running_old && running_new && node_busy {
+            assert!(
+                generations.len() == 2
+                    && retiring
+                    && !pool_full
+                    && by_node.len() == staged.hosted
+                    && by_node
+                        .get(&running_fingerprint)
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(1)
+                    && pool["in_use"].as_u64() == Some(actor_sum)
+                    && running_count == actor_sum
+                    && pool["in_use"]
+                        .as_u64()
+                        .zip(pool["limit"].as_u64())
+                        .is_some_and(|(in_use, limit)| in_use < limit)
+                    && pool["limit"] == expected_limit,
+                "PRODUCT: `vox status --json` did not aggregate the retired and replacement \
+                 actor into the same two node slots, or named the refusal PoolFull: {}",
+                pool
+            );
+            break;
+        }
+        assert!(
+            !pool_full,
+            "PRODUCT: a replacement actor reached PoolFull while its retired generation shared \
+             the same node's source-owned slots: {}",
+            replacement["lanes"]
+        );
+        assert!(
+            Instant::now() < replacement_by,
+            "PRODUCT: the replacement and its retired generation did not aggregate to two \
+             charged workers plus an exact NodeBusy refusal within the source-owned \
+             bounded-round contract: {}",
+            replacement["lanes"]
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     std::fs::remove_file(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release {}: {error}", hold.display()));
-    loop {
-        let (ok, out, err) = vox(
-            &staged.host,
-            &as_node(&["room", "read", room], Some(FX35_HOSTED[0])),
-            None,
-        );
-        assert!(
-            ok,
-            "PRODUCT: generation-accounting read refused: {out}{err}"
-        );
-        if out.contains(target) {
-            break;
+    let released_by = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
+    for (room, text) in [
+        (&staged.rooms[0], target),
+        (&staged.rooms[0], "generation-accounting-successor-one"),
+        (&staged.rooms[1], "generation-accounting-successor-two"),
+    ] {
+        loop {
+            let (ok, out, err) = vox(
+                &staged.host,
+                &as_node(&["room", "read", room], Some(running_name)),
+                None,
+            );
+            assert!(
+                ok,
+                "PRODUCT: generation-accounting read refused: {out}{err}"
+            );
+            if out.contains(text) {
+                break;
+            }
+            assert!(
+                Instant::now() < released_by,
+                "PRODUCT: the exact NodeBusy admission did not resume from the retired charge's \
+                 release within the source-owned bounded-round contract: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
         }
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -1495,8 +1603,9 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// tail short of its target at the source-owned PRODUCT bound with periodic scheduling disabled
 /// and no post-release request; dropping archive ownership turns the exact shipped archive
 /// request's own bounded PRODUCT assertion red, never the global watchdog;
-/// counting actor generations instead of unique hosted fingerprints makes the panic/replacement
-/// generation status assertion PRODUCT-red; removing the
+/// giving a replacement generation two new node slots instead of sharing the retired actor's
+/// source-owned pair prevents the exact NodeBusy verdict and makes the generation assertion
+/// PRODUCT-red (and returning PoolFull names that separate PRODUCT defect); removing the
 /// post-quiet need re-arm leaves the waiting node short of the named `re-armed` posts.
 #[cfg(feature = "optional-proofs")]
 #[test]

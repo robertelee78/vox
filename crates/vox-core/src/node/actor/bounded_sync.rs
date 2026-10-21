@@ -2555,13 +2555,16 @@ impl Node {
         let pstore = profile.store_handle();
         let worker = tokio::spawn(async move {
             let _slot = slot;
-            job.hold_for_proof().await;
             let deadline =
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
             let mut flow = worker_flow.lock().await;
             let Some(flow) = flow.as_mut() else {
                 return Some("bounded history supervisor retained no Flow".to_owned());
             };
+            // The proof barrier belongs after exclusive Flow ownership. While it is held, an
+            // actor panic can retire the controller but cannot adopt/park this Flow; its charge
+            // therefore remains truthfully attributed to the retiring actor generation.
+            job.hold_for_proof().await;
             if flow.needs_board() && !worker_fence.is_retired() {
                 if let Some(net) = net {
                     flow.admitted_authors = tokio::select! {

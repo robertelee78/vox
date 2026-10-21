@@ -1479,7 +1479,17 @@ impl Flow {
                         "required current evidence is unavailable",
                     ));
                 }
-                if matches!(result.status, Status::Busy | Status::EvidenceUnavailable) {
+                if result.status == Status::Busy {
+                    // Busy did not end the admitted request. Keep the exact body/page and its
+                    // continuation in this Flow; the actor parks the round and the port's Busy
+                    // edge retries this same owner. In particular, do not checkpoint/pause the
+                    // shipped archive request and require a person to resume work the peer only
+                    // deferred.
+                    self.push(task)?;
+                    self.waiting = true;
+                    return Ok(());
+                }
+                if result.status == Status::EvidenceUnavailable {
                     if self.archive && body {
                         self.finish_archive(job).await?;
                         self.tasks.clear();

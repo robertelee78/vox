@@ -425,7 +425,11 @@ impl Job {
     }
 
     /// Proof-only: keep one admitted Live or Archive job until apparatus removes its lane's
-    /// named file. Production builds contain neither variable nor this pause.
+    /// named file. The caller invokes this only after it exclusively owns the charged Flow.
+    /// A `<hold>.entered.<actor>.<job>` file containing the node fingerprint is the apparatus
+    /// edge which proves that ownership; observing admission/status before this edge is
+    /// insufficient because the controller can still adopt a Flow whose worker has not locked
+    /// it. Production builds contain neither variable, marker nor pause.
     #[cfg(feature = "test-knobs")]
     pub(crate) async fn hold_for_proof(&self) {
         let variable = match self.0.lane {
@@ -436,9 +440,29 @@ impl Job {
         let Some(path) = std::env::var_os(variable) else {
             return;
         };
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        let Some(owner) = self.0.flow_owner else {
+            return;
+        };
+        let job = Arc::as_ptr(&self.0) as usize;
+        let entered = std::path::PathBuf::from(format!(
+            "{}.entered.{owner}.{job}",
+            std::path::Path::new(&path).display()
+        ));
+        if std::fs::write(
+            &entered,
+            crate::node::link::b32_encode(&self.0.node).as_bytes(),
+        )
+        .is_err()
+        {
+            return;
+        }
         while std::path::Path::new(&path).exists() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        let _ = std::fs::remove_file(entered);
     }
 
     #[cfg(not(feature = "test-knobs"))]
