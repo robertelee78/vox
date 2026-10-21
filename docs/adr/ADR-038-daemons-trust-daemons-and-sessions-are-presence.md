@@ -248,8 +248,8 @@ The decider then answered twelve questions, one at a time. His answers are the d
   node attached or detached in the bound roster) within 5 s of the change on the daemon where
   it was made, whatever the other daemon does; on the other daemon within 5 s of the exchange
   the changing daemon starts for it (#989) completing, and, when that exchange does not
-  complete (the peer unreachable, the stream cut), within 60 s of the change, the fallback
-  exchange's period, once the peer is reachable again. Two daemons on which nothing changed
+  complete (the peer unreachable, the stream cut), within 60 s, the fallback exchange's
+  period, after the peer becomes reachable again. Two daemons on which nothing changed
   MUST spend nothing on it:
   over an idle minute their CPU grows by no more than FX-15's quiet-room bound. "We need the
   detection of change logic to be sound. Easy for local daemon to notice, but daemon to daemon
@@ -293,8 +293,8 @@ The decider then answered twelve questions, one at a time. His answers are the d
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person
   would lose (own entries, consent, trust, keys, Sessions, the format marker) gets the full
   flush to disk", "correct"). Derived sync state (held heads, cursors, verifier contexts, live
-  windows) MAY be lost in such a crash: the daemon rebuilds it from the proofs it holds and from
-  the peers it can reach. A sync round that persists only derived state MUST make no full flush:
+  windows) MAY be lost in such a crash, and after one the daemon MUST rebuild what it lost from
+  the proofs it holds and from the peers it can reach, so the room syncs on. A sync round that persists only derived state MUST make no full flush:
   `vox status --json` names the daemon's count of full flushes, and over a quiet minute it MUST
   NOT move. Decision: derived state commits at redb `Durability::None` or `Eventual` (a later
   durable commit carries it) and the ruled set stays `Immediate` however it arrived: a
@@ -365,7 +365,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-036 legacy history recovery (Legacy history required, resume, cancel, cached-only reads) | Deleted (FX-18) |
 | ADR-037 R7, R11: event-driven gates; a turn may run several chunks, never a cycle | FX-15 adds: no round without a nameable need; a no-progress, no-wait round retires; a hint for a held head finishes on arrival |
 | ADR-037 R5: a member's higher own head marks the room "own history behind"; every write refuses until resolved | FX-32 says what resolves it: the node recovers its own entries from that member (verified under its own key), keeps reading, and writes again once current |
-| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds the bound: a change made on either daemon shows on every node of both at once, or within 60 s when its exchange is lost, and an unchanged pair spends nothing |
+| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds the bound: a change made on either daemon shows on every attached node of both within 5 s, or within 60 s after the peer is reachable again when its exchange was lost, and an unchanged pair spends nothing |
 | ADR-037 R7, R11: a port runs a round only on a need; a turn may run several chunks, never a cycle | Preserved; FX-29 adds what a round that brings nothing may write: nothing |
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
