@@ -37,7 +37,7 @@ use ml_dsa::{
     MlDsa65, Signature as DsaSignature, SigningKey as DsaSigningKey,
     VerifyingKey as DsaVerifyingKey, B32 as DsaB32,
 };
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::hash::{
@@ -238,31 +238,20 @@ impl core::fmt::Debug for CompositeSignature {
 ///
 /// Held only by the in-software [`SoftwareRootSigner`]; external backends
 /// (gpg-agent, Secure Enclave) keep their own secrets and never construct this.
-/// The Ed25519 key zeroizes on drop natively; the ML-DSA key is stored as its
-/// 32-byte seed (the value ML-DSA keygen is derived from), wrapped so it
-/// zeroizes on drop.
+/// Both keys zeroize on drop natively. The ML-DSA key retains its seed and its
+/// expanded signing material so signing does not reconstruct either on a Tokio
+/// worker stack (ADR-038 FX-37).
 struct CompositeSecret {
     ed: EdSigningKey,
-    ml_dsa_seed: DsaSeed,
+    ml_dsa: DsaSigningKey<MlDsa65>,
 }
 
-/// A 32-byte ML-DSA seed that zeroizes on drop. The expanded signing key is
-/// re-derived from it on demand, so only this minimal secret persists.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-struct DsaSeed([u8; 32]);
-
 impl CompositeSecret {
-    /// Derive the ML-DSA signing key from the stored seed.
-    fn ml_dsa_key(&self) -> DsaSigningKey<MlDsa65> {
-        let seed: DsaB32 = self.ml_dsa_seed.0.into();
-        DsaSigningKey::<MlDsa65>::from_seed(&seed)
-    }
-
     /// The composite public key.
     fn public(&self) -> CompositePublicKey {
         CompositePublicKey {
             ed: self.ed.verifying_key(),
-            ml_dsa: self.ml_dsa_key().verifying_key(),
+            ml_dsa: self.ml_dsa.verifying_key(),
             fp: std::sync::OnceLock::new(),
         }
     }
@@ -274,7 +263,7 @@ impl CompositeSecret {
         // and constant, so the only error path (context too long) is unreachable;
         // we still surface it as an error rather than panicking.
         let ml_dsa = self
-            .ml_dsa_key()
+            .ml_dsa
             .expanded_key()
             .sign_deterministic(msg, b"")
             .map_err(|_| Error::SigningFailed)?;
@@ -284,9 +273,9 @@ impl CompositeSecret {
 
 impl Drop for CompositeSecret {
     fn drop(&mut self) {
-        // `ed` (ed25519-dalek SigningKey) and `ml_dsa_seed` both zeroize
-        // themselves on drop; nothing extra to do, but the explicit impl
-        // documents that this type owns secret material.
+        // `ed` and `ml_dsa` both zeroize themselves on drop. The latter wipes
+        // both its retained seed and expanded secret components; nothing extra
+        // to do, but the explicit impl documents that this type owns them.
     }
 }
 
@@ -384,10 +373,9 @@ impl<T: RootSigner + ?Sized> RootSigner for std::sync::Arc<T> {
 /// natively-generated identity (ADR-002 §GPG integration "Generate").
 pub struct SoftwareRootSigner {
     secret: CompositeSecret,
-    /// The public key and its fingerprint, worked out once when the signer is built (V210-127):
-    /// deriving them expands the ML-DSA key from its seed, which a record's build asked for on
-    /// every publish, on the node's actor. They are fields of the signer, which never changes
-    /// its key: a new identity is a new signer, so they cannot outlive the key they came from.
+    /// The public key and its fingerprint, worked out once when the signer is built (V210-127).
+    /// They are fields of the signer, which never changes its key: a new identity is a new
+    /// signer, so they cannot outlive the key they came from.
     public: CompositePublicKey,
     fingerprint: Digest32,
 }
@@ -415,10 +403,10 @@ impl SoftwareRootSigner {
     /// by backup restore (ADR-002 §Backup), and by tests with fixed vectors.
     pub fn from_component_seeds(ed_seed: &[u8; 32], ml_dsa_seed: &[u8; 32]) -> Result<Self> {
         let ed = EdSigningKey::from_bytes(ed_seed);
-        let secret = CompositeSecret {
-            ed,
-            ml_dsa_seed: DsaSeed(*ml_dsa_seed),
-        };
+        let mut seed: DsaB32 = (*ml_dsa_seed).into();
+        let ml_dsa = DsaSigningKey::<MlDsa65>::from_seed(&seed);
+        seed.as_mut_slice().zeroize();
+        let secret = CompositeSecret { ed, ml_dsa };
         let public = secret.public();
         let fingerprint = public.fingerprint();
         Ok(Self {
@@ -442,7 +430,9 @@ impl SoftwareRootSigner {
     /// Returned [`Zeroizing`] for the same reason as [`Self::ed25519_seed`].
     #[must_use]
     pub(crate) fn ml_dsa_seed(&self) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(self.secret.ml_dsa_seed.0)
+        let mut seed = Zeroizing::new([0u8; 32]);
+        seed.copy_from_slice(self.secret.ml_dsa.as_seed().as_slice());
+        seed
     }
 }
 
