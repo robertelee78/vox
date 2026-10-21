@@ -1113,11 +1113,22 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     }
 
     // A completed inventory round is not evidence that Bob had to answer for Alice's history.
-    // Ask through the shipped reader for the exact page below Alice's oldest live-window row:
-    // that bounded interval contains the package. Alice is offline and Bob is the only source, so
+    // Re-arm Carol's package hold before the shipped reader asks for the exact page below Alice's
+    // oldest live-window row. In the grant-credit mutant, the forbidden body crosses that request
+    // and schedules a separate package-maintenance turn. The hold keeps its shipped pending bit
+    // observable until the proof releases it, so the privacy read cannot win an actor-scheduling
+    // race. The healthy product has only the role-complete header and schedules no such turn.
+    std::fs::write(&hold, b"").unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not re-arm Carol's package hold at {} before the explicit history \
+             request: {e}",
+            hold.display()
+        )
+    });
+
+    // The bounded interval contains the package. Alice is offline and Bob is the only source, so
     // the retained request bound to that exact authenticated Alice cursor and ending its quantum
-    // has given Bob the exact opportunity to serve every byte he holds in that interval. Only
-    // after that causal boundary may absence of Alice's private tail be a privacy verdict.
+    // has given Bob the exact opportunity to serve every byte he holds in that interval.
     let (ok, out, err) = vox(
         &carol,
         &[
@@ -1155,6 +1166,38 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::yield_now();
     };
+
+    if !refused_body {
+        let staged_deadline = Instant::now() + READY_WITHIN;
+        while key_packages_pending(&carol, &room) != Some(true) {
+            assert!(
+                Instant::now() < staged_deadline,
+                "APPARATUS: Bob's exact durably stored hostile package did not reach Carol's \
+                 shipped key-packages-pending state within {READY_WITHIN:?} after her explicit \
+                 Alice-history request; the grant-credit privacy precondition was not staged\n\
+                 carol said: {}\nbob said: {}",
+                said(&carol, "carol-from-bob"),
+                said(&bob, "bob-after-restart")
+            );
+            std::thread::yield_now();
+        }
+    }
+    std::fs::remove_file(&hold).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not release Carol's post-history package hold at {}: {e}",
+            hold.display()
+        )
+    });
+    let post_history_packages_deadline = Instant::now() + READY_WITHIN;
+    while key_packages_pending(&carol, &room) != Some(false) {
+        assert!(
+            Instant::now() < post_history_packages_deadline,
+            "PRODUCT: Carol's shipped status did not report post-history key-package processing \
+             complete within {READY_WITHIN:?} while Alice was offline\ncarol said: {}",
+            said(&carol, "carol-from-bob")
+        );
+        std::thread::yield_now();
+    }
     assert!(
         !reads(&carol, &room, &package_marker),
         "PRODUCT: after Bob exhausted Carol's explicit Alice-history quantum (phase={}, \
