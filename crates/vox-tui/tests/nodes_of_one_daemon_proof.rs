@@ -2382,22 +2382,47 @@ const IDLE_EXCHANGES: u64 = 1;
 const FALLBACK_NAMED: Duration = Duration::from_secs(55);
 /// How often the idle minute samples each side's status for a new dated exchange.
 const SAMPLE_EVERY: Duration = Duration::from_secs(5);
-/// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle.
+/// CPU time a daemon may spend over [`PAIRED_IDLE`] with nothing to settle: the quiet bound of
+/// a paired computer (ADR-038 FX-15, FX-28).
 const IDLE_CPU: Duration = Duration::from_secs(3);
+/// How soon after a change to computer trust `vox computer status` shows it applied (ADR-038
+/// FX-28): on the daemon where it was made, after the change; on the other daemon, after the
+/// exchange the changing daemon started for it completed.
+const CHANGE_SHOWN_WITHIN: Duration = Duration::from_secs(5);
+/// Staging: how long the exchange that carries a change to the other computer, and the receipts
+/// that confirm it on both, may take before the proof gives up on the pair.
+const EXCHANGE_WITHIN: Duration = Duration::from_secs(60);
 
-/// **Two paired computers that are idle exchange nothing** (ADR-038 FX-15; #989): alpha and
-/// beta, two data roots with a daemon each, pair as computers (`vox computer invite`, `pair
-/// --preview`, `approve` on both) and both report `confirmed`. Over [`PAIRED_IDLE`] of nothing
-/// changing, each side's `vox computer status --json` MUST count at most [`IDLE_EXCHANGES`] more
-/// exchanges with the other and name when the last one was, and each daemon's CPU time MUST
-/// grow by at most [`IDLE_CPU`]. Measured before this (2026-10-20, the decider's work Mac): the
-/// pairing manager exchanged the whole signed history with every computer every 2 s and
-/// re-verified it, 47–95% of a core while nothing changed.
+/// **Two paired computers follow each other's changes and are idle otherwise** (ADR-038 FX-15,
+/// FX-28; #989, #1020): alpha and beta, two data roots with a daemon each, pair as computers
+/// (`vox computer invite`, `pair --preview`, `approve` on both) and both report `confirmed`.
 ///
-/// Mutant: the need filter in `Management::retry` removed (every computer exchanged every tick)
-/// turns the exchange-count claim red on its own number.
+/// A change made on either shows on both: gamma is made and attached on alpha's computer, and
+/// within [`CHANGE_SHOWN_WITHIN`] of the attach alpha's `vox computer status` names gamma with
+/// every binding derived at the policy revision the change made and alpha's keyring trusting
+/// gamma; within [`CHANGE_SHOWN_WITHIN`] of the exchange alpha's daemon started for beta
+/// completing, beta's status names gamma under alpha's computer with beta's own binding derived
+/// at beta's new revision, and beta's keyring trusts gamma. Then delta is attached on beta's
+/// computer and the same holds the other way. Both confirm each other again.
+///
+/// Over [`PAIRED_IDLE`] of nothing changing, with four nodes hosted, each side's `vox computer
+/// status --json` MUST count at most [`IDLE_EXCHANGES`] more exchanges with the other and name
+/// when the last one was, every node's binding MUST stand derived at the current policy
+/// revision at the same moment as before the minute (nothing was derived again), and each
+/// daemon's CPU time MUST grow by at most [`IDLE_CPU`]. Measured before this (2026-10-20, the
+/// decider's work Mac): the pairing manager exchanged the whole signed history with every
+/// computer every 2 s and re-verified it, 47–95% of a core while nothing changed; and a 1 s tick
+/// re-derived every attached node's binding (an ML-DSA verification of every management event)
+/// with nothing changed, 21–24% of the busy CPU of a daemon idling at 0.63 of a core.
+///
+/// Mutants: the need filter in `Management::retry` removed (every computer exchanged every
+/// tick) turns the exchange-count claim red on its own number; the 1 s reconcile tick restored
+/// (every node's binding derived every second) turns the no-derivation claim red on the moment
+/// each binding was derived, and the CPU claim on its number; a merged exchange no longer
+/// treated as a change (the follower not woken by it) turns the cross-daemon claim red: the
+/// other computer's binding stays at its old revision and its keyring never trusts the new node.
 #[test]
-#[ignore = "a minute of two real vox daemons paired as computers; run in release"]
+#[ignore = "two minutes of two real vox daemons paired as computers; run in release"]
 fn two_paired_computers_that_are_idle_exchange_nothing() {
     let a = Account::new();
     let b = Account::new();
@@ -2447,6 +2472,13 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         da.said(),
         db.said()
     );
+
+    // ---- a change on either daemon shows on both (ADR-038 FX-28; #1020) ------------------
+    let gamma = a.make_node("gamma");
+    change_shows_on_both((&a, "alpha", &da), (&b, "beta", &db), "gamma", &gamma);
+    let delta = b.make_node("delta");
+    change_shows_on_both((&b, "beta", &db), (&a, "alpha", &da), "delta", &delta);
+
     // Let the confirmation's own exchanges settle before the idle minute is counted.
     std::thread::sleep(Duration::from_secs(10));
     // What `vox computer status --json` shows: the sum of `exchanges` over the computers listed,
@@ -2486,6 +2518,24 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     };
     let (ea0, aa0, last_a0, _, shown_a0) = exchanges(&a);
     let (eb0, ab0, last_b0, _, shown_b0) = exchanges(&b);
+    // Every binding stands derived at the current policy revision before the minute, and the
+    // moment it was derived must not move during it: nothing is derived with nothing changed.
+    let derived0 = (
+        bindings_shown(&computer(&a, &["status"])),
+        bindings_shown(&computer(&b, &["status"])),
+    );
+    for (who, nodes, (revision, shown)) in [
+        ("alpha", ["alpha", "gamma"], &derived0.0),
+        ("beta", ["beta", "delta"], &derived0.1),
+    ] {
+        for node in nodes {
+            assert!(
+                shown.get(node).is_some_and(|(at, _)| *at == Some(*revision)),
+                "PRODUCT: before the idle minute {who}'s `vox computer status` does not show {node}'s \
+                 binding derived at its policy revision {revision} (ADR-038 FX-28): {shown:?}"
+            );
+        }
+    }
     let cpu0 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
     // Every SAMPLE_EVERY, each side's dated last exchange: a new one must be at least the
     // fallback after the one before it, or the round had no need the status names.
@@ -2517,6 +2567,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let (ea1, aa1, last_a, confirmed_a, shown_a1) = exchanges(&a);
     let (eb1, ab1, last_b, confirmed_b, shown_b1) = exchanges(&b);
     let cpu1 = (cpu_time(da.child.id()), cpu_time(db.child.id()));
+    let derived1 = (
+        bindings_shown(&computer(&a, &["status"])),
+        bindings_shown(&computer(&b, &["status"])),
+    );
     let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
     // The count is "since the daemon started" and the daemons ran throughout: it never shrinks.
     let grew = |before: u64, after: u64, who: &str, shown0: &str, shown1: &str| -> u64 {
@@ -2541,18 +2595,36 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
          alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b} over {PAIRED_IDLE:?} (at most {IDLE_EXCHANGES} each)\n{shown_a1}\n{shown_b1}"
     );
     println!(
-        "[proof] over {PAIRED_IDLE:?} idle: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); CPU: alpha's daemon +{:?}, beta's +{:?} (bound {IDLE_CPU:?})",
+        "[proof] over {PAIRED_IDLE:?} idle with four nodes hosted: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); bindings: alpha's computer at policy revision {} {:?}, beta's at {} {:?}, derived again during the minute: {}; CPU: alpha's daemon +{:?}, beta's +{:?} (bound {IDLE_CPU:?})",
+        derived1.0 .0,
+        derived1.0 .1,
+        derived1.1 .0,
+        derived1.1 .1,
+        derived0 != derived1,
         spent.0,
         spent.1
     );
+    // Nothing was derived again: every binding names the same revision and the same moment as
+    // before the minute, and that revision is still the policy's.
+    for (who, (revision0, before), (revision1, after)) in [
+        ("alpha", &derived0.0, &derived1.0),
+        ("beta", &derived0.1, &derived1.1),
+    ] {
+        assert!(
+            revision0 == revision1 && before == after,
+            "PRODUCT: {who}'s computer derived a node's binding again with nothing changed \
+             (ADR-038 FX-28, #1020): before the idle minute policy revision {revision0}, bindings \
+             (revision, derived at ms) {before:?}; after it revision {revision1}, {after:?}"
+        );
+    }
     assert!(
         confirmed_a && confirmed_b && last_a.is_some() && last_b.is_some(),
         "PRODUCT: `vox computer status` does not say the peer is confirmed and when it was last exchanged with: alpha {confirmed_a} {last_a:?}, beta {confirmed_b} {last_b:?}"
     );
     // The plain `vox computer status` says the same to a person.
-    for (who, acct, n, total, tried) in [
-        ("alpha", &a, during_a, ea1, aa1),
-        ("beta", &b, during_b, eb1, ab1),
+    for (who, acct, n, total, tried, (revision, nodes)) in [
+        ("alpha", &a, during_a, ea1, aa1, &derived1.0),
+        ("beta", &b, during_b, eb1, ab1, &derived1.1),
     ] {
         let (ok, text, err) = acct.run(&["computer", "status"], "");
         assert!(ok, "PRODUCT: `vox computer status` failed for {who}: {err}");
@@ -2567,6 +2639,17 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             !text.contains("failed in a row"),
             "PRODUCT: {who}'s `vox computer status` reports failures on an idle pair ({n} exchanges): {text}"
         );
+        // And, per node of this computer, the revision its binding was derived at and that it
+        // is the current one (ADR-038 FX-28).
+        let current = format!("binding derived at policy revision {revision} (current)");
+        assert!(
+            text.contains(&format!("policy revision {revision}"))
+                && text.matches(&current).count() == nodes.len(),
+            "PRODUCT: {who}'s `vox computer status` does not say, for each of its {} nodes, that \
+             its binding was derived at the current policy revision {revision} (ADR-038 FX-28); \
+             it said: {text}",
+            nodes.len()
+        );
     }
     assert!(
         during_a <= IDLE_EXCHANGES && during_b <= IDLE_EXCHANGES,
@@ -2578,9 +2661,210 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     );
     assert!(
         spent.0 <= IDLE_CPU && spent.1 <= IDLE_CPU,
-        "PRODUCT: idle paired computers spent CPU (ADR-038 FX-15, #989): alpha's daemon +{:?}, beta's +{:?} over {PAIRED_IDLE:?} (bound {IDLE_CPU:?})",
+        "PRODUCT: idle paired computers spent CPU (ADR-038 FX-15, FX-28; #989, #1020): alpha's daemon +{:?}, beta's +{:?} over {PAIRED_IDLE:?} (bound {IDLE_CPU:?})",
         spent.0,
         spent.1
+    );
+}
+
+/// Unix milliseconds now, the clock `vox computer status` dates exchanges and bindings with.
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// What `vox computer status --json` says of this computer's own nodes: the policy revision,
+/// and per node name the revision its binding was derived at and when (ADR-038 FX-28).
+#[allow(clippy::type_complexity)]
+fn bindings_shown(
+    status: &serde_json::Value,
+) -> (
+    u64,
+    std::collections::BTreeMap<String, (Option<u64>, Option<u64>)>,
+) {
+    let me = status["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let revision = status["revision"].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT: `vox computer status --json` names no policy revision: {status}")
+    });
+    let nodes = status["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n["computer"] == me)
+        .map(|n| {
+            (
+                n["name"].as_str().unwrap_or_default().to_owned(),
+                (
+                    n["binding_revision"].as_u64(),
+                    n["binding_derived_ms"].as_u64(),
+                ),
+            )
+        })
+        .collect();
+    (revision, nodes)
+}
+
+/// Whether `status` (one computer's) lists every node in `names` as its own with a binding
+/// derived at its current policy revision.
+fn roster_current(status: &serde_json::Value, names: &[&str]) -> bool {
+    let (revision, nodes) = bindings_shown(status);
+    names.iter().all(|name| {
+        nodes
+            .get(*name)
+            .is_some_and(|(at, _)| *at == Some(revision))
+    })
+}
+
+/// Whether `node`'s keyring on `acct` (`vox trust list`) names `fp`.
+fn ring_has(acct: &Account, node: &str, fp: &str) -> bool {
+    let (ok, out, _) = acct.run(&["trust", "list", "--node", node], "");
+    ok && out.lines().any(|line| line.contains(fp))
+}
+
+/// **A change made on one computer shows on both** (ADR-038 FX-28; #1020). `new_node`, already
+/// made on `changer`'s account, is attached there. Within [`CHANGE_SHOWN_WITHIN`] of the attach,
+/// `changer`'s `vox computer status` lists it beside `changer_node` with every binding derived
+/// at the policy revision the change made, and `changer_node`'s keyring trusts it. Within
+/// [`CHANGE_SHOWN_WITHIN`] of the exchange `changer`'s daemon started for `other` completing
+/// (dated by `changer`'s status), `other`'s status lists the new node under `changer`'s
+/// computer with `other_node`'s binding derived at `other`'s new revision, and `other_node`'s
+/// keyring trusts it. Then both computers confirm each other again (staging for the next step).
+fn change_shows_on_both(
+    (changer, changer_node, changer_daemon): (&Account, &str, &Daemon),
+    (other, other_node, other_daemon): (&Account, &str, &Daemon),
+    new_node: &str,
+    new_fp: &str,
+) {
+    let changer_id = computer(changer, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let other_id = computer(other, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let before = unix_ms();
+    let (ok, out, err) = changer.run(
+        &["node", "attach", new_node, "--passphrase-file", "-"],
+        PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: attach {new_node} on {changer_node}'s computer: {out}{err}"
+    );
+    let attached = Instant::now();
+    // On the daemon where the change was made.
+    let shown_here = loop {
+        let status = computer(changer, &["status"]);
+        if roster_current(&status, &[changer_node, new_node])
+            && ring_has(changer, changer_node, new_fp)
+        {
+            break status;
+        }
+        assert!(
+            attached.elapsed() < CHANGE_SHOWN_WITHIN,
+            "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after {new_node} attached on {changer_node}'s computer, \
+             `vox computer status` there does not show the change applied (ADR-038 FX-28, #1020): \
+             it should list {changer_node} and {new_node} with bindings derived at its policy \
+             revision, and {changer_node}'s keyring should trust {new_node}; status: revision {} \
+             nodes {}; {changer_node}'s keyring: {}\n{changer_node}'s daemon said: {}",
+            status["revision"],
+            status["nodes"],
+            changer.run(&["trust", "list", "--node", changer_node], "").1,
+            changer_daemon.said()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    println!(
+        "[proof] {:?} after {new_node} attached, {changer_node}'s computer lists it with every binding derived at policy revision {}",
+        attached.elapsed(),
+        shown_here["revision"]
+    );
+    // On the other daemon: the change travels in the exchange the changer's daemon starts for
+    // it. Its completion is dated by the changer's status; the showing by this proof's clock.
+    let started = Instant::now();
+    let mut exchanged: Option<u64> = None;
+    let mut shown_there: Option<u64> = None;
+    loop {
+        if exchanged.is_none() {
+            let status = computer(changer, &["status"]);
+            exchanged = status["applications"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["computer"]["fingerprint"] == other_id.as_str())
+                .filter_map(|p| p["last_exchange_ms"].as_u64())
+                .find(|at| *at >= before);
+        }
+        if shown_there.is_none() {
+            let status = computer(other, &["status"]);
+            let names_it = status["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|n| n["name"] == new_node && n["computer"] == changer_id.as_str());
+            if names_it
+                && roster_current(&status, &[other_node])
+                && ring_has(other, other_node, new_fp)
+            {
+                shown_there = Some(unix_ms());
+            }
+        }
+        if let (Some(at), Some(seen)) = (exchanged, shown_there) {
+            assert!(
+                seen <= at + CHANGE_SHOWN_WITHIN.as_millis() as u64,
+                "PRODUCT: {other_node}'s computer showed {new_node} applied {} ms after the exchange \
+                 that carried it completed (ADR-038 FX-28, #1020; at most {CHANGE_SHOWN_WITHIN:?})",
+                seen.saturating_sub(at)
+            );
+            println!(
+                "[proof] {new_node} shown applied on {other_node}'s computer {} ms after the exchange {changer_node}'s daemon started completed (bound {CHANGE_SHOWN_WITHIN:?})",
+                seen as i64 - at as i64
+            );
+            break;
+        }
+        if let Some(at) = exchanged {
+            let status = computer(other, &["status"]);
+            assert!(
+                unix_ms() <= at + CHANGE_SHOWN_WITHIN.as_millis() as u64,
+                "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after the exchange {changer_node}'s daemon started for \
+                 {other_node}'s completed, {other_node}'s `vox computer status` does not show the change \
+                 applied (ADR-038 FX-28, #1020): it should list {new_node} under {changer_node}'s computer \
+                 with {other_node}'s binding derived at its policy revision, and {other_node}'s keyring \
+                 should trust {new_node}; status: revision {} nodes {}; {other_node}'s keyring: {}\n\
+                 {other_node}'s daemon said: {}",
+                status["revision"],
+                status["nodes"],
+                other.run(&["trust", "list", "--node", other_node], "").1,
+                other_daemon.said()
+            );
+        }
+        assert!(
+            started.elapsed() < EXCHANGE_WITHIN,
+            "PRODUCT (staging): within {EXCHANGE_WITHIN:?} of {new_node} attaching, {changer_node}'s daemon \
+             completed no exchange with {other_node}'s computer: {}\n{changer_node}'s daemon said: {}",
+            computer(changer, &["status"])["applications"],
+            changer_daemon.said()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Both confirm each other again: the other's receipt for the new state comes back.
+    assert!(
+        wait_until(EXCHANGE_WITHIN, || {
+            computer(changer, &["status"])["state"] == "confirmed"
+                && computer(other, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: after {new_node} attached on {changer_node}'s computer the two computers did not \
+         both confirm again within {EXCHANGE_WITHIN:?}: {changer_node}'s {}, {other_node}'s {}\n{}\n{}",
+        computer(changer, &["status"])["state"],
+        computer(other, &["status"])["state"],
+        changer_daemon.said(),
+        other_daemon.said()
     );
 }
 
