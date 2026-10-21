@@ -951,7 +951,11 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
     assert!(ok, "PRODUCT: read reply failed: {rows}{err}");
     let reply_row = rows
         .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+            })
+        })
         .find(|row| row["entry_hash"] == reply)
         .unwrap_or_else(|| panic!("PRODUCT: room read did not show reply {reply}: {rows}"));
     assert!(
@@ -979,7 +983,7 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         vox(&data, &cfg, &["room", "read", &room, "--json"], None);
     assert!(
         read_ok,
-        "APPARATUS: could not read after the missing-prefix refusal: {after_missing}{read_err}"
+        "PRODUCT: could not read after the missing-prefix refusal: {after_missing}{read_err}"
     );
     assert!(
         !after_missing.contains("PREFIX-MISSING"),
@@ -1082,7 +1086,7 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         vox(&data, &cfg, &["room", "read", &room, "--json"], None);
     assert!(
         read_ok,
-        "APPARATUS: could not read after the ambiguous-prefix refusal: {after_ambiguous}{read_err}"
+        "PRODUCT: could not read after the ambiguous-prefix refusal: {after_ambiguous}{read_err}"
     );
     assert!(
         !after_ambiguous.contains("PREFIX-AMBIGUOUS"),
@@ -1159,9 +1163,12 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         );
     }
     #[cfg(not(feature = "test-knobs"))]
-    eprintln!(
-        "OPTIONAL PROOF NOT RUN: changing-room reply-prefix scan needs --features vox-tui/test-knobs"
-    );
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "OPTIONAL PROOF NOT RUN: changing-room reply-prefix scan needs --features vox-tui/test-knobs"
+        );
+    }
     let exited = node.0.try_wait().ok().flatten();
     assert!(
         exited.is_none(),

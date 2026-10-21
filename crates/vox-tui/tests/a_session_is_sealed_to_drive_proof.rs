@@ -1790,7 +1790,11 @@ fn legacy_placeholder_journey(
         let (ok, out, err) = member.vox(&["room", "read", room, "--json"], None);
         assert!(ok, "PRODUCT: receiver room read failed: {out}{err}");
         out.lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+                })
+            })
             .any(|row| row["entry_hash"] == b32_encode(&hash) && row["owed"] == true)
     };
     offer(&skeleton(&legacy));
@@ -2132,6 +2136,54 @@ fn a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional() {
     println!(
         "[proof] (7a) alice's read while held:\n{}",
         shown.lines().take(3).collect::<Vec<_>>().join("\n")
+    );
+    // FX-14: a prefix is resolved only against a stable, non-provisional room view. The fold hold
+    // gives the real daemon a provisional page. Mutant: remove `provisional` from reply_entry's
+    // refusal; this command posts and the final absence assertion turns PRODUCT red.
+    let (ok, rows, err) = alice.vox(&["room", "read", &room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice could not read JSON while her room view was provisional: {rows}{err}"
+    );
+    let provisional_parent = rows
+        .lines()
+        .map(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("PRODUCT: provisional room read returned invalid JSON row {line:?}: {error}")
+            });
+            row["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("PRODUCT: provisional room row named no string entry_hash: {row}")
+                })
+                .to_owned()
+        })
+        .next()
+        .expect("PRODUCT: provisional room read printed no entry to reply to");
+    let provisional_prefix = provisional_parent.get(..8).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: provisional room read printed no eight-character ASCII selector: {provisional_parent:?}"
+        )
+    });
+    let (reply_ok, reply_out, reply_err) = alice.vox(
+        &[
+            "room",
+            "post",
+            &room,
+            "--re",
+            provisional_prefix,
+            "PROVISIONAL-PREFIX-REPLY",
+        ],
+        None,
+    );
+    assert!(
+        !reply_ok && reply_err.contains("room changed"),
+        "PRODUCT: reply prefix was resolved from a provisional room view: {reply_out}{reply_err}"
+    );
+    let (ok, after_reply, err) = alice.vox(&["room", "read", &room, "--json"], None);
+    assert!(
+        ok && !after_reply.contains("PROVISIONAL-PREFIX-REPLY"),
+        "PRODUCT: provisional reply-prefix refusal still posted the reply: {after_reply}{err}"
     );
 
     // ---- (b) her Session's next entry does not leave while held; (c) her text does ----
