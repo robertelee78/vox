@@ -2185,6 +2185,56 @@ fn a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional() {
         ok && !after_reply.contains("PROVISIONAL-PREFIX-REPLY"),
         "PRODUCT: provisional reply-prefix refusal still posted the reply: {after_reply}{err}"
     );
+    // A full hash is already unambiguous and keeps its direct path: it does not scan or depend on
+    // the page's provisional flag. Mutant: remove reply_entry's exact-hash fast path; this command
+    // is incorrectly refused by the provisional-prefix guard above.
+    assert!(
+        provisional_parent.len() == vox_core::node::link::B32_DIGEST_LEN,
+        "PRODUCT: room read printed a non-canonical full entry hash: {provisional_parent:?}"
+    );
+    let (exact_ok, exact_out, exact_err) = alice.vox(
+        &[
+            "room",
+            "post",
+            &room,
+            "--json",
+            "--re",
+            &provisional_parent,
+            "PROVISIONAL-EXACT-REPLY",
+        ],
+        None,
+    );
+    assert!(
+        exact_ok,
+        "PRODUCT: exact reply hash was refused merely because the room view was provisional: {exact_out}{exact_err}"
+    );
+    let exact_reply: serde_json::Value = serde_json::from_str(&exact_out).unwrap_or_else(|error| {
+        panic!("PRODUCT: exact provisional reply returned invalid JSON {exact_out:?}: {error}")
+    });
+    let exact_hash = exact_reply["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: exact provisional reply named no string entry_hash: {exact_reply}")
+        })
+        .to_owned();
+    let (ok, exact_rows, err) = alice.vox(&["room", "read", &room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: room read failed after exact provisional reply: {exact_rows}{err}"
+    );
+    let exact_row = exact_rows.lines().find_map(|line| {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+        });
+        (row["entry_hash"] == exact_hash).then_some(row)
+    });
+    let exact_row = exact_row.unwrap_or_else(|| {
+        panic!("PRODUCT: room read omitted exact provisional reply {exact_hash}: {exact_rows}")
+    });
+    assert!(
+        exact_row["envelope"]["re"] == provisional_parent,
+        "PRODUCT: exact provisional reply did not keep parent {provisional_parent}: {exact_row}"
+    );
 
     // ---- (b) her Session's next entry does not leave while held; (c) her text does ----
     // The append is made on a thread of its own: a node that holds it until the fold is current

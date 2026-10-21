@@ -1093,6 +1093,50 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         "PRODUCT: the ambiguous-prefix refusal posted the rejected text: {after_ambiguous}"
     );
 
+    // A unique match that exists only below the newest bounded page is still a prefix a person
+    // can use. Mutant: traverse old pages only to find collisions, then reject a sole old-page
+    // match; this reply fails or names the wrong canonical parent.
+    let all_ids = newest_ids.iter().chain(&older_ids).collect::<Vec<_>>();
+    let (older_target, older_prefix) = older_ids
+        .iter()
+        .filter(|entry| entry.as_str() != root && entry.as_str() != reply)
+        .find_map(|entry| {
+            let prefix = entry.get(..51)?;
+            (all_ids
+                .iter()
+                .filter(|candidate| candidate.starts_with(prefix))
+                .count()
+                == 1)
+                .then_some((entry.clone(), prefix.to_owned()))
+        })
+        .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
+    let older_reply = post(&["--re", &older_prefix, "PREFIX-OLDER-UNIQUE"]);
+    let (ok, older_reply_rows, err) = vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: room read failed after the older-page prefix reply: {older_reply_rows}{err}"
+    );
+    let older_reply_row = entry_ids(&older_reply_rows)
+        .iter()
+        .any(|entry| entry == &older_reply);
+    let canonical_parent = older_reply_rows.lines().find_map(|line| {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+        });
+        (row["entry_hash"] == older_reply).then_some(row)
+    });
+    let canonical_parent = canonical_parent.unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: room read omitted older-page prefix reply {older_reply}: {older_reply_rows}"
+        )
+    });
+    assert!(
+        older_reply_row
+            && canonical_parent["envelope"]["re"] == older_target
+            && canonical_parent["envelope"]["thread"] == older_target,
+        "PRODUCT: unique older-page prefix {older_prefix} did not reply to canonical parent {older_target}: {canonical_parent}"
+    );
+
     // A multi-page selector is one logical read. Hold the shipped CLI after its first page,
     // change the room through a second shipped CLI, then let it continue. It must refuse the
     // stale scan and post nothing. Mutant: remove the display-revision comparison; the reply is
@@ -1100,7 +1144,6 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
     #[cfg(feature = "test-knobs")]
     {
         test_knobs::require(&["VOX_TEST_REPLY_PREFIX_HOLD_FILE"]);
-        let all_ids = newest_ids.iter().chain(&older_ids).collect::<Vec<_>>();
         let (changing_target, changing_prefix) = older_ids
             .iter()
             .find_map(|entry| {
