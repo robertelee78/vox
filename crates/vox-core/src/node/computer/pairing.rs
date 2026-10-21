@@ -670,6 +670,11 @@ impl Management {
                 let Some(me) = weak.upgrade() else {
                     return;
                 };
+                // Register before retry inspects/spawns. An attempt may finish on another worker
+                // before retry returns; this enabled permit preserves that exact release edge.
+                let released = wake.notified();
+                tokio::pin!(released);
+                released.as_mut().enable();
                 let next = match me.retry().await {
                     Ok(next) => next,
                     Err(e) => {
@@ -686,7 +691,7 @@ impl Management {
                 };
                 tokio::select! {
                     () = deadline => {}
-                    () = wake.notified() => {}
+                    () = &mut released => {}
                     changed = changes.recv() => {
                         match changed {
                             Ok(event) => {
@@ -997,6 +1002,15 @@ impl Management {
                             .get(&target)
                             .filter(|record| record.failures > 0)
                             .and_then(|record| record.deadline)
+                        {
+                            causal_deadline = causal_deadline.min(deadline);
+                        }
+                        // Supersession transfers the earliest causal deadline into retry_ready
+                        // before aborting. The old flight can disappear before this operator wins
+                        // the slot, so the retained mark is part of takeover state too.
+                        if let Some(deadline) = lock(&self.retry_ready)
+                            .get(&target)
+                            .map(|mark| mark.deadline)
                         {
                             causal_deadline = causal_deadline.min(deadline);
                         }

@@ -1246,14 +1246,16 @@ fn close_expired_pairing() {
 /// without firewall/root.
 ///
 /// Independent mutants: removing the stale-flight deadline handoff makes the first revision's
-/// deadline move; requiring a retained peer connection strands the repair; discarding failed
-/// transport work means the remote anchor's return never causes registration. Each reaches the
-/// final PRODUCT roster assertion, while inability to stage the in-flight first exchange is
+/// deadline move; omitting `retry_ready` from operator takeover lets the shipped preview outlive
+/// that deadline; requiring a retained peer connection strands the repair; discarding failed
+/// transport work means the remote anchor's return never causes registration. Each reaches a
+/// PRODUCT deadline/roster assertion, while inability to stage the in-flight first exchange is
 /// APPARATUS.
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
 fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     watchdog::arm();
+    test_knobs::require(&["VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE"]);
     let anchor = Account::new();
     let a = Account::new();
     let b = Account::new();
@@ -1393,21 +1395,21 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         ],
         PASS,
     );
-    assert!(ok, "APPARATUS: attach the first outage node: {out}{err}");
+    assert!(ok, "PRODUCT: attach the first outage node: {out}{err}");
     assert!(
-        wait_until(RETURN_WITHIN, || {
-            let toward = application_toward(&a, &b_id);
-            first_flight_engaged.is_file()
-                && computer(&a, &["status"])["revision"]
+        wait_until(RETURN_WITHIN, || first_flight_engaged.is_file()),
+        "APPARATUS: the test-only hold did not mark the first revision's exchange in flight"
+    );
+    let staged = application_toward(&a, &b_id);
+    assert!(
+        computer(&a, &["status"])["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > revision_before)
+            && staged["exchange_attempts"]
                 .as_u64()
-                .is_some_and(|revision| revision > revision_before)
-                && toward["exchange_attempts"]
-                    .as_u64()
-                    .is_some_and(|attempts| attempts > attempts_before)
-                && toward["exchange_failures"].as_u64() == Some(failures_before)
-        }),
-        "APPARATUS: the first revision's exchange did not remain in flight through its source-owned local-apply interval, so supersession was not staged: before {before}; after {}",
-        application_toward(&a, &b_id)
+                .is_some_and(|attempts| attempts > attempts_before)
+            && staged["exchange_failures"].as_u64() == Some(failures_before),
+        "PRODUCT: after the first shipped policy change, status did not show its held exchange as a new attempt without a fabricated failure: before {before}; after {staged}"
     );
     let first_revision = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
     let (ok, out, err) = a.run(
@@ -1422,15 +1424,36 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
     assert!(
         ok,
-        "APPARATUS: attach the superseding outage node: {out}{err}"
+        "PRODUCT: attach the superseding outage node: {out}{err}"
     );
     assert!(
         wait_until(CHANGE_SHOWN_WITHIN, || computer(&a, &["status"])["revision"]
             .as_u64()
             .is_some_and(|revision| revision > first_revision)),
-        "APPARATUS: the second attached node did not create a later policy revision than {first_revision}: {}",
+        "PRODUCT: the second attached node did not create a later policy revision than {first_revision}: {}",
         computer(&a, &["status"])
     );
+
+    // Exercise the operator takeover race itself while every path is still down. B's fresh
+    // invitation is a shipped operator request targeting the same computer whose superseded retry
+    // just transferred the first deadline into retry_ready. Run it concurrently so only the
+    // remote anchor's later return can answer it.
+    let takeover_invitation = computer(&b, &["invite"]);
+    let takeover_link = takeover_invitation["invite_link"]
+        .as_str()
+        .expect("PRODUCT: takeover invitation named no invite_link")
+        .to_owned();
+    let takeover_invite_id = takeover_invitation["invite_id"]
+        .as_str()
+        .expect("PRODUCT: takeover invitation named no invite_id")
+        .to_owned();
+    let mut takeover = a
+        .cmd(&["computer", "pair", &takeover_link, "--preview", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: could not start shipped operator takeover command");
 
     // Keep the only path down until a failed replacement's source-owned ordinary backoff would
     // pass the first revision's absolute deadline. Correct code backstops that retry by the first
@@ -1450,7 +1473,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             computer_exchange_backoff(failures)
                 > first_deadline.saturating_duration_since(Instant::now())
         }),
-        "APPARATUS: no failed replacement reached the causal first-deadline staging boundary; application: {}; left: {}",
+        "PRODUCT: shipped exchange status never showed a failed replacement whose source-owned backoff crossed the causal first deadline; application: {}; left: {}",
         application_toward(&a, &b_id),
         left.said()
     );
@@ -1458,6 +1481,23 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     // No local command, daemon restart or network transition follows: the anchor process alone
     // returns. Failed registration is durable work and must cause its own retry.
     relay = start_anchor(&anchor_listen);
+    let takeover_finished = wait_until(
+        first_deadline.saturating_duration_since(Instant::now()),
+        || takeover.try_wait().is_ok_and(|status| status.is_some()),
+    );
+    assert!(
+        takeover_finished,
+        "PRODUCT: the shipped operator takeover did not yield by the first superseded revision's {RETURN_WITHIN:?} causal deadline"
+    );
+    let takeover_output = takeover
+        .wait_with_output()
+        .expect("APPARATUS: could not collect the completed operator takeover command");
+    println!(
+        "[proof] shipped operator takeover completed before the inherited deadline: {}{}",
+        String::from_utf8_lossy(&takeover_output.stdout),
+        String::from_utf8_lossy(&takeover_output.stderr)
+    );
+    computer(&b, &["cancel", &takeover_invite_id]);
     let expected_roster = [
         ("anchor-return-first", first.as_str()),
         ("anchor-return-second", second.as_str()),
