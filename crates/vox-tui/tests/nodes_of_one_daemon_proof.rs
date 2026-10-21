@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use vox_core::node::computer::{
-    COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
+    computer_exchange_backoff, COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
     COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED, COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
 };
 
@@ -1285,19 +1285,34 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let v4 = format!("{fp}@/ip4/127.0.0.1/udp/{port}");
     let v6 = format!("{fp}@/ip6/::1/udp/{port}");
     let anchor_listen = format!("[::]:{port}");
-    let start = |account: &Account, listen: &str, anchor: &str| {
+    let first_flight_arm = a.data.join("hold-first-computer-exchange");
+    let first_flight_engaged = a.data.join("held-first-computer-exchange");
+    let first_flight_spec = format!(
+        "{}\t{}",
+        first_flight_arm.display(),
+        first_flight_engaged.display()
+    );
+    let start = |account: &Account, listen: &str, anchor: &str, env: &[(&str, &str)]| {
         let daemon = Daemon::start(
             account,
             &["--no-node", "--listen", listen, "--anchor", anchor],
-            &[],
+            env,
         );
         daemon.expect_apparatus("its control socket", RETURN_WITHIN, |line| {
             line.contains("control socket")
         });
         daemon
     };
-    let mut left = start(&a, "127.0.0.1:0", &v4);
-    let mut right = start(&b, "[::1]:0", &v6);
+    let mut left = start(
+        &a,
+        "127.0.0.1:0",
+        &v4,
+        &[(
+            "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
+            &first_flight_spec,
+        )],
+    );
+    let mut right = start(&b, "[::1]:0", &v6, &[]);
     let invitation = computer(&a, &["invite"]);
     let link = invitation["invite_link"]
         .as_str()
@@ -1322,7 +1337,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
     // Give the returning computer one attached node while the anchor path is healthy. Its shipped
     // trust listing is the eventual observation of both revisions from the other computer.
-    let _bob = b.make_node("after-remote-anchor-b");
+    let bob = b.make_node("after-remote-anchor-b");
     let (ok, out, err) = b.run(
         &[
             "node",
@@ -1355,7 +1370,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .child
         .wait()
         .expect("APPARATUS: stopped anchor did not exit");
-    right = start(&b, "[::1]:0", &v6);
+    right = start(&b, "[::1]:0", &v6, &[]);
 
     let b_id = computer_id(&b);
     let before = application_toward(&a, &b_id);
@@ -1364,7 +1379,10 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let revision_before = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
     let first = a.make_node("anchor-return-first");
     let second = a.make_node("anchor-return-second");
+    std::fs::write(&first_flight_arm, format!("{revision_before}\n"))
+        .expect("APPARATUS: arm the first causal exchange hold");
     let first_changed = Instant::now();
+    let first_deadline = first_changed + RETURN_WITHIN;
     let (ok, out, err) = a.run(
         &[
             "node",
@@ -1377,9 +1395,10 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
     assert!(ok, "APPARATUS: attach the first outage node: {out}{err}");
     assert!(
-        wait_until(CHANGE_SHOWN_WITHIN, || {
+        wait_until(RETURN_WITHIN, || {
             let toward = application_toward(&a, &b_id);
-            computer(&a, &["status"])["revision"]
+            first_flight_engaged.is_file()
+                && computer(&a, &["status"])["revision"]
                 .as_u64()
                 .is_some_and(|revision| revision > revision_before)
                 && toward["exchange_attempts"]
@@ -1387,7 +1406,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
                     .is_some_and(|attempts| attempts > attempts_before)
                 && toward["exchange_failures"].as_u64() == Some(failures_before)
         }),
-        "APPARATUS: the first revision was not observed in an in-flight exchange before it could be superseded: before {before}; after {}",
+        "APPARATUS: the first revision's exchange did not remain in flight through its source-owned local-apply interval, so supersession was not staged: before {before}; after {}",
         application_toward(&a, &b_id)
     );
     let first_revision = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
@@ -1413,28 +1432,50 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&a, &["status"])
     );
 
+    // Keep the only path down until a failed replacement's source-owned ordinary backoff would
+    // pass the first revision's absolute deadline. Correct code backstops that retry by the first
+    // deadline; a replacement that minted a new deadline cannot. Failure-count changes are the
+    // shipped status observation; this wait is only APPARATUS staging.
+    let mut observed_failures = u32::try_from(failures_before).unwrap_or(u32::MAX);
+    assert!(
+        wait_until(first_deadline.saturating_duration_since(Instant::now()), || {
+            let failures = application_toward(&a, &b_id)["exchange_failures"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(0);
+            if failures <= observed_failures {
+                return false;
+            }
+            observed_failures = failures;
+            computer_exchange_backoff(failures)
+                > first_deadline.saturating_duration_since(Instant::now())
+        }),
+        "APPARATUS: no failed replacement reached the causal first-deadline staging boundary; application: {}; left: {}",
+        application_toward(&a, &b_id),
+        left.said()
+    );
+
     // No local command, daemon restart or network transition follows: the anchor process alone
     // returns. Failed registration is durable work and must cause its own retry.
     relay = start_anchor(&anchor_listen);
-    let converged = wait_until(RETURN_WITHIN, || {
-        let (_, trust, _) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
-        let status = computer(&b, &["status"]);
-        let names_both = status["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|node| node["name"] == "anchor-return-first")
-            && status["nodes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|node| node["name"] == "anchor-return-second");
-        trust.contains(&first)
-            && trust.contains(&second)
-            && names_both
-            && computer(&a, &["status"])["state"] == "confirmed"
-            && status["state"] == "confirmed"
-    });
+    let expected_roster = [
+        ("anchor-return-first", first.as_str()),
+        ("anchor-return-second", second.as_str()),
+        ("after-remote-anchor-b", bob.as_str()),
+    ];
+    let expected_bob_grants = [(first.as_str(), "read"), (second.as_str(), "read")];
+    let converged = wait_until(
+        first_deadline.saturating_duration_since(Instant::now()),
+        || {
+            let left_status = computer(&a, &["status"]);
+            let status = computer(&b, &["status"]);
+            exact_roster(&left_status, &expected_roster)
+                && exact_roster(&status, &expected_roster)
+                && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
+                && computer(&a, &["status"])["state"] == "confirmed"
+                && status["state"] == "confirmed"
+        },
+    );
     let returned_after = first_changed.elapsed();
     assert!(
         converged && returned_after <= RETURN_WITHIN,
@@ -1461,9 +1502,27 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .expect("APPARATUS: right daemon did not exit");
     relay.child.wait().expect("APPARATUS: anchor did not exit");
     relay = start_anchor(&anchor_listen);
-    left = start(&a, "127.0.0.1:0", &v4);
-    right = start(&b, "[::1]:0", &v6);
-    assert!(wait_until(RETURN_WITHIN, || b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "").1.contains(&first) && b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "").1.contains(&second)), "PRODUCT: the exact recovered roster did not survive all three process restarts; left: {}; right: {}; anchor: {}", a.log(), b.log(), relay.said());
+    left = start(
+        &a,
+        "127.0.0.1:0",
+        &v4,
+        &[(
+            "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
+            &first_flight_spec,
+        )],
+    );
+    right = start(&b, "[::1]:0", &v6, &[]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            exact_roster(&computer(&a, &["status"]), &expected_roster)
+                && exact_roster(&computer(&b, &["status"]), &expected_roster)
+                && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
+        }),
+        "PRODUCT: the exact recovered roster and grants did not survive all three process restarts; left: {}; right: {}; anchor: {}",
+        a.log(),
+        b.log(),
+        relay.said()
+    );
     for (account, node) in [(&a, "anchor-return-first"), (&b, "after-remote-anchor-b")] {
         let (ok, out, err) = account.run(&["room", "list", "--node", node], "");
         assert!(
@@ -2930,6 +2989,37 @@ fn roster_current(status: &serde_json::Value, names: &[&str]) -> bool {
             .get(*name)
             .is_some_and(|(at, _)| *at == Some(revision))
     })
+}
+
+/// Whether shipped `vox computer status --json` shows exactly these authenticated node
+/// identities: no stale extra name, substituted fingerprint, or missing member can satisfy it.
+fn exact_roster(status: &serde_json::Value, expected: &[(&str, &str)]) -> bool {
+    let Some(nodes) = status["nodes"].as_array() else {
+        return false;
+    };
+    let shown: std::collections::BTreeMap<_, _> = nodes
+        .iter()
+        .filter_map(|node| Some((node["name"].as_str()?, node["fingerprint"].as_str()?)))
+        .collect();
+    let expected: std::collections::BTreeMap<_, _> = expected.iter().copied().collect();
+    nodes.len() == shown.len() && shown == expected
+}
+
+/// Whether one shipped `vox trust list` shows exactly these fingerprint/capability grants.
+fn exact_grants(acct: &Account, node: &str, expected: &[(&str, &str)]) -> bool {
+    let (ok, out, _) = acct.run(&["trust", "list", "--node", node], "");
+    if !ok {
+        return false;
+    }
+    let shown: std::collections::BTreeMap<_, _> = out
+        .lines()
+        .filter_map(|line| {
+            let (fingerprint, rest) = line.split_once("  ")?;
+            Some((fingerprint.trim(), rest.rsplit("  ").next()?.trim()))
+        })
+        .collect();
+    let expected: std::collections::BTreeMap<_, _> = expected.iter().copied().collect();
+    shown == expected
 }
 
 /// The shipped journey a person checks a node's trust with, `vox trust list --node <node>`:

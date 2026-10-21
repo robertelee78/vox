@@ -16,6 +16,13 @@ use std::time::Duration;
 
 const PAIR_DOMAIN: &[u8] = b"vox/computer-pair/v1\0";
 const PATIENCE: Duration = Duration::from_secs(15);
+/// **Test-only** (`test-knobs`): `<arm path>\t<engaged path>`. The arm contains the policy revision
+/// before the proof's change. The later exchange that atomically consumes it creates the engaged
+/// marker after the source-owned local-apply interval and parks until superseded. This gives the
+/// shipped journey a causal stale-flight boundary without copying a sleep or product timeout.
+/// Shipped builds neither name nor read this variable.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_FIRST_COMPUTER_EXCHANGE_ENV: &str = "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE";
 // An exchange carries retained records from the same bounded transaction, never a smaller
 // unrelated limit that would strand an otherwise valid roster as nodes are added.
 const MAX_FRAME: usize = MAX_STATE as usize;
@@ -412,7 +419,9 @@ impl Drop for Reserved {
         {
             inflight.remove(&self.peer);
         }
-        self.me.retry_wake.notify_one();
+        // Flight release is useful to both the scheduler and an operator command taking over
+        // this exact peer. Wake every already-registered waiter; neither has to poll the map.
+        self.me.retry_wake.notify_waiters();
     }
 }
 
@@ -440,15 +449,15 @@ impl Drop for Attempt {
             );
         }
         inflight.remove(&self.peer);
-        self.me.retry_wake.notify_one();
+        // See `Reserved::drop`: a takeover and the scheduler can both be waiting for this one
+        // causal release.
+        self.me.retry_wake.notify_waiters();
     }
 }
 
 /// Without a need, a computer whose receipt covers this node's current state is exchanged with
 /// this often, so a lost message never leaves two computers apart for long.
 const EXCHANGE_FALLBACK: Duration = COMPUTER_QUIET_EXCHANGE_AFTER;
-/// A computer that could not be reached is tried again after this, doubling per failure.
-const EXCHANGE_BACKOFF: Duration = Duration::from_secs(2);
 /// An authenticated no-state-change request held on a failed peer's QUIC connection. Its stream
 /// is written once; QUIC wakes it on delivery when a transient path becomes reachable again.
 const REACHABILITY_WAKE_OP: u64 = 3;
@@ -969,14 +978,28 @@ impl Management {
         // The operator's action comes first: a retry exchange in flight with that computer
         // is cut (as no failure) and its reservation waited for, briefly; another operator
         // pairing in flight is reported.
-        let waited = std::time::Instant::now();
-        let mut causal_deadline = waited + PAIR_WITHIN;
+        let mut causal_deadline = std::time::Instant::now() + PAIR_WITHIN;
         let serial = next_flight();
         loop {
+            // Register before inspecting the reservation. `notify_waiters` carries no saved
+            // permit, so enabling first closes the release-between-check-and-wait race.
+            let released = self.retry_wake.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             {
                 let mut inflight = lock(&self.inflight);
                 match inflight.get_mut(&target) {
                     None => {
+                        // A failed retry can record and release between the operator reading the
+                        // link and taking this reservation. Its first causal deadline remains the
+                        // pairing command's deadline too; a later failure may not replace it.
+                        if let Some(deadline) = lock(&self.exchanged)
+                            .get(&target)
+                            .filter(|record| record.failures > 0)
+                            .and_then(|record| record.deadline)
+                        {
+                            causal_deadline = causal_deadline.min(deadline);
+                        }
                         inflight.insert(
                             target,
                             Flight {
@@ -1001,22 +1024,27 @@ impl Management {
                         ));
                     }
                     Some(flight) => {
+                        causal_deadline = causal_deadline.min(flight.deadline);
                         if !flight.superseded {
+                            flight.superseded = true;
                             if let Some(abort) = &flight.abort {
-                                causal_deadline = causal_deadline.min(flight.deadline);
-                                flight.superseded = true;
                                 abort.abort();
                             }
                         }
                     }
                 }
             }
-            if waited.elapsed() > Duration::from_secs(10) {
-                return Err(Error::Profile(
-                    "an exchange with that computer did not yield within 10 s; try again",
-                ));
+            // The inherited absolute deadline is the only bound. Release normally wakes this
+            // branch; reaching the deadline is a truthful failure of the already-open cause, not
+            // a fresh command-local timeout.
+            tokio::select! {
+                () = &mut released => {}
+                () = tokio::time::sleep_until(causal_deadline.into()) => {
+                    return Err(Error::Profile(
+                        "the existing computer exchange did not yield before its causal convergence deadline; try again",
+                    ));
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let mut reserved = Reserved {
             me: Arc::clone(self),
@@ -1032,7 +1060,14 @@ impl Management {
         let me = Arc::clone(self);
         let (link_owned, url_owned) = (link, url.to_owned());
         let task = tokio::spawn(async move {
-            tokio::time::timeout(PAIR_WITHIN, me.pair(&link_owned, &url_owned)).await
+            let pairing = me.pair(&link_owned, &url_owned, causal_deadline);
+            if causal_deadline <= std::time::Instant::now() {
+                // As for ordinary retry, a missed reporting boundary must not prevent a real
+                // repair attempt. Its merge still publishes the original deadline.
+                Ok(pairing.await)
+            } else {
+                tokio::time::timeout_at(causal_deadline.into(), pairing).await
+            }
         });
         reserved.abort = Some(task.abort_handle());
         if let Some(flight) = lock(&self.inflight).get_mut(&target) {
@@ -1831,17 +1866,26 @@ impl Management {
     }
     /// The operator's pairing handshake with the inviting computer: this node's revision as it
     /// stood when the handshake began, and after the computer's state was merged.
-    async fn pair(self: &Arc<Self>, link: &Link, url: &str) -> Result<(u64, u64)> {
+    async fn pair(
+        self: &Arc<Self>,
+        link: &Link,
+        url: &str,
+        deadline: std::time::Instant,
+    ) -> Result<(u64, u64)> {
         let conn = self
             .connect(link.target, &link.endpoints, Some(link))
             .await?;
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
+        let return_by_ms = wire_deadline(deadline);
         write_frame(
             &mut send,
-            &hello(1, &self.computer.description(), &link.invite, 0),
+            &hello(1, &self.computer.description(), &link.invite, return_by_ms),
         )
         .await?;
-        let (_, peer, _, _) = read_hello(&mut recv, &conn).await?;
+        let (op, peer, _, echoed_return_by_ms) = read_hello(&mut recv, &conn).await?;
+        if op != 1 || echoed_return_by_ms != return_by_ms {
+            return Err(bad());
+        }
         let f = frame(&mut recv).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 3)?;
@@ -1886,7 +1930,7 @@ impl Management {
         pop::verify(&proof, &ci, &transcript, &link.target)?;
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
-        let revisions = self.computer.change(|s| {
+        let revisions = self.computer.change_until(deadline, |s| {
             // The revision this node stood at when it accepted the pairing, read in the
             // transaction that merges the computer's state, and the revision after.
             let before = s.revision;
@@ -1947,6 +1991,10 @@ impl Management {
         if op != 1 {
             return Err(bad());
         }
+        if return_by_ms == 0 {
+            return Err(bad());
+        }
+        let deadline = causal_deadline(return_by_ms);
         let (invite, mut g) = {
             let s = lock(&self.computer.state);
             let i=s.invitations.iter().find(|i|i.id==id&&!i.cancelled&&i.expires>now()).ok_or(Error::Profile("computer pairing code expired, cancelled, or unknown; no new trust was established"))?;
@@ -2003,7 +2051,7 @@ impl Management {
         );
         let proof = pop::open_pop(isk.as_ref(), sealed)?;
         pop::verify(&proof, &ci, &transcript, &conn.peer_id())?;
-        let recorded = self.computer.change(|s| {
+        let recorded = self.computer.change_until(deadline, |s| {
             let i = s
                 .invitations
                 .iter_mut()
@@ -2169,12 +2217,10 @@ impl Management {
                         // The backoff is inside the return contract begun by the failure. Leave
                         // the real apply-or-detach interval before its one absolute end; no stage
                         // starts another clock.
-                        let wait = EXCHANGE_BACKOFF
-                            .saturating_mul(1u32 << (record.failures - 1).min(6))
-                            .min(
-                                COMPUTER_RETURN_SHOWN_WITHIN
-                                    .saturating_sub(COMPUTER_CHANGE_SHOWN_WITHIN),
-                            );
+                        let wait = computer_exchange_backoff(record.failures).min(
+                            COMPUTER_RETURN_SHOWN_WITHIN
+                                .saturating_sub(COMPUTER_CHANGE_SHOWN_WITHIN),
+                        );
                         let unchanged = record.revision == revision
                             && record.involved == (involved == Some(*peer));
                         if unchanged && !reachability_restored {
@@ -2347,11 +2393,11 @@ impl Management {
                     // The product already missed the causal contract, but repair must continue.
                     // Transport operations carry their own source-owned bounds; do not let an
                     // expired reporting deadline prevent a reachable peer from being dialled.
-                    me.sync_peer(peer, endpoints, url, deadline)
+                    me.sync_peer(peer, endpoints, url, revision, deadline)
                         .await
                         .map_err(|e| e.to_string())
                 } else {
-                    let exchange = me.sync_peer(peer, endpoints, url, deadline);
+                    let exchange = me.sync_peer(peer, endpoints, url, revision, deadline);
                     tokio::pin!(exchange);
                     tokio::select! {
                         // Poll the exchange first at the boundary. This starts the real dial;
@@ -2419,7 +2465,7 @@ impl Management {
             }
             Err(text) => {
                 record.failures = record.failures.saturating_add(1);
-                record.deadline = Some(deadline);
+                record.deadline = Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
                 record.problem = Some(text);
             }
         }
@@ -2497,8 +2543,12 @@ impl Management {
         peer: Digest32,
         endpoints: EndpointList,
         url: Option<Zeroizing<String>>,
+        _revision: u64,
         deadline: std::time::Instant,
     ) -> Result<(u64, u64)> {
+        #[cfg(feature = "test-knobs")]
+        self.hold_first_computer_exchange_for_proof(_revision, deadline)
+            .await;
         let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
         let conn = self.connect(peer, endpoints, link.as_ref()).await?;
@@ -2527,6 +2577,52 @@ impl Management {
         })?;
         let _ = send.finish();
         Ok((sent, merged))
+    }
+
+    /// Park exactly the first selected exchange after its source-owned local-apply interval. The
+    /// state revision that supersedes it aborts this future through the production flight handle.
+    /// A marker is apparatus evidence only; every verdict still comes from shipped status and
+    /// trust commands.
+    #[cfg(feature = "test-knobs")]
+    async fn hold_first_computer_exchange_for_proof(
+        &self,
+        revision: u64,
+        deadline: std::time::Instant,
+    ) {
+        let Ok(spec) = std::env::var(TEST_HOLD_FIRST_COMPUTER_EXCHANGE_ENV) else {
+            return;
+        };
+        let Some((arm, engaged)) = spec.split_once('\t') else {
+            return;
+        };
+        // The arm names the revision observed before the journey's change. An idle/fallback
+        // exchange that races the command cannot consume it; only a flight carrying later policy
+        // can. Removing it is then the one-shot claim.
+        let Some(after) = std::fs::read_to_string(arm)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+        else {
+            return;
+        };
+        if revision <= after {
+            return;
+        }
+        if std::fs::remove_file(arm).is_err() {
+            return;
+        }
+        let stage_at = deadline
+            .checked_sub(COMPUTER_RETURN_SHOWN_WITHIN.saturating_sub(COMPUTER_CHANGE_SHOWN_WITHIN))
+            .unwrap_or(deadline);
+        tokio::time::sleep_until(stage_at.into()).await;
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(engaged)
+            .is_err()
+        {
+            return;
+        }
+        std::future::pending::<()>().await;
     }
 
     /// Record an exchange `peer` started and this node answered, now: what a person reads as

@@ -32,6 +32,12 @@ pub const COMPUTER_CHANGE_SHOWN_WITHIN: Duration = Duration::from_secs(5);
 /// A reachable enrolled computer must show a trust change within this long, including after a
 /// failed path becomes reachable again (ADR-038 FX-28).
 pub const COMPUTER_RETURN_SHOWN_WITHIN: Duration = Duration::from_secs(60);
+/// Backoff before retrying the `failures`th consecutive failed computer exchange. Proofs use the
+/// same exported calculation to stage recovery between a causal deadline and an ordinary retry;
+/// they never duplicate a count or delay.
+pub fn computer_exchange_backoff(failures: u32) -> Duration {
+    Duration::from_secs(2).saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+}
 
 /// A confirmed computer with no state to settle is not exchanged before this fallback cadence.
 pub const COMPUTER_QUIET_EXCHANGE_AFTER: Duration = Duration::from_secs(60);
