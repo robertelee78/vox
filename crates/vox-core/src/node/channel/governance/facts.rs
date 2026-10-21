@@ -518,6 +518,12 @@ impl<'a> Read<'a> {
                 .segment_id_after(self.room, SegmentKind::LogDb, Some(self.header.known_tail))?
                 .is_none())
     }
+    /// Whether the header says the live source receipt barrier is complete. This is sufficient
+    /// only for checking an already-loaded in-memory projection: a restart has no projection and
+    /// takes [`Self::current_ready`] before loading one, including its source-tail check.
+    pub(super) fn projection_ready(&self) -> bool {
+        self.header.initialized
+    }
     pub(super) fn ready(&self, now: u64) -> Result<bool> {
         Ok(self.current_ready()?
             && self.settled()

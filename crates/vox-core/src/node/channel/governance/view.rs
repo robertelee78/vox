@@ -110,6 +110,40 @@ impl ConsentFacts {
     ) -> bool {
         self.revoked.contains(&pair(author, target))
     }
+
+    /// Select current consent targets from the semantic projection, including identities
+    /// outside the admitted roster. The cursor advances over inspected slots, including a
+    /// withdrawn or reset consent, exactly as the sealed-index page does.
+    pub(in crate::node::channel) fn consenters(
+        &self,
+        author: &Digest32,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> TargetPage {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let Some(readers) = self.consent.get(author) else {
+            return TargetPage {
+                rows: Vec::new(),
+                next: None,
+            };
+        };
+        let mut cursor = after;
+        let mut rows = Vec::new();
+        for _ in 0..limit.clamp(1, PAGE_ROWS) {
+            let Some((target, _)) = readers
+                .range((cursor.map_or(Unbounded, Excluded), Unbounded))
+                .next()
+            else {
+                return TargetPage { rows, next: None };
+            };
+            cursor = Some(*target);
+            if self.can_read(target, author) {
+                rows.push(*target);
+            }
+        }
+        TargetPage { rows, next: cursor }
+    }
 }
 
 pub(in crate::node::channel) struct View<'a> {
@@ -119,6 +153,24 @@ pub(in crate::node::channel) struct View<'a> {
 impl<'a> View<'a> {
     pub(in crate::node::channel) fn revision(&self) -> u64 {
         self.facts.revision()
+    }
+
+    /// Read only the governance header to check an already-loaded semantic projection.
+    ///
+    /// A live receipt updates this same header before it can make a newly appended governance
+    /// row observable. On restart no projection exists, so the caller takes [`Self::current`]
+    /// and checks the source tail before loading one. Thus the unchanged fast path need not ask
+    /// the store for the `LogDb` tail on every governance question (ADR-038 FX-22).
+    pub(in crate::node::channel) fn projection_revision(
+        store: &Store,
+        sek: &'a Sek,
+        room: &'a Digest32,
+    ) -> Result<u64> {
+        let facts = Read::open(store, sek, room)?;
+        if !facts.projection_ready() {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(facts.revision())
     }
 
     pub(in crate::node::channel) fn open(
@@ -495,38 +547,6 @@ impl<'a> View<'a> {
             .transpose()?
             .map_or(0, |entry| entry.skeleton.seq);
         Ok(entry.skeleton.seq > reset)
-    }
-
-    /// The cursor advances over inspected slots, including withdrawn/reset
-    /// consent. An empty page is not an end-of-range claim.
-    pub(in crate::node::channel) fn consenters(
-        &self,
-        author: &Digest32,
-        after: Option<Digest32>,
-        limit: usize,
-    ) -> Result<TargetPage> {
-        let mut after = after;
-        let mut rows = Vec::new();
-        for _ in 0..limit.clamp(1, PAGE_ROWS) {
-            let row = match after {
-                Some(target) => self
-                    .facts
-                    .first(Table::Consent, Some(pair(author, &target)))?,
-                None => self.facts.at_or_after(Table::Consent, hash_key(author))?,
-            }
-            .filter(|(key, _)| key[..32] == author[..]);
-            let Some((key, _)) = row else {
-                return Ok(TargetPage { rows, next: None });
-            };
-            let target = key[32..]
-                .try_into()
-                .map_err(|_| invalid("governance consenter cursor"))?;
-            after = Some(target);
-            if self.can_read(&target, author)? {
-                rows.push(target);
-            }
-        }
-        Ok(TargetPage { rows, next: after })
     }
 
     /// Newest-first disk continuation returned in chronological order. Caller

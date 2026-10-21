@@ -130,7 +130,9 @@ impl ChannelState {
             Query::Service { .. } => (None, false),
             Query::Admin { .. } => (None, true),
         };
-        let revision = if authority {
+        let revision = if matches!(&query, Query::Consent { .. }) {
+            self.consent_facts(store)?.revision()
+        } else if authority {
             self.checked_governance(store, self.now_hint)?.revision()
         } else {
             self.current_governance(store)?.revision()
@@ -407,9 +409,7 @@ impl ChannelState {
         after: Option<Digest32>,
         limit: usize,
     ) -> Result<GovernanceTargets> {
-        let page = self
-            .current_governance(store)?
-            .consenters(author, after, limit)?;
+        let page = self.consent_facts(store)?.consenters(author, after, limit);
         Ok(GovernanceTargets {
             targets: page.rows,
             next: page.next,

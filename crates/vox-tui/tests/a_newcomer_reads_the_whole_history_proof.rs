@@ -350,6 +350,91 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
     }
 }
 
+/// Every text a person reads, oldest first, in one exact JSON read. This journey's staged rows
+/// fit below the product's 128-row live window; reaching the limit is an apparatus fault because
+/// it would turn the claimed one read into a paged history request. A malformed row or a refused
+/// read is a product red because both are what the shipped command returned.
+fn room_texts(dir: &Path, room: &str) -> Vec<String> {
+    const LIMIT: usize = 128;
+    let limit = LIMIT.to_string();
+    let (ok, out, err) = vox(
+        dir,
+        &["room", "read", room, "--json", "--limit", &limit],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room read --json --limit {LIMIT}` refused: {out}{err}"
+    );
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "PRODUCT: `vox room read --json` printed a row that is not JSON ({error}): \
+                     {line}"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        rows.len() < LIMIT,
+        "APPARATUS: the FX-22 room filled the one-read live window ({LIMIT} rows); the exact \
+         late-render verdict needs a smaller staging"
+    );
+    rows.into_iter()
+        .filter_map(|row| row["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The status facts that establish the late-render verdict's apparatus: the room's entry count,
+/// accepted sender-key generations and authors whose consent to this reader has folded.
+fn room_readiness(status: &str, room: &str) -> Option<(u64, u64, usize)> {
+    let value: serde_json::Value = serde_json::from_str(status).ok()?;
+    value["rooms"].as_array()?.iter().find_map(|row| {
+        row["id"]
+            .as_str()
+            .filter(|id| id.starts_with(room))
+            .map(|_| {
+                (
+                    row["entries"].as_u64().unwrap_or(0),
+                    row["received_key_generations"].as_u64().unwrap_or(0),
+                    row["consenting"].as_array().map_or(0, Vec::len),
+                )
+            })
+    })
+}
+
+/// Two immediate status observations must agree on the entry count and show both the author's
+/// key and consent. This does not poll or turn a made-up duration into a product contract: the
+/// journey reaches its existing delivery boundary first. An unmet prerequisite is apparatus.
+fn room_still_with_key_and_consent(dir: &Path, reader: &str, room: &str) -> (u64, u64, usize) {
+    let first = vox(dir, &["status", "--json"], None);
+    let second = vox(dir, &["status", "--json"], None);
+    let a = first.0.then(|| room_readiness(&first.1, room)).flatten();
+    let b = second.0.then(|| room_readiness(&second.1, room)).flatten();
+    assert!(
+        first.0 && second.0 && a.is_some() && b.is_some(),
+        "APPARATUS: {reader}'s two `vox status --json` observations did not both contain room \
+         {room}; first success {}, room {a:?}, stdout: {}, stderr: {}; second success {}, room \
+         {b:?}, stdout: {}, stderr: {}",
+        first.0,
+        first.1,
+        first.2,
+        second.0,
+        second.1,
+        second.2
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert!(
+        a.0 == b.0 && b.1 >= 1 && b.2 >= 1,
+        "APPARATUS: {reader}'s room {room} was not stable with an accepted sender key and folded \
+         author consent at the verdict boundary; consecutive room status: {a:?}, {b:?}"
+    );
+    b
+}
+
 /// The post numbers in `1..=posts` that `seen` lacks, as a few ranges for a failure message.
 fn missing_ranges(seen: &BTreeSet<usize>, posts: usize) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
@@ -593,12 +678,16 @@ const AT_WORK: Duration = Duration::from_secs(60);
 /// Rooms the two agents share while they work: each publication of the daemon's status covers
 /// every open room, so the cost under test grows with this.
 const WORK_ROOMS: usize = 3;
+/// Rows Alice seals in each work room before Bob joins it. Bob cannot hold that room's sender
+/// key or folded consent yet, so these stage the late-render half of FX-22 without a test knob.
+const BEFORE_KEY: usize = 8;
 /// CPU time a daemon may spend over [`AT_WORK`] of two agents posting into [`WORK_ROOMS`] rooms:
 /// Activity Monitor's number. Measured 2026-10-20 on the decider's work Mac (v0.4.7, four nodes,
 /// four rooms, agents working): ~180% of a core, that is 108 s per minute. In this staging the
 /// v0.4.7 code spent 17.5 s per daemon per minute; with each room's trust picture reused across
-/// publications (#990) it spends 8 s, the rest being the rounds the posts themselves run (~9 per
-/// post, #996). The bound is what #990 delivers; #996 lowers it again.
+/// publications (#990) and unchanged consent questions answered from the room's in-memory facts
+/// (FX-22, #1007) it spends at most this, the rest being the rounds the posts themselves run (~9
+/// per post, #996). A mutant that rebuilds the facts for every unchanged question exceeds it.
 const WORK_CPU: Duration = Duration::from_secs(10);
 /// Every `vox status --json` during the work answers within this: the control socket is what the
 /// app, the TUI and the harness hook (500 ms of patience) wait on. Measured before this: 0.5 s.
@@ -609,18 +698,17 @@ const ANSWER_WITHIN: Duration = Duration::from_millis(200);
 /// [`AT_WORK`] each posts once a second, round-robin over the rooms, as two harness sessions at
 /// work do. Over that minute each daemon's CPU time MUST grow by at most [`WORK_CPU`], every
 /// `vox status --json` asked meanwhile MUST answer within [`ANSWER_WITHIN`], and the work MUST be
-/// real: each reads the other's last post within [`READY_WITHIN`] of the end. And every post
-/// MUST be readable, not only the last (ADR-038 FX-22, #1007): once a room has held still and
-/// its daemon has accepted the other's sender key (`received_key_generations` in `vox status
-/// --json`), the next `vox room read` shows every post the other made there, with no re-ask: a
-/// row that arrived before its key, or before its author's consent folded, is rendered when
-/// they land.
+/// real: each reads the other's last post within [`READY_WITHIN`] of the end. Alice also seals
+/// [`BEFORE_KEY`] rows in each room before Bob joins, when he cannot yet hold its sender key or
+/// folded consent. Once Bob's room has held still and accepted Alice's key
+/// (`received_key_generations` in `vox status --json`), one `vox room read --json` MUST show those
+/// rows exactly once and in order, with no re-ask. The same exact read checks every work post,
+/// not only the last (ADR-038 FX-22, #1007).
 ///
-/// Mutants: every status publication deriving every room's trust picture again (the reuse in
-/// `detail_of` removed) turns the CPU claim red on its own number; the key's arrival no longer
-/// queuing the author's render backfill (`accept_skdm` without `queue_backfill(author,
-/// Some(1))`) leaves the rows that arrived before their key unrendered, red on the every-post
-/// claim with the rows named.
+/// Mutants: rebuilding the semantic consent projection for every unchanged question turns the
+/// FX-22 CPU claim red on its own number; suppressing the render backfill for rows accepted before
+/// their key/consent leaves Alice's [`BEFORE_KEY`] rows unreadable and turns the exact-row claim
+/// red on its own list.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
@@ -666,6 +754,11 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             .to_owned();
         let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
         assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+        for row in 0..BEFORE_KEY {
+            let text = format!("alice before key room {i} row {row}");
+            let (ok, out, err) = vox(&alice, &["room", "post", &room, &text], None);
+            assert!(ok, "PRODUCT: Alice's pre-key post was refused: {out}{err}");
+        }
         let (ok, _, err) = vox(
             &bob,
             &["room", "join", "--passphrase-file", "-", link.trim()],
@@ -698,6 +791,24 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
              said: {}",
             said(&bob, "bob"),
             said(&alice, "alice")
+        );
+    }
+    for (index, room) in rooms.iter().enumerate() {
+        let readiness = room_still_with_key_and_consent(&bob, "bob", room);
+        let expected_before: Vec<String> = (0..BEFORE_KEY)
+            .map(|row| format!("alice before key room {} row {row}", index + 1))
+            .collect();
+        let texts = room_texts(&bob, room);
+        let actual_before: Vec<String> = texts
+            .iter()
+            .filter(|text| text.starts_with("alice before key room "))
+            .cloned()
+            .collect();
+        assert_eq!(
+            actual_before, expected_before,
+            "PRODUCT: Bob's one `vox room read --json` did not show every row Alice sealed \
+             before he joined exactly once and in order after her key and consent landed \
+             (ADR-038 FX-22, #1007); room status {readiness:?}; all text rows: {texts:?}"
         );
     }
     std::thread::sleep(Duration::from_secs(5));
@@ -799,12 +910,10 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         said(&alice, "alice"),
         said(&bob, "bob")
     );
-    // Every post is readable, not only the last (ADR-038 FX-22, #1007): per room, once the
-    // reader's status shows the room still (its entry count unchanged across two looks 2 s
-    // apart) and the other's sender key accepted, one `vox room read` must show every post the
-    // other made there; a row that arrived before its key must have been rendered when the
-    // key landed, with no re-ask.
-    let mut unreadable: Vec<String> = Vec::new();
+    // Every post is readable, not only the last (ADR-038 FX-22, #1007). Per room, first establish
+    // as apparatus that the reader's entry count is still and the author's key is held. A single
+    // exact JSON read must then show every work row once and in order. Bob must additionally see
+    // the rows Alice sealed before he joined and could hold her key/consent, with no re-ask.
     for (reader, dir, author, posted) in [
         ("bob", &bob, "alice", posted_a),
         ("alice", &alice, "bob", posted_b),
@@ -814,68 +923,44 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
                 .filter(|i| i % rooms.len() == index)
                 .map(|i| format!("{author} step {i}"))
                 .collect();
-            let room_of = |status: &str| -> Option<(u64, u64)> {
-                let v: serde_json::Value = serde_json::from_str(status).ok()?;
-                v["rooms"].as_array()?.iter().find_map(|r| {
-                    r["id"]
-                        .as_str()
-                        .filter(|id| id.starts_with(room.as_str()))
-                        .map(|_| {
-                            (
-                                r["entries"].as_u64().unwrap_or(0),
-                                r["received_key_generations"].as_u64().unwrap_or(0),
-                            )
-                        })
-                })
-            };
-            // Still, and the key held: two looks 2 s apart with the same entry count and a
-            // received key generation, within READY_WITHIN of the end.
-            let settled_by = Instant::now() + READY_WITHIN;
-            let mut look = room_of(&vox(dir, &["status", "--json"], None).1);
-            let mut still = false;
-            while Instant::now() < settled_by {
-                std::thread::sleep(Duration::from_secs(2));
-                let next = room_of(&vox(dir, &["status", "--json"], None).1);
-                if let (Some(a), Some(b)) = (look, next) {
-                    if a.0 == b.0 && b.1 >= 1 {
-                        still = true;
-                        break;
-                    }
-                }
-                look = next;
-            }
-            let (ok, out, err) = vox(dir, &["room", "read", room], None);
-            assert!(
-                ok,
-                "PRODUCT: {reader}'s `vox room read` refused: {out}{err}"
-            );
-            let missing: Vec<&String> = expected
+            let readiness = room_still_with_key_and_consent(dir, reader, room);
+            let texts = room_texts(dir, room);
+            let actual: Vec<String> = texts
                 .iter()
-                .filter(|t| !out.contains(t.as_str()))
+                .filter(|text| text.starts_with(&format!("{author} step ")))
+                .cloned()
                 .collect();
-            if !missing.is_empty() {
-                unreadable.push(format!(
-                    "{reader} in room {room} (still {still}, entries and received key generations {look:?}): \
-                     {} of {author}'s {} posts unreadable: {missing:?}",
-                    missing.len(),
-                    expected.len()
-                ));
+            assert_eq!(
+                actual, expected,
+                "PRODUCT: {reader}'s one `vox room read --json` did not show every {author} work \
+                 post exactly once and in order after the room held still with the key accepted \
+                 (ADR-038 FX-22, #1007); room status {readiness:?}; all text rows: {texts:?}"
+            );
+            if reader == "bob" {
+                let expected_before: Vec<String> = (0..BEFORE_KEY)
+                    .map(|row| format!("alice before key room {} row {row}", index + 1))
+                    .collect();
+                let actual_before: Vec<String> = texts
+                    .iter()
+                    .filter(|text| text.starts_with("alice before key room "))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    actual_before, expected_before,
+                    "PRODUCT: Bob's one `vox room read --json` did not show every row Alice \
+                     sealed before he joined exactly once and in order after her key and consent \
+                     landed (ADR-038 FX-22, #1007); room status {readiness:?}; all text rows: \
+                     {texts:?}"
+                );
             }
         }
     }
     assert!(
-        unreadable.is_empty(),
-        "PRODUCT: a post that arrived before its key or its author's consent stayed unreadable \
-         after they landed (ADR-038 FX-22, #1007): {unreadable:?}\nalice's daemon said: {}\nbob's \
-         daemon said: {}",
-        said(&alice, "alice"),
-        said(&bob, "bob")
-    );
-    assert!(
         spent.0 <= WORK_CPU && spent.1 <= WORK_CPU,
-        "PRODUCT: a daemon with agents at work spent more CPU than a person should pay (ADR-038 \
-         FX-15, #990): alice's daemon +{:?}, bob's +{:?} over {worked:?} (bound {WORK_CPU:?})\n\
-         alice's daemon said: {}\nbob's daemon said: {}",
+        "PRODUCT: unchanged consent questions made a daemon with agents at work spend more CPU \
+         than a person should pay (ADR-038 FX-22, #1007; FX-15, #990): alice's daemon +{:?}, \
+         bob's +{:?} over {worked:?} (bound {WORK_CPU:?})\nalice's daemon said: {}\nbob's \
+         daemon said: {}",
         spent.0,
         spent.1,
         said(&alice, "alice"),

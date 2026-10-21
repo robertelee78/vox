@@ -4545,9 +4545,24 @@ impl ChannelState {
     /// governance stands. A room whose current facts are not settled refuses here as
     /// [`Self::current_governance`] does.
     fn consent_facts(&self, store: &Store) -> Result<std::sync::Arc<governance::ConsentFacts>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        // The common path opens and decrypts only the index header. A first load (including every
+        // restart) and a changed revision take the fully checked view below before rebuilding.
+        let revision = governance::View::projection_revision(store, &self.sek, &self.channel_id)?;
+        let mut held = self
+            .consent_facts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(facts) = held.as_ref().filter(|facts| facts.revision() == revision) {
+            return Ok(std::sync::Arc::clone(facts));
+        }
+        drop(held);
+
         let view = self.current_governance(store)?;
         let revision = view.revision();
-        let mut held = self
+        held = self
             .consent_facts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
