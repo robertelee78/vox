@@ -3,7 +3,10 @@
 - **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
   at a time, quoted below) are the requirements; nothing here is built. Each requirement lands
   with its proof (ADR-018) in a small release (FX-19).
-- **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU)
+- **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
+  2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
+  recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
+  that could not be unlocked)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -183,19 +186,22 @@ The decider then answered twelve questions, one at a time. His answers are the d
   MUST run on the VM setup (the macOS guests of the v0.4.4 app-proof work), not on his working
   Macs ("use the VM stuffs so I'm not losing ability to use my macs").
 - **FX-21.** Every product requirement above (FX-1–FX-10, FX-12–FX-18, FX-22–FX-24, FX-26,
-  FX-27) lands with a proof that drives the shipped `vox` binary as a person would, with a
-  mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
+  FX-27, FX-28–FX-34) lands with a proof that drives the shipped `vox` binary as a person
+  would, with a mutant that turns it red on its own assertion (ADR-018). The two-computer requirements
   (FX-2–FX-7) are proved by two daemons in two data roots on one machine. FX-11's design, FX-19,
   FX-20 and FX-25 are process rulings: FX-19's record is each closed release milestone, FX-20's
   is the walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
   release's asset list.
 - **FX-22.** A governance question about a room (who may read whom, who has consented, what a
-  member offers) MUST cost no store read and no decrypt when the room's governance has not
-  changed since the question was last answered. Decision: the room keeps its folded consent facts
-  in memory as a semantic projection (per author, the readers it consented to and its reset
-  sequence), never a store snapshot, page or row vector, so the index's bounded-turn rule
-  stands; the sealed index remains the only durable representation, and a restart loads the
-  projection from the index and the entries it names, never by replaying the log. Measured
+  member offers) MUST read nothing from the store but the governance index's header, and decrypt
+  no fact or entry, when the room's governance has not changed since the question was last
+  answered. Decision: the room keeps its folded consent facts in memory as a semantic projection
+  (per author, the readers it consented to and its reset sequence), never a store snapshot, page
+  or row vector, so the index's bounded-turn rule stands; the index header's revision, which
+  moves with every change to the index, says whether the projection is current, so no
+  in-process bookkeeping can miss a write; the sealed index remains the only durable
+  representation, and a restart loads the projection from the index and the entries it names,
+  never by replaying the log. Measured
   cause, 2026-10-20 (the decider's daemon, vox 0.4.7; `ps` 155–170% of a core; two 10 s `sample`
   runs, 13,558 busy samples each, about 1.36 cores): 72% of all busy CPU was the status
   publication and 44% of all busy CPU was `trusted_by`, which opened a fresh view (a store
@@ -236,6 +242,138 @@ The decider then answered twelve questions, one at a time. His answers are the d
   rule and stands unchanged. Ruling: "caps on cpu seem like … footguns", "we need to understand
   what is driving the cpu inefficiency rather than capping the cpu" (the decider, 2026-10-20,
   rejecting a ten-fast-turns-then-one-a-second cap proposed for FX-24's cause).
+- **FX-28.** A change to the person's computer trust (ADR-035: a policy revision, a node
+  attaching or detaching, a computer joining or leaving the roster) made on either of two paired
+  daemons MUST show on every attached node of both: `vox computer status` asked of each such
+  node names the new policy (the computer added or removed, the drive granted or revoked, the
+  node attached or detached in the bound roster) within 5 s of the change on the daemon where
+  it was made, whatever the other daemon does; on the other daemon within 5 s of the exchange
+  the changing daemon starts for it (#989) completing, and, when that exchange does not
+  complete (the peer unreachable, the stream cut), within 60 s, the fallback exchange's
+  period, after the peer becomes reachable again. Two daemons on which nothing changed
+  MUST spend nothing on it:
+  over an idle minute their CPU grows by no more than FX-15's quiet-room bound. "We need the
+  detection of change logic to be sound. Easy for local daemon to notice, but daemon to daemon
+  update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
+  once per revision of the computer policy and on no timer; a change made on the other daemon
+  arrives in the pairing exchange that daemon starts, and a merged exchange that moves this
+  daemon's revision is a change here, so detection on either side is the exchange itself.
+  Measured cause, 2026-10-20 (the decider's daemon, vox 0.4.9, four nodes Ready in eleven
+  rooms, no room gaining an entry; `ps` 0.63 of a core at steady state; two 10 s `sample` runs
+  symbolized from the release symbols, FX-25): 21–24% of the busy CPU was
+  `prepare_computer_binding` → `Computer::bind_node` (`State::derive` and `Binding::verify`: an
+  ML-DSA verification of every management event, `CompositePublicKey::from_bytes` expanding the
+  key for each), reached from a 1 s `tokio::time::interval` in the host's `follow_computer_trust`
+  that calls `reconcile_computer()` for every attached node every second and then
+  `record_application()`, which derives again; a further 6–8% was the app's polling re-deriving
+  the same state per control answer (`individual_trust_eligibility` → `Computer::capability` →
+  `Binding::verify`). Four nodes, nothing changed.
+- **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
+  not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
+  commit at all from its rounds. Decision: a hint this node holds (its committed head, its
+  control readiness and its live window all at the hint) is not pulled again each period; a
+  hint whose missing pages a peer said it does not hold is not pulled from that peer again
+  until that peer's inventory changes; a head or header already held is not saved again; and a
+  verifier persists its progress once per proof verified to its end (an inclusion proof or a
+  control range), never once per Merkle join, since a proof is bounded and is verified again
+  from its bytes after a crash. Measured cause, the same daemon: 1,367 durable store commits per second across the four node stores
+  (redb transaction ids read 30 s apart: robert-work 524/s, opencode-work 495/s, codex-work
+  197/s, claude-work 151/s; robert-work's store at transaction 20.4 million) with no room
+  gaining an entry. By site, ≈64% of commit wall time was `history_stream::admission::advance`
+  committing the context and the cursor after every `Progress` step of `ControlRangeVerifier`
+  and `InclusionVerifier` (a `WorkBudget` of 4 signatures or 32 descriptors; the step's own CPU
+  was 65 of 4,152 samples, the rest the flush), ≈16% `admission::stage` saving every hinted
+  author's head and headers whether or not held, ≈8% the private Session pull that runs with
+  each sync. `offer_inventory` re-offers every hint that is not `held`, and a held one again when
+  `missing_page` finds a position within the last page, so an author whose missing bodies no
+  peer holds any more (his rooms are sparse: 200, 188 and 76 of one room's entries on three
+  nodes) is pulled again from every peer every period: 3.67 syncs per second over 39 peer-room
+  pairs, a median 11 s between two syncs of one pair, about 370 commits per sync.
+- **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
+  power loss: a node's own entries, consent, trust, keys, Session records and the format marker
+  are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person
+  would lose (own entries, consent, trust, keys, Sessions, the format marker) gets the full
+  flush to disk", "correct"). Derived sync state (held heads, cursors, verifier contexts, live
+  windows) MAY be lost in such a crash, and after one the daemon MUST rebuild what it lost from
+  the proofs it holds and from the peers it can reach, so the room syncs on. A sync round that persists only derived state MUST make no full flush:
+  `vox status --json` names the daemon's count of full flushes, and over a quiet minute it MUST
+  NOT move. Decision: derived state commits at redb `Durability::None` or `Eventual` (a later
+  durable commit carries it) and the ruled set stays `Immediate` however it arrived: a
+  received consent, trust change, key package or Session record is flushed like the node's own.
+  Any other received entry commits with the derived state that admitted it and reaches disk
+  with the next durable commit, before this node acknowledges holding it to its sender (ADR-028
+  R-6), so a crash in between loses only what the sender has not yet seen acknowledged and
+  offers again. Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
+  `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
+  0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
+  an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
+- **FX-31.** A flush to disk of one commit MUST NOT delay what does not depend on it: while a
+  flush is held (apparatus: the store's flush stalled by a `VOX_TEST_*` knob of the `test-knobs`
+  build, the way every held-step proof here stages a stall), the daemon's status
+  publication, a member's read in that room, a post in that room or any other, and attention
+  selection MUST answer within FX-17's bound ("publications, reads, posts and attention never
+  wait on" a flush, ruled 2026-10-20: "sounds right"), and `vox status` MUST NOT say "room
+  publication is busy" for a room whose only activity is a flush. Decision: no commit's flush
+  runs while the room's lock is held; a post's batch is written under the lock and its own
+  flush completes after the lock is released, so the post is accepted, and durable, within the
+  bound while an earlier flush is still held. Measured cause, the same daemon: every commit ran inside `history_write` with
+  the room mutex held (the `read_charged` closure owns the `lock_owned()` guard), so the daemon
+  log said `room publication is busy; retry this operation` 424 times and `attention selection
+  remains pending`, and the app's member list flickered (#983).
+- **FX-32.** A node that finds a member holding more of its own feed than it does (a restored
+  older profile, ADR-037 R5) MUST recover its own entries from that member, each verified under
+  its own key and chain, and MUST keep reading meanwhile, the history it holds and the posts
+  that arrive: "yes can supplement if signed/done correctly" (the decider, 2026-10-19). Its
+  writes MUST stay refused until its own feed is current again and MUST resume then. Measured
+  before this: a restored node refused its writes correctly and never read the member's next
+  post (the restarts proof, step 5, 2026-10-19).
+- **FX-33.** A change to a room's retention MUST NOT stop the room: after the admin shortens
+  it, every member MUST still read and post there, the rows the member holds that are older
+  than the new lifetime MUST expire on it, and no daemon MUST say it cannot save because of the
+  sweep that change started. A room's recovery after a failed save MUST NOT impair the node's
+  other rooms: while one room recovers, and when its recovery fails, every other room of the
+  node MUST still read and post, and `vox status` MUST still answer. Decision: the recovery
+  re-saves the room's sealed state in an ordinary write transaction on the store as it is
+  open, never by closing and reopening the node's store file; the sweep prunes what the node holds; a signed-format
+  entry is never a legacy Session; an entry whose body never arrived, or that sits past its
+  author's verified head, is skipped that sweep and is not evidence of a malformed store; a row
+  the sweep cannot classify (a Session step or a message) expires under the message lifetime,
+  the longer of the two, once it is older than that, so nothing is kept forever for want of a
+  classification. Measured cause, 2026-10-20 (the
+  decider's node, vox 0.4.9, its daemon log `.daemon/log` at 2026-10-21T00:00:11Z): he set his
+  repo room's retention from forever to one week in the app; the next sweep's legacy Session
+  classification (`legacy_kind_in`) refused a format-2 entry as "Session classification source
+  unverified", the room was poisoned, and the app said "vox cannot save: store save room:
+  malformed at-rest artifact … It recovers by itself when writes succeed again", which it
+  cannot while every tick's sweep hits the same entry; the same log shows two earlier sweeps
+  that day (19:32:57Z and 23:21:31Z) poisoning rooms with "retention entry missing" (a body
+  never received has no first-seen fact), cleared when the room was reopened (23:21:35Z). At
+  00:15:30Z the poisoned room's recovery closed robert-work's whole store to reopen it
+  writable; redb refused the reopen while another handle in the daemon was alive, the fallback
+  left the store read-only or closed, and from then on every room of the node answered "the
+  store is read-only until the identity is unlocked" or "the store is being reopened" on each
+  one-second retry, for hours, until a restart: the app, `vox status` and the hooks got no
+  answer from the daemon.
+- **FX-34.** Unlocking a node is not remembering it. `vox node unlock` with a passphrase typed
+  at the terminal, read from stdin or taken from `VOX_IDENTITY_PASSPHRASE` MUST make the node
+  Ready for this daemon's life on every system, and the Locked status line MUST name a command
+  that works. Where the system has a credential store Vox uses, the Keychain on macOS
+  (ADR-028 K-10), `vox node unlock` MAY also remember the node there and MUST say so, and `vox
+  node lock` MUST forget it. Where there is no such store, Linux today, `vox node unlock` MUST
+  NOT persist the passphrase anywhere and MUST say that a daemon restart will ask again; a node
+  Locked after a restart is unlocked again by hand, which the decider accepts ("that's ok as
+  long as I can actually unlock them", 2026-10-21), so no Linux credential store is built for
+  now. Vox MUST remember a plaintext passphrase file only by the path the person named with
+  `--passphrase-file` (it copies nothing), and MUST never write one on its own. "I'm not saying passphrases should be stored,
+  but there has to be a way to unlock a node"; "at least put the files in a correct place" (the
+  decider, 2026-10-21). Measured cause, 2026-10-21 (the decider's Linux host, Ubuntu 26.04, vox
+  0.4.9): after `vox update` restarted the daemon, the three nodes attached from typed
+  passphrases on 10-19 came back Locked, and every unlock without a persistent file (typed,
+  stdin, the environment variable) was refused with "node … cannot be remembered from a typed
+  passphrase, an environment variable or stdin on this system; save its passphrase in a private
+  persistent file", while the status line said "Unlock with vox node unlock …": the product's
+  advice looped into its refusal. Introduced by 6d9f286fa (2026-10-13), shipped in v0.4.5
+  through v0.4.9; the Keychain path hid it on macOS.
 
 ## Unchanged rulings
 
@@ -257,6 +395,12 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-020 4.11 (the ask and answer vocabulary) | An undirected ask is answered per Session that finds it relevant, without cross-replies; an addressed ask by its addressee (FX-13) |
 | ADR-036 legacy history recovery (Legacy history required, resume, cancel, cached-only reads) | Deleted (FX-18) |
 | ADR-037 R7, R11: event-driven gates; a turn may run several chunks, never a cycle | FX-15 adds: no round without a nameable need; a no-progress, no-wait round retires; a hint for a held head finishes on arrival |
+| ADR-037 R5: a member's higher own head marks the room "own history behind"; every write refuses until resolved | FX-32 says what resolves it: the node recovers its own entries from that member (verified under its own key), keeps reading, and writes again once current |
+| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds the bound: a change made on either daemon shows on every attached node of both within 5 s, or within 60 s after the peer is reachable again when its exchange was lost, and an unchanged pair spends nothing |
+| ADR-037 R7, R11: a port runs a round only on a need; a turn may run several chunks, never a cycle | Preserved; FX-29 adds what a round that brings nothing may write: nothing |
+| No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
+| PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
+| ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
@@ -271,6 +415,9 @@ Narrow successor amendments. Requirements not named here remain in force.
 7. FX-24, FX-26, FX-27, FX-23, FX-22, FX-25: the daemon's CPU under real rooms, measured on
    the decider's daemon on 2026-10-20, in that order (the trigger, the cipher, the design, the
    symbols); one cut (v0.4.8).
+8. FX-28, FX-29, FX-30, FX-31: the idle daemon's disk and CPU, measured on the decider's
+   daemon (v0.4.9) on 2026-10-20, in that order (the tick, the re-pull, the flush, the lock);
+   FX-32 under #934; FX-33 and FX-34 with them; one cut (v0.4.10).
 
 Each ADR change under this record is reviewed by an independent session (opencode-work) before
 its stories are extracted.
