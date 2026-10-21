@@ -50,6 +50,9 @@ pub(crate) struct Received {
     pub(crate) needs: Vec<Query>,
     pub(crate) verifiers: Vec<CursorBinding>,
     pub(crate) body_ready: Option<Digest32>,
+    /// Exact authenticated header whose private body this node's role must not receive. Its
+    /// inclusion and semantic settlement still have to complete before the archive can advance.
+    pub(crate) role_ready: Option<(Digest32, u64)>,
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
     pub(crate) heads: Vec<super::HeadHint>,
@@ -63,6 +66,7 @@ impl Received {
             needs: Vec::new(),
             verifiers: Vec::new(),
             body_ready: None,
+            role_ready: None,
             body_progress: false,
             inventory: None,
             heads: Vec::new(),
@@ -346,6 +350,11 @@ impl Receiver {
                             // header-only; an unexpected body frame is refused by credit.accept
                             // before Action::Chunk can persist a byte.
                             if !body_allowed {
+                                if result.role_ready.replace((*head, seq)).is_some() {
+                                    return Err(Error::SizeLimitExceeded(
+                                        "history role-complete header handoff",
+                                    ));
+                                }
                                 continue;
                             }
                             let Some(staging) = &self.staging else {
@@ -562,7 +571,13 @@ pub(crate) struct Record {
     pub(crate) entry: crate::log::entry::Entry,
     job: crate::node::history_budget::Job,
     _charge: crate::node::history_budget::BufferCharge,
-    staged: Option<(RequestId, Digest32)>,
+    staged: Option<(RequestId, Digest32, StagedAdmission)>,
+}
+
+#[derive(Clone, Copy)]
+enum StagedAdmission {
+    Body,
+    RoleHeader,
 }
 pub(crate) enum Assembly {
     Ready(Arc<Record>),
@@ -631,7 +646,7 @@ impl Receiver {
                 entry,
                 job: record_job,
                 _charge: charge,
-                staged: Some((active.request(), generation)),
+                staged: Some((active.request(), generation, StagedAdmission::Body)),
             })))
         })
         .await
@@ -1009,7 +1024,7 @@ fn complete_staged(
     record: &Record,
     hash: Digest32,
 ) -> Result<()> {
-    let Some((request, generation)) = record.staged else {
+    let Some((request, generation, admission)) = record.staged else {
         return Ok(());
     };
     if hash != record.entry.entry_hash() {
@@ -1023,7 +1038,18 @@ fn complete_staged(
     if active.request() != request || active.binding().grant != generation {
         return Err(Error::Profile("history completion activation changed"));
     }
-    demand::entry_admitted(batch, &staging.context, &active, hash, &record.job)
+    match admission {
+        StagedAdmission::Body => {
+            demand::entry_admitted(batch, &staging.context, &active, hash, &record.job)
+        }
+        StagedAdmission::RoleHeader => demand::role_header_admitted(
+            batch,
+            &staging.context,
+            &active,
+            record.entry.skeleton.seq,
+            &record.job,
+        ),
+    }
 }
 
 /// Small scheduling state only. Bodies and context maps never survive a local-step return.
@@ -1035,6 +1061,7 @@ pub(crate) enum LocalStep {
         head: Digest32,
         seq: u64,
         body: bool,
+        role_header: bool,
         phase: EntryPhase,
     },
     Control {
@@ -1162,6 +1189,7 @@ impl Receiver {
             head,
             seq,
             body,
+            role_header,
             phase,
         } = step
         else {
@@ -1195,10 +1223,19 @@ impl Receiver {
         if record.entry.skeleton.seq != seq {
             return Err(Error::Profile("history local step entry changed"));
         }
-        if body && !full {
+        if (body && !full) || role_header {
+            let staged = Some((
+                request,
+                self.generation,
+                if role_header {
+                    StagedAdmission::RoleHeader
+                } else {
+                    StagedAdmission::Body
+                },
+            ));
             Arc::get_mut(&mut record)
                 .ok_or(Error::Profile("history header record is shared"))?
-                .staged = Some((request, self.generation));
+                .staged = staged;
         }
         let hash = record.entry.entry_hash();
         let record_author = record.entry.skeleton.author_id;
@@ -1207,6 +1244,7 @@ impl Receiver {
             head,
             seq,
             body,
+            role_header,
             phase,
         };
         let is_governance = record
@@ -1278,6 +1316,7 @@ impl Receiver {
                             head,
                             seq,
                             body: true,
+                            role_header: false,
                             phase: EntryPhase::Body,
                         })
                     }
@@ -1294,6 +1333,7 @@ impl Receiver {
                                 head,
                                 seq,
                                 body: true,
+                                role_header: false,
                                 phase,
                             }
                         } else {

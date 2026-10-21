@@ -276,6 +276,7 @@ impl Flow {
                     head,
                     seq,
                     body: false,
+                    role_header: false,
                     phase: EntryPhase::Start,
                 }),
             })?;
@@ -1129,6 +1130,7 @@ impl Flow {
                                 head,
                                 seq,
                                 body: content && !expired,
+                                role_header: false,
                                 phase: EntryPhase::Start,
                             }),
                         })?;
@@ -1313,6 +1315,7 @@ impl Flow {
                             head,
                             seq,
                             body: false,
+                            role_header: false,
                             phase: EntryPhase::Start,
                         }),
                         ..task
@@ -1408,7 +1411,23 @@ impl Flow {
                     return Ok(());
                 }
                 if self.archive && body {
-                    if result.body_ready.is_none() {
+                    if let Some((head, seq)) = result.role_ready {
+                        self.archive_next = seq
+                            .checked_sub(1)
+                            .filter(|next| matches!(query, Query::Page { lo, .. } if *next >= lo));
+                        self.push(Task {
+                            request: wire_request,
+                            purpose: Purpose::History,
+                            operation: Operation::Local(LocalStep::Entry {
+                                request: wire_request,
+                                head,
+                                seq,
+                                body: false,
+                                role_header: true,
+                                phase: EntryPhase::Start,
+                            }),
+                        })?;
+                    } else if result.body_ready.is_none() {
                         // The one requested quantum ended. Its exact body/page continuation is
                         // already durable; only a new explicit Resume may request more bytes.
                         self.finish_archive(job).await?;
@@ -1434,6 +1453,7 @@ impl Flow {
                                 head: state.state().bounds.head,
                                 seq: body.seq,
                                 body: true,
+                                role_header: false,
                                 phase: EntryPhase::Start,
                             }),
                         })?;
@@ -1589,6 +1609,7 @@ impl Flow {
                                 head,
                                 seq,
                                 body: false,
+                                role_header: false,
                                 phase: EntryPhase::Start,
                             }),
                         })?;

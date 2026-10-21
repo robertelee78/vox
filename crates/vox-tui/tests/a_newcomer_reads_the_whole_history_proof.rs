@@ -259,7 +259,7 @@ fn attached(dir: &Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "PRODUCT: {tag}'s daemon never answered `vox room list` in 90 s: {last}\nits stderr: {}",
+        "APPARATUS: {tag}'s daemon never answered `vox room list` in 90 s: {last}\nits stderr: {}",
         said(dir, tag)
     );
 }
@@ -377,6 +377,73 @@ fn reads(dir: &Path, room: &str, text: &str) -> bool {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
     assert!(ok, "PRODUCT: `vox room read` refused: {out}{err}");
     out.contains(text)
+}
+
+/// The exact entry hash a person sees for `text`, walking the shipped JSON read pages.
+fn read_hash(dir: &Path, room: &str, text: &str) -> Option<String> {
+    let mut before: Option<String> = None;
+    loop {
+        let limit = PAGE.to_string();
+        let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
+        if let Some(oldest) = before.as_deref() {
+            args.extend(["--before", oldest]);
+        }
+        let (ok, out, err) = vox(dir, &args, None);
+        assert!(
+            ok,
+            "PRODUCT: `vox room read --json` refused while locating {text:?}: {out}{err}"
+        );
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: `vox room read --json` printed invalid JSON ({error}): {line}")
+                })
+            })
+            .collect();
+        if let Some(hash) = rows.iter().find_map(|row| {
+            (row["text"].as_str() == Some(text))
+                .then(|| row["entry_hash"].as_str().map(str::to_owned))
+                .flatten()
+        }) {
+            return Some(hash);
+        }
+        if rows.len() < PAGE {
+            return None;
+        }
+        before = rows
+            .first()
+            .and_then(|row| row["entry_hash"].as_str())
+            .map(str::to_owned);
+        assert!(
+            before.is_some(),
+            "PRODUCT: a `vox room read --json` row carries no entry_hash while locating {text:?}"
+        );
+    }
+}
+
+fn history_status(dir: &Path, room: &str) -> (String, u64) {
+    let (ok, out, err) = vox(
+        dir,
+        &["room", "read", room, "--json", "--history", "status"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room read --history status --json` was refused: {out}{err}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: `vox room read --history status --json` printed invalid JSON ({error}): {out}")
+    });
+    let phase = value["status"]["phase"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: history status named no phase: {value}"))
+        .to_owned();
+    let remaining = value["status"]["remaining"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("PRODUCT: history status named no remaining count: {value}"));
+    (phase, remaining)
 }
 
 /// How long after `since` each side first read the other: alice `to_alice`, bob `to_bob`
@@ -624,7 +691,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         )
     });
     let carol_replicated_deadline = Instant::now() + READY_WITHIN;
-    while member_held_through(&carol, &room, &fps[0]).is_none_or(|held| held < carol_tail_through) {
+    while member_held_through(&carol, &room, &fps[0]) != Some(carol_tail_through) {
         assert!(
             Instant::now() < carol_replicated_deadline,
             "APPARATUS: Alice did not acknowledge Carol's exact feed position \
@@ -637,6 +704,17 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     }
     let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
     carol_daemon.stop();
+    let before_package_text = "alice row before carol's package";
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's row before the private package was refused: {out}{err}"
+    );
+    let before_package_hash = read_hash(&alice, &room, before_package_text).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's shipped JSON read omitted the accepted row before the private package"
+        )
+    });
     let before_package = status_rows(&alice, &room).unwrap_or_else(|| {
         panic!(
             "PRODUCT: alice's `vox status --json` did not report the room before the private \
@@ -701,6 +779,43 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let hostile_engaged = std::path::PathBuf::from(format!("{}.engaged", hostile.display()));
     let bob_after_gap = daemon(&bob, "bob-after-gap");
     attached(&bob, "bob-after-gap");
+    let marker_deadline = Instant::now() + READY_WITHIN;
+    while !reads(&bob, &room, &package_marker) {
+        assert!(
+            Instant::now() < marker_deadline,
+            "PRODUCT: Bob did not read Alice's newest marker within {READY_WITHIN:?}; the shipped \
+             archive request could not be staged\nbob said: {}",
+            said(&bob, "bob-after-gap")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let oldest_alice_live = format!(
+        "alice settled successor {}",
+        alice_successors - vox_core::log::history::MAX_PAGE_ENTRIES
+    );
+    let oldest = read_hash(&bob, &room, &oldest_alice_live).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: Bob's shipped JSON read omitted Alice's expected oldest live-window row \
+             {oldest_alice_live:?} before archive paging"
+        )
+    });
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "room",
+            "read",
+            &room,
+            "--history",
+            "older",
+            "--before",
+            &oldest,
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Bob's `vox room read --history older --before {oldest}` was refused: {out}{err}"
+    );
     let hostile_deadline = Instant::now() + READY_WITHIN;
     while !hostile_engaged.is_file() {
         assert!(
@@ -716,7 +831,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // feed position after the package. That role-contiguous cursor cannot jump over Carol's
     // package header, even though Bob must never receive its private body.
     let crossed_deadline = Instant::now() + READY_WITHIN;
-    while member_held_through(&alice, &room, &fps[1]).is_none_or(|held| held < marker_through) {
+    while member_held_through(&alice, &room, &fps[1]) != Some(marker_through) {
         assert!(
             Instant::now() < crossed_deadline,
             "PRODUCT: within {READY_WITHIN:?}, alice did not report Bob holding her authenticated \
@@ -728,10 +843,19 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(
-        reads(&bob, &room, &package_marker),
-        "PRODUCT: Bob acknowledged Alice's feed through {marker_through}, but `vox room read` did \
-         not show its later marker\nbob's daemon said: {}",
+        read_hash(&bob, &room, before_package_text).as_deref()
+            == Some(before_package_hash.as_str()),
+        "PRODUCT: Bob's shipped archive read settled Alice's exact cursor through \
+         {marker_through}, but did not continue past Carol's header to the exact older row \
+         {before_package_hash}\nbob's daemon said: {}",
         said(&bob, "bob-after-gap")
+    );
+    let archive_status = history_status(&bob, &room);
+    assert_eq!(
+        archive_status,
+        ("complete".to_owned(), 0),
+        "PRODUCT: after the shipped archive read crossed Carol's role-complete header and \
+         returned the exact older row, its status was not exactly complete with zero remaining"
     );
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
     let before = [synced(&alice), synced(&bob)];
@@ -801,8 +925,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let _bob_after_restart = daemon(&bob, "bob-after-restart");
     attached(&bob, "bob-after-restart");
     let restart_deadline = Instant::now() + READY_WITHIN;
-    while member_holds_through(&bob, &room, &fps[0]).is_none_or(|held| held < marker_through)
-        || member_holds_through(&bob, &room, &fps[2]).is_none_or(|held| held < carol_tail_through)
+    while member_holds_through(&bob, &room, &fps[0]) != Some(marker_through)
+        || member_holds_through(&bob, &room, &fps[2]) != Some(carol_tail_through)
     {
         assert!(
             Instant::now() < restart_deadline,
@@ -840,7 +964,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(
-        member_held_through(&carol, &room, &fps[1]).is_some_and(|held| held >= carol_tail_through),
+        member_held_through(&carol, &room, &fps[1]) == Some(carol_tail_through),
         "PRODUCT: after both authors exceeded the bounded continuation page and Carol completed \
          a sync with restarted Bob, his receipt did not preserve her exact feed position \
          {carol_tail_through}\ncarol said: {}\nbob said: {}",

@@ -34,7 +34,7 @@ fn test_private_body_marker() -> Option<(std::path::PathBuf, std::path::PathBuf)
         }
         let mut engaged = trigger.as_os_str().to_os_string();
         engaged.push(".engaged");
-        return Some((trigger, engaged.into()));
+        Some((trigger, engaged.into()))
     }
     #[cfg(not(feature = "test-knobs"))]
     None
@@ -50,6 +50,7 @@ struct EntryResult {
     status: Status,
     hash: Option<Digest32>,
     offset: u64,
+    role_complete: bool,
 }
 
 #[allow(clippy::too_many_arguments)] // One bound stream and its node-owned scalar hint sink.
@@ -375,6 +376,26 @@ async fn respond(
                         }),
                     ));
                 }
+                if result.role_complete {
+                    // The receiver still has to prove inclusion and commit this authenticated
+                    // header's role-specific effect. Keep the archive operation non-terminal
+                    // until that durable settlement has happened. At the lower bound the
+                    // current position is a sentinel; settlement turns a zero remaining count
+                    // into Complete in the same transaction as the accepted effect.
+                    return Ok((
+                        Status::More,
+                        Some(Continuation {
+                            query_kind: 4,
+                            head,
+                            lo,
+                            hi,
+                            next_seq: seq.checked_sub(1).filter(|next| *next >= lo).unwrap_or(seq),
+                            entry: None,
+                            offset: 0,
+                            entries_remaining: credit.headers_left(),
+                        }),
+                    ));
+                }
                 if credit.headers_left() == 0 || seq == hi {
                     return Ok((Status::Complete, None));
                 }
@@ -403,6 +424,7 @@ async fn entry(
         status: Status::EvidenceUnavailable,
         hash: None,
         offset,
+        role_complete: false,
     };
     let head = match source
         .read(&job, 128 * 1024, move |room, store| {
@@ -519,12 +541,13 @@ async fn entry(
     let payload = if withhold_private_body {
         None
     } else {
+        let Some(record_job) = record_job.as_ref() else {
+            return Err(Error::Profile("history body reservation disappeared"));
+        };
         Some(
             match source
                 .read_body(
-                    record_job
-                        .as_ref()
-                        .expect("non-private history body reserved a record job"),
+                    record_job,
                     envelope,
                     length as usize + MAX_HEADER_BYTES + 9,
                     move |room, store| Ok(Some(room.history_payload(store, &hash)?)),
@@ -578,6 +601,7 @@ async fn entry(
         // This peer's role is fully satisfied by the authenticated header.  Complete the entry
         // instead of advertising a missing body, so Page can continue past it without a retry.
         result.status = Status::Complete;
+        result.role_complete = true;
         if let Some(bound) = live {
             job.finish_live(bound);
         }

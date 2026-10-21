@@ -961,6 +961,48 @@ pub fn entry_admitted(
     put(batch, key, &scope, &state)
 }
 
+/// Commit one bodyless, authenticated entry that is complete for this node's recipient role.
+/// The caller invokes this only from the exact entry's semantic-effect transaction, after its
+/// inclusion proof and typed dispatch have succeeded. Unlike body staging, this both advances
+/// the archive count and preserves the already-checkpointed next-page cursor atomically.
+pub fn role_header_admitted(
+    batch: &mut Batch<'_>,
+    context: &Context,
+    active: &Active,
+    seq: u64,
+    job: &Job,
+) -> Result<()> {
+    let _charge = charge(job, STATE_WORK)?;
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut state = live(batch, key, &scope, context, active)?;
+    let expected_next = seq
+        .checked_sub(1)
+        .filter(|next| *next >= state.bounds.lo)
+        .unwrap_or(seq);
+    if state.body.is_some()
+        || state.cleanup.is_some()
+        || state.remaining == 0
+        || seq < state.bounds.lo
+        || seq > state.bounds.hi
+        || state.progress != Progress::More
+        || !state.cursor.is_some_and(|cursor| {
+            cursor.query_kind == 4
+                && cursor.next_seq == expected_next
+                && cursor.entry.is_none()
+                && cursor.offset == 0
+        })
+    {
+        return Err(invalid("role-complete history header changed"));
+    }
+    state.remaining -= 1;
+    if state.remaining == 0 {
+        state.cursor = None;
+        state.progress = Progress::Complete;
+    }
+    put(batch, key, &scope, &state)
+}
+
 /// Persist a locally normalized cursor within the original authorization and actual credit.
 /// An Entry quantum's [seq,seq] wire bounds must first be rebound to the original local page;
 /// never treat the peer's narrower quantum, new query kind or count as fresh authorization.
