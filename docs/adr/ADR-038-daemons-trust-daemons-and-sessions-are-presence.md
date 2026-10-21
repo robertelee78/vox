@@ -396,10 +396,9 @@ The decider then answered twelve questions, one at a time. His answers are the d
   MUST re-arm all and only work still outstanding under FX-29 without creating a need from a
   hint the node already holds, MUST release every room, lane-job, live-flow, outbound-slot and
   flow-state reservation the attempt acquired, and MUST re-queue the port with its need
-  preserved; The port MUST then have exactly one entry in a daemon-wide first-come flow-state
+  preserved. The port MUST then have exactly one entry in a daemon-wide first-come flow-state
   wait queue; it MUST retain that entry until it is selected or ceases to be eligible, and the
-  daemon MUST remove it immediately when either occurs. Whenever a charge is available, the
-  daemon MUST select the earliest-enqueued eligible waiter, remove its entry and run one start
+  daemon MUST remove it immediately when either occurs. Whenever a charge is available and at least one eligible waiter remains, the daemon MUST select the earliest-enqueued eligible waiter, remove its entry and run one start
   attempt for it before permitting a port not selected from that queue to reserve the charge; if
   that attempt ends before reserving the charge, the daemon MUST repeat this selection while a
   charge and an eligible waiter remain; ties in enqueue order MAY be broken arbitrarily. No
@@ -464,7 +463,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
-| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a flow-state pool charge is held only while a round runs, so the pool never accounts for flows at rest (nothing is disposed by time), and that the latest start attempt's outcome is reported for every port, and that the latest start attempt's outcome is reported for every port |
+| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a flow-state pool charge is held only while a round runs, so the pool never accounts for flows at rest (nothing is disposed by time), and that the latest start attempt's outcome is reported for every port |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
