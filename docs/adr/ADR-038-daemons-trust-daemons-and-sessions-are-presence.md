@@ -376,27 +376,26 @@ The decider then answered twelve questions, one at a time. His answers are the d
   advice looped into its refusal. Introduced by 6d9f286fa (2026-10-13), shipped in v0.4.5
   through v0.4.9; the Keychain path hid it on macOS.
 - **FX-35.** A full daemon-wide flow-state pool MUST NOT keep an eligible port from starting
-  a bounded-sync round while any charge of that pool is held by a parked flow. Terms: a port is
+  a bounded-sync round while any charge of that pool is held by a flow that is not running a
+  round. Terms: a port is
   eligible when it has a need (ADR-037 R7: a raised request or a head newer than it served), a
   connection to its peer and no bounded-sync round running for that port; a flow is parked while it sits in `ready`,
   `deferred`, `retiring` or `cleanup` and no task runs it; the flow-state pool is
   `RETAINED_FLOWS` charges per daemon (16 today, each 128 KiB), shared by every hosted node.
-  When an eligible port cannot reserve flow state because the pool is full, the daemon MUST,
-  before re-queuing the port, repeat the following while that reservation has not succeeded
-  and a parked flow remains: choose and dispose exactly one parked flow under the ordering
-  below, release its charge, and retry that port's reservation. The release and retry MUST be
-  atomic with respect to other flow-state reservations. If the reservation still fails after
-  no parked flow remains, the daemon MUST re-queue the port; it MUST NOT re-queue the port
-  before then. Ordering: parked flows of ports
-  without a need first; if they do not suffice, other parked flows; within either group the
-  flow parked longest first, ties broken arbitrarily. Flow-state reclamation under this rule
-  MUST be triggered only by an eligible port's failed reservation of a full pool. A period
+  Decision: a flow holds flow state only while its round runs. A flow back from a round, or
+  shelved before one, releases its charge; a flow reserves the charge again before its round,
+  after its outbound slot is taken; a flow that cannot is disposed with its outstanding hint
+  re-armed and is never left holding its port; so no parked flow holds a charge and the pool
+  bounds rounds running at once (two per node, sixteen per daemon), never flows at rest, while
+  flows at rest stay bounded per node by the controller's twelve-flow limit. When an eligible
+  port cannot reserve flow state because every charge is held by a running round, the daemon
+  MUST re-queue the port and MUST NOT dispose, expire or defer any flow for it. A period
   count, turn count, elapsed-time threshold or CPU-time threshold MUST NOT trigger disposal,
-  expiry, deferral or flow-state reclamation (FX-27); parked duration MAY be used only to apply
-  the longest-first ordering above. Disposing a flow MUST re-arm all and only work still
+  expiry, deferral or release of flow state (FX-27); only a round's end releases it.
+  Disposing a flow MUST re-arm all and only work still
   outstanding under FX-29 and MUST NOT create a need from a hint the node already holds. A start attempt
-  is one scheduler invocation for an eligible port, including every reclamation and
-  reservation retry required above; it ends `started` only when it launches the bounded-sync
+  is one scheduler invocation for an eligible port, including its flow-state reservation; it
+  ends `started` only when it launches the bounded-sync
   round, otherwise `not_started`. `vox status --json` MUST report, for every port under
   `lanes.ports[]`, `start_outcome`, equal to `never_attempted` until the first start attempt in
   the current daemon process ends and thereafter equal to `started` or `not_started` for the
@@ -405,7 +404,7 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `start_reason`, present if and only if `start_outcome` is `not_started`, the gates MUST be tested in the following order, and `start_reason` MUST equal the first gate that fails: `room_busy` (the room's state could not be
   taken without waiting), `live_lane_busy` (the node's live flow slot holds another flow),
   `control_budget_busy` (the control-lane job could not be reserved), `flow_state_pool_full`
-  (the flow-state reservation still failed after no parked flow remained),
+  (every charge of the pool is held by a running round),
   `archive_budget_busy` (the archive-lane job could not be reserved) and `no_outbound_slot`
   (the outbound slot could not be taken); and MUST report the pool under
   `lanes.budget.flow_state` as the integers
@@ -450,7 +449,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |
 | ADR-028 K-10, ADR-031 CW-2, CW-7: a node unlocked at a terminal is remembered in the Keychain so the daemon makes it Ready at each start | Preserved where a credential store exists (the Keychain); FX-34 adds that unlocking never depends on remembering, that Linux remembers nothing for now, and that Vox never writes a passphrase file on its own |
-| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that a full pool does not keep an eligible port from starting while any flow-state charge is held by a parked flow (parked flows are disposed on demand, never by time), and that the latest start attempt's outcome is reported for every port |
+| ADR-037 R7, R11; ADR-026: a bounded flow keeps its state between turns, within a daemon-wide pool | FX-35 adds that flow state is held only while a round runs, so a full pool never means flows at rest (nothing is disposed by time), and that the latest start attempt's outcome is reported for every port |
 | ADR-034 §5 "Health is true" (HL-1, HL-2), PRD-001 R35 | The lane's completed rounds are completed syncs (FX-16); the control socket answers under sync load (FX-17) |
 
 ## Implementation order and related work
