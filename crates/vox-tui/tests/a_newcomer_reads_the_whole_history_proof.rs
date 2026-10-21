@@ -548,9 +548,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
     std::thread::sleep(Duration::from_secs(20));
     let before = [synced(&alice), synced(&bob)];
+    let flushed_before = [store_counts(&alice), store_counts(&bob)];
     let counted = Instant::now();
     std::thread::sleep(IDLE);
     let after = [synced(&alice), synced(&bob)];
+    let flushed_after = [store_counts(&alice), store_counts(&bob)];
     let idled = counted.elapsed();
     let allowed = 2 * (idled.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
     let grown: Vec<u64> = (0..2)
@@ -582,6 +584,39 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
          (ADR-038 FX-16): alice {}, bob {}\nalice's status: {}\nbob's status: {}",
         after[0].1,
         after[1].1,
+        after[0].2,
+        after[1].2
+    );
+    // ---- nothing was flushed to disk over the quiet minute (ADR-038 FX-30; #1022) ------------
+    // A round that persists only derived state, or nothing, makes no full flush: `vox status
+    // --json` names the store's commits and how many were flushed, and the flushed count MUST
+    // stand still while nobody posts.
+    println!(
+        "[proof] ADR-038 FX-30 / #1022: over {idled:?} of quiet, alice's store went from {} \
+         commits ({} flushed) to {} ({} flushed); bob's from {} ({}) to {} ({})",
+        flushed_before[0].0,
+        flushed_before[0].1,
+        flushed_after[0].0,
+        flushed_after[0].1,
+        flushed_before[1].0,
+        flushed_before[1].1,
+        flushed_after[1].0,
+        flushed_after[1].1
+    );
+    assert!(
+        flushed_before[0].1 == flushed_after[0].1 && flushed_before[1].1 == flushed_after[1].1,
+        "PRODUCT: a quiet minute flushed the store to disk (ADR-038 FX-30, #1022): alice's \
+         flushes {} -> {} (commits {} -> {}), bob's flushes {} -> {} (commits {} -> {}); only \
+         what a person would lose is flushed, and nobody posted\nalice's status: {}\nbob's \
+         status: {}",
+        flushed_before[0].1,
+        flushed_after[0].1,
+        flushed_before[0].0,
+        flushed_after[0].0,
+        flushed_before[1].1,
+        flushed_after[1].1,
+        flushed_before[1].0,
+        flushed_after[1].0,
         after[0].2,
         after[1].2
     );
@@ -696,6 +731,7 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
 
     // ---- the agents work -----------------------------------------------------------------------
     let cpu0 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
+    let store0 = (store_counts(&alice), store_counts(&bob));
     let started = Instant::now();
     let worker = |dir: std::path::PathBuf, who: &'static str, rooms: Vec<String>| {
         std::thread::spawn(move || {
@@ -742,6 +778,9 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
     let cpu1 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
     let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
     let slowest = answers.iter().copied().max().unwrap_or_default();
+    // The work's last posts are let land before the store is counted, so a flush owed for a
+    // post still in flight is counted with the post that caused it.
+    let store1 = (store_counts(&alice), store_counts(&bob));
     // The work was real: each reads the other's last post, in the room it went to.
     let alice_last = format!("alice step {}", posted_a.saturating_sub(1));
     let bob_last = format!("bob step {}", posted_b.saturating_sub(1));
@@ -805,6 +844,37 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
         slowest <= ANSWER_WITHIN,
         "PRODUCT: `vox status --json` answered in {slowest:?} while agents worked, over \
          {ANSWER_WITHIN:?} (ADR-038 FX-17); every answer: {answers:?}"
+    );
+    // ---- only the posts were flushed to disk (ADR-038 FX-30; #1022) ----------------------------
+    // Over the minute each daemon flushed at most once per post it made (its own entry) and
+    // once per post it received (the flush that precedes acknowledging it); everything else it
+    // committed (render, indexes, folds, cursors) rode along without a flush. Measured before
+    // this: every commit was a flush, 0.65 thread-seconds per wall second inside F_FULLFSYNC.
+    let flushes = (
+        store1.0 .1.saturating_sub(store0.0 .1),
+        store1.1 .1.saturating_sub(store0.1 .1),
+    );
+    let commits = (
+        store1.0 .0.saturating_sub(store0.0 .0),
+        store1.1 .0.saturating_sub(store0.1 .0),
+    );
+    let allowed = (posted_a + posted_b) as u64;
+    println!(
+        "[proof] ADR-038 FX-30 / #1022: over {worked:?} alice's store made {} commits, {} flushed \
+         to disk; bob's {} commits, {} flushed; allowed flushes {allowed} each (one per post made \
+         or received)",
+        commits.0, flushes.0, commits.1, flushes.1
+    );
+    assert!(
+        flushes.0 <= allowed && flushes.1 <= allowed,
+        "PRODUCT: the daemon flushed derived state to disk (ADR-038 FX-30, #1022): over \
+         {worked:?} alice's store flushed {} of {} commits and bob's {} of {}, while {posted_a} \
+         and {posted_b} posts were made (at most {allowed} flushes each: one per post made or \
+         received)",
+        flushes.0,
+        commits.0,
+        flushes.1,
+        commits.1
     );
 }
 
@@ -1852,6 +1922,21 @@ fn cpu_time(pid: u32) -> Duration {
     let mins: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let hours: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
+}
+
+/// What one profile's store committed and flushed to disk since its daemon started, from `vox
+/// status --json` (`store.commits`, `store.flushes`; ADR-038 FX-30).
+fn store_counts(dir: &Path) -> (u64, u64) {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"));
+    let n = |k: &str| {
+        v["store"][k].as_u64().unwrap_or_else(|| {
+            panic!("PRODUCT: `vox status --json` does not count the store's {k} (ADR-038 FX-30): {out}")
+        })
+    };
+    (n("commits"), n("flushes"))
 }
 
 /// `vox status --json` of one profile: completed sync rounds summed over its ports, whether the
