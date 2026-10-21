@@ -423,7 +423,13 @@ fn read_hash(dir: &Path, room: &str, text: &str) -> Option<String> {
     }
 }
 
-fn history_status(dir: &Path, room: &str) -> (String, u64) {
+struct HistoryObservation {
+    phase: String,
+    remaining: u64,
+    request: Option<String>,
+}
+
+fn history_observation(dir: &Path, room: &str) -> HistoryObservation {
     let (ok, out, err) = vox(
         dir,
         &["room", "read", room, "--json", "--history", "status"],
@@ -436,14 +442,31 @@ fn history_status(dir: &Path, room: &str) -> (String, u64) {
     let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
         panic!("PRODUCT: `vox room read --history status --json` printed invalid JSON ({error}): {out}")
     });
-    let phase = value["status"]["phase"]
+    let status = &value["status"];
+    let phase = status["phase"]
         .as_str()
         .unwrap_or_else(|| panic!("PRODUCT: history status named no phase: {value}"))
         .to_owned();
-    let remaining = value["status"]["remaining"]
+    let remaining = status["remaining"]
         .as_u64()
         .unwrap_or_else(|| panic!("PRODUCT: history status named no remaining count: {value}"));
-    (phase, remaining)
+    // The CLI renders the binary request id as a copyable hexadecimal string at the envelope;
+    // the nested status keeps its wire-shaped byte array.
+    let request = match &value["request"] {
+        serde_json::Value::String(request) => Some(request.to_owned()),
+        serde_json::Value::Null => None,
+        _ => panic!("PRODUCT: history status printed a non-string request id: {value}"),
+    };
+    HistoryObservation {
+        phase,
+        remaining,
+        request,
+    }
+}
+
+fn history_status(dir: &Path, room: &str) -> (String, u64) {
+    let observed = history_observation(dir, room);
+    (observed.phase, observed.remaining)
 }
 
 /// How long after `since` each side first read the other: alice `to_alice`, bob `to_bob`
@@ -1046,11 +1069,58 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         std::thread::yield_now();
     }
+
+    // A completed inventory round is not evidence that Bob had to answer for Alice's history.
+    // Ask through the shipped reader for the exact page below Alice's oldest live-window row:
+    // that bounded interval contains the package. Alice is offline and Bob is the only source, so
+    // the retained request bound to that exact authenticated Alice cursor and ending its quantum
+    // has given Bob the exact opportunity to serve every byte he holds in that interval. Only
+    // after that causal boundary may absence of Alice's private tail be a privacy verdict.
+    let (ok, out, err) = vox(
+        &carol,
+        &[
+            "room",
+            "read",
+            &room,
+            "--history",
+            "older",
+            "--before",
+            &oldest,
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: while Alice was offline, Carol's shipped history read through Bob was refused: \
+         {out}{err}"
+    );
+    let history_deadline = Instant::now() + PAGE_WITHIN;
+    let bob_only_history = loop {
+        let observed = history_observation(&carol, &room);
+        if observed.request.is_some() && matches!(observed.phase.as_str(), "more" | "complete") {
+            break observed;
+        }
+        assert!(
+            Instant::now() < history_deadline,
+            "PRODUCT: Carol's shipped history status did not finish the exact Alice page through \
+             reachable Bob within {PAGE_WITHIN:?} while Alice was offline; phase={}, request={:?}, \
+             remaining={}\ncarol said: {}\nbob said: {}",
+            observed.phase,
+            observed.request,
+            observed.remaining,
+            said(&carol, "carol-from-bob"),
+            said(&bob, "bob-after-restart")
+        );
+        std::thread::yield_now();
+    };
     assert!(
         !reads(&carol, &room, &package_marker),
-        "PRODUCT: after a completed sync with Bob and a synchronous retained-package replay while \
-         Alice was offline, Carol read Alice's private-package tail {package_marker:?}; Bob \
-         persisted and re-served ciphertext addressed only to Carol\ncarol said: {}\nbob said: {}",
+        "PRODUCT: after Bob exhausted Carol's explicit Alice-history quantum (phase={}, \
+         remaining={}) and retained-package replay completed while Alice was offline, Carol read \
+         Alice's private-package tail {package_marker:?}; Bob persisted and re-served ciphertext \
+         addressed only to Carol\ncarol said: {}\nbob said: {}",
+        bob_only_history.phase,
+        bob_only_history.remaining,
         said(&carol, "carol-from-bob"),
         said(&bob, "bob-after-restart")
     );
