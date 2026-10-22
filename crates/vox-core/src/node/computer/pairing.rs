@@ -57,6 +57,63 @@ const TEST_STOPPED_READER_ARM_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ARM_FILE
 /// answered marker after every bounded slot reaches the unread error-response boundary.
 #[cfg(feature = "test-knobs")]
 const TEST_STOPPED_READER_ANSWERED_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE";
+
+/// Publish a populated proof marker in one namespace operation, without replacing an existing
+/// marker. The uniquely named sibling is complete and flushed before a no-replace rename makes
+/// the final name visible; a collision therefore remains an apparatus fault instead of silently
+/// consuming another hook invocation's marker.
+#[cfg(feature = "test-knobs")]
+fn publish_proof_marker(path: &std::path::Path, bytes: &[u8]) -> core::result::Result<(), String> {
+    use std::io::Write as _;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+    let staged = path.with_file_name(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| format!("could not create {}: {e}", staged.display()))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let cleanup = std::fs::remove_file(&staged).err();
+        return Err(format!(
+            "could not populate {}: {error}; cleanup: {cleanup:?}",
+            staged.display()
+        ));
+    }
+    drop(file);
+    if let Err(error) = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &staged,
+        rustix::fs::CWD,
+        path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        let cleanup = std::fs::remove_file(&staged).err();
+        return Err(format!(
+            "could not publish {} without replacement: {error}; cleanup: {cleanup:?}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Make a hook setup failure causally visible to the shipped-binary journey. The journey reads a
+/// successfully published fault marker first; if even that namespace operation is unavailable,
+/// daemon termination is its independent APPARATUS observation instead of an unbounded wait.
+#[cfg(feature = "test-knobs")]
+fn publish_proof_fault(path: &std::path::Path, detail: &str) {
+    if let Err(error) = publish_proof_marker(path, detail.as_bytes()) {
+        eprintln!(
+            "APPARATUS: could not publish proof fault {}: {error}",
+            path.display()
+        );
+        std::process::exit(70);
+    }
+}
 // An exchange carries retained records from the same bounded transaction, never a smaller
 // unrelated limit that would strand an otherwise valid roster as nodes are added.
 const MAX_FRAME: usize = MAX_STATE as usize;
@@ -3222,7 +3279,7 @@ impl Management {
                         }
                     }
                 };
-                let _ = std::fs::write(fault, detail);
+                publish_proof_fault(std::path::Path::new(fault), &detail);
             }
             return;
         };
@@ -3234,16 +3291,14 @@ impl Management {
             let _ = std::fs::remove_file(release);
             return;
         }
-        if std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(engaged)
-            .is_err()
+        if let Err(detail) =
+            publish_proof_marker(std::path::Path::new(engaged), text_id(&peer).as_bytes())
         {
             let _ = std::fs::remove_file(release);
+            let message = format!("retry-ready marker publication failed: {detail}");
+            publish_proof_fault(std::path::Path::new(fault), &message);
             return;
         }
-        let _ = std::fs::write(engaged, text_id(&peer));
         let _ = listener.accept().await;
         let _ = std::fs::remove_file(release);
     }

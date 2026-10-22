@@ -1802,14 +1802,14 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&a, &["status"])
     );
     loop {
-        if retry_ready_engaged.is_file() {
-            break;
-        }
         if retry_ready_fault.is_file() {
             panic!(
                 "APPARATUS: retry-ready was not the sole deadline source: {}",
                 std::fs::read_to_string(&retry_ready_fault).unwrap_or_default()
             );
+        }
+        if retry_ready_engaged.is_file() {
+            break;
         }
         if let Some(status) = left
             .child
