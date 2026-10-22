@@ -3566,16 +3566,23 @@ fn active_and_removed_computers_keep_local_manual_trust() {
     let operation = preview["pairing"]["operation_id"]
         .as_str()
         .expect("PRODUCT: pairing preview named no operation");
+    let approvals_started = Instant::now();
     computer(&b, &["approve", operation]);
     computer(&a, &["approve", operation]);
-    assert!(
-        wait_until(PAIR_WITHIN, || {
-            [&a, &b]
-                .into_iter()
-                .all(|account| computer(account, &["status"])["state"] == "confirmed")
-        }),
-        "PRODUCT: approved computers did not become confirmed"
-    );
+    loop {
+        let status_a = computer(&a, &["status"]);
+        let status_b = computer(&b, &["status"]);
+        if status_a["state"] == "confirmed" && status_b["state"] == "confirmed" {
+            break;
+        }
+        assert!(
+            approvals_started.elapsed() < CHANGE_SHOWN_WITHIN,
+            "PRODUCT: approved computers did not apply and confirm within the Computer change contract: alpha {status_a}; beta {status_b}; alpha daemon:\n{}\nbeta daemon:\n{}",
+            a.log(),
+            b.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 
     let a_frontier = computer(&a, &["status"])["frontier"]
         .as_str()
@@ -3658,7 +3665,8 @@ fn active_and_removed_computers_keep_local_manual_trust() {
         );
         assert!(
             ok,
-            "PRODUCT: active/removed computer refused later manual trust on {node}: {out}{err}"
+            "PRODUCT: active/removed computer refused later manual trust on {node}: {out}{err}\ndaemon:\n{}",
+            account.log()
         );
     }
     offline_for_enrollment(&a, "active computer manual-trust restart");

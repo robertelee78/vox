@@ -2524,8 +2524,12 @@ impl Computer {
     pub fn binding_group(&self) -> Option<Digest32> {
         let s = lock(&self.state);
         let local = self.signer.fingerprint();
-        if s.genesis.is_some() && s.grant(&local).is_some() {
-            return s.group();
+        if s.genesis.is_some() {
+            // Once an incarnation is established, its retained pairing intent is history, not a
+            // second source of binding authority. A removed computer has no binding group and
+            // must proceed to revocation-only application; falling through to `pending` made it
+            // rediscover the old approved genesis forever.
+            return s.grant(&local).and_then(|_| s.group());
         }
         let g = s.pending.as_ref()?;
         if g.group.is_some() {
@@ -2554,20 +2558,33 @@ impl Computer {
         name: &str,
         deadline: std::time::Instant,
     ) -> Result<()> {
-        let Some(group) = self.binding_group() else {
-            return Ok(());
-        };
         let local = self.signer.fingerprint();
         let key = signer.fingerprint();
-        // Derived once per revision (ADR-038 FX-28): the history is verified again only when
-        // the policy moved, by a change here or by a merged exchange.
-        if self.binding_current(&key) {
-            return Ok(());
-        }
-        self.change_until(deadline, |s| {
-            if s.quarantined.contains(&local) {
+        loop {
+            let Some(group) = self.binding_group() else {
                 return Ok(());
-            }
+            };
+            let current = self.change_until(deadline, |s| {
+                // `binding_group` and this transaction take the state lock separately. A remote
+                // removal or replacement incarnation can land between them; never use the
+                // captured group's grant to sign in the newer state. Retry a replacement group
+                // within the original causal boundary, or finish without a binding when this
+                // computer retired.
+                if s.group() != Some(group) || s.grant(&local).is_none() {
+                    return Ok(false);
+                }
+                // Derived once per revision (ADR-038 FX-28): the history is verified again only
+                // when the policy moved, by a change here or by a merged exchange.
+                if !Self::revision_expired(s)
+                    && s.derived
+                        .get(&key)
+                        .is_some_and(|derived| derived.revision == s.policy_revision)
+                {
+                    return Ok(true);
+                }
+                if s.quarantined.contains(&local) {
+                    return Ok(true);
+                }
             let (_old_revision, old_personal, mut bindings) = match s.rosters.get(&local) {
                 Some(r) => r.read(&local, &group)?,
                 None => (0, None, Vec::new()),
@@ -2589,7 +2606,7 @@ impl Computer {
                 }
             }
             if known && retained.is_none() && approval.is_none() {
-                if was_local { return Ok(()); } // Released: never silently reclaim an old vault.
+                if was_local { return Ok(true); } // Released: never silently reclaim an old vault.
                 return Err(Error::Profile("this node is bound to another computer; explicitly approve its signed transfer or recovery before unlocking it"));
             }
             if approval.is_some() { bindings.retain(|b| b.verify(&local, &group).ok() != Some(key)); }
@@ -2659,8 +2676,12 @@ impl Computer {
                     at_ms: pairing::now(),
                 },
             );
-            Ok(())
-        })
+            Ok(true)
+            })?;
+            if current {
+                return Ok(());
+            }
+        }
     }
 
     /// Exact policy for an attached node, from verified durable rosters. No roster grants room

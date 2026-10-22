@@ -779,8 +779,14 @@ impl Node {
         {
             return Ok(());
         }
-        loop {
+        'policy: loop {
             Self::computer_policy_active(deadline, cancelled)?;
+            // Binding and keyring are one policy projection. A remote roster can move policy
+            // after the event's initial binding preparation while this loop is committing an
+            // older keyring plan. Re-derive the binding on every retry within the same causal
+            // boundary; otherwise the keyring reaches revision N while its binding remains at
+            // N-1, making `policy_current` impossible and spinning until the deadline.
+            self.prepare_computer_binding_until(deadline, cancelled)?;
             let mut floor = 0;
             for room in self.channels.values() {
                 floor = floor.max(room.lock().await.newest_mint_seq());
@@ -817,7 +823,15 @@ impl Node {
             for room in rooms {
                 self.act_on_removals_while_closed(&room).await?;
                 Self::computer_policy_active(deadline, cancelled)?;
-                self.mark_decisions_on_open(&room).await?;
+                if let Err(error) = self.mark_decisions_on_open(&room).await {
+                    let applied = self
+                        .computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if identity.is_some_and(|node| !c.policy_current(applied, node)) {
+                        continue 'policy;
+                    }
+                    return Err(error);
+                }
                 Self::computer_policy_active(deadline, cancelled)?;
                 if let Some(channel) = self.channels.get(&room) {
                     channel.lock().await.release_held_packages();
@@ -827,7 +841,15 @@ impl Node {
             }
             self.deliver_owed_consents(None).await;
             Self::computer_policy_active(deadline, cancelled)?;
-            self.tend_drive_keys_until(deadline, cancelled).await?;
+            if let Err(error) = self.tend_drive_keys_until(deadline, cancelled).await {
+                let applied = self
+                    .computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if identity.is_some_and(|node| !c.policy_current(applied, node)) {
+                    continue 'policy;
+                }
+                return Err(error);
+            }
             if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
                 c.invalidate_reachers();
                 return Err(error);
@@ -1077,6 +1099,15 @@ impl Node {
                 settled: false,
             });
         }
+        // The durable keyring and its application receipt are now one settled authority
+        // projection. Publish that exact revision to the actor before running the ordinary room
+        // follow-up below: those paths revalidate `computer_revision`, and leaving the old value
+        // installed makes reconciliation reject itself as "pending" and the daemon detach a
+        // correctly updated node. A policy move after this store still makes every publication
+        // fence fail because `policy_current` compares this revision with durable state.
+        Self::computer_policy_active(deadline, cancelled)?;
+        self.computer_revision
+            .store(revision, std::sync::atomic::Ordering::Release);
         for (id, was) in changed_drive {
             self.note_capability(id, was);
         }
@@ -1093,8 +1124,6 @@ impl Node {
                 .filter(|fp| self.trust.has_drive(fp))
                 .collect();
         });
-        self.computer_revision
-            .store(revision, std::sync::atomic::Ordering::Release);
         Ok(KeyringApplication {
             changes,
             settled: true,

@@ -193,6 +193,9 @@ impl Router {
                         }
                     }
                     Err(why) => {
+                        eprintln!(
+                            "vox daemon: node {name} computer trust reconciliation at revision {revision} failed: {why}"
+                        );
                         if router.detach_failed_computer_node(name.clone(), generation, revision) {
                             management.node_pending(name.as_str(), &why);
                         }
