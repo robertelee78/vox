@@ -668,9 +668,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BoundedRoomReady { .. } => "retrying work after its room was released",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
-        NetEvent::BoundedFlowStateReady { .. } => {
-            "retrying retained work after running flow state was released"
-        }
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
@@ -1388,12 +1385,6 @@ enum NetEvent {
     },
     /// The exact shared byte reservation a bounded port met was released.
     BoundedBytesReady {
-        token: u64,
-        room: Digest32,
-        peer: Digest32,
-    },
-    /// A running round returned one daemon flow-state charge.
-    BoundedFlowStateReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
@@ -5004,6 +4995,9 @@ pub struct Node {
     presence: Option<(Arc<crate::node::presence::NetPresence>, bool)>,
     /// Sender the actor keeps so the network queue never closes under it.
     net_tx: mpsc::Sender<NetEvent>,
+    /// Impossible flow-state pressure has its own lossless actor-owned handoff. A charge release
+    /// enqueues the exact retained continuation synchronously, outside the bounded network queue.
+    flow_release_tx: tokio::sync::mpsc::UnboundedSender<crate::node::history_budget::FlowRelease>,
     /// Where the endpoint binds, if this node networks at all.
     bind: Option<Bind>,
     computer: Option<Arc<crate::node::computer::Computer>>,
@@ -5766,6 +5760,7 @@ impl Node {
         // later (ADR-020 §7); the actor keeps its own clone to emit with.
         let handle_event_tx = event_tx.clone();
         let (net_tx, net_rx) = mpsc::channel(NET_QUEUE);
+        let (flow_release_tx, flow_release_rx) = tokio::sync::mpsc::unbounded_channel();
         let decisions = crate::node::decisions::DecisionLog::new(&paths.profile_dir);
         let (anchor_inventory, anchor_inventory_load_error) =
             match crate::node::anchor_inventory::load(&paths) {
@@ -5786,6 +5781,7 @@ impl Node {
             held_notes: Vec::new(),
             history_budget,
             flow_pool_registration: None,
+            flow_release_tx,
             paths,
             decisions,
             profile,
@@ -6046,7 +6042,7 @@ impl Node {
         let decisions = node.decisions.clone();
         let computer = node.computer.clone();
         let computer_revision = Arc::clone(&node.computer_revision);
-        let actor = tokio::spawn(node.run(cmd_rx, net_rx));
+        let actor = tokio::spawn(node.run(cmd_rx, net_rx, flow_release_rx));
         let handle = NodeHandle {
             display_incarnation,
             computer,
@@ -6073,6 +6069,9 @@ impl Node {
         mut self,
         mut cmd_rx: mpsc::Receiver<(NodeCommand, oneshot::Sender<Outcome>)>,
         mut net_rx: mpsc::Receiver<NetEvent>,
+        mut flow_release_rx: tokio::sync::mpsc::UnboundedReceiver<
+            crate::node::history_budget::FlowRelease,
+        >,
     ) {
         // Two inputs, one writer: client commands and the network's inbound work are
         // interleaved here, so channel state is only ever mutated by this task
@@ -6330,12 +6329,53 @@ impl Node {
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
+                    if let NetEvent::Status(reply) = event {
+                        // Snapshotting the pool fences every synchronous release handoff included
+                        // in it. Drain exactly those already-granted orders before rendering the
+                        // actor-owned admission state. A missing handoff is therefore visible as
+                        // `granted: true` beside `handed_off: false`, never a transient race.
+                        let budget = self.history_budget.snapshot();
+                        let granted: BTreeSet<u64> = budget
+                            .flow_state_waiting
+                            .iter()
+                            .filter(|continuation| continuation.7)
+                            .map(|continuation| continuation.0)
+                            .collect();
+                        let mut later = Vec::new();
+                        while let Ok(release) = flow_release_rx.try_recv() {
+                            if granted.contains(&release.order) {
+                                if self.bounded_sync.accept_pool_release(release) {
+                                    self.sched_rooms.insert(release.room);
+                                }
+                            } else {
+                                later.push(release);
+                            }
+                        }
+                        let _ = reply.send(self.status_report(&budget));
+                        // A handoff later than the fenced snapshot belongs to the next state. It
+                        // may run after this report, but cannot alter the snapshot just returned.
+                        for release in later {
+                            if self.bounded_sync.accept_pool_release(release) {
+                                self.sched_rooms.insert(release.room);
+                            }
+                        }
+                        self.publish().await;
+                        self.schedule().await;
+                        continue;
+                    }
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
                     self.handle_net(event).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
                     self.schedule().await;
+                }
+                Some(release) = flow_release_rx.recv() => {
+                    if self.bounded_sync.accept_pool_release(release) {
+                        self.sched_rooms.insert(release.room);
+                        self.publish().await;
+                        self.schedule().await;
+                    }
                 }
                 _ = bounded_completion_wake.notified() => {
                     // Results were stored before this retained/coalesced edge fired. Audit every
@@ -10403,13 +10443,6 @@ impl Node {
                     self.sched_rooms.insert(room);
                 }
             }
-            NetEvent::BoundedFlowStateReady { token, room, peer } => {
-                if self.bounded_sync.pool_admission_ready(token, room, peer)
-                    && self.port_eligible(&(room, peer), std::time::Instant::now())
-                {
-                    self.sched_rooms.insert(room);
-                }
-            }
             NetEvent::BackoffExpired {
                 channel_id,
                 peer,
@@ -10786,9 +10819,6 @@ impl Node {
                     self.finish_leave_if_heard(channel_id, sent).await;
                 }
             }
-            NetEvent::Status(reply) => {
-                let _ = reply.send(self.status_report());
-            }
             NetEvent::SessionActivity {
                 channel_id,
                 query,
@@ -10838,6 +10868,9 @@ impl Node {
                     _ => Err("room not open".into()),
                 };
                 let _ = reply.send(result);
+            }
+            NetEvent::Status(_) => {
+                unreachable!("status is fenced and answered by the actor loop")
             }
             NetEvent::SessionFiles {
                 channel_id,
@@ -14992,7 +15025,10 @@ impl Node {
     fn register_in_flow_pool(&mut self) {
         if self.flow_pool_registration.is_none() {
             if let Some(me) = self.profile.as_ref().map(Profile::fingerprint) {
-                self.flow_pool_registration = Some(self.history_budget.register_node(me));
+                self.flow_pool_registration = Some(
+                    self.history_budget
+                        .register_node(me, self.flow_release_tx.clone()),
+                );
             }
         }
     }
@@ -20683,7 +20719,10 @@ impl Node {
     /// changing none of them.
     ///
     /// [`StatusBook`]: crate::node::status::StatusBook
-    fn status_report(&mut self) -> crate::node::status::StatusReport {
+    fn status_report(
+        &mut self,
+        budget: &crate::node::history_budget::BudgetSnapshot,
+    ) -> crate::node::status::StatusReport {
         use crate::node::status::{
             add_stats, ForwardStatus, MemberStatus, PeerStatus, RoomStatus, StatusReport,
         };
@@ -20747,7 +20786,7 @@ impl Node {
         // One snapshot of the daemon's budget for the whole document (ADR-038 FX-35): every
         // port's `round_running` and the pool's numbers agree with each other, whatever another
         // hosted node does meanwhile.
-        report.lanes = self.lanes_json(&self.history_budget.snapshot());
+        report.lanes = self.lanes_json(budget);
         report.preparing = view
             .channels
             .iter()

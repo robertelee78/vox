@@ -311,13 +311,17 @@ struct PoolAdmission {
     gate: &'static str,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
-    ticket: crate::node::history_budget::FlowWaitTicket,
-    task: tokio::task::JoinHandle<()>,
+    ticket: crate::node::history_budget::FlowReleaseTicket,
+    /// Set only by the exact release handoff. Unrelated actor events cannot consume a granted
+    /// continuation before this owner has received its causal edge.
+    handed_off: bool,
 }
 #[derive(Clone, Copy)]
 struct PoolWait {
     gate: &'static str,
     work: AdmissionWork,
+    request: stream::RequestId,
+    instance: [u8; 16],
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RequiredOwner {
@@ -392,9 +396,7 @@ impl Drop for Controller {
         for (_, admission) in std::mem::take(&mut self.byte_admission) {
             admission.task.abort();
         }
-        for (_, admission) in std::mem::take(&mut self.pool_admission) {
-            admission.task.abort();
-        }
+        self.pool_admission.clear();
         let mut flows = Vec::new();
         flows.extend(self.ready.iter_mut().filter_map(Option::take));
         flows.extend(self.deferred.drain(..));
@@ -688,39 +690,50 @@ impl Controller {
     }
 
     fn cancel_pool_admission(&mut self, room: Digest32, peer: Digest32) {
-        if let Some(admission) = self.pool_admission.remove(&(room, peer)) {
-            admission.task.abort();
-        }
+        self.pool_admission.remove(&(room, peer));
     }
 
-    pub(super) fn pool_admission_ready(&self, token: u64, room: Digest32, peer: Digest32) -> bool {
+    pub(super) fn accept_pool_release(
+        &mut self,
+        release: crate::node::history_budget::FlowRelease,
+    ) -> bool {
+        let Some(admission) = self.pool_admission.get_mut(&(release.room, release.peer)) else {
+            return false;
+        };
+        if admission.token != release.token
+            || admission.ticket.sequence() != release.order
+            || !admission.ticket.granted()
+        {
+            return false;
+        }
+        admission.handed_off = true;
+        true
+    }
+
+    pub(super) fn pool_admission_blocked(&self, room: Digest32, peer: Digest32) -> bool {
         self.pool_admission
             .get(&(room, peer))
-            .is_some_and(|admission| admission.token == token)
+            .is_some_and(|admission| !admission.handed_off)
     }
 
     fn wait_for_pool(
         &mut self,
-        net_tx: &mpsc::Sender<NetEvent>,
         next_token: &mut u64,
         room: Digest32,
         peer: Digest32,
         waiting: PoolWait,
-        ticket: crate::node::history_budget::FlowWaitTicket,
+        job: &crate::node::history_budget::Job,
     ) {
         if self.pool_admission.contains_key(&(room, peer)) {
             return;
         }
         let token = *next_token;
         *next_token += 1;
-        let tx = net_tx.clone();
-        let wake = ticket.wake();
-        let task = tokio::spawn(async move {
-            wake.await;
-            let _ = tx
-                .send(NetEvent::BoundedFlowStateReady { token, room, peer })
-                .await;
-        });
+        let Some(ticket) =
+            job.flow_wait_ticket(room, peer, waiting.request, waiting.instance, token)
+        else {
+            return;
+        };
         self.pool_admission.insert(
             (room, peer),
             PoolAdmission {
@@ -729,7 +742,7 @@ impl Controller {
                 root: waiting.work.root,
                 lane: waiting.work.lane,
                 ticket,
-                task,
+                handed_off: false,
             },
         );
     }
@@ -1076,9 +1089,7 @@ impl Controller {
         for (_, admission) in std::mem::take(&mut self.byte_admission) {
             admission.task.abort();
         }
-        for (_, admission) in std::mem::take(&mut self.pool_admission) {
-            admission.task.abort();
-        }
+        self.pool_admission.clear();
         for flow in self
             .deferred
             .iter()
@@ -2008,6 +2019,11 @@ impl Node {
         conn: Arc<VoxConnection>,
     ) -> bool {
         self.accept_bounded_sync();
+        // Only the exact release handoff may make an impossible-path continuation runnable.
+        // Generic actor traffic still evaluates queued ports, but cannot stand in for that edge.
+        if self.bounded_sync.pool_admission_blocked(room, peer) {
+            return false;
+        }
         let Some(profile) = self.profile.as_ref() else {
             return false;
         };
@@ -2561,21 +2577,21 @@ impl Node {
                 flow.park();
                 debug_assert!(self.bounded_sync.ready[index].is_none());
                 self.bounded_sync.ready[index] = Some(flow);
-                if let Some(ticket) =
-                    state_job.flow_wait_ticket(room, peer, retirement_request, instance)
-                {
-                    self.bounded_sync.wait_for_pool(
-                        &self.net_tx,
-                        &mut self.next_token,
-                        room,
-                        peer,
-                        PoolWait {
-                            gate,
-                            work: AdmissionWork { root, lane },
-                        },
-                        ticket,
-                    );
-                }
+                // A granted claim was consumed by this failed attempt, if one existed. Replace
+                // its actor-owned record with the exact still-retained Flow and a later order.
+                self.bounded_sync.cancel_pool_admission(room, peer);
+                self.bounded_sync.wait_for_pool(
+                    &mut self.next_token,
+                    room,
+                    peer,
+                    PoolWait {
+                        gate,
+                        work: AdmissionWork { root, lane },
+                        request: retirement_request,
+                        instance,
+                    },
+                    &state_job,
+                );
                 return false;
             }
         }
@@ -2827,7 +2843,8 @@ impl Controller {
                          root: &str,
                          lane: crate::node::history_budget::Lane,
                          request: Option<stream::RequestId>,
-                         wait_order: Option<u64>| {
+                         wait_order: Option<u64>,
+                         handed_off: Option<bool>| {
             let request = request.map_or_else(
                 || "null".to_owned(),
                 |request| {
@@ -2841,7 +2858,7 @@ impl Controller {
                 },
             );
             format!(
-                "{{\"admission\":{},\"gate\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"request\":{},\"wait_order\":{}}}",
+                "{{\"admission\":{},\"gate\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"request\":{},\"wait_order\":{},\"handed_off\":{}}}",
                 token,
                 gate,
                 b32_encode(&room),
@@ -2849,7 +2866,8 @@ impl Controller {
                 root,
                 lane_name(lane),
                 request,
-                wait_order.map_or_else(|| "null".to_owned(), |order| order.to_string())
+                wait_order.map_or_else(|| "null".to_owned(), |order| order.to_string()),
+                handed_off.map_or_else(|| "null".to_owned(), |value| value.to_string())
             )
         };
         let mut admissions = Vec::new();
@@ -2863,6 +2881,7 @@ impl Controller {
                 crate::node::history_budget::Lane::Archive,
                 Some(waiting.request),
                 None,
+                None,
             ));
         }
         admissions.extend(self.foreground_admission.iter().flatten().map(|waiting| {
@@ -2873,6 +2892,7 @@ impl Controller {
                 waiting.peer,
                 waiting.root,
                 waiting.lane,
+                None,
                 None,
                 None,
             )
@@ -2887,6 +2907,7 @@ impl Controller {
                 waiting.lane,
                 None,
                 None,
+                None,
             )
         }));
         admissions.extend(self.secret_admission.iter().map(|((room, peer), waiting)| {
@@ -2897,6 +2918,7 @@ impl Controller {
                 *peer,
                 waiting.root,
                 waiting.lane,
+                None,
                 None,
                 None,
             )
@@ -2911,6 +2933,7 @@ impl Controller {
                 waiting.lane,
                 None,
                 None,
+                None,
             )
         }));
         admissions.extend(self.pool_admission.iter().map(|((room, peer), waiting)| {
@@ -2923,6 +2946,7 @@ impl Controller {
                 waiting.lane,
                 None,
                 Some(waiting.ticket.sequence()),
+                Some(waiting.handed_off),
             )
         }));
         format!(

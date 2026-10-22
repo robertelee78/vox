@@ -503,7 +503,7 @@ impl Flow {
         &mut self,
         job: &Job,
         bytes: crate::node::history_budget::BufferCharge,
-        waiter: Option<&mut crate::node::history_budget::FlowWaitTicket>,
+        waiter: Option<&mut crate::node::history_budget::FlowReleaseTicket>,
     ) -> Resumed {
         if self.state_charge.is_some() {
             return Resumed::Held;

@@ -454,30 +454,35 @@ impl Job {
         peer: Digest32,
         request: [u8; 16],
         instance: [u8; 16],
-    ) -> Option<FlowWaitTicket> {
+        token: u64,
+    ) -> Option<FlowReleaseTicket> {
         let owner = self.0.flow_owner?;
         let budget = Arc::clone(&self.0.budget);
         let mut pool = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
-        let node = pool.owners.get(&owner)?.node;
-        let mut id = pool.next_waiter.wrapping_add(1);
-        while pool.waiters.iter().any(|waiting| waiting.id == id) {
+        let mut id = pool.next_continuation.wrapping_add(1);
+        while pool
+            .owners
+            .values()
+            .any(|owner| owner.continuations.contains_key(&id))
+        {
             id = id.wrapping_add(1);
         }
-        pool.next_waiter = id;
-        pool.waiters.push_back(FlowWaiter {
+        pool.next_continuation = id;
+        pool.owners.get_mut(&owner)?.continuations.insert(
             id,
-            owner,
-            node,
-            room,
-            peer,
-            request,
-            instance,
-            granted: false,
-            wake: Arc::new(Notify::new()),
-        });
-        pool.grant_waiters();
+            FlowContinuation {
+                id,
+                room,
+                peer,
+                request,
+                instance,
+                token,
+                granted: false,
+            },
+        );
+        pool.handoff_continuations();
         drop(pool);
-        Some(FlowWaitTicket { budget, id })
+        Some(FlowReleaseTicket { budget, owner, id })
     }
 
     /// Subscribe before a shared byte reservation attempt so its exact release cannot be lost.
@@ -548,7 +553,7 @@ impl Job {
         request: [u8; 16],
         instance: [u8; 16],
         bytes: BufferCharge,
-        waiter: Option<&mut FlowWaitTicket>,
+        waiter: Option<&mut FlowReleaseTicket>,
     ) -> FlowStateTry {
         let budget = Arc::clone(&self.0.budget);
         let mut p = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
@@ -579,14 +584,21 @@ impl Job {
             .map(|pool_owner| pool_owner.charges)
             .sum();
         let promised_for_node = p
-            .waiters
-            .iter()
-            .filter(|waiting| waiting.granted && waiting.node == node)
+            .owners
+            .values()
+            .filter(|owner| owner.node == node)
+            .flat_map(|owner| owner.continuations.values())
+            .filter(|continuation| continuation.granted)
             .count();
         if !granted && node_in_use + promised_for_node >= BOUNDED_SYNC_RUNNING_SLOTS {
             return FlowStateTry::NodeBusy;
         }
-        let promised = p.waiters.iter().filter(|waiting| waiting.granted).count();
+        let promised = p
+            .owners
+            .values()
+            .flat_map(|owner| owner.continuations.values())
+            .filter(|continuation| continuation.granted)
+            .count();
         if !granted && p.in_use + promised >= p.limit {
             return FlowStateTry::PoolFull;
         }
@@ -853,31 +865,41 @@ struct Pool {
     /// The current actor generation for each hosted fingerprint.
     active: BTreeMap<Digest32, u64>,
     /// Active and retiring actor generations. A replacement with the same fingerprint gets its
-    /// own owner for exact attribution, but both generations count as one hosted node.
+    /// own owner for exact attribution, but both generations count as one hosted node. Impossible
+    /// continuations remain actor-owned here, never in a daemon-wide wait queue.
     owners: BTreeMap<u64, PoolOwner>,
-    /// Impossible-path continuations, ordered by the admission failure that retained their exact
-    /// Flow. A granted row is not a charge: it is a release-edge claim which prevents a later
-    /// contender taking that capacity before the selected continuation resumes.
-    waiters: VecDeque<FlowWaiter>,
-    next_waiter: u64,
+    next_continuation: u64,
 }
 
-struct FlowWaiter {
+struct FlowContinuation {
     id: u64,
-    owner: u64,
-    node: Digest32,
     room: Digest32,
     peer: Digest32,
     request: [u8; 16],
     instance: [u8; 16],
+    token: u64,
     granted: bool,
-    wake: Arc<Notify>,
 }
 
 struct PoolOwner {
     node: Digest32,
     registered: bool,
     charges: usize,
+    /// Exact Flows remain in this actor generation's controller. These records only bind their
+    /// monotonic release order and causal actor handoff; they are not a daemon-wide work queue.
+    continuations: BTreeMap<u64, FlowContinuation>,
+    release: tokio::sync::mpsc::UnboundedSender<FlowRelease>,
+}
+
+/// A charge release synchronously puts this exact retained continuation on its owning actor's
+/// runnable queue. The actor processes this queue before reporting status, so a shipped snapshot
+/// cannot mistake a pending handoff for a wedge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FlowRelease {
+    pub(crate) order: u64,
+    pub(crate) token: u64,
+    pub(crate) room: Digest32,
+    pub(crate) peer: Digest32,
 }
 
 /// Exact running-round ownership published in the same pool snapshot as its charge.
@@ -900,8 +922,7 @@ impl Default for Pool {
             next_owner: 0,
             active: BTreeMap::new(),
             owners: BTreeMap::new(),
-            waiters: VecDeque::new(),
-            next_waiter: 0,
+            next_continuation: 0,
         }
     }
 }
@@ -918,43 +939,78 @@ impl Pool {
             .collect::<BTreeSet<_>>()
             .len();
         self.limit = FLOW_STATE_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * hosted);
-        self.grant_waiters();
+        self.handoff_continuations();
     }
 
-    /// Select the earliest continuation which can use a daemon charge and one of its node's two
-    /// source-owned running slots. Grants are counted ahead of new contenders until consumed or
-    /// cancelled, making release ownership monotonic rather than a Notify race.
-    fn grant_waiters(&mut self) {
+    /// Select the earliest actor-owned continuation which can use a daemon charge and one of its
+    /// node's two source-owned running slots. A successful synchronous send is a promise counted
+    /// ahead of new contenders until consumed or cancelled. The pool scans the continuations of
+    /// its already-registered actor generations; it owns no daemon-wide work queue.
+    fn handoff_continuations(&mut self) {
         loop {
             let promised = self
-                .waiters
-                .iter()
-                .filter(|waiting| waiting.granted)
+                .owners
+                .values()
+                .flat_map(|owner| owner.continuations.values())
+                .filter(|continuation| continuation.granted)
                 .count();
             if self.in_use + promised >= self.limit {
                 return;
             }
-            let at = self.waiters.iter().position(|waiting| {
-                if waiting.granted || !self.owners.contains_key(&waiting.owner) {
-                    return false;
+            let candidate = self
+                .owners
+                .iter()
+                .filter(|(_, owner)| owner.registered)
+                .flat_map(|(generation, owner)| {
+                    owner
+                        .continuations
+                        .values()
+                        .filter(|continuation| !continuation.granted)
+                        .map(move |continuation| (*generation, owner.node, continuation.id))
+                })
+                .filter(|(_, node, _)| {
+                    let in_use: usize = self
+                        .owners
+                        .values()
+                        .filter(|owner| owner.node == *node)
+                        .map(|owner| owner.charges)
+                        .sum();
+                    let promised = self
+                        .owners
+                        .values()
+                        .filter(|owner| owner.node == *node)
+                        .flat_map(|owner| owner.continuations.values())
+                        .filter(|continuation| continuation.granted)
+                        .count();
+                    in_use + promised < BOUNDED_SYNC_RUNNING_SLOTS
+                })
+                .min_by_key(|(_, _, order)| *order);
+            let Some((generation, _, order)) = candidate else {
+                return;
+            };
+            let sent = {
+                let Some(owner) = self.owners.get_mut(&generation) else {
+                    continue;
+                };
+                let Some(continuation) = owner.continuations.get_mut(&order) else {
+                    continue;
+                };
+                continuation.granted = true;
+                owner
+                    .release
+                    .send(FlowRelease {
+                        order,
+                        token: continuation.token,
+                        room: continuation.room,
+                        peer: continuation.peer,
+                    })
+                    .is_ok()
+            };
+            if !sent {
+                if let Some(owner) = self.owners.get_mut(&generation) {
+                    owner.continuations.remove(&order);
                 }
-                let in_use: usize = self
-                    .owners
-                    .values()
-                    .filter(|owner| owner.node == waiting.node)
-                    .map(|owner| owner.charges)
-                    .sum();
-                let promised = self
-                    .waiters
-                    .iter()
-                    .filter(|candidate| candidate.granted && candidate.node == waiting.node)
-                    .count();
-                in_use + promised < BOUNDED_SYNC_RUNNING_SLOTS
-            });
-            let Some(at) = at else { return };
-            let waiting = &mut self.waiters[at];
-            waiting.granted = true;
-            waiting.wake.notify_one();
+            }
         }
     }
 }
@@ -962,33 +1018,13 @@ impl Pool {
 /// Exact ownership of an impossible flow-state admission wait. It retains no worker, bytes,
 /// outbound slot or flow-state charge. Dropping it removes ineligible work immediately and, when
 /// it owned a release-edge grant, passes that grant to the next earliest eligible continuation.
-pub(crate) struct FlowWaitTicket {
+pub(crate) struct FlowReleaseTicket {
     budget: Arc<Budget>,
+    owner: u64,
     id: u64,
 }
 
-impl FlowWaitTicket {
-    pub(crate) fn wake(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let wake = self
-            .budget
-            .pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .waiters
-            .iter()
-            .find(|waiting| waiting.id == self.id)
-            .map(|waiting| Arc::clone(&waiting.wake));
-        let Some(wake) = wake else {
-            // Actor replacement/cancellation may retire the exact owner between enrollment and
-            // spawning its waiter. Do not leave that actor task asleep on an unrelated, private
-            // Notify; let it report the now-stale token and retire normally.
-            return Box::pin(std::future::ready(()));
-        };
-        let mut future = Box::pin(wake.notified_owned());
-        future.as_mut().enable();
-        future
-    }
-
+impl FlowReleaseTicket {
     fn take_grant_locked(
         &self,
         pool: &mut Pool,
@@ -998,24 +1034,34 @@ impl FlowWaitTicket {
         request: [u8; 16],
         instance: [u8; 16],
     ) -> bool {
-        let Some(at) = pool
-            .waiters
-            .iter()
-            .position(|waiting| waiting.id == self.id)
-        else {
+        let Some(owner_state) = pool.owners.get_mut(&owner) else {
             return false;
         };
-        if !pool.waiters[at].granted
-            || pool.waiters[at].owner != owner
-            || pool.waiters[at].room != room
-            || pool.waiters[at].peer != peer
-            || pool.waiters[at].request != request
-            || pool.waiters[at].instance != instance
+        let Some(continuation) = owner_state.continuations.get(&self.id) else {
+            return false;
+        };
+        if self.owner != owner
+            || !continuation.granted
+            || continuation.room != room
+            || continuation.peer != peer
+            || continuation.request != request
+            || continuation.instance != instance
         {
             return false;
         }
-        pool.waiters.remove(at);
+        owner_state.continuations.remove(&self.id);
         true
+    }
+
+    pub(crate) fn granted(&self) -> bool {
+        self.budget
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .owners
+            .get(&self.owner)
+            .and_then(|owner| owner.continuations.get(&self.id))
+            .is_some_and(|continuation| continuation.granted)
     }
 
     pub(crate) fn sequence(&self) -> u64 {
@@ -1023,15 +1069,17 @@ impl FlowWaitTicket {
     }
 }
 
-impl Drop for FlowWaitTicket {
+impl Drop for FlowReleaseTicket {
     fn drop(&mut self) {
         let mut pool = self
             .budget
             .pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        pool.waiters.retain(|waiting| waiting.id != self.id);
-        pool.grant_waiters();
+        if let Some(owner) = pool.owners.get_mut(&self.owner) {
+            owner.continuations.remove(&self.id);
+        }
+        pool.handoff_continuations();
     }
 }
 
@@ -1056,8 +1104,8 @@ impl Drop for FlowPoolRegistration {
         }
         if let Some(owner) = p.owners.get_mut(&self.owner) {
             owner.registered = false;
+            owner.continuations.clear();
         }
-        p.waiters.retain(|waiting| waiting.owner != self.owner);
         if p.owners
             .get(&self.owner)
             .is_some_and(|owner| owner.charges == 0)
@@ -1147,22 +1195,29 @@ pub struct BudgetSnapshot {
     /// The running rounds holding a flow state (node, room, peer), from the same view.
     pub flow_state_running: Vec<FlowStateOwner>,
     /// Exact retained impossible-path continuations in monotonic enrollment order.
-    pub flow_state_waiting: Vec<(
-        u64,
-        u64,
-        Digest32,
-        Digest32,
-        Digest32,
-        [u8; 16],
-        [u8; 16],
-        bool,
-    )>,
+    pub flow_state_waiting: Vec<FlowContinuationSnapshot>,
 }
+
+/// Monotonic order, actor, node, room, peer, request, incarnation and release grant.
+pub type FlowContinuationSnapshot = (
+    u64,
+    u64,
+    Digest32,
+    Digest32,
+    Digest32,
+    [u8; 16],
+    [u8; 16],
+    bool,
+);
 
 impl Budget {
     /// A hosted node lists itself in the flow-state pool when it starts networking, at 0 until
     /// it holds one (`by_node` has one member per hosted node, ADR-038 FX-35).
-    pub(crate) fn register_node(self: &Arc<Self>, node: Digest32) -> FlowPoolRegistration {
+    pub(crate) fn register_node(
+        self: &Arc<Self>,
+        node: Digest32,
+        release: tokio::sync::mpsc::UnboundedSender<FlowRelease>,
+    ) -> FlowPoolRegistration {
         let mut p = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
         let mut owner = p.next_owner.wrapping_add(1);
         while p.owners.contains_key(&owner) {
@@ -1172,11 +1227,11 @@ impl Budget {
         if let Some(replaced_owner) = p.active.insert(node, owner) {
             if let Some(replaced) = p.owners.get_mut(&replaced_owner) {
                 replaced.registered = false;
+                replaced.continuations.clear();
             }
             // The replacement owns new work for this fingerprint. An old generation may keep
             // an already-running charge until its task returns, but its parked continuations
             // ceased to be eligible at replacement and must not consume a later release grant.
-            p.waiters.retain(|waiting| waiting.owner != replaced_owner);
         }
         p.owners.insert(
             owner,
@@ -1184,6 +1239,8 @@ impl Budget {
                 node,
                 registered: true,
                 charges: 0,
+                continuations: BTreeMap::new(),
+                release,
             },
         );
         p.owners
@@ -1243,24 +1300,30 @@ impl Budget {
             flow_state_running: p
                 .running
                 .iter()
-                .flat_map(|(owner, count)| std::iter::repeat(*owner).take(*count))
+                .flat_map(|(owner, count)| std::iter::repeat_n(*owner, *count))
                 .collect(),
-            flow_state_waiting: p
-                .waiters
-                .iter()
-                .map(|waiting| {
-                    (
-                        waiting.id,
-                        waiting.owner,
-                        waiting.node,
-                        waiting.room,
-                        waiting.peer,
-                        waiting.request,
-                        waiting.instance,
-                        waiting.granted,
-                    )
-                })
-                .collect(),
+            flow_state_waiting: {
+                let mut waiting = p
+                    .owners
+                    .iter()
+                    .flat_map(|(generation, owner)| {
+                        owner.continuations.values().map(|continuation| {
+                            (
+                                continuation.id,
+                                *generation,
+                                owner.node,
+                                continuation.room,
+                                continuation.peer,
+                                continuation.request,
+                                continuation.instance,
+                                continuation.granted,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                waiting.sort_by_key(|continuation| continuation.0);
+                waiting
+            },
         }
     }
 }

@@ -1389,6 +1389,108 @@ impl Drop for TailObserver {
 }
 
 #[cfg(feature = "optional-proofs")]
+fn observe_flow_release_handoff(
+    dir: &Path,
+    node: Option<&str>,
+    who: &str,
+    wait_order: u64,
+    room: &str,
+    peer: &str,
+) {
+    loop {
+        let shown = fx35_synced(dir, node);
+        let status: serde_json::Value =
+            serde_json::from_str(&shown.status).unwrap_or_else(|error| {
+                panic!(
+                    "PRODUCT: {who}'s release-edge status was not JSON ({error}): {}",
+                    shown.status
+                )
+            });
+        let continuation = status["lanes"]["budget"]["flow_state"]["waiting"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|continuation| continuation["order"] == wait_order);
+        let admission = status["lanes"]["bounded"]["admissions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|admission| admission["wait_order"] == wait_order);
+        let Some(continuation) = continuation else {
+            // Consuming the exact promise removes both records before the round becomes visible;
+            // that is causal product progress, not a wall-clock inference.
+            assert!(
+                admission.is_none_or(|admission| admission["handed_off"] == true),
+                "PRODUCT: {who}'s actor still retains flow-state admission {wait_order} for \
+                 {room}/{peer} after its exact pool promise disappeared, but status says the \
+                 release was not handed off: {}",
+                shown.status
+            );
+            return;
+        };
+        if continuation["granted"] != true {
+            let pool = &status["lanes"]["budget"]["flow_state"];
+            let waiting = pool["waiting"].as_array().cloned().unwrap_or_default();
+            let promised = waiting
+                .iter()
+                .filter(|candidate| candidate["granted"] == true)
+                .count() as u64;
+            let capacity_available = pool["in_use"]
+                .as_u64()
+                .zip(pool["limit"].as_u64())
+                .is_some_and(|(in_use, limit)| in_use + promised < limit);
+            let earliest_eligible = capacity_available.then(|| {
+                waiting
+                    .iter()
+                    .filter(|candidate| candidate["granted"] != true)
+                    .filter(|candidate| {
+                        let Some(node) = candidate["node"].as_str() else {
+                            return false;
+                        };
+                        let charged = pool["by_node"][node].as_u64().unwrap_or(u64::MAX);
+                        let promised_here = waiting
+                            .iter()
+                            .filter(|other| {
+                                other["granted"] == true && other["node"].as_str() == Some(node)
+                            })
+                            .count() as u64;
+                        charged + promised_here
+                            < vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS as u64
+                    })
+                    .filter_map(|candidate| candidate["order"].as_u64())
+                    .min()
+            });
+            assert_ne!(
+                earliest_eligible.flatten(),
+                Some(wait_order),
+                "PRODUCT: flow-state continuation {wait_order} for {who} ({room}/{peer}) is the \
+                 earliest eligible retained Flow after capacity was released, but the pool did \
+                 not grant and hand it to its actor: {}",
+                shown.status
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let admission = admission.unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: flow-state continuation {wait_order} for {who} ({room}/{peer}) owns a \
+                 release promise but the actor no longer reports its exact retained admission: \
+                 {}",
+                shown.status
+            )
+        });
+        assert_eq!(
+            admission["handed_off"], true,
+            "PRODUCT: flow-state continuation {wait_order} for {who} ({room}/{peer}) owns the \
+             earliest eligible release promise, but its actor did not receive that causal \
+             handoff: {}",
+            shown.status
+        );
+        return;
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
 fn charged_flow_hold_entries(hold: &Path) -> Vec<(u64, String, std::path::PathBuf)> {
     let Some(parent) = hold.parent() else {
         return Vec::new();
@@ -1599,7 +1701,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         // pool admission that name its exact room, peer, root and lane. A refusal on some other
         // port cannot satisfy this claim.
         let bounded = &replacement["lanes"]["bounded"];
-        let bound_refusals: Vec<(usize, String, String, u64)> = successors
+        let bound_refusals: Vec<(usize, String, String, u64, u64)> = successors
             .iter()
             .enumerate()
             .filter_map(|(index, (room, peer, _))| {
@@ -1620,13 +1722,14 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
                 let root = admission["root"].as_str()?.to_owned();
                 let lane = admission["lane"].as_str()?.to_owned();
                 let token = admission["admission"].as_u64()?;
+                let wait_order = admission["wait_order"].as_u64()?;
                 bounded["ready"].as_array()?.iter().find(|flow| {
                     flow["room"] == *room
                         && flow["peer"] == *peer
                         && flow["root"].as_str() == Some(root.as_str())
                         && flow["lane"].as_str() == Some(lane.as_str())
                 })?;
-                Some((index, root, lane, token))
+                Some((index, root, lane, token, wait_order))
             })
             .collect();
         let exact_refusal = (bound_refusals.len() == 1).then(|| bound_refusals[0].clone());
@@ -1679,7 +1782,15 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
     let release_started = Instant::now();
     std::fs::remove_file(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release {}: {error}", hold.display()));
-    let (refused_index, refused_root, refused_lane, refused_admission) = refused;
+    let (refused_index, refused_root, refused_lane, refused_admission, wait_order) = refused;
+    observe_flow_release_handoff(
+        &staged.host,
+        Some(running_name),
+        running_name,
+        wait_order,
+        successors[refused_index].0,
+        successors[refused_index].1,
+    );
     successor_tails[refused_index].wait_for_after(
         successors[refused_index].2,
         running_name,
@@ -1737,13 +1848,14 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// reporting the right limit, turning the unused-capacity PoolFull PRODUCT assertion red;
 /// `scratchpad/mutant_fx35_required.py` disposes the exact required root at an admission
 /// refusal, turning the retained-required-root PRODUCT assertion red at the PoolFull snapshot;
-/// `scratchpad/mutant_fx35_release_wake.py` drops both exact release wakes; the already-attached
-/// shipped tail and retained exact admission then expose the missing causal release while periodic
-/// scheduling is disabled and no post-release request can stand in for it; dropping archive
-/// ownership turns the exact shipped archive request's structural ownership assertion red;
-/// `scratchpad/mutant_fx35_node_release.py` drops the charged worker's pool, lane and completion
-/// release notifications, so the exact room/peer/root/lane NodeBusy admission remains visible
-/// but its already-attached tail turns PRODUCT red without a command that could schedule it;
+/// `scratchpad/mutant_fx35_release_wake.py` removes the synchronous actor handoff after granting
+/// the earliest exact continuation; one shipped status snapshot then reports the same release
+/// order `granted: true` and `handed_off: false`, immediately PRODUCT red before the already-
+/// attached tail is consulted; dropping archive ownership turns the exact shipped archive
+/// request's structural ownership assertion red; `scratchpad/mutant_fx35_node_release.py` removes
+/// `FlowStateCharge::drop`'s capacity-to-continuation handoff, so status shows the exact room/peer/
+/// root/lane NodeBusy admission as the earliest eligible ungranted Flow after its charge is gone,
+/// another terminating PRODUCT state without a scheduling command or tick;
 /// giving a replacement generation two new node slots instead of sharing the retired actor's
 /// source-owned pair prevents the exact NodeBusy verdict and makes the generation assertion
 /// PRODUCT-red (and returning PoolFull names that separate PRODUCT defect); removing the
@@ -1838,7 +1950,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     );
     let mut pool_full_seen = false;
     let mut required_pool_full_seen = false;
-    let mut live_pool_full: Option<(&str, Instant)> = None;
+    let mut live_pool_full: Option<(&str, Instant, u64, String)> = None;
     let mut most_pressure = 0;
     let mut pressure_staged = false;
     let observed = 'pressure: loop {
@@ -1899,11 +2011,32 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 })
             {
                 required_pool_full_seen |= flow["root"] == "required";
-                if flow["room"] == *pressure_room && required_pool_full_seen {
-                    live_pool_full = Some((*name, Instant::now()));
-                    most_pressure = most_pressure.max(in_use);
-                    break 'pressure most_pressure;
-                }
+            }
+            if let Some(admission) =
+                bounded["admissions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|admission| {
+                        admission["gate"] == "pool"
+                            && admission["root"] == "required"
+                            && admission["room"] == *pressure_room
+                    })
+            {
+                let wait_order = admission["wait_order"].as_u64().unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT: {name}'s exact PoolFull admission omitted its monotonic release \
+                         order: {}",
+                        shown.status
+                    )
+                });
+                let peer = admission["peer"]
+                    .as_str()
+                    .expect("PRODUCT: exact PoolFull admission omitted peer")
+                    .to_owned();
+                live_pool_full = Some((*name, Instant::now(), wait_order, peer));
+                most_pressure = most_pressure.max(in_use);
+                break 'pressure most_pressure;
             }
             most_pressure = most_pressure.max(in_use);
         }
@@ -1926,12 +2059,17 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             "PRODUCT: a shipped bounded start reached PoolFull but status did not retain its \
              exact required root; the dependency was discarded instead of re-armed"
         );
-        let (name, observed_at) = live_pool_full.unwrap_or_else(|| {
+        let (name, observed_at, wait_order, peer) = live_pool_full.unwrap_or_else(|| {
             panic!(
                 "PRODUCT: a shipped bounded start reached PoolFull but no exact shared-room \
                  required admission remained for the release edge"
             )
         });
+        let (dir, node, _, _) = staged.everyone[..staged.hosted]
+            .iter()
+            .find(|(_, _, candidate, _)| *candidate == name)
+            .expect("APPARATUS: PoolFull owner disappeared from staged nodes");
+        observe_flow_release_handoff(dir, *node, name, wait_order, pressure_room, &peer);
         pressure_tails
             .get(name)
             .expect("APPARATUS: PoolFull node lost its pre-attached observer")
