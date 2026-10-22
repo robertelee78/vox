@@ -8169,15 +8169,22 @@ impl ChannelState {
     }
 
     fn drain_backfill(&mut self, store: &Store, now_ms: u64) -> Result<usize> {
+        // No durable cursor means no render work. Return before `place_committed`: that follow-up
+        // also advances legacy/private-session migration and is not a harmless empty read. A
+        // maintenance sweep with no backfill used to run it for every room on every unrelated
+        // continuation, keeping the actor hot and starving commands even while shipped status
+        // truthfully reported `render_backfill_pending: false`.
+        if !self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?
+            .has_backfill()
+        {
+            self.backfill_after = None;
+            self.backfill_refreshing = false;
+            return Ok(0);
+        }
         let mut expired = Vec::new();
         let result = (|| -> Result<Vec<Rendered>> {
-            if !self
-                .entries
-                .render_view(store, &self.sek, &self.channel_id)?
-                .has_backfill()
-            {
-                return Ok(Vec::new());
-            }
             let mut batch = store.batch()?;
             let rows =
                 self.drain_backfill_into(&mut batch, &BTreeSet::new(), now_ms, &mut expired)?;
