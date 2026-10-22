@@ -4388,14 +4388,18 @@ impl NodeHandle {
     /// one that lands afterward overlaps this read, which linearizes at the classification. No
     /// potentially large view clone or formatting holds the Computer state lock.
     pub(crate) fn coherent_view(&self) -> (NodeView, bool) {
-        let view = self.view_rx.borrow().clone();
         let applied = self
             .computer_revision
             .load(std::sync::atomic::Ordering::Acquire);
-        let policy_current = self
-            .computer
-            .as_ref()
-            .is_none_or(|computer| computer.policy_current(applied));
+        // Load the actor revision before cloning the rows it publishes before that release
+        // store.  The opposite order could pair old trust rows with the new revision and call
+        // them current.
+        let view = self.view_rx.borrow().clone();
+        let policy_current = self.computer.as_ref().is_none_or(|computer| {
+            view.identity
+                .as_ref()
+                .is_some_and(|identity| computer.policy_current(applied, identity.fingerprint))
+        });
         #[cfg(feature = "test-knobs")]
         let policy_current =
             policy_current || crate::node::computer::fx28_mutant("stale-trust-projection");
@@ -4909,6 +4913,16 @@ enum RoomPublicationKind {
     Anchors,
 }
 
+/// What durable room state existed before this publication began.  Only a failed create or join
+/// owns newly-written room rows and may purge them; opening an existing room owns only its live
+/// projection and must leave the user's stored room and reopen record intact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomPublicationOwnership {
+    Existing,
+    Joined,
+    Created,
+}
+
 /// One original room reply, fenced to the room it actually published.
 /// Reopens use the same completion without retaining an individual reply.
 struct RoomPublication {
@@ -4919,7 +4933,7 @@ struct RoomPublication {
     /// Settings need current local policy/configuration, not history or an anchor round.
     kind: RoomPublicationKind,
     /// The exact Computer projection which authorized creating/joining/opening this incarnation.
-    authority: Option<(computer::ComputerAuthority, bool)>,
+    authority: Option<(computer::ComputerAuthority, RoomPublicationOwnership)>,
 }
 
 /// The node actor's state (owned by its task).
@@ -5207,9 +5221,10 @@ pub struct Node {
     /// One completion per room, after current detail is published and any required
     /// initial anchor round ends. Neither room keys nor a snapshot survive a wait.
     publish_waiters: BTreeMap<Digest32, RoomPublication>,
-    /// Carried from the first durable room write to the publication waiter. The boolean selects
-    /// the room-create mutant boundary; ordinary joins/reopens use the normal authority fence.
-    room_publication_authority: BTreeMap<Digest32, (computer::ComputerAuthority, bool)>,
+    /// Carried from the first durable room write to the publication waiter. Ownership selects
+    /// both the room-create mutant boundary and whether failed publication may purge new rows.
+    room_publication_authority:
+        BTreeMap<Digest32, (computer::ComputerAuthority, RoomPublicationOwnership)>,
     publication_after: Option<Digest32>,
     publication_pending: bool,
     publication_again: bool,
@@ -6050,14 +6065,11 @@ impl Node {
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
-                    // Creating/unlocking the identity must reach start_network(), which applies
-                    // computer policy before registering an endpoint. A locked store cannot be
-                    // reconciled before Unlock has opened it.
-                    let opens_identity = matches!(command, NodeCommand::Unlock { .. } | NodeCommand::CreateIdentity { .. });
-                    if !shutdown && !opens_identity && self.apply_computer_keyring().await.is_err() {
-                        let _=reply.send(Outcome::Failed(Fault::Storage));
-                        continue;
-                    }
+                    // Computer policy is applied by its causal `ComputerPolicy` event (and by
+                    // startup before Ready), never by minting a fresh wall-clock deadline for an
+                    // unrelated command.  Authority-bearing handlers below fence their exact
+                    // irreversible write; reads remain available and fail closed projections do
+                    // not take the whole node out of service while reconciliation is pending.
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
                     // Proof the actor is taking commands (V210-83): it changes nothing, so nothing
@@ -6258,7 +6270,6 @@ impl Node {
                     self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
-                    if !matches!(&event, NetEvent::ComputerPolicy { .. }) && self.apply_computer_keyring().await.is_err() { continue; }
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
                     self.handle_net(event).await;
@@ -6267,7 +6278,6 @@ impl Node {
                     self.schedule().await;
                 }
                 _ = ingress_wake.notified() => {
-                    if self.apply_computer_keyring().await.is_err() { continue; }
                     let mut progressed = false;
                     for _ in 0..16 {
                         progressed |= self.drain_session_ingress().await;
@@ -6649,12 +6659,8 @@ impl Node {
                 fingerprint,
                 petname,
             } => {
-                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
-                    if c.grouped() {
-                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
-                            return Outcome::Failed(fault_of(&e));
-                        }
-                    }
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
                 }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
@@ -6674,12 +6680,8 @@ impl Node {
                 history,
                 capability,
             } => {
-                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
-                    if c.grouped() {
-                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
-                            return Outcome::Failed(fault_of(&e));
-                        }
-                    }
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
                 }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
@@ -6692,12 +6694,8 @@ impl Node {
                 fingerprint,
                 capability,
             } => {
-                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
-                    if c.grouped() {
-                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
-                            return Outcome::Failed(fault_of(&e));
-                        }
-                    }
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
                 }
                 self.set_capability(fingerprint, capability).await
             }
@@ -6728,12 +6726,8 @@ impl Node {
                 }
             }
             NodeCommand::Untrust { fingerprint } => {
-                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
-                    if c.grouped() {
-                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
-                            return Outcome::Failed(fault_of(&e));
-                        }
-                    }
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
                 }
                 let alias = self.trust.petname(&fingerprint).map(str::to_owned);
                 let out = self.untrust_identity(&fingerprint).await;
@@ -7856,14 +7850,15 @@ impl Node {
             self.reopening.remove(&room);
             waiting.reopening = false;
         }
-        if let Some((authority, room_creation)) = &waiting.authority {
-            let current = if *room_creation {
+        if let Some((authority, ownership)) = &waiting.authority {
+            let current = if *ownership == RoomPublicationOwnership::Created {
                 authority.publish_room_creation(|| ()).is_some()
             } else {
                 authority.current()
             };
             if !current {
-                let outcome = self.reject_unpublished_live_channel(&room, Fault::ComputerPolicy);
+                let outcome =
+                    self.reject_room_publication(&room, *ownership, Fault::ComputerPolicy);
                 self.publish().await;
                 if let Some(reply) = waiting.reply {
                     let _ = reply.send(outcome);
@@ -13043,8 +13038,10 @@ impl Node {
                     channel_id: parsed.channel_id,
                     responder,
                 });
-                self.room_publication_authority
-                    .insert(parsed.channel_id, (authority.clone(), false));
+                self.room_publication_authority.insert(
+                    parsed.channel_id,
+                    (authority.clone(), RoomPublicationOwnership::Joined),
+                );
             })
             .is_none()
         {
@@ -18435,7 +18432,7 @@ impl Node {
                     .event_tx
                     .send(NodeEvent::ChannelOpened { channel_id: id });
                 self.room_publication_authority
-                    .insert(id, (authority.clone(), true));
+                    .insert(id, (authority.clone(), RoomPublicationOwnership::Created));
             })
             .is_none()
         {
@@ -18624,6 +18621,40 @@ impl Node {
     /// The durable room and reopen entry are removed in the same store batch before failure is
     /// reported, so a rejected authority can leave no live or restart-visible partial room.
     fn reject_unpublished_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
+        self.retract_live_channel(channel_id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        match Self::purge_unpublished_channel(profile, channel_id) {
+            Ok(()) => Outcome::Failed(fault),
+            Err(error) => Outcome::Failed(fault_of(&error)),
+        }
+    }
+
+    /// Remove only the transient projection of a stored room.  An explicit open or startup
+    /// reopen never owns the room rows and therefore must not reuse create/join rollback.
+    fn reject_existing_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
+        self.retract_live_channel(channel_id);
+        Outcome::Failed(fault)
+    }
+
+    fn reject_room_publication(
+        &mut self,
+        channel_id: &Digest32,
+        ownership: RoomPublicationOwnership,
+        fault: Fault,
+    ) -> Outcome {
+        match ownership {
+            RoomPublicationOwnership::Existing => {
+                self.reject_existing_live_channel(channel_id, fault)
+            }
+            RoomPublicationOwnership::Joined | RoomPublicationOwnership::Created => {
+                self.reject_unpublished_live_channel(channel_id, fault)
+            }
+        }
+    }
+
+    fn retract_live_channel(&mut self, channel_id: &Digest32) {
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -18631,13 +18662,6 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             net.membership().clear_channel(channel_id);
             net.forget_room_on_board(channel_id);
-        }
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        match Self::purge_unpublished_channel(profile, channel_id) {
-            Ok(()) => Outcome::Failed(fault),
-            Err(error) => Outcome::Failed(fault_of(&error)),
         }
     }
 
@@ -19482,13 +19506,7 @@ impl Node {
                 .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
         if published.is_none() {
-            let Some(profile) = self.profile.as_ref() else {
-                return Outcome::Failed(Fault::NoIdentity);
-            };
-            return match Self::purge_unpublished_channel(profile, &channel_id) {
-                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
-                Err(error) => Outcome::Failed(fault_of(&error)),
-            };
+            return Outcome::Failed(Fault::ComputerPolicy);
         }
         // Preparation established current decisions and completed all pending narrowing.
         self.resume_leave(&channel_id).await;
@@ -19502,19 +19520,21 @@ impl Node {
         self.install_key_packages(&channel_id).await;
         self.reach_members_of(&channel_id).await;
         if !authority.current() {
-            let outcome = self.reject_unpublished_live_channel(&channel_id, Fault::ComputerPolicy);
+            let outcome = self.reject_existing_live_channel(&channel_id, Fault::ComputerPolicy);
             self.publish().await;
             return outcome;
         }
         if authority
             .publish(|| {
                 let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
-                self.room_publication_authority
-                    .insert(channel_id, (authority.clone(), false));
+                self.room_publication_authority.insert(
+                    channel_id,
+                    (authority.clone(), RoomPublicationOwnership::Existing),
+                );
             })
             .is_none()
         {
-            let outcome = self.reject_unpublished_live_channel(&channel_id, Fault::ComputerPolicy);
+            let outcome = self.reject_existing_live_channel(&channel_id, Fault::ComputerPolicy);
             self.publish().await;
             return outcome;
         }
@@ -20046,13 +20066,13 @@ impl Node {
             }
         }
         self.note_local_append(channel_id);
-        // The roster is part of the user-visible admin change. A rejected final publication is
-        // not `Done`; governance retains the durable append and retries its board projection.
-        if let Err(fault) = self.publish_admin_roster(channel_id).await {
-            self.governance_work.pending = true;
-            self.governance_work.again = true;
-            return Outcome::Failed(fault);
-        }
+        // The certificate is the durable admin decision. Its own append necessarily makes the
+        // derived governance view refresh, so trying to build the roster synchronously here
+        // reported `GovernanceRefreshing` after the admin had already been added. Governance
+        // owns the projection and retries it until the board roster reflects that certificate.
+        self.governance_work.admin_rosters.insert(*channel_id);
+        self.governance_work.pending = true;
+        self.governance_work.again = true;
         Outcome::Done
     }
 

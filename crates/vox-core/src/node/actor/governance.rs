@@ -8,6 +8,10 @@ pub(super) struct Maintenance {
     after: Option<Digest32>,
     pub(super) again: bool,
     consent_after: BTreeMap<Digest32, Digest32>,
+    /// Admin changes already committed to the room log whose board roster still owes a
+    /// successful projection.  A refresh or Computer-policy handoff is retryable, not a reason
+    /// to report that the durable admin change failed.
+    pub(super) admin_rosters: BTreeSet<Digest32>,
     pub(super) removal: Option<Removal>,
 }
 
@@ -105,7 +109,6 @@ impl Node {
                     // Computer reconciliation retries it; never answer Done while boards still
                     // carry the roster which the removal replaced.
                     self.governance_work.removal = Some(work);
-                    self.governance_work.again = true;
                 } else {
                     let _ = work.reply.send(Outcome::Failed(fault));
                 }
@@ -119,7 +122,10 @@ impl Node {
             channel.remove_admin(profile, &work.member, work.after, self.now_ms())
         });
         let Some(result) = result else {
-            let _ = work.reply.send(Outcome::Failed(Fault::ComputerPolicy));
+            // Keep the exact cursor and any already-durable certificates.  The queued policy
+            // event (or the ordinary tick) retries after reconciliation; re-arming this
+            // always-ready branch here would spin the actor and delay that very event.
+            self.governance_work.removal = Some(work);
             return;
         };
         drop(channel);
@@ -209,6 +215,9 @@ impl Node {
             self.governance_work
                 .consent_after
                 .retain(|room, _| self.channels.contains_key(room));
+            self.governance_work
+                .admin_rosters
+                .retain(|room| self.channels.contains_key(room));
             self.governance_work.pending = std::mem::take(&mut self.governance_work.again);
             return;
         };
@@ -331,11 +340,21 @@ impl Node {
                 }
             }
         }
-        if progress.ready && progress.changed {
+        if progress.ready
+            && (progress.changed || self.governance_work.admin_rosters.contains(&room))
+        {
             self.adopt_channel_anchors(&room).await;
             self.refresh_network_view().await;
-            if self.publish_admin_roster(&room).await.is_err() {
-                self.governance_work.again = true;
+            match self.publish_admin_roster(&room).await {
+                Ok(()) => {
+                    self.governance_work.admin_rosters.remove(&room);
+                }
+                Err(fault) => {
+                    self.governance_work.admin_rosters.insert(room);
+                    // A policy handoff is woken by its own event.  Immediate self-requeue here
+                    // can monopolize the actor while authority is necessarily stale.
+                    self.governance_work.again |= !matches!(fault, Fault::ComputerPolicy);
+                }
             }
         }
         if progress.changed || backfilled > 0 || legacy_finished || views_finished {

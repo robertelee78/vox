@@ -495,7 +495,7 @@ impl NodeHandle {
         let applied = self
             .computer_revision
             .load(std::sync::atomic::Ordering::Acquire);
-        if !computer.policy_current(applied) {
+        if !computer.policy_current(applied, me) {
             return (
                 false,
                 "computer policy is pending application on this node".into(),
@@ -506,7 +506,7 @@ impl NodeHandle {
             Ok(None) => (true, String::new()),
             Err(e) => (false, e.to_string()),
         };
-        if !computer.policy_current(applied) {
+        if !computer.policy_current(applied, me) {
             return (
                 false,
                 "computer policy changed; refresh before changing individual trust".into(),
@@ -534,7 +534,10 @@ impl NodeHandle {
             .identity
             .as_ref()
             .map(|id| id.fingerprint);
-        computer.policy_current(applied) && me.is_some_and(|me| computer.binding_current(&me))
+        me.is_some_and(|me| {
+            computer.policy_current(applied, me)
+                && (computer.current_revision_expired() || computer.binding_current(&me))
+        })
     }
 
     /// Ask the already attached node to sign its management binding and durably apply policy.
@@ -615,6 +618,38 @@ impl NodeHandle {
 }
 
 impl Node {
+    /// Journal an explicit per-node trust choice, then reconcile that exact new Computer
+    /// revision before the keyring command captures its authority token.  Previously the
+    /// command advanced policy here and immediately tried to save under the actor's old
+    /// revision, so every grouped Trust/SetCapability/Untrust of an unmanaged peer rejected
+    /// itself after making the durable policy change.
+    pub(super) async fn choose_individual_trust(
+        &mut self,
+        peer: Digest32,
+    ) -> crate::error::Result<()> {
+        let Some(computer) = self.computer.clone() else {
+            return Ok(());
+        };
+        if !computer.grouped() {
+            return Ok(());
+        }
+        let node = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .map(Profile::fingerprint)
+            .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()))
+            .ok_or(Error::Profile("managed node has no unlocked identity"))?;
+        // The explicit choice and the reconciliation it causes share one causal boundary; the
+        // command must not mint a replacement clock after the policy transaction commits.
+        let deadline =
+            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN;
+        computer.individual_choice_until(node, peer, deadline)?;
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        self.apply_computer_keyring_until(deadline, &cancelled)
+            .await
+    }
+
     /// Run one synchronous irreversible room write while this actor's computer-policy projection
     /// is current. Callers finish every await and take the room lock first. Computer mutations
     /// never take a room lock while holding their state lock, so this room -> policy order cannot
@@ -689,11 +724,6 @@ impl Node {
         let Some(computer) = &self.computer else {
             return Ok(());
         };
-        if !may_replace_expired && computer.current_revision_expired() {
-            return Err(Error::Profile(
-                "this policy revision expired before convergence; an operator change must replace it",
-            ));
-        }
         if computer.binding_group().is_none() {
             return Ok(());
         }
@@ -703,30 +733,40 @@ impl Node {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or(Error::Profile("managed node name is unreadable"))?;
-        if let Some(p) = &self.profile {
+        let signer: &(dyn RootSigner + Send + Sync) = if let Some(p) = &self.profile {
             if p.is_unlocked() {
-                return computer.bind_node_until(p.signer()?, name, deadline);
+                p.signer()?
+            } else if let Some(s) = &self.headless {
+                s.as_ref()
+            } else {
+                return Err(Error::Profile(
+                    "managed node needs its passphrase to become Ready",
+                ));
             }
+        } else if let Some(s) = &self.headless {
+            s.as_ref()
+        } else {
+            return Err(Error::Profile(
+                "managed node needs its passphrase to become Ready",
+            ));
+        };
+        if !may_replace_expired && computer.current_revision_expired() {
+            let revision = computer.policy_revision();
+            if computer.application_settled(&signer.fingerprint(), revision) {
+                // The missed revision is permanently visible as expired, but its grants are
+                // gone.  Requiring an unrelated operator change here took every managed node
+                // out of service even though the safe fail-closed result had already landed.
+                return Ok(());
+            }
+            return Err(Error::Profile(
+                "this policy revision expired before its managed grants were removed",
+            ));
         }
-        if let Some(s) = &self.headless {
-            return computer.bind_node_until(s.as_ref(), name, deadline);
-        }
-        Err(Error::Profile(
-            "managed node needs its passphrase to become Ready",
-        ))
+        computer.bind_node_until(signer, name, deadline)
     }
 
-    /// Before the endpoint registers, and before handling live authorization work, reconcile the
-    /// durable plan. Persist the keyring before its journal receipt; repeat safely after a crash.
-    pub(super) async fn apply_computer_keyring(&mut self) -> crate::error::Result<()> {
-        let cancelled = std::sync::atomic::AtomicBool::new(false);
-        self.apply_computer_keyring_until(
-            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
-            &cancelled,
-        )
-        .await
-    }
-
+    /// Reconcile the durable plan under the causal boundary owned by the change that woke it.
+    /// Persist the keyring before its journal receipt; repeat safely after a crash.
     pub(super) async fn apply_computer_keyring_until(
         &mut self,
         deadline: std::time::Instant,
@@ -736,15 +776,23 @@ impl Node {
         let Some(c) = self.computer.clone() else {
             return Ok(());
         };
+        let revision = c.policy_revision();
+        let identity = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .map(Profile::fingerprint)
+            .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()));
         if c.grouped() {
             c.storage_ready()?;
         }
         if !c.grouped()
-            || (!c.current_revision_expired()
-                && self
-                    .computer_revision
+            || identity.is_some_and(|identity| {
+                self.computer_revision
                     .load(std::sync::atomic::Ordering::Acquire)
-                    == c.policy_revision())
+                    == revision
+                    && c.application_settled(&identity, revision)
+            })
         {
             return Ok(());
         }
@@ -758,6 +806,14 @@ impl Node {
             let application = self.apply_computer_keyring_at_until(floor, deadline, cancelled)?;
             if !application.settled {
                 continue;
+            }
+            if c.current_revision_expired() {
+                // `apply_computer_keyring_at_until` has durably removed every grant from this
+                // missed revision and published the empty projection.  Drive-key maintenance
+                // requires a live management policy and used to fail here, turning successful
+                // fail-closed recovery into a daemon-wide outage.
+                self.publish().await;
+                return Ok(());
             }
             // A policy revision can grant an already admitted member read or drive. That member
             // may not have received the live capability record before this boundary, so publish

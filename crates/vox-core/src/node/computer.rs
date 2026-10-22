@@ -2426,12 +2426,20 @@ impl Computer {
 
     /// A failed policy write invalidates current grants even when the durable revision did not
     /// advance. Restart revalidates the retained state and its ability to be saved before attach.
-    pub(crate) fn policy_current(&self, applied: u64) -> bool {
+    pub(crate) fn policy_current(&self, applied: u64, node: Digest32) -> bool {
         let s = lock(&self.state);
         (s.genesis.is_none() && s.intervals.is_empty())
-            || (self.storage_ready().is_ok()
-                && !Self::revision_expired(&s)
-                && s.policy_revision == applied)
+            || (self.storage_ready().is_ok() && s.policy_revision == applied)
+                && if Self::revision_expired(&s) {
+                    // Expiry revokes the missed revision's managed grants; it does not make the
+                    // node unusable forever.  The actor may publish again only after its exact
+                    // node keyring is durably settled with no retained managed grant.
+                    Self::application_settled_in(&s, &node, applied)
+                } else {
+                    s.derived
+                        .get(&node)
+                        .is_some_and(|derived| derived.revision == s.policy_revision)
+                }
     }
 
     /// Execute one synchronous irreversible publication only while `node`'s actor projection is
@@ -2448,12 +2456,18 @@ impl Computer {
         let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
         let current = unmanaged
             || (self.storage_ready().is_ok()
-                && !Self::revision_expired(&state)
                 && state.policy_revision == applied
-                && state
-                    .derived
-                    .get(&node)
-                    .is_some_and(|derived| derived.revision == state.policy_revision));
+                && if Self::revision_expired(&state) {
+                    // The expired policy itself is not authority.  The safe, durably-revoked
+                    // projection is: it lets manual/unmanaged work continue without allowing a
+                    // grant from the missed revision to survive or reappear.
+                    Self::application_settled_in(&state, &node, applied)
+                } else {
+                    state
+                        .derived
+                        .get(&node)
+                        .is_some_and(|derived| derived.revision == state.policy_revision)
+                });
         current.then(publish)
     }
 
@@ -3147,14 +3161,19 @@ impl Computer {
     }
     /// The ordinary explicit Trust command after retirement chooses individual mode. Journal
     /// that choice before its keyring write; a failed write grants nothing and can be retried.
-    pub fn individual_choice(&self, node: Digest32, peer: Digest32) -> Result<()> {
+    pub(crate) fn individual_choice_until(
+        &self,
+        node: Digest32,
+        peer: Digest32,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         if self.capability(node, &peer)?.is_some() {
             return Ok(());
         }
         if !self.individual_permitted(node, &peer)? {
             return Err(Error::SignatureInvalid);
         }
-        self.change(|s| {
+        self.change_until(deadline, |s| {
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
             s.policy_revision = s.revision;
             s.individual

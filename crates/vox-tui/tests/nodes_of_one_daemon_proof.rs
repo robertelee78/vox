@@ -4874,7 +4874,13 @@ fn exact_grants(acct: &Account, node: &str, expected: &[(&str, &str)]) -> bool {
         .lines()
         .filter_map(|line| {
             let (fingerprint, rest) = line.split_once("  ")?;
-            Some((fingerprint.trim(), rest.rsplit("  ").next()?.trim()))
+            let fingerprint = fingerprint.trim();
+            // The empty-keyring help line is indented and contains repeated spaces.  It is
+            // explanation, not a zero-length identity entry.
+            if fingerprint.is_empty() {
+                return None;
+            }
+            Some((fingerprint, rest.rsplit("  ").next()?.trim()))
         })
         .collect();
     let expected: std::collections::BTreeMap<_, _> = expected.iter().copied().collect();

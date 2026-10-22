@@ -4817,6 +4817,7 @@ impl ChannelState {
             e,
             Error::Profile(legacy_provisional::LEGACY_HISTORY_REQUIRED)
                 | Error::Profile(crate::node::history_demand::CANCELLED)
+                | Error::Profile("computer policy changed before the room mutation")
                 | Error::OwnHistoryBehind
                 | Error::RoomNotSynced
         ) || governance::refreshing(e)
