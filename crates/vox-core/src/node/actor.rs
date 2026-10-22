@@ -21303,42 +21303,45 @@ impl Node {
         let Some(channel) = self.channels.get(&pending.room).cloned() else {
             return false;
         };
-        let holders = self.drive_holders();
         let now = (self.millis_clock)();
-        let result = {
+        let committed = {
             let Ok(mut channel) = channel.try_lock() else {
                 return false;
             };
-            channel
-                .require_governance_ready(profile.store(), crate::time::Ms(now))
-                .and_then(|current| {
-                    channel.rotate_drive_if_lost(
-                        profile.store(),
-                        &holders,
-                        crate::time::Ms(now),
-                        current,
-                    )
-                })
-                .and_then(|_| {
-                    channel.append_ingress_session(
-                        profile,
-                        &pending.session,
-                        &pending.body,
-                        &holders,
-                        now,
-                        &pending.completion,
-                    )
-                })
+            self.with_current_computer_authority(|| {
+                let holders = self.drive_holders();
+                channel
+                    .require_governance_ready(profile.store(), crate::time::Ms(now))
+                    .and_then(|current| {
+                        channel.rotate_drive_if_lost(
+                            profile.store(),
+                            &holders,
+                            crate::time::Ms(now),
+                            current,
+                        )
+                    })
+                    .and_then(|_| {
+                        channel.append_ingress_session(
+                            profile,
+                            &pending.session,
+                            &pending.body,
+                            &holders,
+                            now,
+                            &pending.completion,
+                        )
+                    })
+            })
         };
-        match result {
-            Ok(_) => {
+        match committed {
+            Some(Ok(_)) => {
                 self.session_ingress_error = None;
                 self.note_local_append(&pending.room);
+                let holders = self.drive_holders();
                 self.tend_drive_keys_in(&pending.room, &holders).await;
                 self.say_session_news(&pending.room).await;
                 true
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 if !matches!(error, crate::error::Error::RoomNotSynced) {
                     self.session_ingress_error = Some(format!(
                         "Session activity is saved and waiting for its room: {error}"
@@ -21346,6 +21349,7 @@ impl Node {
                 }
                 false
             }
+            None => false,
         }
     }
 
@@ -21361,33 +21365,38 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let holders = self.drive_holders();
         let now_millis = (self.millis_clock)();
-        let entry = {
+        let committed = {
             let mut ch = shared.lock().await;
-            // **Never sealed under a key a member that lost drive still holds** (SC-2b): the key
-            // changes here, before the entry, whatever the tick has not got to yet.
-            // The fold is one bounded governance turn away, never a peer round trip (ADR-037 R1,
-            // R2): an append that finds it behind takes that turn here instead of refusing an
-            // entry its harness sends once. Measured: a fold released from a hold stayed behind
-            // until the one-second tick, and the harness's next append was refused meanwhile.
-            let now = crate::time::Ms(now_millis);
-            let current = match ch.require_governance_ready(profile.store(), now) {
-                Err(e) if ChannelState::governance_refreshing(&e) => ch
-                    .advance_governance(profile.store(), now)
-                    .and_then(|_| ch.require_governance_ready(profile.store(), now)),
-                other => other,
-            };
-            match current.and_then(|current| {
-                ch.rotate_drive_if_lost(profile.store(), &holders, now, current)
-            }) {
-                Ok(_) => ch.append_session(profile, session_id, body, &holders, now_millis),
-                Err(e) => Err(e),
-            }
+            // The room lock is the last asynchronous preparation. Re-read holders only inside
+            // the held current-policy transaction, then persist rotation and entry together;
+            // revocation cannot land between the holder set and either irreversible record.
+            self.with_current_computer_authority(|| {
+                let holders = self.drive_holders();
+                // **Never sealed under a key a member that lost drive still holds** (SC-2b): the
+                // key changes here, before the entry, whatever the tick has not got to yet.
+                // The fold is one bounded governance turn away, never a peer round trip.
+                let now = crate::time::Ms(now_millis);
+                let current = match ch.require_governance_ready(profile.store(), now) {
+                    Err(e) if ChannelState::governance_refreshing(&e) => ch
+                        .advance_governance(profile.store(), now)
+                        .and_then(|_| ch.require_governance_ready(profile.store(), now)),
+                    other => other,
+                };
+                current
+                    .and_then(|current| {
+                        ch.rotate_drive_if_lost(profile.store(), &holders, now, current)
+                    })
+                    .and_then(|_| {
+                        ch.append_session(profile, session_id, body, &holders, now_millis)
+                    })
+                    .map(|entry| (entry, holders))
+            })
         };
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
+        let (entry, holders) = match committed {
+            None => return Outcome::Failed(Fault::NotTrusted),
+            Some(Ok(committed)) => committed,
+            Some(Err(e)) => return Outcome::Failed(fault_of(&e)),
         };
         self.note_local_append(channel_id);
         self.tend_drive_keys_in(channel_id, &holders).await;
@@ -21548,24 +21557,41 @@ impl Node {
             };
             // Recovery/control catch-up must run before an announcement can refuse
             // for pending facts, or the same refusal would starve its own repair.
-            if ch.advance_sessions(profile.store(), now_millis).is_err() {
+            let Some(advanced) = self.with_current_computer_authority(|| {
+                ch.advance_sessions(profile.store(), now_millis)
+            }) else {
+                return Ok(());
+            };
+            if advanced.is_err() {
                 return Ok(());
             }
             self.computer_drive_guard(guard)?;
             // Ordinary-key declarations name only this node's authenticated legacy hashes.
             // They let read-only peers identify withheld steps without granting drive.
-            if ch.announce_legacy_sessions(profile, now_millis).is_err() {
+            let Some(announced) = self.with_current_computer_authority(|| {
+                ch.announce_legacy_sessions(profile, now_millis)
+            }) else {
+                return Ok(());
+            };
+            if announced.is_err() {
                 return Ok(());
             }
             self.computer_drive_guard(guard)?;
-            if ch.announce_private_support(profile, now_millis).is_err() {
+            let Some(announced) = self.with_current_computer_authority(|| {
+                ch.announce_private_support(profile, now_millis)
+            }) else {
+                return Ok(());
+            };
+            if announced.is_err() {
                 return Ok(());
             }
             self.computer_drive_guard(guard)?;
-            if ch
-                .rotate_drive_if_lost(profile.store(), holders, now_ms, current)
-                .is_err()
-            {
+            let Some(rotated) = self.with_current_computer_authority(|| {
+                ch.rotate_drive_if_lost(profile.store(), holders, now_ms, current)
+            }) else {
+                return Ok(());
+            };
+            if rotated.is_err() {
                 return Ok(());
             }
             self.computer_drive_guard(guard)?;
@@ -21583,12 +21609,15 @@ impl Node {
                 _ => return Ok(()),
             };
             self.computer_drive_guard(guard)?;
-            if has_session
-                && ch
-                    .ensure_drive(profile.store(), holders, now_ms, current)
-                    .is_err()
-            {
-                return Ok(());
+            if has_session {
+                let Some(ensured) = self.with_current_computer_authority(|| {
+                    ch.ensure_drive(profile.store(), holders, now_ms, current)
+                }) else {
+                    return Ok(());
+                };
+                if ensured.is_err() {
+                    return Ok(());
+                }
             }
             self.computer_drive_guard(guard)?;
             let owed = match ch.owed_drive(profile, holders, now_ms) {
@@ -21596,12 +21625,15 @@ impl Node {
                 Err(_) => return Ok(()),
             };
             self.computer_drive_guard(guard)?;
-            if !owed.is_empty()
-                && !ch
-                    .refresh_session_records(profile, holders, &owed, now_millis)
-                    .is_ok_and(|refresh| refresh == SessionRefresh::Complete)
-            {
-                return Ok(());
+            if !owed.is_empty() {
+                let Some(refreshed) = self.with_current_computer_authority(|| {
+                    ch.refresh_session_records(profile, holders, &owed, now_millis)
+                }) else {
+                    return Ok(());
+                };
+                if !refreshed.is_ok_and(|refresh| refresh == SessionRefresh::Complete) {
+                    return Ok(());
+                }
             }
             let mut releases = Vec::new();
             for member in owed {
@@ -21651,7 +21683,9 @@ impl Node {
             };
             let mut channel = shared.lock().await;
             self.computer_drive_guard(guard)?;
-            let _ = channel.note_drive_delivered(profile.store(), member, generation);
+            let _ = self.with_current_computer_authority(|| {
+                channel.note_drive_delivered(profile.store(), member, generation)
+            });
         }
         // The member that lost drive still holds the old key: until an entry is sealed under the
         // new one, nothing tells it the key changed. Written once every member that keeps drive
@@ -21671,12 +21705,15 @@ impl Node {
                 }
             };
             self.computer_drive_guard(guard)?;
-            unsaid
-                && ch
+            if !unsaid
+                || !ch
                     .owed_drive(profile, holders, now_ms)
                     .is_ok_and(|owed| owed.is_empty())
-                && {
-                    self.computer_drive_guard(guard)?;
+            {
+                false
+            } else {
+                self.computer_drive_guard(guard)?;
+                self.with_current_computer_authority(|| {
                     ch.append_session(
                         profile,
                         crate::node::drive::KEY_CHANGED,
@@ -21685,7 +21722,9 @@ impl Node {
                         now_millis,
                     )
                     .is_ok()
-                }
+                })
+                .unwrap_or(false)
+            }
         };
         if written {
             self.note_local_append(channel_id);

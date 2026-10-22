@@ -889,8 +889,9 @@ impl Management {
                                 // Each response exceeds one eighth of the transaction cap. Eight
                                 // unread streams therefore exceed the connection's whole bounded
                                 // transaction allowance without inventing another size constant.
-                                if crate::node::computer::fx28_mutant("stopped-reader-fresh-write")
-                                {
+                                // This is invariant apparatus for both product and mutant runs;
+                                // the mutant changes only the response deadline's ownership.
+                                if std::env::var_os(TEST_STOPPED_READER_ANSWERED_ENV).is_some() {
                                     problem.push_str(&"x".repeat(MAX_FRAME / MANAGEMENT_SLOTS));
                                 }
                             }

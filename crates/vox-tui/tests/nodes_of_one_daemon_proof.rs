@@ -3775,6 +3775,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         (&a, &da, &nodes_a),
         (&b, &db, &[("beta", beta.as_str())]),
         "gamma",
+        Some(&stopped_reader_answered),
     );
     assert!(
         stopped_reader_answered.is_file(),
@@ -3782,7 +3783,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     );
     let delta = b.make_node("delta");
     let nodes_b = [("beta", beta.as_str()), ("delta", delta.as_str())];
-    change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta");
+    change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta", None);
 
     // ---- a stale reconciliation cannot detach a replacement attachment -------------------
     replacement_generation_survives((&a, &da), (&b, &db), &reply_marker);
@@ -4169,12 +4170,14 @@ fn change_shows_on_both(
     (changer, changer_daemon, here): (&Account, &Daemon, &[(&str, &str)]),
     (other, other_daemon, there): (&Account, &Daemon, &[(&str, &str)]),
     new_node: &str,
+    stopped_reader_answered: Option<&Path>,
 ) {
     let changer_id = computer_id(changer);
     let other_id = computer_id(other);
     let all: Vec<(&str, &str)> = here.iter().chain(there).copied().collect();
     let names_here: Vec<&str> = here.iter().map(|(n, _)| *n).collect();
     let names_there: Vec<&str> = there.iter().map(|(n, _)| *n).collect();
+    let mut stopped_reader_staged = stopped_reader_answered.is_none();
     // The clock starts with the command a person types, not when it returns.
     let attached = Instant::now();
     let (ok, out, err) = changer.run(
@@ -4193,9 +4196,19 @@ fn change_shows_on_both(
         let keyrings = keyrings_complete(changer, here, &all);
         let shown = roster_current(&status, &names_here) && keyrings.is_ok();
         let elapsed = attached.elapsed();
+        if !stopped_reader_staged && stopped_reader_answered.is_some_and(std::path::Path::is_file) {
+            println!(
+                "[proof] FX-28 stopped-reader apparatus staged: every bounded management slot reached an unread reply"
+            );
+            stopped_reader_staged = true;
+        }
         if shown && elapsed <= CHANGE_SHOWN_WITHIN {
             break status;
         }
+        assert!(
+            elapsed < CHANGE_SHOWN_WITHIN || stopped_reader_staged,
+            "APPARATUS: the answering shipped daemon did not reach an unread reply in every bounded management slot before the change verdict"
+        );
         assert!(
             !shown && elapsed < CHANGE_SHOWN_WITHIN,
             "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after `vox node attach {new_node}` was asked of {}'s \
@@ -4236,6 +4249,12 @@ fn change_shows_on_both(
         let shown =
             carried && names_it && roster_current(&status, &names_there) && keyrings.is_ok();
         let elapsed = attached.elapsed();
+        if !stopped_reader_staged && stopped_reader_answered.is_some_and(std::path::Path::is_file) {
+            println!(
+                "[proof] FX-28 stopped-reader apparatus staged: every bounded management slot reached an unread reply"
+            );
+            stopped_reader_staged = true;
+        }
         if shown && elapsed <= CHANGE_SHOWN_WITHIN {
             println!(
                 "[proof] {new_node} shown applied on {}'s computer {elapsed:?} after the attach was asked; shipped status names revision {revision_here} carried (bound {CHANGE_SHOWN_WITHIN:?})",
@@ -4243,6 +4262,10 @@ fn change_shows_on_both(
             );
             break;
         }
+        assert!(
+            elapsed < CHANGE_SHOWN_WITHIN || stopped_reader_staged,
+            "APPARATUS: the answering shipped daemon did not reach an unread reply in every bounded management slot before the change verdict"
+        );
         assert!(
             !shown && elapsed < CHANGE_SHOWN_WITHIN,
             "{}: {CHANGE_SHOWN_WITHIN:?} after `vox node attach {new_node}` was asked, {}'s \
@@ -4270,9 +4293,19 @@ fn change_shows_on_both(
     loop {
         let here_state = computer(changer, &["status"])["state"].clone();
         let there_state = computer(other, &["status"])["state"].clone();
+        if !stopped_reader_staged && stopped_reader_answered.is_some_and(std::path::Path::is_file) {
+            println!(
+                "[proof] FX-28 stopped-reader apparatus staged: every bounded management slot reached an unread reply"
+            );
+            stopped_reader_staged = true;
+        }
         if here_state == "confirmed" && there_state == "confirmed" {
             break;
         }
+        assert!(
+            attached.elapsed() < RETURN_WITHIN || stopped_reader_staged,
+            "APPARATUS: the answering shipped daemon did not reach an unread reply in every bounded management slot before the confirmation verdict"
+        );
         assert!(
             attached.elapsed() < RETURN_WITHIN,
             "PRODUCT: {RETURN_WITHIN:?} after `vox node attach {new_node}` was asked on {}'s \
@@ -4285,6 +4318,16 @@ fn change_shows_on_both(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    if !stopped_reader_staged && stopped_reader_answered.is_some_and(std::path::Path::is_file) {
+        println!(
+            "[proof] FX-28 stopped-reader apparatus staged: every bounded management slot reached an unread reply"
+        );
+        stopped_reader_staged = true;
+    }
+    assert!(
+        stopped_reader_staged,
+        "APPARATUS: the answering shipped daemon did not observe one unread error response in every bounded management slot"
+    );
 }
 
 /// A UDP port nothing holds right now, for a daemon to listen on for the whole proof.

@@ -13,6 +13,7 @@ case "${1-}" in
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
     verdict='PRODUCT [FX28 stopped-reader-write]:'
+    staging='[proof] FX-28 stopped-reader apparatus staged:'
     ;;
   stale-flight-clears-newer)
     mutant=$1
@@ -51,5 +52,13 @@ fi
 if ! grep -Fq "$verdict" "$artifact"; then
   printf 'APPARATUS: FX-28 mutant %s stopped without its intended verdict %s; output: %s\n' "$mutant" "$verdict" "$artifact" >&2
   exit 1
+fi
+if [ "${staging-}" ]; then
+  staging_line=$(grep -nF "$staging" "$artifact" | head -n 1 | cut -d: -f1 || true)
+  verdict_line=$(grep -nF "$verdict" "$artifact" | head -n 1 | cut -d: -f1 || true)
+  if [ -z "$staging_line" ] || [ -z "$verdict_line" ] || [ "$staging_line" -ge "$verdict_line" ]; then
+    printf 'APPARATUS: FX-28 mutant %s did not prove stopped-reader staging before its PRODUCT verdict; output: %s\n' "$mutant" "$artifact" >&2
+    exit 1
+  fi
 fi
 printf 'FX-28 mutant %s: intended independent verdict %s (%s)\n' "$mutant" "$verdict" "$artifact"

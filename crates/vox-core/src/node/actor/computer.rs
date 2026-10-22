@@ -177,18 +177,22 @@ impl NodeHandle {
 }
 
 impl Node {
-    /// Whether this actor's live trust/key projection belongs to the current durable computer
-    /// policy. Periodic work is an authorization path too: a queued policy event must fence the
-    /// old projection before the next tick can publish consent, drive keys, or private attention.
-    pub(super) fn computer_authority_current(&self) -> bool {
+    /// Run one synchronous irreversible room write while this actor's computer-policy projection
+    /// is current. Callers finish every await and take the room lock first. Computer mutations
+    /// never take a room lock while holding their state lock, so this room -> policy order cannot
+    /// invert.
+    pub(super) fn with_current_computer_authority<T>(
+        &self,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
         if crate::node::computer::fx28_mutant("stale-tick-authority") {
-            return true;
+            return Some(publish());
         }
         let Some(computer) = &self.computer else {
-            return true;
+            return Some(publish());
         };
         if !computer.grouped() && computer.binding_group().is_none() {
-            return true;
+            return Some(publish());
         }
         let applied = self
             .computer_revision
@@ -198,12 +202,15 @@ impl Node {
             .as_ref()
             .filter(|profile| profile.is_unlocked())
             .map(Profile::fingerprint)
-            .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()));
-        me.is_some_and(|me| {
-            computer
-                .publish_with_current_authority(applied, me, || ())
-                .is_some()
-        })
+            .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()))?;
+        computer.publish_with_current_authority(applied, me, publish)
+    }
+
+    /// Whether this actor's live trust/key projection belongs to the current durable computer
+    /// policy. Periodic work is an authorization path too: a queued policy event must fence the
+    /// old projection before the next tick can publish consent, drive keys, or private attention.
+    pub(super) fn computer_authority_current(&self) -> bool {
+        self.with_current_computer_authority(|| ()).is_some()
     }
 
     pub(super) fn computer_policy_active(
