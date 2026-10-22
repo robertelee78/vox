@@ -42,10 +42,9 @@ impl Router {
         self.inner.rt.spawn(async move {
             // Daemon start is the first cause. Every later pass carries the deadline of the
             // event that caused it; a remote merge does not get a new reconciliation clock.
-            let mut deadline = vox_core::node::computer::ComputerChange::now(
+            let mut change = vox_core::node::computer::ComputerChange::now(
                 management.computer.policy_revision(),
-            )
-            .apply_deadline();
+            );
             let mut advertised = endpoints.borrow_and_update().clone();
             loop {
                 let Some(inner) = weak.upgrade() else {
@@ -54,15 +53,19 @@ impl Router {
                 if inner.stopping.load(Ordering::Relaxed) {
                     return;
                 }
-                Router { inner }.reconcile_computer_trust(deadline).await;
-                deadline = tokio::select! {
+                Router { inner }.reconcile_computer_trust(change).await;
+                change = tokio::select! {
                     moved = policy.recv() => {
                         match moved {
-                            Ok(event) => event.apply_deadline(),
+                            Ok(event) => event,
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 // A missed earlier event may already be at its bound; never
                                 // replace it with a later five-second window.
-                                std::time::Instant::now()
+                                let revision = management.computer.policy_revision();
+                                let now = std::time::Instant::now();
+                                vox_core::node::computer::ComputerChange::at(
+                                    revision, now, now,
+                                )
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
                         }
@@ -78,15 +81,15 @@ impl Router {
                         advertised = now;
                         vox_core::node::computer::ComputerChange::now(
                             management.computer.policy_revision(),
-                        ).apply_deadline()
+                        )
                     }
                     event = nodes.recv() => {
                         match event {
                             Ok(DaemonEvent::Attached { .. } | DaemonEvent::Detached { .. })
                             | Err(broadcast::error::RecvError::Lagged(_)) => {
                                 vox_core::node::computer::ComputerChange::now(
-                                management.computer.policy_revision(),
-                                ).apply_deadline()
+                                    management.computer.policy_revision(),
+                                )
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
                         }
@@ -105,8 +108,10 @@ impl Router {
     /// detached (a failed write must not leave stale grants on the network). The slot moves to
     /// `Detaching` synchronously before cleanup starts, so queued actor work cannot hide a stale
     /// attached node past the public five-second contract.
-    async fn reconcile_computer_trust(&self, deadline: std::time::Instant) {
+    async fn reconcile_computer_trust(&self, change: vox_core::node::computer::ComputerChange) {
         let management = Arc::clone(&self.inner.defaults.computer);
+        let revision = change.revision();
+        let deadline = change.apply_deadline();
         if management.computer.binding_group().is_none() && !management.computer.grouped() {
             return;
         }
@@ -127,17 +132,26 @@ impl Router {
         }
         let mut pending = Vec::new();
         let mut behind = Vec::new();
-        let attached: Vec<_> = lock(&self.inner.slots)
-            .iter()
-            .filter_map(|(name, slot)| match slot {
-                Slot::Attached(attached) => Some((
-                    name.as_str().to_owned(),
-                    attached.handle.clone(),
-                    attached.generation,
-                )),
-                _ => None,
-            })
-            .collect();
+        let attached: Vec<_> = {
+            let mut slots = lock(&self.inner.slots);
+            slots
+                .iter_mut()
+                .filter_map(|(name, slot)| match slot {
+                    Slot::Attached(attached) => {
+                        // Claim the attachment for this exact revision before any older task can
+                        // report. Attachment generation alone cannot distinguish R1 from R2 on
+                        // the same live actor.
+                        attached.computer_reconciliation = Some(revision);
+                        Some((
+                            name.as_str().to_owned(),
+                            attached.handle.clone(),
+                            attached.generation,
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
         for info in self.nodes() {
             let Some((_, handle, generation)) = attached
                 .iter()
@@ -171,7 +185,7 @@ impl Router {
                     .map_err(|error| error.to_string());
                 match outcome {
                     Ok(()) => {
-                        if router.attachment_generation(&name) != Some(generation) {
+                        if !router.computer_reconciliation_current(&name, generation, revision) {
                             return;
                         }
                         if let Err(e) = management.record_application() {
@@ -179,7 +193,7 @@ impl Router {
                         }
                     }
                     Err(why) => {
-                        if router.detach_failed_computer_node(name.clone(), generation) {
+                        if router.detach_failed_computer_node(name.clone(), generation, revision) {
                             management.node_pending(name.as_str(), &why);
                         }
                     }
@@ -190,18 +204,29 @@ impl Router {
 
     /// Make a failed node non-attached in the same synchronous critical section that decides it,
     /// then leave its potentially slow actor cleanup to an independent task.
-    fn attachment_generation(&self, node: &NodeName) -> Option<u64> {
+    fn computer_reconciliation_current(
+        &self,
+        node: &NodeName,
+        generation: u64,
+        revision: u64,
+    ) -> bool {
         match lock(&self.inner.slots).get(node) {
-            Some(Slot::Attached(attached)) => Some(attached.generation),
-            _ => None,
+            Some(Slot::Attached(attached)) => {
+                attached.generation == generation
+                    && attached.computer_reconciliation == Some(revision)
+            }
+            _ => false,
         }
     }
 
-    fn detach_failed_computer_node(&self, node: NodeName, generation: u64) -> bool {
+    fn detach_failed_computer_node(&self, node: NodeName, generation: u64, revision: u64) -> bool {
         let going = {
             let mut slots = lock(&self.inner.slots);
             match slots.get(&node) {
-                Some(Slot::Attached(attached)) if attached.generation == generation => {
+                Some(Slot::Attached(attached))
+                    if attached.generation == generation
+                        && attached.computer_reconciliation == Some(revision) =>
+                {
                     begin_detach(&mut slots, &node)
                 }
                 _ => None,

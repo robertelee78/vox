@@ -79,6 +79,21 @@ impl ComputerChange {
         }
     }
 
+    /// Construct a change with already-owned absolute deadlines. Used when a lagged follower
+    /// must carry the current exact revision without granting it a fresh convergence window.
+    #[must_use]
+    pub fn at(
+        revision: u64,
+        apply_deadline: std::time::Instant,
+        return_deadline: std::time::Instant,
+    ) -> Self {
+        Self {
+            revision,
+            apply_deadline,
+            return_deadline,
+        }
+    }
+
     /// The durable policy revision carried by this event.
     #[must_use]
     pub fn revision(self) -> u64 {

@@ -3549,7 +3549,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// every expected keyring grant, and both computers confirmed. The exported broader
 /// [`RETURN_WITHIN`] contract still names a peer that must reconnect.
 ///
-/// With four nodes hosted and nothing changing, the proof waits for each side's shipped status to
+/// With all staged nodes hosted and nothing changing, the proof waits for each side's shipped status to
 /// name its next completed, dated fallback exchange. Across that causal boundary it MUST count
 /// exactly that one attempt/exchange, no earlier round, and every node's binding MUST stand derived
 /// at the current policy revision at the same durable moment as before the unchanged-state
@@ -3559,12 +3559,13 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// before this (2026-10-20, the decider's work Mac): the pairing
 /// manager exchanged the whole signed history with every computer every 2 s and re-verified it,
 /// and a 1 s tick re-derived every attached node's binding with nothing changed.
-/// Finally, a test-only causal release keeps delta's exact actor message queued while epsilon
-/// attaches.
-/// Within [`CHANGE_SHOWN_WITHIN`], after all final observations finish, beta has applied epsilon
+/// A test-only causal hold parks delta's exact admitted remote pause at its final publication
+/// boundary while durable Computer policy moves; releasing it must make the shipped command
+/// refuse, never publish with stale drive. Finally, another causal release keeps delta's exact
+/// policy message queued while eta attaches.
+/// Within [`CHANGE_SHOWN_WITHIN`], after all final observations finish, beta has applied eta
 /// on its healthy node and `vox node list` shows delta no longer attached. Cleanup may continue;
-/// queued room/node work cannot turn a late observation into an apparent pass. The proof then
-/// releases that exact message and proves its expired work did not move delta's durable binding.
+/// queued room/node work cannot turn a late observation into an apparent pass.
 ///
 /// Every elapsed verdict begins before the shipped command or path-restoration action which owns
 /// it. Observing a completed exchange is evidence about progress, never permission to restart the
@@ -3579,9 +3580,9 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// reconciliation a fresh timeout or delay `Detaching`: held delta remains Ready past
 /// [`CHANGE_SHOWN_WITHIN`] and turns PRODUCT red; (6) serialize siblings behind held delta:
 /// beta's binding/keyring claim misses that same bound and turns PRODUCT red; (7) remove the
-/// attachment-generation checks: the old delayed result detaches replacement delta and turns
-/// PRODUCT red; (8) restore actor-tick policy application and bypass its current-revision guard:
-/// the idle binding-derived moments move and turn PRODUCT red. The stuck-node phase begins behind
+/// reconciliation ownership checks: an old delayed result detaches either replacement delta or
+/// the same attachment applying a newer revision and turns PRODUCT red; (8) bypass the current-authority publication fence: the causally held shipped
+/// remote pause publishes after its actor revision becomes stale and turns PRODUCT red. The stuck-node phase begins behind
 /// saturated backoff, so resetting either exchange or apply clocks turns its return bound red.
 #[cfg(feature = "optional-proofs")]
 #[test]
@@ -3593,6 +3594,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_CLOCK_STEP_MS",
         "VOX_TEST_HOLD_COMPUTER_POLICY",
         "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY",
+        "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
         "VOX_TEST_FX28_MUTANT",
         "VOX_TEST_FX28_STOPPED_READER_ARM_FILE",
@@ -3626,6 +3628,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     );
     let reply_marker = b.data.join("hold-delta-computer-policy-reply");
     let reply_spec = format!("delta\t15000\t{}", reply_marker.display());
+    let stale_pause_arm = b.data.join("hold-delta-stale-pause-arm");
+    let stale_pause_engaged = b.data.join("hold-delta-stale-pause-engaged");
+    let stale_pause_release = b.data.join("hold-delta-stale-pause-release.sock");
+    let stale_pause_spec = format!(
+        "delta\t{}\t{}\t{}",
+        stale_pause_arm.display(),
+        stale_pause_engaged.display(),
+        stale_pause_release.display()
+    );
     let status_arm = a.data.join("mark-computer-status");
     let status_accepted = a.data.join("accepted-computer-status");
     let status_returned = a.data.join("returned-computer-status");
@@ -3659,6 +3670,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_LISTEN", &listen_b),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", &hold_spec),
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", &reply_spec),
+            ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", &stale_pause_spec),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
                 &stopped_reader_answered_spec,
@@ -3759,6 +3771,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             listen: &listen_b,
             hold_spec: &hold_spec,
             reply_spec: &reply_spec,
+            stale_pause_spec: &stale_pause_spec,
             stopped_reader_answered: &stopped_reader_answered_spec,
         },
     );
@@ -3785,7 +3798,22 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     let nodes_b = [("beta", beta.as_str()), ("delta", delta.as_str())];
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta", None);
 
-    // ---- a stale reconciliation cannot detach a replacement attachment -------------------
+    // ---- a stale actor cannot publish a remote drive mutation -----------------------------
+    let epsilon = stale_remote_pause_is_refused(
+        (&a, &da),
+        (&b, &db),
+        &stale_pause_arm,
+        &stale_pause_engaged,
+        &stale_pause_release,
+        (&beta, &delta),
+    );
+    let nodes_a = [
+        ("alpha", alpha.as_str()),
+        ("gamma", gamma.as_str()),
+        ("epsilon", epsilon.as_str()),
+    ];
+
+    // ---- stale reconciliation cannot detach a replacement generation or revision ----------
     replacement_generation_survives((&a, &da), (&b, &db), &reply_marker);
 
     // ---- both live daemons converge when their userspace path is restored -----------------
@@ -3912,7 +3940,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
          alpha {tried_a} attempt(s) for {during_a} exchange(s), beta {tried_b} for {during_b}\n{shown_a1}\n{shown_b1}"
     );
     println!(
-        "[proof] at each side's next named quiet fallback boundary with four nodes hosted: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); bindings: alpha's computer at policy revision {} {:?}, beta's at {} {:?}, derived again across the boundary: {}",
+        "[proof] at each side's next named quiet fallback boundary with all staged nodes hosted: alpha exchanged {during_a} time(s) with beta (last at {last_a:?}, confirmed {confirmed_a}), beta {during_b} with alpha (last at {last_b:?}, confirmed {confirmed_b}); bindings: alpha's computer at policy revision {} {:?}, beta's at {} {:?}, derived again across the boundary: {}",
         derived1.0 .0,
         derived1.0 .1,
         derived1.1 .0,
@@ -4351,6 +4379,7 @@ struct RestartComputerSide<'a> {
     listen: &'a str,
     hold_spec: &'a str,
     reply_spec: &'a str,
+    stale_pause_spec: &'a str,
     stopped_reader_answered: &'a str,
 }
 
@@ -4365,6 +4394,7 @@ fn a_restart_derives_nothing(
         listen: listen_b,
         hold_spec,
         reply_spec,
+        stale_pause_spec,
         stopped_reader_answered,
     } = side;
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
@@ -4383,6 +4413,7 @@ fn a_restart_derives_nothing(
             ("VOX_TEST_CLOCK_STEP_MS", REMOTE_CLOCK_SKEW_MS),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", reply_spec),
+            ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", stale_pause_spec),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
                 stopped_reader_answered,
@@ -4441,9 +4472,10 @@ fn a_restart_derives_nothing(
     db
 }
 
-/// A reconciliation result belongs to one attachment generation. The old delta actor applies a
-/// change but its reply is held while a person detaches and re-attaches delta. When the old
-/// five-second waiter expires, the replacement must remain Ready and current.
+/// A reconciliation result belongs to one attachment generation and one exact policy revision.
+/// First, an old delta actor applies a change but its reply is held while a person detaches and
+/// re-attaches delta. Then, on that replacement attachment, R1's reply is held while R2 starts and
+/// applies. Neither old five-second waiter may detach the attachment that superseded its work.
 fn replacement_generation_survives(
     (a, da): (&Account, &Daemon),
     (b, db): (&Account, &Daemon),
@@ -4497,6 +4529,65 @@ fn replacement_generation_survives(
         "PRODUCT: after the old generation's reconciliation deadline, replacement delta did not remain Ready with current computer trust (ADR-038 FX-28, #1020): Ready {delta_ready}, current {}, zeta grant {:?}, daemons alive {alive}; node list error {listed_err}; nodes {}; applications {}\n{}\n{}",
         roster_current(&status, &["beta", "delta"]),
         grant_words(b, "delta", &zeta),
+        status["nodes"],
+        status["applications"],
+        da.said(),
+        db.said()
+    );
+
+    // Same attachment, two policy revisions: attachment generation alone cannot own this result.
+    std::fs::write(reply_marker, b"hold revision R1's reply")
+        .unwrap_or_else(|e| panic!("APPARATUS: stage delayed R1 reply: {e}"));
+    let theta = a.make_node("theta");
+    let r1_started = Instant::now();
+    let (ok, out, err) = a.run(&["node", "attach", "theta", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: attach theta to stage R1: {out}{err}");
+    while reply_marker.is_file() {
+        assert!(
+            r1_started.elapsed() < CHANGE_SHOWN_WITHIN,
+            "PRODUCT: delta did not accept R1 before its causal apply deadline\n{}\n{}",
+            da.said(),
+            db.said()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let r1_reply_held = Instant::now();
+    let iota = a.make_node("iota");
+    let (ok, out, err) = a.run(&["node", "attach", "iota", "--passphrase-file", "-"], PASS);
+    assert!(
+        ok,
+        "APPARATUS: attach iota to begin superseding R2: {out}{err}"
+    );
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            let status = computer(b, &["status"]);
+            roster_current(&status, &["beta", "delta"])
+                && grant_words(b, "delta", &iota).as_deref() == Some("read")
+        }),
+        "PRODUCT: R2 did not apply to delta while R1's reconciliation result was held\n{}\n{}",
+        da.said(),
+        db.said()
+    );
+    std::thread::sleep(
+        CHANGE_SHOWN_WITHIN
+            .saturating_add(Duration::from_secs(1))
+            .saturating_sub(r1_reply_held.elapsed()),
+    );
+    let status = computer(b, &["status"]);
+    let (listed_ok, listed, listed_err) = b.run(&["node", "list"], "");
+    let delta_ready = listed_ok
+        && listed
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("delta") && line.contains("Ready"));
+    assert!(
+        delta_ready
+            && roster_current(&status, &["beta", "delta"])
+            && grant_words(b, "delta", &theta).as_deref() == Some("read")
+            && grant_words(b, "delta", &iota).as_deref() == Some("read"),
+        "PRODUCT: after superseding R2 began and applied on the same attachment, R1's older waiter detached or displaced delta (ADR-038 FX-28, #1020): Ready {delta_ready}, current {}, theta grant {:?}, iota grant {:?}; node list error {listed_err}; nodes {}; applications {}\n{}\n{}",
+        roster_current(&status, &["beta", "delta"]),
+        grant_words(b, "delta", &theta),
+        grant_words(b, "delta", &iota),
         status["nodes"],
         status["applications"],
         da.said(),
@@ -4678,35 +4769,143 @@ fn change_reaches_a_live_computer(
     );
 }
 
-/// One node whose actor queue is held must be visibly non-attached within FX-28's five seconds;
-/// its healthy sibling applies the same revision inside that bound. The elapsed time is sampled
-/// after both computer statuses, the sibling's shipped `vox trust list`, and `vox node list`.
-fn delayed_node_does_not_make_a_late_pass(
-    (a, da, _nodes_a): (&Account, &Daemon, &[(&str, &str)]),
-    (b, db, _nodes_b): (&Account, &Daemon, &[(&str, &str)]),
+/// Hold one real remote drive mutation at its final publication boundary, move durable Computer
+/// policy through another shipped action, then judge the released request by what shipped
+/// `vox room pause` tells its caller. The marker proves causal staging; no elapsed silence is a
+/// PRODUCT verdict.
+fn stale_remote_pause_is_refused(
+    (a, da): (&Account, &Daemon),
+    (b, db): (&Account, &Daemon),
     hold_arm: &Path,
     hold_engaged: &Path,
     hold_release: &Path,
-    forward: &port_forward::PortForward,
-) {
+    (beta, delta): (&str, &str),
+) -> String {
+    let room = make_room(b, "delta");
+    let (ok, link, err) = b.run(&["room", "link", &room, "--node", "delta"], "");
+    assert!(ok, "APPARATUS: link delta's stale-publication room: {err}");
+    let (ok, out, err) = b.run(
+        &[
+            "room",
+            "join",
+            "--node",
+            "beta",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+        ],
+        ROOM_PASS,
+    );
+    assert!(
+        ok,
+        "APPARATUS: join beta to delta's stale-publication room: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            ["beta", "delta"].iter().all(|node| {
+                let (ok, roster, _) = b.run(&["room", "roster", &room, "--node", node], "");
+                ok && roster.contains(beta) && roster.contains(delta)
+            })
+        }),
+        "APPARATUS: beta and delta did not both expose the staged room roster"
+    );
+
+    std::fs::write(hold_arm, b"hold delta's admitted remote pause\n")
+        .expect("APPARATUS: arm the stale remote-pause publication hold");
+    let mut pause = b
+        .cmd(&["room", "pause", &room, "delta", "--node", "beta", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the shipped remote room-pause command");
+    wait_for_command_marker(
+        hold_engaged,
+        &mut pause,
+        db.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "delta's admitted remote pause at its final publication boundary",
+    );
+
+    // A real user action moves durable Computer policy while that exact room mutation is held.
+    // Epsilon is attached on alpha's healthy actor; beta applies the new revision while delta's
+    // old projection remains parked at the publication fence.
+    let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     let epsilon = a.make_node("epsilon");
-    let b_id = computer_id(b);
-    let before_revision = computer(a, &["status"])["revision"].as_u64().unwrap_or(0);
-    let delta_binding_before = full_roster(&computer(b, &["status"]))
-        .and_then(|roster| roster.get("delta").cloned())
-        .expect("APPARATUS: beta's status did not expose delta's binding before the held change");
-    std::fs::write(hold_arm, b"hold delta's next policy message")
-        .unwrap_or_else(|e| panic!("APPARATUS: could not stage the held delta marker: {e}"));
-    forward.close();
-    let changed = Instant::now();
     let (ok, out, err) = a.run(
         &["node", "attach", "epsilon", "--passphrase-file", "-"],
         PASS,
     );
     assert!(
         ok,
-        "APPARATUS: attach epsilon on alpha's computer: {out}{err}"
+        "APPARATUS: attach epsilon for stale-publication staging: {out}{err}"
     );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let status = computer(b, &["status"]);
+            status["revision"].as_u64().is_some_and(|r| r > before)
+                && grant_words(b, "beta", &epsilon).is_some()
+        }),
+        "APPARATUS: durable policy did not move and apply on beta while delta's exact publication was held\n{}\n{}",
+        da.said(),
+        db.said()
+    );
+    assert!(
+        hold_engaged.is_file(),
+        "APPARATUS: delta's exact remote pause was not still held after durable policy moved"
+    );
+    println!(
+        "[proof] FX-28 stale-tick-authority apparatus staged: durable Computer policy moved while delta's exact admitted remote pause remained held at its final publication boundary"
+    );
+    std::os::unix::net::UnixStream::connect(hold_release).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: release delta's held remote pause at {}: {e}",
+            hold_release.display()
+        )
+    });
+    let paused = pause
+        .wait_with_output()
+        .expect("APPARATUS: collect the causally released room-pause command");
+    assert!(
+        !paused.status.success(),
+        "PRODUCT [FX28 stale-tick-authority]: after durable Computer policy moved while its exact admitted remote pause was held, shipped `vox room pause` still published and acknowledged the stale drive mutation: stdout {}; stderr {}",
+        String::from_utf8_lossy(&paused.stdout),
+        String::from_utf8_lossy(&paused.stderr)
+    );
+    println!(
+        "[proof] after durable policy moved, releasing the exact admitted stale-authority publication made shipped `vox room pause` refuse it: {}",
+        String::from_utf8_lossy(&paused.stderr).trim()
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
+                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+        }),
+        "APPARATUS: nodes did not settle after the stale-publication refusal"
+    );
+    epsilon
+}
+
+/// One node whose actor queue is held must be visibly non-attached within FX-28's five seconds;
+/// its healthy sibling applies the same revision inside that bound. The elapsed time is sampled
+/// after both computer statuses, the sibling's shipped `vox trust list`, and `vox node list`.
+fn delayed_node_does_not_make_a_late_pass(
+    (a, da, nodes_a): (&Account, &Daemon, &[(&str, &str)]),
+    (b, db, _nodes_b): (&Account, &Daemon, &[(&str, &str)]),
+    hold_arm: &Path,
+    hold_engaged: &Path,
+    hold_release: &Path,
+    forward: &port_forward::PortForward,
+) {
+    let eta = a.make_node("eta");
+    let b_id = computer_id(b);
+    let before_revision = computer(a, &["status"])["revision"].as_u64().unwrap_or(0);
+    std::fs::write(hold_arm, b"hold delta's next policy message")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not stage the held delta marker: {e}"));
+    forward.close();
+    let changed = Instant::now();
+    let (ok, out, err) = a.run(&["node", "attach", "eta", "--passphrase-file", "-"], PASS);
+    assert!(ok, "APPARATUS: attach eta on alpha's computer: {out}{err}");
     loop {
         if application_toward(a, &b_id)["exchange_failures"]
             .as_u64()
@@ -4716,7 +4915,7 @@ fn delayed_node_does_not_make_a_late_pass(
         }
         assert!(
             changed.elapsed() < RETURN_WITHIN,
-            "PRODUCT: {RETURN_WITHIN:?} after `vox node attach epsilon` was asked with the path \
+            "PRODUCT: {RETURN_WITHIN:?} after `vox node attach eta` was asked with the path \
              closed, shipped status had not exposed the sixth failed exchange needed to show \
              bounded retry progress: {}\n{}",
             application_toward(a, &b_id),
@@ -4737,7 +4936,7 @@ fn delayed_node_does_not_make_a_late_pass(
                 .as_u64()
                 .is_some_and(|revision| revision >= sent_revision);
         let status_b = computer(b, &["status"]);
-        let beta_grant = grant_words(b, "beta", &epsilon);
+        let beta_grant = grant_words(b, "beta", &eta);
         let (listed_ok, listed, listed_err) = b.run(&["node", "list"], "");
         assert!(
             listed_ok,
@@ -4748,7 +4947,9 @@ fn delayed_node_does_not_make_a_late_pass(
             .find(|line| line.split_whitespace().next() == Some("delta"))
             .unwrap_or("");
         let delta_non_attached = !delta_line.is_empty() && !delta_line.starts_with("delta Ready");
-        let local_current = roster_current(&status_a, &["alpha", "gamma", "epsilon"]);
+        let mut local_names: Vec<&str> = nodes_a.iter().map(|(name, _)| *name).collect();
+        local_names.push("eta");
+        let local_current = roster_current(&status_a, &local_names);
         let beta_current = roster_current(&status_b, &["beta"]);
         let alive = daemon_alive(da.child.id()) && daemon_alive(db.child.id());
         let shown =
@@ -4762,7 +4963,7 @@ fn delayed_node_does_not_make_a_late_pass(
                     "APPARATUS: delta was not causally held in its computer-policy actor before the non-attached verdict"
                 );
                 println!(
-                    "[proof] {elapsed:?} after path restoration was triggered, shipped status names epsilon carried, beta applied it on its healthy node and lists held delta non-attached ({delta_line:?}); bound {CHANGE_SHOWN_WITHIN:?}"
+                    "[proof] {elapsed:?} after path restoration was triggered, shipped status names eta carried, beta applied it on its healthy node and lists held delta non-attached ({delta_line:?}); bound {CHANGE_SHOWN_WITHIN:?}"
                 );
                 break;
             }
@@ -4771,7 +4972,7 @@ fn delayed_node_does_not_make_a_late_pass(
                 "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after path restoration was triggered, \
                  beta did not apply-or-detach every attached node (ADR-038 FX-28, #1020; shown \
                  {shown} only after {elapsed:?}): alpha bindings current {local_current}; beta \
-                 binding current {beta_current}; beta's grant for epsilon {beta_grant:?}; delta \
+                 binding current {beta_current}; beta's grant for eta {beta_grant:?}; delta \
                  line {delta_line:?}; daemons alive {alive}; alpha status nodes {}; beta status nodes {}\nalpha \
                  daemon:\n{}\nbeta daemon:\n{}",
                 status_a["nodes"],
@@ -4783,7 +4984,7 @@ fn delayed_node_does_not_make_a_late_pass(
             assert!(
                 elapsed < CHANGE_SHOWN_WITHIN,
                 "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after path restoration was triggered, alpha \
-                 completed no exchange carrying epsilon to beta: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
+                 completed no exchange carrying eta to beta: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
                 application_toward(a, &b_id),
                 da.said(),
                 db.said()
@@ -4805,13 +5006,6 @@ fn delayed_node_does_not_make_a_late_pass(
         );
         std::thread::yield_now();
     }
-    let delta_binding_after = full_roster(&computer(b, &["status"]))
-        .and_then(|roster| roster.get("delta").cloned())
-        .expect("PRODUCT: beta's status lost delta's binding after the expired actor work resumed");
-    assert_eq!(
-        delta_binding_after, delta_binding_before,
-        "PRODUCT [FX28 stale-tick-authority]: after its causal deadline and visible detach, releasing delta's exact queued actor work still derived or saved the expired policy"
-    );
     forward.set_delay(Duration::ZERO);
 }
 

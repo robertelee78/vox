@@ -11,6 +11,8 @@ use crate::node::trust::HistoryGrant;
 const TEST_HOLD_COMPUTER_POLICY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY";
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_POLICY_REPLY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY";
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION";
 
 #[cfg(feature = "test-knobs")]
 impl Node {
@@ -63,6 +65,40 @@ impl Node {
         // accepted the event before the proof replaces that attachment.
         std::fs::remove_file(marker).ok()?;
         Some(delay)
+    }
+
+    /// Test apparatus: hold a real remote pause after all asynchronous admission and immediately
+    /// before its current-authority publication fence. A shipped-binary journey moves durable
+    /// Computer policy while this exact request is held, then releases it and judges the command's
+    /// user-visible answer. The knob creates no publication of its own.
+    pub(super) async fn hold_room_pause_publication_for_proof(&self) {
+        let Ok(spec) = std::env::var(TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(node), Some(arm), Some(engaged), Some(release)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        let mine = self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str());
+        if mine != Some(node) || std::fs::remove_file(arm).is_err() {
+            return;
+        }
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
+            return;
+        };
+        if std::fs::write(engaged, b"room pause publication held\n").is_err() {
+            return;
+        }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(engaged);
+        let _ = std::fs::remove_file(release);
     }
 }
 

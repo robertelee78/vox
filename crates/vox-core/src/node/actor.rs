@@ -15926,37 +15926,70 @@ impl Node {
                     };
                     release
                 };
-                if !self.post_key_package(&channel_id, peer, &skdm).await {
-                    continue;
-                }
+                // Seal against the current bundle first. Only after every await is complete do
+                // the package append, held-key removal and consent record run together under the
+                // exact actor policy revision which authorized this release.
+                let posted_as = (
+                    channel_id,
+                    peer,
+                    crate::governance::membership::skdm_ref(&skdm),
+                );
+                let package = if self.packages_posted.contains(&posted_as) {
+                    None
+                } else {
+                    let Some(package) = self.prepare_key_package(&channel_id, peer, &skdm).await
+                    else {
+                        continue;
+                    };
+                    Some(package)
+                };
                 let now_ms = self.now_ms();
-                let issued = {
+                let mut package_appended = false;
+                let committed = {
                     let Some(profile) = self.profile.as_ref() else {
                         return;
                     };
-                    // Forgotten before the consent is recorded, as on the direct path.
-                    if forget_consent_key(&mut self.consent_keys, profile, &channel_id, peer)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    // Recorded exactly as the direct path records it: the entitlement from the
-                    // plan's first position, and the generations before the live one owed as
-                    // history, which go out below.
                     let entitled_from = plan
                         .as_ref()
                         .and_then(|p| p.first().copied())
                         .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
                     let mut channel = shared.lock().await;
-                    channel
-                        .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
-                        .is_ok()
-                        && (entitled_from.0 >= skdm.body.chain_id
-                            || channel
-                                .owe_history(profile.store(), peer, entitled_from.0)
-                                .is_ok())
+                    let authority = self.computer.as_ref().map(|computer| {
+                        (
+                            Arc::clone(computer),
+                            self.computer_revision
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            profile.fingerprint(),
+                        )
+                    });
+                    let mut commit = || -> crate::error::Result<()> {
+                        if let Some(package) = &package {
+                            channel.append_key_package(profile, package, (self.millis_clock)())?;
+                            package_appended = true;
+                        }
+                        // Forgotten before the consent is recorded, as on the direct path.
+                        forget_consent_key(&mut self.consent_keys, profile, &channel_id, peer)?;
+                        // Recorded exactly as the direct path records it: the entitlement from
+                        // the plan's first position, and the generations before the live one owed
+                        // as history, which go out below.
+                        channel.issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)?;
+                        if entitled_from.0 < skdm.body.chain_id {
+                            channel.owe_history(profile.store(), peer, entitled_from.0)?;
+                        }
+                        Ok(())
+                    };
+                    match authority {
+                        Some((computer, applied, node)) => {
+                            computer.publish_with_current_authority(applied, node, commit)
+                        }
+                        None => Some(commit()),
+                    }
                 };
-                if issued {
+                if let Some(package) = package.as_ref().filter(|_| package_appended) {
+                    self.note_key_package_posted(posted_as, package);
+                    self.note_local_append(&channel_id);
+                }
+                if matches!(committed, Some(Ok(()))) {
                     self.note_local_append(&channel_id);
                     let _ = self.event_tx.send(NodeEvent::Consented {
                         channel_id,
@@ -16044,12 +16077,6 @@ impl Node {
         skdm: &crate::group::skdm::Skdm,
         authority: Option<(Arc<crate::node::computer::Computer>, u64, Digest32)>,
     ) -> bool {
-        if self.net.is_none() {
-            return false;
-        }
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return false;
-        };
         // Posted already: on the log, and taken from there (a batch retried whole).
         let posted_as = (
             *channel_id,
@@ -16059,30 +16086,11 @@ impl Node {
         if self.packages_posted.contains(&posted_as) {
             return true;
         }
-        let Ok(ctx) = shared.lock().await.join_context() else {
+        let Some(package) = self.prepare_key_package(channel_id, target, skdm).await else {
             return false;
         };
-        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
-        // A burst waits for a fresh one-time prekey as a burst of frames does, at most 30 s while
-        // the member is connected; a member away goes to its signed prekey at once (S-5).
-        let Ok(bundle) = self.delivery_bundle_waiting(channel_id, target, true).await else {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return false;
-        };
-        let package = {
-            let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
-                return false;
-            };
-            let ring = ring.lock().await;
-            match crate::node::keypackage::KeyPackage::seal(
-                ring.identity_dh(),
-                &bundle,
-                &ctx,
-                target,
-                skdm,
-            ) {
-                Ok(p) => p,
-                Err(_) => return false,
-            }
         };
         let posted = {
             let Some(profile) = self.profile.as_ref() else {
@@ -16102,20 +16110,62 @@ impl Node {
             }
         };
         if posted {
-            // A one-time prekey is named by one delivery only, frame or package (ADR-030 P-3): a
-            // second naming it would be opened as a replay, last-resort-grade.
-            if let Some(prekey_id) = package
-                .initial_message()
-                .ok()
-                .and_then(|init| init.one_time_prekey_id)
-            {
-                self.refused_otps.note(target, prekey_id);
-            }
-            self.packages_posted.insert(posted_as);
+            self.note_key_package_posted(posted_as, &package);
             // An entry like any other: it goes out on the next push.
             self.note_local_append(channel_id);
         }
         posted
+    }
+
+    /// Complete every asynchronous key-package preparation step. The caller takes the room lock
+    /// and current-policy lock only around its final synchronous append (and any coupled record).
+    async fn prepare_key_package(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        skdm: &crate::group::skdm::Skdm,
+    ) -> Option<crate::node::keypackage::KeyPackage> {
+        self.net.as_ref()?;
+        let shared = self.channels.get(channel_id).map(Arc::clone)?;
+        let Ok(ctx) = shared.lock().await.join_context() else {
+            return None;
+        };
+        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
+        // A burst waits for a fresh one-time prekey as a burst of frames does, at most 30 s while
+        // the member is connected; a member away goes to its signed prekey at once (S-5).
+        let Ok(bundle) = self.delivery_bundle_waiting(channel_id, target, true).await else {
+            return None;
+        };
+        {
+            let ring = self.prekeys.as_ref().map(Arc::clone)?;
+            let ring = ring.lock().await;
+            crate::node::keypackage::KeyPackage::seal(
+                ring.identity_dh(),
+                &bundle,
+                &ctx,
+                target,
+                skdm,
+            )
+            .ok()
+        }
+    }
+
+    /// Record the in-memory consequences of a package whose durable append already succeeded.
+    fn note_key_package_posted(
+        &mut self,
+        posted_as: (Digest32, Digest32, Digest32),
+        package: &crate::node::keypackage::KeyPackage,
+    ) {
+        // A one-time prekey is named by one delivery only, frame or package (ADR-030 P-3): a
+        // second naming it would be opened as a replay, last-resort-grade.
+        if let Some(prekey_id) = package
+            .initial_message()
+            .ok()
+            .and_then(|init| init.one_time_prekey_id)
+        {
+            self.refused_otps.note(posted_as.1, prekey_id);
+        }
+        self.packages_posted.insert(posted_as);
     }
 
     fn key_package_work_ready(&self) -> bool {
@@ -20939,11 +20989,25 @@ impl Node {
             return Err(Fault::ReadSelectionChanged);
         }
         if let Some(paused) = paused {
-            if let Err(error) =
-                ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)())
-            {
-                ch.poison(&error);
-                return Err(fault_of(&error));
+            #[cfg(feature = "test-knobs")]
+            self.hold_room_pause_publication_for_proof().await;
+            let mut write =
+                || ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)());
+            let written = if by == profile.fingerprint() {
+                Some(write())
+            } else {
+                // The room lock is already held and every await is complete. Computer policy
+                // never takes a room lock while holding its state lock, so this room -> policy
+                // order is safe and the exact durable pause write cannot outlive its authority.
+                self.with_current_computer_authority(write)
+            };
+            match written {
+                None => return Err(Fault::Refused),
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    ch.poison(&error);
+                    return Err(fault_of(&error));
+                }
             }
         }
         let selection = vox_agentcomms::drive::PauseSelection {
