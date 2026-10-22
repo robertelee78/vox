@@ -568,12 +568,17 @@ fn assert_history_owned(dir: &Path, room: &str, peer: &str, held: usize, expecte
             && row["peer"].as_str() == Some(peer)
     };
     let demand_owned = history["owner"].as_object().is_some_and(|_| {
-        history["owner"]["room"]
+        let exact_request = history["owner"]["room"]
             .as_str()
             .is_some_and(|candidate| candidate.starts_with(room))
-            && history["owner"]["peer"].as_str() == Some(peer)
             && history["owner"]["request"].as_str().is_some()
-            && history["owner"]["instance"].as_str().is_some()
+            && history["owner"]["instance"].as_str().is_some();
+        exact_request
+            && if history["owner"]["stage"] == "resume_owed" {
+                history["owner"]["ticket"].as_u64().is_some() && history["owner"]["wake"] == true
+            } else {
+                history["owner"]["peer"].as_str() == Some(peer)
+            }
     });
     let bounded = &status["lanes"]["bounded"];
     let flow_owned = [
@@ -2280,7 +2285,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 );
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(50));
         }
         let release_hold = staged
             .release_hold
@@ -2818,8 +2823,8 @@ fn foreground_release_wakes_without_a_tick() {
 /// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
 /// the non-recipient package turns the exact held-through assertion red; restoring direct
 /// inventory credit turns the pre-release no-credit assertion red when Bob echoes Alice's merely
-/// committed head; granting body credit persists the hostile
-/// ciphertext and turns the Bob-only privacy assertion red; moving the archive cursor
+/// committed head; granting body credit persists the hostile ciphertext and turns the exact
+/// pre-persistence refusal assertion red; moving the archive cursor
 /// below the role-only header before its effect makes the interrupted request finish with debt;
 /// skipping the already-settled callback or rejecting its terminal replay strands the resumed
 /// request; dropping bounded continuation stalls the exact older-row assertion; each mutation
@@ -2833,8 +2838,10 @@ fn foreground_release_wakes_without_a_tick() {
 /// or dropping the authorization comparison, makes the transaction-barrier cycle decline without
 /// the shipped lane first reporting the stale old Flow. Retaining the departed room/member
 /// refusal suppresses the rejoined lifetime's decline; treating a changed head as the old
-/// decision prevents the successor's read/re-armed assertion. Each mutant reaches its own exact
-/// terminal PRODUCT red.
+/// decision prevents the successor's read/re-armed assertion. `drop-resume-owed` removes only the
+/// replacement owner after an archive Flow becomes authorization-stale while an earlier Control
+/// waiter owns admission; the exact shipped `lanes.history.owner` assertion turns red. Each mutant
+/// reaches its own exact terminal PRODUCT red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
@@ -2846,6 +2853,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
         "VOX_TEST_HOLD_CONTROL_JOB_FILE",
         "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
+        "VOX_TEST_FOREGROUND_JOBS",
+        "VOX_TEST_FX29_MUTANT",
     ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -2895,6 +2904,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         .to_owned();
     let settlement_engaged =
         std::path::PathBuf::from(format!("{}.engaged", settlement_hold.display()));
+    let control_hold = root.join("hold-archive-resume-control-owner");
+    let control_hold_path = control_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 Control-owner hold path")
+        .to_owned();
     let body_durable = root.join("history-body-durable");
     let body_durable_path = body_durable
         .to_str()
@@ -3185,6 +3199,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
             body_durable_path.as_str(),
         ),
+        ("VOX_TEST_FOREGROUND_JOBS", "1"),
+        ("VOX_TEST_HOLD_CONTROL_JOB_FILE", control_hold_path.as_str()),
     ];
     let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_settlement_knob);
     attached(&bob, "bob-after-gap");
@@ -3248,34 +3264,23 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "APPARATUS: {} did not name one exact authenticated entry",
         hostile_engaged.display()
     );
-    let settlement_deadline = Instant::now() + READY_WITHIN;
-    while !settlement_engaged.is_file()
-        && std::fs::read(&body_durable).ok().as_deref() != Some(hostile_hash.as_slice())
-    {
-        assert!(
-            Instant::now() < settlement_deadline,
-            "APPARATUS: Bob neither durably parked Carol's role-only header nor durably stored the \
-             exact hostile body within {READY_WITHIN:?}; the interruption was not staged\n\
-             bob said: {}",
-            said(&bob, "bob-after-gap")
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let refused_body = settlement_engaged.is_file();
-    if refused_body {
-        let held_status = history_status(&bob, &room);
-        assert!(
-            held_status.0 != "complete" && held_status.1 != 0,
-            "PRODUCT: before Carol's role-only header was semantically settled, Bob reported the \
-             archive request complete with no remaining debt: {held_status:?}"
-        );
-    } else {
-        assert_eq!(
+    while !settlement_engaged.is_file() {
+        assert_ne!(
             std::fs::read(&body_durable).ok().as_deref(),
             Some(hostile_hash.as_slice()),
-            "APPARATUS: Bob's receiver marker did not match Alice's exact hostile entry"
+            "PRODUCT [FX29 private-body-refusal]: Bob durably stored Carol's exact private body \
+             instead of refusing it before persistence"
         );
+        // The suite watchdog is the APPARATUS deadman if neither causal outcome arrives. This
+        // sleep only paces observation; elapsed wall time is not a PRODUCT verdict.
+        std::thread::sleep(Duration::from_millis(200));
     }
+    let held_status = history_status(&bob, &room);
+    assert!(
+        held_status.0 != "complete" && held_status.1 != 0,
+        "PRODUCT: before Carol's role-only header was semantically settled, Bob reported the \
+         archive request complete with no remaining debt: {held_status:?}"
+    );
     let bob_held_before_receipt =
         member_held_through_state(&alice, &room, &fps[1]).unwrap_or_else(|| {
             panic!(
@@ -3291,22 +3296,160 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
          his echoed inventory scalar was treated as a catch-up receipt (reported \
          {bob_held_before_receipt:?})"
     );
-    // Stop at the exact durable boundary, then resume through the shipped command. The healthy
-    // product parked the refused body at its header; the grant-credit mutant parked the exact
-    // forbidden body after append. Either restart must continue this request rather than invent an
-    // older cursor or a false terminal state.
-    bob_after_gap.stop();
-    let interruption = if refused_body {
-        &settlement_engaged
-    } else {
-        &body_durable
+    // Make the exact archive Flow authorization-stale while Control admission is genuinely busy.
+    // Its own Control job is still held at role settlement. Bob's trust of Carol is a real keyring
+    // generation change; Carol's real post then queues an older Control waiter behind that held
+    // job. Once the archive Flow returns stale, FIFO admission gives Carol the released job and
+    // holds it, so the archive replacement must remain visibly owned as `resume_owed` with its
+    // exact request/ticket/wake. The isolated mutant drops only `owe_resume`; after the exact stale
+    // lane terminal and held Control owner, this assertion turns PRODUCT red rather than waiting.
+    let archive_request = history_observation(&bob, &room)
+        .request
+        .unwrap_or_else(|| panic!("PRODUCT: the held archive request exposed no exact request id"));
+    let (ok, held_owner_status, err) = vox(&bob, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's shipped status failed while identifying the held archive owner: {err}"
+    );
+    let held_owner_status: serde_json::Value = serde_json::from_str(&held_owner_status)
+        .unwrap_or_else(|error| {
+            panic!(
+                "PRODUCT: Bob's shipped status was not JSON while identifying the held archive \
+                 owner: {error}: {held_owner_status}"
+            )
+        });
+    let held_owner = &held_owner_status["lanes"]["history"]["owner"];
+    let archive_instance = held_owner["instance"]
+        .as_str()
+        .filter(|instance| instance.len() == 32)
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: Bob's held archive owner exposed no exact incarnation: \
+                 {held_owner_status}"
+            )
+        })
+        .to_owned();
+    assert!(
+        held_owner["room"] == room && held_owner["request"] == archive_request,
+        "PRODUCT: Bob's held archive owner did not identify the exact room/request before \
+         authorization changed: {held_owner_status}"
+    );
+    let control_pressure_daemon = {
+        std::fs::File::create(&control_hold).unwrap_or_else(|error| {
+            panic!("APPARATUS: could not arm the real Control owner: {error}")
+        });
+        let stale_before = exact_lane(
+            &bob,
+            &room,
+            &fps[0],
+            "before the held archive authorization changed",
+        );
+        let (ok, out, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
+        assert!(
+            ok,
+            "PRODUCT: Bob's shipped trust of Carol was refused while staging the archive authorization change: {out}{err}"
+        );
+        let pressure = daemon_env(&carol, "carol-control-pressure", &knob);
+        attached(&carol, "carol-control-pressure");
+        wait_room_open(&carol, &room, "carol-control-pressure");
+        let control_post = "carol's real Control-pressure successor";
+        let (ok, out, err) = vox(&carol, &["room", "post", &room, control_post], None);
+        assert!(
+            ok,
+            "PRODUCT: Carol's Control-pressure post was refused: {out}{err}"
+        );
+        loop {
+            let (ok, status, err) = vox(&bob, &["status", "--json"], None);
+            assert!(
+                ok,
+                "APPARATUS: Bob's shipped status failed while staging the queued Control owner: {err}"
+            );
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap_or_else(|error| {
+                panic!("PRODUCT: Bob's shipped status was not JSON while staging Control pressure: {error}: {status}")
+            });
+            let queued = value["lanes"]["bounded"]["admissions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|owner| {
+                    owner["room"].as_str() == Some(room.as_str())
+                        && owner["peer"].as_str() == Some(fps[2].as_str())
+                        && owner["lane"].as_str() == Some("control")
+                });
+            if queued {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!(
+            "[proof] FX-29 archive authorization-stale Control-busy apparatus staged: room {room}, peer {}, request {archive_request}",
+            fps[0]
+        );
+        std::fs::remove_file(&settlement_engaged).unwrap_or_else(|error| {
+            panic!("APPARATUS: could not release the exact stale archive Flow: {error}")
+        });
+        loop {
+            let stale = exact_lane(
+                &bob,
+                &room,
+                &fps[0],
+                "after the held archive authorization changed",
+            )
+            .since(stale_before);
+            if stale.stale > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        loop {
+            let held =
+                charged_flow_hold_entries(&control_hold)
+                    .into_iter()
+                    .any(|(_, _, marker)| {
+                        std::fs::read_to_string(marker).is_ok_and(|identity| {
+                            identity.lines().any(|line| line == format!("room={room}"))
+                                && identity
+                                    .lines()
+                                    .any(|line| line == format!("peer={}", fps[2]))
+                        })
+                    });
+            if held {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let (ok, status, err) = vox(&bob, &["status", "--json"], None);
+        assert!(
+            ok,
+            "PRODUCT: Bob's shipped status failed after the exact stale archive terminal: {err}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&status).unwrap_or_else(|error| {
+            panic!("PRODUCT: Bob's shipped status was not JSON after the stale archive terminal: {error}: {status}")
+        });
+        let owner = &value["lanes"]["history"]["owner"];
+        assert!(
+            owner["stage"] == "resume_owed"
+                && owner["room"] == room
+                && owner["request"] == archive_request
+                && owner["instance"].as_str() == Some(archive_instance.as_str())
+                && owner["ticket"].as_u64().is_some()
+                && owner["wake"] == true
+                && value["lanes"]["budget"]["control"] == 1,
+            "PRODUCT [FX29 archive-resume-owner]: after the exact archive Flow became authorization-stale and Carol's earlier real Control work owned the sole admission, shipped status did not retain Bob's exact room/request/incarnation FIFO ticket and wake as `resume_owed`: {status}"
+        );
+        pressure
     };
-    std::fs::remove_file(interruption).unwrap_or_else(|e| {
-        panic!(
-            "APPARATUS: could not release {} after Bob stopped: {e}",
-            interruption.display()
-        )
-    });
+
+    // Stop at the exact durable boundary, then resume through the shipped command. The product
+    // now has an exact retained replacement owner. The held real Control worker deliberately
+    // prevents a clean actor stop, so kill this scratch daemon by its owned process handle and
+    // remove only its scratch apparatus.
+    drop(bob_after_gap);
+    let _ = std::fs::remove_file(&control_hold);
+    for (_, _, marker) in charged_flow_hold_entries(&control_hold) {
+        let _ = std::fs::remove_file(marker);
+    }
+    control_pressure_daemon.stop();
     let bob_after_interruption = daemon(&bob, "bob-after-interruption");
     attached(&bob, "bob-after-interruption");
     let (ok, out, err) = vox(&bob, &["room", "read", &room, "--history", "resume"], None);
@@ -3319,16 +3462,19 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // independently. Alice must instead report Bob's authenticated receipt through the exact
     // feed position after the package. That role-contiguous cursor cannot jump over Carol's
     // package header, even though Bob must never receive its private body.
-    let crossed_deadline = Instant::now() + READY_WITHIN;
     while member_held_through(&alice, &room, &fps[1]) != Some(marker_through) {
+        let current = history_observation(&bob, &room);
         assert!(
-            Instant::now() < crossed_deadline,
-            "PRODUCT: within {READY_WITHIN:?}, alice did not report Bob holding her authenticated \
-             room feed through {marker_through}; Carol's header-only package did not settle \
-             contiguously for Bob's role\n\
+            current.phase != "complete" && current.remaining != 0,
+            "PRODUCT: Bob's exact archive request reached terminal status {}/{}, but Alice did \
+             not report his authenticated receipt through {marker_through}; Carol's header-only \
+             package did not settle contiguously for Bob's role\n\
              bob's daemon said: {}",
+            current.phase,
+            current.remaining,
             said(&bob, "bob-after-interruption")
         );
+        assert_history_owned(&bob, &room, &fps[0], 0, 1);
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(
@@ -3514,19 +3660,14 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let bob_after_restart = daemon(&bob, "bob-after-restart");
     attached(&bob, "bob-after-restart");
     wait_room_open(&bob, &room, "bob-after-restart");
-    let restart_deadline = Instant::now() + READY_WITHIN;
-    while member_holds_through(&bob, &room, &fps[0]) != Some(marker_through)
-        || member_holds_through(&bob, &room, &fps[2]) != Some(carol_tail_through)
-    {
-        assert!(
-            Instant::now() < restart_deadline,
-            "PRODUCT: restarted Bob's `vox status --json` did not restore the exact authenticated \
-             contiguous feed heads for Alice through {marker_through} and Carol through \
-             {carol_tail_through} within {READY_WITHIN:?}\nbob said: {}",
-            said(&bob, "bob-after-restart")
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    assert!(
+        member_holds_through(&bob, &room, &fps[0]) == Some(marker_through)
+            && member_holds_through(&bob, &room, &fps[2]) == Some(carol_tail_through),
+        "PRODUCT: after restarted Bob's shipped room reached its Open terminal state, \
+         `vox status --json` did not restore the exact durable contiguous feed heads for Alice \
+         through {marker_through} and Carol through {carol_tail_through}\nbob said: {}",
+        said(&bob, "bob-after-restart")
+    );
 
     // Alice now goes offline. Release Carol's package hold only after Carol and Bob are running,
     // then wait for a completed Carol↔Bob sync (not elapsed silence). If Bob persisted the hostile
@@ -3585,10 +3726,9 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 
     // A completed inventory round is not evidence that Bob had to answer for Alice's history.
     // Re-arm Carol's package hold before the shipped reader asks for the exact page below Alice's
-    // oldest live-window row. In the grant-credit mutant, the forbidden body crosses that request
-    // and schedules a separate package-maintenance turn. The hold keeps its shipped pending bit
-    // observable until the proof releases it, so the privacy read cannot win an actor-scheduling
-    // race. The healthy product has only the role-complete header and schedules no such turn.
+    // oldest live-window row. The hold keeps the shipped pending bit observable until the proof
+    // releases it. The product has only the role-complete header: persisting the hostile private
+    // body already turns the earlier exact refusal assertion red.
     std::fs::write(&hold, b"").unwrap_or_else(|e| {
         panic!(
             "APPARATUS: could not re-arm Carol's package hold at {} before the explicit history \
@@ -3638,21 +3778,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::yield_now();
     };
 
-    if !refused_body {
-        let staged_deadline = Instant::now() + READY_WITHIN;
-        while key_packages_pending(&carol, &room) != Some(true) {
-            assert!(
-                Instant::now() < staged_deadline,
-                "APPARATUS: Bob's exact durably stored hostile package did not reach Carol's \
-                 shipped key-packages-pending state within {READY_WITHIN:?} after her explicit \
-                 Alice-history request; the grant-credit privacy precondition was not staged\n\
-                 carol said: {}\nbob said: {}",
-                said(&carol, "carol-from-bob"),
-                said(&bob, "bob-after-restart")
-            );
-            std::thread::yield_now();
-        }
-    }
     std::fs::remove_file(&hold).unwrap_or_else(|e| {
         panic!(
             "APPARATUS: could not release Carol's post-history package hold at {}: {e}",

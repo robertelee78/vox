@@ -185,7 +185,10 @@ impl State {
             Lane::Archive => {
                 self.archive_nodes.len() < ARCHIVE_JOBS && !self.archive_nodes.contains(&node)
             }
-            Lane::Control => self.control < FOREGROUND_JOBS,
+            // The proof-only capacity override applies to both foreground reservations. In a
+            // production build `foreground_jobs()` is the same source constant, so this does not
+            // change shipped admission; it lets a real daemon causally stage Control pressure.
+            Lane::Control => self.control < self.foreground_jobs,
             Lane::LargeControl => {
                 self.foreground < self.foreground_jobs
                     && (self.queues[Lane::Live.index()].is_empty()
@@ -340,6 +343,12 @@ pub struct Ticket {
 }
 
 impl Ticket {
+    /// Stable FIFO identity exposed only through the owning shipped status snapshot. This is not
+    /// a retry count or progress proxy: it identifies the exact retained admission owner.
+    pub(crate) fn sequence(&self) -> u64 {
+        self.ticket
+    }
+
     /// Register before attempting admission, so a permit released between the check and the
     /// actor's wake task cannot be missed. This future owns only the notification subscription;
     /// the controller retains the queue ticket and can cancel it synchronously.

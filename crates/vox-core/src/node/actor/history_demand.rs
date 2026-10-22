@@ -116,6 +116,10 @@ impl Controller {
     }
 
     pub(super) fn owe_resume(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX29_MUTANT").as_deref() == Ok("drop-resume-owed") {
+            return;
+        }
         if self.resume_owed.as_ref().is_some_and(|owed| {
             owed.room == room && owed.instance == instance && owed.request == request
         }) {
@@ -1743,11 +1747,40 @@ impl Controller {
         } else {
             None
         };
-        let owner = self
-            .status
-            .as_ref()
-            .zip(active_stage)
-            .map_or_else(|| "null".to_owned(), |(status, stage)| {
+        let owner = if let Some(owed) = self.resume_owed.as_ref() {
+            let peer = self
+                .status
+                .as_ref()
+                .filter(|status| status.request == Some(owed.request))
+                .and_then(|status| status.private_peer)
+                .map_or_else(
+                    || "null".to_owned(),
+                    |peer| format!("\"{}\"", b32_encode(&peer)),
+                );
+            let request = owed
+                .request
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let instance = owed
+                .instance
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let ticket = owed
+                .ticket
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), |ticket| ticket.sequence().to_string());
+            format!(
+                "{{\"stage\":\"resume_owed\",\"room\":\"{}\",\"peer\":{peer},\"request\":\"{request}\",\"instance\":\"{instance}\",\"ticket\":{ticket},\"wake\":{}}}",
+                b32_encode(&owed.room),
+                owed.wake_task.is_some()
+            )
+        } else {
+            self.status
+                .as_ref()
+                .zip(active_stage)
+                .map_or_else(|| "null".to_owned(), |(status, stage)| {
             let peer = self
                 .ready
                 .as_ref()
@@ -1769,7 +1802,8 @@ impl Controller {
                 "{{\"stage\":\"{stage}\",\"room\":\"{}\",\"peer\":{peer},\"request\":{request},\"instance\":\"{instance}\"}}",
                 b32_encode(&status.room)
             )
-            });
+                })
+        };
         format!(
             "{{\"phase\":{phase},\"detail\":{detail},\"owner\":{owner},\"preparing\":{},\"ready\":{},\"running\":{},\"private_work\":{}}}",
             self.preparing.is_some(),
