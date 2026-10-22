@@ -18,8 +18,8 @@
 //! running the old one until restarted, and the person is asked to restart it.
 
 use std::fs;
-use std::io::Read as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,15 +42,27 @@ const PARTIAL: &str = ".Vox.app.partial";
 const UNPACK_PARTIAL: &str = ".Vox.app.unpack.partial";
 /// The CLI inside the bundle.
 const HELPER: &str = "Contents/Helpers/vox";
-/// The journal of a publish under way: it holds the version being published and the bundle that
-/// was [`PREVIOUS`], so a publish cut short is finished or undone by the next transition
-/// ([`recover`]) instead of losing the replaced bundle.
+/// The durable journal of a publish or rollback under way. It holds the exact filesystem objects
+/// on each side of the exchange, so recovery never guesses from a version string.
 const PUBLISHING: &str = ".Vox.app.publishing";
-/// In [`PUBLISHING`]: the version the publish puts in place.
-const PUBLISHING_VERSION: &str = "version";
+/// In [`PUBLISHING`]: the fully flushed transition record.
+const TRANSITION_STATE: &str = "state";
 
-/// **Test-only**: abort the process right after a publish's swap, before the replaced bundle is
-/// renamed to [`PREVIOUS`], so a proof can stand a publish cut short at its one awkward moment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransitionKind {
+    Publish,
+    Rollback,
+}
+
+struct Transition {
+    kind: TransitionKind,
+    active_id: u64,
+    target_id: u64,
+    version: String,
+}
+
+/// **Test-only**: abort the process right after a publish or rollback exchange, before the
+/// displaced bundle is retained, so a proof can stand a transition cut short at that boundary.
 /// Nothing a person runs sets it; not compiled in without the `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 const TEST_ABORT_AFTER_SWAP_ENV: &str = "VOX_TEST_ABORT_AFTER_SWAP";
@@ -69,52 +81,69 @@ pub(super) fn update(
     let target = target_triple();
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|_| usage("this binary's own version is not SemVer"))?;
-    let vox = fetch_record(channel, target)?;
-    let app = fetch_app_record(channel, target)?;
-    if app.version != vox.version {
-        return Err(usage(format!(
-            "the {channel} release offers vox {} but Vox.app {}; they are applied together or not \
-             at all",
-            vox.version_text, app.version_text
-        )));
-    }
-    if vox.version <= current {
-        println!(
-            "Vox {current} is current (the newest {channel} release is {})",
-            vox.version_text
-        );
-        // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
-        // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
-        if !check_only {
-            // A previous bundle left as an application (before M-29a, or by a set-aside that
-            // failed) is repaired here too, so a plain `vox update` finishes the job.
-            let _lock = InstallLock::acquire(apps)?;
-            let repaired = recover(apps)?;
-            shell_setup_from(apps, exe);
-            println!("Vox {current} is current; {}", super::skill_said());
-            repaired.say_without_swap();
+    if check_only {
+        let (vox, _) = fetch_pair(channel, target)?;
+        if vox.version <= current {
+            println!(
+                "Vox {current} is current (the newest {channel} release is {})",
+                vox.version_text
+            );
+        } else {
+            println!(
+                "Vox {} is available on {channel} (this is {current})",
+                vox.version_text
+            );
         }
         return Ok(());
     }
-    println!(
-        "Vox {} is available on {channel} (this is {current})",
-        vox.version_text
-    );
-    if check_only {
-        return Ok(());
-    }
 
-    // The lock first: what is in `apps` is read only while no other transition changes it.
+    // Acquire the transition lock and recover before any network dependency. A person can
+    // always finish a durable local transition, and every release decision is then made once,
+    // under the same lock, against the app actually installed at that moment.
     let _lock = InstallLock::acquire(apps)?;
     let repaired = recover(apps)?;
-    repaired.say_before_transition();
     let active = apps.join(BUNDLE);
+    require_bundle(&active, BUNDLE)?;
     if !active.join(HELPER).is_file() {
         return Err(usage(format!(
             "{} holds the install marker but no {BUNDLE} with {HELPER}",
             apps.display()
         )));
     }
+    if repaired.finished_rollback() {
+        return finish_recovered_rollback(apps, &active, exe, repaired);
+    }
+
+    let (vox, app) = fetch_pair(channel, target)?;
+    let installed_text = active_app_version(&active).ok_or_else(|| {
+        usage(format!(
+            "the active {} has no readable Contents/Info.plist version",
+            active.display()
+        ))
+    })?;
+    let installed = semver::Version::parse(&installed_text).map_err(|_| {
+        usage(format!(
+            "the active {} says its version is {installed_text:?}, not SemVer",
+            active.display()
+        ))
+    })?;
+    if vox.version <= installed {
+        println!(
+            "Vox {installed} is current (the newest {channel} release is {})",
+            vox.version_text
+        );
+        // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
+        // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
+        shell_setup_from(apps, exe);
+        println!("Vox {installed} is current; {}", super::skill_said());
+        repaired.say_without_swap();
+        return Ok(());
+    }
+    println!(
+        "Vox {} is available on {channel} (installed: {installed})",
+        vox.version_text
+    );
+    repaired.say_before_transition();
 
     let mut downloading = tempfile::Builder::new()
         .prefix("vox-update.")
@@ -140,7 +169,7 @@ pub(super) fn update(
         "         the previous Vox.app is kept at {} for `vox update --rollback`",
         apps.join(PREVIOUS).display()
     );
-    ask_to_restart(current.to_string().as_str(), &vox.version_text);
+    ask_to_restart(&installed_text, &vox.version_text);
     let detached = super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
@@ -148,6 +177,19 @@ pub(super) fn update(
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+fn fetch_pair(channel: &str, target: &str) -> Result<(Validated, Validated), AppError> {
+    let vox = fetch_record(channel, target)?;
+    let app = fetch_app_record(channel, target)?;
+    if app.version != vox.version {
+        return Err(usage(format!(
+            "the {channel} release offers vox {} but Vox.app {}; they are applied together or not \
+             at all",
+            vox.version_text, app.version_text
+        )));
+    }
+    Ok((vox, app))
 }
 
 /// `vox update --rollback` for the Vox.app in `apps`: swap it with `.Vox.app.previous`, so a
@@ -160,37 +202,59 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let previous = apps.join(PREVIOUS);
     let _lock = InstallLock::acquire(apps)?;
     let repaired = recover(apps)?;
+    if repaired.finished_rollback() {
+        return finish_recovered_rollback(apps, &active, exe, repaired);
+    }
     repaired.say_before_transition();
+    require_bundle(&active, BUNDLE)?;
+    require_bundle(&previous, PREVIOUS)?;
     if !previous.join(HELPER).is_file() {
         return Err(usage(format!(
             "no previous Vox.app was retained in {} — nothing to roll back to",
             apps.display()
         )));
     }
-    let was = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
-    // The kept bundle becomes an application again before it is swapped in; the one it replaces
-    // is set aside after, so neither is ever both in place and set aside.
+    let was = active_app_version(&active).unwrap_or_else(|| "unknown".to_owned());
+    let now = bundle_version(&previous).unwrap_or_else(|| "unknown".to_owned());
+    let transition = Transition {
+        kind: TransitionKind::Rollback,
+        active_id: file_id(&active)?,
+        target_id: file_id(&previous)?,
+        version: now.clone(),
+    };
+    begin_transition(apps, &transition)?;
+    // The journal is durable before the kept plist is restored. Recovery can therefore finish a
+    // pre-swap exchange or a post-swap set-aside without guessing which app moved.
     restore(&previous)?;
     if let Err(failed) = swap(&previous, &active) {
-        // Nothing was swapped: the kept bundle is set aside again, never left an application.
-        return Err(match set_aside(&previous) {
-            Ok(_) => failed,
-            Err(aside) => AppError::Usage(format!(
-                "the rollback swap failed ({failed}), and {aside}; run `vox update` to repair, \
-                 and until then open Vox as {}",
-                active.display()
-            )),
-        });
+        // Nothing was swapped. The journal-backed recovery retries the exact rollback; if the
+        // exchange failure was transient it completes the user's command, otherwise the journal
+        // remains for the next command.
+        return match recover(apps) {
+            Ok(recovered) if recovered.finished_rollback() => {
+                finish_recovered_rollback(apps, &active, exe, recovered)
+            }
+            Ok(_) => Err(failed),
+            Err(repair) => Err(usage(format!(
+                "the rollback swap failed ({failed}), and its durable repair failed ({repair}); \
+                 run `vox update` to finish the recorded transition"
+            ))),
+        };
     }
     sync_dir(apps)?;
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
+        std::process::abort();
+    }
     // The rollback is done at this point. A set-aside that fails is reported last, after the
     // active bundle is registered and the daemon restarted, so a failed step never leaves the
     // rest of the transition undone or invites a second --rollback that would reverse it.
     let aside = set_aside(&previous);
-    if let Err(said) = launch_services(true, &active) {
-        println!("note: {said}; the current Vox.app is in place and opens by path");
+    let registration = launch_services(true, &active);
+    if aside.is_ok() && registration.is_ok() {
+        finish_transition(apps)?;
     }
-    let now = app_version(&active).unwrap_or_else(|| "unknown".to_owned());
+    let now = active_app_version(&active).unwrap_or(now);
     println!("rolled back: {} -> Vox {now}", active.display());
     println!(
         "         Vox {was} is kept at {} for --rollback",
@@ -210,6 +274,34 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
             active.display()
         );
     }
+    if let Err(e) = registration {
+        println!(
+            "vox: the rollback is done, but {e}; run `vox update` to retry the recorded \
+             registration, and until then open Vox as {}",
+            active.display()
+        );
+    }
+    Ok(())
+}
+
+fn finish_recovered_rollback(
+    apps: &Path,
+    active: &Path,
+    exe: &Path,
+    repaired: Recovery,
+) -> Result<(), AppError> {
+    require_bundle(active, BUNDLE)?;
+    let now = active_app_version(active).unwrap_or_else(|| "unknown".to_owned());
+    let was = bundle_version(&apps.join(PREVIOUS)).unwrap_or_else(|| "unknown".to_owned());
+    println!(
+        "finished the interrupted rollback: {} is Vox {now}",
+        active.display()
+    );
+    ask_to_restart(&was, &now);
+    let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
+    shell_setup_from(apps, exe);
+    super::restart::say_next(&detached);
+    repaired.say_without_swap();
     Ok(())
 }
 
@@ -226,6 +318,112 @@ fn swap(a: &Path, b: &Path) -> Result<(), AppError> {
     .map_err(|e| AppError::Io(e.into()))
 }
 
+fn begin_transition(apps: &Path, transition: &Transition) -> Result<(), AppError> {
+    let journal = apps.join(PUBLISHING);
+    if path_exists(&journal)? {
+        return Err(usage(format!(
+            "{} still holds an unfinished app transition; run `vox update` to repair it",
+            journal.display()
+        )));
+    }
+    fs::create_dir(&journal).map_err(AppError::Io)?;
+    sync_dir(apps)?;
+    let kind = match transition.kind {
+        TransitionKind::Publish => "publish",
+        TransitionKind::Rollback => "rollback",
+    };
+    let state = journal.join(TRANSITION_STATE);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&state)
+        .map_err(AppError::Io)?;
+    write!(
+        file,
+        "vox-app-transition-v1\nkind={kind}\nactive_id={}\ntarget_id={}\nversion={}\n",
+        transition.active_id, transition.target_id, transition.version
+    )
+    .map_err(AppError::Io)?;
+    file.sync_all().map_err(AppError::Io)?;
+    sync_dir(&journal)?;
+    sync_dir(apps)
+}
+
+fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
+    let state = journal.join(TRANSITION_STATE);
+    let meta = match fs::symlink_metadata(&state) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(AppError::Io(e)),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(usage(format!(
+            "{} is not a direct transition-state file; leave it in place and report this",
+            state.display()
+        )));
+    }
+    let text = match fs::read_to_string(&state) {
+        Ok(text) => text,
+        Err(e) => return Err(AppError::Io(e)),
+    };
+    let mut lines = text.lines();
+    if lines.next() != Some("vox-app-transition-v1") {
+        return Err(usage(format!(
+            "{} has an unreadable app-transition record; leave it in place and report this",
+            state.display()
+        )));
+    }
+    let field = |line: Option<&str>, name: &str| -> Result<String, AppError> {
+        line.and_then(|line| line.strip_prefix(&format!("{name}=")))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                usage(format!(
+                    "{} has an incomplete app-transition record; leave it in place and report this",
+                    state.display()
+                ))
+            })
+    };
+    let kind = match field(lines.next(), "kind")?.as_str() {
+        "publish" => TransitionKind::Publish,
+        "rollback" => TransitionKind::Rollback,
+        _ => {
+            return Err(usage(format!(
+                "{} names an unknown app transition; leave it in place and report this",
+                state.display()
+            )))
+        }
+    };
+    let active_id = field(lines.next(), "active_id")?.parse().map_err(|_| {
+        usage(format!(
+            "{} has an invalid active filesystem identity",
+            state.display()
+        ))
+    })?;
+    let target_id = field(lines.next(), "target_id")?.parse().map_err(|_| {
+        usage(format!(
+            "{} has an invalid target filesystem identity",
+            state.display()
+        ))
+    })?;
+    let version = field(lines.next(), "version")?;
+    if lines.next().is_some() {
+        return Err(usage(format!(
+            "{} has unexpected app-transition data; leave it in place and report this",
+            state.display()
+        )));
+    }
+    Ok(Some(Transition {
+        kind,
+        active_id,
+        target_id,
+        version,
+    }))
+}
+
+fn finish_transition(apps: &Path) -> Result<(), AppError> {
+    clear(&apps.join(PUBLISHING))
+}
+
 /// Make the verified `.Vox.app.partial` the bundle, keeping the one it replaces.
 ///
 /// **Journalled** ([`PUBLISHING`]): the bundle that was [`PREVIOUS`] is moved into the journal
@@ -236,14 +434,23 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
     let journal = apps.join(PUBLISHING);
-    clear(&journal)?;
-    fs::create_dir(&journal).map_err(AppError::Io)?;
-    fs::write(journal.join(PUBLISHING_VERSION), version).map_err(AppError::Io)?;
-    if fs::symlink_metadata(&previous).is_ok() {
+    let active = apps.join(BUNDLE);
+    require_bundle(&active, BUNDLE)?;
+    require_bundle(&staged, PARTIAL)?;
+    require_optional_bundle(&previous, PREVIOUS)?;
+    let transition = Transition {
+        kind: TransitionKind::Publish,
+        active_id: file_id(&active)?,
+        target_id: file_id(&staged)?,
+        version: version.to_owned(),
+    };
+    begin_transition(apps, &transition)?;
+    if path_exists(&previous)? {
         fs::rename(&previous, journal.join(BUNDLE)).map_err(AppError::Io)?;
+        sync_dir(&journal)?;
+        sync_dir(apps)?;
     }
-    sync_dir(apps)?;
-    if let Err(failed) = swap(&staged, &apps.join(BUNDLE)) {
+    if let Err(failed) = swap(&staged, &active) {
         // Nothing was swapped: the previous bundle goes back where it was.
         let _ = recover(apps);
         return Err(failed);
@@ -257,29 +464,36 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
     fs::rename(&staged, &previous).map_err(AppError::Io)?;
     sync_dir(apps)?;
     let aside = set_aside(&previous);
-    if let Err(said) = launch_services(true, &apps.join(BUNDLE)) {
-        println!("note: {said}; the current Vox.app is in place and opens by path");
+    let registration = launch_services(true, &active);
+    if let Err(error) = aside {
+        // The active app is committed. Keep the durable journal so the next update can finish
+        // disarming the displaced bundle before it considers another candidate.
+        return Ok(Some(usage(format!(
+            "Vox {version} is in place, but the replaced Vox.app was not set aside: {error}; run \
+             `vox update` again to finish the recorded transition, and until then open Vox as {}",
+            active.display()
+        ))));
+    }
+    if let Err(error) = registration {
+        return Ok(Some(usage(format!(
+            "Vox {version} is in place, but {error}; run `vox update` again to retry the \
+             recorded registration, and until then open Vox as {}",
+            active.display()
+        ))));
     }
     // The bundle that was previous before this publish goes, unless something still runs from
     // it: then it is retired, and a later transition removes it (see [`sweep`]).
     let older = journal.join(BUNDLE);
-    if fs::symlink_metadata(&older).is_ok() {
+    if path_exists(&older)? {
+        require_bundle(&older, "the journal's retained bundle")?;
         if in_use(&older) {
             retire(apps, &older)?;
         } else {
             clear(&older)?;
         }
     }
-    clear(&journal)?;
-    // The publish is done at this point; a set-aside that failed is the caller's to report
-    // after it has restarted the daemon, never a reason to leave the transition half finished.
-    Ok(aside.err().map(|e| {
-        AppError::Usage(format!(
-            "Vox {version} is in place, but the replaced Vox.app was not set aside: {e}; run \
-             `vox update` again to finish, and until then open Vox as {}",
-            apps.join(BUNDLE).display()
-        ))
-    }))
+    finish_transition(apps)?;
+    Ok(None)
 }
 
 /// Bundles retired by earlier transitions while code from them was running: `.Vox.app.retired.*`.
@@ -293,14 +507,16 @@ fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
     let name = format!("{RETIRED_PREFIX}{ms}.{}", std::process::id());
     let retired = apps.join(name);
     fs::rename(bundle, &retired).map_err(AppError::Io)?;
+    sync_dir(apps)?;
     set_aside(&retired).map(|_| ())
 }
 
 /// Tell LaunchServices about a bundle: `register` adds or refreshes the bundle in place;
 /// otherwise a record made for a bundle now set aside is taken out. The set-aside bundle has no
 /// `Info.plist` ([`set_aside`]), which is what keeps it unlaunchable; this call only clears the
-/// record a running app may still re-register when it quits. Best effort: a refusal is said,
-/// not fatal. Measured 2026-10-19: both bundles registered as `us.vox.app` with the same
+/// record a running app may still re-register when it quits. A displaced-bundle release is
+/// retried after a refusal; an active-bundle registration keeps the transition journal until a
+/// later command succeeds. Measured 2026-10-19: both bundles registered as `us.vox.app` with the same
 /// CFBundleVersion, and reopening Vox launched the replaced 0.4.4 against the 0.4.6 daemon.
 fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
     const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
@@ -340,42 +556,67 @@ const INFO_PLIST: &str = "Contents/Info.plist";
 /// fails and tried again by every later transition that finds the bundle still there (`sweep`,
 /// `recover`, the next publish), until it succeeds.
 fn set_aside(bundle: &Path) -> Result<bool, AppError> {
+    require_bundle(bundle, "the bundle being set aside")?;
     if let Err(said) = launch_services(false, bundle) {
         println!("note: {said}; tried again at the next update or rollback");
     }
     let plist = bundle.join(INFO_PLIST);
+    let kept = bundle.join(KEPT_INFO_PLIST);
     if !plist.is_file() {
-        return Ok(false);
+        return if kept.is_file() {
+            Ok(false)
+        } else {
+            Err(usage(format!(
+                "{} has neither a live nor kept Info.plist; it was not removed",
+                bundle.display()
+            )))
+        };
     }
-    fs::rename(&plist, bundle.join(KEPT_INFO_PLIST)).map_err(|e| {
+    if path_exists(&kept)? {
+        return Err(usage(format!(
+            "{} has both a live and kept Info.plist; neither was replaced",
+            bundle.display()
+        )));
+    }
+    fs::rename(&plist, &kept).map_err(|e| {
         AppError::Usage(format!(
             "{} is still an application: its Info.plist could not be set aside ({e})",
             bundle.display()
         ))
     })?;
+    sync_dir(&bundle.join("Contents"))?;
     Ok(true)
 }
 
 /// Make a set-aside bundle an application again, for the swap that brings it back.
 fn restore(bundle: &Path) -> Result<(), AppError> {
+    require_bundle(bundle, "the bundle being restored")?;
     let kept = bundle.join(KEPT_INFO_PLIST);
+    let live = bundle.join(INFO_PLIST);
+    if path_exists(&kept)? && path_exists(&live)? {
+        return Err(usage(format!(
+            "{} has both a live and kept Info.plist; neither was replaced",
+            bundle.display()
+        )));
+    }
     if kept.is_file() {
-        fs::rename(&kept, bundle.join(INFO_PLIST)).map_err(AppError::Io)?;
+        fs::rename(&kept, live).map_err(AppError::Io)?;
+        sync_dir(&bundle.join("Contents"))?;
     }
     Ok(())
 }
 
 /// Remove the retired bundles nothing runs from any more.
 fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
-    let Ok(entries) = fs::read_dir(apps) else {
-        return Ok(());
-    };
-    for entry in entries.filter_map(Result::ok) {
+    let entries = fs::read_dir(apps).map_err(AppError::Io)?;
+    for entry in entries {
+        let entry = entry.map_err(AppError::Io)?;
         let retired = entry
             .file_name()
             .to_string_lossy()
             .starts_with(RETIRED_PREFIX);
         if retired {
+            require_bundle(&entry.path(), "a reserved retired-bundle path")?;
             // Set aside first, again if an earlier attempt failed: the record goes and the
             // bundle is no application even if it then cannot be removed. One still in use stays.
             if set_aside(&entry.path())? {
@@ -397,14 +638,22 @@ fn in_use(bundle: &Path) -> bool {
     let mut files = Vec::new();
     let mut dirs = vec![bundle.join("Contents")];
     while let Some(dir) = dirs.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return true,
         };
-        for entry in entries.filter_map(Result::ok) {
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
-                continue;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => return true,
             };
-            if meta.is_dir() {
+            let meta = match fs::symlink_metadata(entry.path()) {
+                Ok(meta) => meta,
+                Err(_) => return true,
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            } else if meta.is_dir() {
                 dirs.push(entry.path());
             } else if meta.is_file() && meta.permissions().mode() & 0o100 != 0 {
                 files.push(entry.path());
@@ -412,73 +661,169 @@ fn in_use(bundle: &Path) -> bool {
         }
     }
     if files.is_empty() {
-        return false;
+        return true;
     }
-    // The pids, not the status: lsof exits 1 when any one file named is not open.
-    Command::new("/usr/sbin/lsof")
+    // `lsof` exits 1 with no output when none of the exact files is open. Any output, diagnostic,
+    // other status, or inability to ask is uncertainty and keeps the bundle.
+    match Command::new("/usr/sbin/lsof")
         .arg("-t")
         .args(&files)
         .env_clear()
         .output()
-        .map_or(true, |out| !out.stdout.is_empty())
+    {
+        Ok(out) if !out.stdout.is_empty() => true,
+        Ok(out)
+            if out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty() =>
+        {
+            false
+        }
+        _ => true,
+    }
 }
 
-/// Finish or undo a publish that was cut short (see [`publish`]); nothing when none was. Run
-/// under the install lock, before anything else reads `apps`.
-///
-/// The journal's version and the active bundle say which side of the swap the publish stopped on:
-/// if [`BUNDLE`] is that version, the swap happened and a remaining [`PARTIAL`] holds the replaced
-/// bundle; otherwise a remaining partial is the unpublished candidate, and goes. This also covers
-/// a stop before the version file was written. Either way the journal's earlier previous bundle
-/// comes back when nothing has taken its place, and every journal is reported as an interrupted
-/// publish even when no rename remains to perform.
+/// Finish or undo a transition cut short under the install lock. The durable record names the
+/// exact filesystem objects, so an equal version or a kept plist can never be mistaken for proof
+/// that the exchange happened.
 fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
     sweep(apps, &mut repaired)?;
+    let active = apps.join(BUNDLE);
+    let staged = apps.join(PARTIAL);
+    let previous = apps.join(PREVIOUS);
     let journal = apps.join(PUBLISHING);
-    if fs::symlink_metadata(&journal).is_err() {
+    require_bundle(&active, BUNDLE)?;
+    require_optional_bundle(&staged, PARTIAL)?;
+    require_optional_bundle(&previous, PREVIOUS)?;
+    require_optional_dir(&journal, PUBLISHING)?;
+    if !path_exists(&journal)? {
         // No publish was cut short. A previous bundle is set aside again under the lock: one an
         // earlier release left as an application (before M-29a), or one whose record removal
         // failed last time.
-        let previous = apps.join(PREVIOUS);
-        if fs::symlink_metadata(&previous).is_ok() {
+        if path_exists(&previous)? {
             repaired.previous_set_aside = set_aside(&previous)?;
         }
         return Ok(repaired);
     }
-    let staged = apps.join(PARTIAL);
-    let previous = apps.join(PREVIOUS);
-    let published = fs::read_to_string(journal.join(PUBLISHING_VERSION)).unwrap_or_default();
-    let published = published.trim();
-    let swapped =
-        !published.is_empty() && app_version(&apps.join(BUNDLE)).as_deref() == Some(published);
-    repaired.interrupted_publish = Some(if swapped {
-        InterruptedPublish::PutInPlace(published.to_owned())
-    } else {
-        InterruptedPublish::BeforeSwap(published.to_owned())
-    });
-    if swapped {
-        if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
-            fs::rename(&staged, &previous).map_err(AppError::Io)?;
-            let _ = set_aside(&previous)?;
-        }
-    } else if fs::symlink_metadata(&staged).is_ok() {
-        // The active app was never exchanged: the partial name is only the unpublished
-        // candidate, including when an existing previous bundle had not yet entered the journal.
-        clear(&staged)?;
-    }
     let kept = journal.join(BUNDLE);
-    if fs::symlink_metadata(&previous).is_err() && fs::symlink_metadata(&kept).is_ok() {
-        fs::rename(&kept, &previous).map_err(AppError::Io)?;
+    require_optional_bundle(&kept, "the journal's retained bundle")?;
+    let Some(transition) = read_transition(&journal)? else {
+        // The directory can reach disk before its state file. No bundle mutation is permitted
+        // until that state file is flushed, so this is unambiguously before the exchange.
+        if path_exists(&staged)? {
+            clear(&staged)?;
+        }
+        finish_transition(apps)?;
+        repaired.interrupted_transition = Some(InterruptedTransition::BeforePublish(String::new()));
+        return Ok(repaired);
+    };
+    let active_id = file_id(&active)?;
+    match transition.kind {
+        TransitionKind::Publish if active_id == transition.target_id => {
+            repaired.interrupted_transition =
+                Some(InterruptedTransition::Published(transition.version.clone()));
+            if path_exists(&previous)? {
+                if file_id(&previous)? != transition.active_id {
+                    return Err(transition_conflict(
+                        &journal,
+                        "the retained previous app changed",
+                    ));
+                }
+            } else {
+                if !path_exists(&staged)? || file_id(&staged)? != transition.active_id {
+                    return Err(transition_conflict(
+                        &journal,
+                        "the replaced app is under neither recorded name",
+                    ));
+                }
+                fs::rename(&staged, &previous).map_err(AppError::Io)?;
+                sync_dir(apps)?;
+            }
+            repaired.previous_set_aside |= set_aside(&previous)?;
+            if path_exists(&kept)? {
+                if in_use(&kept) {
+                    retire(apps, &kept)?;
+                } else {
+                    clear(&kept)?;
+                }
+            }
+        }
+        TransitionKind::Publish if active_id == transition.active_id => {
+            repaired.interrupted_transition = Some(InterruptedTransition::BeforePublish(
+                transition.version.clone(),
+            ));
+            if path_exists(&staged)? {
+                if file_id(&staged)? != transition.target_id {
+                    return Err(transition_conflict(
+                        &journal,
+                        "the unpublished candidate changed",
+                    ));
+                }
+                clear(&staged)?;
+            }
+            if path_exists(&kept)? {
+                if path_exists(&previous)? {
+                    return Err(transition_conflict(
+                        &journal,
+                        "two different previous bundles are present",
+                    ));
+                }
+                fs::rename(&kept, &previous).map_err(AppError::Io)?;
+                sync_dir(&journal)?;
+                sync_dir(apps)?;
+            }
+            if path_exists(&previous)? {
+                repaired.previous_set_aside |= set_aside(&previous)?;
+            }
+        }
+        TransitionKind::Rollback if active_id == transition.target_id => {
+            repaired.interrupted_transition = Some(InterruptedTransition::RolledBack(
+                transition.version.clone(),
+            ));
+            if !path_exists(&previous)? || file_id(&previous)? != transition.active_id {
+                return Err(transition_conflict(
+                    &journal,
+                    "the displaced app is not the recorded active app",
+                ));
+            }
+            repaired.previous_set_aside |= set_aside(&previous)?;
+        }
+        TransitionKind::Rollback if active_id == transition.active_id => {
+            repaired.interrupted_transition = Some(InterruptedTransition::BeforeRollback(
+                transition.version.clone(),
+            ));
+            if !path_exists(&previous)? || file_id(&previous)? != transition.target_id {
+                return Err(transition_conflict(
+                    &journal,
+                    "the rollback app is not the recorded target",
+                ));
+            }
+            restore(&previous)?;
+            swap(&previous, &active)?;
+            sync_dir(apps)?;
+            repaired.previous_set_aside |= set_aside(&previous)?;
+        }
+        _ => {
+            return Err(transition_conflict(
+                &journal,
+                "the active app is neither recorded side of the exchange",
+            ))
+        }
     }
-    // The previous bundle is set aside again under the lock, before anything else reads `apps`:
-    // one an earlier release left as an application, or one whose record removal failed.
-    if fs::symlink_metadata(&previous).is_ok() {
-        repaired.previous_set_aside |= set_aside(&previous)?;
-    }
-    sync_dir(apps)?;
-    clear(&journal)?;
+    launch_services(true, &active).map_err(|said| {
+        usage(format!(
+            "the recorded app transition is repaired, but {said}; its journal is retained so \
+             `vox update` can retry registration"
+        ))
+    })?;
+    finish_transition(apps)?;
     Ok(repaired)
+}
+
+fn transition_conflict(journal: &Path, detail: &str) -> AppError {
+    usage(format!(
+        "cannot finish the recorded app transition in {}: {detail}; no path was removed",
+        journal.display()
+    ))
 }
 
 /// Work an earlier or interrupted transition left for the next update. It is accumulated so a
@@ -486,22 +831,33 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
 /// exchange the active bundle (ADR-014 M-29a).
 #[derive(Default)]
 struct Recovery {
-    interrupted_publish: Option<InterruptedPublish>,
+    interrupted_transition: Option<InterruptedTransition>,
     previous_set_aside: bool,
     retired_set_aside: usize,
     retired_removed: usize,
 }
 
-enum InterruptedPublish {
+enum InterruptedTransition {
     /// The journal exists but the active app is not its version: the candidate never published.
-    BeforeSwap(String),
+    BeforePublish(String),
     /// The journal's version is active: finish retaining the bundle it replaced.
-    PutInPlace(String),
+    Published(String),
+    /// Recovery completed a rollback whose exchange had not happened yet.
+    BeforeRollback(String),
+    /// The rollback exchange happened; finish disarming the displaced app.
+    RolledBack(String),
 }
 
 impl Recovery {
+    fn finished_rollback(&self) -> bool {
+        matches!(
+            &self.interrupted_transition,
+            Some(InterruptedTransition::RolledBack(_) | InterruptedTransition::BeforeRollback(_))
+        )
+    }
+
     fn is_empty(&self) -> bool {
-        self.interrupted_publish.is_none()
+        self.interrupted_transition.is_none()
             && !self.previous_set_aside
             && self.retired_set_aside == 0
             && self.retired_removed == 0
@@ -509,16 +865,22 @@ impl Recovery {
 
     fn detail(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(interrupted) = &self.interrupted_publish {
+        if let Some(interrupted) = &self.interrupted_transition {
             parts.push(match interrupted {
-                InterruptedPublish::BeforeSwap(version) if !version.is_empty() => format!(
+                InterruptedTransition::BeforePublish(version) if !version.is_empty() => format!(
                     "finished the update cut short before Vox {version} was put in place and discarded its unpublished candidate"
                 ),
-                InterruptedPublish::BeforeSwap(_) => {
-                    "finished an update cut short before its candidate was put in place and discarded that unpublished candidate".to_owned()
+                InterruptedTransition::BeforePublish(_) => {
+                    "finished an update cut short before its candidate was put in place and discarded its unpublished candidate".to_owned()
                 }
-                InterruptedPublish::PutInPlace(version) => format!(
+                InterruptedTransition::Published(version) => format!(
                     "finished the update cut short after Vox {version} was put in place and kept the replaced app for rollback"
+                ),
+                InterruptedTransition::BeforeRollback(version) => format!(
+                    "finished the rollback cut short before Vox {version} was put in place and kept the replaced app for rollback"
+                ),
+                InterruptedTransition::RolledBack(version) => format!(
+                    "finished the rollback cut short after Vox {version} was put in place and kept the replaced app for rollback"
                 ),
             });
         }
@@ -561,9 +923,12 @@ impl Recovery {
 fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
     let unpacked = apps.join(UNPACK_PARTIAL);
     let staged = apps.join(PARTIAL);
+    require_optional_dir(&unpacked, UNPACK_PARTIAL)?;
+    require_optional_bundle(&staged, PARTIAL)?;
     clear(&unpacked)?;
     clear(&staged)?;
     fs::create_dir(&unpacked).map_err(AppError::Io)?;
+    sync_dir(apps)?;
     let out = Command::new("/usr/bin/ditto")
         .args(["-x", "-k"])
         .arg(zip)
@@ -576,9 +941,12 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
     }
     let entries: Vec<String> = fs::read_dir(&unpacked)
         .map_err(AppError::Io)?
-        .filter_map(Result::ok)
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
+        .map(|entry| {
+            entry
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .map_err(AppError::Io)
+        })
+        .collect::<Result<_, _>>()?;
     let bundle = unpacked.join(BUNDLE);
     let is_dir = fs::symlink_metadata(&bundle).is_ok_and(|m| m.is_dir());
     if entries != [BUNDLE] || !is_dir {
@@ -587,7 +955,11 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
             "the downloaded zip holds {entries:?}, not exactly {BUNDLE}"
         )));
     }
+    sync_tree(&bundle)?;
+    sync_dir(&unpacked)?;
     fs::rename(&bundle, &staged).map_err(AppError::Io)?;
+    sync_dir(&unpacked)?;
+    sync_dir(apps)?;
     clear(&unpacked)?;
     Ok(staged)
 }
@@ -604,7 +976,7 @@ fn verify(active: &Path, staged: &Path, vox: &Validated) -> Result<(), AppError>
             vox.version_text
         )));
     }
-    let says = app_version(staged).unwrap_or_default();
+    let says = active_app_version(staged).unwrap_or_default();
     if says != vox.version_text {
         return Err(usage(format!(
             "the new Vox.app says it is version {says:?}, not {}",
@@ -687,12 +1059,21 @@ fn verify_apple(active: &Path, staged: &Path) -> Result<(), AppError> {
     .map_err(|e| named("the new Vox.app", e))
 }
 
-/// The bundle's `CFBundleShortVersionString`.
-fn app_version(bundle: &Path) -> Option<String> {
-    let plist = [INFO_PLIST, KEPT_INFO_PLIST]
-        .iter()
-        .map(|p| bundle.join(p))
-        .find(|p| p.is_file())?;
+/// An active bundle's `CFBundleShortVersionString`. Evidence about [`BUNDLE`] comes only from
+/// its real Info.plist; a kept plist is never evidence that a swap happened.
+fn active_app_version(bundle: &Path) -> Option<String> {
+    plist_version(&bundle.join(INFO_PLIST))
+}
+
+/// A bundle's version while it is deliberately set aside, or while it is active.
+fn bundle_version(bundle: &Path) -> Option<String> {
+    active_app_version(bundle).or_else(|| plist_version(&bundle.join(KEPT_INFO_PLIST)))
+}
+
+fn plist_version(plist: &Path) -> Option<String> {
+    if !plist.is_file() {
+        return None;
+    }
     let out = Command::new("/usr/libexec/PlistBuddy")
         .args(["-c", "Print :CFBundleShortVersionString"])
         .arg(plist)
@@ -704,6 +1085,71 @@ fn app_version(bundle: &Path) -> Option<String> {
     }
     let text = String::from_utf8(out.stdout).ok()?;
     Some(text.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+fn path_exists(path: &Path) -> Result<bool, AppError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(AppError::Io(e)),
+    }
+}
+
+fn require_optional_dir(path: &Path, name: &str) -> Result<(), AppError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::Io(e)),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(usage(format!(
+            "reserved app-transition path {} ({name}) is not a direct directory; no transition was attempted",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_optional_bundle(path: &Path, name: &str) -> Result<(), AppError> {
+    require_optional_dir(path, name)
+}
+
+fn require_bundle(path: &Path, name: &str) -> Result<(), AppError> {
+    require_optional_bundle(path, name)?;
+    if !path_exists(path)? {
+        return Err(usage(format!(
+            "reserved app-transition path {} ({name}) is missing",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn file_id(path: &Path) -> Result<u64, AppError> {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.ino())
+        .map_err(AppError::Io)
+}
+
+/// Flush every regular file and directory in a verified candidate before its name can be
+/// exchanged into place. Symlinks are metadata in their parent directory and are never followed.
+fn sync_tree(path: &Path) -> Result<(), AppError> {
+    let meta = fs::symlink_metadata(path).map_err(AppError::Io)?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_file() {
+        return fs::File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(AppError::Io);
+    }
+    if meta.is_dir() {
+        for entry in fs::read_dir(path).map_err(AppError::Io)? {
+            sync_tree(&entry.map_err(AppError::Io)?.path())?;
+        }
+        return sync_dir(path);
+    }
+    Ok(())
 }
 
 fn sha256_of(path: &Path) -> Result<[u8; 32], AppError> {
@@ -726,18 +1172,22 @@ fn clear(path: &Path) -> Result<(), AppError> {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return Ok(());
     };
-    if meta.is_dir() {
+    let removed = if meta.is_dir() {
         writable(path)?;
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
-    }
-    .map_err(|e| {
+    };
+    removed.map_err(|e| {
         usage(format!(
             "cannot clear {}: {e}\n       remove it by hand, then run this again",
             path.display()
         ))
-    })
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 fn writable(dir: &Path) -> Result<(), AppError> {
