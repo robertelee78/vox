@@ -83,6 +83,7 @@ optional_proof::not_run!(
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
     hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port,
     a_quiet_room_costs_no_rounds_and_says_when_it_last_synced,
+    retained_rows_render_once_their_key_and_consent_arrive,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -266,21 +267,16 @@ fn attached(dir: &Path, tag: &str) -> String {
 }
 
 /// The same shipped readiness observation for one named node on a multi-node daemon.
-fn attached_as(dir: &Path, tag: &str, node: Option<&str>) -> String {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    let mut last = String::new();
-    while Instant::now() < deadline {
+fn attached_as(dir: &Path, _tag: &str, node: Option<&str>) -> String {
+    const APPARATUS_ATTACH_RETRY_PACE: Duration = Duration::from_millis(200);
+    loop {
         let (ok, out, err) = vox(dir, &as_node(&["room", "list"], node), None);
         if ok {
             return out;
         }
-        last = err;
-        std::thread::sleep(Duration::from_millis(200));
+        let _ = err;
+        std::thread::sleep(APPARATUS_ATTACH_RETRY_PACE);
     }
-    panic!(
-        "APPARATUS: {tag}'s daemon never answered `vox room list` in 90 s: {last}\nits stderr: {}",
-        said(dir, tag)
-    );
 }
 
 /// `args` as one named node on a multi-node daemon runs it.
@@ -427,6 +423,432 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
         oldest: before,
         pages,
         rows,
+    }
+}
+
+/// Every row a person reads, oldest first, in one exact paged JSON observation. A malformed row
+/// or a refused read is a product red because both are what the shipped command returned.
+fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
+    let limit = PAGE.to_string();
+    let mut before: Option<String> = None;
+    let mut pages_newest_first = Vec::new();
+    loop {
+        let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
+        if let Some(cursor) = before.as_deref() {
+            args.extend(["--before", cursor]);
+        }
+        let (ok, out, err) = vox(dir, &args, None);
+        assert!(
+            ok,
+            "PRODUCT: paged `vox room read --json` refused before {before:?}: {out}{err}"
+        );
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!(
+                        "PRODUCT: `vox room read --json` printed a row that is not JSON \
+                         ({error}): {line}"
+                    )
+                })
+            })
+            .collect();
+        if rows.is_empty() {
+            break;
+        }
+        let short = rows.len() < PAGE;
+        let next = rows[0]["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: a `vox room read --json` row carries no entry_hash: {}",
+                    rows[0]
+                )
+            })
+            .to_owned();
+        assert_ne!(
+            before.as_deref(),
+            Some(next.as_str()),
+            "PRODUCT: paged `vox room read --json` repeated cursor {next}"
+        );
+        before = Some(next);
+        pages_newest_first.push(rows);
+        if short {
+            break;
+        }
+    }
+    pages_newest_first.into_iter().rev().flatten().collect()
+}
+
+/// Wait until the exact rows Alice posted are visibly present in Bob's paged log, while none has
+/// text he can read. That is the user-visible evidence that those rows were accepted before their
+/// missing prerequisite; counts alone could be satisfied by Bob's own join records.
+fn wait_for_held_rows(dir: &Path, room: &str, expected_hashes: &[String], hold: &str) {
+    loop {
+        let rows = room_rows(dir, room);
+        let staged: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| {
+                row["entry_hash"]
+                    .as_str()
+                    .is_some_and(|hash| expected_hashes.iter().any(|expected| expected == hash))
+            })
+            .collect();
+        if staged.len() < expected_hashes.len() {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let actual_hashes: Vec<&str> = staged
+            .iter()
+            .filter_map(|row| row["entry_hash"].as_str())
+            .collect();
+        assert_eq!(
+            actual_hashes, expected_hashes,
+            "APPARATUS: the exact late rows were not staged once each in source order while the \
+             {hold} hold was engaged in room {room}; all rows: {rows:?}"
+        );
+        assert!(
+            staged.iter().all(|row| row["text"].as_str().is_none()),
+            "PRODUCT: an exact late row was readable while the {hold} hold proved its required \
+             consent/key fact absent \
+             in room {room}; staged rows: {staged:?}"
+        );
+        return;
+    }
+}
+
+/// Shipped reads follow a multi-turn render continuation, then one exact observation
+/// proves that these retained objects—not merely equal text from a refetch or duplicate post—
+/// became readable once each in source order.
+fn assert_exact_read_rows(
+    dir: &Path,
+    reader: &str,
+    room: &str,
+    expected_hashes: &[String],
+    expected_texts: &[String],
+    ordering: &str,
+) {
+    let expected: Vec<(String, Option<String>)> = expected_hashes
+        .iter()
+        .cloned()
+        .zip(expected_texts.iter().cloned().map(Some))
+        .collect();
+    let mut work_seen = false;
+    loop {
+        let rows = room_rows(dir, room);
+        let actual: Vec<(String, Option<String>)> = rows
+            .iter()
+            .filter_map(|row| {
+                let hash = row["entry_hash"].as_str()?;
+                expected_hashes
+                    .iter()
+                    .any(|expected| expected == hash)
+                    .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
+            })
+            .collect();
+        if actual == expected {
+            return;
+        }
+        let status = room_status(dir, reader, room);
+        work_seen |=
+            status.render_backfill_pending || actual.iter().any(|(_, text)| text.is_some());
+        if work_seen && !status.render_backfill_pending {
+            // The first paged walk may have straddled the last render turn. Once shipped status
+            // says no continuation remains, take a fresh, stable observation before judging the
+            // product; otherwise a healthy completion between pages could look incomplete.
+            let final_rows = room_rows(dir, room);
+            let final_actual: Vec<(String, Option<String>)> = final_rows
+                .iter()
+                .filter_map(|row| {
+                    let hash = row["entry_hash"].as_str()?;
+                    expected_hashes
+                        .iter()
+                        .any(|expected| expected == hash)
+                        .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
+                })
+                .collect();
+            if final_actual == expected {
+                return;
+            }
+            let settled = room_status(dir, reader, room);
+            if settled.render_backfill_pending {
+                work_seen = true;
+                continue;
+            }
+            panic!(
+                "PRODUCT: after {ordering}, Bob's causally engaged render continuation finished \
+                 without showing each exact retained object once, readable, and in source order \
+                 in room {room}; expected: {expected:?}; first observation: {actual:?}; stable \
+                 observation: {final_actual:?}; all stable rows: {final_rows:?}; final status: \
+                 {settled:?}"
+            );
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RoomStatus {
+    log_entries: u64,
+    received_key_generations: u64,
+    governance_revision: u64,
+    governance_pending: bool,
+    render_backfill_pending: bool,
+    key_delivery_pending: Vec<String>,
+}
+
+/// What the shipped status command says about one room. Refused or malformed output is a product
+/// red even while the proof is arranging its deliberate holds: it is still the shipped command's
+/// user-visible answer.
+fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: {reader}'s `vox status --json` was unavailable while staging room {room}: \
+         {out}{err}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!(
+            "PRODUCT: {reader}'s `vox status --json` was malformed while staging room {room} \
+             ({error}): {out}"
+        )
+    });
+    let row = value["rooms"]
+        .as_array()
+        .and_then(|rooms| {
+            rooms
+                .iter()
+                .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {reader}'s `vox status --json` did not contain staged room {room}: \
+                 {out}"
+            )
+        });
+    RoomStatus {
+        log_entries: row["log_entries"].as_u64().unwrap_or_else(|| {
+            panic!("PRODUCT: {reader}'s room status has no numeric `log_entries`: {row}")
+        }),
+        received_key_generations: row["received_key_generations"].as_u64().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {reader}'s room status has no numeric `received_key_generations`: {row}"
+            )
+        }),
+        governance_revision: row["governance_revision"].as_u64().unwrap_or_else(|| {
+            panic!("PRODUCT: {reader}'s room status has no numeric `governance_revision`: {row}")
+        }),
+        governance_pending: value["governance_pending"].as_bool().unwrap_or_else(|| {
+            panic!("PRODUCT: {reader}'s node status has no boolean `governance_pending`: {value}")
+        }),
+        render_backfill_pending: row["render_backfill_pending"].as_bool().unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {reader}'s room status has no boolean `render_backfill_pending`: {row}"
+            )
+        }),
+        key_delivery_pending: row["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("PRODUCT: {reader}'s room status has no members: {row}"))
+            .iter()
+            .filter_map(|member| {
+                let pending = member["key_delivery_pending"].as_bool().unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT: {reader}'s room member has no boolean \
+                         `key_delivery_pending`: {member}"
+                    )
+                });
+                pending.then(|| {
+                    member["id"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "PRODUCT: {reader}'s pending key-delivery member has no id: \
+                                 {member}"
+                            )
+                        })
+                        .to_owned()
+                })
+            })
+            .collect(),
+    }
+}
+
+fn room_id(dir: &Path, reader: &str, room: &str) -> vox_core::hash::Digest32 {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: {reader}'s `vox status --json` was unavailable for room {room}: {out}{err}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: {reader}'s status was malformed ({error}): {out}")
+    });
+    let id = value["rooms"]
+        .as_array()
+        .and_then(|rooms| {
+            rooms
+                .iter()
+                .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))
+        })
+        .and_then(|row| row["id"].as_str())
+        .unwrap_or_else(|| panic!("PRODUCT: {reader}'s status omitted room {room}: {out}"));
+    vox_core::node::link::b32_decode(id, "status room id").unwrap_or_else(|error| {
+        panic!("PRODUCT: {reader}'s status named a malformed room id: {error}")
+    })
+}
+
+/// Exact authenticated room-order hashes exposed by the shipped diagnostic command.
+fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
+    let (ok, out, err) = vox(dir, &["room", "read", room, "--hashes"], None);
+    assert!(
+        ok,
+        "PRODUCT: {reader}'s `vox room read --hashes` failed for {room}: {out}{err}"
+    );
+    out.lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let hash = fields.next().unwrap_or_else(|| {
+                panic!("PRODUCT: {reader}'s room order contained an empty row: {out}")
+            });
+            let clock = fields.next().and_then(|clock| clock.parse::<u64>().ok());
+            assert!(
+                fields.next().is_none() && clock.is_some(),
+                "PRODUCT: {reader}'s room order row was malformed: {line:?}"
+            );
+            hash.to_owned()
+        })
+        .collect()
+}
+
+/// Rename through the shipped command and return the exact authenticated row it says it appended.
+fn rename_hash(dir: &Path, reader: &str, room: &str, name: &str) -> String {
+    let (ok, out, err) = vox(dir, &["room", "rename", room, name], None);
+    assert!(
+        ok,
+        "PRODUCT: {reader}'s `vox room rename {room} {name}` was refused: {out}{err}"
+    );
+    let hashes: Vec<_> = out
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("entry "))
+        .collect();
+    assert_eq!(
+        hashes.len(),
+        1,
+        "PRODUCT: {reader}'s successful room rename did not name exactly one appended entry: \
+         {out}{err}"
+    );
+    vox_core::node::link::b32_decode(hashes[0], "rename entry hash").unwrap_or_else(|error| {
+        panic!(
+            "PRODUCT: {reader}'s room rename named a malformed entry hash ({error}): {}",
+            hashes[0]
+        )
+    });
+    hashes[0].to_owned()
+}
+
+/// Wait for the shipped admin page to include or exclude one exact member. A refreshing page is
+/// causal work in flight; any other refusal and failure to reach the expected roster are product
+/// reds for this authority claim, not a generic harness timeout.
+fn wait_admin_membership(dir: &Path, reader: &str, room: &str, member: &str, present: bool) {
+    loop {
+        let (ok, out, err) = vox(dir, &["room", "admin", "list", room], None);
+        if ok
+            && out
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(member))
+                == present
+        {
+            return;
+        }
+        assert!(
+            ok || err.contains("governance") && err.contains("refreshing"),
+            "PRODUCT: {reader}'s `vox room admin list` failed for {room}: {out}{err}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Wait for a shipped authority-dependent page to answer. Refreshing is the product's explicit
+/// retry result while the causal fold is in progress; any other refusal is a product red. An
+/// external operator deadman may stop a structurally stalled run as NO RESULT; elapsed time is
+/// not a product or apparatus verdict here.
+fn wait_governance_current(dir: &Path, reader: &str, room: &str, _claim: &str) {
+    loop {
+        let (ok, out, err) = vox(
+            dir,
+            &["room", "read", room, "--json", "--notices", "--limit", "1"],
+            None,
+        );
+        if ok {
+            return;
+        }
+        assert!(
+            err.contains("governance") && err.contains("refreshing"),
+            "PRODUCT: {reader}'s authority-dependent room page failed for {room}: {out}{err}"
+        );
+        std::thread::yield_now();
+    }
+}
+
+/// Wait for a causal product observation. A key arriving while its marker hold exists means the
+/// staging itself was not achieved; elapsed time says nothing about product correctness.
+fn wait_room_status(
+    dir: &Path,
+    reader: &str,
+    room: &str,
+    key_must_stay_held: bool,
+    claim: &str,
+    ready: impl Fn(&RoomStatus) -> bool,
+) -> RoomStatus {
+    loop {
+        let status = room_status(dir, reader, room);
+        assert!(
+            !key_must_stay_held || status.received_key_generations == 0,
+            "APPARATUS: {reader} accepted a sender key in room {room} while the package hold \
+             marker still existed during `{claim}`: {status:?}"
+        );
+        if ready(&status) {
+            return status;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// The product's trust sentence for a room member. Doctor may exit non-zero because another
+/// check warns; its JSON is still the user-visible observation this staging needs.
+fn trust_detail(dir: &Path, reader: &str, room: &str, member: &str) -> String {
+    let (_, out, err) = vox(dir, &["agent", "doctor", "--room", room, "--json"], None);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!(
+            "PRODUCT: {reader}'s `vox agent doctor --json` was malformed while staging room \
+             {room} ({error}): {out}{err}"
+        )
+    });
+    let trust_check = format!("trust {member}");
+    report["checks"]
+        .as_array()
+        .and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["check"].as_str().is_some_and(|id| id == trust_check))
+        })
+        .and_then(|check| check["detail"].as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: {reader}'s doctor reported no `trust {member}` detail for staged \
+                 room {room}: {report}"
+            )
+        })
+        .to_owned()
+}
+
+fn wait_trust_detail(dir: &Path, reader: &str, room: &str, member: &str, expected: &str) {
+    loop {
+        let actual = trust_detail(dir, reader, room, member);
+        if actual == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -4659,60 +5081,270 @@ fn await_lane_claim(
     }
 }
 
-/// How long the two agents work: a post a second from each into each of [`WORK_ROOMS`] rooms in
-/// turn, what harness hooks at work append.
-const AT_WORK: Duration = Duration::from_secs(60);
-/// Rooms the two agents share while they work: each publication of the daemon's status covers
-/// every open room, so the cost under test grows with this.
+/// Rooms staged together so the bounded backfill has both a long author and independent work.
 const WORK_ROOMS: usize = 3;
-/// CPU time a daemon may spend over [`AT_WORK`] of two agents posting into [`WORK_ROOMS`] rooms:
-/// Activity Monitor's number. Measured 2026-10-20 on the decider's work Mac (v0.4.7, four nodes,
-/// four rooms, agents working): ~180% of a core, that is 108 s per minute. In this staging the
-/// v0.4.7 code spent 17.5 s per daemon per minute; with each room's trust picture reused across
-/// publications (#990) it spends 8 s, the rest being the rounds the posts themselves run (~9 per
-/// post, #996). The bound is what #990 delivers; #996 lowers it again.
-const WORK_CPU: Duration = Duration::from_secs(10);
-/// Every `vox status --json` during the work answers within this: the control socket is what the
-/// app, the TUI and the harness hook (500 ms of patience) wait on. Measured before this: 0.5 s.
-const ANSWER_WITHIN: Duration = Duration::from_millis(200);
-
-/// **A daemon whose agents are working stays cheap and answers at once** (ADR-038 FX-15, FX-17;
-/// #990): alice and bob, each on a daemon of their own, share [`WORK_ROOMS`] rooms; for
-/// [`AT_WORK`] each posts once a second, round-robin over the rooms, as two harness sessions at
-/// work do. Over that minute each daemon's CPU time MUST grow by at most [`WORK_CPU`], every
-/// `vox status --json` asked meanwhile MUST answer within [`ANSWER_WITHIN`], and the work MUST be
-/// real: each reads the other's last post within [`READY_WITHIN`] of the end.
+/// Rows Alice seals in each work room before Bob joins it. The fold and package marker holds below
+/// make Bob accept these rows before their author's consent and sender key, respectively.
+const BEFORE_KEY: usize = 4 * vox_core::node::channel::RENDER_BACKFILL_ROWS_PER_TURN + 1;
+/// **Rows parked on missing consent/key cost no busy loop and wake from retained facts**
+/// (ADR-038 FX-22, #1007): Bob visibly retains Alice's exact rows while both facts are absent.
+/// Alice then becomes unavailable before Bob opens the retained logged key package; Bob MUST
+/// render every retained row once and in order.
 ///
-/// Mutant: every status publication deriving every room's trust picture again (the reuse in
-/// `detail_of` removed) turns the CPU claim red on its own number.
-#[cfg(feature = "optional-proofs")]
-#[test]
-#[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
-fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
-    watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
-    let root = tmp.path();
+/// Mutant: after rendering the first retained row, clearing that author's next sparse backfill
+/// cursor makes shipped status say the continuation is finished while exact retained hashes/text
+/// are still missing, which turns the stable user-visible completion assertion PRODUCT red.
+fn key_before_consent_survives_a_restart(root: &Path) {
     let alice = root.join("alice");
     let bob = root.join("bob");
-    for d in [&alice, &bob] {
+    for dir in [&alice, &bob] {
+        std::fs::create_dir_all(dir.join("cfg"))
+            .unwrap_or_else(|error| panic!("APPARATUS: could not create profile: {error}"));
+    }
+    let alice_fold = root.join("alice-fold");
+    let bob_fold = root.join("bob-fold");
+    let alice_fold_path = alice_fold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 Alice fold path");
+    let bob_fold_path = bob_fold.to_str().expect("APPARATUS: a UTF-8 Bob fold path");
+
+    let (ok, alice_fp, err) = vox(&alice, &["id"], None);
+    assert!(ok, "PRODUCT: Alice's `vox id` failed: {err}");
+    let (ok, bob_fp, err) = vox(&bob, &["id"], None);
+    assert!(ok, "PRODUCT: Bob's `vox id` failed: {err}");
+    for (dir, fp, name) in [
+        (&alice, bob_fp.trim(), "bob"),
+        (&bob, alice_fp.trim(), "alice"),
+    ] {
+        let (ok, out, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add {name}` failed: {out}{err}");
+    }
+    let alice_daemon = daemon_env(
+        &alice,
+        "alice-consent-last",
+        &[("VOX_TEST_FOLD_HOLD_FILE", alice_fold_path)],
+    );
+    let bob_daemon = daemon_env(
+        &bob,
+        "bob-consent-last",
+        &[("VOX_TEST_FOLD_HOLD_FILE", bob_fold_path)],
+    );
+    attached(&alice, "alice-consent-last");
+    attached(&bob, "bob-consent-last");
+    let (ok, out, err) = vox(
+        &alice,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "consent-last",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: Alice could not create consent-last: {out}{err}"
+    );
+    let listed = attached(&alice, "alice-consent-last");
+    let room = listed
+        .lines()
+        .find(|line| line.contains("consent-last"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` omitted consent-last: {listed}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let mut hashes = Vec::with_capacity(BEFORE_KEY);
+    let mut expected = Vec::with_capacity(BEFORE_KEY);
+    for row in 0..BEFORE_KEY {
+        let text = format!("key before consent row {row}");
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, "--json", "-"], Some(&text));
+        assert!(ok, "PRODUCT: Alice's retained post failed: {out}{err}");
+        let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: `vox room post --json` was malformed ({error}): {out}")
+        });
+        hashes.push(
+            posted["entry_hash"]
+                .as_str()
+                .unwrap_or_else(|| panic!("PRODUCT: post named no entry_hash: {posted}"))
+                .to_owned(),
+        );
+        expected.push(text);
+    }
+
+    std::fs::write(&alice_fold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage Alice's fold: {error}"));
+    let (ok, out, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", link.trim()],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: Bob could not join consent-last: {out}{err}");
+    assert_eq!(
+        trust_detail(&bob, "bob", &room, "alice"),
+        "you trust it, but it has not trusted you: it cannot read you",
+        "APPARATUS: consent was not held before the key-before-consent ordering"
+    );
+    wait_for_held_rows(&bob, &room, &hashes, "author-governance");
+    // Take Bob's count after the paged observation, so its read record is also inside the causal
+    // boundary Alice must accept before her fold is released.
+    let bob_log = room_status(&bob, "bob", &room).log_entries;
+    wait_room_status(
+        &alice,
+        "alice",
+        &room,
+        false,
+        "Alice never retained Bob's causal join/read boundary",
+        |status| status.log_entries >= bob_log,
+    );
+
+    std::fs::write(&bob_fold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage Bob's fold: {error}"));
+    std::fs::remove_file(&alice_fold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release Alice's fold: {error}"));
+    let with_key = wait_room_status(
+        &bob,
+        "bob",
+        &room,
+        false,
+        "Bob never accepted the retained sender key before consent",
+        |status| status.received_key_generations >= 1,
+    );
+    assert_eq!(
+        trust_detail(&bob, "bob", &room, "alice"),
+        "you trust it, but it has not trusted you: it cannot read you",
+        "APPARATUS: Bob's consent fold did not hold after the key arrived"
+    );
+    wait_for_held_rows(&bob, &room, &hashes, "consent-fold");
+    assert!(
+        with_key.received_key_generations >= 1,
+        "APPARATUS: key-before-consent was not staged: {with_key:?}"
+    );
+
+    // Both source and reader stop while the exact rows, key and as-yet-unfolded consent are
+    // retained. Only Bob returns; successful reprojection therefore cannot be a refetch.
+    alice_daemon.stop();
+    bob_daemon.stop();
+    std::fs::remove_file(&bob_fold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release Bob's fold: {error}"));
+    let _bob_restarted = daemon(&bob, "bob-consent-last-restarted");
+    attached(&bob, "bob-consent-last-restarted");
+    wait_trust_detail(&bob, "bob", &room, "alice", "you trust each other");
+    assert_exact_read_rows(
+        &bob,
+        "bob",
+        &room,
+        &hashes,
+        &expected,
+        "row→key→consent with Alice unavailable and Bob restarted",
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "real vox daemons and deterministic missing-fact holds; optional, run it in release"]
+fn retained_rows_render_once_their_key_and_consent_arrive() {
+    test_knobs::require(&[
+        "VOX_TEST_FOLD_HOLD_FILE",
+        "VOX_TEST_HOLD_PACKAGES_FILE",
+        "VOX_TEST_HOLD_RENDER_FILE",
+        vox_core::node::channel::TEST_EXPIRING_ADMIN_ENV,
+        "VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE",
+    ]);
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    key_before_consent_survives_a_restart(&tmp.path().join("key-before-consent"));
+    let row_before_key = tmp.path().join("row-before-key");
+    let root = row_before_key.as_path();
+    let mut alice = root.join("alice");
+    let bob = root.join("bob");
+    let mut carol = root.join("carol");
+    for d in [&alice, &bob, &carol] {
         std::fs::create_dir_all(d.join("cfg"))
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
     }
     let mut fps = Vec::new();
-    for dir in [&alice, &bob] {
+    for dir in [&alice, &bob, &carol] {
         let (ok, out, err) = vox(dir, &["id"], None);
         assert!(ok, "PRODUCT: `vox id` failed: {err}");
         fps.push(out.trim().to_owned());
     }
-    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+    let alice_id = vox_core::node::link::b32_decode(&fps[0], "Alice fingerprint")
+        .unwrap_or_else(|error| panic!("APPARATUS: Alice's fingerprint was malformed: {error}"));
+    let carol_id = vox_core::node::link::b32_decode(&fps[2], "Carol fingerprint")
+        .unwrap_or_else(|error| panic!("APPARATUS: Carol's fingerprint was malformed: {error}"));
+    if alice_id > carol_id {
+        // The durable queue orders by author fingerprint. Give the lower fingerprint the long
+        // backlog so the competing row genuinely observes a round-robin step rather than the
+        // tree's ordinary successor after a short author.
+        std::mem::swap(&mut alice, &mut carol);
+        fps.swap(0, 2);
+    }
+    for (dir, fp, name) in [
+        (&alice, &fps[1], "bob"),
+        (&alice, &fps[2], "carol"),
+        (&bob, &fps[0], "alice"),
+        (&bob, &fps[2], "carol"),
+        (&carol, &fps[0], "alice"),
+        (&carol, &fps[1], "bob"),
+    ] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
-    let alice_daemon = daemon(&alice, "alice");
+    let fold_hold = root.join("fx22-fold-hold");
+    let carol_fold_hold = root.join("fx22-carol-fold-hold");
+    let package_hold = root.join("fx22-package-hold");
+    let package_hold_engaged = root.join("fx22-package-hold.engaged");
+    let render_hold = root.join("fx22-render-hold");
+    let render_hold_ready = root.join("fx22-render-hold.ready");
+    let render_hold_engaged = root.join("fx22-render-hold.engaged");
+    let render_hold_replacement = root.join("fx22-render-hold-replacement");
+    let sweep_hold = root.join("fx22-sweep-hold");
+    let sweep_engaged = root.join("fx22-sweep-hold.engaged");
+    let fold_hold_path = fold_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 fold-hold path")
+        .to_owned();
+    let carol_fold_hold_path = carol_fold_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 Carol fold-hold path")
+        .to_owned();
+    let package_hold_path = package_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 package-hold path")
+        .to_owned();
+    let render_hold_path = render_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 render-hold path")
+        .to_owned();
+    let sweep_hold_path = sweep_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 governance-sweep hold path")
+        .to_owned();
+    let fold_knob = [
+        ("VOX_TEST_FOLD_HOLD_FILE", fold_hold_path.as_str()),
+        (vox_core::node::channel::TEST_EXPIRING_ADMIN_ENV, "1"),
+        (
+            "VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE",
+            sweep_hold_path.as_str(),
+        ),
+    ];
+    let carol_fold_knob = [("VOX_TEST_FOLD_HOLD_FILE", carol_fold_hold_path.as_str())];
+    let package_knob = [
+        ("VOX_TEST_HOLD_PACKAGES_FILE", package_hold_path.as_str()),
+        ("VOX_TEST_HOLD_RENDER_FILE", render_hold_path.as_str()),
+    ];
+    let alice_daemon = daemon_env(&alice, "alice", &fold_knob);
+    let carol_daemon = daemon_env(&carol, "carol", &carol_fold_knob);
     attached(&alice, "alice");
-    let bob_daemon = daemon(&bob, "bob");
-    attached(&bob, "bob");
+    attached(&carol, "carol");
     let mut rooms = Vec::with_capacity(WORK_ROOMS);
+    let mut links = Vec::with_capacity(WORK_ROOMS);
+    let mut late_hashes = Vec::with_capacity(WORK_ROOMS);
+    let mut competing_hashes = Vec::with_capacity(WORK_ROOMS);
+    let mut competing_texts = Vec::with_capacity(WORK_ROOMS);
     for i in 1..=WORK_ROOMS {
         let name = format!("work-{i}");
         let (ok, _, err) = vox(
@@ -4730,153 +5362,909 @@ fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
             .to_owned();
         let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
         assert!(ok, "PRODUCT: `vox room link` failed: {err}");
-        let (ok, _, err) = vox(
-            &bob,
-            &["room", "join", "--passphrase-file", "-", link.trim()],
+        let mut room_late_hashes = Vec::with_capacity(BEFORE_KEY);
+        for row in 0..BEFORE_KEY {
+            let text = format!("alice before key room {i} row {row}");
+            let (ok, out, err) = vox(&alice, &["room", "post", &room, "--json", "-"], Some(&text));
+            assert!(ok, "PRODUCT: Alice's pre-key post was refused: {out}{err}");
+            let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!(
+                    "PRODUCT: Alice's `vox room post --json` answer was malformed ({error}): \
+                     {out}{err}"
+                )
+            });
+            room_late_hashes.push(
+                posted["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "PRODUCT: Alice's `vox room post --json` answer named no entry_hash: \
+                             {posted}"
+                        )
+                    })
+                    .to_owned(),
+            );
+        }
+        rooms.push(room);
+        links.push(link.trim().to_owned());
+        late_hashes.push(room_late_hashes);
+    }
+
+    // Carol is an independently keyed source in every room. Her one retained row sits behind
+    // Alice's continuation of more than two production pages, so eventual exact visibility from
+    // both authors proves the per-author queue does not let that continuation starve a peer.
+    for (index, (room, link)) in rooms.iter().zip(&links).enumerate() {
+        let (ok, out, err) = vox(
+            &carol,
+            &["room", "join", "--passphrase-file", "-", link],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(
             ok,
-            "PRODUCT: bob's `vox room join {name}` was refused: {err}"
+            "PRODUCT: Carol could not join work-{}: {out}{err}",
+            index + 1
         );
-        rooms.push(room);
-    }
-    // Both have read each other in every room before the clock starts.
-    let joined = Instant::now();
-    for room in &rooms {
-        let (ok, out, err) = vox(&alice, &["room", "post", room, "ready, alice"], None);
-        assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
-        let (ok, out, err) = vox(&bob, &["room", "post", room, "ready, bob"], None);
-        assert!(ok, "PRODUCT: bob's post was refused: {out}{err}");
-        let (to_alice, to_bob) = arrivals(
-            joined,
-            (&alice, "ready, bob"),
-            (&bob, "ready, alice"),
+        wait_trust_detail(&carol, "carol", room, "alice", "you trust each other");
+        wait_room_status(
+            &carol,
+            "carol",
             room,
-            BOUND,
+            false,
+            "Carol never accepted Alice's sender key",
+            |status| status.received_key_generations >= 1,
+        );
+        let text = format!("carol competing row room {}", index + 1);
+        let (ok, out, err) = vox(&carol, &["room", "post", room, "--json", "-"], Some(&text));
+        assert!(ok, "PRODUCT: Carol's competing post failed: {out}{err}");
+        let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Carol's post answer was malformed ({error}): {out}")
+        });
+        competing_hashes.push(vec![posted["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("PRODUCT: Carol's post named no entry_hash: {posted}"))
+            .to_owned()]);
+        competing_texts.push(vec![text]);
+    }
+
+    // Alice may accept Bob's admission but cannot fold it, so she cannot consent or release her
+    // key. Bob nevertheless accepts Alice's existing LogDb prefix. The product itself says that
+    // the prefix is present, no sender key is held, Alice has not consented, and none of the named
+    // content is readable: those are the APPARATUS preconditions for the late-render verdict.
+    std::fs::write(&fold_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage the fold hold: {error}"));
+    std::fs::write(&carol_fold_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage Carol's fold hold: {error}"));
+    std::fs::write(&package_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage the package hold: {error}"));
+    let bob_before_key = daemon_env(&bob, "bob", &package_knob);
+    attached(&bob, "bob");
+    for (i, (room, link)) in rooms.iter().zip(&links).enumerate() {
+        let (ok, out, err) = vox(
+            &bob,
+            &["room", "join", "--passphrase-file", "-", link],
+            Some(&format!("{ROOMPASS}\n")),
         );
         assert!(
-            to_alice.is_some() && to_bob.is_some(),
-            "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \
-             {to_bob:?} (None = never) in room {room}\nbob's daemon said: {}\nalice's daemon \
-             said: {}",
-            said(&bob, "bob"),
-            said(&alice, "alice")
+            ok,
+            "PRODUCT: bob's `vox room join work-{}` was refused: {out}{err}",
+            i + 1
+        );
+        wait_room_status(
+            &bob,
+            "bob",
+            room,
+            true,
+            "Bob never retained Alice's pre-key room prefix",
+            |status| status.log_entries > 0,
+        );
+        let held_trust = trust_detail(&bob, "bob", room, "alice");
+        assert_eq!(
+            held_trust, "you trust it, but it has not trusted you: it cannot read you",
+            "APPARATUS: Alice's governance fold was not visibly held after Bob accepted her \
+             existing LogDb prefix in room {room}"
+        );
+        wait_for_held_rows(&bob, room, &late_hashes[i], "governance-fold");
+        assert_eq!(
+            trust_detail(&bob, "bob", room, "carol"),
+            "you trust it, but it has not trusted you: it cannot read you",
+            "APPARATUS: Carol's governance fold was not visibly held in room {room}"
+        );
+        wait_for_held_rows(&bob, room, &competing_hashes[i], "Carol-governance-fold");
+        // Alice has durably accepted Bob's join-side rows before he goes offline; only her held
+        // governance fold keeps the release from being issued. Take Bob's count after the paged
+        // observation above, so any read record it made is before this causal sync boundary too.
+        let bob_log = room_status(&bob, "bob", room).log_entries;
+        wait_room_status(
+            &alice,
+            "alice",
+            room,
+            false,
+            "Alice never retained Bob's causal join/read boundary",
+            |status| status.log_entries >= bob_log,
         );
     }
-    std::thread::sleep(Duration::from_secs(5));
 
-    // ---- the agents work -----------------------------------------------------------------------
-    let cpu0 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
-    let started = Instant::now();
-    let worker = |dir: std::path::PathBuf, who: &'static str, rooms: Vec<String>| {
-        std::thread::spawn(move || {
-            let mut refused = 0usize;
-            let mut i = 0usize;
-            while started.elapsed() < AT_WORK {
-                let room = &rooms[i % rooms.len()];
-                let (ok, _, _) = vox(
-                    &dir,
-                    &["room", "post", room, &format!("{who} step {i}")],
-                    None,
-                );
-                if !ok {
-                    refused += 1;
-                }
-                i += 1;
-                std::thread::sleep(Duration::from_secs(1));
-            }
-            (i, refused)
-        })
-    };
-    let a = worker(alice.clone(), "alice", rooms.clone());
-    let b = worker(bob.clone(), "bob", rooms.clone());
-    let mut answers: Vec<Duration> = Vec::new();
-    while started.elapsed() < AT_WORK {
-        std::thread::sleep(Duration::from_secs(5));
-        for dir in [&alice, &bob] {
-            let asked = Instant::now();
-            let (ok, _, err) = vox(dir, &["status", "--json"], None);
-            assert!(
-                ok,
-                "PRODUCT: `vox status --json` refused while agents worked: {err}"
+    // The exact held rows and missing product facts above are the staging evidence. CPU and
+    // elapsed time are not verdicts for this claim: the causal consent/key events below must
+    // either make those same hashes readable or leave structural render work unfinished.
+    bob_before_key.stop();
+    if package_hold_engaged.exists() {
+        std::fs::remove_file(&package_hold_engaged).unwrap_or_else(|error| {
+            panic!("APPARATUS: could not clear the first daemon's package-hold evidence: {error}")
+        });
+    }
+
+    // Stage one same-name action while the fold is still held and prove the command appended one
+    // exact authenticated room-order object. Command success alone is not the precondition: a
+    // mutant that returns success without the append has no new hash and fails here.
+    for room in &rooms {
+        let before = room_hashes(&alice, "alice", room);
+        let appended = rename_hash(&alice, "alice", room, room);
+        assert!(
+            !before.contains(&appended) && room_hashes(&alice, "alice", room).contains(&appended),
+            "PRODUCT: Alice's successful same-name rename named entry {appended}, but that exact \
+             authenticated row was not newly present in room {room}"
+        );
+    }
+
+    // With Bob offline, release the two authors separately. The exact ordered interval around
+    // Alice's release identifies grant1 itself: after subtracting the one causal same-name rename,
+    // exactly one newly appended authenticated object remains. Releasing Carol afterwards keeps
+    // her consent from being misidentified as Alice's grant.
+    let grant1_baselines: Vec<Vec<String>> = rooms
+        .iter()
+        .map(|room| room_hashes(&alice, "alice", room))
+        .collect();
+    std::fs::remove_file(&fold_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
+    // Marker removal is apparatus, not a product wake. A second authenticated same-name action is
+    // the causal event that resumes Alice's released fold.
+    let mut alice_causal_renames = Vec::with_capacity(rooms.len());
+    for room in &rooms {
+        let causal = rename_hash(&alice, "alice", room, room);
+        assert!(
+            room_hashes(&alice, "alice", room).contains(&causal),
+            "PRODUCT: Alice's causal same-name rename named {causal}, but the exact \
+             authenticated row was absent after the fold hold was released in room {room}"
+        );
+        alice_causal_renames.push(causal);
+    }
+    for room in &rooms {
+        wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
+    }
+    let mut grant1_hashes = Vec::with_capacity(rooms.len());
+    for (index, room) in rooms.iter().enumerate() {
+        let after = room_hashes(&alice, "alice", room);
+        let appended: Vec<_> = after
+            .iter()
+            .filter(|hash| {
+                !grant1_baselines[index].contains(hash) && **hash != alice_causal_renames[index]
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            appended.len(),
+            1,
+            "PRODUCT: Alice's released fold did not append exactly one identifiable consent grant1 in room {room}; before {:?}; causal rename {}; after {after:?}; candidates {appended:?}",
+            grant1_baselines[index],
+            alice_causal_renames[index]
+        );
+        grant1_hashes.push(appended[0].clone());
+    }
+
+    std::fs::remove_file(&carol_fold_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
+    // Carol's authenticated same-name action is the independent causal wake for her released
+    // fold; it cannot add another Alice-authored candidate to the grant1 boundary above.
+    for room in &rooms {
+        let causal = rename_hash(&carol, "carol", room, room);
+        assert!(
+            room_hashes(&carol, "carol", room).contains(&causal),
+            "PRODUCT: Carol's causal same-name rename named {causal}, but the exact authenticated row was absent after her fold hold was released in room {room}"
+        );
+        wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
+    }
+
+    // Bob now receives Alice's consent and the sealed package row, but the package marker keeps
+    // the shipped daemon from opening it. Doctor says consent is mutual while status still says
+    // zero received generations: the second hold is visibly engaged.
+    let mut bob_daemon = daemon_env(&bob, "bob", &package_knob);
+    attached(&bob, "bob");
+    while !package_hold_engaged.exists() {
+        for room in &rooms {
+            let status = room_status(&bob, "bob", room);
+            assert_eq!(
+                status.received_key_generations, 0,
+                "APPARATUS: Bob accepted a sender key before a real package/delivery attempt \
+                 causally engaged the package hold in room {room}: {status:?}"
             );
-            answers.push(asked.elapsed());
+        }
+        std::thread::yield_now();
+    }
+    for (i, room) in rooms.iter().enumerate() {
+        wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
+        wait_trust_detail(&bob, "bob", room, "carol", "you trust each other");
+        let held = wait_room_status(
+            &bob,
+            "bob",
+            room,
+            true,
+            "Bob never reported the room while its key package was held",
+            |_| true,
+        );
+        wait_for_held_rows(&bob, room, &late_hashes[i], "logged-key-package");
+        wait_for_held_rows(&bob, room, &competing_hashes[i], "Carol-logged-key-package");
+        assert_eq!(
+            held.received_key_generations, 0,
+            "APPARATUS: Bob accepted Alice's sender key while its package hold was engaged in \
+             room {room}: {held:?}"
+        );
+    }
+
+    // Alice now stops, so removing the package marker cannot be confused with a fresh direct key
+    // delivery. Once Bob's status says the key landed from his retained log, one exact paged
+    // observation proves all rows accepted before key and consent were rendered exactly once and
+    // in order.
+    alice_daemon.stop();
+    carol_daemon.stop();
+    let fairness_room = room_id(&bob, "bob", &rooms[0]);
+    let long_author = vox_core::node::link::b32_decode(&fps[0], "long author fingerprint")
+        .unwrap_or_else(|error| panic!("APPARATUS: Alice's fingerprint was malformed: {error}"));
+    let competing_author =
+        vox_core::node::link::b32_decode(&fps[2], "competing author fingerprint").unwrap_or_else(
+            |error| panic!("APPARATUS: Carol's fingerprint was malformed: {error}"),
+        );
+    let mut key_stage = Vec::with_capacity(96);
+    key_stage.extend_from_slice(&fairness_room);
+    key_stage.extend_from_slice(&long_author);
+    key_stage.extend_from_slice(&competing_author);
+    std::fs::write(&render_hold, key_stage).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not hold both exact authors' render cursors: {error}")
+    });
+    std::fs::remove_file(&package_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
+    std::fs::remove_file(&package_hold_engaged).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not clear the package-hold engagement evidence: {error}")
+    });
+    for (fingerprint, name) in [(&fps[0], "alice"), (&fps[2], "carol")] {
+        let (ok, out, err) = vox(&bob, &["trust", "add", fingerprint, "--name", name], None);
+        assert!(
+            ok,
+            "PRODUCT: Bob's idempotent `vox trust add {name}` could not causally replay the held \
+             sender-key package after release: {out}{err}"
+        );
+    }
+
+    // The 96-byte apparatus marker is renamed only after this real daemon holds the sender keys
+    // of both exact authors. Rendering stays parked, so neither package arrival can win a race
+    // and drain its author before the other author is runnable.
+    while !render_hold_ready.exists() {
+        std::thread::yield_now();
+    }
+    let mut fair_turn = Vec::with_capacity(64);
+    fair_turn.extend_from_slice(&fairness_room);
+    fair_turn.extend_from_slice(&competing_author);
+    std::fs::write(&render_hold_replacement, fair_turn).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not prepare the competing-author turn marker: {error}")
+    });
+    std::fs::rename(&render_hold_replacement, &render_hold).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not arm the competing-author turn marker: {error}")
+    });
+    std::fs::remove_file(&render_hold_ready)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the exact-key hold: {error}"));
+    let fairness_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn");
+    assert!(
+        room_hashes(&bob, "bob", &rooms[0]).contains(&fairness_wake),
+        "PRODUCT: Bob's exact fairness wake {fairness_wake} was absent from room {}",
+        rooms[0]
+    );
+
+    // The marker engages only after one real bounded turn commits Carol's exact-author row, then
+    // parks later turns. If Alice's exact backlog becomes wholly readable before that boundary,
+    // author service was not fair; this cannot depend on catching a transient scheduling window.
+    while !render_hold_engaged.exists() {
+        let rows = room_rows(&bob, &rooms[0]);
+        if render_hold_engaged.exists() {
+            break;
+        }
+        let status = room_status(&bob, "bob", &rooms[0]);
+        if !status.render_backfill_pending && !render_hold_engaged.exists() {
+            panic!(
+                "APPARATUS: Bob's render continuation finished before the exact competing-author \
+                 marker engaged in room {}; staging was not achieved: {status:?}; rows: {rows:?}",
+                rooms[0]
+            );
+        }
+        std::thread::yield_now();
+    }
+    let fair_rows = room_rows(&bob, &rooms[0]);
+    let competing: Vec<_> = fair_rows
+        .iter()
+        .filter(|row| row["entry_hash"] == competing_hashes[0][0])
+        .collect();
+    assert_eq!(
+        competing.len(),
+        1,
+        "PRODUCT: the held fair turn did not show Carol's exact retained row {} once in room {}: \
+         {fair_rows:?}",
+        competing_hashes[0][0],
+        rooms[0]
+    );
+    assert_eq!(
+        competing[0]["text"].as_str(),
+        Some(competing_texts[0][0].as_str()),
+        "PRODUCT: the held fair turn did not make Carol's exact retained row {} readable in room \
+         {}: {}",
+        competing_hashes[0][0],
+        rooms[0],
+        competing[0]
+    );
+    let fair_readable_long = fair_rows
+        .iter()
+        .filter(|row| {
+            row["entry_hash"].as_str().is_some_and(|hash| {
+                late_hashes[0].iter().any(|expected| expected == hash)
+                    && row["text"].as_str().is_some()
+            })
+        })
+        .count();
+    assert!(
+        fair_readable_long < late_hashes[0].len(),
+        "PRODUCT: Carol's exact retained row became readable only after all {} rows of Alice's \
+         continuation in room {}; the bounded author queue was not fair: {fair_rows:?}",
+        late_hashes[0].len(),
+        rooms[0]
+    );
+    let fair_status = room_status(&bob, "bob", &rooms[0]);
+    assert!(
+        fair_status.render_backfill_pending,
+        "PRODUCT: shipped status said no render work remained at the held fair-turn boundary, \
+         although only {fair_readable_long} of Alice's {} exact rows were readable in room {}: \
+         {fair_status:?}",
+        late_hashes[0].len(),
+        rooms[0]
+    );
+    std::fs::remove_file(&render_hold_engaged)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release the fair-turn hold: {error}"));
+    let continuation_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn-resume");
+    assert!(
+        room_hashes(&bob, "bob", &rooms[0]).contains(&continuation_wake),
+        "PRODUCT: Bob's exact continuation wake {continuation_wake} was absent from room {}",
+        rooms[0]
+    );
+
+    for (index, room) in rooms.iter().enumerate() {
+        let expected_before: Vec<String> = (0..BEFORE_KEY)
+            .map(|row| format!("alice before key room {} row {row}", index + 1))
+            .collect();
+        assert_exact_read_rows(
+            &bob,
+            "bob",
+            room,
+            &late_hashes[index],
+            &expected_before,
+            "row→consent→key with Alice unavailable after the exact competing author was readable",
+        );
+        assert_exact_read_rows(
+            &bob,
+            "bob",
+            room,
+            &competing_hashes[index],
+            &competing_texts[index],
+            "competing-author no-starvation after Alice's >64-row continuation with both \
+             sources unavailable",
+        );
+    }
+
+    // `trust add` completes only after applying that trust revision and retrying retained logged
+    // packages. Both exact authors' generations are already held and both sources are offline, so
+    // Alice's retained package presents an unchanged SKDM. The shipped status work observation is
+    // causal and exact: no new projection revision and no render continuation may appear. This
+    // replaces an aggregate CPU sample that could pass without observing the duplicate at all.
+    let duplicate_before = room_status(&bob, "bob", &rooms[0]);
+    assert!(
+        !duplicate_before.render_backfill_pending,
+        "PRODUCT: room {} still reported render backfill before the unchanged key replay: \
+         {duplicate_before:?}",
+        rooms[0]
+    );
+    std::fs::write(&render_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: could not engage render hold: {error}"));
+    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's idempotent `vox trust add alice` could not replay the retained key \
+         package: {out}{err}"
+    );
+    let duplicate_after = room_status(&bob, "bob", &rooms[0]);
+    assert_eq!(
+        duplicate_after.governance_revision, duplicate_before.governance_revision,
+        "PRODUCT: an unchanged retained sender key revised room {}'s governance projection: \
+         before {duplicate_before:?}, after {duplicate_after:?}",
+        rooms[0]
+    );
+    assert_eq!(
+        duplicate_after.received_key_generations, duplicate_before.received_key_generations,
+        "PRODUCT: an unchanged retained sender key changed room {}'s held generations: before \
+         {duplicate_before:?}, after {duplicate_after:?}",
+        rooms[0]
+    );
+    assert!(
+        !duplicate_after.render_backfill_pending,
+        "PRODUCT: an unchanged retained sender key requeued already-rendered history in room {}: \
+         before {duplicate_before:?}, after {duplicate_after:?} (ADR-038 FX-22, #1007)",
+        rooms[0]
+    );
+    std::fs::remove_file(&render_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: could not release render hold: {error}"));
+    let mut alice_restarted = daemon_env(&alice, "alice", &fold_knob);
+    attached(&alice, "alice");
+
+    // Isolate the repeated-grant claim to Alice and Bob before taking any semantic or room-order
+    // baseline. A Presence rotation retries consent for every identity Alice still trusts. If
+    // offline Carol remained in that set, her equal regrant could own the next semantic revision
+    // or share Bob's row interval, so `reset + 1` and the final row would not identify Bob's
+    // grant. Removing Carol is a shipped user action; wait for its real rotation/regrant fold and
+    // prove the node-wide trust decision before the quiet two-member sequence begins.
+    let isolation_before = room_status(&alice, "alice", &rooms[0]);
+    let (ok, out, err) = vox(&alice, &["trust", "remove", &fps[2]], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice could not remove offline Carol before the isolated repeated-grant \
+         sequence: {out}{err}"
+    );
+    let (ok, trusted, err) = vox(&alice, &["trust", "list"], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's shipped trust list failed after removing Carol: {err}"
+    );
+    assert!(
+        !trusted
+            .lines()
+            .any(|line| line.trim_start().starts_with(&fps[2])),
+        "PRODUCT: after successful `vox trust remove`, Alice's shipped trust list still named \
+         Carol {}: {trusted}",
+        fps[2]
+    );
+    let isolation_revision = isolation_before
+        .governance_revision
+        .checked_add(2)
+        .expect("PRODUCT: Alice's governance revision overflowed while isolating Bob's grant");
+    let isolation_settled = wait_room_status(
+        &alice,
+        "alice",
+        &rooms[0],
+        false,
+        "Carol's removal did not publish its reset and the one Bob-only regrant, or Alice did \
+         not finish Bob's resulting key delivery",
+        |status| {
+            status.governance_revision >= isolation_revision
+                && !status
+                    .key_delivery_pending
+                    .iter()
+                    .any(|member| member == &fps[1])
+        },
+    );
+    assert_eq!(
+        isolation_settled.governance_revision, isolation_revision,
+        "PRODUCT: removing Carol from the three-member trusted-reader set did not publish exactly \
+         the one reset and one Bob-only regrant in quiet room {}: before {isolation_before:?}, \
+         settled {isolation_settled:?}",
+        rooms[0]
+    );
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "Carol's removal and the resulting Bob-only regrant never completed their bounded fold",
+    );
+    wait_trust_detail(&bob, "bob", &rooms[0], "alice", "you trust each other");
+
+    // A same-value authenticated action exists in the immutable room order but is not a new
+    // canonical meaning. Wait on an authority-dependent shipped page so the equal revision below
+    // is observed after the exact row was folded, not before asynchronous work began.
+    let semantic_before = room_status(&alice, "alice", &rooms[0]);
+    let order_before = room_hashes(&alice, "alice", &rooms[0]);
+    let semantic_noop = rename_hash(&alice, "alice", &rooms[0], &rooms[0]);
+    assert!(
+        !order_before.contains(&semantic_noop)
+            && room_hashes(&alice, "alice", &rooms[0]).contains(&semantic_noop),
+        "PRODUCT: Alice's successful semantic-no-op rename named {semantic_noop}, but that exact \
+         authenticated row was not newly present in room {}",
+        rooms[0]
+    );
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "the exact same-name rename never completed its bounded governance fold",
+    );
+    let semantic_after = room_status(&alice, "alice", &rooms[0]);
+    assert_eq!(
+        semantic_after.governance_revision, semantic_before.governance_revision,
+        "PRODUCT: an authenticated same-name rename revised room {} despite leaving its canonical \
+         meaning unchanged: before {semantic_before:?}, after {semantic_after:?}",
+        rooms[0]
+    );
+
+    // Alice's shipped status above is the source-owned terminal observation for the prior re-key:
+    // its durable ledger and live delivery machinery both say Bob is owed nothing. Thus no delayed
+    // package from Carol's removal can enter the interval below and masquerade as reset or grant2.
+    // The original Alice→Bob grant is already user-visible and its sender key is held. Take Bob
+    // offline, then drive one source-owned sender-generation bound through the shipped post
+    // command. The rotation appends an authenticated Presence reset between the original grant
+    // and Alice's automatic, equal grant to every still-trusted reader. Bob's sparse catch-up
+    // admits the newest control fact before filling the older reset, which is the reachable
+    // grant₁ → reset → identical grant₂ → late-reset order: sequence, not arrival, must win.
+    //
+    // Take the semantic baseline before that source-owned transition starts. A baseline after
+    // the post command races its asynchronous offline fallback: it can already include grant₂,
+    // or can observe only the reset. The same-name rename above independently proves the
+    // semantic-no-op rule; this genuinely newer post-reset grant must advance the revision.
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust each other",
+        "APPARATUS: the first Alice→Bob grant was not visibly effective before staging the \
+         repeated-grant sequence"
+    );
+    let rotation_order_before = room_hashes(&alice, "alice", &rooms[0]);
+    let semantic_before_rotation = room_status(&alice, "alice", &rooms[0]);
+    let grant1_hash = &grant1_hashes[0];
+    assert!(
+        rotation_order_before.contains(grant1_hash),
+        "PRODUCT: Alice's exact consent grant1 {grant1_hash} disappeared before sender rotation: {rotation_order_before:?}"
+    );
+    bob_daemon.stop();
+    let mut last_rotated = None;
+    let mut rotation_post_hashes = Vec::new();
+    for row in 0..vox_core::group::ROTATE_AFTER_MESSAGES {
+        let text = format!("Alice rotation proof row {row}");
+        let (ok, out, err) = vox(
+            &alice,
+            &["room", "post", &rooms[0], "--json", "-"],
+            Some(&text),
+        );
+        assert!(
+            ok,
+            "PRODUCT: Alice's shipped post {row} of the source-owned sender-generation bound \
+             was refused: {out}{err}"
+        );
+        let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Alice's rotation-bound post answer was malformed ({error}): {out}")
+        });
+        let posted_hash = posted["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: Alice's rotation-bound post named no entry_hash: {posted}")
+            })
+            .to_owned();
+        rotation_post_hashes.push(posted_hash.clone());
+        if row + 1 == vox_core::group::ROTATE_AFTER_MESSAGES {
+            last_rotated = Some((posted_hash, text));
         }
     }
-    let (posted_a, refused_a) = a
-        .join()
-        .unwrap_or_else(|_| panic!("APPARATUS: alice's worker panicked"));
-    let (posted_b, refused_b) = b
-        .join()
-        .unwrap_or_else(|_| panic!("APPARATUS: bob's worker panicked"));
-    let worked = started.elapsed();
-    let cpu1 = (cpu_time(alice_daemon.0.id()), cpu_time(bob_daemon.0.id()));
-    let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
-    let slowest = answers.iter().copied().max().unwrap_or_default();
-    // The work was real: each reads the other's last post, in the room it went to.
-    let alice_last = format!("alice step {}", posted_a.saturating_sub(1));
-    let bob_last = format!("bob step {}", posted_b.saturating_sub(1));
-    let (to_alice, _) = arrivals(
-        started,
-        (&alice, &bob_last),
-        (&bob, &bob_last),
-        &rooms[(posted_b.saturating_sub(1)) % rooms.len()],
-        READY_WITHIN + worked,
+    let (last_rotated_hash, last_rotated_text) = last_rotated
+        .unwrap_or_else(|| panic!("APPARATUS: the source-owned rotation bound was empty"));
+    // The source transaction fixes the semantic identity without sampling semantic revision as
+    // completion: its Presence is the first non-post row, its offline fallback awaits an optional
+    // key package and then appends consent last. The actor cannot answer a shipped room-order read
+    // between that package and consent append, so Presence plus a later non-post row is the exact
+    // source-owned completion boundary. Only then wait for the authority-dependent page to settle
+    // and assert that both source facts changed canonical meaning. With grant₂'s semantic change
+    // mutated away, source completion and settlement still occur and the revision assertion is a
+    // PRODUCT red rather than a watchdog NO RESULT.
+    let grant2_revision = semantic_before_rotation
+        .governance_revision
+        .checked_add(2)
+        .expect("PRODUCT: Alice's governance revision overflowed during the repeated grant");
+    let (after_grant2, transition_rows) = loop {
+        let order = room_hashes(&alice, "alice", &rooms[0]);
+        let rows: Vec<_> = order
+            .iter()
+            .filter(|hash| {
+                !rotation_order_before.contains(hash) && !rotation_post_hashes.contains(hash)
+            })
+            .cloned()
+            .collect();
+        assert!(
+            rows.len() <= 3,
+            "PRODUCT: the source-owned rotation appended rows beyond Presence, its optional key \
+             package and consent in quiet room {}: before {rotation_order_before:?}; posts \
+             {rotation_post_hashes:?}; after {order:?}; transition rows {rows:?}",
+            rooms[0],
+        );
+        if rows.len() >= 2 {
+            break (order, rows);
+        }
+        std::thread::yield_now();
+    };
+    assert!(
+        matches!(transition_rows.len(), 2 | 3),
+        "PRODUCT: the exact two source-owned semantic transitions did not expose Presence, then \
+         optional key package, then consent in Alice's shipped room order; before \
+         {rotation_order_before:?}; posts {rotation_post_hashes:?}; after {after_grant2:?}; \
+         transition rows {transition_rows:?}"
     );
-    let (_, to_bob) = arrivals(
-        started,
-        (&alice, &alice_last),
-        (&bob, &alice_last),
-        &rooms[(posted_a.saturating_sub(1)) % rooms.len()],
-        READY_WITHIN + worked,
+    let reset_hash = transition_rows
+        .first()
+        .expect("PRODUCT: source-owned transition completed without a Presence row")
+        .clone();
+    // The fallback awaits the optional key-package append before it records consent. Room order
+    // is causal, so the final row at the exact two-transition boundary uniquely names grant₂.
+    let grant2_hash = transition_rows
+        .last()
+        .expect("PRODUCT: source-owned transition completed without a consent row")
+        .clone();
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "the source-complete Presence→grant2 sequence never settled its bounded governance \
+         work",
     );
-    let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
-    let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
-    println!(
-        "[proof] over {worked:?} alice posted {posted_a} ({refused_a} refused) and bob {posted_b} \
-         ({refused_b} refused) into {WORK_ROOMS} rooms; CPU time: alice's daemon +{:?}, bob's \
-         +{:?} (bound {WORK_CPU:?}); {} status answers, slowest {slowest:?} (bound \
-         {ANSWER_WITHIN:?}); last posts read: alice {to_alice:?}, bob {to_bob:?}; alice's lanes: {}; \
-         bob's lanes: {}",
-        spent.0,
-        spent.1,
-        answers.len(),
-        lanes_of(&alice_status),
-        lanes_of(&bob_status)
+    let semantic_after_grant2 = room_status(&alice, "alice", &rooms[0]);
+    let ordered_positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
+        .iter()
+        .map(|hash| {
+            after_grant2
+                .iter()
+                .position(|entry| entry == *hash)
+                .unwrap_or_else(|| panic!("PRODUCT: exact sequence row {hash} missing"))
+        })
+        .collect();
+    assert!(
+        ordered_positions[0] < ordered_positions[1]
+            && ordered_positions[1] < ordered_positions[2],
+        "PRODUCT: Alice's shipped room order did not prove grant1 {grant1_hash} → reset {reset_hash} → identical grant2 {grant2_hash}: positions {ordered_positions:?}; order {after_grant2:?}"
+    );
+    assert_eq!(
+        semantic_after_grant2.governance_revision, grant2_revision,
+        "PRODUCT: Alice's newer post-reset grant did not make exactly one required semantic \
+         transition after its Presence reset, or the sequence invented an extra displayed \
+         revision: before {semantic_before_rotation:?}, after {semantic_after_grant2:?}"
+    );
+
+    bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
+    attached(&bob, "bob-repeated-grant");
+    // Sparse catch-up must first expose the newest grant2 while the older Presence reset is still
+    // absent. This is the apparatus boundary that makes the later reset genuinely late rather than
+    // merely asserting an eventual set. If reset arrives first, this run did not stage the claim.
+    loop {
+        let held = room_hashes(&bob, "bob", &rooms[0]);
+        if held.contains(&grant2_hash) && !held.contains(&reset_hash) {
+            break;
+        }
+        assert!(
+            !held.contains(&reset_hash),
+            "APPARATUS: Bob received Presence reset {reset_hash} before the newer grant2 {grant2_hash}, so late-reset arrival was not staged; held order {held:?}"
+        );
+        std::thread::yield_now();
+    }
+    loop {
+        let held = room_hashes(&bob, "bob", &rooms[0]);
+        if [grant1_hash, &reset_hash, &grant2_hash]
+            .iter()
+            .all(|hash| held.contains(hash))
+        {
+            let positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
+                .iter()
+                .map(|hash| held.iter().position(|entry| entry == *hash).unwrap())
+                .collect();
+            assert!(
+                positions[0] < positions[1] && positions[1] < positions[2],
+                "PRODUCT: Bob's shipped order changed the authenticated grant1/reset/grant2 sequence: positions {positions:?}; held {held:?}"
+            );
+            break;
+        }
+        std::thread::yield_now();
+    }
+    wait_governance_current(
+        &bob,
+        "bob",
+        &rooms[0],
+        "the equal repeated grant and late reset never completed their bounded governance fold",
+    );
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust each other",
+        "PRODUCT: after the equal repeated grant and late reset completed, Bob no longer saw \
+         Alice's newer grant as effective"
+    );
+    assert_exact_read_rows(
+        &bob,
+        "bob",
+        &rooms[0],
+        std::slice::from_ref(&last_rotated_hash),
+        std::slice::from_ref(&last_rotated_text),
+        "the newer equal grant and late older reset reached Bob",
+    );
+
+    // Restart with Alice unavailable. The same exact retained object still reading proves the
+    // durable Consent locator advanced to grant₂; the pre-restart observation above proves the
+    // live RAM sequence also rejected the late, older reset.
+    alice_restarted.stop();
+    bob_daemon.stop();
+    bob_daemon = daemon_env(&bob, "bob-repeated-grant-restarted", &package_knob);
+    attached(&bob, "bob-repeated-grant-restarted");
+    wait_governance_current(
+        &bob,
+        "bob",
+        &rooms[0],
+        "Bob's durable governance projection never completed after restart",
+    );
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust each other",
+        "PRODUCT: after Bob's durable governance projection completed on restart, the older \
+         reset revoked Alice's newer equal grant"
+    );
+    assert_exact_read_rows(
+        &bob,
+        "bob",
+        &rooms[0],
+        std::slice::from_ref(&last_rotated_hash),
+        std::slice::from_ref(&last_rotated_text),
+        "Bob restarted with Alice unavailable after the equal-grant sequence",
+    );
+    alice_restarted = daemon_env(&alice, "alice-after-repeated-grant", &fold_knob);
+    attached(&alice, "alice-after-repeated-grant");
+    // Keep both shipped daemons alive for the remaining user journey.
+    let _running_after_repeated_grant = (&alice_restarted, &bob_daemon);
+
+    // The test-only certificate lifetime is owned by the product source; the proof does not
+    // invent a delay or use unrelated traffic as the trigger. The shipped admin page first
+    // proves Bob's certificate has effective semantic meaning. In the otherwise quiet room, its
+    // exact deadline must then wake the fold, remove Bob, and publish exactly one new semantic
+    // revision without a command or network event to prod it.
+    let authority_before = room_status(&alice, "alice", &rooms[0]);
+    let (ok, out, err) = vox(&alice, &["room", "admin", "add", &rooms[0], &fps[1]], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's `vox room admin add` was refused: {out}{err}"
+    );
+    wait_admin_membership(&alice, "alice", &rooms[0], &fps[1], true);
+    let authority_active = wait_room_status(
+        &alice,
+        "alice",
+        &rooms[0],
+        false,
+        "the effective administrator certificate did not publish a semantic revision",
+        |status| status.governance_revision > authority_before.governance_revision,
+    );
+    assert_eq!(
+        authority_active.governance_revision,
+        authority_before.governance_revision + 1,
+        "PRODUCT: one effective administrator certificate did not publish exactly one semantic \
+         governance revision in room {}: before {authority_before:?}, active {authority_active:?}",
+        rooms[0]
+    );
+    let positioning_before = room_status(&alice, "alice", &rooms[0]);
+    std::fs::write(&sweep_hold, room_id(&alice, "alice", &rooms[0])).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not arm the governance sweep after room {}: {error}",
+            rooms[0]
+        )
+    });
+    // A changed name is a causal semantic boundary. The hold is checked before this room can
+    // fold it: if the published revision advances while the marker remains unrenamed, the
+    // apparatus did not park the intended room and can say so without an elapsed deadline.
+    let positioning = rename_hash(&alice, "alice", &rooms[0], "fx22-expiry-boundary");
+    assert!(
+        room_hashes(&alice, "alice", &rooms[0]).contains(&positioning),
+        "PRODUCT: the exact authenticated positioning rename {positioning} was absent from room \
+         {}",
+        rooms[0]
+    );
+    while !sweep_engaged.exists() {
+        let observed = room_status(&alice, "alice", &rooms[0]);
+        assert_eq!(
+            observed.governance_revision, positioning_before.governance_revision,
+            "APPARATUS: the exact positioning rename {positioning} reached a published semantic \
+             revision before the governance-sweep marker engaged for room {}; the requested \
+             expiry-behind-cursor staging was not achieved: before {positioning_before:?}, \
+             observed {observed:?}",
+            rooms[0]
+        );
+        std::thread::yield_now();
+    }
+    let (ok, active, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
+    assert!(
+        ok && active
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(fps[1].as_str())),
+        "APPARATUS: the source-owned administrator certificate expired before the bounded \
+         governance cursor was parked after room {}; expiry-behind-cursor staging was not \
+         achieved: {active}{err}",
+        rooms[0]
+    );
+    // The shipped authority page becomes refreshing when its exact source-owned deadline has
+    // fired. It may also move directly to the final absent answer when both bounded sweeps finish
+    // before the next observation. Once refreshing is observed, shipped status provides the
+    // causal terminal boundary: no governance maintenance remains queued. The behind-cursor
+    // second-sweep mutant reaches that boundary too, then the one-shot roster/revision assertions
+    // below turn PRODUCT red instead of waiting forever for the desired state.
+    let expired_without_refresh = loop {
+        let (ok, out, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
+        let contains_bob = out
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(fps[1].as_str()));
+        if ok && !contains_bob {
+            break true;
+        }
+        if ok {
+            std::thread::yield_now();
+            continue;
+        }
+        assert!(
+            err.contains("governance") && err.contains("refreshing"),
+            "PRODUCT: Alice's shipped admin page failed while its exact certificate expiry was \
+             becoming current in room {}: {out}{err}",
+            rooms[0]
+        );
+        break false;
+    };
+    if !expired_without_refresh {
+        while room_status(&alice, "alice", &rooms[0]).governance_pending {
+            std::thread::yield_now();
+        }
+    }
+    let (ok, expired, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
+    assert!(
+        ok && !expired
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(fps[1].as_str())),
+        "PRODUCT: after Alice's source-owned expiry work reached shipped governance idle, Bob \
+         still had administrator authority or the page stayed unavailable in room {}: \
+         {expired}{err}",
+        rooms[0]
+    );
+    let authority_expired = room_status(&alice, "alice", &rooms[0]);
+    assert_eq!(
+        authority_expired.governance_revision,
+        authority_active.governance_revision + 1,
+        "PRODUCT: expiry of one effective administrator certificate did not publish exactly one \
+         semantic governance revision in quiet room {}: active {authority_active:?}, expired \
+         {authority_expired:?}",
+        rooms[0]
+    );
+
+    // The exact post after Alice's revocation is a causal boundary: once Bob retains that
+    // descendant, his doctor answer can no longer be an observation made before the revocation.
+    // Alice's key rotation also keeps the descendant unreadable, so this checks the consent
+    // projection itself rather than granting the row through an old key.
+    let (ok, out, err) = vox(&alice, &["trust", "remove", &fps[1]], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's `vox trust remove bob` failed: {out}{err}"
+    );
+    let revoked_text = "after Alice revoked Bob";
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &rooms[0], "--json", "-"],
+        Some(revoked_text),
     );
     assert!(
-        refused_a == 0 && refused_b == 0 && posted_a >= 30 && posted_b >= 30,
-        "APPARATUS: the agents did not work as staged: alice posted {posted_a} ({refused_a} \
-         refused), bob {posted_b} ({refused_b} refused)\nalice's daemon said: {}\nbob's daemon \
-         said: {}",
-        said(&alice, "alice"),
-        said(&bob, "bob")
+        ok,
+        "PRODUCT: Alice's post after revocation failed: {out}{err}"
     );
-    assert!(
-        to_alice.is_some() && to_bob.is_some(),
-        "PRODUCT: the agents' last posts were not read within {READY_WITHIN:?} of the end: alice \
-         read bob's: {to_alice:?}, bob read alice's: {to_bob:?}\nalice's lanes: {}\nbob's lanes: \
-         {}\nalice's daemon said: {}\nbob's daemon said: {}",
-        lanes_of(&alice_status),
-        lanes_of(&bob_status),
-        said(&alice, "alice"),
-        said(&bob, "bob")
+    let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: Alice's post-after-revocation answer was malformed ({error}): {out}")
+    });
+    let revoked_hash = posted["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: post-after-revocation named no entry_hash: {posted}"))
+        .to_owned();
+    wait_for_held_rows(
+        &bob,
+        &rooms[0],
+        std::slice::from_ref(&revoked_hash),
+        "revocation descendant",
     );
-    assert!(
-        spent.0 <= WORK_CPU && spent.1 <= WORK_CPU,
-        "PRODUCT: a daemon with agents at work spent more CPU than a person should pay (ADR-038 \
-         FX-15, #990): alice's daemon +{:?}, bob's +{:?} over {worked:?} (bound {WORK_CPU:?})\n\
-         alice's daemon said: {}\nbob's daemon said: {}",
-        spent.0,
-        spent.1,
-        said(&alice, "alice"),
-        said(&bob, "bob")
-    );
-    assert!(
-        slowest <= ANSWER_WITHIN,
-        "PRODUCT: `vox status --json` answered in {slowest:?} while agents worked, over \
-         {ANSWER_WITHIN:?} (ADR-038 FX-17); every answer: {answers:?}"
+    assert_eq!(
+        trust_detail(&bob, "bob", &rooms[0], "alice"),
+        "you trust it, but it has not trusted you: it cannot read you",
+        "PRODUCT: after Bob retained Alice's exact post-revocation descendant {revoked_hash}, \
+         `vox agent doctor` still answered from stale in-memory consent"
     );
 }
 
@@ -6035,28 +7423,28 @@ fn a_room_that_cannot_finish_preparing_says_why_and_costs_nothing() {
     drop(second);
 }
 
-/// Completed sync rounds per peer, from `vox status --json`'s lanes; an unreadable status is
-/// an apparatus fault, never a zero that reads as quiet.
+/// Completed sync rounds per peer, from `vox status --json`'s lanes; an unreadable or malformed
+/// shipped answer is a product red, never a zero that reads as quiet.
 fn completed_rounds(dir: &Path) -> std::collections::BTreeMap<String, u64> {
     let (ok, out, err) = vox(dir, &["status", "--json"], None);
     assert!(
         ok,
-        "APPARATUS: `vox status --json` failed while counting rounds: {err}"
+        "PRODUCT: `vox status --json` failed while counting rounds: {err}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("APPARATUS: `vox status --json` is not JSON: {e}: {out}"));
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"));
     let lanes = v["sync"]
         .as_array()
-        .unwrap_or_else(|| panic!("APPARATUS: `vox status --json` has no `sync` lanes: {out}"));
+        .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` has no `sync` lanes: {out}"));
     let mut rounds = std::collections::BTreeMap::new();
     for lane in lanes {
         let peer = lane["peer"]
             .as_str()
-            .unwrap_or_else(|| panic!("APPARATUS: a lane names no peer: {lane}"))
+            .unwrap_or_else(|| panic!("PRODUCT: a status lane names no peer: {lane}"))
             .to_owned();
         let completed = lane["completed"]
             .as_u64()
-            .unwrap_or_else(|| panic!("APPARATUS: a lane counts no completed rounds: {lane}"));
+            .unwrap_or_else(|| panic!("PRODUCT: a status lane counts no completed rounds: {lane}"));
         *rounds.entry(peer).or_insert(0) += completed;
     }
     rounds
@@ -6356,12 +7744,29 @@ fn cpu_time(pid: u32) -> Duration {
         .args(["-o", "cputime=", "-p", &pid.to_string()])
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: ps: {e}"));
+    assert!(
+        out.status.success(),
+        "APPARATUS: `ps` could not observe daemon {pid}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     // MM:SS.ss or HH:MM:SS
     let mut parts: Vec<&str> = text.split(':').collect();
-    let secs: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let mins: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    let hours: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let secs: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+        panic!("APPARATUS: `ps` printed no CPU seconds for daemon {pid}: {text}")
+    });
+    let mins: f64 = parts.pop().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+        panic!("APPARATUS: `ps` printed no CPU minutes for daemon {pid}: {text}")
+    });
+    let hours: f64 = parts.pop().map_or(0.0, |s| {
+        s.parse().unwrap_or_else(|_| {
+            panic!("APPARATUS: `ps` printed bad CPU hours for daemon {pid}: {text}")
+        })
+    });
+    assert!(
+        parts.is_empty(),
+        "APPARATUS: `ps` printed an unknown CPU time for daemon {pid}: {text}"
+    );
     Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
 }
 

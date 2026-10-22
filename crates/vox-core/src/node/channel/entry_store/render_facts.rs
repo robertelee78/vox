@@ -1715,13 +1715,23 @@ impl Write<'_, '_> {
         )?;
         self.set_render_roots(roots)
     }
-    pub(crate) fn next_backfill(&self) -> Result<Option<(Digest32, u64)>> {
+    pub(crate) fn next_backfill_after(
+        &self,
+        after: Option<Digest32>,
+    ) -> Result<Option<(Digest32, u64)>> {
+        let key = match after {
+            None => [0; 64],
+            Some(author) => match successor(hashed(&author)) {
+                Some(key) => key,
+                None => return Ok(None),
+            },
+        };
         Source::Batch(self.batch)
             .first(
                 self.sek,
                 self.channel,
                 self.render_roots()?.rendered.backfill,
-                &[0; 64],
+                &key,
                 0,
             )?
             .map(|(key, value)| match value {

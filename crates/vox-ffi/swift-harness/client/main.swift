@@ -58,7 +58,8 @@
 //   REFUSED <error>         `renameRoom` on the peer's room, which this node may not rename
 //   CREATED <room> <link>   `createRoom` named "mine", and its link
 //   (waits for a line on stdin: the peer has joined it)
-//   RENAMED                 `renameRoom` gave it the name "renamed"
+//   RENAMED <entry>         `renameRoom` gave it the name "renamed" and returned the exact
+//                           authenticated entry it appended
 //   RETENTION_SECS <n>      `retentionSecs` of that room after `setRetention` of 7 days
 //   (waits for a line on stdin: the id of a session of this node's, staged through its hook)
 //   SESSION <label> PENDING <n> DRIVE <bool>
@@ -299,7 +300,7 @@ do {
     say("PULLED_BY \(byNames) SAME \(pulledBy.first?.id == fileShare.entry)")
     // A rename asks for no passphrase (ADR-028 K-11).
     do {
-        try await client.renameRoom(room: room, name: "taken")
+        _ = try await client.renameRoom(room: room, name: "taken")
         say("REFUSED nothing: the rename was answered")
     } catch {
         say("REFUSED \(error)")
@@ -308,8 +309,8 @@ do {
         name: "mine", passphrase: try Passphrase(bytes: Data("mine passphrase".utf8)))
     say("CREATED \(made) \(try await client.link(room: made).url)")
     _ = readLine()
-    try await client.renameRoom(room: made, name: "renamed")
-    say("RENAMED")
+    let renameEntry = try await client.renameRoom(room: made, name: "renamed")
+    say("RENAMED \(renameEntry)")
     // What a retention change opens at (D14): the room's own value.
     try await client.setRetention(room: made, ttlSecs: 7 * 86_400)
     say("RETENTION_SECS \(try await client.retentionSecs(room: made))")

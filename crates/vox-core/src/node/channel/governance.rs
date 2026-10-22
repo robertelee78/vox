@@ -9,6 +9,7 @@ mod facts;
 mod fold;
 mod sparse;
 mod view;
+pub(in crate::node::channel) use view::{ConsentFacts, PAGE_ROWS, REFRESHING};
 
 pub(crate) use sparse::{
     sparse_control_evaluation, ControlEvaluation, PayloadValidation, SparsePayloadState,
@@ -217,6 +218,11 @@ fn is_control(entry: &crate::log::entry::Entry) -> bool {
     }
 }
 
+pub(super) struct Acceptance {
+    pub(super) work_changed: bool,
+    pub(super) current_advanced: bool,
+}
+
 fn observe(
     writer: &mut facts::Write<'_, '_>,
     log: u64,
@@ -225,7 +231,7 @@ fn observe(
     entry: &crate::log::entry::Entry,
     authors: &std::collections::BTreeMap<Digest32, crate::identity::composite::CompositePublicKey>,
     root: &Digest32,
-) -> Result<()> {
+) -> Result<Acceptance> {
     use crate::governance::entry::GovEntry;
     let hash = entry.entry_hash();
     let control = is_control(entry);
@@ -234,7 +240,8 @@ fn observe(
     // control closure, so a late content row changes nothing the order reads: it neither
     // raises the barrier nor holds the settlement (ADR-037 R2c). A legacy room's control
     // rows can have content parents, so there every late row still raises it.
-    if late && (control || !writer.control_only()) {
+    let mut changed = late && !control && !writer.control_only();
+    if changed {
         writer.barrier(log);
     }
     if writer
@@ -247,10 +254,16 @@ fn observe(
         writer.enqueue(&hash, log, control)?;
     }
     if !control {
-        return Ok(());
+        return Ok(Acceptance {
+            work_changed: changed,
+            current_advanced: false,
+        });
     }
     let Some(payload) = entry.payload.as_deref() else {
-        return Ok(());
+        return Ok(Acceptance {
+            work_changed: changed,
+            current_advanced: false,
+        });
     };
     let _ = payload;
     if writer
@@ -258,7 +271,10 @@ fn observe(
         .is_some()
     {
         // The content hash, not the receipt time or cursor, binds the verified body.
-        return Ok(());
+        return Ok(Acceptance {
+            work_changed: changed,
+            current_advanced: false,
+        });
     }
     let key = authors
         .get(&entry.skeleton.author_id)
@@ -266,7 +282,12 @@ fn observe(
     let body = match GovEntry::body_bound_to(entry) {
         Ok(body) => body,
         Err(error) if entry.skeleton.v2.is_some() => return Err(error),
-        Err(_) => return Ok(()),
+        Err(_) => {
+            return Ok(Acceptance {
+                work_changed: changed,
+                current_advanced: false,
+            });
+        }
     };
     // Malformed/unauthenticated nested statements confer nothing, just as in
     // the original pass-1 evaluator. Local Store/index errors above remain errors.
@@ -274,21 +295,58 @@ fn observe(
         return if entry.skeleton.v2.is_some() {
             Err(error)
         } else {
-            Ok(())
+            Ok(Acceptance {
+                work_changed: changed,
+                current_advanced: false,
+            })
         };
     }
-    writer.barrier(log);
-    writer.verified(&hash, &entry.skeleton.author_id, entry.skeleton.seq, log)?;
-    writer.authority_input(
+    let current = facts::Write::current_input_kind(&body);
+    let (updates_current, changes_projection) = if current {
+        writer.current_input_change(&entry.skeleton.author_id, entry.skeleton.seq, &body)?
+    } else {
+        (false, false)
+    };
+    // Canonical inputs are always ordered: only the checked fold can decide whether a signed
+    // action is authorized and changes the published meaning. Current single-writer facts never
+    // enter that order and wake only when their canonical value changes.
+    let changes_order = !current;
+    if changes_order {
+        writer.barrier(log);
+    }
+    writer.verified(
         &hash,
         &entry.skeleton.author_id,
         entry.skeleton.seq,
         log,
-        root,
-        &body,
+        changes_projection,
+        changes_order,
     )?;
-    writer.observe_clock(&hash, clock)?;
-    writer.current_input(&entry.skeleton.author_id, entry.skeleton.seq, log, &body)
+    changed |= changes_projection || changes_order;
+    if changes_order {
+        writer.authority_input(
+            &hash,
+            &entry.skeleton.author_id,
+            entry.skeleton.seq,
+            log,
+            root,
+            &body,
+        )?;
+        writer.observe_clock(&hash, clock)?;
+    }
+    if updates_current {
+        writer.current_input(
+            &entry.skeleton.author_id,
+            entry.skeleton.seq,
+            log,
+            &body,
+            changes_projection,
+        )?;
+    }
+    Ok(Acceptance {
+        work_changed: changed,
+        current_advanced: updates_current,
+    })
 }
 
 /// Advance a bounded batch of authoritative source rows. The cursor and every
@@ -330,12 +388,8 @@ fn advance_source(
         if published {
             let clock = published_clock(input.log_id(&hash)?, input.clock(&hash)?, id)?;
             let late = input.child_after(&hash, None)?.is_some();
-            observe(&mut writer, id, clock, late, &entry, authors, root)?;
-            if writer
-                .get(facts::Table::Hashes, &facts::hash_key(&hash))?
-                .is_some()
-                && grants_this_reader(&entry, me)
-            {
+            let accepted = observe(&mut writer, id, clock, late, &entry, authors, root)?;
+            if accepted.work_changed && grants_this_reader(&entry, me) {
                 backfill.insert(entry.skeleton.author_id);
             }
         }
@@ -426,7 +480,7 @@ pub(super) fn accepted_into(
     log: u64,
     entry: &crate::log::entry::Entry,
     late: bool,
-) -> Result<()> {
+) -> Result<Acceptance> {
     let (clock, sparse) = {
         let input = entries.in_batch(batch, sek, room)?;
         let hash = entry.entry_hash();
@@ -437,17 +491,14 @@ pub(super) fn accepted_into(
     };
     let mut writer = facts::Write::open(batch, sek, room)?;
     writer.set_control_only(sparse);
-    observe(&mut writer, log, clock, late, entry, authors, root)?;
+    let accepted = observe(&mut writer, log, clock, late, entry, authors, root)?;
     writer.live_receipt(log)?;
-    let backfill = writer
-        .get(facts::Table::Hashes, &facts::hash_key(&entry.entry_hash()))?
-        .is_some()
-        && grants_this_reader(entry, me);
+    let backfill = accepted.work_changed && grants_this_reader(entry, me);
     writer.seal()?;
     if backfill {
         queue_backfill(batch, entries, sek, room, entry.skeleton.author_id)?;
     }
-    Ok(())
+    Ok(accepted)
 }
 
 fn grants_this_reader(entry: &crate::log::entry::Entry, me: &Digest32) -> bool {
@@ -502,8 +553,8 @@ pub(super) fn advance(
     #[cfg(feature = "test-knobs")]
     if fold_held() {
         // A proof holds the fold where it stands to stage "received but not yet folded"
-        // (ADR-037 R3's gates). Nothing re-arms a turn until the tick, so a held room does
-        // not spin the actor; the tick marks governance work pending again every second.
+        // (ADR-037 R3's gates). A held room does not spin the actor; after the apparatus releases
+        // the marker, the proof supplies a real governance fact whose acceptance wakes this work.
         return Ok(Progress {
             ready: current.ready,
             pending: false,

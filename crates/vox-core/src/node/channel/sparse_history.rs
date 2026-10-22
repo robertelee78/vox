@@ -682,9 +682,10 @@ impl ChannelState {
             &first_seen_bytes(now.get(), false),
         )?;
         batch.put_segment(&self.channel_id, SegmentKind::Index, log, &first_seen)?;
-        // Only source/causal facts are observed here. Presence, private floors, keys and
-        // rendering wait for semantic completion, so source validation cannot grant effects.
-        governance::accepted_into(
+        // The governance index records authenticated single-writer current inputs at this
+        // publication boundary. Presence side effects, private floors, keys and rendering still
+        // wait for semantic completion.
+        let accepted = governance::accepted_into(
             &mut batch,
             &self.entries,
             &self.sek,
@@ -698,11 +699,15 @@ impl ChannelState {
         )?;
         batch.commit()?;
         committed.store(true, std::sync::atomic::Ordering::Release);
+        // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
+        // publication paths, a sparse history caller does not poison the room on commit failure.
+        if accepted.current_advanced {
+            self.note_committed_consent(entry)?;
+        }
         self.entries.committed();
         self.next_log_id = log
             .checked_add(1)
             .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-        self.governance_ready = false;
         Ok(())
     }
 

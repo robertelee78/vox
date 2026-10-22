@@ -6182,9 +6182,10 @@ pub async fn rename(paths: &Paths, room: &str, name: &str) -> Result<(), AppErro
         })
         .await
     {
-        Ok(Frame::Ok) => {
+        Ok(Frame::Appended { entry }) => {
             println!("vox: renamed {} to {name}", short(&channel_id));
             println!("     every member sees the new name as this reaches them");
+            println!("     entry {}", claim::b32(&entry));
             Ok(())
         }
         // The node's own words (`Fault::explain`) say why: not an admin, or not a name.

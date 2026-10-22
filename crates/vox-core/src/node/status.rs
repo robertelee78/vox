@@ -115,6 +115,9 @@ pub struct MemberStatus {
     pub held_through: Option<u64>,
     /// Last authenticated, role-complete position this node holds in this member's room feed.
     pub holds_through: Option<u64>,
+    /// Whether this member is still owed, or is actively being sent, any generation of this
+    /// node's sender key in this room.
+    pub key_delivery_pending: bool,
 }
 
 /// One room that is still preparing: not open, not closed, and saying what it waits for.
@@ -157,6 +160,10 @@ pub struct RoomStatus {
     pub received_key_generations: usize,
     /// Whether this room still owes a bounded retained key-package processing turn.
     pub key_packages_pending: bool,
+    /// Revision of the room's checked governance projection.
+    pub governance_revision: u64,
+    /// Whether retained ciphertext still has bounded rendering work queued.
+    pub render_backfill_pending: bool,
     /// Authors this node froze here for signing two entries at one position (ADR-008).
     pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened
@@ -290,6 +297,9 @@ pub struct StatusReport {
     pub identity: Option<Digest32>,
     /// Whether it is on the network.
     pub networked: bool,
+    /// Whether the actor has bounded governance maintenance queued. A room's displayed
+    /// projection remains the last complete one while this is true.
+    pub governance_pending: bool,
     /// When the machine's network last changed, unix milliseconds, and the change in one line
     /// (ADR-012 N-52); `None` if it has not since the daemon started.
     pub network_changed: Option<(u64, String)>,
@@ -458,6 +468,7 @@ impl StatusReport {
             self.identity.map_or("null".into(), |d| q(&b32_encode(&d)))
         );
         let _ = write!(j, "\"networked\":{},", self.networked);
+        let _ = write!(j, "\"governance_pending\":{},", self.governance_pending);
         let _ = write!(
             j,
             "\"keyring_open_secs\":{},",
@@ -491,7 +502,7 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"key_delivery_pending\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
@@ -500,12 +511,13 @@ impl StatusReport {
                     opt(m.last_sync),
                     m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q),
                     opt(m.held_through),
-                    opt(m.holds_through)
+                    opt(m.holds_through),
+                    m.key_delivery_pending
                 )
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"key_packages_pending\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"own_feed_through\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"key_packages_pending\":{},\"governance_revision\":{},\"render_backfill_pending\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"own_feed_through\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
@@ -515,6 +527,8 @@ impl StatusReport {
                 r.key_generations,
                 r.received_key_generations,
                 r.key_packages_pending,
+                r.governance_revision,
+                r.render_backfill_pending,
                 frozen,
                 r.refused_below_checkpoint,
                 r.entries,

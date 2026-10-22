@@ -175,13 +175,30 @@ const PREPARE_RETRY: Duration = Duration::from_millis(50);
 /// re-queued every 50 ms for hours while `vox room list` said only "[preparing history]".
 const PREPARE_WAIT: Duration = Duration::from_secs(1);
 
-/// Test-only: while the file this names exists, the node opens none of the key-packages the log
-/// brings it; they stay queued, as between a sync session's entries and its end, so a proof can
-/// show what a member is told while one waits (`drive_given_on_an_idle_session_…`).
+/// Test-only: while the file this names exists, the node accepts no sender-key delivery: neither
+/// the ordinary logged-package worker, a package opened during room preparation, nor a live
+/// pairwise delivery. The first real attempt writes the same path with `.engaged` appended, so a
+/// proof can observe that the apparatus intercepted an acceptance rather than infer it from time.
+/// Logged work stays queued; live delivery answers not-accepted so the sender retains/retries it.
 /// **For proofs; nothing in a real deployment sets it.** Not compiled in without the
 /// `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_PACKAGES_ENV: &str = "VOX_TEST_HOLD_PACKAGES_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn held_packages_path() -> Option<std::path::PathBuf> {
+    std::env::var_os(TEST_HOLD_PACKAGES_ENV)
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.exists())
+}
+
+#[cfg(feature = "test-knobs")]
+fn note_package_hold_engaged(path: &std::path::Path) {
+    let mut engaged = path.as_os_str().to_owned();
+    engaged.push(".engaged");
+    let _ = std::fs::write(std::path::PathBuf::from(engaged), b"");
+}
 
 /// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
 /// between waits, and the next record names all of it.
@@ -357,7 +374,7 @@ fn detail_of(
     ch: &ChannelState,
     store: &crate::node::store::Store,
     prev: Option<&ChannelDetail>,
-    _now: crate::time::Ms,
+    now: crate::time::Ms,
     sequence: &std::sync::atomic::AtomicU64,
 ) -> crate::error::Result<ChannelDetail> {
     if ch.is_poisoned() {
@@ -390,7 +407,7 @@ fn detail_of(
     // is derived again. Measured before this (ADR-038 FX-15, #990): every status publication
     // derived it afresh for every open room, and a daemon with four working agent nodes spent
     // ~180% of a core doing so while its control socket answered in 0.5 s.
-    let governance_revision = ch.governance_revision(store)?;
+    let governance_revision = ch.governance_revision(now)?;
     let members = ch.members();
     let epoch = ch.epoch();
     let session_revision = ch.sessions_revision(store)?;
@@ -444,6 +461,12 @@ fn detail_of(
         .iter()
         .filter_map(|member| ch.holds_through(member).map(|seq| (*member, seq)))
         .collect();
+    let mut key_delivery_pending = Vec::new();
+    for target in &member_consent {
+        if ch.key_delivery_pending(store, target)? {
+            key_delivery_pending.push(*target);
+        }
+    }
     Ok(ChannelDetail {
         pause: ch.room_pause(),
         pause_resume_after: ch.pause_resume_after(),
@@ -467,6 +490,8 @@ fn detail_of(
         creator: ch.genesis().creator_pubkey().fingerprint(),
         member_consent,
         governance_revision,
+        render_backfill_pending: ch.governance_backfill_pending(store)?,
+        key_delivery_pending,
         consenting,
         offer_bases,
         trusted_by,
@@ -5389,6 +5414,10 @@ pub struct Node {
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Deliveries begun by this actor that have not reached either a durable direct
+    /// acknowledgement or a completed store-and-forward append. Kept through refusal so a stale
+    /// published room view cannot briefly report completion before the fallback updates it.
+    key_delivery_settling: BTreeSet<(Digest32, Digest32)>,
     /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
     /// member takes it, a later key supersedes it, or the member says its opening cannot work.
     deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
@@ -5951,6 +5980,7 @@ impl Node {
             redeliver_now: false,
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
+            key_delivery_settling: BTreeSet::new(),
             deliveries: BTreeMap::new(),
             delivery_reserved: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
@@ -6126,7 +6156,22 @@ impl Node {
         // ready classes; each retains its own room cursor and yields after one bounded turn.
         let mut maintenance_next = 0u8;
         loop {
+            let governance_delay = self.governance_work.next_deadline().map(|deadline| {
+                Duration::from_millis(deadline.saturating_sub(self.now_ms().get()))
+            });
+            let governance_deadline = async move {
+                match governance_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(governance_deadline);
             tokio::select! {
+                () = &mut governance_deadline => {
+                    // Certificate expiry is its own causal wake. A quiet room does not wait for
+                    // the one-second actor tick, a command, or network traffic to invalidate it.
+                    self.governance_work.wake_expired(self.now_ms().get());
+                }
                 () = tokio::task::yield_now(), if self.governance_work.pending || self.room_preparation_work_ready() || (!self.legacy_cleanup_rooms.is_empty() && std::time::Instant::now() >= self.legacy_cleanup_due) || self.key_package_work_ready() => {
                     if self.apply_computer_keyring().await.is_err() { continue; }
                     for _ in 0..4 {
@@ -6175,7 +6220,6 @@ impl Node {
                         let _ = reply.send(Outcome::Done);
                         continue;
                     }
-                    self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if let NodeCommand::SetAdmin { channel_id, member, admin: false } = command {
@@ -6364,7 +6408,6 @@ impl Node {
                     self.schedule().await;
                 }
                 Some(event) = net_rx.recv() => {
-                    self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
@@ -6439,7 +6482,6 @@ impl Node {
                     }
                 }
                 _ = ticker.tick() => {
-                    self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if self.apply_computer_keyring().await.is_err() { continue; }
@@ -7918,8 +7960,7 @@ impl Node {
             // room must have this incarnation and current policy/drive authority.
             Ok(Some(
                 detail.history_instance == channel.history_instance(profile.store())?
-                    && detail.governance_revision
-                        == channel.governance_revision(profile.store())?
+                    && detail.governance_revision == channel.governance_revision(self.now_ms())?
                     && detail.drive_from == channel.drive_from_known(profile.store())?.0,
             ))
         })();
@@ -10454,6 +10495,16 @@ impl Node {
                 if whole_history {
                     let _ = channel.note_history_delivered(profile.store(), &peer);
                 }
+                let still_owed = channel
+                    .key_delivery_pending(profile.store(), &peer)
+                    .unwrap_or(true);
+                drop(channel);
+                if !still_owed
+                    && !self.keys_in_flight.contains_key(&(channel_id, peer))
+                    && !self.history_in_flight.contains_key(&(channel_id, peer))
+                {
+                    self.key_delivery_settling.remove(&(channel_id, peer));
+                }
             }
             NetEvent::RoomStored { channel_id } => {
                 // A worker persisted entries: the room's generation moved, and its ports are
@@ -10673,7 +10724,6 @@ impl Node {
                                 None
                             }
                         };
-                        self.governance_work.pending = true;
                         self.settle_sparse_room(&channel_id).await;
                         // Head promotion advances the shared room generation inside the disk
                         // worker. Touch the room here so schedule observes it immediately and
@@ -10861,6 +10911,11 @@ impl Node {
                     // behind. Records mirrored onto this board come through `BoardGrew`, which
                     // fires for news.
                     if o.governance > 0 {
+                        // The session accepted authenticated governance/index work. That causal
+                        // publication, rather than every network event or the one-second ticker,
+                        // wakes its bounded settlement. A superseded current fact still settles
+                        // its frontier but does not revise/invalidate the checked projection.
+                        self.governance_work.pending = true;
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(&channel_id, PublishCause::Governance)
                             .await;
@@ -13224,7 +13279,7 @@ impl Node {
         };
         // The grant is on the log now, and a reader renders nothing without it: pushed at once,
         // as every local append is, not on the next tick (V210-78).
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         // The generation delivered is the key's own: a key taken before a rotation is the older
         // one, and a refusal must re-owe exactly that (V210-30).
         let chain_id = skdm.body.chain_id;
@@ -13628,6 +13683,8 @@ impl Node {
         self.delivery_reserved
             .retain(|(_, peer, _), _| peer != fingerprint);
         self.key_waiting.retain(|(_, peer), _| peer != fingerprint);
+        self.key_delivery_settling
+            .retain(|(_, peer)| peer != fingerprint);
         self.note_capability(*fingerprint, had_drive);
         // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
         // nothing it posts from now opens on this node. A closed room drops them, and changes its
@@ -13720,7 +13777,7 @@ impl Node {
         self.delivery_reserved
             .retain(|(r, peer, _), _| r != room || *peer != target);
         self.key_waiting.remove(&(*room, target));
-        self.note_local_append(room);
+        self.note_local_governance_append(room);
         let _ = self.event_tx.send(NodeEvent::Revoked {
             channel_id: *room,
             target,
@@ -14475,7 +14532,7 @@ impl Node {
                 port.raise();
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
     }
 
     /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
@@ -14606,6 +14663,14 @@ impl Node {
         }
         self.sched_rooms.insert(*channel_id);
         self.discover_rooms.insert(*channel_id);
+    }
+
+    /// A locally appended governance fact both needs ordinary propagation and causally wakes the
+    /// bounded governance projection. Content, status and unrelated network traffic never use
+    /// this path merely to poll sealed governance state.
+    fn note_local_governance_append(&mut self, channel_id: &Digest32) {
+        self.governance_work.pending = true;
+        self.note_local_append(channel_id);
     }
 
     /// The room instance `channel_id` names now, and its generation counter.
@@ -16428,6 +16493,7 @@ impl Node {
             };
             if owes_consent {
                 let before_package = shared.lock().await.own_verified_head();
+                self.key_delivery_settling.insert((channel_id, peer));
                 // **The same release the pairwise stream would have carried** (`consent_release`):
                 // what this member may read depends on when it was trusted, never on the path its
                 // key took (V210-45, #226). A key taken now, when the dial failed, would start
@@ -16504,7 +16570,7 @@ impl Node {
                                 .is_ok())
                 };
                 if issued {
-                    self.note_local_append(&channel_id);
+                    self.note_local_governance_append(&channel_id);
                     let consent_seq = shared.lock().await.own_verified_head();
                     self.offline_fallbacks.insert(
                         (channel_id, peer),
@@ -16567,6 +16633,7 @@ impl Node {
                 (None, Some(k)) => vec![k],
                 (None, None) => continue,
             };
+            self.key_delivery_settling.insert((channel_id, peer));
             let mut all_posted = true;
             for key in &keys {
                 if !self.post_key_package(&channel_id, peer, key).await {
@@ -16587,8 +16654,19 @@ impl Node {
             } else {
                 Ok(())
             };
-            let _ = history_noted
+            let completed = history_noted
                 .and_then(|()| channel.note_delivered(profile.store(), peer, generation));
+            let still_owed = completed.is_err()
+                || channel
+                    .key_delivery_pending(profile.store(), &peer)
+                    .unwrap_or(true);
+            drop(channel);
+            if !still_owed
+                && !self.keys_in_flight.contains_key(&(channel_id, peer))
+                && !self.history_in_flight.contains_key(&(channel_id, peer))
+            {
+                self.key_delivery_settling.remove(&(channel_id, peer));
+            }
         }
     }
 
@@ -16672,10 +16750,11 @@ impl Node {
 
     fn key_package_work_ready(&self) -> bool {
         #[cfg(feature = "test-knobs")]
-        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
-            .is_some_and(|f| std::path::Path::new(&f).exists())
-        {
-            return false;
+        if !self.key_package_rooms.is_empty() {
+            if let Some(path) = held_packages_path() {
+                note_package_hold_engaged(&path);
+                return false;
+            }
         }
         !self.key_package_rooms.is_empty()
     }
@@ -16728,9 +16807,8 @@ impl Node {
     /// replay from disk, including packages which failed to open or were not trusted.
     async fn install_key_packages(&mut self, channel_id: &Digest32) -> bool {
         #[cfg(feature = "test-knobs")]
-        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
-            .is_some_and(|f| std::path::Path::new(&f).exists())
-        {
+        if let Some(path) = held_packages_path() {
+            note_package_hold_engaged(&path);
             self.key_package_rooms.entry(*channel_id).or_insert(false);
             return false;
         }
@@ -16801,24 +16879,34 @@ impl Node {
                 let Some(profile) = self.profile.as_ref() else {
                     return false;
                 };
-                shared.lock().await.accept_skdm(profile.store(), &skdm, now)
+                let mut channel = shared.lock().await;
+                let installed = channel.accept_skdm(profile.store(), &skdm, now);
+                // Key acceptance is the event that wakes any rows parked on this missing fact.
+                // accept_skdm drains one bounded page itself; one governance turn continues a
+                // retained cursor or observes that it is already empty.
+                if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
+                    self.governance_work.pending = true;
+                }
+                installed
             };
-            if let Ok(backfilled) = installed {
-                changed = true;
-                let _ = self.event_tx.send(
-                    if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
-                        NodeEvent::SessionEntry {
-                            channel_id: *channel_id,
-                            session_id: crate::node::drive::KEY_CHANGED.to_owned(),
-                        }
-                    } else {
-                        NodeEvent::SenderKeyReceived {
-                            channel_id: *channel_id,
-                            peer: skdm.body.author_id,
-                            backfilled: backfilled as u64,
-                        }
-                    },
-                );
+            if let Ok(accepted) = installed {
+                if accepted.changed {
+                    changed = true;
+                    let _ = self.event_tx.send(
+                        if skdm.body.channel_id == crate::node::drive::drive_channel(channel_id) {
+                            NodeEvent::SessionEntry {
+                                channel_id: *channel_id,
+                                session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                            }
+                        } else {
+                            NodeEvent::SenderKeyReceived {
+                                channel_id: *channel_id,
+                                peer: skdm.body.author_id,
+                                backfilled: accepted.rendered as u64,
+                            }
+                        },
+                    );
+                }
             }
         }
         let mut channel = shared.lock().await;
@@ -17316,6 +17404,7 @@ impl Node {
     /// again. Taken is when it is delivered; a `history` key counts towards the batch it belongs
     /// to, whose history is recorded once all of it was taken.
     fn key_in_flight(&mut self, channel_id: Digest32, target: Digest32) -> u64 {
+        self.key_delivery_settling.insert((channel_id, target));
         *self.keys_in_flight.entry((channel_id, target)).or_default() += 1;
         self.delivery_epoch
     }
@@ -18065,6 +18154,11 @@ impl Node {
         if !self.trust.is_trusted(&author) {
             return Err(KeyRefusal::NotTrusted);
         }
+        #[cfg(feature = "test-knobs")]
+        if let Some(path) = held_packages_path() {
+            note_package_hold_engaged(&path);
+            return Err(KeyRefusal::NotAccepted);
+        }
         let mut fresh = false;
         let backfilled = match (
             self.profile.as_ref(),
@@ -18073,11 +18167,15 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                channel.accept_skdm(profile.store(), skdm, now_ms).ok()
+                let installed = channel.accept_skdm(profile.store(), skdm, now_ms).ok();
+                if installed.as_ref().is_some_and(|accepted| accepted.changed) {
+                    self.governance_work.pending = true;
+                }
+                installed
             }
             _ => None,
         };
-        let Some(n) = backfilled else {
+        let Some(accepted) = backfilled else {
             return Err(KeyRefusal::NotAccepted);
         };
         // A generation new to us: the author may have refused ours while we were untrusted, or
@@ -18086,20 +18184,22 @@ impl Node {
         if fresh {
             self.reoffer.insert((channel_id, author));
         }
-        let _ = self.event_tx.send(
-            if skdm.body.channel_id == crate::node::drive::drive_channel(&channel_id) {
-                NodeEvent::SessionEntry {
-                    channel_id,
-                    session_id: crate::node::drive::KEY_CHANGED.to_owned(),
-                }
-            } else {
-                NodeEvent::SenderKeyReceived {
-                    channel_id,
-                    peer,
-                    backfilled: n as u64,
-                }
-            },
-        );
+        if accepted.changed {
+            let _ = self.event_tx.send(
+                if skdm.body.channel_id == crate::node::drive::drive_channel(&channel_id) {
+                    NodeEvent::SessionEntry {
+                        channel_id,
+                        session_id: crate::node::drive::KEY_CHANGED.to_owned(),
+                    }
+                } else {
+                    NodeEvent::SenderKeyReceived {
+                        channel_id,
+                        peer,
+                        backfilled: accepted.rendered as u64,
+                    }
+                },
+            );
+        }
         Ok(())
     }
 
@@ -18312,6 +18412,7 @@ impl Node {
         }
         // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
         self.keys_in_flight.clear();
+        self.key_delivery_settling.clear();
         // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
         self.deliveries.clear();
         self.delivery_reserved.clear();
@@ -19263,6 +19364,15 @@ impl Node {
             ch.require_governance_ready(profile.store(), now)?;
         }
         if ch.needs_session_upgrade() && ch.key_packages_pending() {
+            #[cfg(feature = "test-knobs")]
+            if let Some(path) = held_packages_path() {
+                note_package_hold_engaged(&path);
+                prepared.wait_on(
+                    "test apparatus holding members' sender keys",
+                    self.now_ms().get(),
+                );
+                return Ok(false);
+            }
             let ctx = ch.join_context()?;
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let progress =
@@ -19274,7 +19384,13 @@ impl Node {
                     .await?;
                 let installed = if let Some(skdm) = opened {
                     match self.profile.as_ref() {
-                        Some(profile) => ch.accept_skdm(profile.store(), &skdm, now).map(|_| ()),
+                        Some(profile) => {
+                            let installed = ch.accept_skdm(profile.store(), &skdm, now);
+                            if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
+                                self.governance_work.pending = true;
+                            }
+                            installed.map(|_| ())
+                        }
                         None => Err(Error::AtRestLocked),
                     }
                 } else {
@@ -19439,6 +19555,7 @@ impl Node {
     /// Publish a room only after both shared and local retention have been applied durably.
     async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
+        let governance_deadline = ch.governance_deadline();
         if ch.legacy_startup_cleanup_pending() {
             self.legacy_cleanup_rooms.entry(channel_id).or_insert(None);
             self.legacy_cleanup_due = std::time::Instant::now();
@@ -19448,6 +19565,8 @@ impl Node {
         self.remember_or_say(&ch);
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        self.governance_work
+            .set_deadline(channel_id, governance_deadline);
         // Preparation established current decisions and completed all pending narrowing.
         self.resume_leave(&channel_id).await;
         self.adopt_channel_anchors(&channel_id).await;
@@ -19486,6 +19605,7 @@ impl Node {
             }
         }
         self.key_package_rooms.remove(channel_id);
+        self.governance_work.set_deadline(*channel_id, None);
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
@@ -19609,7 +19729,7 @@ impl Node {
         gen: u64,
         reply: Option<oneshot::Sender<Outcome>>,
     ) {
-        self.note_local_append(&channel_id);
+        self.note_local_governance_append(&channel_id);
         let _ = self.sync_channel(&channel_id).await;
         self.leave_serial += 1;
         let serial = self.leave_serial;
@@ -19884,7 +20004,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
             .await;
         // The checked local publication completes first; the regular lifecycle turn
@@ -19921,7 +20041,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         // Bounded governance maintenance publishes the checked roster (V030-14)
         // before the local completion is eligible to answer.
         Outcome::Done
@@ -19942,7 +20062,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         Outcome::Done
     }
 
@@ -20003,6 +20123,7 @@ impl Node {
         }
         let mut name = String::new();
         self.key_package_rooms.remove(channel_id);
+        self.governance_work.set_deadline(*channel_id, None);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
             name = crate::node::resolver::room_shown(ch.name(), channel_id);
@@ -20090,6 +20211,8 @@ impl Node {
         self.delivery_reserved
             .retain(|(room, _, _), _| room != channel_id);
         self.key_waiting.retain(|(room, _), _| room != channel_id);
+        self.key_delivery_settling
+            .retain(|(room, _)| room != channel_id);
         self.refresh_network_view().await;
         // Published before it is said: whoever is told the room is deleted and then looks
         // (`vox room list`) must not still see it.
@@ -20312,7 +20435,7 @@ impl Node {
             (back, own_hint, own_targets)
         };
         match back {
-            Ok(true) => self.note_local_append(channel_id),
+            Ok(true) => self.note_local_governance_append(channel_id),
             Ok(false) => {}
             Err(e) => {
                 let _ = self.event_tx.send(NodeEvent::JoinFailed {
@@ -20402,8 +20525,9 @@ impl Node {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
         let now_ms = self.now_ms();
-        let outcome = {
+        let (outcome, governance_appended) = {
             let mut channel = shared.lock().await;
+            let mut governance_appended = false;
             let outcome = channel
                 .add_service(profile.store(), profile, service_tag, local, kind, persist)
                 .and_then(|_| {
@@ -20421,18 +20545,21 @@ impl Node {
                             let _ = channel.remove_service(profile.store(), service_tag);
                             Err(e)
                         }
-                        Ok(()) => Ok(()),
+                        Ok(()) => {
+                            governance_appended = true;
+                            Ok(())
+                        }
                     }
                 });
             if outcome.is_ok() {
                 self.publish_service_offers(&channel);
             }
-            outcome
+            (outcome, governance_appended)
         };
         match outcome {
             Ok(()) => {
-                if persist {
-                    self.note_local_append(channel_id);
+                if governance_appended {
+                    self.note_local_governance_append(channel_id);
                 }
                 self.refresh_reachers().await;
                 Outcome::Done
@@ -20456,24 +20583,30 @@ impl Node {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
         let now_ms = self.now_ms();
-        let outcome = {
+        let (outcome, governance_appended) = {
             let mut channel = shared.lock().await;
             let was_shared = channel.is_shared(service_tag);
             let removed = channel.remove_service(profile.store(), service_tag);
             // The room is told it is no longer shared (V030-25). Not saying so leaves it listed
             // where nothing answers — a wrong listing, not a failed removal: the service is gone
             // either way.
-            if matches!(removed, Ok(true)) && was_shared {
-                let _ = channel.say_share(profile, service_tag, false, now_ms);
-            }
+            let governance_appended = matches!(removed, Ok(true))
+                && was_shared
+                && channel
+                    .say_share(profile, service_tag, false, now_ms)
+                    .is_ok();
             if matches!(removed, Ok(true)) {
                 self.publish_service_offers(&channel);
             }
-            removed
+            (removed, governance_appended)
         };
         match outcome {
             Ok(true) => {
-                self.note_local_append(channel_id);
+                if governance_appended {
+                    self.note_local_governance_append(channel_id);
+                } else {
+                    self.note_local_append(channel_id);
+                }
                 self.refresh_reachers().await;
                 Outcome::Done
             }
@@ -20867,6 +21000,7 @@ impl Node {
             started: self.status.started,
             identity: me,
             networked: self.net.is_some(),
+            governance_pending: self.governance_work.pending(),
             network_changed: self
                 .presence
                 .as_ref()
@@ -20932,6 +21066,8 @@ impl Node {
                         .holds_through
                         .iter()
                         .find_map(|(member, seq)| (*member == *m).then_some(*seq)),
+                    key_delivery_pending: room.key_delivery_pending.contains(m)
+                        || self.key_delivery_active(room.channel_id, *m),
                 })
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
@@ -20954,6 +21090,8 @@ impl Node {
                 key_generations: room.key_generations,
                 received_key_generations: room.received_key_generations,
                 key_packages_pending: room.key_packages_pending,
+                governance_revision: room.governance_revision,
+                render_backfill_pending: room.render_backfill_pending,
                 frozen: room.frozen.clone(),
                 refused_below_checkpoint: room.refused_below_checkpoint,
                 entries: summary.map_or(0, |c| c.entries),
@@ -21040,6 +21178,16 @@ impl Node {
                 &self.sync_book,
             ));
         report
+    }
+
+    /// Whether a sender-key delivery is in flight and has not reached its terminal
+    /// acknowledgement yet. Combined with the room view's durable obligations, this keeps status
+    /// true across direct delivery and store-and-forward completion.
+    fn key_delivery_active(&self, room: Digest32, member: Digest32) -> bool {
+        let pair = (room, member);
+        self.key_delivery_settling.contains(&pair)
+            || self.keys_in_flight.contains_key(&pair)
+            || self.history_in_flight.contains_key(&pair)
     }
 
     /// Recompute every channel's live reacher set in place.
@@ -21148,7 +21296,7 @@ impl Node {
         if let Err(error) = changed {
             return Outcome::Failed(fault_of(&error));
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         // Adoption and the background publish use the checked canonical set, after
         // bounded governance maintenance, through this command's local completion.
         Outcome::Done
@@ -21166,11 +21314,12 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        if let Err(e) = shared.lock().await.set_name(profile, name, now_ms) {
-            return Outcome::Failed(fault_of(&e));
-        }
-        self.note_local_append(channel_id);
-        Outcome::Done
+        let appended = match shared.lock().await.set_name(profile, name, now_ms) {
+            Ok(appended) => appended,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        self.note_local_governance_append(channel_id);
+        Outcome::Appended(appended)
     }
 
     /// Set the room rule when authorized; another member may shorten only its own retention.
@@ -21224,7 +21373,7 @@ impl Node {
         if let Err(e) = shared.lock().await.set_retention(profile, ttl, now_ms) {
             return Outcome::Failed(fault_of(&e));
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         self.retention_read_at = 0; // re-read the node's own file too: an explicit act
         self.sweep_retention().await;
         Outcome::Done
@@ -21280,7 +21429,7 @@ impl Node {
         if let Err(e) = shared.lock().await.set_step_retention(profile, ttl, now_ms) {
             return Outcome::Failed(fault_of(&e));
         }
-        self.note_local_append(channel_id);
+        self.note_local_governance_append(channel_id);
         self.retention_read_at = 0; // re-read the node's own file too: an explicit act
         self.sweep_retention().await;
         Outcome::Done
