@@ -860,7 +860,19 @@ impl Controller {
             return;
         }
         self.cleanup_due = None;
-        let Some(flow) = self.retiring.pop_front() else {
+        // A live Flow in this room may own the durable publication that every retiree must
+        // leave alone. Let that exact owner run before taking the room mutex for cleanup;
+        // otherwise each room-release wake starts another non-owner cleanup first and the
+        // publication owner can never resume. Other rooms' retirement remains eligible.
+        let Some(at) = self.retiring.iter().position(|candidate| {
+            let room = candidate.room;
+            !self.ready.iter().flatten().any(|flow| flow.room == room)
+                && !self.deferred.iter().any(|flow| flow.room == room)
+                && !self.running.iter().flatten().any(|flow| flow.room == room)
+        }) else {
+            return;
+        };
+        let Some(flow) = self.retiring.remove(at) else {
             return;
         };
         let cancellations = flow.cancellation_handles();
@@ -2194,6 +2206,10 @@ impl Node {
                 }
             }
         }
+        // Completion may have removed the last live publication owner in a room whose retired
+        // flows were ineligible at the beginning of this audit. Start its exact cleanup now;
+        // the retained completion wake is the causal edge, not a scheduler tick.
+        self.bounded_sync.poll_cleanup();
     }
 
     /// Records a lane round that completed cleanly as this room's, and this peer's, last
