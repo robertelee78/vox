@@ -9296,6 +9296,12 @@ impl Node {
                 // **Not admitted, not accepted.** This was dropped, and the joiner was told it was
                 // in whatever happened: a room already full took nobody, and its joiner exited 0.
                 if admitted.is_ok() {
+                    // Admission rebuilds the in-memory consent projection for the enlarged
+                    // author set. Invalidate this room's completed governance sweep before any
+                    // queued render backfill observes that rebuilding projection. Otherwise the
+                    // settled cache skips the only work that can finish it, while backfill keeps
+                    // selecting the same durable cursor forever.
+                    self.governance_work.wake_room(channel_id);
                     // And into the view the board and the stream gate read, before the joiner is
                     // answered: an author only the room knows is still a stranger to the board,
                     // which refused the newcomer's records until something else refreshed it
