@@ -2368,6 +2368,15 @@ pub struct PolicyPlan {
     pub(crate) expired: bool,
 }
 
+/// Whether a node-keyring write still belongs to the durable policy observed before that write.
+/// The node store and Computer journal cannot share one atomic rename, so the actor must repeat
+/// reconciliation when an authenticated policy change wins between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplicationReceipt {
+    Current,
+    Reconcile,
+}
+
 /// One persistent management identity and transaction domain, owned by its account daemon.
 pub struct Computer {
     path: PathBuf,
@@ -2821,6 +2830,7 @@ impl Computer {
             covered,
             std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
         )
+        .map(|_| ())
     }
 
     /// Persist the exact revocation set before committing the node's keyring. This is not an
@@ -2862,14 +2872,33 @@ impl Computer {
         node: Digest32,
         revision: u64,
         covered: &[Digest32],
-        deadline: std::time::Instant,
-    ) -> Result<()> {
-        self.change_until(deadline, |s| {
+        _deadline: std::time::Instant,
+    ) -> Result<ApplicationReceipt> {
+        let mut receipt = ApplicationReceipt::Current;
+        // The node-keyring commit is already irreversible. Its receipt or rollback decision is
+        // safety recovery, not fresh authorization, and must not be abandoned merely because the
+        // initiating convergence deadline ended between the two durable stores.
+        self.change_durable(|s| {
             if revision > s.policy_revision {
                 return Err(bad());
             }
+            // The node keyring was prepared while this revision was live, but an authenticated
+            // missed-exchange marker may have expired it during the node-store rename. Preserve
+            // the durable prepared rollback set and make the actor revoke the just-written grant
+            // before it publishes the projection or starts networking. This check deliberately
+            // shares the policy-state transaction with the receipt below.
+            if revision == s.policy_revision
+                && Self::revision_expired(s)
+                && !fx28_mutant("keyring-commit-accepts-expired")
+            {
+                receipt = ApplicationReceipt::Reconcile;
+                return Ok(());
+            }
             // Another authenticated roster may have arrived during the node store write.
             // Record the exact revision actually applied; the actor retries before authorizing.
+            if revision != s.policy_revision {
+                receipt = ApplicationReceipt::Reconcile;
+            }
 
             let interval = s
                 .genesis
@@ -2893,7 +2922,8 @@ impl Computer {
                 s.prepared.remove(&node);
             }
             Ok(())
-        })
+        })?;
+        Ok(receipt)
     }
 
     /// Record that all computer-managed grants for an expired revision were removed. The miss
@@ -2902,13 +2932,21 @@ impl Computer {
         &self,
         node: Digest32,
         revision: u64,
-        deadline: std::time::Instant,
-    ) -> Result<()> {
-        self.change_until(deadline, |state| {
+        _deadline: std::time::Instant,
+    ) -> Result<ApplicationReceipt> {
+        let mut receipt = ApplicationReceipt::Current;
+        // As with the applied receipt, the keyring write already happened. Completing or
+        // superseding its recovery journal cannot be cut off by the earlier apply deadline.
+        self.change_durable(|state| {
+            if revision > state.policy_revision {
+                return Err(bad());
+            }
+            // A newer authenticated policy can arrive during the revocation keyring rename.
+            // The stale revocation is safe but is not current: retain its recovery records and
+            // immediately derive the newer policy instead of failing or claiming convergence.
             if state.policy_revision != revision || !Self::revision_expired(state) {
-                return Err(Error::Profile(
-                    "computer policy changed while expired trust was being revoked",
-                ));
+                receipt = ApplicationReceipt::Reconcile;
+                return Ok(());
             }
             if let Some(applied) = state.applied.get_mut(&node) {
                 applied.grants.clear();
@@ -2917,7 +2955,29 @@ impl Computer {
             // Receipts are statements by computers, not by their managed nodes.
             state.receipts.remove(&self.signer.fingerprint());
             Ok(())
-        })
+        })?;
+        Ok(receipt)
+    }
+
+    /// Whether the durable Computer journal proves this exact node projection is complete.
+    /// Expiry is complete only after its prepared rollback set is gone and its recorded
+    /// computer-managed grants are empty; observing the expiry marker alone is not settlement.
+    pub(crate) fn application_settled(&self, node: &Digest32, revision: u64) -> bool {
+        let state = lock(&self.state);
+        if state.policy_revision != revision || state.prepared.contains_key(node) {
+            return false;
+        }
+        if Self::revision_expired(&state) {
+            state
+                .applied
+                .get(node)
+                .is_none_or(|applied| applied.grants.is_empty())
+        } else {
+            state
+                .applied
+                .get(node)
+                .is_some_and(|applied| applied.revision == revision)
+        }
     }
 
     /// The policy replaces a covered individual entry, including stronger drive. Aliases remain

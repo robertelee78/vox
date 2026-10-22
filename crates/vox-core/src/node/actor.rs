@@ -6905,13 +6905,12 @@ impl Node {
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         self.prepare_computer_binding_causal(deadline, &cancelled, true)?;
         loop {
-            self.apply_computer_keyring_at_until(0, deadline, &cancelled)?;
-            if self.computer.as_ref().is_none_or(|c| {
-                c.policy_current(
-                    self.computer_revision
-                        .load(std::sync::atomic::Ordering::Acquire),
-                ) || c.current_revision_expired()
-            }) {
+            // Only the receipt from this exact keyring application can open networking. Seeing
+            // an expired marker is not completion: its durable revocation branch must finish.
+            if self
+                .apply_computer_keyring_at_until(0, deadline, &cancelled)?
+                .settled
+            {
                 break;
             }
         }

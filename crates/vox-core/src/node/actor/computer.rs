@@ -8,8 +8,20 @@ use super::*;
 #[cfg(feature = "test-knobs")]
 const TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV: &str =
     "VOX_TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_FILE";
+/// **Test-only** (`test-knobs`): `<arm>\t<prepared>\t<release socket>\t<fault>`. `arm`
+/// contains the exact grant fingerprint. After the matching durable Computer preparation and
+/// before the node-keyring commit, the actor publishes its node/revision/grant identity and waits
+/// for one connection to `release`. Shipped builds neither name nor read this variable.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_ENV: &str =
+    "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_FILE";
 use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
+
+pub(super) struct KeyringApplication {
+    pub(super) changes: Vec<(Digest32, crate::node::consent_order::Stamp)>,
+    pub(super) settled: bool,
+}
 
 /// **Test-only** (`test-knobs`): `<node>\t<arm>\t<engaged>\t<release socket>`. The actor consumes
 /// `arm`, creates `engaged`, and waits for one connection to `release`. The shipped-binary proof
@@ -19,6 +31,8 @@ use crate::node::trust::HistoryGrant;
 const TEST_HOLD_COMPUTER_POLICY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY";
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_POLICY_REPLY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY";
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_COMPUTER_RECONCILE_SEND_ENV: &str = "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE";
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION";
 
@@ -111,6 +125,88 @@ impl Node {
 }
 
 impl NodeHandle {
+    /// Test apparatus: hold the later Attached-event reconciliation before it reaches the actor.
+    /// The arm and marker both name the actor's authenticated identity and exact policy revision,
+    /// so the shipped trust observation cannot accidentally follow asynchronous repair.
+    #[cfg(feature = "test-knobs")]
+    async fn hold_computer_reconcile_send_for_proof(&self) -> crate::error::Result<()> {
+        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_RECONCILE_SEND_ENV) else {
+            return Ok(());
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(arm), Some(engaged), Some(release), Some(fault)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::Profile(
+                "computer reconciliation proof hold is malformed",
+            ));
+        };
+        let Some(computer) = &self.computer else {
+            return Ok(());
+        };
+        let Some(identity) = self
+            .view_rx
+            .borrow()
+            .identity
+            .as_ref()
+            .map(|identity| identity.fingerprint)
+        else {
+            return Ok(());
+        };
+        let exact = format!(
+            "{}\t{}",
+            crate::node::link::b32_encode(&identity),
+            computer.policy_revision()
+        );
+        let arm = std::path::Path::new(arm);
+        let expected = match std::fs::read_to_string(arm) {
+            Ok(expected) => expected,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                crate::node::computer::publish_proof_fault(
+                    std::path::Path::new(fault),
+                    &format!("could not read exact reconciliation arm: {error}"),
+                );
+                return Err(Error::Profile("computer reconciliation proof hold failed"));
+            }
+        };
+        if expected.trim() != exact {
+            return Ok(());
+        }
+        let fail = |detail: String| {
+            crate::node::computer::publish_proof_fault(std::path::Path::new(fault), &detail);
+            Error::Profile("computer reconciliation proof hold failed")
+        };
+        std::fs::remove_file(arm).map_err(|error| {
+            fail(format!(
+                "could not consume exact reconciliation arm: {error}"
+            ))
+        })?;
+        let release = std::path::Path::new(release);
+        match std::fs::remove_file(release) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(fail(format!(
+                    "could not clear reconciliation release socket: {error}"
+                )))
+            }
+        }
+        let listener = tokio::net::UnixListener::bind(release)
+            .map_err(|error| fail(format!("could not bind reconciliation release: {error}")))?;
+        crate::node::computer::publish_proof_marker(
+            std::path::Path::new(engaged),
+            exact.as_bytes(),
+        )
+        .map_err(|error| fail(format!("could not publish reconciliation marker: {error}")))?;
+        listener
+            .accept()
+            .await
+            .map_err(|error| fail(format!("reconciliation release failed: {error}")))?;
+        let _ = std::fs::remove_file(release);
+        Ok(())
+    }
+
     /// Current daemon policy for rendering individual Trust actions. This is an observation,
     /// never an authorization token: every mutation reconciles and checks policy again.
     pub fn individual_trust_eligibility(&self, peer: Digest32) -> (bool, String) {
@@ -183,6 +279,8 @@ impl NodeHandle {
         &self,
         deadline: std::time::Instant,
     ) -> crate::error::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        self.hold_computer_reconcile_send_for_proof().await?;
         let (reply, rx) = oneshot::channel();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let send = self.net_tx.send(NetEvent::ComputerPolicy {
@@ -353,13 +451,16 @@ impl Node {
                 floor = floor.max(room.lock().await.newest_mint_seq());
                 Self::computer_policy_active(deadline, cancelled)?;
             }
-            let changes = self.apply_computer_keyring_at_until(floor, deadline, cancelled)?;
+            let application = self.apply_computer_keyring_at_until(floor, deadline, cancelled)?;
+            if !application.settled {
+                continue;
+            }
             // A policy revision can grant an already admitted member read or drive. That member
             // may not have received the live capability record before this boundary, so publish
             // discovery again. It carries no authority; rooms coalesce it to one signed record.
             self.owe_private_support_in_open_rooms().await;
             Self::computer_policy_active(deadline, cancelled)?;
-            for (id, stamp) in changes {
+            for (id, stamp) in application.changes {
                 self.mark_trust_decision(id, stamp).await;
                 Self::computer_policy_active(deadline, cancelled)?;
             }
@@ -393,14 +494,18 @@ impl Node {
                 c.invalidate_reachers();
                 return Err(error);
             }
-            if c.current_revision_expired() {
-                return Ok(());
-            }
-            if self.computer.as_ref().is_none_or(|c| {
-                c.policy_revision()
-                    == self
-                        .computer_revision
-                        .load(std::sync::atomic::Ordering::Acquire)
+            let applied_revision = self
+                .computer_revision
+                .load(std::sync::atomic::Ordering::Acquire);
+            let identity = self
+                .profile
+                .as_ref()
+                .map(Profile::fingerprint)
+                .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()));
+            if self.computer.as_ref().is_none_or(|computer| {
+                identity.is_some_and(|identity| {
+                    computer.application_settled(&identity, applied_revision)
+                })
             }) {
                 return Ok(());
             }
@@ -412,13 +517,19 @@ impl Node {
         floor: u64,
         deadline: std::time::Instant,
         cancelled: &std::sync::atomic::AtomicBool,
-    ) -> crate::error::Result<Vec<(Digest32, crate::node::consent_order::Stamp)>> {
+    ) -> crate::error::Result<KeyringApplication> {
         Self::computer_policy_active(deadline, cancelled)?;
         let Some(computer) = self.computer.clone() else {
-            return Ok(Vec::new());
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: true,
+            });
         };
         if !computer.grouped() {
-            return Ok(Vec::new());
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: true,
+            });
         }
         computer.storage_ready()?;
         let revision = computer.policy_revision();
@@ -428,22 +539,39 @@ impl Node {
                 .load(std::sync::atomic::Ordering::Acquire)
                 == revision
         {
-            return Ok(Vec::new());
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: true,
+            });
         }
         let Some(profile) = &self.profile else {
             if let Some(signer) = &self.headless {
-                if computer.current_revision_expired() {
-                    computer.mark_expired_until(signer.fingerprint(), revision, deadline)?;
+                let receipt = if computer.current_revision_expired() {
+                    computer.mark_expired_until(signer.fingerprint(), revision, deadline)?
                 } else if !computer.applied(&signer.fingerprint(), revision) {
-                    computer.mark_applied_until(signer.fingerprint(), revision, &[], deadline)?;
+                    computer.mark_applied_until(signer.fingerprint(), revision, &[], deadline)?
+                } else {
+                    crate::node::computer::ApplicationReceipt::Current
+                };
+                if receipt == crate::node::computer::ApplicationReceipt::Current {
+                    self.computer_revision
+                        .store(revision, std::sync::atomic::Ordering::Release);
                 }
-                self.computer_revision
-                    .store(revision, std::sync::atomic::Ordering::Release);
+                return Ok(KeyringApplication {
+                    changes: Vec::new(),
+                    settled: receipt == crate::node::computer::ApplicationReceipt::Current,
+                });
             }
-            return Ok(Vec::new());
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: true,
+            });
         };
         if !profile.is_unlocked() {
-            return Ok(Vec::new());
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: true,
+            });
         }
         let me = profile.fingerprint();
         // Applied at this revision already: recorded after the keyring was saved, and kept
@@ -451,10 +579,16 @@ impl Node {
         if computer.applied(&me, revision) {
             self.computer_revision
                 .store(revision, std::sync::atomic::Ordering::Release);
-            return Ok(Vec::new());
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: true,
+            });
         }
         let Some(plan) = computer.plan(me)? else {
-            return Ok(Vec::new());
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: true,
+            });
         };
         let expired = plan.expired;
         let revision = plan.revision;
@@ -554,21 +688,39 @@ impl Node {
         }
         Self::computer_policy_active(deadline, cancelled)?;
         next.save_checked(profile.store(), profile.signer()?, || {
-            Self::computer_policy_active(deadline, cancelled)
+            Self::computer_policy_active(deadline, cancelled)?;
+            // This is the real commit boundary: the redb transaction is fully staged and its
+            // causal condition passed; returning publishes it. The proof can let authenticated
+            // expiry land in precisely the remaining interval.
+            #[cfg(feature = "test-knobs")]
+            if !expired {
+                Self::hold_after_computer_application_prepared_for_proof(me, revision, &covered)?;
+            }
+            Ok(())
         })?;
         #[cfg(feature = "test-knobs")]
         if !expired {
             Self::crash_after_computer_keyring_commit_for_proof(me, revision, &covered);
         }
-        Self::computer_policy_active(deadline, cancelled)?;
+        // The keyring commit is now irreversible. Always classify it against durable Computer
+        // policy and, when needed, perform its rollback before consulting the caller's deadline.
         self.trust = next;
+        let receipt = if expired {
+            computer.mark_expired_until(me, revision, deadline)?
+        } else {
+            computer.mark_applied_until(me, revision, &covered, deadline)?
+        };
+        if receipt == crate::node::computer::ApplicationReceipt::Reconcile {
+            // `next` is the keyring now on disk. Keep the actor's private projection aligned with
+            // that durable fact, but publish none of its transient authority; the prepared record
+            // makes the immediately repeated pass revoke or supersede it after a crash too.
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: false,
+            });
+        }
         for (id, was) in changed_drive {
             self.note_capability(id, was);
-        }
-        if expired {
-            computer.mark_expired_until(me, revision, deadline)?;
-        } else {
-            computer.mark_applied_until(me, revision, &covered, deadline)?;
         }
         if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
             computer.invalidate_reachers();
@@ -585,7 +737,92 @@ impl Node {
         });
         self.computer_revision
             .store(revision, std::sync::atomic::Ordering::Release);
-        Ok(changes)
+        Ok(KeyringApplication {
+            changes,
+            settled: true,
+        })
+    }
+
+    /// Hold the exact durable-prepare/node-keyring-commit boundary for the shipped-binary proof.
+    /// The arm names authenticated semantic content, so another node or policy cannot satisfy it.
+    #[cfg(feature = "test-knobs")]
+    fn hold_after_computer_application_prepared_for_proof(
+        node: Digest32,
+        revision: u64,
+        covered: &[Digest32],
+    ) -> crate::error::Result<()> {
+        let Ok(spec) = std::env::var(TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_ENV) else {
+            return Ok(());
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(arm), Some(prepared), Some(release), Some(fault)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::Profile(
+                "computer application proof hold is malformed",
+            ));
+        };
+        let arm = std::path::Path::new(arm);
+        let target = match std::fs::read_to_string(arm) {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                crate::node::computer::publish_proof_fault(
+                    std::path::Path::new(fault),
+                    &format!("could not read exact prepared-application arm: {error}"),
+                );
+                return Err(Error::Profile("computer application proof hold failed"));
+            }
+        };
+        let target = target.trim();
+        if !covered
+            .iter()
+            .any(|peer| crate::node::link::b32_encode(peer) == target)
+        {
+            return Ok(());
+        }
+        let fail = |detail: String| {
+            crate::node::computer::publish_proof_fault(std::path::Path::new(fault), &detail);
+            Error::Profile("computer application proof hold failed")
+        };
+        std::fs::remove_file(arm).map_err(|error| {
+            fail(format!(
+                "could not consume exact prepared-application arm: {error}"
+            ))
+        })?;
+        let release = std::path::Path::new(release);
+        match std::fs::remove_file(release) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(fail(format!(
+                    "could not clear prepared-application release socket: {error}"
+                )))
+            }
+        }
+        let listener = std::os::unix::net::UnixListener::bind(release).map_err(|error| {
+            fail(format!(
+                "could not bind prepared-application release: {error}"
+            ))
+        })?;
+        let marker = format!(
+            "{}\t{revision}\t{target}",
+            crate::node::link::b32_encode(&node)
+        );
+        crate::node::computer::publish_proof_marker(
+            std::path::Path::new(prepared),
+            marker.as_bytes(),
+        )
+        .map_err(|error| {
+            fail(format!(
+                "could not publish prepared-application marker: {error}"
+            ))
+        })?;
+        listener
+            .accept()
+            .map_err(|error| fail(format!("prepared-application release failed: {error}")))?;
+        let _ = std::fs::remove_file(release);
+        Ok(())
     }
 
     /// End the proof daemon at the exact two-store boundary: its keyring is durable, while the
