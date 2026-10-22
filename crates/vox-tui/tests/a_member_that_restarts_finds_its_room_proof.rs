@@ -59,15 +59,15 @@
 //!
 //! - (e) **a member whose daemon crashes keeps what it was told it has** (ADR-038 FX-30, #1022).
 //!   Only what a person would lose is flushed to disk; derived sync state is not, and is rebuilt
-//!   after a crash. Each record of the ruled set is the last thing written before a SIGKILL by
-//!   PID (nothing is closed, nothing is flushed on the way out), so nothing flushed after it can
+//!   after a crash. Each record of the ruled set is either the last thing written before a
+//!   SIGKILL by PID or retained in an exact writer-held crash image, so nothing flushed later can
 //!   carry it, and after every restart the whole set staged so far is read back as a person
-//!   would: the room open in `vox room list`, the own rows, bob's post (read only under the key
-//!   he released), `vox trust list`, `vox room sessions --json`, and the room's
-//!   `received_key_generations` in `vox status --json`. Alice: (1) `vox trust add carol`, then
+//!   would: the room open in `vox room list`, the own rows, bob's real post rendered under the
+//!   key he released, `vox trust list`, and `vox room sessions --json`. Alice: (1) `vox trust add carol`, then
 //!   the kill; (2) her Session opened through the shipped hook and listed, then the kill; (3)
 //!   bob's first sender-key batch committed at an exact test-only hold (compiled out of packaged
-//!   Vox), bob's daemon frozen so nothing can be fetched again, then the kill at that boundary;
+//!   Vox), its crash image retained there, then the live processes establish that Bob completed
+//!   delivery before he is frozen and Alice restarts from the image;
 //!   (4) [`CRASH_POSTS`] own posts, then the kill. Bob: (5) alice posts once more and the proof
 //!   parks the exact receive flow's owned fallback flush, then waits until her own row says it is
 //!   held on his node (`vox room read --json`'s `held`, ADR-028 R-6: bob's own word in a sync,
@@ -614,14 +614,12 @@ const CRASH_BACKLOG: usize = 60;
 struct Ruled {
     /// Own posts `kept 1..=kept`.
     kept: usize,
-    /// Bob's post, readable only under the sender key he released.
-    from_bob: bool,
+    /// Bob's exact post, readable only under the sender key he released.
+    from_bob: Option<&'static str>,
     /// Names `vox trust list` names.
     trusted: Vec<&'static str>,
     /// The Session ids `vox room sessions --json` lists.
     sessions: Vec<String>,
-    /// `received_key_generations` of the room in `vox status --json`, when a key was staged.
-    keys: Option<u64>,
 }
 
 /// (e) — see the module doc.
@@ -643,6 +641,8 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     let received_flush_hold = t.path().join("hold-received-flow-flush");
     let received_flush_reached = received_flush_hold.with_extension("reached");
     let received_ack_reached = received_flush_hold.with_extension("ack-reached");
+    let ack_decision_hold = t.path().join("hold-after-ack-flush-decision");
+    let ack_decision_reached = ack_decision_hold.with_extension("reached");
     let durable_flow_hold = t.path().join("hold-after-received-flow-flush");
     let durable_flow_reached = durable_flow_hold.with_extension("reached");
     let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
@@ -660,6 +660,10 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
             "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
             key_hold.to_string_lossy().into_owned(),
         ),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+            durable_flow_hold.to_string_lossy().into_owned(),
+        ),
     ];
     if mutant.as_deref() == Some("received-key-not-durable") {
         alice_env.push(("VOX_TEST_FX30_MUTANT", mutant.clone().unwrap()));
@@ -669,6 +673,10 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         (
             "VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE",
             received_flush_hold.to_string_lossy().into_owned(),
+        ),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+            ack_decision_hold.to_string_lossy().into_owned(),
         ),
     ];
     if mutant.as_deref() == Some("received-ack-not-flushed") {
@@ -764,12 +772,6 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     );
 
     // ---- (3) a received key, last: exact post-commit hold; bob frozen through the restart -----
-    assert_eq!(
-        received_key_generations(&alice, &room),
-        0,
-        "APPARATUS: alice already held a sender-key generation from bob before the exact crash \
-         boundary was armed, so a duplicate could rescue the durability mutant"
-    );
     // This fresh room has not rotated Bob's sender chain: its first and only generation is 0.
     // Bind the apparatus to that exact author/generation rather than accepting any later package.
     let expected_generation = 0;
@@ -811,25 +813,47 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
          expected {bob_fp} generation {expected_generation} and one nonzero transaction, got \
          {marker:?}"
     );
-    // Bob has made exactly his first sender generation; no other peer has posted to Alice. The
-    // independently delivered post may still be behind the held room mutex, so this crash
-    // boundary claims only the exact key that Alice has actually committed.
-    ruled.keys = Some(1);
+    // Preserve the exact disk image while this transaction still owns the writer. Then let the
+    // live process answer Bob and wait for his own shipped row to say Alice holds the post. That
+    // causally proves Bob recorded delivery before he is frozen; restarting the preserved image
+    // cannot be rescued by a replacement key or by any later flush in the live process.
+    let alice_pid = alice_d.0.id();
+    signal(alice_pid, rustix::process::Signal::STOP, true);
+    let alice_key_crash = t.path().join("alice-key-crash");
+    copy_dir(&alice, &alice_key_crash);
+    signal(alice_pid, rustix::process::Signal::CONT, false);
+    std::fs::remove_file(&key_hold)
+        .expect("APPARATUS: cannot release the received-key hold after copying its exact image");
+    let delivered_at = Instant::now();
+    loop {
+        let rendered = read(&alice, &room).iter().any(|row| row == "from bob");
+        let held = held_on(&bob, &room, "from bob");
+        if rendered && held.as_ref().is_some_and(|(count, _, _)| *count >= 1) {
+            break;
+        }
+        assert!(
+            delivered_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, the live alice did not render bob's key \
+             probe and acknowledge its exact post, so bob's completed key delivery was not \
+             established (rendered {rendered}, bob row {held:?})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let bob_pid = bob_d.0.id();
     signal(bob_pid, rustix::process::Signal::STOP, true);
     drop(alice_d);
-    std::fs::remove_file(&key_hold)
-        .expect("APPARATUS: cannot release the received-key hold after SIGKILL");
     println!(
-        "[proof] alice-3: the daemon killed at the exact received-key commit boundary; bob frozen"
+        "[proof] alice-3: restarted from the exact received-key commit image after bob's shipped \
+         row established completed delivery; bob frozen"
     );
     let alice_d = daemon(
-        &alice,
+        &alice_key_crash,
         "alice-3",
         &format!("{IDENTITY}\n{ROOMPASS}\n"),
         &alice_at,
         &alice_env,
     );
+    let alice = alice_key_crash;
     ruled_set_intact(
         &alice,
         "alice-3",
@@ -837,6 +861,53 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &ruled,
         "(3) a received key was the last write before the round's generic flush, bob frozen",
     );
+    // Exercise the recovered key itself, not a status counter. Bob's live sender already recorded
+    // generation 0 as delivered before this crash; this new content does not carry a replacement
+    // key. Its exact receive flow publishes a post-flush boundary whether rendering succeeded or
+    // not, so the mutant reaches the shipped read assertion instead of a timing verdict.
+    std::fs::write(&durable_flow_hold, format!("{room} {bob_fp}\n"))
+        .expect("APPARATUS: cannot arm the recovered-key effect boundary");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    let key_effect = "from bob after alice's key crash";
+    post(&bob, &room, key_effect);
+    let key_effect_at = Instant::now();
+    while !durable_flow_reached.exists() {
+        assert!(
+            key_effect_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice did not reach bob's exact \
+             post-flush receive-flow boundary after her restart, so the recovered-key effect was \
+             not staged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let key_effect_marker = std::fs::read_to_string(&durable_flow_reached)
+        .expect("APPARATUS: cannot read the recovered-key effect boundary");
+    let mut key_effect_fields = key_effect_marker.split_whitespace();
+    let effect_room = key_effect_fields.next().unwrap_or_default();
+    let effect_peer = key_effect_fields.next().unwrap_or_default();
+    let effect_transaction = key_effect_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        effect_room == room
+            && effect_peer == bob_fp
+            && effect_transaction.is_some_and(|transaction| transaction > 0)
+            && key_effect_fields.next().is_none(),
+        "APPARATUS: the recovered-key effect boundary was not bob's exact receive flow: \
+         expected `{room} {bob_fp} <transaction>`, got {key_effect_marker:?}"
+    );
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let after_key_crash = read(&alice, &room);
+    assert!(
+        after_key_crash.iter().any(|row| row == key_effect),
+        "PRODUCT [FX30 received-key]: alice could not render bob's real post after the crash, so \
+         the received sender key was lost (ADR-038 FX-30, #1022): she reads {after_key_crash:?}"
+    );
+    ruled.from_bob = Some(key_effect);
+    std::fs::remove_file(&durable_flow_hold)
+        .expect("APPARATUS: cannot release the recovered-key effect boundary");
+    std::fs::remove_file(&durable_flow_reached)
+        .expect("APPARATUS: cannot clear the recovered-key effect marker");
     signal(bob_pid, rustix::process::Signal::CONT, false);
 
     // ---- (4) own posts, last -------------------------------------------------------------------
@@ -885,6 +956,8 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         format!("{exact_received_flow} {acked_entry}\n"),
     )
     .expect("APPARATUS: cannot arm bob's exact received-entry acknowledgement boundary");
+    std::fs::write(&ack_decision_hold, format!("{exact_received_flow}\n"))
+        .expect("APPARATUS: cannot arm bob's exact post-ACK flush-decision boundary");
     signal(bob_pid, rustix::process::Signal::CONT, false);
     let flow_staged_at = Instant::now();
     while !received_flush_reached.exists() {
@@ -911,6 +984,41 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "APPARATUS: the parked received-flow flush was not alice's exact nonzero transaction in \
          this room: expected `{exact_received_flow} <transaction>`, got {marked_flow:?}"
     );
+    let decision_at = Instant::now();
+    while !ack_decision_reached.exists() {
+        assert!(
+            decision_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, bob did not reach the exact post-ACK \
+             flush-decision boundary for alice's post"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let decision_marker = std::fs::read_to_string(&ack_decision_reached)
+        .expect("APPARATUS: cannot read bob's post-ACK flush-decision marker");
+    let mut decision_fields = decision_marker.split_whitespace();
+    let decision_room = decision_fields.next().unwrap_or_default();
+    let decision_peer = decision_fields.next().unwrap_or_default();
+    let decision_transaction = decision_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        decision_room == room
+            && decision_peer == alice_fp
+            && decision_transaction == flow_transaction
+            && decision_fields.next().is_none(),
+        "APPARATUS: bob's post-ACK boundary was not the exact parked receive transaction: \
+         fallback {marked_flow:?}, decision {decision_marker:?}"
+    );
+    // Stop the whole process at the common post-commit boundary and retain that exact crash
+    // image. The healthy image contains the Immediate flush; the isolated mutant contains the
+    // same empty transaction at Durability::None. Later activity cannot rescue either image.
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let bob_crash = t.path().join("bob-ack-crash");
+    copy_dir(&bob, &bob_crash);
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    std::fs::remove_file(&ack_decision_hold)
+        .expect("APPARATUS: cannot release bob's post-ACK flush-decision boundary");
     let asked = Instant::now();
     let held_on_bob = loop {
         match held_on(&alice, &room, "acked") {
@@ -953,7 +1061,6 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
          transaction and alice post: fallback {marked_flow:?}, acknowledgement {ack_marker:?}, \
          row entry {acked_entry:?}"
     );
-    let bobs_keys = received_key_generations(&bob, &room);
     // The exact flow-owned fallback remains parked. Freeze Alice before Bob dies so neither a
     // resend nor a different lane can replace the acknowledgement whose durability is asserted.
     let alice_pid = alice_d.0.id();
@@ -966,22 +1073,22 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
          fallback flush was parked and alice was frozen ({held_on_bob:?} after her post)"
     );
     let _bob_d = daemon(
-        &bob,
+        &bob_crash,
         "bob-2",
         &format!("{IDENTITY}\n{ROOMPASS}\n"),
         &bob_at,
         &bob_env,
     );
+    let bob = bob_crash;
     assert!(
         room_answers(&bob, &room, APPARATUS_WATCHDOG),
         "APPARATUS: bob's room did not answer after the exact acknowledged-entry crash boundary"
     );
     let bobs = Ruled {
         kept: 0,
-        from_bob: true,
+        from_bob: None,
         trusted: vec!["alice"],
         sessions: Vec::new(),
-        keys: Some(bobs_keys),
     };
     ruled_set_intact(
         &bob,
@@ -1081,15 +1188,14 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &unheard,
     );
     let opened = room_answers(&copy, &room, APPARATUS_WATCHDOG);
-    let (listed, at_reopen, copy_keys, copy_trusted) = if opened {
+    let (listed, at_reopen, copy_trusted) = if opened {
         (
             room_list_line(&copy, &room),
             read(&copy, &room),
-            received_key_generations(&copy, &room),
             vox(&copy, &["trust", "list"], None).1,
         )
     } else {
-        (String::new(), Vec::new(), 0, String::new())
+        (String::new(), Vec::new(), String::new())
     };
     signal(alice_pid, rustix::process::Signal::CONT, false);
     assert!(
@@ -1125,12 +1231,6 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         copy_trusted.contains("alice"),
         "PRODUCT: a trust decision is missing from the room reopened from a copy (ADR-038 FX-30, \
          #1022): `vox trust list` says {copy_trusted}"
-    );
-    assert!(
-        copy_keys >= 1,
-        "PRODUCT: the key alice released is missing from the room reopened from a copy (ADR-038 \
-         FX-30, #1022): with alice frozen it lists {held_at_reopen} of her posts and `vox status \
-         --json` counts {copy_keys} received key generations"
     );
     let synced_on = Instant::now();
     assert!(
@@ -1187,18 +1287,6 @@ fn crash_and_restart(
 /// Everything of the ruled set staged so far, read back as a person would after the crash (e):
 /// the room open in `vox room list`, the own and received rows, the trust, the Session, the key.
 fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str) {
-    // Check the key through the shipped status surface before attempting to render the post that
-    // uses it or requiring the room to finish preparing. A key-only mutant therefore reaches its
-    // own assertion rather than being hidden by any later room/read symptom.
-    if let Some(keys) = ruled.keys {
-        let now = received_key_generations(dir, room);
-        assert!(
-            now == keys,
-            "PRODUCT [FX30 received-key]: a received key was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
-             {when}): `vox status --json` counted {keys} received key generation(s) for the room \
-             before the crash and {now} after {tag}'s restart"
-        );
-    }
     let listed = room_list_line(dir, room);
     assert_open_line(&listed, room, &format!("{tag}, after the crash ({when})"));
     let rows = read(dir, room);
@@ -1208,11 +1296,11 @@ fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str
          FX-30, #1022; {when}): {tag} should read kept 1..={} and reads {rows:?}",
         ruled.kept
     );
-    if ruled.from_bob {
+    if let Some(from_bob) = ruled.from_bob {
         assert!(
-            rows.iter().any(|t| t == "from bob"),
+            rows.iter().any(|t| t == from_bob),
             "PRODUCT: a received post, or the key it is read under, was lost by a crash of the \
-             daemon (ADR-038 FX-30, #1022; {when}): {tag} reads {rows:?}, and not bob's post"
+             daemon (ADR-038 FX-30, #1022; {when}): {tag} reads {rows:?}, and not {from_bob:?}"
         );
     }
     let (ok, trusted, err) = vox(dir, &["trust", "list"], None);
@@ -1233,8 +1321,8 @@ fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str
     );
     println!(
         "[proof] {tag}: after the crash ({when}) the room is open, it reads {rows:?}, trusts {:?}, \
-         lists Sessions {sessions:?} and holds {:?} received key generation(s)",
-        ruled.trusted, ruled.keys
+         and lists Sessions {sessions:?}",
+        ruled.trusted
     );
 }
 
@@ -1306,29 +1394,6 @@ fn sessions_of(dir: &Path, room: &str) -> Vec<String> {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter_map(|v| v["id"].as_str().map(str::to_owned))
         .collect()
-}
-
-/// `vox status --json` of `dir`, parsed.
-fn status_json(dir: &Path) -> serde_json::Value {
-    let (ok, out, err) = vox(dir, &["status", "--json"], None);
-    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
-    serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"))
-}
-
-/// How many other members' sender key generations `dir` holds for `room`, as `vox status --json`
-/// counts them (`rooms[].received_key_generations`): the key record as the product shows it.
-fn received_key_generations(dir: &Path, room: &str) -> u64 {
-    let v = status_json(dir);
-    v["rooms"]
-        .as_array()
-        .and_then(|rooms| {
-            rooms
-                .iter()
-                .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))
-        })
-        .and_then(|r| r["received_key_generations"].as_u64())
-        .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` does not count received key generations for the room {room}: {v}"))
 }
 
 /// One run of the shipped harness hook (`vox agent hook`) for `dir`'s node in `room`, fed a

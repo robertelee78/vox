@@ -427,19 +427,19 @@ impl Source {
     /// a stale source nor a later flow in this room can substitute its bytes for that snapshot.
     pub(super) async fn flush_received_before_ack(
         &self,
-        debt: Option<ReceivedDebt>,
+        debts: Vec<ReceivedDebt>,
         _boundary: Option<Digest32>,
     ) -> Result<()> {
-        let Some(debt) = debt else {
+        if debts.is_empty() {
             return Ok(());
-        };
+        }
         let store = Arc::clone(&self.store);
         let room = self.room_id;
         let peer = self.peer;
         let _probe = self.received_ack_probe();
         tokio::task::spawn_blocking(move || {
-            store
-                .flush_received_through_with(
+            for debt in debts {
+                store.flush_received_through_with(
                     debt,
                     |_debt| {
                         #[cfg(feature = "test-knobs")]
@@ -469,8 +469,9 @@ impl Source {
                                         == Ok("received-ack-not-flushed")
                                     {
                                         // Isolated mutant: only this exact acknowledged transaction
-                                        // skips its flush. Its fenced debt keeps every later writer
-                                        // from rescuing it before the proof crashes the daemon.
+                                        // commits its empty flush boundary at Durability::None. The
+                                        // common post-commit hold lets the proof retain that exact
+                                        // crash image before any later writer can rescue it.
                                         return Ok(false);
                                     }
                                 }
@@ -479,8 +480,9 @@ impl Source {
                         Ok(true)
                     },
                     |debt| crate::node::store::hold_after_received_flow_flush(debt, room, peer),
-                )
-                .map(|_| ())
+                )?;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| Error::Unreachable("history flush worker stopped"))?
@@ -495,6 +497,7 @@ impl Source {
             return Ok(Lookup::Busy);
         };
         let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
+        let mut debts = Vec::new();
         let mut after = None;
         for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {
             self.current()?;
@@ -502,18 +505,25 @@ impl Source {
             let page = self
                 .read(job, 64 * 1024, move |room, store| {
                     let page = room.history_head_hints(store, after)?;
-                    let debt = if page.next.is_none() && !exact_head_probe {
-                        store.received_debt(&room.channel_id())?
+                    let page_debts = if !exact_head_probe {
+                        page.heads
+                            .iter()
+                            .map(|hint| room.received_debt_for_current(store, &hint.author))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
+                            .flatten()
+                            .collect()
                     } else {
-                        None
+                        Vec::new()
                     };
-                    Ok(Some((page, debt)))
+                    Ok(Some((page, page_debts)))
                 })
                 .await?;
             let Lookup::Found(page) = page else {
                 return Ok(Lookup::Busy);
             };
-            let (page, debt) = page.value;
+            let (page, page_debts) = page.value;
+            debts.extend(page_debts);
             if hints.len() + page.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
                 return Err(Error::SizeLimitExceeded("inventory author bound"));
             }
@@ -531,7 +541,7 @@ impl Source {
                     if exact_head_probe {
                         return Ok(Lookup::Busy);
                     }
-                    self.flush_received_before_ack(debt, None).await?;
+                    self.flush_received_before_ack(debts, None).await?;
                     return Ok(Lookup::Found(Held {
                         value: hints,
                         _charge: charge,

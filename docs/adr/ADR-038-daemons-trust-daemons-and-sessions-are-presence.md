@@ -297,15 +297,18 @@ The decider then answered twelve questions, one at a time. His answers are the d
   would lose (own entries, consent, trust, keys, Sessions, the format marker) gets the full
   flush to disk", "correct"). Derived sync state (held heads, cursors, verifier contexts, live
   windows) MAY be lost in such a crash, and after one the daemon MUST rebuild what it lost from
-  the proofs it holds and from the peers it can reach, so the room syncs on. A sync round that persists only derived state MUST make no full flush:
-  `vox status --json` names the daemon's count of full flushes, and over a quiet minute it MUST
-  NOT move. Decision: derived state commits at redb `Durability::None` or `Eventual` (a later
+  the proofs it holds and from the peers it can reach, so the room syncs on. A sync round that
+  persists only derived state MUST request no full flush. Decision: derived state commits at
+  redb `Durability::None` or `Eventual` (a later
   durable commit carries it) and the ruled set stays `Immediate` however it arrived: a
   received consent, trust change, key package or Session record is flushed like the node's own.
   Any other received entry commits with the derived state that admitted it and reaches disk
   with the next durable commit, before this node acknowledges holding it to its sender (ADR-028
-  R-6), so a crash in between loses only what the sender has not yet seen acknowledged and
-  offers again. Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
+  R-6). Each live receive flow owns its debt by exact capability identity; pending debt never
+  blocks another flow, room or ordinary writer, while any durable commit advances the store's
+  durable frontier and retires every debt it covered. An acknowledgement captures only the owner
+  that created its exact applied tip. Thus a crash in between loses only what the sender has not
+  yet seen acknowledged and offers again. Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
   `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.

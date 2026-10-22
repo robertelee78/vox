@@ -311,6 +311,26 @@ impl ChannelState {
         read.history_head(&id)
     }
 
+    /// Durability debt for the exact live flow which created this author's current applied tip.
+    /// A head from another lane, an unapplied/source-only head, or a superseded tip has no claim
+    /// on that owner's debt.
+    pub(crate) fn received_debt_for_current(
+        &self,
+        store: &Store,
+        author: &Digest32,
+    ) -> Result<Option<crate::node::store::ReceivedDebt>> {
+        let Some((owned_tip, owner)) = self.received_tip_owners.get(author) else {
+            return Ok(None);
+        };
+        let Some(current) = self.history_read(store)?.history_settled_tip(author)? else {
+            return Ok(None);
+        };
+        if current.entry_hash() != *owned_tip {
+            return Ok(None);
+        }
+        store.received_debt(owner)
+    }
+
     pub(crate) fn history_context(
         &self,
         store: &Store,

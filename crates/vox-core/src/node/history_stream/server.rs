@@ -196,7 +196,7 @@ async fn respond(
                     }) {
                         return Ok(None);
                     }
-                    let debt = store.received_debt(&room.channel_id())?;
+                    let debt = room.received_debt_for_current(store, &author)?;
                     Ok(Some((head, debt, boundary)))
                 })
                 .await?;
@@ -208,7 +208,9 @@ async fn respond(
             // The head was read; what it covers is on disk before the peer hears of it
             // (ADR-038 FX-30).
             let (head, debt, boundary) = held.value;
-            source.flush_received_before_ack(debt, boundary).await?;
+            source
+                .flush_received_before_ack(debt.into_iter().collect(), boundary)
+                .await?;
             let wire = head.to_wire();
             let status = match send(
                 source,

@@ -1061,6 +1061,10 @@ pub struct ChannelState {
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
     held: BTreeMap<Digest32, u64>,
+    /// Latest semantically applied tip created by each live receive flow. This is memory-only:
+    /// its Arc capability lets an acknowledgement capture only the exact flow which committed
+    /// the advertised tip, never another lane selected merely by room id.
+    received_tip_owners: BTreeMap<Digest32, (Digest32, ReceivedFlow)>,
     /// Last missing-body position examined by `owed_wants`, including ineligible positions.
     /// The next session resumes after it and wraps, so unavailable bodies cannot starve others.
     owed_asked_to: Option<(Digest32, u64)>,
@@ -1949,6 +1953,7 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
+            received_tip_owners: BTreeMap::new(),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
@@ -2641,6 +2646,7 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held,
+            received_tip_owners: BTreeMap::new(),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: match restart
@@ -2904,6 +2910,7 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
+            received_tip_owners: BTreeMap::new(),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
@@ -6292,10 +6299,15 @@ impl ChannelState {
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
         let received = ReceivedFlow::new(self.channel_id);
-        let mut out = received.scope(|| self.absorb_arrived(store, &before, now_ms, &received))?;
-        if let Some(debt) = received.debt(store)? {
-            store.flush_received_through(debt)?;
-        }
+        let absorbed = received.scope(|| self.absorb_arrived(store, &before, now_ms, &received));
+        // `absorb_arrived` may commit one or more batches before a later batch fails. Settle that
+        // exact flow even on the partial-failure path; otherwise its committed Durability::None
+        // bytes have neither an acknowledgement owner nor a future retry capable of naming them.
+        let settled = received.debt(store).and_then(|debt| {
+            debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
+        });
+        settled?;
+        let mut out = absorbed?;
         if let Ok(n) = session {
             out.applied = n;
         }
@@ -6531,6 +6543,13 @@ impl ChannelState {
         received: Option<&ReceivedFlow>,
         authorization: Option<LegacySync>,
     ) -> Result<SyncOutcome> {
+        let received_tips = received.map(|flow| {
+            let mut tips = BTreeMap::new();
+            for (author, entry_hash, _, _) in &arrived {
+                tips.insert(*author, (*entry_hash, flow.clone()));
+            }
+            tips
+        });
         let mut out = SyncOutcome {
             applied: arrived.len(),
             ..SyncOutcome::default()
@@ -6762,6 +6781,9 @@ impl ChannelState {
         self.place_committed(store, rendered_rows, &expired)?;
         // An entry that arrived may be a parent others named before it: rows move.
         self.settle_display_order(store)?;
+        if let Some(tips) = received_tips {
+            self.received_tip_owners.extend(tips);
+        }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)

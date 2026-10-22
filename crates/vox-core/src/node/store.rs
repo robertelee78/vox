@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -208,20 +208,20 @@ struct ReceivedOwner {
     room: Digest32,
 }
 
-/// One exact flow's consecutive received transactions. Pointer identity distinguishes two lanes
-/// in the same room. `fenced` freezes the exact last transaction included in a head/inventory
-/// snapshot: no later transaction, even from this owner, can join it before settlement.
+/// One exact flow's latest received transaction. Pointer identity distinguishes concurrent lanes,
+/// including two lanes in the same room. A durable commit covers every transaction through its
+/// own identity, so independent debts can be settled without lending ownership between flows.
 struct PendingReceived {
     owner: Arc<ReceivedOwner>,
     through: u64,
-    fenced: bool,
 }
 
 #[derive(Default)]
 struct Epochs {
     /// Identity for every transaction. Exhaustion is rejected before commit, never after it.
     next_transaction: u64,
-    pending: Option<PendingReceived>,
+    durable_through: u64,
+    pending: Vec<PendingReceived>,
     /// A database replacement whose directory entry has not
     /// yet been synced. This debt survives reopen or directory-sync failure and gates every
     /// later write and acknowledgement until the exact replacement becomes durable.
@@ -243,10 +243,11 @@ impl ReceivedDebt {
     }
 }
 
-/// Hold one exact receive owner's post-durability boundary for a crash-image proof. The gate
+/// Hold one exact receive owner's post-flush-decision boundary for a crash-image proof. The gate
 /// contains `<room> <peer>`; the marker adds the exact transaction identity. This callback is
-/// invoked while the store still holds its writer after the flush commit, so neither another
-/// receive flow nor an ordinary writer can add bytes before the apparatus stops the process.
+/// invoked while the store still holds its writer after the empty commit (durable in the healthy
+/// path, non-durable in the isolated mutant), so neither another receive flow nor an ordinary
+/// writer can add bytes before the apparatus stops the process.
 #[cfg(feature = "test-knobs")]
 pub(crate) fn hold_after_received_flow_flush(
     debt: &ReceivedDebt,
@@ -324,7 +325,7 @@ impl ReceivedFlow {
     }
 
     pub(crate) fn debt(&self, store: &Store) -> Result<Option<ReceivedDebt>> {
-        store.fence_received_owner(&self.owner)
+        store.received_debt(self)
     }
 }
 
@@ -359,7 +360,6 @@ pub struct Store {
     /// its received ownership moved while this is held, so the commit's visibility and its mark are one
     /// step to every other holder. redb admits one writer at a time anyway; this names it.
     writer: Mutex<Epochs>,
-    received_settled: Condvar,
     /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
     /// `db` so it is released only after the database is closed: the store goes with its last
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
@@ -421,7 +421,6 @@ impl Store {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
             writer: Mutex::new(Epochs::default()),
-            received_settled: Condvar::new(),
             _lock: None,
         };
         store.init_schema()?;
@@ -445,7 +444,6 @@ impl Store {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
             writer: Mutex::new(Epochs::default()),
-            received_settled: Condvar::new(),
             _lock: None,
         };
         if store.schema_is_current()? {
@@ -479,7 +477,7 @@ impl Store {
         // Keep one lock order for every writer, including `rewrite_fresh`: writer before db.
         // Taking the read snapshot first would let a rewrite hold `writer` while waiting for
         // this `db` read, and this recovery wait for `writer` in the other direction.
-        let mut epochs = self.writer_for(None)?;
+        let mut epochs = self.writer()?;
         let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(db) = &*backing else {
             return Err(Error::Storage {
@@ -571,7 +569,7 @@ impl Store {
         // A write transaction can outlive the `db` guard that created it (`Cached` above).
         // Serialize the complete snapshot and replacement with every such transaction, or one
         // can commit to the old inode after the snapshot and disappear at the rename.
-        let mut epochs = self.writer_for(None)?;
+        let mut epochs = self.writer()?;
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(old) = &*backing else {
             return Err(Error::Storage {
@@ -665,6 +663,7 @@ impl Store {
         // writer and every pending-received acknowledgement comes back through this exact step.
         super::paths::sync_dir(&self.path)?;
         epochs.replacement = false;
+        Self::settle_durable_through(epochs, epochs.next_transaction);
         Ok(true)
     }
 
@@ -678,29 +677,14 @@ impl Store {
 
     /// Begin a write transaction, holding the store's writer — refused, writing nothing, while
     /// the store is read-only.
-    fn writer_for(&self, owner: Option<&Arc<ReceivedOwner>>) -> Result<MutexGuard<'_, Epochs>> {
+    fn writer(&self) -> Result<MutexGuard<'_, Epochs>> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
-            self.finish_replacement(&mut epochs)?;
-            let available = match (&epochs.pending, owner) {
-                (None, _) => true,
-                (Some(pending), Some(owner)) => {
-                    Arc::ptr_eq(&pending.owner, owner) && !pending.fenced
-                }
-                (Some(_), None) => false,
-            };
-            if available {
-                return Ok(epochs);
-            }
-            epochs = self
-                .received_settled
-                .wait(epochs)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
+        self.finish_replacement(&mut epochs)?;
+        Ok(epochs)
     }
 
     fn begin_write(&self) -> Result<(MutexGuard<'_, Epochs>, Cached<redb::WriteTransaction>)> {
-        let epochs = self.writer_for(None)?;
+        let epochs = self.writer()?;
         match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => {
                 Ok((epochs, db.begin_write().map_err(storage("begin write"))?))
@@ -1048,12 +1032,11 @@ impl Store {
         })
     }
 
-    /// Begin a batch owned by one exact receive flow. Consecutive transactions from that owner may
-    /// join its debt; a different flow or ordinary writer waits for the owner's explicit flush.
-    /// Once an acknowledgement fences the debt, even the same flow waits until that exact snapshot
-    /// is settled. No later transaction can carry an earlier owner's bytes.
+    /// Begin a batch owned by one exact receive flow. Its debt is tracked independently by Arc
+    /// identity. Other flows and ordinary writers remain live; if one performs a durable commit,
+    /// redb makes every earlier transaction durable and the corresponding debts are retired.
     pub(crate) fn received_batch(&self, flow: &ReceivedFlow) -> Result<Batch<'_>> {
-        let epochs = self.writer_for(Some(&flow.owner))?;
+        let epochs = self.writer()?;
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin received write"))?,
             Backing::ReadOnly(_) | Backing::Closed => {
@@ -1085,7 +1068,7 @@ impl Store {
     /// # Errors
     /// The transaction cannot be begun or committed.
     pub fn flush(&self) -> Result<()> {
-        let mut epochs = self.writer_for(None)?;
+        let mut epochs = self.writer()?;
         if self.finish_replacement(&mut epochs)? {
             return Ok(());
         }
@@ -1096,37 +1079,17 @@ impl Store {
         self.commit_flushed(txn, &mut epochs, "flush")
     }
 
-    /// Fence the exact durability debt visible inside an acknowledgement's room snapshot.
-    /// The returned owner/transaction pair never grows, so a delayed acknowledgement worker
-    /// cannot flush a later receive flow's otherwise unrelated write.
-    pub(crate) fn received_debt(&self, room: &Digest32) -> Result<Option<ReceivedDebt>> {
+    /// Capture the exact creating flow's durability debt. Room equality is necessary but never
+    /// sufficient: a concurrent lane in the same room has a different Arc owner and cannot be
+    /// acknowledged through this capability.
+    pub(crate) fn received_debt(&self, flow: &ReceivedFlow) -> Result<Option<ReceivedDebt>> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         self.finish_replacement(&mut epochs)?;
-        let Some(pending) = epochs
-            .pending
-            .as_mut()
-            .filter(|pending| pending.owner.room == *room)
-        else {
+        let Some(pending) = epochs.pending.iter().find(|pending| {
+            pending.owner.room == flow.owner.room && Arc::ptr_eq(&pending.owner, &flow.owner)
+        }) else {
             return Ok(None);
         };
-        pending.fenced = true;
-        Ok(Some(ReceivedDebt {
-            owner: Arc::clone(&pending.owner),
-            through: pending.through,
-        }))
-    }
-
-    fn fence_received_owner(&self, owner: &Arc<ReceivedOwner>) -> Result<Option<ReceivedDebt>> {
-        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        self.finish_replacement(&mut epochs)?;
-        let Some(pending) = epochs
-            .pending
-            .as_mut()
-            .filter(|pending| Arc::ptr_eq(&pending.owner, owner))
-        else {
-            return Ok(None);
-        };
-        pending.fenced = true;
         Ok(Some(ReceivedDebt {
             owner: Arc::clone(&pending.owner),
             through: pending.through,
@@ -1151,15 +1114,17 @@ impl Store {
     ) -> Result<bool> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         self.finish_replacement(&mut epochs)?;
-        let current = epochs.pending.as_ref().is_some_and(|pending| {
-            Arc::ptr_eq(&pending.owner, &debt.owner)
-                && pending.through == debt.through
-                && pending.fenced
-        });
-        if !current || !before(&debt)? {
+        if epochs.durable_through >= debt.through {
             return Ok(false);
         }
-        let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+        let owned = epochs.pending.iter().any(|pending| {
+            Arc::ptr_eq(&pending.owner, &debt.owner) && pending.through >= debt.through
+        });
+        if !owned {
+            return Ok(false);
+        }
+        let immediate = before(&debt)?;
+        let mut txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
             Backing::ReadOnly(_) | Backing::Closed => {
                 return Err(Error::Storage {
@@ -1169,15 +1134,31 @@ impl Store {
                 })
             }
         };
+        if !immediate {
+            // Test-only callers use this as the isolated omitted-flush mutant: commit the same
+            // empty boundary without durability so proof apparatus can stop at the exact common
+            // post-commit point. Packaged callers always request Immediate.
+            txn.set_durability(redb::Durability::None)
+                .map_err(storage("set flush durability"))?;
+        }
         txn.commit().map_err(storage("flush received debt"))?;
-        // Keep the writer through the exact post-durability boundary. Proof apparatus can stop a
-        // process here and copy its crash image knowing that no later transaction carried or
-        // followed this owner's bytes. Packaged builds pass a no-op callback.
-        epochs.pending = None;
+        // Keep the writer through the exact post-decision commit boundary. Proof apparatus can
+        // stop a process here and copy its crash image knowing that no later transaction carried
+        // or followed this owner's bytes. Packaged builds pass a no-op callback.
+        if immediate {
+            let through = epochs.next_transaction;
+            Self::settle_durable_through(&mut epochs, through);
+        }
         let after = after(&debt);
-        self.received_settled.notify_all();
         after?;
-        Ok(true)
+        Ok(immediate)
+    }
+
+    fn settle_durable_through(epochs: &mut Epochs, through: u64) {
+        epochs.durable_through = epochs.durable_through.max(through);
+        epochs
+            .pending
+            .retain(|pending| pending.through > epochs.durable_through);
     }
 
     /// Commit a raw transaction flushed to disk. Admission guarantees that no other receive
@@ -1185,10 +1166,11 @@ impl Store {
     fn commit_flushed(
         &self,
         txn: Cached<redb::WriteTransaction>,
-        _epochs: &mut Epochs,
+        epochs: &mut Epochs,
         op: &'static str,
     ) -> Result<()> {
         txn.commit().map_err(storage(op))?;
+        Self::settle_durable_through(epochs, epochs.next_transaction);
         Ok(())
     }
 
@@ -1640,7 +1622,7 @@ impl Batch<'_> {
     pub fn commit(self) -> Result<()> {
         let Self {
             mut txn,
-            store,
+            store: _store,
             class,
             received_flow,
             mut epochs,
@@ -1664,30 +1646,20 @@ impl Batch<'_> {
         txn.commit().map_err(storage("commit"))?;
         epochs.next_transaction = transaction;
         if flushed {
-            if let Some(pending) = epochs.pending.as_ref() {
-                debug_assert!(
-                    received_flow
-                        .as_ref()
-                        .is_some_and(|flow| Arc::ptr_eq(&pending.owner, &flow.owner)),
-                    "only the pending receive owner can make its debt durable"
-                );
-            }
-            epochs.pending = None;
-            store.received_settled.notify_all();
+            Store::settle_durable_through(&mut epochs, transaction);
         } else if matches!(class, Class::Received) {
             if let Some(flow) = received_flow {
-                match epochs.pending.as_mut() {
-                    Some(pending) if Arc::ptr_eq(&pending.owner, &flow.owner) => {
-                        pending.through = transaction;
-                    }
-                    None => {
-                        epochs.pending = Some(PendingReceived {
-                            owner: Arc::clone(&flow.owner),
-                            through: transaction,
-                            fenced: false,
-                        });
-                    }
-                    Some(_) => unreachable!("the writer admitted a different received owner"),
+                if let Some(pending) = epochs
+                    .pending
+                    .iter_mut()
+                    .find(|pending| Arc::ptr_eq(&pending.owner, &flow.owner))
+                {
+                    pending.through = transaction;
+                } else {
+                    epochs.pending.push(PendingReceived {
+                        owner: Arc::clone(&flow.owner),
+                        through: transaction,
+                    });
                 }
             }
         }
