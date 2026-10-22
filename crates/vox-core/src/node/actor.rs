@@ -3412,8 +3412,9 @@ impl Joiner {
         Ok(conn)
     }
 
-    /// A board for this join: every route dialled at once, the room's own anchors preferred for a
-    /// short grace, then whichever has answered (Happy Eyeballs, RFC 8305).
+    /// A board for this join: every route dialled at once, a directly reachable member taken at
+    /// once, otherwise the room's own anchors preferred for a short grace and then whichever has
+    /// answered (Happy Eyeballs, RFC 8305).
     ///
     /// **Not one after another.** The routes were dialled in turn, so a route this node cannot
     /// use held up every route after it for its full timeout: an IPv6-only member whose address
@@ -3421,11 +3422,13 @@ impl Joiner {
     /// whole time — after `board 20.76s`, measured through the real binaries (#197; PRD-001 R42
     /// asks for under 2s).
     ///
-    /// **Preferred, not waited for.** The order still matters: the link's own anchors come first
-    /// because they are the boards that hold the room, and a joiner's own anchor may not. But
-    /// waiting for every earlier route to *fail* would only halve a 20s wait, since a route that
-    /// cannot be reached fails by timing out. So once any route has answered, an earlier one gets
-    /// [`BOARD_PREFERENCE_GRACE`] to answer too; after that, the earliest route that **has**
+    /// **Direct does not wait on an anchor.** A member route is itself a board holding the room;
+    /// when it answers, the join returns it immediately even if an earlier anchor dial is still
+    /// pending. Among anchor routes the order still matters: the link's own anchors come first
+    /// because they are the boards that hold the room, and a joiner's own anchor may not. Waiting
+    /// for every earlier route to *fail* would only halve a 20s wait, since a route that cannot be
+    /// reached fails by timing out. So once an anchor has answered, an earlier anchor gets
+    /// [`BOARD_PREFERENCE_GRACE`] to answer too; after that, the earliest anchor that **has**
     /// answered is taken and the slower ones are dropped.
     async fn reach_a_board(&self) -> Option<Arc<VoxConnection>> {
         let deadline = tokio::time::Instant::now() + Node::BOARD_PATIENCE;
@@ -3454,6 +3457,16 @@ impl Joiner {
                 vec![None; self.routes.len()];
             let mut grace_ends: Option<tokio::time::Instant> = None;
             loop {
+                // An address-marked member is directly reachable. It needs no anchor for this
+                // rendezvous, so an outstanding anchor dial must not delay it (ADR-012).
+                if let Some(direct) = settled.iter().enumerate().find_map(|(at, answer)| {
+                    self.parsed
+                        .names_member(&self.routes[at].0)
+                        .then(|| answer.as_ref().and_then(Option::as_ref))
+                        .flatten()
+                }) {
+                    return Some(Arc::clone(direct));
+                }
                 // The earliest route that answered, and whether any route before it is still
                 // dialling (and so might yet be preferred).
                 let best = settled.iter().position(|o| matches!(o, Some(Some(_))));
