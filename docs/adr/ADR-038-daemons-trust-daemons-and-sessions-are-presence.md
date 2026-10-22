@@ -173,6 +173,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   consistent with the observation; it does not prove that #996 fixes that exact journey. The
   #986 journey MUST run on the composed #996 candidate before either story cites this wedge as
   fixed.
+  Decision (the decider, 2026-10-21): `held_through` is the last authenticated feed position the
+  peer has completely satisfied for that peer's role. An authenticated header whose private
+  payload and effect are addressed only to another member counts as satisfied without the other
+  member's payload; it MUST NOT cause a permanent receipt probe, partial round or repeated offer.
 - **FX-16.** `vox status` and the app MUST record each round the lane completes as the room's
   and the peer's last completed sync; "no completed sync" MUST fire only when it is true
   (ADR-034 §5 "Health is true", HL-1; PRD-001 R35).
@@ -314,9 +318,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   windows) MAY be lost in such a crash, and after one the daemon MUST rebuild what it lost from
   the proofs it holds and from the peers it can reach, so the room syncs on. A sync round that persists only derived state MUST make no full flush:
   `vox status --json` names the daemon's count of full flushes, and over a quiet minute it MUST
-  NOT move. Decision: derived state commits at redb `Durability::None` or `Eventual` (a later
-  durable commit carries it) and the ruled set stays `Immediate` however it arrived: a
-  received consent, trust change, key package or Session record is flushed like the node's own.
+  NOT move. Decision: derived state commits at redb `Durability::None` (redb 4.3.0 has no
+  `Eventual`; a later durable commit carries it) and the ruled set stays `Immediate` however it
+  arrived: a received consent, trust change, key package or Session record is flushed like the
+  node's own.
   Any other received entry commits with the derived state that admitted it and reaches disk
   with the next durable commit, before this node acknowledges holding it to its sender (ADR-028
   R-6), so a crash in between loses only what the sender has not yet seen acknowledged and
@@ -453,14 +458,15 @@ The decider then answered twelve questions, one at a time. His answers are the d
   after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The product
   said only the symptom. "please make vox work"; "be methodical" (the decider, 2026-10-21).
 
-  > **Draft FX-35 amendment — pending the decider's sign-off, not a Decision.** Keep a fixed
-  > daemon-wide capacity of 16 **running** flow states. A full pool is ordinary admission
-  > pressure: retain the exact parked Flow, release its lane worker, byte charge and outbound
-  > slot, and resume it only from the running charge's release edge. Do not claim that the pool
-  > cannot fill, discard or reconstruct the work, depend on the ticker, or retire it by elapsed
-  > time, retry count, queue count, CPU use or machine load. Actor generations of one hosted node
-  > share two running slots. This draft replaces the wait-queue paragraphs above only if the
-  > decider accepts it.
+  > **Decision amendment (the decider, 2026-10-21).** There is no daemon-wide flow-state wait
+  > queue. The pool limit is `max(16, 2 × currently hosted node identities)`, matching the maximum
+  > legal running rounds, so legal running work cannot fill it before its own charge is available.
+  > A parked or waiting continuation retains its exact `Flow` but no worker, byte charge,
+  > outbound slot or flow-state charge; an impossible invariant violation wakes the
+  > earliest-retained eligible continuation from the exact running-round release edge. Vox MUST
+  > NOT discard or reconstruct that work, depend on a tick, or retire, refuse, delay or reorder it
+  > by elapsed time, retry count, queue count, CPU use or machine load. This Decision replaces the
+  > fixed-16 and daemon-wide wait-queue requirements above.
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
