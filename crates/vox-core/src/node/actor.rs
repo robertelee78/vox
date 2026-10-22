@@ -12915,60 +12915,76 @@ impl Node {
         ) else {
             return Outcome::Failed(Fault::UnknownChannel);
         };
-        // **The held key leaves the store before the consent is recorded, never after.** Removed
-        // after, a failed save left a delivered key on disk, and after a revocation and a new
-        // consent that stale pre-rotation key would have been the one delivered (found in
-        // verification of #203). Removed first, a key on disk means no consent was recorded for
-        // it. So a failed removal is refused, loudly, with nothing recorded: the key stays held,
-        // and the next attempt delivers the same key again. A failure between the removal and the
-        // record can only lose the held key, so that consent is taken again from a later position:
-        // narrower, never wider.
-        if let Err(e) = forget_consent_key(&mut self.consent_keys, profile, channel_id, target) {
-            return Outcome::Failed(fault_of(&e));
-        }
-        let history_owed = {
-            let mut channel = shared.lock().await;
-            // What this consent releases, from its earliest position (V210-45): every later
-            // release to `target` starts there and never before it.
-            let entitled_from = plan
-                .as_ref()
-                .and_then(|p| p.first().copied())
-                .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
-            // The generations before the live one that the decision — or a full-history grant —
-            // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
-            match channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms) {
-                Ok((_, history_owed)) => history_owed,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            }
-        };
-        // The grant is on the log now, and a reader renders nothing without it: pushed at once,
-        // as every local append is, not on the next tick (V210-78).
-        self.note_local_append(channel_id);
-        // The generation delivered is the key's own: a key taken before a rotation is the older
-        // one, and a refusal must re-owe exactly that (V210-30).
+        // Complete every await before the final authority check. The policy-state lock held by
+        // `publish_with_current_authority` then spans the synchronous consent record and delivery
+        // enqueue, so a durable revocation cannot land in between them.
+        let mut channel = shared.lock().await;
+        let authority = self.computer.as_ref().map(|computer| {
+            (
+                Arc::clone(computer),
+                self.computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+                profile.fingerprint(),
+            )
+        });
+        let entitled_from = plan
+            .as_ref()
+            .and_then(|p| p.first().copied())
+            .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
         let chain_id = skdm.body.chain_id;
-        // The consent is a fact once decided; whether the key landed is learnt off the actor, and
-        // it is recorded as delivered only then (V210-88).
-        // In flight from here until the member answers (V210-88): a crash before then leaves it owed.
-        let epoch = self.key_in_flight(*channel_id, target);
         let opening = frames
             .first()
             .filter(|_| session.is_none())
             .map(|frame| crate::hash::sha256(frame));
-        queue.send(PairwiseJob {
-            conn,
-            frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
-            channel_id: *channel_id,
-            after: AfterWrite::Key {
-                chain_id,
-                opening,
-                hello: carries_hello,
-                session,
-                history: false,
-                epoch,
-            },
-            credit: job,
-        });
+        let commit = || -> crate::error::Result<bool> {
+            // **The held key leaves the store before the consent is recorded, never after.**
+            // Removed after, a failed save left a delivered key on disk. Removed first, failure
+            // can only narrow: a later attempt takes consent again from a later position.
+            forget_consent_key(&mut self.consent_keys, profile, channel_id, target)?;
+            // What this consent releases, from its earliest position (V210-45): every later
+            // release to `target` starts there and never before it.
+            // The generations before the live one that the decision — or a full-history grant —
+            // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
+            let (_, history_owed) =
+                channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms)?;
+            // The consent is a fact once decided; whether the key landed is learnt off the actor,
+            // and is recorded delivered only then. A crash before the answer leaves it owed.
+            *self
+                .keys_in_flight
+                .entry((*channel_id, target))
+                .or_default() += 1;
+            let epoch = self.delivery_epoch;
+            queue.send(PairwiseJob {
+                conn,
+                frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
+                channel_id: *channel_id,
+                after: AfterWrite::Key {
+                    chain_id,
+                    opening,
+                    hello: carries_hello,
+                    session,
+                    history: false,
+                    epoch,
+                },
+                credit: job,
+            });
+            Ok(history_owed)
+        };
+        let committed = match authority {
+            Some((computer, applied, node)) => {
+                computer.publish_with_current_authority(applied, node, commit)
+            }
+            None => Some(commit()),
+        };
+        let history_owed = match committed {
+            Some(Ok(history_owed)) => history_owed,
+            Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
+            None => return Outcome::Failed(Fault::NotTrusted),
+        };
+        drop(channel);
+        // The grant is on the log now, and a reader renders nothing without it: pushed at once,
+        // as every local append is, not on the next tick (V210-78).
+        self.note_local_append(channel_id);
         if history_owed {
             // At once rather than on the tick: the connection and session are live now.
             let _ = self.deliver_rekeys_for(channel_id, asked).await;
@@ -16014,6 +16030,20 @@ impl Node {
         target: Digest32,
         skdm: &crate::group::skdm::Skdm,
     ) -> bool {
+        self.post_key_package_authorized(channel_id, target, skdm, None)
+            .await
+    }
+
+    /// Prepare a key package asynchronously, then put only its final synchronous room-log append
+    /// under the current computer-authority fence. `None` is for publications whose authority is
+    /// not computer policy (ordinary room re-key/history delivery).
+    async fn post_key_package_authorized(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        skdm: &crate::group::skdm::Skdm,
+        authority: Option<(Arc<crate::node::computer::Computer>, u64, Digest32)>,
+    ) -> bool {
         if self.net.is_none() {
             return false;
         }
@@ -16058,11 +16088,18 @@ impl Node {
             let Some(profile) = self.profile.as_ref() else {
                 return false;
             };
-            shared
-                .lock()
-                .await
-                .append_key_package(profile, &package, (self.millis_clock)())
-                .is_ok()
+            let mut channel = shared.lock().await;
+            let mut append = || {
+                channel
+                    .append_key_package(profile, &package, (self.millis_clock)())
+                    .is_ok()
+            };
+            match authority {
+                Some((computer, applied, node)) => computer
+                    .publish_with_current_authority(applied, node, append)
+                    .unwrap_or(false),
+                None => append(),
+            }
         };
         if posted {
             // A one-time prekey is named by one delivery only, frame or package (ADR-030 P-3): a
@@ -20841,7 +20878,19 @@ impl Node {
                 return Err("the selected room changed; refresh and retry".into());
             }
         }
-        channel.attention(profile.store(), owner, operation, (self.millis_clock)())
+        let write = || channel.attention(profile.store(), owner, operation, (self.millis_clock)());
+        if by == owner {
+            return write();
+        }
+        let Some(computer) = self.computer.as_ref().map(Arc::clone) else {
+            return write();
+        };
+        let applied = self
+            .computer_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        computer
+            .publish_with_current_authority(applied, owner, write)
+            .ok_or_else(|| "attention waits for current computer trust".to_owned())?
     }
 
     async fn room_pause(
@@ -21565,10 +21614,20 @@ impl Node {
         };
         for (member, skdm, generation) in releases {
             self.computer_drive_guard(guard)?;
+            let authority = match (&self.computer, &self.profile) {
+                (Some(computer), Some(profile)) => Some((
+                    Arc::clone(computer),
+                    self.computer_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    profile.fingerprint(),
+                )),
+                (Some(_), None) => return Ok(()),
+                (None, _) => None,
+            };
             let posted = if let Some((deadline, _cancelled)) = guard {
                 match tokio::time::timeout_at(
                     deadline.into(),
-                    self.post_key_package(channel_id, member, &skdm),
+                    self.post_key_package_authorized(channel_id, member, &skdm, authority),
                 )
                 .await
                 {
@@ -21580,7 +21639,8 @@ impl Node {
                     }
                 }
             } else {
-                self.post_key_package(channel_id, member, &skdm).await
+                self.post_key_package_authorized(channel_id, member, &skdm, authority)
+                    .await
             };
             if !posted {
                 continue;

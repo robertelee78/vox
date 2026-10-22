@@ -16,6 +16,7 @@ use std::time::Duration;
 
 const PAIR_DOMAIN: &[u8] = b"vox/computer-pair/v1\0";
 const PATIENCE: Duration = Duration::from_secs(15);
+const MANAGEMENT_SLOTS: usize = 8;
 /// **Test-only** (`test-knobs`): `<arm path>\t<engaged path>`. The arm contains the policy revision
 /// before the proof's change. The later exchange that atomically consumes it creates the engaged
 /// marker after the source-owned local-apply interval and parks until superseded. This gives the
@@ -44,6 +45,16 @@ const TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV: &str =
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_ENV: &str =
     "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE";
+/// **Test-only** (`test-knobs`): an arm file consumed by an enrolled real Vox peer. It opens one
+/// malformed management request per bounded answer slot, then deliberately leaves every response
+/// unread. This is peer apparatus; the verdict still comes from the other shipped daemon's
+/// status/trust projection.
+#[cfg(feature = "test-knobs")]
+const TEST_STOPPED_READER_ARM_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ARM_FILE";
+/// **Test-only** (`test-knobs`): marker created by the answering shipped daemon after every
+/// bounded slot has reached the unread error-response boundary.
+#[cfg(feature = "test-knobs")]
+const TEST_STOPPED_READER_ANSWERED_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE";
 // An exchange carries retained records from the same bounded transaction, never a smaller
 // unrelated limit that would strand an otherwise valid roster as nodes are added.
 const MAX_FRAME: usize = MAX_STATE as usize;
@@ -508,7 +519,7 @@ const EXCHANGE_FALLBACK: Duration = COMPUTER_QUIET_EXCHANGE_AFTER;
 const REACHABILITY_WAKE_OP: u64 = 3;
 /// An operator's enrollment ceremony may carry a long retained history, but never holds its
 /// explicit command forever. Ordinary convergence uses [`COMPUTER_RETURN_SHOWN_WITHIN`].
-const PAIR_WITHIN: Duration = Duration::from_secs(600);
+pub const COMPUTER_PAIR_WITHIN: Duration = Duration::from_secs(600);
 impl Management {
     /// Register and renew rendezvous leases only for a real cause. The only timer is derived
     /// from the expiry returned by the registration itself; a quiet daemon has no refresh tick.
@@ -715,7 +726,7 @@ impl Management {
             anchors,
             serving: Mutex::new(Default::default()),
             inflight: Mutex::new(BTreeMap::new()),
-            slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            slots: Arc::new(tokio::sync::Semaphore::new(MANAGEMENT_SLOTS)),
             problem: Mutex::new(problem),
             pending_nodes: Mutex::new(Vec::new()),
             transport_cache: Mutex::new(BTreeMap::new()),
@@ -869,7 +880,23 @@ impl Management {
                     }
                     if let Err(e) = result {
                         let mut f = Encoder::new();
-                        f.array(2).uint(0).text(&e.to_string());
+                        let problem = e.to_string();
+                        #[cfg(feature = "test-knobs")]
+                        let problem = {
+                            let mut problem = problem;
+                            if problem.contains("causal convergence deadline") {
+                                Self::mark_stopped_reader_answer_for_proof();
+                                // Each response exceeds one eighth of the transaction cap. Eight
+                                // unread streams therefore exceed the connection's whole bounded
+                                // transaction allowance without inventing another size constant.
+                                if crate::node::computer::fx28_mutant("stopped-reader-fresh-write")
+                                {
+                                    problem.push_str(&"x".repeat(MAX_FRAME / MANAGEMENT_SLOTS));
+                                }
+                            }
+                            problem
+                        };
+                        f.array(2).uint(0).text(&problem);
                         // A peer which stopped reading cannot retain one of the bounded answer
                         // slots forever merely because its error response is backpressured.
                         let response_deadline =
@@ -1074,7 +1101,7 @@ impl Management {
         // The operator's action comes first: a retry exchange in flight with that computer
         // is cut (as no failure) and its reservation waited for, briefly; another operator
         // pairing in flight is reported.
-        let mut causal_deadline = std::time::Instant::now() + PAIR_WITHIN;
+        let mut causal_deadline = std::time::Instant::now() + COMPUTER_PAIR_WITHIN;
         let serial = next_flight();
         loop {
             // Register before inspecting the reservation. `notify_waiters` carries no saved
@@ -2120,7 +2147,7 @@ impl Management {
         let (op, peer, id, remaining_ms) = read_hello_until(recv, conn, *response_deadline).await?;
         let deadline = match op {
             REACHABILITY_WAKE_OP => std::time::Instant::now() + PATIENCE,
-            1 if remaining_ms > 0 => local_deadline(remaining_ms, PAIR_WITHIN),
+            1 if remaining_ms > 0 => local_deadline(remaining_ms, COMPUTER_PAIR_WITHIN),
             2 if remaining_ms > 0 => local_deadline(remaining_ms, COMPUTER_RETURN_SHOWN_WITHIN),
             1 | 2 => return Err(bad()),
             _ => return Err(bad()),
@@ -2901,6 +2928,8 @@ impl Management {
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
         let conn = self.connect(peer, endpoints, link.as_ref()).await?;
         self.serve(Arc::clone(&conn));
+        #[cfg(feature = "test-knobs")]
+        self.stage_stopped_reader_for_proof(&conn).await?;
         let (payload, sent) = {
             let s = lock(&self.computer.state);
             (exchange(&s, &peer)?, s.revision)
@@ -2927,6 +2956,58 @@ impl Management {
         })?;
         let _ = send.finish();
         Ok((sent, merged))
+    }
+
+    /// Have this real shipped daemon act as the stopped reader. The peer sees ordinary
+    /// authenticated Computer streams. Their one-millisecond advertised request budget expires
+    /// before the malformed payload is sent, and the receive halves remain alive but unread for
+    /// the production response patience. Correct code uses the expired request deadline and frees
+    /// each slot; the mutant gives each write a fresh interval and strands all slots behind QUIC
+    /// flow control.
+    #[cfg(feature = "test-knobs")]
+    async fn stage_stopped_reader_for_proof(&self, conn: &Arc<VoxConnection>) -> Result<()> {
+        let Ok(arm) = std::env::var(TEST_STOPPED_READER_ARM_ENV) else {
+            return Ok(());
+        };
+        if std::fs::remove_file(&arm).is_err() {
+            return Ok(());
+        }
+        let mut held = Vec::with_capacity(MANAGEMENT_SLOTS);
+        for _ in 0..MANAGEMENT_SLOTS {
+            let (mut send, recv) = streams::open_typed(conn, StreamKind::Computer).await?;
+            write_frame(
+                &mut send,
+                &hello(2, &self.computer.description(), &[0; 32], 1),
+            )
+            .await?;
+            held.push((send, recv));
+        }
+        // Apparatus staging only: pass the one-millisecond request budget before supplying the
+        // deliberately malformed payload. No verdict is inferred from this wait.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        for (send, _) in &mut held {
+            write_frame(send, &[0xff]).await?;
+        }
+        tokio::spawn(async move {
+            let _unread = held;
+            tokio::time::sleep(PATIENCE).await;
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "test-knobs")]
+    fn mark_stopped_reader_answer_for_proof() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ANSWERS: AtomicUsize = AtomicUsize::new(0);
+        let Ok(marker) = std::env::var(TEST_STOPPED_READER_ANSWERED_ENV) else {
+            return;
+        };
+        if ANSWERS.fetch_add(1, Ordering::AcqRel) + 1 == MANAGEMENT_SLOTS {
+            let _ = std::fs::write(
+                marker,
+                b"all bounded management slots reached unread replies\n",
+            );
+        }
     }
 
     /// Park exactly the first selected exchange after its source-owned local-apply interval. The

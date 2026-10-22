@@ -199,7 +199,11 @@ impl Node {
             .filter(|profile| profile.is_unlocked())
             .map(Profile::fingerprint)
             .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()));
-        computer.policy_current(applied) && me.is_some_and(|me| computer.binding_current(&me))
+        me.is_some_and(|me| {
+            computer
+                .publish_with_current_authority(applied, me, || ())
+                .is_some()
+        })
     }
 
     pub(super) fn computer_policy_active(

@@ -33,6 +33,7 @@ mod test_knobs;
 mod optional_proof;
 optional_proof::not_run!(
     computer_pairing_uses_an_anchor_without_room_membership_and_reconnects,
+    computer_preview_and_approval_survive_a_crash,
     two_paired_computers_that_are_idle_exchange_nothing,
 );
 
@@ -45,9 +46,10 @@ use vox_core::node::computer::{
     computer_exchange_backoff, COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED,
 };
 use vox_core::node::computer::{
-    COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
+    COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN, COMPUTER_PAIR_WITHIN as PAIR_WITHIN,
     COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
 };
+use vox_core::node::ipc::ACTOR_WITHIN;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const PASS: &str = "identity passphrase";
@@ -124,6 +126,12 @@ impl Account {
             let (ok, shown) = typed::keyring(&cmd);
             return (ok, shown.clone(), shown);
         }
+        let started = Instant::now();
+        let bound = if args.starts_with(&["computer", "pair"]) {
+            PAIR_WITHIN
+        } else {
+            ACTOR_WITHIN
+        };
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -138,6 +146,31 @@ impl Account {
             .write_all(stdin.as_bytes())
             .expect("APPARATUS: write staged input to shipped vox command");
         drop(input);
+        while child
+            .try_wait()
+            .unwrap_or_else(|e| panic!("APPARATUS: inspect shipped vox {args:?}: {e}"))
+            .is_none()
+        {
+            if started.elapsed() >= bound {
+                let _ = child.kill();
+                let out = child.wait_with_output().unwrap_or_else(|e| {
+                    panic!("APPARATUS: collect timed-out shipped vox {args:?}: {e}")
+                });
+                panic!(
+                    "PRODUCT: shipped `vox {}` was still running after its source-owned \
+                     {bound:?} {} contract; stdout: {}; stderr: {}",
+                    args.join(" "),
+                    if bound == PAIR_WITHIN {
+                        "pairing"
+                    } else {
+                        "actor-liveness"
+                    },
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let out = child
             .wait_with_output()
             .expect("APPARATUS: collect shipped vox command output");
@@ -216,6 +249,7 @@ fn wait_until(within: Duration, mut f: impl FnMut() -> bool) -> bool {
 struct Daemon {
     child: Child,
     out: PathBuf,
+    started: Instant,
 }
 
 impl Drop for Daemon {
@@ -236,9 +270,12 @@ impl Daemon {
         for (k, v) in env {
             c.env(k, v);
         }
-        if let Ok(mutant) = std::env::var("VOX_TEST_FX28_MUTANT") {
-            c.env("VOX_TEST_FX28_MUTANT", mutant);
+        if !env.iter().any(|(key, _)| *key == "VOX_TEST_FX28_MUTANT") {
+            if let Ok(mutant) = std::env::var("VOX_TEST_FX28_MUTANT") {
+                c.env("VOX_TEST_FX28_MUTANT", mutant);
+            }
         }
+        let started = Instant::now();
         let child = c
             .stdin(Stdio::null())
             .stdout(
@@ -249,7 +286,11 @@ impl Daemon {
             .spawn()
             .expect("APPARATUS: start shipped vox daemon");
         eprintln!("[test] vox daemon {args:?} pid {}", child.id());
-        Self { child, out }
+        Self {
+            child,
+            out,
+            started,
+        }
     }
 
     fn said(&self) -> String {
@@ -268,6 +309,10 @@ impl Daemon {
     /// attributable apparatus fault; an operator-requested watchdog remains available for a
     /// genuinely wedged process.
     fn expect_apparatus_event(&mut self, what: &str, f: impl Fn(&str) -> bool) {
+        self.expect_event_until(self.started + ACTOR_WITHIN, what, f);
+    }
+
+    fn expect_event_until(&mut self, deadline: Instant, what: &str, f: impl Fn(&str) -> bool) {
         loop {
             if self.said().lines().any(&f) {
                 return;
@@ -282,6 +327,12 @@ impl Daemon {
                     self.said()
                 );
             }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: the shipped process remained live but did not say {what} before its \
+                 source-owned product deadline; it said:\n{}",
+                self.said()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -291,12 +342,30 @@ impl Daemon {
         let _ = self.child.wait();
         self.said()
     }
+
+    fn crash(mut self) -> String {
+        let status = Command::new("kill")
+            .args(["-KILL", &self.child.id().to_string()])
+            .status()
+            .expect("APPARATUS: send SIGKILL to scratch daemon");
+        assert!(status.success(), "APPARATUS: SIGKILL scratch daemon");
+        self.child
+            .wait()
+            .expect("APPARATUS: reap SIGKILLed scratch daemon");
+        self.said()
+    }
 }
 
 /// Wait for test apparatus produced by one shipped command. No elapsed time decides the result:
 /// either the marker establishes the exact boundary, or an exited command/daemon names the
 /// apparatus fault. An operator can opt into the suite watchdog when diagnosing a real wedge.
-fn wait_for_command_marker(marker: &Path, command: &mut Child, daemon_pid: u32, what: &str) {
+fn wait_for_command_marker(
+    marker: &Path,
+    command: &mut Child,
+    daemon_pid: u32,
+    deadline: Instant,
+    what: &str,
+) {
     loop {
         if marker.is_file() {
             return;
@@ -311,13 +380,18 @@ fn wait_for_command_marker(marker: &Path, command: &mut Child, daemon_pid: u32, 
             daemon_alive(daemon_pid),
             "APPARATUS: daemon {daemon_pid} exited before {what}"
         );
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: the shipped command and daemon remained live but never reached {what} \
+             before the operation's source-owned product deadline"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 /// Wait for a file boundary created by the daemon-side apparatus. Process death is attributable;
 /// elapsed wall time is deliberately not the verdict.
-fn wait_for_daemon_marker(marker: &Path, daemon: &mut Daemon, what: &str) {
+fn wait_for_daemon_marker(marker: &Path, daemon: &mut Daemon, deadline: Instant, what: &str) {
     loop {
         if marker.is_file() {
             return;
@@ -332,6 +406,12 @@ fn wait_for_daemon_marker(marker: &Path, daemon: &mut Daemon, what: &str) {
                 daemon.said()
             );
         }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: the shipped daemon remained live but never reached {what} before the \
+             operation's source-owned product deadline; it said:\n{}",
+            daemon.said()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1361,6 +1441,69 @@ fn close_expired_pairing() {
     drop(stepped);
 }
 
+/// **The exact pairing preview and local approval survive a daemon crash** (ADR-038 FX-28;
+/// #1020). Two real shipped daemons reach an authenticated preview, beta approves the displayed
+/// operation, and beta is terminated before the other operator approves. After restart, shipped
+/// status must show that same peer, operation and local approval. The mutant which omits the
+/// preview/approval journal advance loses this user-visible intent at the crash boundary.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "optional two real vox daemons with production Argon2id; run in release with optional-proofs"]
+fn computer_preview_and_approval_survive_a_crash() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_FX28_MUTANT"]);
+    let a = Account::new();
+    let b = Account::new();
+    let alpha = a.make_node("alpha");
+    let beta = b.make_node("beta");
+    let mut da = Daemon::start(&a, &["--node", "alpha"], &[]);
+    let mut db = Daemon::start(&b, &["--node", "beta"], &[]);
+    da.expect_apparatus_event("node alpha is Ready", |line| {
+        line.contains("alpha is Ready")
+    });
+    db.expect_apparatus_event("node beta is Ready", |line| line.contains("beta is Ready"));
+    computer(&a, &["personal", "alpha"]);
+    computer(&b, &["personal", "beta"]);
+    let invitation = computer(&a, &["invite"]);
+    let link = invitation["invite_link"]
+        .as_str()
+        .expect("PRODUCT: Add Computer did not show a pairing link");
+    let preview = computer(&b, &["pair", link, "--preview"]);
+    let operation = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: pairing preview names no operation")
+        .to_owned();
+    let peer = preview["pairing"]["peer"].clone();
+    let approved = computer(&b, &["approve", &operation]);
+    assert!(
+        approved["pairing"]["operation_id"] == operation
+            && approved["pairing"]["approved_here"] == true,
+        "APPARATUS: shipped approval did not stage the displayed operation before crash: {approved}"
+    );
+    let _ = db.crash();
+    let restarted = Instant::now();
+    let mut db = Daemon::start(&b, &["--node", "beta"], &[]);
+    db.expect_event_until(
+        restarted + RETURN_WITHIN,
+        "node beta is Ready after the preview/approval crash",
+        |line| line.contains("beta is Ready"),
+    );
+    let after = computer(&b, &["status"]);
+    assert!(
+        restarted.elapsed() <= RETURN_WITHIN
+            && after["pairing"]["operation_id"] == operation
+            && after["pairing"]["peer"] == peer
+            && after["pairing"]["approved_here"] == true,
+        "PRODUCT [FX28 preview-approval-crash]: after beta crashed with the authenticated preview and its local approval recorded, restarted shipped status did not show the same peer, operation and approval within {RETURN_WITHIN:?}: before {approved}; after {after}; daemon {}",
+        db.said()
+    );
+    // Keep both identities live through the verdict; setup never substitutes an in-process node.
+    assert!(
+        !alpha.is_empty() && !beta.is_empty() && daemon_alive(da.child.id()),
+        "APPARATUS: a staged shipped identity or the other daemon disappeared before the crash verdict"
+    );
+}
+
 /// CT-11, CT-9 and FX-28: two installations on opposite address families pair through a public
 /// anchor. With the remote daemon and anchor gone there is no retained computer connection; two
 /// local policy revisions overlap the failed exchange. The remote daemon returns while the anchor
@@ -1397,6 +1540,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let start_anchor = |listen: &str| {
         let out = anchor.data.with_extension("anchor.out");
         let f = std::fs::File::create(&out).expect("APPARATUS: anchor transcript");
+        let started = Instant::now();
         let child = anchor
             .cmd(&["node", "--listen", listen, "--serve", "anyone"])
             .stdin(Stdio::null())
@@ -1407,7 +1551,11 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             .stderr(f)
             .spawn()
             .expect("APPARATUS: start scratch anchor");
-        let mut process = Daemon { child, out };
+        let mut process = Daemon {
+            child,
+            out,
+            started,
+        };
         process.expect_apparatus_event("its advertised anchor address", |line| {
             line.contains('@') && line.contains("/udp/")
         });
@@ -1614,6 +1762,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     wait_for_daemon_marker(
         &first_flight_engaged,
         &mut left,
+        first_deadline,
         "the first revision's exchange entered its exact held flight",
     );
     let staged = application_toward(&a, &b_id);
@@ -1860,7 +2009,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let returned_after = first_changed.elapsed();
     assert!(
         converged && returned_after <= RETURN_WITHIN,
-        "PRODUCT: after only the remote anchor returned, the computer with no retained connection did not show both superseding policy revisions within the first revision's {RETURN_WITHIN:?} causal deadline (observed after {returned_after:?}); left: {}; right: {}; anchor: {}",
+        "PRODUCT [FX28 stale-flight-newer-obligation]: after only the remote anchor returned, the computer with no retained connection did not show both superseding policy revisions within the first revision's {RETURN_WITHIN:?} causal deadline (observed after {returned_after:?}); left: {}; right: {}; anchor: {}",
         computer(&a, &["status"]),
         computer(&b, &["status"]),
         relay.said()
@@ -1884,6 +2033,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .to_owned();
     std::fs::write(&operator_reserved_arm, b"armed\n")
         .expect("APPARATUS: arm the operator reserve-to-handle-install boundary");
+    let race_preview_started = Instant::now();
     let mut raced_preview = a
         .cmd(&["computer", "pair", &race_link, "--preview", "--json"])
         .stdin(Stdio::null())
@@ -1895,6 +2045,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         &operator_reserved_engaged,
         &mut raced_preview,
         left.child.id(),
+        race_preview_started + PAIR_WITHIN,
         "the operator held its exact reservation before handle installation",
     );
     assert_eq!(
@@ -1919,6 +2070,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     wait_for_daemon_marker(
         &operator_superseded,
         &mut left,
+        race_changed + RETURN_WITHIN,
         "the newer policy revision superseded the held operator reservation",
     );
     assert_eq!(
@@ -3443,6 +3595,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
         "VOX_TEST_FX28_MUTANT",
+        "VOX_TEST_FX28_STOPPED_READER_ARM_FILE",
+        "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
     ]);
     let a = Account::new();
     let b = Account::new();
@@ -3481,6 +3635,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         status_accepted.display(),
         status_returned.display()
     );
+    let stopped_reader_arm = a.data.join("fx28-stopped-reader-arm");
+    let stopped_reader_answered = b.data.join("fx28-stopped-reader-all-answers");
+    let stopped_reader_arm_spec = stopped_reader_arm.to_string_lossy().into_owned();
+    let stopped_reader_answered_spec = stopped_reader_answered.to_string_lossy().into_owned();
     let mut da = Daemon::start(
         &a,
         &["--node", "alpha"],
@@ -3488,6 +3646,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_LISTEN", &listen_a),
             ("VOX_TEST_ADVERTISE", &advertised),
             ("VOX_TEST_MARK_COMPUTER_STATUS_FILE", &status_spec),
+            (
+                "VOX_TEST_FX28_STOPPED_READER_ARM_FILE",
+                &stopped_reader_arm_spec,
+            ),
         ],
     );
     let mut db = Daemon::start(
@@ -3497,6 +3659,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_LISTEN", &listen_b),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", &hold_spec),
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", &reply_spec),
+            (
+                "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
+                &stopped_reader_answered_spec,
+            ),
         ],
     );
     // Each node is Ready before it is chosen as its computer's personal node.
@@ -3508,6 +3674,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // not an arbitrary wait followed by an unattributed deadman.
     std::fs::write(&status_arm, b"armed\n")
         .expect("APPARATUS: arm the computer-status progress boundary");
+    let status_started = Instant::now();
     let mut status_command = a
         .cmd(&["computer", "status", "--json"])
         .stdin(Stdio::null())
@@ -3519,6 +3686,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &status_accepted,
         &mut status_command,
         da.child.id(),
+        status_started + ACTOR_WITHIN,
         "the daemon accepted the computer status read",
     );
     let (listed_ok, listed, listed_err) = a.run(&["node", "list"], "");
@@ -3591,16 +3759,26 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             &listen_b,
             &hold_spec,
             &reply_spec,
+            &stopped_reader_answered_spec,
         ),
     );
 
     // ---- a change on either daemon shows on both despite the clock skew (#1020) -----------
     let gamma = a.make_node("gamma");
     let nodes_a = [("alpha", alpha.as_str()), ("gamma", gamma.as_str())];
+    std::fs::write(
+        &stopped_reader_arm,
+        b"open real management streams and stop reading\n",
+    )
+    .expect("APPARATUS: arm the real stopped-reader peer");
     change_shows_on_both(
         (&a, &da, &nodes_a),
         (&b, &db, &[("beta", beta.as_str())]),
         "gamma",
+    );
+    assert!(
+        stopped_reader_answered.is_file(),
+        "APPARATUS: the answering shipped daemon did not observe one unread error response in every bounded management slot"
     );
     let delta = b.make_node("delta");
     let nodes_b = [("beta", beta.as_str()), ("delta", delta.as_str())];
@@ -4067,11 +4245,16 @@ fn change_shows_on_both(
         }
         assert!(
             !shown && elapsed < CHANGE_SHOWN_WITHIN,
-            "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after `vox node attach {new_node}` was asked, {}'s \
+            "{}: {CHANGE_SHOWN_WITHIN:?} after `vox node attach {new_node}` was asked, {}'s \
              daemon had not both carried revision {revision_here} to {} and applied it there \
              (ADR-038 FX-28, #1020; shown {shown} after {elapsed:?}): carried {carried}; remote \
              names node {names_it}; remote bindings current {}; keyrings {}; exchange {}; remote \
              nodes {}\nchanger daemon: {}\nremote daemon: {}",
+            if new_node == "gamma" {
+                "PRODUCT [FX28 stopped-reader-write]"
+            } else {
+                "PRODUCT"
+            },
             names_here[0],
             names_there[0],
             roster_current(&status, &names_there),
@@ -4120,10 +4303,11 @@ fn free_v6_udp_port() -> u16 {
 /// computers confirm each other again (staging). Returns beta's new daemon.
 fn a_restart_derives_nothing(
     (a, da): (&Account, &Daemon),
-    (b, db, nodes_b, listen_b, hold_spec, reply_spec): (
+    (b, db, nodes_b, listen_b, hold_spec, reply_spec, stopped_reader_answered): (
         &Account,
         Daemon,
         &[(&str, &str)],
+        &str,
         &str,
         &str,
         &str,
@@ -4145,15 +4329,28 @@ fn a_restart_derives_nothing(
             ("VOX_TEST_CLOCK_STEP_MS", REMOTE_CLOCK_SKEW_MS),
             ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", reply_spec),
+            (
+                "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
+                stopped_reader_answered,
+            ),
         ],
     );
     for name in &names_b {
         let ready = format!("{name} is Ready");
-        db.expect_apparatus_event(&format!("node {name} is Ready"), |line| {
-            line.contains(&ready)
-        });
+        db.expect_event_until(
+            restarted + RETURN_WITHIN,
+            &format!("node {name} is Ready after restart"),
+            |line| line.contains(&ready),
+        );
     }
     let after = bindings_shown(&computer(b, &["status"]));
+    assert!(
+        restarted.elapsed() <= RETURN_WITHIN,
+        "PRODUCT: {RETURN_WITHIN:?} after beta's daemon restart was triggered, its Ready nodes \
+         and shipped computer status had still not exposed the unchanged durable bindings: \
+         before {before:?}; after {after:?}; daemon {}",
+        db.said()
+    );
     assert!(
         after == before,
         "PRODUCT: a restart of beta's daemon with nothing changed derived a binding again, or lost \
@@ -4172,18 +4369,21 @@ fn a_restart_derives_nothing(
         after.0,
         after.1
     );
-    assert!(
-        wait_until(RETURN_WITHIN, || {
-            computer(a, &["status"])["state"] == "confirmed"
-                && computer(b, &["status"])["state"] == "confirmed"
-        }),
-        "PRODUCT: after beta's daemon restarted the two computers did not both confirm again \
-         within {RETURN_WITHIN:?}: alpha's {}, beta's {}\n{}\n{}",
-        computer(a, &["status"])["state"],
-        computer(b, &["status"])["state"],
-        da.said(),
-        db.said()
-    );
+    loop {
+        let alpha = computer(a, &["status"])["state"].clone();
+        let beta = computer(b, &["status"])["state"].clone();
+        if alpha == "confirmed" && beta == "confirmed" {
+            break;
+        }
+        assert!(
+            restarted.elapsed() < RETURN_WITHIN,
+            "PRODUCT: {RETURN_WITHIN:?} after beta's daemon restart was triggered, the \
+             computers were still not confirmed: alpha {alpha}, beta {beta}\n{}\n{}",
+            da.said(),
+            db.said()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     db
 }
 
@@ -4556,7 +4756,7 @@ fn delayed_node_does_not_make_a_late_pass(
         .expect("PRODUCT: beta's status lost delta's binding after the expired actor work resumed");
     assert_eq!(
         delta_binding_after, delta_binding_before,
-        "PRODUCT: after its causal deadline and visible detach, releasing delta's exact queued actor work still derived or saved the expired policy"
+        "PRODUCT [FX28 stale-tick-authority]: after its causal deadline and visible detach, releasing delta's exact queued actor work still derived or saved the expired policy"
     );
     forward.set_delay(Duration::ZERO);
 }

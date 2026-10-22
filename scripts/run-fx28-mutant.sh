@@ -4,8 +4,25 @@
 set -eu
 
 case "${1-}" in
-  preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority)
+  preview-approval-not-durable)
     mutant=$1
+    journey=computer_preview_and_approval_survive_a_crash
+    verdict='PRODUCT [FX28 preview-approval-crash]:'
+    ;;
+  stopped-reader-fresh-write)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 stopped-reader-write]:'
+    ;;
+  stale-flight-clears-newer)
+    mutant=$1
+    journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
+    verdict='PRODUCT [FX28 stale-flight-newer-obligation]:'
+    ;;
+  stale-tick-authority)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 stale-tick-authority]:'
     ;;
   *)
     printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority" >&2
@@ -22,7 +39,7 @@ set +e
 cargo test --release -p vox-tui \
   --features optional-proofs,test-knobs \
   --test nodes_of_one_daemon_proof \
-  two_paired_computers_that_are_idle_exchange_nothing \
+  "$journey" \
   -- --ignored --exact --nocapture >"$artifact" 2>&1
 status=$?
 set -e
@@ -31,8 +48,8 @@ if [ "$status" -eq 0 ]; then
   printf 'APPARATUS: FX-28 mutant %s stayed green; output: %s\n' "$mutant" "$artifact" >&2
   exit 1
 fi
-if ! grep -q 'PRODUCT:' "$artifact"; then
-  printf 'APPARATUS: FX-28 mutant %s stopped without an attributed PRODUCT red; output: %s\n' "$mutant" "$artifact" >&2
+if ! grep -Fq "$verdict" "$artifact"; then
+  printf 'APPARATUS: FX-28 mutant %s stopped without its intended verdict %s; output: %s\n' "$mutant" "$verdict" "$artifact" >&2
   exit 1
 fi
-printf 'FX-28 mutant %s: independent PRODUCT red (%s)\n' "$mutant" "$artifact"
+printf 'FX-28 mutant %s: intended independent verdict %s (%s)\n' "$mutant" "$verdict" "$artifact"

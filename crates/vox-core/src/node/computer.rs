@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 mod pairing;
 pub use pairing::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
-    ExchangeRecord, Management, PairingPreview,
+    ExchangeRecord, Management, PairingPreview, COMPUTER_PAIR_WITHIN,
 };
 
 /// A trust change must either be applied by an attached node or make that node visibly no longer
@@ -2304,6 +2304,29 @@ impl Computer {
             || (self.storage_ready().is_ok()
                 && !Self::revision_expired(&s)
                 && s.policy_revision == applied)
+    }
+
+    /// Execute one synchronous irreversible publication only while `node`'s actor projection is
+    /// current. The policy-state lock stays held through `publish`, so a durable revocation cannot
+    /// land between the final revision/binding check and the room-log or delivery-queue write.
+    /// Callers must complete every await (connection, prekey, channel lock) before entering.
+    pub(crate) fn publish_with_current_authority<T>(
+        &self,
+        applied: u64,
+        node: Digest32,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = lock(&self.state);
+        let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
+        let current = unmanaged
+            || (self.storage_ready().is_ok()
+                && !Self::revision_expired(&state)
+                && state.policy_revision == applied
+                && state
+                    .derived
+                    .get(&node)
+                    .is_some_and(|derived| derived.revision == state.policy_revision));
+        current.then(publish)
     }
 
     pub(crate) fn storage_ready(&self) -> Result<()> {

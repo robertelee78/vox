@@ -158,15 +158,18 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
 | `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, a missed revision becomes ordinary trust, or a marker arriving after remote application fails to revoke the exact late-derived grant across restart. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
 FX-28's four executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`,
-`stale-flight-clears-newer`, or `stale-tick-authority`. The runner accepts only a non-zero journey
-result containing an attributed `PRODUCT:` red and writes the full transcript under
-`target/fx28-mutants/`. These are on-demand diagnostics, not CI or release gates, and are serialized
-like the journey itself.
+`stale-flight-clears-newer`, or `stale-tick-authority`. Each mode selects the journey which stages
+that fault and accepts only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is
+an apparatus failure, not evidence for the mutant. `stopped-reader-fresh-write` uses one real
+shipped daemon as an authenticated peer which fills the other daemon's bounded management slots
+and leaves every response unread. Full transcripts are written under `target/fx28-mutants/`.
+These are on-demand diagnostics, not CI or release gates, and are serialized like the journeys.
 
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 
