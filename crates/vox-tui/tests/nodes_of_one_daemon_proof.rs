@@ -3752,15 +3752,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // ---- restart under skew before proving changes in both directions --------------------
     let db = a_restart_derives_nothing(
         (&a, &da),
-        (
-            &b,
-            db,
-            &[("beta", beta.as_str())],
-            &listen_b,
-            &hold_spec,
-            &reply_spec,
-            &stopped_reader_answered_spec,
-        ),
+        RestartComputerSide {
+            account: &b,
+            daemon: db,
+            nodes: &[("beta", beta.as_str())],
+            listen: &listen_b,
+            hold_spec: &hold_spec,
+            reply_spec: &reply_spec,
+            stopped_reader_answered: &stopped_reader_answered_spec,
+        },
     );
 
     // ---- a change on either daemon shows on both despite the clock skew (#1020) -----------
@@ -4344,18 +4344,29 @@ fn free_v6_udp_port() -> u16 {
 /// every binding at the same policy revision and the same derived
 /// moment as before the restart: the record survived, and nothing was derived again. Both
 /// computers confirm each other again (staging). Returns beta's new daemon.
+struct RestartComputerSide<'a> {
+    account: &'a Account,
+    daemon: Daemon,
+    nodes: &'a [(&'a str, &'a str)],
+    listen: &'a str,
+    hold_spec: &'a str,
+    reply_spec: &'a str,
+    stopped_reader_answered: &'a str,
+}
+
 fn a_restart_derives_nothing(
     (a, da): (&Account, &Daemon),
-    (b, db, nodes_b, listen_b, hold_spec, reply_spec, stopped_reader_answered): (
-        &Account,
-        Daemon,
-        &[(&str, &str)],
-        &str,
-        &str,
-        &str,
-        &str,
-    ),
+    side: RestartComputerSide<'_>,
 ) -> Daemon {
+    let RestartComputerSide {
+        account: b,
+        daemon: db,
+        nodes: nodes_b,
+        listen: listen_b,
+        hold_spec,
+        reply_spec,
+        stopped_reader_answered,
+    } = side;
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
     let before = bindings_shown(&computer(b, &["status"]));
     assert!(
