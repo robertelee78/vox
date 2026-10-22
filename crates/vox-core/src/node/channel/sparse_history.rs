@@ -21,6 +21,38 @@ pub(crate) struct HistoryHeadPage {
     pub next: Option<Digest32>,
 }
 
+/// Test-only exact crash boundary for FX-30: when the named gate file exists, a received
+/// key-package batch writes `<gate-with-extension-reached>` after its commit and does not advance
+/// the round while the gate remains. A shipped proof can then SIGKILL the real daemon after that
+/// exact commit and before a later received-entry flush could carry it. Compiled out of packaged
+/// binaries (V210-105).
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_AFTER_RECEIVED_KEY_ENV: &str = "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn hold_after_received_key_commit() {
+    let Some(gate) = std::env::var_os(TEST_HOLD_AFTER_RECEIVED_KEY_ENV) else {
+        return;
+    };
+    let gate = std::path::PathBuf::from(gate);
+    if !gate.exists() {
+        return;
+    }
+    let reached = gate.with_extension("reached");
+    std::fs::write(&reached, b"received key batch committed\n").unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not mark the received-key crash boundary at {}: {error}",
+            reached.display()
+        )
+    });
+    while gate.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(feature = "test-knobs"))]
+fn hold_after_received_key_commit() {}
+
 /// A missing local body is not an authenticated expiry claim.
 pub(crate) enum HistoryPayload {
     Missing,
@@ -848,6 +880,12 @@ impl ChannelState {
             }
             batch.commit()?;
             self.entries.committed();
+            if kind == SignedEntryKind::KeyPackage
+                && entry.payload.is_some()
+                && key_package_for(&entry, &self.me())
+            {
+                hold_after_received_key_commit();
+            }
             // The settled-tip index and presence update are now durable in the same Batch.
             // A source-only entry cannot change membership, and a late earlier effect must
             // not move the applied tail backward past a later return/content statement.
@@ -1049,6 +1087,9 @@ impl ChannelState {
             }
             batch.commit()?;
             self.entries.committed();
+            if kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me()) {
+                hold_after_received_key_commit();
+            }
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
                 self.key_packages.published(self.next_log_id);

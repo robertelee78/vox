@@ -66,7 +66,9 @@
 //!   he released), `vox trust list`, `vox room sessions --json`, and the room's
 //!   `received_key_generations` in `vox status --json`. Alice: (1) `vox trust add carol`, then
 //!   the kill; (2) her Session opened through the shipped hook and listed, then the kill; (3)
-//!   bob's first post read, bob's daemon frozen so nothing can be fetched again, then the kill;
+//!   bob's first sender-key batch committed at an exact test-only hold (compiled out of packaged
+//!   Vox), bob's daemon frozen so nothing can be fetched again, then the kill before the receive
+//!   round can perform its generic end flush;
 //!   (4) [`CRASH_POSTS`] own posts, then the kill. Bob: (5) alice posts once more and the proof
 //!   waits until her own row says it is held on his node (`vox room read --json`'s `held`,
 //!   ADR-028 R-6: bob's own word in a sync, which the design flushes before); his daemon is
@@ -625,9 +627,20 @@ struct Ruled {
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     watchdog::arm();
-    test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
-    let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
+    test_knobs::require(&[
+        "VOX_TEST_NO_NEARBY",
+        "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
+    ]);
     let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let key_hold = t.path().join("hold-after-received-key");
+    let key_reached = key_hold.with_extension("reached");
+    let unheard = [
+        ("VOX_TEST_NO_NEARBY", "1".to_owned()),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
+            key_hold.to_string_lossy().into_owned(),
+        ),
+    ];
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
     let (carol, carol_fp) = identity(t.path(), "carol");
@@ -717,39 +730,43 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "(2) a Session record was the last write",
     );
 
-    // ---- (3) a received key, last: bob's first post, read; bob frozen through the restart -----
+    // ---- (3) a received key, last: exact post-commit hold; bob frozen through the restart -----
+    std::fs::write(&key_hold, b"hold\n")
+        .expect("APPARATUS: cannot arm the received-key crash boundary");
     post(&bob, &room, "from bob");
-    assert!(
-        until_reads(&alice, &room, "from bob", APPARATUS_WATCHDOG),
-        "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice did not read bob's post, so received-key \
-         durability was not staged; no product verdict: she reads {:?}",
-        read(&alice, &room)
-    );
-    let keys = received_key_generations(&alice, &room);
-    assert!(
-        keys >= 1,
-        "PRODUCT (staging): alice reads bob's post yet `vox status --json` counts no received \
-         key generation for the room, so no key record could be staged"
-    );
+    let staged_at = Instant::now();
+    while !key_reached.exists() {
+        assert!(
+            staged_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice did not mark the exact committed \
+             received-key boundary; received-key durability was not staged, so no product verdict"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     ruled.from_bob = true;
-    ruled.keys = Some(keys);
+    // Bob has made exactly his first sender generation; no other peer has posted to Alice.
+    ruled.keys = Some(1);
     let bob_pid = bob_d.0.id().to_string();
     signal(&bob_pid, "STOP");
-    let alice_d = crash_and_restart(
-        alice_d,
+    drop(alice_d);
+    std::fs::remove_file(&key_hold)
+        .expect("APPARATUS: cannot release the received-key hold after SIGKILL");
+    println!(
+        "[proof] alice-3: the daemon killed at the exact received-key commit boundary; bob frozen"
+    );
+    let alice_d = daemon(
         &alice,
         "alice-3",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
         &alice_at,
         &unheard,
-        &room,
-        "she read bob's post; bob's daemon frozen",
     );
     ruled_set_intact(
         &alice,
         "alice-3",
         &room,
         &ruled,
-        "(3) a received key was the last write, bob frozen",
+        "(3) a received key was the last write before the round's generic flush, bob frozen",
     );
     signal(&bob_pid, "CONT");
 
@@ -998,11 +1015,9 @@ fn crash_and_restart(
 /// Everything of the ruled set staged so far, read back as a person would after the crash (e):
 /// the room open in `vox room list`, the own and received rows, the trust, the Session, the key.
 fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str) {
-    let listed = room_list_line(dir, room);
-    assert_open_line(&listed, room, &format!("{tag}, after the crash ({when})"));
     // Check the key through the shipped status surface before attempting to render the post that
-    // uses it. A key-only mutant therefore reaches its own assertion rather than being hidden by
-    // the later, deliberately combined post-or-key readability verdict.
+    // uses it or requiring the room to finish preparing. A key-only mutant therefore reaches its
+    // own assertion rather than being hidden by any later room/read symptom.
     if let Some(keys) = ruled.keys {
         let now = received_key_generations(dir, room);
         assert!(
@@ -1012,6 +1027,8 @@ fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str
              before the crash and {now} after {tag}'s restart"
         );
     }
+    let listed = room_list_line(dir, room);
+    assert_open_line(&listed, room, &format!("{tag}, after the crash ({when})"));
     let rows = read(dir, room);
     assert!(
         holds(&rows, "kept", ruled.kept) == ruled.kept,
