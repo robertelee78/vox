@@ -1926,6 +1926,8 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .child
         .wait()
         .expect("APPARATUS: stopped anchor did not exit");
+    let before_late_right = full_roster(&computer(&b, &["status"]))
+        .expect("APPARATUS: right status did not expose its pre-expiry binding evidence");
     let late = a.make_node("anchor-return-late");
     let revision_before_late = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
     let (ok, out, err) = a.run(
@@ -1967,14 +1969,16 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         let left_status = computer(&a, &["status"]);
         let right_status = computer(&b, &["status"]);
         let application = application_toward(&a, &b_id);
+        let remote_application = application_toward(&b, &a_id);
         let repaired = application["last_started_exchange"]["sent_revision"]
             .as_u64()
             .is_some_and(|revision| revision >= late_revision)
-            && right_status["nodes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|node| node["fingerprint"] == late.as_str());
+            && application["missed_revision"] == late_revision
+            && application["repaired_late"] == true
+            && application["convergence_state"] == "repaired-late"
+            && remote_application["missed_revision"] == right_status["revision"]
+            && remote_application["convergence_state"] == "expired"
+            && right_status["state"] == "expired";
         if repaired {
             assert!(
                 application["exchange_failures"].as_u64().unwrap_or(0) > 0
@@ -1982,6 +1986,14 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
                         .as_str()
                         .is_some_and(|problem| problem.contains("repaired state only after")),
                 "PRODUCT: the late exchange repaired revision {late_revision} but cleared its missed causal contract: status {left_status}; application {application}"
+            );
+            let after_late_right = full_roster(&right_status).unwrap_or_else(|| {
+                panic!("PRODUCT: the expired remote status lost its structural binding evidence: {right_status}")
+            });
+            assert_eq!(
+                after_late_right.get("after-remote-anchor-b"),
+                before_late_right.get("after-remote-anchor-b"),
+                "PRODUCT: the remote actor derived or saved ordinary trust from expired revision {late_revision}: before {before_late_right:?}; after {after_late_right:?}"
             );
             break;
         }
@@ -2058,16 +2070,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     loop {
         if full_roster(&computer(&a, &["status"])) == Some(before_restart.0.clone())
             && full_roster(&computer(&b, &["status"])) == Some(before_restart.1.clone())
-            && exact_grants(
-                &b,
-                "after-remote-anchor-b",
-                &[
-                    (first.as_str(), "read"),
-                    (second.as_str(), "read"),
-                    (third.as_str(), "read"),
-                    (late.as_str(), "read"),
-                ],
-            )
+            && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
         {
             break;
         }
@@ -2085,6 +2088,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let restarted_late = computer(&a, &["status"]);
+    let restarted_remote = computer(&b, &["status"]);
     assert!(
         restarted_late["problem"]
             .as_str()
@@ -2092,8 +2096,74 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             && application_toward(&a, &b_id)["exchange_failures"]
                 .as_u64()
                 .unwrap_or(0)
-                > 0,
-        "PRODUCT: restarting the daemon cleared the durable missed causal contract without a newer policy revision: {restarted_late}"
+                > 0
+            && application_toward(&a, &b_id)["missed_revision"] == late_revision
+            && application_toward(&a, &b_id)["convergence_state"] == "repaired-late"
+            && application_toward(&b, &a_id)["missed_revision"]
+                == restarted_remote["revision"]
+            && matches!(
+                application_toward(&b, &a_id)["convergence_state"].as_str(),
+                Some("expired" | "repaired-late")
+            ),
+        "PRODUCT: restarting the daemons cleared the exact durable missed causal contract without a newer policy revision: left {restarted_late}; right {restarted_remote}"
+    );
+
+    // A newer operator change is the only replacement cause. Before its exchange, status names
+    // the old miss as replaced; after its own timely exchange both computers name convergence
+    // and only then may the remote actor derive the formerly-late grant.
+    stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
+    relay
+        .child
+        .wait()
+        .expect("APPARATUS: stopped anchor did not exit before replacement staging");
+    let replacement = a.make_node("after-expired-revision");
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "after-expired-revision",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(ok, "PRODUCT: attach replacement-cause node: {out}{err}");
+    let replaced = application_toward(&a, &b_id);
+    assert!(
+        replaced["missed_revision"] == late_revision
+            && replaced["convergence_state"] == "replaced",
+        "PRODUCT: a newer policy cause did not structurally replace exact expired revision {late_revision}: {replaced}"
+    );
+    relay = start_anchor(&anchor_listen);
+    wait_for_current_anchor_peers(&mut relay, &[&a_id, &b_id]);
+    let final_roster = [
+        ("anchor-return-first", first.as_str()),
+        ("anchor-return-second", second.as_str()),
+        ("anchor-return-third", third.as_str()),
+        ("anchor-return-late", late.as_str()),
+        ("after-expired-revision", replacement.as_str()),
+        ("after-remote-anchor-b", bob.as_str()),
+    ];
+    let final_grants = [
+        (first.as_str(), "read"),
+        (second.as_str(), "read"),
+        (third.as_str(), "read"),
+        (late.as_str(), "read"),
+        (replacement.as_str(), "read"),
+    ];
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let left_status = computer(&a, &["status"]);
+            let right_status = computer(&b, &["status"]);
+            exact_roster(&left_status, &final_roster)
+                && exact_roster(&right_status, &final_roster)
+                && exact_grants(&b, "after-remote-anchor-b", &final_grants)
+                && application_toward(&a, &b_id)["convergence_state"] == "converged"
+                && application_toward(&b, &a_id)["convergence_state"] == "converged"
+        }),
+        "PRODUCT: the newer cause did not converge after replacing expired revision {late_revision}: left {}; right {}",
+        computer(&a, &["status"]),
+        computer(&b, &["status"])
     );
     for (account, node) in [(&a, "anchor-return-first"), (&b, "after-remote-anchor-b")] {
         let (ok, out, err) = account.run(&["room", "list", "--node", node], "");
@@ -3174,10 +3244,12 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// a product verdict. Measured before this (2026-10-20, the decider's work Mac): the pairing
 /// manager exchanged the whole signed history with every computer every 2 s and re-verified it,
 /// and a 1 s tick re-derived every attached node's binding with nothing changed.
-/// Finally, a test-only held actor message keeps delta queued for 15 s while epsilon attaches.
+/// Finally, a test-only causal release keeps delta's exact actor message queued while epsilon
+/// attaches.
 /// Within [`CHANGE_SHOWN_WITHIN`], after all final observations finish, beta has applied epsilon
 /// on its healthy node and `vox node list` shows delta no longer attached. Cleanup may continue;
-/// queued room/node work cannot turn a late observation into an apparent pass.
+/// queued room/node work cannot turn a late observation into an apparent pass. The proof then
+/// releases that exact message and proves its expired work did not move delta's durable binding.
 ///
 /// Independent mutants: (1) remove the need filter in `Management::retry`: extra attempts before
 /// the fallback boundary turn PRODUCT red (unchanged means no network); (2) remove the
@@ -3220,8 +3292,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // Beta keeps one endpoint for the whole proof, restart included. A reach that moved would be
     // a change of its own, and the restart claim is that nothing is derived with none.
     let listen_b = format!("[::1]:{}", free_v6_udp_port());
-    let hold_marker = b.data.join("hold-delta-computer-policy");
-    let hold_spec = format!("delta\t15000\t{}", hold_marker.display());
+    let hold_arm = b.data.join("hold-delta-computer-policy-arm");
+    let hold_engaged = b.data.join("hold-delta-computer-policy-engaged");
+    let hold_release = b.data.join("hold-delta-computer-policy-release.sock");
+    let hold_spec = format!(
+        "delta\t{}\t{}\t{}",
+        hold_arm.display(),
+        hold_engaged.display(),
+        hold_release.display()
+    );
     let reply_marker = b.data.join("hold-delta-computer-policy-reply");
     let reply_spec = format!("delta\t15000\t{}", reply_marker.display());
     let status_arm = a.data.join("mark-computer-status");
@@ -3539,7 +3618,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     delayed_node_does_not_make_a_late_pass(
         (&a, &da, &nodes_a),
         (&b, &db, &nodes_b),
-        &hold_marker,
+        &hold_arm,
+        &hold_engaged,
+        &hold_release,
         &forward,
     );
 }
@@ -4184,13 +4265,18 @@ fn change_reaches_a_live_computer(
 fn delayed_node_does_not_make_a_late_pass(
     (a, da, _nodes_a): (&Account, &Daemon, &[(&str, &str)]),
     (b, db, _nodes_b): (&Account, &Daemon, &[(&str, &str)]),
-    hold_marker: &Path,
+    hold_arm: &Path,
+    hold_engaged: &Path,
+    hold_release: &Path,
     forward: &port_forward::PortForward,
 ) {
     let epsilon = a.make_node("epsilon");
     let b_id = computer_id(b);
     let before_revision = computer(a, &["status"])["revision"].as_u64().unwrap_or(0);
-    std::fs::write(hold_marker, b"hold delta's next policy message")
+    let delta_binding_before = full_roster(&computer(b, &["status"]))
+        .and_then(|roster| roster.get("delta").cloned())
+        .expect("APPARATUS: beta's status did not expose delta's binding before the held change");
+    std::fs::write(hold_arm, b"hold delta's next policy message")
         .unwrap_or_else(|e| panic!("APPARATUS: could not stage the held delta marker: {e}"));
     forward.close();
     let (ok, out, err) = a.run(
@@ -4258,6 +4344,10 @@ fn delayed_node_does_not_make_a_late_pass(
             let elapsed = observed.elapsed();
             let returned = restored.elapsed();
             if shown && elapsed <= CHANGE_SHOWN_WITHIN && returned <= RETURN_WITHIN {
+                assert!(
+                    hold_engaged.is_file(),
+                    "APPARATUS: delta was not causally held in its computer-policy actor before the non-attached verdict"
+                );
                 println!(
                     "[proof] after {returned:?} from saturated-backoff heal and {elapsed:?} from exchange, beta applied epsilon on its healthy node and lists held delta non-attached ({delta_line:?}); bounds {RETURN_WITHIN:?}/{CHANGE_SHOWN_WITHIN:?}"
                 );
@@ -4288,6 +4378,26 @@ fn delayed_node_does_not_make_a_late_pass(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    std::os::unix::net::UnixStream::connect(hold_release).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not release delta's held computer-policy actor at {}: {e}",
+            hold_release.display()
+        )
+    });
+    while hold_engaged.is_file() {
+        assert!(
+            daemon_alive(db.child.id()),
+            "APPARATUS: beta daemon exited before delta consumed the causal actor release"
+        );
+        std::thread::yield_now();
+    }
+    let delta_binding_after = full_roster(&computer(b, &["status"]))
+        .and_then(|roster| roster.get("delta").cloned())
+        .expect("PRODUCT: beta's status lost delta's binding after the expired actor work resumed");
+    assert_eq!(
+        delta_binding_after, delta_binding_before,
+        "PRODUCT: after its causal deadline and visible detach, releasing delta's exact queued actor work still derived or saved the expired policy"
+    );
     forward.set_delay(Duration::ZERO);
 }
 

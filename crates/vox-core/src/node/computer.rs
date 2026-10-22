@@ -16,7 +16,9 @@ use crate::identity::composite::{
     CompositePublicKey, CompositeSignature, RootSigner, SoftwareRootSigner,
 };
 use crate::identity::rng::random_array;
-use crate::node::paths::{create_private_dir, write_private_file, Account};
+use crate::node::paths::{
+    create_private_dir, write_private_file, write_private_file_checked, Account,
+};
 use zeroize::Zeroizing;
 
 mod pairing;
@@ -2298,6 +2300,18 @@ impl Computer {
     /// Bind an already unlocked local node. The signer never crosses the daemon's actor boundary.
     /// This does not unlock or create a node, enroll a computer, or authorize an unapproved group.
     pub fn bind_node(&self, signer: &dyn RootSigner, name: &str) -> Result<()> {
+        self.bind_node_until(
+            signer,
+            name,
+            std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+        )
+    }
+    pub(crate) fn bind_node_until(
+        &self,
+        signer: &dyn RootSigner,
+        name: &str,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         let Some(group) = self.binding_group() else {
             return Ok(());
         };
@@ -2308,7 +2322,7 @@ impl Computer {
         if self.binding_current(&key) {
             return Ok(());
         }
-        self.change(|s| {
+        self.change_until(deadline, |s| {
             if s.quarantined.contains(&local) {
                 return Ok(());
             }
@@ -2415,6 +2429,14 @@ impl Computer {
             return Ok(None);
         }
         self.storage_ready()?;
+        if s.missed_exchanges
+            .values()
+            .any(|(revision, _)| *revision == s.revision)
+        {
+            return Err(Error::Profile(
+                "this policy revision expired before convergence; a newer policy change must replace it",
+            ));
+        }
         // Derived once per revision (ADR-038 FX-28): every input of the plan moves the
         // revision when it changes (`fold_history`, `retain_roster`, `merge`), so a plan at the
         // current revision is the plan.
@@ -2426,6 +2448,13 @@ impl Computer {
         let plan = Self::derive_plan(&s, self.signer.fingerprint(), node)?;
         lock(&self.plans).insert(node, (s.revision, plan.clone()));
         Ok(Some(plan))
+    }
+
+    pub(crate) fn current_revision_expired(&self) -> bool {
+        let s = lock(&self.state);
+        s.missed_exchanges
+            .values()
+            .any(|(revision, _)| *revision == s.revision)
     }
 
     /// The plan for `node` from the verified rosters of `s`, derived.
@@ -2547,7 +2576,21 @@ impl Computer {
     /// Record application only after the actor saved the complete keyring under the ordinary
     /// node store protection. A crash before this write repeats reconciliation before networking.
     pub fn mark_applied(&self, node: Digest32, revision: u64, covered: &[Digest32]) -> Result<()> {
-        self.change(|s| {
+        self.mark_applied_until(
+            node,
+            revision,
+            covered,
+            std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+        )
+    }
+    pub(crate) fn mark_applied_until(
+        &self,
+        node: Digest32,
+        revision: u64,
+        covered: &[Digest32],
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        self.change_until(deadline, |s| {
             if revision > s.revision {
                 return Err(bad());
             }
@@ -2645,7 +2688,19 @@ impl Computer {
 
     /// Capture alias metadata before automatic grant consumption or removal.
     pub fn retain_aliases(&self, node: Digest32, aliases: &[(Digest32, String)]) -> Result<()> {
-        self.change(|s| {
+        self.retain_aliases_until(
+            node,
+            aliases,
+            std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+        )
+    }
+    pub(crate) fn retain_aliases_until(
+        &self,
+        node: Digest32,
+        aliases: &[(Digest32, String)],
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        self.change_until(deadline, |s| {
             s.aliases
                 .entry(node)
                 .or_default()
@@ -2810,6 +2865,9 @@ impl Computer {
         Ok(c)
     }
     fn save(&self, s: &State) -> Result<()> {
+        self.save_before(s, None)
+    }
+    fn save_before(&self, s: &State, deadline: Option<std::time::Instant>) -> Result<()> {
         secure(self.path.parent().ok_or_else(bad)?, true)?;
         if self.path.symlink_metadata().is_ok() {
             secure(&self.path, false)?;
@@ -2826,7 +2884,19 @@ impl Computer {
                 "computer management history is full; no state was discarded",
             ));
         }
-        write_private_file(&self.path, &bytes)
+        if let Some(deadline) = deadline {
+            write_private_file_checked(&self.path, &bytes, || {
+                if std::time::Instant::now() >= deadline {
+                    Err(Error::Profile(
+                        "the computer change reached its causal convergence deadline before its atomic commit",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        } else {
+            write_private_file(&self.path, &bytes)
+        }
     }
     /// Commit a complete management transaction before publishing it to live authorization.
     pub(crate) fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
@@ -2862,7 +2932,7 @@ impl Computer {
                     "the computer change reached its causal convergence deadline before it could be saved",
                 ));
             }
-            if let Err(error) = self.save(&next) {
+            if let Err(error) = self.save_before(&next, Some(deadline)) {
                 self.storage_failure();
                 return Err(error);
             }
@@ -2903,12 +2973,6 @@ impl Computer {
         })
     }
 
-    pub(crate) fn clear_missed_exchange(&self, peer: Digest32) -> Result<()> {
-        self.change(|state| {
-            state.missed_exchanges.remove(&peer);
-            Ok(())
-        })
-    }
     /// Publish into an existing room gate only while its node's durable keyring matches
     /// current policy. Register the same gate for synchronous invalidation on later changes.
     pub(crate) fn publish_reachers(

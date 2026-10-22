@@ -79,6 +79,12 @@ pub struct ComputerApplication {
     pub exchange_attempts: u64,
     /// Consecutive exchanges which did not satisfy their causal contract.
     pub exchange_failures: u32,
+    /// Exact policy revision whose convergence deadline was missed.
+    pub missed_revision: Option<u64>,
+    /// Whether that missed revision was exchanged only after its deadline.
+    pub repaired_late: bool,
+    /// pending / expired / repaired-late / replaced / converged.
+    pub convergence_state: String,
     /// Last exchange this daemon started with the member.
     pub last_started_exchange: Option<ExchangeRecord>,
     /// Last exchange the member started and this daemon answered.
@@ -93,6 +99,9 @@ impl From<core::ComputerApplication> for ComputerApplication {
             exchanges: v.exchanges,
             exchange_attempts: v.exchange_attempts,
             exchange_failures: v.exchange_failures,
+            missed_revision: v.missed_revision,
+            repaired_late: v.repaired_late,
+            convergence_state: v.convergence_state,
             last_started_exchange: v.last_started_exchange.map(Into::into),
             last_answered_exchange: v.last_answered_exchange.map(Into::into),
         }
@@ -155,7 +164,7 @@ pub struct ComputerStatus {
     pub this_computer: ComputerIdentity,
     /// Fixed permission policy, shown before confirmation.
     pub policy: String,
-    /// individual / waiting / needs-approval / applying / confirmed.
+    /// individual / waiting / needs-approval / applying / expired / confirmed.
     pub state: String,
     /// Current computer-policy revision.
     pub revision: u64,

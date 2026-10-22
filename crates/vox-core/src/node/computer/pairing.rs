@@ -6,7 +6,7 @@ use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::node::network::NodeNet;
 use crate::node::presence::NetPresence;
 use crate::transport::{
-    framing::{read_frame, read_frame_within, write_frame},
+    framing::{read_frame, read_frame_until as read_frame_before, read_frame_within, write_frame},
     quic::VoxConnection,
     streams::{self, StreamKind},
 };
@@ -111,6 +111,15 @@ pub struct ComputerApplication {
     pub exchange_attempts: u64,
     /// Attempts in a row that could not reach it; the retry backs off with each.
     pub exchange_failures: u32,
+    /// Exact policy revision whose convergence contract was missed, retained after replacement.
+    #[serde(default)]
+    pub missed_revision: Option<u64>,
+    /// Whether the missed revision's state was eventually exchanged after its deadline.
+    #[serde(default)]
+    pub repaired_late: bool,
+    /// Current structural outcome: pending, expired, repaired-late, replaced, or converged.
+    #[serde(default)]
+    pub convergence_state: String,
     /// The last exchange this daemon started with it that completed: a change made here
     /// travels in one of these (ADR-038 FX-28).
     #[serde(default)]
@@ -159,7 +168,7 @@ pub struct ComputerStatus {
     pub this_computer: ComputerIdentity,
     /// Exact fixed-policy explanation used by both app and CLI.
     pub policy: String,
-    /// Individual, waiting, needs-approval, applying, or confirmed.
+    /// Individual, waiting, needs-approval, applying, expired, or confirmed.
     pub state: String,
     /// This daemon's policy revision: it moves with every change to computer trust, made here or
     /// merged from an exchange; a node's binding is current when it names the same revision.
@@ -304,6 +313,8 @@ pub struct Management {
     /// Per computer: when this node last exchanged state with it, and how many exchanges in a row
     /// failed since one succeeded. What `retry` keys its cadence on (ADR-038 FX-15; #989).
     exchanged: Mutex<BTreeMap<Digest32, Exchanged>>,
+    /// Serializes outcome persistence without nesting the flight lock with computer state.
+    recording: Mutex<()>,
     /// Coalesced reasons to reconsider the exact next exchange deadline: local state, a real
     /// network change, an authenticated peer connection/stream, or an attempt ending.
     retry_wake: Arc<tokio::sync::Notify>,
@@ -321,6 +332,8 @@ pub struct Management {
 /// One computer's exchange record.
 #[derive(Clone, Debug, Default)]
 struct Exchanged {
+    /// Newest flight whose outcome was recorded; a torn older task cannot overwrite it.
+    last_serial: u64,
     /// The last attempt, succeeded or not.
     last: Option<std::time::Instant>,
     /// The last completed exchange, Unix milliseconds, for the status a person reads.
@@ -376,6 +389,7 @@ impl Attempt {
         self.recorded = true;
         self.me.record_exchange(
             self.peer,
+            self.serial,
             self.revision,
             self.involved,
             self.deadline,
@@ -447,28 +461,31 @@ impl Drop for Reserved {
 
 impl Drop for Attempt {
     fn drop(&mut self) {
-        // Removed and read in one step under the one lock: a mark set after this cannot
-        // linger on a later flight.
-        // Recorded, when it must be, before the flight is released, and both under the one
-        // lock: nothing can reserve, run and record for this computer in between, so an old
-        // result never lands over a newer flight's.
-        let mut inflight = lock(&self.me.inflight);
-        let Some(flight) = inflight.get(&self.peer) else {
-            return;
+        // Remove and read in one step under the flight lock, then release that lock before an
+        // outcome can acquire durable computer state. Outcome recording is serial-ordered, so a
+        // newer flight which finishes in between cannot be overwritten by this torn older task.
+        let should_record = {
+            let mut inflight = lock(&self.me.inflight);
+            let Some(flight) = inflight.get(&self.peer) else {
+                return;
+            };
+            if flight.serial != self.serial {
+                return;
+            }
+            let should_record = !self.recorded && !flight.superseded;
+            inflight.remove(&self.peer);
+            should_record
         };
-        if flight.serial != self.serial {
-            return;
-        }
-        if !self.recorded && !flight.superseded {
+        if should_record {
             self.me.record_exchange(
                 self.peer,
+                self.serial,
                 self.revision,
                 self.involved,
                 self.deadline,
                 Err("the exchange task failed".to_owned()),
             );
         }
-        inflight.remove(&self.peer);
         // See `Reserved::drop`: a takeover and the scheduler can both be waiting for this one
         // causal release.
         self.me.retry_wake.notify_waiters();
@@ -686,6 +703,7 @@ impl Management {
             transport_cache: Mutex::new(BTreeMap::new()),
             revoked_transport: Mutex::new(Default::default()),
             exchanged: Mutex::new(exchanged),
+            recording: Mutex::new(()),
             retry_wake: Arc::new(tokio::sync::Notify::new()),
             retry_ready: Mutex::new(BTreeMap::new()),
             transport_wake: Arc::new(tokio::sync::Notify::new()),
@@ -1177,6 +1195,7 @@ impl Management {
             };
             self.record_exchange(
                 target,
+                serial,
                 revision,
                 true,
                 causal_deadline.min(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN),
@@ -1424,16 +1443,30 @@ impl Management {
             .iter()
             .map(|(id, d)| {
                 let record = exchanged.get(id).cloned().unwrap_or_default();
+                let missed = s.missed_exchanges.get(id).copied();
+                let expired = missed.is_some_and(|(revision, _)| revision == s.revision);
+                let confirmed = !storage_failed
+                    && !expired
+                    && s.receipts
+                        .get(id)
+                        .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false));
+                let convergence_state = match missed {
+                    Some((revision, true)) if revision == s.revision => "repaired-late",
+                    Some((revision, false)) if revision == s.revision => "expired",
+                    Some((revision, _)) if revision < s.revision && !confirmed => "replaced",
+                    _ if confirmed => "converged",
+                    _ => "pending",
+                };
                 Ok(ComputerApplication {
                     computer: ComputerIdentity::of(d)?,
-                    confirmed: !storage_failed
-                        && s.receipts
-                            .get(id)
-                            .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false)),
+                    confirmed,
                     last_exchange_ms: record.last_ms,
                     exchanges: record.count,
                     exchange_attempts: record.attempts,
                     exchange_failures: record.failures,
+                    missed_revision: missed.map(|(revision, _)| revision),
+                    repaired_late: missed.is_some_and(|(_, repaired)| repaired),
+                    convergence_state: convergence_state.into(),
                     last_started_exchange: record.last_started,
                     last_answered_exchange: record.last_answered,
                 })
@@ -1507,6 +1540,12 @@ impl Management {
             }
         }
         former.retain(|id, _| !descriptions.contains_key(id));
+        let expired = applications.iter().any(|application| {
+            matches!(
+                application.convergence_state.as_str(),
+                "expired" | "repaired-late"
+            )
+        });
         let state = if storage_failed || !s.quarantined.is_empty() {
             "quarantined"
         } else if s.genesis.is_some() && s.grant(&local).is_none() && !busy {
@@ -1515,6 +1554,8 @@ impl Management {
             "needs-approval"
         } else if busy || invitation.is_some() {
             "waiting"
+        } else if expired {
+            "expired"
         } else if s.genesis.is_some() {
             if !applications.is_empty()
                 && applications.iter().all(|a| a.confirmed)
@@ -2057,7 +2098,7 @@ impl Management {
             // record names is the revision the reply carries.
             let (merged, reply) = self.computer.change_until(deadline, |s| {
                 merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
-                Ok((s.revision, exchange(s)?))
+                Ok((s.revision, exchange(s, &conn.peer_id())?))
             })?;
             write_frame(send, &reply).await?;
             self.record_answered(conn.peer_id(), merged);
@@ -2143,7 +2184,7 @@ impl Management {
             s.pending = Some(g);
             s.pending_expires = invite.expires;
             // The state sent back, encoded with the pairing just recorded, and its revision.
-            Ok((s.revision, exchange(s)?))
+            Ok((s.revision, exchange(s, &conn.peer_id())?))
         })?;
         let (revision, payload) = recorded;
         let proof = pop::IdentityProof::create(self.computer.signer.as_ref(), &ci, &transcript)?;
@@ -2544,11 +2585,19 @@ impl Management {
     fn record_exchange(
         self: &Arc<Self>,
         peer: Digest32,
+        serial: u64,
         revision: u64,
         involved: bool,
         deadline: std::time::Instant,
         mut outcome: std::result::Result<(u64, u64), String>,
     ) {
+        let _recording = lock(&self.recording);
+        if lock(&self.exchanged)
+            .get(&peer)
+            .is_some_and(|record| record.last_serial > serial)
+        {
+            return;
+        }
         let completed = std::time::Instant::now();
         let (retained_miss, was_repaired) =
             lock(&self.exchanged)
@@ -2559,12 +2608,10 @@ impl Management {
                         record.repaired_late == Some(revision),
                     )
                 });
-        let missed = retained_miss || completed > deadline;
+        let missed = retained_miss || completed >= deadline;
         let durable = if missed {
             self.computer
                 .record_missed_exchange(peer, revision, outcome.is_ok() || was_repaired)
-        } else if outcome.is_ok() {
-            self.computer.clear_missed_exchange(peer)
         } else {
             Ok(())
         };
@@ -2575,6 +2622,7 @@ impl Management {
         }
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
+        record.last_serial = serial;
         record.last = Some(completed);
         record.revision = revision;
         record.involved = involved;
@@ -2714,7 +2762,7 @@ impl Management {
         self.serve(Arc::clone(&conn));
         let (payload, sent) = {
             let s = lock(&self.computer.state);
-            (exchange(&s)?, s.revision)
+            (exchange(&s, &peer)?, s.revision)
         };
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         let remaining_ms = wire_budget(deadline);
@@ -3015,13 +3063,16 @@ async fn frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     frame_within(recv, PATIENCE).await
 }
 async fn frame_until(recv: &mut RecvStream, deadline: std::time::Instant) -> Result<Vec<u8>> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
+    if std::time::Instant::now() >= deadline {
         return Err(Error::Profile(
             "the computer exchange reached its causal convergence deadline",
         ));
     }
-    frame_within(recv, remaining).await
+    read_frame_before(recv, MAX_FRAME, deadline)
+        .await?
+        .ok_or(Error::Profile(
+            "computer pairing peer closed before answering",
+        ))
 }
 async fn frame_within(recv: &mut RecvStream, within: Duration) -> Result<Vec<u8>> {
     let f = read_frame_within(recv, MAX_FRAME, within)
@@ -3092,12 +3143,12 @@ fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
     }
     Ok(())
 }
-fn exchange(s: &State) -> Result<Vec<u8>> {
+fn exchange(s: &State, peer: &Digest32) -> Result<Vec<u8>> {
     let group = s
         .group()
         .ok_or(Error::Profile("no computer pairing intent"))?;
     let mut e = Encoder::new();
-    e.array(4)
+    e.array(5)
         .bytes(
             &s.genesis
                 .as_ref()
@@ -3124,11 +3175,23 @@ fn exchange(s: &State) -> Result<Vec<u8>> {
     for (id, r) in &s.receipts {
         e.array(2).bytes(id).bytes(&r.encode());
     }
+    if let Some((revision, repaired)) = s
+        .missed_exchanges
+        .get(peer)
+        .filter(|(revision, _)| *revision == s.revision)
+    {
+        e.array(1)
+            .array(2)
+            .uint(*revision)
+            .uint(u64::from(*repaired));
+    } else {
+        e.array(0);
+    }
     Ok(e.finish())
 }
 fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -> Result<()> {
     let mut d = Decoder::new(bytes);
-    arity(&mut d, 4)?;
+    arity(&mut d, 5)?;
     let read = |bytes: &[u8]| -> Result<Option<Enrollment>> {
         if bytes.is_empty() {
             Ok(None)
@@ -3239,8 +3302,34 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
         arity(&mut d, 2)?;
         receipts.push((digest(&mut d)?, Signed::decode(d.bytes()?)?));
     }
+    let missed = match count(&mut d)? {
+        0 => None,
+        1 => {
+            arity(&mut d, 2)?;
+            let revision = d.uint()?;
+            let repaired = match d.uint()? {
+                0 => false,
+                1 => true,
+                _ => return Err(bad()),
+            };
+            Some((revision, repaired))
+        }
+        _ => return Err(bad()),
+    };
     d.finish()?;
     activate(s, signer)?;
+    if let Some((_sender_revision, repaired)) = missed {
+        // Revision numbers are local journal order. The marker describes the exact state carried
+        // by this payload; after its atomic merge, that state is this daemon's current revision.
+        let local_revision = s.revision;
+        let held = s
+            .missed_exchanges
+            .entry(peer)
+            .or_insert((local_revision, repaired));
+        if local_revision > held.0 || (local_revision == held.0 && repaired) {
+            *held = (local_revision, repaired);
+        }
+    }
     for (author, receipt) in receipts {
         if author != local && valid_receipt(s, &author, &receipt)? {
             s.receipts.insert(author, receipt);

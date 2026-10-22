@@ -706,11 +706,23 @@ impl Store {
     /// Write a public metadata entry (its own durable transaction). Meta holds
     /// only public facts (schema version, identity fingerprint, creation time).
     pub fn put_meta(&self, name: &str, value: &[u8]) -> Result<()> {
+        self.put_meta_checked(name, value, || Ok(()))
+    }
+
+    /// Stage one metadata write, then check its caller-owned condition at the transaction commit
+    /// boundary. A refused check drops the transaction without publishing it.
+    pub(crate) fn put_meta_checked(
+        &self,
+        name: &str,
+        value: &[u8],
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let txn = self.begin_write()?;
         {
             let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
             meta.insert(name, value).map_err(storage("write meta"))?;
         }
+        before_commit()?;
         txn.commit().map_err(storage("commit"))
     }
 

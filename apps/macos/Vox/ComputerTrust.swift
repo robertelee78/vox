@@ -144,6 +144,9 @@ struct ComputerTrustView: View {
                                     Text("Exchanged \(application.exchanges) time(s) in \(application.exchangeAttempts) attempt(s) · \(application.exchangeFailures) failed in a row")
                                         .font(Theme.mono).secondaryText()
                                         .accessibilityIdentifier("computer-exchange-counts-" + application.computer.fingerprint)
+                                    Text(convergenceEvidence(application))
+                                        .font(Theme.mono).secondaryText()
+                                        .accessibilityIdentifier("computer-convergence-" + application.computer.fingerprint)
                                     if let exchange = application.lastStartedExchange {
                                         Text("Last started exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
                                             .font(Theme.mono).secondaryText()
@@ -377,10 +380,21 @@ struct ComputerTrustView: View {
 
     private func applicationState(_ application: ComputerApplication, status: ComputerStatus) -> String {
         if status.state == "quarantined" { return "Trust suspended" }
+        if application.convergenceState == "expired" { return "Expired before convergence" }
+        if application.convergenceState == "repaired-late" { return "Repaired late; trust not applied" }
+        if application.convergenceState == "replaced" { return "Expired revision replaced; applying current policy" }
         if !model.reachable {
             return application.confirmed ? "Last known: confirmed" : "Last known: awaiting confirmation"
         }
         return application.confirmed ? "Confirmed" : "Awaiting confirmation"
+    }
+
+    private func convergenceEvidence(_ application: ComputerApplication) -> String {
+        guard let revision = application.missedRevision else {
+            return "Convergence: \(application.convergenceState)"
+        }
+        let repaired = application.repairedLate ? "yes" : "no"
+        return "Convergence: \(application.convergenceState) · missed revision \(revision) · repaired late \(repaired)"
     }
 
     private func identity(_ computer: ComputerIdentity, title: String) -> some View {

@@ -688,7 +688,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
-        NetEvent::ComputerPolicy(_) => "applying computer trust",
+        NetEvent::ComputerPolicy { .. } => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
         NetEvent::TrustLocalNode { .. } => "applying the daemon's local trust policy",
     }
@@ -1124,7 +1124,11 @@ enum NetEvent {
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
     /// Daemon-internal only: no IPC request maps to these policy operations.
     LocalTrustBlacklist(oneshot::Sender<crate::error::Result<Option<BTreeSet<Digest32>>>>),
-    ComputerPolicy(oneshot::Sender<crate::error::Result<()>>),
+    ComputerPolicy {
+        deadline: std::time::Instant,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        reply: oneshot::Sender<crate::error::Result<()>>,
+    },
     TrustLocalNode {
         fingerprint: Digest32,
         name: String,
@@ -6209,7 +6213,7 @@ impl Node {
                     self.governance_work.pending = true;
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
-                    if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
+                    if !matches!(&event, NetEvent::ComputerPolicy { .. }) && self.apply_computer_keyring().await.is_err() { continue; }
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
                     self.handle_net(event).await;
@@ -10775,13 +10779,20 @@ impl Node {
                 .await;
                 let _ = reply.send(result);
             }
-            NetEvent::ComputerPolicy(reply) => {
+            NetEvent::ComputerPolicy {
+                deadline,
+                cancelled,
+                reply,
+            } => {
                 #[cfg(feature = "test-knobs")]
                 self.hold_computer_policy_for_proof().await;
                 #[cfg(feature = "test-knobs")]
                 let reply_delay = self.hold_computer_policy_reply_for_proof();
-                let result = match self.prepare_computer_binding() {
-                    Ok(()) => self.apply_computer_keyring().await,
+                let result = match self.prepare_computer_binding_until(deadline, &cancelled) {
+                    Ok(()) => {
+                        self.apply_computer_keyring_until(deadline, &cancelled)
+                            .await
+                    }
                     Err(e) => Err(e),
                 };
                 if result.is_ok() {

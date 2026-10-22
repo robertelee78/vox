@@ -283,17 +283,26 @@ The decider then answered twelve questions, one at a time. His answers are the d
   local reconciliation. Its hello carries only the duration budget remaining when the hello is
   sent. Immediately when the complete authenticated hello is received—before echoing it or reading
   its payload—the answerer caps that duration to the operation's public contract and applies it to
-  its own monotonic clock. Every later frame read uses the remainder of that same deadline, never
-  a fresh fixed patience interval, and the state transaction checks it both before executing and
-  before saving. There is no second outer timeout: it would truncate the ten-minute
+  its own monotonic clock. The complete length-prefixed frame (length and body together) uses that
+  one absolute end; neither half renews the remainder. A state transaction checks it before
+  executing, then stages and flushes its replacement file, checks again at the atomic rename
+  boundary, and publishes the in-memory state only after that commit. There is no second outer timeout: it would truncate the ten-minute
   pairing contract or mint a fresh ordinary-exchange clock. This bounds remote transaction and
   reconciliation work without claiming to reconstruct the initiator's instant. Network transit
   continues to consume the initiator's original deadline. If repair completes only after that
-  retained deadline, its exchange and repaired state remain visible, periodic retry stops, and the
-  missed cause is saved in the signed local computer state and remains a failure across daemon
-  restart and a same-state failed preview; only a later policy change can create a new cause and
-  clear it by meeting its own deadline. Thus a late answer cannot turn the original miss into an on-time
-  result. The shipped journey restarts one daemon with its Unix clock one hour ahead and then
+  retained deadline, the miss is durably recorded before repair is attempted. The exchange carries
+  that structural marker with the state, so the answerer's merge commits the received policy and
+  its local expired classification atomically. It may retain the state as evidence, but its node
+  actors refuse to derive or save ordinary trust from that revision. A successful late exchange
+  changes the marker to repaired-late; restart and a same-state failed preview preserve it. Only a
+  later operator policy change replaces it, and only that newer cause meeting its deadline may
+  converge and apply trust. Thus a late answer cannot turn the original miss into an on-time
+  result or an ordinary grant. The daemon-to-node event carries the same absolute deadline and a
+  cancellation token through its bounded queue and actor. Every durable actor stage rechecks both;
+  caller timeout cancels queued work rather than merely dropping its reply, and continuously moving
+  revisions retry until that causal deadline instead of an arbitrary revision count. The shipped
+  journey causally releases an actor message only after visible detachment and proves its binding
+  evidence did not move. The shipped journey also restarts one daemon with its Unix clock one hour ahead and then
   proves changes in both directions from a causal observation on the proof process's monotonic
   clock, never by comparing either daemon's Unix timestamp. A recovery proof evaluates no PRODUCT
   timing verdict until it has causal apparatus evidence of reachability (the restored anchor's
@@ -303,10 +312,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the real restoration event. Absence of idle derivation is compared across the next dated,
   completed fallback exchange named by the same shipped status snapshot as the binding evidence,
   not an arbitrary quiet window: the unchanged revision is a structural cause boundary and every
-  binding's durable derivation record must remain identical across it. CLI JSON, the app FFI and
-  the native Computer Trust screen all expose that policy revision, per-peer exchange
-  record/counters and per-node binding revision and derivation moment; neither client has to infer
-  currentness from elapsed time.
+  binding's durable derivation record must remain identical across it. CLI JSON, plain CLI, the app
+  FFI and the native Computer Trust screen expose the exact missed revision, whether it repaired
+  late, and whether it is expired, replaced, pending or converged, alongside policy revision,
+  per-peer exchange records/counters and per-node binding revision/derivation moment. Neither
+  client has to infer currentness from elapsed time or free-text failure wording.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its

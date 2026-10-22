@@ -164,19 +164,10 @@ impl Router {
             let router = self.clone();
             let management = Arc::clone(&management);
             self.inner.rt.spawn(async move {
-                let outcome = match tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    handle.reconcile_computer(),
-                )
-                .await
-                {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err(format!(
-                        "did not apply computer trust before the change's {:?} deadline",
-                        vox_core::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
-                    )),
-                };
+                let outcome = handle
+                    .reconcile_computer(deadline)
+                    .await
+                    .map_err(|error| error.to_string());
                 match outcome {
                     Ok(()) => {
                         if router.attachment_generation(&name) != Some(generation) {
@@ -266,7 +257,9 @@ impl Router {
                                 .into(),
                         );
                     };
-                    if let Err(e) = handle.reconcile_computer().await {
+                    let deadline = std::time::Instant::now()
+                        + vox_core::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN;
+                    if let Err(e) = handle.reconcile_computer(deadline).await {
                         return DaemonFrame::ComputerFailed(e.to_string());
                     }
                     let Some(info) = self

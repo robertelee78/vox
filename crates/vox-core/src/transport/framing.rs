@@ -78,30 +78,38 @@ pub async fn read_frame_within(
     max_len: usize,
     patience: std::time::Duration,
 ) -> Result<Option<Vec<u8>>> {
+    read_frame_until(recv, max_len, std::time::Instant::now() + patience).await
+}
+
+/// Read one complete frame before one absolute monotonic deadline. The length and body share
+/// the same end: receiving the length never mints another body-sized wait.
+pub async fn read_frame_until(
+    recv: &mut RecvStream,
+    max_len: usize,
+    deadline: std::time::Instant,
+) -> Result<Option<Vec<u8>>> {
+    match tokio::time::timeout_at(deadline.into(), read_frame_unbounded(recv, max_len)).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::Unreachable(
+            "quic stream: peer sent no complete frame in time",
+        )),
+    }
+}
+
+async fn read_frame_unbounded(recv: &mut RecvStream, max_len: usize) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match tokio::time::timeout(patience, recv.read_exact(&mut len_buf)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(quinn::ReadExactError::FinishedEarly(0))) => return Ok(None),
-        Ok(Err(e)) => return Err(read_failure(&e)),
-        Err(_) => {
-            return Err(Error::Unreachable(
-                "quic stream: peer sent no frame in time",
-            ))
-        }
+    match recv.read_exact(&mut len_buf).await {
+        Ok(()) => {}
+        Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(e) => return Err(read_failure(&e)),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > max_len {
         return Err(Error::SizeLimitExceeded("quic stream frame length"));
     }
     let mut body = vec![0u8; len];
-    match tokio::time::timeout(patience, recv.read_exact(&mut body)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(read_failure(&e)),
-        Err(_) => {
-            return Err(Error::Unreachable(
-                "quic stream: peer stopped partway through a frame",
-            ))
-        }
-    }
+    recv.read_exact(&mut body)
+        .await
+        .map_err(|e| read_failure(&e))?;
     Ok(Some(body))
 }

@@ -3,10 +3,10 @@ use super::*;
 use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
 
-/// **Test-only** (`test-knobs`): `<node>\t<milliseconds>\t<marker path>`. Once the marker exists,
-/// that node holds its next computer-policy actor message long enough for a shipped-binary proof
-/// to establish that apply-or-detach is independent of queued node work. Shipped builds neither
-/// name nor read this variable (V210-105).
+/// **Test-only** (`test-knobs`): `<node>\t<arm>\t<engaged>\t<release socket>`. The actor consumes
+/// `arm`, creates `engaged`, and waits for one connection to `release`. The shipped-binary proof
+/// can therefore hold and release the exact actor message causally, without a sleep standing in
+/// for product behavior. Shipped builds neither name nor read this variable (V210-105).
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_POLICY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY";
 #[cfg(feature = "test-knobs")]
@@ -18,9 +18,9 @@ impl Node {
         let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV) else {
             return;
         };
-        let mut fields = spec.splitn(3, '\t');
-        let (Some(node), Some(milliseconds), Some(marker)) =
-            (fields.next(), fields.next(), fields.next())
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(node), Some(arm), Some(engaged), Some(release)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             return;
         };
@@ -29,12 +29,19 @@ impl Node {
             .profile_dir
             .file_name()
             .and_then(|name| name.to_str());
-        let Some(delay) = milliseconds.parse::<u64>().ok() else {
+        if mine != Some(node) || std::fs::remove_file(arm).is_err() {
+            return;
+        }
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
             return;
         };
-        if mine == Some(node) && std::path::Path::new(marker).is_file() {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+        if std::fs::write(engaged, b"computer policy actor held\n").is_err() {
+            return;
         }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(engaged);
+        let _ = std::fs::remove_file(release);
     }
 
     /// Test apparatus: delay only the reply to an applied policy event, leaving the actor free
@@ -128,22 +135,95 @@ impl NodeHandle {
     }
 
     /// Ask the already attached node to sign its management binding and durably apply policy.
-    pub async fn reconcile_computer(&self) -> crate::error::Result<()> {
+    pub async fn reconcile_computer(
+        &self,
+        deadline: std::time::Instant,
+    ) -> crate::error::Result<()> {
         let (reply, rx) = oneshot::channel();
-        self.net_tx
-            .send(NetEvent::ComputerPolicy(reply))
-            .await
-            .map_err(|_| Error::Unreachable("the node has stopped"))?;
-        rx.await
-            .map_err(|_| Error::Unreachable("the node has stopped"))?
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let send = self.net_tx.send(NetEvent::ComputerPolicy {
+            deadline,
+            cancelled: Arc::clone(&cancelled),
+            reply,
+        });
+        tokio::pin!(send);
+        tokio::select! {
+            result = &mut send => {
+                result.map_err(|_| Error::Unreachable("the node has stopped"))?;
+            }
+            () = tokio::time::sleep_until(deadline.into()) => {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+                return Err(Error::Profile("computer trust did not enter the actor before its causal deadline"));
+            }
+        }
+        tokio::pin!(rx);
+        tokio::select! {
+            biased;
+            result = &mut rx => {
+                let result = result.map_err(|_| Error::Unreachable("the node has stopped"))?;
+                if std::time::Instant::now() >= deadline {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                    Err(Error::Profile("computer trust did not apply before its causal deadline"))
+                } else {
+                    result
+                }
+            }
+            () = tokio::time::sleep_until(deadline.into()) => {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+                Err(Error::Profile("computer trust did not apply before its causal deadline"))
+            }
+        }
     }
 }
 
 impl Node {
+    fn computer_policy_active(
+        deadline: std::time::Instant,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> crate::error::Result<()> {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || std::time::Instant::now() >= deadline
+        {
+            Err(Error::Profile(
+                "computer trust did not apply before its causal deadline",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn prepare_computer_binding(&self) -> crate::error::Result<()> {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        self.prepare_computer_binding_causal(
+            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
+            &cancelled,
+            true,
+        )
+    }
+
+    pub(super) fn prepare_computer_binding_until(
+        &self,
+        deadline: std::time::Instant,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> crate::error::Result<()> {
+        self.prepare_computer_binding_causal(deadline, cancelled, false)
+    }
+
+    fn prepare_computer_binding_causal(
+        &self,
+        deadline: std::time::Instant,
+        cancelled: &std::sync::atomic::AtomicBool,
+        may_replace_expired: bool,
+    ) -> crate::error::Result<()> {
+        Self::computer_policy_active(deadline, cancelled)?;
         let Some(computer) = &self.computer else {
             return Ok(());
         };
+        if !may_replace_expired && computer.current_revision_expired() {
+            return Err(Error::Profile(
+                "this policy revision expired before convergence; an operator change must replace it",
+            ));
+        }
         if computer.binding_group().is_none() {
             return Ok(());
         }
@@ -155,11 +235,11 @@ impl Node {
             .ok_or(Error::Profile("managed node name is unreadable"))?;
         if let Some(p) = &self.profile {
             if p.is_unlocked() {
-                return computer.bind_node(p.signer()?, name);
+                return computer.bind_node_until(p.signer()?, name, deadline);
             }
         }
         if let Some(s) = &self.headless {
-            return computer.bind_node(s.as_ref(), name);
+            return computer.bind_node_until(s.as_ref(), name, deadline);
         }
         Err(Error::Profile(
             "managed node needs its passphrase to become Ready",
@@ -169,6 +249,20 @@ impl Node {
     /// Before the endpoint registers, and before handling live authorization work, reconcile the
     /// durable plan. Persist the keyring before its journal receipt; repeat safely after a crash.
     pub(super) async fn apply_computer_keyring(&mut self) -> crate::error::Result<()> {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        self.apply_computer_keyring_until(
+            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
+            &cancelled,
+        )
+        .await
+    }
+
+    pub(super) async fn apply_computer_keyring_until(
+        &mut self,
+        deadline: std::time::Instant,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> crate::error::Result<()> {
+        Self::computer_policy_active(deadline, cancelled)?;
         let Some(c) = &self.computer else {
             return Ok(());
         };
@@ -183,37 +277,48 @@ impl Node {
         {
             return Ok(());
         }
-        for _ in 0..8 {
+        loop {
+            Self::computer_policy_active(deadline, cancelled)?;
             let mut floor = 0;
             for room in self.channels.values() {
                 floor = floor.max(room.lock().await.newest_mint_seq());
+                Self::computer_policy_active(deadline, cancelled)?;
             }
-            let changes = self.apply_computer_keyring_at(floor)?;
+            let changes = self.apply_computer_keyring_at_until(floor, deadline, cancelled)?;
             // A policy revision can grant an already admitted member read or drive. That member
             // may not have received the live capability record before this boundary, so publish
             // discovery again. It carries no authority; rooms coalesce it to one signed record.
             self.owe_private_support_in_open_rooms().await;
+            Self::computer_policy_active(deadline, cancelled)?;
             for (id, stamp) in changes {
                 self.mark_trust_decision(id, stamp).await;
+                Self::computer_policy_active(deadline, cancelled)?;
             }
             // The existing room machinery performs pending removals, sender-key rotation, and
             // consent delivery. Computer policy does not create a second room authorization path.
             self.refresh_reachers().await;
+            Self::computer_policy_active(deadline, cancelled)?;
             for prepared in self.preparing_rooms.values_mut() {
                 prepared.channel.get_mut().release_held_packages();
             }
             let rooms: Vec<_> = self.channels.keys().copied().collect();
             for room in rooms {
                 self.act_on_removals_while_closed(&room).await?;
+                Self::computer_policy_active(deadline, cancelled)?;
                 self.mark_decisions_on_open(&room).await?;
+                Self::computer_policy_active(deadline, cancelled)?;
                 if let Some(channel) = self.channels.get(&room) {
                     channel.lock().await.release_held_packages();
                 }
                 self.install_key_packages(&room).await;
+                Self::computer_policy_active(deadline, cancelled)?;
             }
             self.deliver_owed_consents(None).await;
+            Self::computer_policy_active(deadline, cancelled)?;
             self.tend_drive_keys().await;
+            Self::computer_policy_active(deadline, cancelled)?;
             self.publish().await;
+            Self::computer_policy_active(deadline, cancelled)?;
             if self.computer.as_ref().is_none_or(|c| {
                 c.revision()
                     == self
@@ -223,15 +328,27 @@ impl Node {
                 return Ok(());
             }
         }
-        Err(Error::Profile(
-            "computer policy is still changing; this node is not ready to authorize requests",
-        ))
     }
 
     pub(super) fn apply_computer_keyring_at(
         &mut self,
         floor: u64,
     ) -> crate::error::Result<Vec<(Digest32, crate::node::consent_order::Stamp)>> {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        self.apply_computer_keyring_at_until(
+            floor,
+            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
+            &cancelled,
+        )
+    }
+
+    fn apply_computer_keyring_at_until(
+        &mut self,
+        floor: u64,
+        deadline: std::time::Instant,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> crate::error::Result<Vec<(Digest32, crate::node::consent_order::Stamp)>> {
+        Self::computer_policy_active(deadline, cancelled)?;
         let Some(computer) = self.computer.clone() else {
             return Ok(Vec::new());
         };
@@ -250,7 +367,7 @@ impl Node {
         let Some(profile) = &self.profile else {
             if let Some(signer) = &self.headless {
                 if !computer.applied(&signer.fingerprint(), revision) {
-                    computer.mark_applied(signer.fingerprint(), revision, &[])?;
+                    computer.mark_applied_until(signer.fingerprint(), revision, &[], deadline)?;
                 }
                 self.computer_revision
                     .store(revision, std::sync::atomic::Ordering::Release);
@@ -286,7 +403,7 @@ impl Node {
                     .map(|name| (*peer, name.to_owned()))
             })
             .collect();
-        computer.retain_aliases(me, &aliases)?;
+        computer.retain_aliases_until(me, &aliases, deadline)?;
         let mut next = self.trust.clone();
         let mut newly = Vec::new();
         let mut changed_drive = Vec::new();
@@ -313,7 +430,9 @@ impl Node {
             let _ =
                 crate::node::consent_order::forget_trust(profile.store(), profile.signer()?, id);
         }
+        Self::computer_policy_active(deadline, cancelled)?;
         locks.save(profile.store(), profile.signer()?)?;
+        Self::computer_policy_active(deadline, cancelled)?;
         pending.save(profile.store(), profile.signer()?)?;
         self.consent_keys = pending;
         for (id, name, capability) in plan.grants {
@@ -340,6 +459,7 @@ impl Node {
         }
         let mut changes = Vec::new();
         for id in newly {
+            Self::computer_policy_active(deadline, cancelled)?;
             changes.push((
                 id,
                 crate::node::consent_order::stamp_trust(
@@ -354,12 +474,16 @@ impl Node {
             .profile
             .as_ref()
             .ok_or(Error::Profile("managed profile disappeared"))?;
-        next.save(profile.store(), profile.signer()?)?;
+        Self::computer_policy_active(deadline, cancelled)?;
+        next.save_checked(profile.store(), profile.signer()?, || {
+            Self::computer_policy_active(deadline, cancelled)
+        })?;
+        Self::computer_policy_active(deadline, cancelled)?;
         self.trust = next;
         for (id, was) in changed_drive {
             self.note_capability(id, was);
         }
-        computer.mark_applied(me, revision, &covered)?;
+        computer.mark_applied_until(me, revision, &covered, deadline)?;
         self.view_tx.send_modify(|view| {
             view.trusted = self.trust_rows();
             view.drive = self

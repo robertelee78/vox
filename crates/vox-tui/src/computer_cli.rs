@@ -324,8 +324,17 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
                 }
             ),
         };
+        let convergence = application.missed_revision.map_or_else(
+            || format!("; convergence {}", application.convergence_state),
+            |revision| {
+                format!(
+                    "; convergence {}, missed revision {revision}, repaired late {}",
+                    application.convergence_state, application.repaired_late
+                )
+            },
+        );
         println!(
-            "{}  {}  {}{exchanged}{carried}",
+            "{}  {}  {}{convergence}{exchanged}{carried}",
             application.computer.name,
             application.computer.fingerprint,
             if application.confirmed {
