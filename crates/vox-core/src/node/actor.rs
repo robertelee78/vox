@@ -6333,14 +6333,6 @@ impl Node {
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
                     if self.apply_computer_keyring().await.is_err() { continue; }
-                    // A joined sparse room that is not yet settled owes its settlement one
-                    // attempt every tick: nothing else reliably re-arms it. Sync session and
-                    // head-completion events call it too, but a room whose remaining piece
-                    // is its own feed's acknowledgement gets no further sync event until
-                    // the fetch that acknowledgement needs is itself driven — by this call.
-                    for room in self.channels.keys().copied().collect::<Vec<_>>() {
-                        self.settle_room(&room).await;
-                    }
                     // Audit durable bounded result slots as maintenance. Completion now sends a
                     // reliable event and admission release has its own exact wake, so progress
                     // does not depend on reaching this periodic audit.
@@ -19944,20 +19936,10 @@ impl Node {
     /// the room before: it moves to a sender generation the others do not hold yet, and, if its
     /// feed ends in its departure, says it is back before it says anything else.
     async fn settle_sparse_room(&mut self, channel_id: &Digest32) {
-        let Some(shared) = self.channels.get(channel_id).cloned() else {
-            return;
-        };
-        let ready = {
-            let Some(profile) = self.profile.as_ref() else {
-                return;
-            };
-            let room = shared.lock().await;
-            room.sparse_settlement_local_ready(profile.store(), self.now_ms())
-                .unwrap_or(false)
-        };
-        if ready {
-            self.settle_room(channel_id).await;
-        }
+        // Governance and bounded-head completion are the causal settlement edges. Even before
+        // local readiness they must offer the exact own head whose acknowledgement can make the
+        // room ready; waiting for a periodic tick here wedges an otherwise quiet joined room.
+        self.settle_room(channel_id).await;
     }
 
     async fn settle_room(&mut self, channel_id: &Digest32) {
@@ -20052,10 +20034,18 @@ impl Node {
             self.held_notes.clear();
             return;
         };
+        let mut touched = std::collections::BTreeSet::new();
         for (room, peer, seq) in std::mem::take(&mut self.held_notes) {
             if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
                 shared.lock().await.note_held(&store, peer, seq);
+                touched.insert(room);
             }
+        }
+        // The bounded result that carried the acknowledgement owns the next settlement attempt.
+        // This is both the write-unblock edge and, while another peer still owes the head, the
+        // edge that offers it there. Neither correctness transition waits for actor maintenance.
+        for room in touched {
+            self.settle_room(&room).await;
         }
     }
 
