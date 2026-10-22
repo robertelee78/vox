@@ -20,7 +20,7 @@
 //!    pages back) and, each time he reaches the oldest row he holds, asks for the page before it
 //!    with `vox room read --history older --before <that row>`; each such page arrives within
 //!    [`PAGE_WITHIN`], and in the end he reads every `post <i>` **once each and in order**, within
-//!    [`BOUND`] of his join. Two sizes: [`BACKLOG`] (160: 32 below the window) **blocks**; 1,500
+//!    [`BOUND`] of his join. Two sizes: [`BACKLOG`] (257: 129 below the window) **blocks**; 1,500
 //!    (across the sender-key rotation at 1,000, ADR-006 `N`) is **optional** for its staging time.
 //!
 //! **The defect this began with.** Bob's paged read stopped at 500 posts, 1,001–1,500: a sender
@@ -69,7 +69,7 @@
 //!   red with bob short of 1,500 once the pages are asked for.
 
 // Two blocking-or-optional arms (decider, 2026-10-01: "Valid proofs block; rest optional"). The
-// 160-post history BLOCKS: a newcomer reads every post exactly once and in order, the part below
+// 257-post history BLOCKS: a newcomer reads every post exactly once and in order, the part below
 // the live window on demand. The timing claim (one wait, fresh or behind) and the 1,500-post
 // history are optional: CI only compiles them, and without `--features optional-proofs` a stand-in
 // says each was not run (`support/optional_proof.rs`).
@@ -113,9 +113,10 @@ const BOUND: Duration = Duration::from_secs(300);
 const READY_WITHIN: Duration = Duration::from_secs(10);
 /// How long one page asked for with `--history older` has to arrive.
 const PAGE_WITHIN: Duration = Duration::from_secs(60);
-/// The backlog: past `MAX_PAGE_ENTRIES` (128), the live window a sparse join holds of one author,
-/// so 32 rows sit below the window and are read only on demand.
-const BACKLOG: usize = 160;
+/// The reproduced connected catch-up backlog: past `MAX_PAGE_ENTRIES` (128), so 129 rows sit
+/// below the live window and are read only on demand. The former 160-row arm did not cover the
+/// 257-row daemon wedge observed on the release base.
+const BACKLOG: usize = 257;
 /// Rows per page when bob pages back, so the blocking arm walks several pages.
 const PAGE: usize = 25;
 
@@ -244,16 +245,6 @@ fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
 fn said(dir: &Path, tag: &str) -> String {
     std::fs::read_to_string(dir.join(format!("daemon-{tag}.err")))
         .unwrap_or_else(|e| format!("(its stderr could not be read: {e})"))
-}
-
-/// How many times the shipped daemon has said its reach to this exact member failed. Capturing a
-/// baseline before a trust decision makes a later line a causal observation of that decision's
-/// failed direct path, without turning an elapsed guess into the verdict.
-fn reach_failures_said(dir: &Path, tag: &str, member_prefix: &str) -> usize {
-    said(dir, tag)
-        .lines()
-        .filter(|line| line.contains("could not reach") && line.contains(member_prefix))
-        .count()
 }
 
 /// `vox room list` once the daemon's socket answers.
@@ -497,6 +488,51 @@ fn history_observation(dir: &Path, room: &str) -> HistoryObservation {
 fn history_status(dir: &Path, room: &str) -> (String, u64) {
     let observed = history_observation(dir, room);
     (observed.phase, observed.remaining)
+}
+
+/// A requested page that has not arrived must still have an exact shipped owner. This detects
+/// the wedge itself: the history request is incomplete while neither its demand controller, its
+/// bounded flow nor an exact admission owns it. It does not infer failure from elapsed time,
+/// retry count, queue depth or CPU load.
+fn assert_history_owned(dir: &Path, room: &str, peer: &str, held: usize, expected: usize) {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: the shipped status command failed while {held} of {expected} requested rows \
+         were held: {err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: shipped status returned malformed JSON during catch-up: {error}: {out}")
+    });
+    let history = &status["lanes"]["history"];
+    let demand_owned = ["preparing", "ready", "running", "private_work"]
+        .iter()
+        .any(|field| history[*field].as_bool() == Some(true));
+    let exact = |row: &serde_json::Value| {
+        row["room"]
+            .as_str()
+            .is_some_and(|candidate| candidate.starts_with(room))
+            && row["peer"].as_str() == Some(peer)
+    };
+    let bounded = &status["lanes"]["bounded"];
+    let flow_owned = ["ready", "running", "admissions"].iter().any(|field| {
+        bounded[*field]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| !row.is_null() && exact(row)))
+    });
+    // These cleanup collections expose counts, not identities. This proof has one room and one
+    // requested source, so counting them as possible owners is conservative: it can delay a red,
+    // never create one.
+    let opaque_owned = ["deferred", "retiring", "required"]
+        .iter()
+        .any(|field| bounded[*field].as_u64().is_some_and(|count| count > 0))
+        || bounded["cleanup"].as_bool() == Some(true);
+    assert!(
+        demand_owned || flow_owned || opaque_owned,
+        "PRODUCT: connected catch-up is structurally wedged at {held} of {expected} requested \
+         rows: shipped status names no demand, bounded flow, admission, dependency or cleanup \
+         owner for room {room} and peer {peer}; status: {out}"
+    );
 }
 
 /// How long after `since` each side first read the other: alice `to_alice`, bob `to_bob`
@@ -749,16 +785,14 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // cannot possibly acknowledge an Alice row before this trust decision, even though Carol
     // already trusts Alice: demanding that state made the old proof wait for an impossible
     // boundary. Stop Carol first and observe the exact member disconnected in shipped status.
-    // Alice then appends the boundary row locally and trusts Carol. A new `could not reach` line
-    // from the shipped daemon proves the direct attempt actually failed; the following exact
-    // two-position log/feed advance proves that failure selected the package-plus-consent path.
+    // Alice then appends the boundary row locally and trusts Carol. A new failure generation on
+    // Carol's exact full-fingerprint sync lane proves the direct attempt actually failed; the
+    // following exact two-position log/feed advance proves that failure selected the
+    // package-plus-consent path.
     carol_daemon.stop();
     while member_connected(&alice, &room, &fps[2]) != Some(false) {
         std::thread::yield_now();
     }
-    let carol_short: String = fps[2].chars().take(26).collect();
-    let reach_failures_before = reach_failures_said(&alice, "alice", &carol_short);
-
     let before_package_text = "alice row before carol's package";
     let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
     assert!(
@@ -782,32 +816,58 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              private package was staged"
         )
     });
+    // Take the direct-failure baseline after the boundary append. That append can raise the
+    // port, so an earlier baseline would let its dial masquerade as the trust decision's path.
+    let reach_failures_before =
+        member_unreachable_failures(&alice, &room, &fps[2]).unwrap_or_else(|| {
+            panic!(
+                "APPARATUS: Alice's shipped status did not expose Carol's exact sync lane before \
+                 the offline trust decision"
+            )
+        });
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
     assert!(
         ok,
         "PRODUCT: alice's `vox trust add` of carol failed: {err}"
     );
-    // Alice had no direct connection at the decision and Carol's process remains stopped, so its
-    // dial can only fail. After that failure, the fallback appends the recipient-scoped package
-    // and consent grant. A new trust can independently owe at most one private-support row;
-    // therefore two exact contiguous-log/feed advances from this boundary require the fallback
-    // package to have been appended. `entries` is not used: packages and governance facts are log
-    // rows, not necessarily visible timeline rows.
-    while reach_failures_said(&alice, "alice", &carol_short) <= reach_failures_before
-        || status_log_entries(&alice, &room)
-            .is_none_or(|entries| entries < before_package_log.saturating_add(2))
-        || room_own_feed_through(&alice, &room)
-            .is_none_or(|through| through < before_package_through.saturating_add(2))
-        || member_key_waits(&alice, &fps[2]) != Some(None)
+    // Alice had no direct connection at the decision and Carol's process remains stopped. Wait
+    // only for the exact lane's next shipped failure generation. A status command that observes
+    // it is handled after ReachFailed finishes `deliver_through_log`, so it is a causal barrier:
+    // the two fallback appends must already be durable. The mutant that omits either append now
+    // reaches the PRODUCT equality below instead of drifting until an apparatus watchdog.
+    while member_unreachable_failures(&alice, &room, &fps[2])
+        .is_none_or(|failures| failures <= reach_failures_before)
     {
         std::thread::yield_now();
     }
-    let package_feed_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+    let after_package_log = status_log_entries(&alice, &room).unwrap_or_else(|| {
         panic!(
-            "APPARATUS: alice's shipped status lost her authenticated feed after the offline \
-             package append"
+            "PRODUCT: after Carol's exact failed-direct event, Alice's shipped status omitted \
+             the room's contiguous log"
         )
     });
+    assert_eq!(
+        after_package_log,
+        before_package_log.saturating_add(2),
+        "PRODUCT: after Carol's exact failed-direct event, Alice's contiguous log advanced from \
+         {before_package_log} to {after_package_log}, not by exactly the owed package and consent"
+    );
+    let package_feed_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: after Carol's exact failed-direct event, Alice's shipped status omitted \
+             her authenticated feed"
+        )
+    });
+    assert_eq!(
+        package_feed_through,
+        before_package_through.saturating_add(2),
+        "PRODUCT: after Carol's exact failed-direct event, Alice's authenticated feed advanced \
+         from {before_package_through} to {package_feed_through}, not by exactly the owed package \
+         and consent"
+    );
+    // `members[].key_waits` is deliberately not evidence here. A cached signed-prekey bundle
+    // lets this fallback proceed without ever entering that wait, so observing `null` would not
+    // establish either a prior wait or its clearance.
 
     // Restart Carol with the installer held only after the package exists. Her exact local
     // role-complete cursor must reach Alice's package-bearing feed position: that shipped cursor,
@@ -2079,23 +2139,28 @@ fn key_packages_pending(dir: &Path, room: &str) -> Option<bool> {
         .as_bool()
 }
 
-/// The operator-visible key-delivery state for one member: outer `None` means the member is not
-/// listed, inner `None` means the member is listed and this node says no key waits for delivery.
-fn member_key_waits(dir: &Path, member: &str) -> Option<Option<String>> {
+/// The current unreachable-backoff generation for one exact room/peer sync lane. The room label
+/// may be the shipped short room ID; the peer match is the complete fingerprint, so a similarly
+/// prefixed member cannot satisfy this causal boundary.
+fn member_unreachable_failures(dir: &Path, room: &str, member: &str) -> Option<u64> {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     if !ok {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(&out).ok()?;
-    value["rooms"].as_array()?.iter().find_map(|room| {
-        room["members"].as_array()?.iter().find_map(|row| {
-            (row["id"].as_str() == Some(member)).then(|| {
-                row["key_waits"]
-                    .as_str()
-                    .map(std::borrow::ToOwned::to_owned)
-            })
-        })
-    })
+    let lane = value["sync"].as_array()?.iter().find(|lane| {
+        lane["room"]
+            .as_str()
+            .is_some_and(|candidate| candidate.starts_with(room))
+            && lane["peer"].as_str() == Some(member)
+    })?;
+    let failures = lane["backoff"]["failures"].as_u64().unwrap_or(0);
+    if failures == 0 {
+        return Some(0);
+    }
+    (lane["backoff"]["kind"].as_str() == Some("unreachable")
+        && lane["last_failure"].as_str().is_some())
+    .then_some(failures)
 }
 
 /// Whether shipped status says one exact room member has a live connection. `None` means the
@@ -3074,6 +3139,7 @@ fn newcomer_reads_the_whole_history(
             if now > history {
                 break;
             }
+            assert_history_owned(&bob, &room, &fps[0], now, posts);
             if asked.elapsed() > PAGE_WITHIN {
                 let (_, status, status_err) =
                     vox(&bob, &["room", "read", &room, "--history", "status"], None);

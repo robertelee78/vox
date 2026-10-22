@@ -3,12 +3,228 @@
 use super::*;
 use crate::node::history_stream::{self as stream, runtime::Flow, Purpose};
 use crate::node::store::Store;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Mutex as StdMutex;
 
+type RetirementKey = crate::node::history_budget::RetirementKey;
+type RetirementLedger = crate::node::history_budget::RetirementLedger;
+type RetirementEntry = crate::node::history_budget::RetirementEntry;
+
+fn retirement_key(flow: &Flow) -> RetirementKey {
+    RetirementKey {
+        actor: flow.actor_incarnation(),
+        request: flow.retirement_request(),
+        node: flow.node,
+        room: flow.room,
+        peer: flow.peer,
+        archive: flow.archive,
+        instance: flow.instance,
+        generation: flow.generation,
+    }
+}
+
+fn note_retirement_error(ledger: &RetirementLedger, key: RetirementKey, error: &str) {
+    if let Ok(mut errors) = ledger.errors.lock() {
+        errors.insert(key, error.to_owned());
+    }
+}
+
+fn clear_retirement_error(ledger: &RetirementLedger, key: RetirementKey) {
+    if let Ok(mut errors) = ledger.errors.lock() {
+        errors.remove(&key);
+    }
+}
+
+struct RetirementRunner {
+    entry: Arc<RetirementEntry>,
+    ledger: Arc<RetirementLedger>,
+    key: RetirementKey,
+    complete: bool,
+}
+
+impl Drop for RetirementRunner {
+    fn drop(&mut self) {
+        self.entry.running.store(false, Ordering::Release);
+        if !self.complete {
+            let message = "history retirement task ended before durable cleanup";
+            note_retirement_error(&self.ledger, self.key, message);
+            eprintln!(
+                "vox: {message} for {}/{}/{}",
+                crate::node::link::b32_encode(&self.key.room),
+                crate::node::link::b32_encode(&self.key.peer),
+                if self.key.archive { "archive" } else { "live" }
+            );
+        }
+    }
+}
+
+async fn finish_owed_retirement(
+    ledger: Arc<RetirementLedger>,
+    entry: Arc<RetirementEntry>,
+    key: RetirementKey,
+) {
+    let mut runner = RetirementRunner {
+        entry,
+        ledger,
+        key,
+        complete: false,
+    };
+    loop {
+        let outcome = {
+            let mut held = runner.entry.flow.lock().await;
+            let Some(flow) = held.as_mut() else {
+                runner.complete = true;
+                return;
+            };
+            // A worker panic can return ownership before its normal end-of-round park. Cleanup
+            // is not a running round and must release that charge before doing anything else.
+            flow.park();
+            flow.retire_slice().await
+        };
+        match outcome {
+            Ok(true) => {
+                clear_retirement_error(&runner.ledger, key);
+                runner.entry.flow.lock().await.take();
+                if let Ok(mut entries) = runner.ledger.entries.lock() {
+                    if entries
+                        .get(&key)
+                        .is_some_and(|entry| Arc::ptr_eq(entry, &runner.entry))
+                    {
+                        entries.remove(&key);
+                    }
+                }
+                runner.complete = true;
+                return;
+            }
+            // A bounded durable slice made progress or awaits local reclamation. Retain exact
+            // ownership and retry forever under the named backoff; never spin on yield_now.
+            Ok(false) => {
+                tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
+            }
+            Err(error) => {
+                note_retirement_error(&runner.ledger, key, &error.to_string());
+                eprintln!(
+                    "vox: history retirement for {}/{}/{} remains owed: {error}",
+                    crate::node::link::b32_encode(&key.room),
+                    crate::node::link::b32_encode(&key.peer),
+                    if key.archive { "archive" } else { "live" }
+                );
+                tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
+            }
+        }
+    }
+}
+
+fn start_retirement(
+    ledger: &Arc<RetirementLedger>,
+    key: RetirementKey,
+    entry: Arc<RetirementEntry>,
+) {
+    if entry.running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let task = handle.spawn(finish_owed_retirement(
+                Arc::clone(ledger),
+                Arc::clone(&entry),
+                key,
+            ));
+            if let Ok(mut retained) = entry.task.lock() {
+                *retained = Some(task);
+            }
+        }
+        Err(error) => {
+            let message = format!("no runtime can finish owed history retirement: {error}");
+            entry.running.store(false, Ordering::Release);
+            note_retirement_error(ledger, key, &message);
+            eprintln!("vox: {message}");
+        }
+    }
+}
+
+fn adopt_retirement_cell(
+    ledger: &Arc<RetirementLedger>,
+    mut key: RetirementKey,
+    flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
+) {
+    let (entry, collision) = {
+        let mut entries = ledger
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut collision = false;
+        loop {
+            match entries.get(&key) {
+                Some(entry) if Arc::ptr_eq(&entry.flow, &flow) => {
+                    break (Arc::clone(entry), collision);
+                }
+                Some(_) => {
+                    // A malformed duplicate key must never discard either owned Flow. Retain
+                    // the incoming obligation under a deterministic collision suffix and make
+                    // the condition visible until that obligation finishes.
+                    collision = true;
+                    for byte in key.request.iter_mut().rev() {
+                        let (next, carry) = byte.overflowing_add(1);
+                        *byte = next;
+                        if !carry {
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    let entry = Arc::new(RetirementEntry {
+                        flow: Arc::clone(&flow),
+                        running: std::sync::atomic::AtomicBool::new(false),
+                        task: StdMutex::new(None),
+                    });
+                    entries.insert(key, Arc::clone(&entry));
+                    break (entry, collision);
+                }
+            }
+        }
+    };
+    if collision {
+        eprintln!(
+            "vox: distinct history retirements collided for {}/{}, retaining both obligations",
+            crate::node::link::b32_encode(&key.room),
+            crate::node::link::b32_encode(&key.peer)
+        );
+        note_retirement_error(
+            ledger,
+            key,
+            "distinct history retirements collided; both were retained",
+        );
+    }
+    start_retirement(ledger, key, entry);
+}
+
+fn spawn_owed_retirement(mut flow: Flow, ledger: Arc<RetirementLedger>) {
+    flow.park();
+    let key = retirement_key(&flow);
+    adopt_retirement_cell(&ledger, key, Arc::new(tokio::sync::Mutex::new(Some(flow))));
+}
+
+fn resume_owed_retirements(ledger: &Arc<RetirementLedger>) {
+    let entries = ledger
+        .entries
+        .lock()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(key, entry)| (*key, Arc::clone(entry)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (key, entry) in entries {
+        start_retirement(ledger, key, entry);
+    }
+}
+
 struct Returned {
-    flow: Flow,
     error: Option<String>,
+    panic: Option<String>,
 }
 struct Running {
     room: Digest32,
@@ -17,16 +233,41 @@ struct Running {
     generation: u64,
     request: u64,
     archive: Option<(stream::RequestId, Digest32)>,
+    lane: crate::node::history_budget::Lane,
+    retirement_key: RetirementKey,
     fence: Arc<crate::transport::stream_transport::Fence>,
+    /// Exclusive ownership stays outside the fallible worker future. The supervised outer task
+    /// observes its JoinError and the actor reclaims this exact Flow even when the worker panics.
+    flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
     result: Arc<StdMutex<Option<Returned>>>,
     task: tokio::task::JoinHandle<()>,
+    started: std::time::Instant,
 }
-type CleanupResult = (Flow, crate::error::Result<bool>);
+/// Retained flows are real bounded demand, not running pool charges. Once full, the exact port
+/// remains needed and is retried by the completion/release event that frees one.
+pub(crate) const RETAINED_FLOW_LIMIT: usize = 12;
 
 struct Cleanup {
-    result: Arc<StdMutex<Option<CleanupResult>>>,
+    key: RetirementKey,
+    /// The task borrows the flow through shared ownership. If that task panics, the controller
+    /// still owns the only durable cell and can retry instead of silently dropping the flow.
+    flow: Arc<tokio::sync::Mutex<Option<Flow>>>,
+    result: Arc<StdMutex<Option<crate::error::Result<bool>>>>,
     task: tokio::task::JoinHandle<()>,
     cancellations: Vec<crate::node::history_demand::Cancellation>,
+}
+#[derive(Clone, Copy)]
+pub(super) struct AdmissionWork {
+    root: &'static str,
+    lane: crate::node::history_budget::Lane,
+}
+impl AdmissionWork {
+    fn from_flow(flow: &Flow) -> Self {
+        Self {
+            root: flow.root_name(),
+            lane: flow.lane(),
+        }
+    }
 }
 struct ArchiveAdmission {
     token: u64,
@@ -38,26 +279,169 @@ struct ArchiveAdmission {
     ticket: crate::node::history_budget::Ticket,
     task: tokio::task::JoinHandle<()>,
 }
+struct ForegroundAdmission {
+    token: u64,
+    room: Digest32,
+    peer: Digest32,
+    root: &'static str,
+    lane: crate::node::history_budget::Lane,
+    ticket: crate::node::history_budget::Ticket,
+    task: tokio::task::JoinHandle<()>,
+}
+struct RoomAdmission {
+    token: u64,
+    root: &'static str,
+    lane: crate::node::history_budget::Lane,
+    task: tokio::task::JoinHandle<()>,
+}
+struct SecretAdmission {
+    token: u64,
+    root: &'static str,
+    lane: crate::node::history_budget::Lane,
+    task: tokio::task::JoinHandle<()>,
+}
+struct ByteAdmission {
+    token: u64,
+    root: &'static str,
+    lane: crate::node::history_budget::Lane,
+    task: tokio::task::JoinHandle<()>,
+}
+struct PoolAdmission {
+    token: u64,
+    gate: &'static str,
+    root: &'static str,
+    lane: crate::node::history_budget::Lane,
+    task: tokio::task::JoinHandle<()>,
+}
+#[derive(Clone, Copy)]
+struct PoolWait {
+    gate: &'static str,
+    work: AdmissionWork,
+}
 enum ArchiveTurn {
     Ready(crate::node::history_budget::Job),
     Waiting,
-    Full,
 }
+enum ForegroundTurn {
+    Ready(crate::node::history_budget::Job),
+    Waiting,
+}
+
+const fn lane_name(lane: crate::node::history_budget::Lane) -> &'static str {
+    match lane {
+        crate::node::history_budget::Lane::Archive => "archive",
+        crate::node::history_budget::Lane::Control => "control",
+        crate::node::history_budget::Lane::LargeControl => "large_control",
+        crate::node::history_budget::Lane::Live => "live",
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Controller {
-    running: [Option<Running>; 2],
-    ready: [Option<Flow>; 2],
+    running: [Option<Running>; crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS],
+    ready: [Option<Flow>; crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS],
     /// The one queued archive turn for this node. The controller owns its daemon-wide fair-queue
     /// ticket; the task waits only for a wake, without an actor or room lock.
     archive_admission: Option<ArchiveAdmission>,
+    /// One retained ticket per startable foreground lane. A release wakes the exact waiting
+    /// port; the scheduler tick is neither its notifier nor a correctness fallback.
+    foreground_admission: [Option<ForegroundAdmission>; 4],
+    /// Exact room-lock release waits for ports that met an off-actor holder. The waiter briefly
+    /// acquires and releases the same mutex, then wakes the port; no scheduler tick guesses.
+    room_admission: BTreeMap<(Digest32, Digest32), RoomAdmission>,
+    secret_admission: BTreeMap<(Digest32, Digest32), SecretAdmission>,
+    byte_admission: BTreeMap<(Digest32, Digest32), ByteAdmission>,
+    pool_admission: BTreeMap<(Digest32, Digest32), PoolAdmission>,
     deferred: VecDeque<Flow>,
     body_slots: Arc<stream::runtime::BodySlots>,
     required: VecDeque<(Digest32, Digest32, Digest32, u64)>,
     retiring: VecDeque<Flow>,
     cleanup: Option<Cleanup>,
     cleanup_due: Option<std::time::Instant>,
+    /// Per-flow retirement failures outlive controller replacement and remain visible until that
+    /// exact flow reaches its durable end. An unrelated cleanup can never clear another's error.
+    retirement_ledger: Arc<RetirementLedger>,
+    /// Workers publish their durable result before notifying this coalesced edge. `Notify`
+    /// retains a permit while the actor is elsewhere; one wake audits every result slot, so no
+    /// completion can be stranded behind the actor's bounded event queue.
+    completion_wake: Arc<tokio::sync::Notify>,
 }
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        self.cancel_archive_admission();
+        for index in 0..self.foreground_admission.len() {
+            self.cancel_foreground_admission(index);
+        }
+        for (_, admission) in std::mem::take(&mut self.room_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.secret_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.byte_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.pool_admission) {
+            admission.task.abort();
+        }
+        let mut flows = Vec::new();
+        flows.extend(self.ready.iter_mut().filter_map(Option::take));
+        flows.extend(self.deferred.drain(..));
+        flows.extend(self.retiring.drain(..));
+        let cleanup = self.cleanup.take();
+        let running = self
+            .running
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect::<Vec<_>>();
+        for flow in &mut flows {
+            flow.cancel();
+            flow.park();
+        }
+        if let Some(cleanup) = &cleanup {
+            for cancellation in &cleanup.cancellations {
+                cancellation.cancel();
+            }
+        }
+        for work in &running {
+            work.fence.retire();
+        }
+        let ledger = Arc::clone(&self.retirement_ledger);
+        let message = "actor ended with durable history retirement still owed";
+        for flow in flows {
+            let key = retirement_key(&flow);
+            note_retirement_error(&ledger, key, message);
+            spawn_owed_retirement(flow, Arc::clone(&ledger));
+        }
+        if let Some(cleanup) = cleanup {
+            note_retirement_error(&ledger, cleanup.key, message);
+            adopt_retirement_cell(&ledger, cleanup.key, cleanup.flow);
+            // Dropping the handle detaches an already-running bounded slice, but ownership is
+            // now in the daemon ledger; its runner waits on the same cell and cannot race it.
+            drop(cleanup.task);
+        }
+        for work in running {
+            note_retirement_error(&ledger, work.retirement_key, message);
+            adopt_retirement_cell(&ledger, work.retirement_key, work.flow);
+            drop(work.task);
+        }
+    }
+}
+
 impl Controller {
+    pub(super) fn set_completion_wake(&mut self, wake: Arc<tokio::sync::Notify>) {
+        self.completion_wake = wake;
+    }
+
+    pub(super) fn set_retirement_ledger(&mut self, ledger: Arc<RetirementLedger>) {
+        self.retirement_ledger = ledger;
+        resume_owed_retirements(&self.retirement_ledger);
+    }
+
+    pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.completion_wake)
+    }
     /// A retained current/archive continuation is itself demand on its exact room/peer port.
     /// Port request generations describe external wakes; an independent clean exchange may
     /// consume one while this continuation is between bounded slices. Do not let that scalar
@@ -77,6 +461,15 @@ impl Controller {
                 .any(|(needed_room, needed_peer, _, _)| {
                     *needed_room == room && *needed_peer == peer
                 })
+            || self
+                .foreground_admission
+                .iter()
+                .flatten()
+                .any(|admission| admission.room == room && admission.peer == peer)
+            || self.room_admission.contains_key(&(room, peer))
+            || self.secret_admission.contains_key(&(room, peer))
+            || self.byte_admission.contains_key(&(room, peer))
+            || self.pool_admission.contains_key(&(room, peer))
     }
 
     fn cancel_archive_admission(&mut self) {
@@ -90,6 +483,257 @@ impl Controller {
         }) {
             self.cancel_archive_admission();
         }
+    }
+    fn cancel_foreground_admission(&mut self, index: usize) {
+        if let Some(admission) = self.foreground_admission[index].take() {
+            admission.task.abort();
+        }
+    }
+    fn cancel_foreground_port(&mut self, room: Digest32, peer: Digest32) {
+        for index in 0..self.foreground_admission.len() {
+            if self.foreground_admission[index]
+                .as_ref()
+                .is_some_and(|admission| admission.room == room && admission.peer == peer)
+            {
+                self.cancel_foreground_admission(index);
+            }
+        }
+    }
+    pub(super) fn release_foreground_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    ) {
+        for index in 0..self.foreground_admission.len() {
+            if self.foreground_admission[index]
+                .as_ref()
+                .is_some_and(|admission| {
+                    admission.token == token && admission.room == room && admission.peer == peer
+                })
+            {
+                self.cancel_foreground_admission(index);
+                return;
+            }
+        }
+    }
+    fn cancel_room_admission(&mut self, room: Digest32, peer: Digest32) {
+        if let Some(admission) = self.room_admission.remove(&(room, peer)) {
+            admission.task.abort();
+        }
+    }
+    pub(super) fn release_room_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    ) -> bool {
+        if self
+            .room_admission
+            .get(&(room, peer))
+            .is_some_and(|admission| admission.token == token)
+        {
+            self.cancel_room_admission(room, peer);
+            true
+        } else {
+            false
+        }
+    }
+    pub(super) fn wait_for_room(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        room: Digest32,
+        peer: Digest32,
+        work: AdmissionWork,
+        shared: Arc<tokio::sync::Mutex<ChannelState>>,
+    ) {
+        if self.room_admission.contains_key(&(room, peer)) {
+            return;
+        }
+        let token = *next_token;
+        *next_token += 1;
+        let tx = net_tx.clone();
+        let task = tokio::spawn(async move {
+            let guard = shared.lock_owned().await;
+            drop(guard);
+            let _ = tx
+                .send(NetEvent::BoundedRoomReady { token, room, peer })
+                .await;
+        });
+        self.room_admission.insert(
+            (room, peer),
+            RoomAdmission {
+                token,
+                root: work.root,
+                lane: work.lane,
+                task,
+            },
+        );
+    }
+    fn cancel_secret_admission(&mut self, room: Digest32, peer: Digest32) {
+        if let Some(admission) = self.secret_admission.remove(&(room, peer)) {
+            admission.task.abort();
+        }
+    }
+    pub(super) fn release_secret_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    ) -> bool {
+        if self
+            .secret_admission
+            .get(&(room, peer))
+            .is_some_and(|admission| admission.token == token)
+        {
+            self.cancel_secret_admission(room, peer);
+            true
+        } else {
+            false
+        }
+    }
+    fn wait_for_secret(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        room: Digest32,
+        peer: Digest32,
+        work: AdmissionWork,
+        secret_work: Arc<tokio::sync::RwLock<()>>,
+    ) {
+        if self.secret_admission.contains_key(&(room, peer)) {
+            return;
+        }
+        let token = *next_token;
+        *next_token += 1;
+        let tx = net_tx.clone();
+        let task = tokio::spawn(async move {
+            let guard = secret_work.read_owned().await;
+            drop(guard);
+            let _ = tx
+                .send(NetEvent::BoundedSecretReady { token, room, peer })
+                .await;
+        });
+        self.secret_admission.insert(
+            (room, peer),
+            SecretAdmission {
+                token,
+                root: work.root,
+                lane: work.lane,
+                task,
+            },
+        );
+    }
+    fn cancel_byte_admission(&mut self, room: Digest32, peer: Digest32) {
+        if let Some(admission) = self.byte_admission.remove(&(room, peer)) {
+            admission.task.abort();
+        }
+    }
+    pub(super) fn release_byte_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    ) -> bool {
+        if self
+            .byte_admission
+            .get(&(room, peer))
+            .is_some_and(|admission| admission.token == token)
+        {
+            self.cancel_byte_admission(room, peer);
+            true
+        } else {
+            false
+        }
+    }
+    fn wait_for_bytes(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        room: Digest32,
+        peer: Digest32,
+        work: AdmissionWork,
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) {
+        if self.byte_admission.contains_key(&(room, peer)) {
+            return;
+        }
+        let token = *next_token;
+        *next_token += 1;
+        let tx = net_tx.clone();
+        let task = tokio::spawn(async move {
+            wake.await;
+            let _ = tx
+                .send(NetEvent::BoundedBytesReady { token, room, peer })
+                .await;
+        });
+        self.byte_admission.insert(
+            (room, peer),
+            ByteAdmission {
+                token,
+                root: work.root,
+                lane: work.lane,
+                task,
+            },
+        );
+    }
+
+    fn cancel_pool_admission(&mut self, room: Digest32, peer: Digest32) {
+        if let Some(admission) = self.pool_admission.remove(&(room, peer)) {
+            admission.task.abort();
+        }
+    }
+
+    pub(super) fn release_pool_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    ) -> bool {
+        if self
+            .pool_admission
+            .get(&(room, peer))
+            .is_some_and(|admission| admission.token == token)
+        {
+            self.cancel_pool_admission(room, peer);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn wait_for_pool(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        room: Digest32,
+        peer: Digest32,
+        waiting: PoolWait,
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) {
+        if self.pool_admission.contains_key(&(room, peer)) {
+            return;
+        }
+        let token = *next_token;
+        *next_token += 1;
+        let tx = net_tx.clone();
+        let task = tokio::spawn(async move {
+            wake.await;
+            let _ = tx
+                .send(NetEvent::BoundedFlowStateReady { token, room, peer })
+                .await;
+        });
+        self.pool_admission.insert(
+            (room, peer),
+            PoolAdmission {
+                token,
+                gate: waiting.gate,
+                root: waiting.work.root,
+                lane: waiting.work.lane,
+                task,
+            },
+        );
     }
     /// Retiring work stays inside the same twelve-flow limit and retains its charge/lease.
     /// Other rooms may progress while one room waits for its next bounded cleanup slice.
@@ -117,17 +761,55 @@ impl Controller {
                 .lock()
                 .ok()
                 .and_then(|mut value| value.take());
-            if let Some((flow, result)) = result {
-                self.cleanup.take();
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => self.retiring.push_back(flow),
+            let flow = cleanup
+                .flow
+                .try_lock()
+                .ok()
+                .and_then(|mut flow| flow.take());
+            let Some(cleanup) = self.cleanup.take() else {
+                return;
+            };
+            if let Some(flow) = flow {
+                let key = retirement_key(&flow);
+                match result.unwrap_or(Err(crate::error::Error::Profile(
+                    "history retirement worker stopped",
+                ))) {
+                    Ok(true) => clear_retirement_error(&self.retirement_ledger, key),
+                    Ok(false) => {
+                        self.retiring.push_back(flow);
+                        self.cleanup_due = Some(
+                            std::time::Instant::now()
+                                + crate::node::history_budget::RETIRE_RETRY_BACKOFF,
+                        );
+                        let wake = self.completion_wake();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF)
+                                .await;
+                            wake.notify_one();
+                        });
+                    }
                     Err(error) => {
                         eprintln!("vox: history retirement is pending: {error}");
+                        note_retirement_error(&self.retirement_ledger, key, &error.to_string());
                         self.retiring.push_back(flow);
-                        self.cleanup_due = Some(std::time::Instant::now() + Duration::from_secs(1));
+                        self.cleanup_due = Some(
+                            std::time::Instant::now()
+                                + crate::node::history_budget::RETIRE_RETRY_BACKOFF,
+                        );
+                        let wake = self.completion_wake();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF)
+                                .await;
+                            wake.notify_one();
+                        });
                     }
                 }
+            } else {
+                note_retirement_error(
+                    &self.retirement_ledger,
+                    cleanup.key,
+                    "history retirement owner unavailable",
+                );
             }
         }
         if self.cleanup.is_some()
@@ -138,19 +820,34 @@ impl Controller {
             return;
         }
         self.cleanup_due = None;
-        let Some(mut flow) = self.retiring.pop_front() else {
+        let Some(flow) = self.retiring.pop_front() else {
             return;
         };
         let cancellations = flow.cancellation_handles();
+        let key = retirement_key(&flow);
+        let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
+        let task_flow = Arc::clone(&flow);
         let output = result.clone();
+        let wake = self.completion_wake();
         let task = tokio::spawn(async move {
-            let outcome = flow.retire_slice().await;
+            let outcome = {
+                let mut flow = task_flow.lock().await;
+                match flow.as_mut() {
+                    Some(flow) => flow.retire_slice().await,
+                    None => Err(crate::error::Error::Profile(
+                        "history retirement owner vanished",
+                    )),
+                }
+            };
             if let Ok(mut result) = output.lock() {
-                *result = Some((flow, outcome));
+                *result = Some(outcome);
             }
+            wake.notify_one();
         });
         self.cleanup = Some(Cleanup {
+            key,
+            flow,
             result,
             task,
             cancellations,
@@ -158,21 +855,40 @@ impl Controller {
     }
     async fn join_cleanup(&mut self) -> crate::error::Result<()> {
         if let Some(cleanup) = self.cleanup.take() {
-            let _ = cleanup.task.await;
+            let key = cleanup.key;
+            let joined = cleanup.task.await;
             let result = cleanup
                 .result
                 .lock()
                 .ok()
                 .and_then(|mut value| value.take());
-            if let Some((flow, result)) = result {
-                match result {
-                    Ok(true) => {}
+            let flow = cleanup.flow.lock().await.take();
+            if let Some(flow) = flow {
+                let key = retirement_key(&flow);
+                match result.unwrap_or_else(|| {
+                    Err(crate::error::Error::Profile(if joined.is_err() {
+                        "history retirement worker stopped"
+                    } else {
+                        "history retirement result vanished"
+                    }))
+                }) {
+                    Ok(true) => clear_retirement_error(&self.retirement_ledger, key),
                     Ok(false) => self.retiring.push_back(flow),
                     Err(error) => {
+                        note_retirement_error(&self.retirement_ledger, key, &error.to_string());
                         self.retiring.push_back(flow);
                         return Err(error);
                     }
                 }
+            } else {
+                note_retirement_error(
+                    &self.retirement_ledger,
+                    key,
+                    "history retirement owner vanished",
+                );
+                return Err(crate::error::Error::Profile(
+                    "history retirement owner vanished",
+                ));
             }
         }
         Ok(())
@@ -184,6 +900,50 @@ impl Controller {
             .is_some_and(|admission| admission.room == room)
         {
             self.cancel_archive_admission();
+        }
+        for index in 0..self.foreground_admission.len() {
+            if self.foreground_admission[index]
+                .as_ref()
+                .is_some_and(|admission| admission.room == room)
+            {
+                self.cancel_foreground_admission(index);
+            }
+        }
+        let waiting: Vec<(Digest32, Digest32)> = self
+            .room_admission
+            .keys()
+            .filter(|(waiting_room, _)| *waiting_room == room)
+            .copied()
+            .collect();
+        for (room, peer) in waiting {
+            self.cancel_room_admission(room, peer);
+        }
+        let waiting: Vec<(Digest32, Digest32)> = self
+            .secret_admission
+            .keys()
+            .filter(|(waiting_room, _)| *waiting_room == room)
+            .copied()
+            .collect();
+        for (room, peer) in waiting {
+            self.cancel_secret_admission(room, peer);
+        }
+        let waiting: Vec<(Digest32, Digest32)> = self
+            .byte_admission
+            .keys()
+            .filter(|(waiting_room, _)| *waiting_room == room)
+            .copied()
+            .collect();
+        for (room, peer) in waiting {
+            self.cancel_byte_admission(room, peer);
+        }
+        let waiting: Vec<(Digest32, Digest32)> = self
+            .pool_admission
+            .keys()
+            .filter(|(waiting_room, _)| *waiting_room == room)
+            .copied()
+            .collect();
+        for (room, peer) in waiting {
+            self.cancel_pool_admission(room, peer);
         }
         for slot in &mut self.ready {
             if let Some(flow) = slot.take_if(|flow| flow.room == room) {
@@ -203,11 +963,9 @@ impl Controller {
             if let Some(work) = slot.take_if(|work| work.room == room) {
                 work.fence.retire();
                 let _ = work.task.await;
-                if let Ok(mut result) = work.result.lock() {
-                    if let Some(returned) = result.take() {
-                        self.retiring.push_back(returned.flow);
-                    }
-                };
+                if let Some(flow) = work.flow.lock().await.take() {
+                    self.retiring.push_back(flow);
+                }
             }
         }
         self.required.retain(|(r, _, _, _)| *r != room);
@@ -222,7 +980,7 @@ impl Controller {
                 Ok(true) => {}
                 Ok(false) => {
                     self.retiring.push_back(flow);
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
                 }
                 Err(error) => {
                     self.retiring.push_back(flow);
@@ -270,6 +1028,11 @@ impl Controller {
         {
             self.cancel_archive_admission();
         }
+        self.cancel_foreground_port(room, peer);
+        self.cancel_room_admission(room, peer);
+        self.cancel_secret_admission(room, peer);
+        self.cancel_byte_admission(room, peer);
+        self.cancel_pool_admission(room, peer);
         for slot in &mut self.ready {
             if slot
                 .as_ref()
@@ -303,6 +1066,21 @@ impl Controller {
     }
     pub(super) fn fence(&mut self) {
         self.cancel_archive_admission();
+        for index in 0..self.foreground_admission.len() {
+            self.cancel_foreground_admission(index);
+        }
+        for (_, admission) in std::mem::take(&mut self.room_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.secret_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.byte_admission) {
+            admission.task.abort();
+        }
+        for (_, admission) in std::mem::take(&mut self.pool_admission) {
+            admission.task.abort();
+        }
         for flow in self
             .deferred
             .iter()
@@ -331,23 +1109,41 @@ impl Controller {
         self.required.clear();
         for slot in &mut self.running {
             if let Some(work) = slot.take() {
-                let _ = work.task.await;
-                if let Ok(mut result) = work.result.lock() {
-                    if let Some(returned) = result.take() {
-                        self.retiring.push_back(returned.flow);
-                    }
-                };
+                let joined = work.task.await;
+                if joined.is_err() {
+                    eprintln!("vox: bounded history supervisor stopped during retirement");
+                }
+                if let Some(flow) = work.flow.lock().await.take() {
+                    self.retiring.push_back(flow);
+                }
             }
         }
-        let _ = self.join_cleanup().await;
+        if let Err(error) = self.join_cleanup().await {
+            eprintln!("vox: history retirement is pending: {error}");
+        }
         while let Some(mut flow) = self.retiring.pop_front() {
             // lock_all has already erased room SEK. Such work exits without writes;
             // bounded reopen recovery owns any durable cursor/publication still present.
             // Memory admission may still be held by a fenced actual worker. Keep this
             // owner until a later bounded slice observes the erased key.
-            if matches!(flow.retire_slice().await, Ok(false)) {
-                self.retiring.push_back(flow);
-                tokio::task::yield_now().await;
+            match flow.retire_slice().await {
+                Ok(true) => clear_retirement_error(&self.retirement_ledger, retirement_key(&flow)),
+                Ok(false) => {
+                    self.retiring.push_back(flow);
+                    tokio::time::sleep(crate::node::history_budget::RETIRE_RETRY_BACKOFF).await;
+                }
+                Err(error) => {
+                    eprintln!("vox: history retirement is pending: {error}");
+                    note_retirement_error(
+                        &self.retirement_ledger,
+                        retirement_key(&flow),
+                        &error.to_string(),
+                    );
+                    // A permanent local error must not hold lock/unlock or shutdown forever.
+                    // Ownership moves to the daemon runtime, which keeps retrying under the
+                    // named policy while the stable status ledger remains visible.
+                    spawn_owed_retirement(flow, Arc::clone(&self.retirement_ledger));
+                }
             }
         }
     }
@@ -405,13 +1201,14 @@ impl Controller {
             self.cancel_archive_admission();
         }
         if let Some(mut admission) = self.archive_admission.take() {
+            // Register again before rechecking. The event that scheduled this actor may have been
+            // a same-lane eligibility edge won by another ticket; the later real release still
+            // needs an enabled listener owned by this exact retained admission.
             let wake = admission.ticket.wake();
             if let Some(job) = admission.ticket.try_admit() {
                 admission.task.abort();
                 return ArchiveTurn::Ready(job);
             }
-            // Replace the completed or superseded notifier with a freshly registered one. A new
-            // token makes a late event from the old task harmless.
             admission.task.abort();
             let tx = net_tx.clone();
             let wake_token = *next_token;
@@ -431,10 +1228,7 @@ impl Controller {
             return ArchiveTurn::Waiting;
         }
 
-        let Some(mut ticket) = budget.enqueue(node, crate::node::history_budget::Lane::Archive)
-        else {
-            return ArchiveTurn::Full;
-        };
+        let mut ticket = budget.enqueue(node, crate::node::history_budget::Lane::Archive);
         let wake = ticket.wake();
         if let Some(job) = ticket.try_admit() {
             return ArchiveTurn::Ready(job);
@@ -464,6 +1258,82 @@ impl Controller {
         });
         ArchiveTurn::Waiting
     }
+
+    /// Retain an exact foreground queue position until its capacity family changes. A pending
+    /// ticket belongs to its original port; another port cannot steal or cancel it while the
+    /// actor happens to visit that port first.
+    #[allow(clippy::too_many_arguments)]
+    fn foreground_turn(
+        &mut self,
+        budget: &Arc<crate::node::history_budget::Budget>,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        node: Digest32,
+        room: Digest32,
+        peer: Digest32,
+        root: &'static str,
+        lane: crate::node::history_budget::Lane,
+    ) -> ForegroundTurn {
+        let index = lane.index();
+        if let Some(admission) = self.foreground_admission[index].as_ref() {
+            if admission.room != room || admission.peer != peer || admission.lane != lane {
+                return ForegroundTurn::Waiting;
+            }
+        }
+        if let Some(mut admission) = self.foreground_admission[index].take() {
+            let wake = admission.ticket.wake();
+            if let Some(job) = admission.ticket.try_admit() {
+                admission.task.abort();
+                return ForegroundTurn::Ready(job);
+            }
+            admission.task.abort();
+            let tx = net_tx.clone();
+            let wake_token = *next_token;
+            *next_token += 1;
+            admission.token = wake_token;
+            admission.task = tokio::spawn(async move {
+                wake.await;
+                let _ = tx
+                    .send(NetEvent::ForegroundAdmissionReady {
+                        token: wake_token,
+                        room,
+                        peer,
+                    })
+                    .await;
+            });
+            self.foreground_admission[index] = Some(admission);
+            return ForegroundTurn::Waiting;
+        }
+
+        let mut ticket = budget.enqueue(node, lane);
+        let wake = ticket.wake();
+        if let Some(job) = ticket.try_admit() {
+            return ForegroundTurn::Ready(job);
+        }
+        let tx = net_tx.clone();
+        let wake_token = *next_token;
+        *next_token += 1;
+        let task = tokio::spawn(async move {
+            wake.await;
+            let _ = tx
+                .send(NetEvent::ForegroundAdmissionReady {
+                    token: wake_token,
+                    room,
+                    peer,
+                })
+                .await;
+        });
+        self.foreground_admission[index] = Some(ForegroundAdmission {
+            token: wake_token,
+            room,
+            peer,
+            root,
+            lane,
+            ticket,
+            task,
+        });
+        ForegroundTurn::Waiting
+    }
 }
 /// Why a foreground round runs (ADR-038 FX-15, #996), from what selected it: the own head
 /// offered for acknowledgement, a head the peer told this node of (or the follow-up such a
@@ -487,6 +1357,75 @@ fn foreground_reason(
 }
 
 impl Node {
+    /// Name the exact bounded root whose next attempt is stopped before a `Flow` exists. This
+    /// mirrors the starter's selection order so status can identify a retained admission rather
+    /// than reporting only that some port is waiting.
+    pub(super) fn bounded_pending_identity(&self, room: Digest32, peer: Digest32) -> AdmissionWork {
+        if let Some(flow) = self
+            .bounded_sync
+            .ready
+            .iter()
+            .flatten()
+            .chain(self.bounded_sync.deferred.iter())
+            .find(|flow| flow.room == room && flow.peer == peer)
+        {
+            return AdmissionWork::from_flow(flow);
+        }
+        if self
+            .ports
+            .get(&(room, peer))
+            .is_some_and(crate::node::ports::Port::announce_owed)
+        {
+            return AdmissionWork {
+                root: "inventory",
+                lane: crate::node::history_budget::Lane::Control,
+            };
+        }
+        if self.history_demand.ready_binding(room, peer).is_some() {
+            return AdmissionWork {
+                root: "archive",
+                lane: crate::node::history_budget::Lane::Archive,
+            };
+        }
+        if self
+            .bounded_sync
+            .required
+            .iter()
+            .any(|(needed_room, needed_peer, _, _)| *needed_room == room && *needed_peer == peer)
+        {
+            return AdmissionWork {
+                root: "required",
+                lane: crate::node::history_budget::Lane::Control,
+            };
+        }
+        if self
+            .leave_waiters
+            .iter()
+            .any(|(left_room, generation, _, _)| {
+                *left_room == room
+                    && self
+                        .ports
+                        .get(&(room, peer))
+                        .is_some_and(|port| port.done_gen >= *generation)
+            })
+        {
+            return AdmissionWork {
+                root: "departure",
+                lane: crate::node::history_budget::Lane::Control,
+            };
+        }
+        if self.history_hints.pending(room, peer) {
+            return AdmissionWork {
+                root: "hint",
+                lane: crate::node::history_budget::Lane::Control,
+            };
+        }
+        AdmissionWork {
+            root: "inventory",
+            lane: crate::node::history_budget::Lane::Control,
+        }
+    }
+
     /// Retire every operation for a departed member except an already decoded
     /// `Control/Head(peer)` response. That response is bounded by its existing fence and
     /// deadline and can return only the peer's own semantic departure receipt.
@@ -556,6 +1495,16 @@ impl Node {
         result
     }
 
+    /// A flow whose start ended before its round retains the exact work already consumed while
+    /// constructing it: an archive dispatch, required dependency, or scalar hint. Park it in its
+    /// lane so the relevant admission/release event retries that same work; reconstructing only a
+    /// hint loses the other two forms and can leave a shipped archive request marked running.
+    fn shelve_exact(&mut self, mut flow: Flow, index: usize) {
+        flow.park();
+        debug_assert!(self.bounded_sync.ready[index].is_none());
+        self.bounded_sync.ready[index] = Some(flow);
+    }
+
     /// Abandoning a flow retires its local capabilities, not the unauthoritative scalar hint it
     /// selected. Re-arm that exact hint while its inbox scope is still live; room/peer retirement
     /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
@@ -569,7 +1518,7 @@ impl Node {
 
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
-        for index in 0..2 {
+        for index in 0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS {
             let Some(work) = self.bounded_sync.running[index].as_ref() else {
                 continue;
             };
@@ -580,10 +1529,21 @@ impl Node {
             let Some(mut returned) = returned else {
                 continue;
             };
-            let Some(work) = self.bounded_sync.running[index].take() else {
-                self.dispose_rearming_hint(returned.flow);
+            let flow = work.flow.try_lock().ok().and_then(|mut flow| flow.take());
+            let Some(flow) = flow else {
+                if let Ok(mut result) = work.result.lock() {
+                    *result = Some(returned);
+                }
                 continue;
             };
+            let Some(work) = self.bounded_sync.running[index].take() else {
+                self.dispose_rearming_hint(flow);
+                continue;
+            };
+            let mut flow = flow;
+            if let Some(panic) = returned.panic.take() {
+                returned.error = Some(format!("bounded history worker panicked: {panic}"));
+            }
             let current = self
                 .ports
                 .get_mut(&(work.room, work.peer))
@@ -594,25 +1554,25 @@ impl Node {
                 && self
                     .channels
                     .get(&work.room)
-                    .is_some_and(|room| Arc::ptr_eq(room, &returned.flow.shared));
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
             if !valid {
-                self.dispose_rearming_hint(returned.flow);
+                self.dispose_rearming_hint(flow);
                 continue;
             }
-            if let Some(seq) = returned.flow.mine_held.take() {
+            if let Some(seq) = flow.mine_held.take() {
                 // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
                 // on the actor's next turn; the settlement tick then stops offering the own
                 // head to that peer (ADR-038 FX-15).
                 self.held_notes.push((work.room, work.peer, seq));
             }
-            if returned.flow.admitted_authors > 0 {
-                returned.flow.admitted_authors = 0;
+            if flow.admitted_authors > 0 {
+                flow.admitted_authors = 0;
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                     channel_id: work.room,
                 });
             }
-            if returned.flow.published {
-                returned.flow.published = false;
+            if flow.published {
+                flow.published = false;
                 self.governance_work.pending = true;
                 self.sched_rooms.insert(work.room);
                 // A bounded publication may have made an addressed key-package durable. Its
@@ -623,11 +1583,11 @@ impl Node {
                 self.key_package_rooms.entry(work.room).or_insert(false);
                 let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
                     channel_id: work.room,
-                    rendered: returned.flow.rendered,
-                    governance: returned.flow.governance,
+                    rendered: flow.rendered,
+                    governance: flow.governance,
                 });
-                returned.flow.rendered = false;
-                returned.flow.governance = false;
+                flow.rendered = false;
+                flow.governance = false;
                 // A required control finished: the archive's next local slice can recheck its
                 // exact dependency. No archive wire request is created by this wake.
                 if let Some(flow) = self.bounded_sync.ready[1].as_mut() {
@@ -635,7 +1595,7 @@ impl Node {
                     self.sched_rooms.insert(flow.room);
                 }
             }
-            if let Some((head, seq)) = returned.flow.external.take() {
+            if let Some((head, seq)) = flow.external.take() {
                 let need = (work.room, work.peer, head, seq);
                 if !self.bounded_sync.required.contains(&need)
                     && self.bounded_sync.required.len() < 128
@@ -643,7 +1603,7 @@ impl Node {
                     self.bounded_sync.required.push_back(need);
                 }
             }
-            if let Some(target) = returned.flow.reroute.take() {
+            if let Some(target) = flow.reroute.take() {
                 // EvidenceUnavailable named the author of the exact missing signed dependency.
                 // Keep this flow, its in-flight hint owner and its exact query/continuation
                 // intact; only the next wire turn moves to the authoritative port.
@@ -668,15 +1628,15 @@ impl Node {
                         .required
                         .iter()
                         .any(|(room, peer, _, _)| *room == work.room && *peer == work.peer);
-                returned.flow.peer = target;
-                returned.flow.route_origin = Some(work.peer);
-                returned.flow.route_complete = false;
+                flow.peer = target;
+                flow.route_origin = Some(work.peer);
+                flow.route_complete = false;
                 debug_assert!(self.bounded_sync.ready[0].is_none());
                 if self.bounded_sync.ready[0].is_some() {
-                    self.dispose_rearming_hint(returned.flow);
+                    self.dispose_rearming_hint(flow);
                     continue;
                 }
-                self.bounded_sync.ready[0] = Some(returned.flow);
+                self.bounded_sync.ready[0] = Some(flow);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -703,20 +1663,13 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            if returned.flow.authorization_changed {
-                let retry_peer = returned
-                    .flow
-                    .route_origin
-                    .unwrap_or(returned.flow.hint_peer);
-                if let Some(hint) = returned.flow.hint {
-                    self.history_hints.retry(
-                        work.room,
-                        returned.flow.hint_peer,
-                        hint.author,
-                        hint.head,
-                    );
+            if flow.authorization_changed {
+                let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
                 }
-                self.bounded_sync.dispose(returned.flow);
+                self.bounded_sync.dispose(flow);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -753,20 +1706,15 @@ impl Node {
                 let cancelled = error
                     == crate::error::Error::Profile(crate::node::history_demand::CANCELLED)
                         .to_string();
-                if let Some(request) = returned.flow.archive_request {
-                    self.history_demand
-                        .failed(request, returned.flow.generation, &error);
+                if let Some(request) = flow.archive_request {
+                    self.history_demand.failed(request, flow.generation, &error);
                 }
 
-                if let Some(hint) = returned.flow.hint {
-                    self.history_hints.finish(
-                        work.room,
-                        returned.flow.hint_peer,
-                        hint.author,
-                        hint.head,
-                    );
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
-                self.bounded_sync.dispose(returned.flow);
+                self.bounded_sync.dispose(flow);
                 if cancelled {
                     self.sched_rooms.insert(work.room);
                     continue;
@@ -796,12 +1744,12 @@ impl Node {
                 );
                 continue;
             }
-            if returned.flow.route_complete {
-                let Some(origin) = returned.flow.route_origin.take() else {
-                    self.dispose_rearming_hint(returned.flow);
+            if flow.route_complete {
+                let Some(origin) = flow.route_origin.take() else {
+                    self.dispose_rearming_hint(flow);
                     continue;
                 };
-                returned.flow.route_complete = false;
+                flow.route_complete = false;
                 let more_for_target = self.history_hints.pending(work.room, work.peer)
                     || self
                         .bounded_sync
@@ -815,7 +1763,7 @@ impl Node {
                     }
                     port.clear_backoff();
                 }
-                let reason = returned.flow.reason;
+                let reason = flow.reason;
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -833,7 +1781,7 @@ impl Node {
                 // 2026-10-19).
                 self.note_lane_sync(work.room, work.peer);
                 let origin_room =
-                    crate::node::ports::RoomRef::Channel(Arc::downgrade(&returned.flow.shared));
+                    crate::node::ports::RoomRef::Channel(Arc::downgrade(&flow.shared));
                 let origin_live = self
                     .ports
                     .get(&(work.room, origin))
@@ -843,17 +1791,17 @@ impl Node {
                     // exact author turn was in flight. Its inbox scope has already retired (or
                     // this hint is safely re-armed for a later reopen); never strand the sole
                     // foreground lane on an absent/unschedulable origin port.
-                    self.dispose_rearming_hint(returned.flow);
+                    self.dispose_rearming_hint(flow);
                     self.sched_rooms.insert(work.room);
                     continue;
                 }
-                returned.flow.peer = origin;
+                flow.peer = origin;
                 debug_assert!(self.bounded_sync.ready[0].is_none());
                 if self.bounded_sync.ready[0].is_some() {
-                    self.dispose_rearming_hint(returned.flow);
+                    self.dispose_rearming_hint(flow);
                     continue;
                 }
-                self.bounded_sync.ready[0] = Some(returned.flow);
+                self.bounded_sync.ready[0] = Some(flow);
                 if let Some(port) = self.ports.get_mut(&(work.room, origin)) {
                     port.raise();
                     port.clear_backoff();
@@ -864,13 +1812,9 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            let superseded = returned.flow.hint.is_some_and(|hint| {
-                self.history_hints.newer_pending(
-                    work.room,
-                    returned.flow.hint_peer,
-                    hint.author,
-                    hint.size,
-                )
+            let superseded = flow.hint.is_some_and(|hint| {
+                self.history_hints
+                    .newer_pending(work.room, flow.hint_peer, hint.author, hint.size)
             });
             if superseded {
                 // The worker has returned from its bounded slice, so no in-flight state is
@@ -878,7 +1822,7 @@ impl Node {
                 // and missing-body facts already committed by earlier slices remain durable.
                 // `retry` drops this obsolete owner because the inbox holds a newer successor,
                 // which resumes the same live window instead of waiting behind up to 128 bodies.
-                self.dispose_rearming_hint(returned.flow);
+                self.dispose_rearming_hint(flow);
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                     port.req_done = port.req_done.max(work.request);
                     port.raise();
@@ -901,8 +1845,7 @@ impl Node {
             // on the same port, and leaving its old Busy backoff intact spaces that real work at
             // the exponential cap even though capacity has just made progress. Transport, policy
             // and no-progress backoffs retain their distinct meaning.
-            let local_progress =
-                returned.flow.done() || !returned.flow.waiting || returned.flow.body_progress;
+            let local_progress = flow.done() || !flow.waiting || flow.body_progress;
             let cleared_busy = local_progress
                 && self
                     .ports
@@ -925,46 +1868,42 @@ impl Node {
                     |counts| counts.backoff = None,
                 );
             }
-            if returned.flow.done() {
-                if !returned.flow.archive && !returned.flow.inventory {
-                    if let Some(head) = returned.flow.authenticated_head {
+            if flow.done() {
+                if !flow.archive && !flow.inventory {
+                    if let Some(head) = flow.authenticated_head {
                         let event = NetEvent::BoundedHeadCompleted {
                             channel_id: work.room,
-                            instance: Arc::downgrade(&returned.flow.shared),
+                            instance: Arc::downgrade(&flow.shared),
                             head,
-                            epoch: returned.flow.epoch,
-                            room_instance: returned.flow.instance,
-                            generation: returned.flow.generation,
+                            epoch: flow.epoch,
+                            room_instance: flow.instance,
+                            generation: flow.generation,
                         };
                         if self.net_tx.try_send(event).is_err() {
                             // Retain the charged completed flow and its in-flight hint until
                             // the actor can receive the exact completion; never lose this edge.
-                            self.bounded_sync.ready[index] = Some(returned.flow);
+                            self.bounded_sync.ready[index] = Some(flow);
                             self.sched_rooms.insert(work.room);
                             continue;
                         }
                     }
                 }
-                if let Some(status) = returned.flow.archive_status.take() {
+                if let Some(status) = flow.archive_status.take() {
                     if let Some(request) = status.request {
                         self.history_demand
-                            .completed(request, returned.flow.generation, status);
+                            .completed(request, flow.generation, status);
                     }
                 }
-                if let Some(hint) = returned.flow.hint {
-                    self.history_hints.finish(
-                        work.room,
-                        returned.flow.hint_peer,
-                        hint.author,
-                        hint.head,
-                    );
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                    if returned.flow.inventory {
+                    if flow.inventory {
                         port.done_gen = port.done_gen.max(work.generation);
                     }
-                    if returned.flow.inventory || returned.flow.hint.is_some() {
+                    if flow.inventory || flow.hint.is_some() {
                         // This attempt consumed the request that selected its inventory or
                         // scalar hint. Leaving it outstanding immediately schedules another
                         // inventory and recreates the feedback churn the bounded inbox removed.
@@ -998,7 +1937,7 @@ impl Node {
                 if raised {
                     self.sched_rooms.insert(work.room);
                 }
-                let reason = returned.flow.reason;
+                let reason = flow.reason;
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1015,30 +1954,20 @@ impl Node {
                 // 2026-10-19).
                 self.note_lane_sync(work.room, work.peer);
             } else {
-                let waiting = returned.flow.waiting;
-                let body_progress = returned.flow.body_progress;
-                if returned.flow.governance_wait {
+                let waiting = flow.waiting;
+                let body_progress = flow.body_progress;
+                if flow.governance_wait {
                     // The flow found the fold pending: the actor's fold hook drives it (ADR-037
                     // R2 b), and the flow's next round finds it ready.
                     self.governance_work.pending = true;
                 }
                 if index == 0 {
-                    if self.bounded_sync.deferred.len() == 8 {
-                        if let Some(old) = self.bounded_sync.deferred.pop_front() {
-                            if let Some(hint) = old.hint {
-                                self.history_hints.finish(
-                                    old.room,
-                                    old.hint_peer,
-                                    hint.author,
-                                    hint.head,
-                                );
-                            }
-                            self.bounded_sync.dispose(old);
-                        }
-                    }
-                    self.bounded_sync.deferred.push_back(returned.flow);
+                    // The controller-wide retained-flow permit already bounds this collection.
+                    // Never evict an exact required/hint/inventory root merely because some
+                    // arbitrary number of other ports are also deferred.
+                    self.bounded_sync.deferred.push_back(flow);
                 } else {
-                    self.bounded_sync.ready[index] = Some(returned.flow);
+                    self.bounded_sync.ready[index] = Some(flow);
                 }
                 if waiting {
                     if body_progress {
@@ -1083,9 +2012,21 @@ impl Node {
             return false;
         };
         let node = profile.fingerprint();
+        let pending_work = self.bounded_pending_identity(room, peer);
         let epoch = match shared.try_lock() {
             Ok(channel) => channel.epoch(),
-            Err(_) => return false,
+            Err(_) => {
+                self.bounded_sync.wait_for_room(
+                    &self.net_tx,
+                    &mut self.next_token,
+                    room,
+                    peer,
+                    pending_work,
+                    shared.clone(),
+                );
+                self.note_start(room, peer, "room_busy");
+                return false;
+            }
         };
         if self.bounded_sync.ready[0].is_none() && self.bounded_sync.running[0].is_none() {
             if let Some(at) = self
@@ -1134,13 +2075,14 @@ impl Node {
                 self.bounded_sync.deferred.push_back(parked);
             }
         }
-        let existing = (0..2).find(|index| {
+        let existing = (0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS).find(|index| {
             self.bounded_sync.running[*index].is_none()
                 && self.bounded_sync.ready[*index]
                     .as_ref()
                     .is_some_and(|flow| flow.room == room && flow.peer == peer && !flow.waiting)
         });
         let mut admitted_archive = None;
+        let mut admitted_control = None;
         let mut flow = if let Some(index) = existing {
             let Some(flow) = self.bounded_sync.ready[index].take() else {
                 return false;
@@ -1149,21 +2091,24 @@ impl Node {
         } else {
             // A retained waiting slice is retried by the existing bounded port backoff. It
             // cannot monopolize the other lane or cause an archive continuation to run.
-            if let Some(index) = (0..2).find(|i| {
-                !announce_first
-                    && self.bounded_sync.running[*i].is_none()
-                    && self.bounded_sync.ready[*i].as_ref().is_some_and(|flow| {
-                        flow.room == room
-                            && flow.peer == peer
-                            && (!flow.archive || self.bounded_sync.required.is_empty())
-                    })
-            }) {
+            if let Some(index) =
+                (0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS).find(|i| {
+                    !announce_first
+                        && self.bounded_sync.running[*i].is_none()
+                        && self.bounded_sync.ready[*i].as_ref().is_some_and(|flow| {
+                            flow.room == room
+                                && flow.peer == peer
+                                && (!flow.archive || self.bounded_sync.required.is_empty())
+                        })
+                })
+            {
                 let Some(flow) = self.bounded_sync.ready[index].take() else {
                     return false;
                 };
                 flow
             } else {
-                if self.bounded_sync.flow_count() >= 12 {
+                if self.bounded_sync.flow_count() >= RETAINED_FLOW_LIMIT {
+                    self.note_start(room, peer, "retained_flow_limit");
                     return false;
                 }
                 if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
@@ -1182,31 +2127,44 @@ impl Node {
                             instance,
                         ) {
                             ArchiveTurn::Ready(job) => admitted_archive = Some(job),
-                            ArchiveTurn::Waiting => return false,
-                            ArchiveTurn::Full => {
-                                self.history_demand.busy(
-                                    request,
-                                    generation,
-                                    "The daemon archive queue is full; resume this request later.",
-                                );
+                            ArchiveTurn::Waiting => {
+                                self.note_start(room, peer, "archive_budget_busy");
                                 return false;
                             }
                         }
                     }
                 }
                 let Ok(lease) = self.secret_work.clone().try_read_owned() else {
+                    self.bounded_sync.wait_for_secret(
+                        &self.net_tx,
+                        &mut self.next_token,
+                        room,
+                        peer,
+                        pending_work,
+                        self.secret_work.clone(),
+                    );
+                    self.note_start(room, peer, "identity_busy");
                     return false;
                 };
                 let lease = Arc::new(lease);
-                let Some(state_job) = self
-                    .history_budget
-                    .try_start(node, crate::node::history_budget::Lane::Control)
-                else {
-                    return false;
+                let state_job = match self.bounded_sync.foreground_turn(
+                    &self.history_budget,
+                    &self.net_tx,
+                    &mut self.next_token,
+                    node,
+                    room,
+                    peer,
+                    pending_work.root,
+                    crate::node::history_budget::Lane::Control,
+                ) {
+                    ForegroundTurn::Ready(job) => job,
+                    ForegroundTurn::Waiting => {
+                        self.note_start(room, peer, "control_budget_busy");
+                        return false;
+                    }
                 };
-                let Some(state_charge) = state_job.reserve_flow_state() else {
-                    return false;
-                };
+                let actor_incarnation = state_job.flow_owner();
+                admitted_control = Some(state_job.clone());
 
                 // Inventory must first advertise the new local departure. Once that fixed
                 // exchange completes, probe only our own exact head; no archive is followed.
@@ -1217,10 +2175,29 @@ impl Node {
                             .get(&(room, peer))
                             .is_some_and(|p| p.done_gen >= *generation)
                 }) {
+                    let bytes_wake = state_job.bytes_wake();
                     let Some(_read_charge) = state_job.reserve(4 * 1024 * 1024) else {
+                        self.bounded_sync.wait_for_bytes(
+                            &self.net_tx,
+                            &mut self.next_token,
+                            room,
+                            peer,
+                            pending_work,
+                            bytes_wake,
+                        );
+                        self.note_start(room, peer, "control_budget_busy");
                         return false;
                     };
                     let Ok(channel) = shared.try_lock() else {
+                        self.bounded_sync.wait_for_room(
+                            &self.net_tx,
+                            &mut self.next_token,
+                            room,
+                            peer,
+                            pending_work,
+                            shared.clone(),
+                        );
+                        self.note_start(room, peer, "room_busy");
                         return false;
                     };
                     match channel.history_head(&store, &node) {
@@ -1265,16 +2242,17 @@ impl Node {
                             dispatch.query,
                             dispatch.request,
                             dispatch.fence,
-                            state_charge,
                             self.bounded_sync.body_slots.clone(),
                             store.clone(),
-                            state_job.clone(),
+                            Arc::clone(&self.history_budget),
+                            actor_incarnation,
                         )
                     } else {
                         if page_only
                             || self.bounded_sync.ready[0].is_some()
                             || self.bounded_sync.running[0].is_some()
                         {
+                            self.note_start(room, peer, "live_lane_busy");
                             return false;
                         }
                         let live = match crate::node::history_demand::Context::current_unlocked(
@@ -1285,16 +2263,17 @@ impl Node {
                             Ok(value) => Arc::new(value),
                             Err(_) => return false,
                         };
-                        let required = if announce_first {
-                            None
-                        } else {
-                            self.bounded_sync
-                                .required
-                                .iter()
-                                .position(|(r, p, _, _)| *r == room && *p == peer)
-                                .and_then(|at| self.bounded_sync.required.remove(at))
-                                .map(|(_, _, head, seq)| (head, seq))
-                        };
+                        let required_at = (!announce_first)
+                            .then(|| {
+                                self.bounded_sync
+                                    .required
+                                    .iter()
+                                    .position(|(r, p, _, _)| *r == room && *p == peer)
+                            })
+                            .flatten();
+                        let required = required_at
+                            .and_then(|at| self.bounded_sync.required.get(at))
+                            .map(|(_, _, head, seq)| (*head, *seq));
                         let hint = if announce_first || required.is_some() {
                             None
                         } else {
@@ -1318,19 +2297,21 @@ impl Node {
                             hint,
                             departure_hint.is_some() && required.is_none(),
                             required,
-                            state_charge,
                             self.bounded_sync.body_slots.clone(),
                             store.clone(),
-                            state_job.clone(),
+                            Arc::clone(&self.history_budget),
+                            actor_incarnation,
                         ) {
                             Ok(mut flow) => {
                                 flow.reason = reason;
+                                if let Some(at) = required_at {
+                                    let _ = self.bounded_sync.required.remove(at);
+                                }
                                 flow
                             }
                             Err(_) => {
                                 if let Some(hint) = hint {
-                                    self.history_hints
-                                        .finish(room, peer, hint.author, hint.head);
+                                    self.history_hints.retry(room, peer, hint.author, hint.head);
                                 }
                                 return false;
                             }
@@ -1341,6 +2322,7 @@ impl Node {
                         || self.bounded_sync.ready[0].is_some()
                         || self.bounded_sync.running[0].is_some()
                     {
+                        self.note_start(room, peer, "live_lane_busy");
                         return false;
                     }
                     let live = match crate::node::history_demand::Context::current_unlocked(
@@ -1351,16 +2333,17 @@ impl Node {
                         Ok(value) => Arc::new(value),
                         Err(_) => return false,
                     };
-                    let required = if announce_first {
-                        None
-                    } else {
-                        self.bounded_sync
-                            .required
-                            .iter()
-                            .position(|(r, p, _, _)| *r == room && *p == peer)
-                            .and_then(|at| self.bounded_sync.required.remove(at))
-                            .map(|(_, _, head, seq)| (head, seq))
-                    };
+                    let required_at = (!announce_first)
+                        .then(|| {
+                            self.bounded_sync
+                                .required
+                                .iter()
+                                .position(|(r, p, _, _)| *r == room && *p == peer)
+                        })
+                        .flatten();
+                    let required = required_at
+                        .and_then(|at| self.bounded_sync.required.get(at))
+                        .map(|(_, _, head, seq)| (*head, *seq));
                     let hint = if announce_first || required.is_some() {
                         None
                     } else {
@@ -1384,19 +2367,21 @@ impl Node {
                         hint,
                         departure_hint.is_some() && required.is_none(),
                         required,
-                        state_charge,
                         self.bounded_sync.body_slots.clone(),
                         store.clone(),
-                        state_job.clone(),
+                        Arc::clone(&self.history_budget),
+                        actor_incarnation,
                     ) {
                         Ok(mut flow) => {
                             flow.reason = reason;
+                            if let Some(at) = required_at {
+                                let _ = self.bounded_sync.required.remove(at);
+                            }
                             flow
                         }
                         Err(_) => {
                             if let Some(hint) = hint {
-                                self.history_hints
-                                    .finish(room, peer, hint.author, hint.head);
+                                self.history_hints.retry(room, peer, hint.author, hint.head);
                             }
                             return false;
                         }
@@ -1406,6 +2391,8 @@ impl Node {
         };
         let index = usize::from(flow.archive);
         let lane = flow.lane();
+        // From here on this Flow is the sole owner of any consumed archive dispatch, required
+        // dependency or hint. Every refusal parks this exact owner until its admission edge.
         let job = if lane == crate::node::history_budget::Lane::Archive {
             if let Some(job) = admitted_archive.take() {
                 job
@@ -1427,38 +2414,153 @@ impl Node {
                 ) {
                     ArchiveTurn::Ready(job) => job,
                     ArchiveTurn::Waiting => {
-                        self.bounded_sync.ready[index] = Some(flow);
+                        self.note_start(room, peer, "archive_budget_busy");
+                        self.shelve_exact(flow, index);
                         return false;
                     }
-                    ArchiveTurn::Full => {
-                        self.history_demand.busy(
-                            request,
-                            flow.generation,
-                            "The daemon archive queue is full; resume this request later.",
-                        );
-                        self.bounded_sync.dispose(flow);
+                }
+            }
+        } else if lane == crate::node::history_budget::Lane::Control {
+            if let Some(job) = admitted_control.take() {
+                job
+            } else {
+                match self.bounded_sync.foreground_turn(
+                    &self.history_budget,
+                    &self.net_tx,
+                    &mut self.next_token,
+                    node,
+                    room,
+                    peer,
+                    flow.root_name(),
+                    lane,
+                ) {
+                    ForegroundTurn::Ready(job) => job,
+                    ForegroundTurn::Waiting => {
+                        self.note_start(room, peer, "control_budget_busy");
+                        self.shelve_exact(flow, index);
                         return false;
                     }
                 }
             }
         } else {
-            let Some(job) = self.history_budget.try_start(node, lane) else {
-                self.bounded_sync.ready[index] = Some(flow);
-                return false;
-            };
+            match self.bounded_sync.foreground_turn(
+                &self.history_budget,
+                &self.net_tx,
+                &mut self.next_token,
+                node,
+                room,
+                peer,
+                flow.root_name(),
+                lane,
+            ) {
+                ForegroundTurn::Ready(job) => job,
+                ForegroundTurn::Waiting => {
+                    // The retained lane ticket wakes this exact port on a relevant release.
+                    self.note_start(room, peer, "control_budget_busy");
+                    self.shelve_exact(flow, index);
+                    return false;
+                }
+            }
+        };
+        // Flow-state bytes always come from Control. A newly created flow reuses the construction
+        // job; a resumed non-Control flow admits a fresh Control job for this round only. Neither
+        // worker survives `Flow::park` because the state charge owns its final reference.
+        let state_job = if lane == crate::node::history_budget::Lane::Control {
+            job.clone()
+        } else if let Some(job) = admitted_control.take() {
             job
+        } else {
+            match self.bounded_sync.foreground_turn(
+                &self.history_budget,
+                &self.net_tx,
+                &mut self.next_token,
+                node,
+                room,
+                peer,
+                flow.root_name(),
+                crate::node::history_budget::Lane::Control,
+            ) {
+                ForegroundTurn::Ready(job) => job,
+                ForegroundTurn::Waiting => {
+                    self.note_start(room, peer, "control_budget_busy");
+                    self.shelve_exact(flow, index);
+                    return false;
+                }
+            }
+        };
+        // The Control bytes the flow state costs, from the same budget gate (ADR-038 FX-35):
+        // their refusal is the control budget's, never the pool's, and they go back with the
+        // flow if a later gate ends the attempt.
+        let bytes_wake = Flow::state_bytes_wake(&state_job);
+        let Some(state_bytes) = flow.reserve_state_bytes(&state_job) else {
+            self.bounded_sync.wait_for_bytes(
+                &self.net_tx,
+                &mut self.next_token,
+                room,
+                peer,
+                AdmissionWork::from_flow(&flow),
+                bytes_wake,
+            );
+            self.note_start(room, peer, "control_budget_busy");
+            self.shelve_exact(flow, index);
+            return false;
         };
         let wake = self.net_tx.clone();
         let Some(slot) = crate::node::ports::Slots::take(
             &self.slots,
             peer,
             Box::new(move || {
-                let _ = wake.try_send(NetEvent::SlotFreed);
+                tokio::spawn(async move {
+                    let _ = wake.send(NetEvent::SlotFreed).await;
+                });
             }),
         ) else {
-            self.bounded_sync.ready[index] = Some(flow);
+            self.note_start(room, peer, "no_outbound_slot");
+            self.shelve_exact(flow, index);
             return false;
         };
+        // The last gate (ADR-038 FX-35): a flow holds the daemon's flow state only while its
+        // round runs, and takes it here, in the step that makes the round run. A full fixed pool
+        // parks the exact flow, gives back the lane job and slot, and wakes only from a running
+        // charge's release; the port keeps its need.
+        let flow_state_wake = Flow::flow_state_wake(&state_job);
+        match flow.resume(&state_job, state_bytes) {
+            crate::node::history_stream::runtime::Resumed::Held => {}
+            refused @ (crate::node::history_stream::runtime::Resumed::PoolFull
+            | crate::node::history_stream::runtime::Resumed::NodeBusy) => {
+                let (reason, gate) = match refused {
+                    crate::node::history_stream::runtime::Resumed::PoolFull => {
+                        ("flow_state_pool_full", "pool")
+                    }
+                    crate::node::history_stream::runtime::Resumed::NodeBusy => {
+                        ("flow_state_node_busy", "node_slots")
+                    }
+                    crate::node::history_stream::runtime::Resumed::Held => unreachable!(),
+                };
+                self.note_start(room, peer, reason);
+                // This ordinary admission wait still owns all work consumed while constructing
+                // the Flow: archive dispatch, exact required dependency, or scalar hint. Retain
+                // it in its lane until a running completion releases capacity and wakes the
+                // actor; never reconstruct only the hint and strand the other two forms.
+                let mut flow = flow;
+                let root = flow.root_name();
+                flow.park();
+                debug_assert!(self.bounded_sync.ready[index].is_none());
+                self.bounded_sync.ready[index] = Some(flow);
+                self.bounded_sync.wait_for_pool(
+                    &self.net_tx,
+                    &mut self.next_token,
+                    room,
+                    peer,
+                    PoolWait {
+                        gate,
+                        work: AdmissionWork { root, lane },
+                    },
+                    flow_state_wake,
+                );
+                return false;
+            }
+        }
         let Some(port) = self.ports.get_mut(&(room, peer)) else {
             self.dispose_rearming_hint(flow);
             return false;
@@ -1501,18 +2603,34 @@ impl Node {
         let archive = flow
             .archive_request
             .map(|request| (request, flow.generation));
+        let running_retirement_key = retirement_key(&flow);
+        // A key to this peer waiting on its bundle makes this round read the peer's board,
+        // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.
+        flow.wants_board = self.key_waiting.contains_key(&(room, peer));
+        let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
+        let worker_flow = Arc::clone(&flow);
+        let settlement_flow = Arc::clone(&flow);
         let output = result.clone();
         let worker_fence = fence.clone();
-        let tx = self.net_tx.clone();
+        let completion_wake = self.bounded_sync.completion_wake();
         let inbox = self.history_hints.clone();
-        let inbox_generation = inbox.generation();
+        let inbox_generation = inbox.generation(room, peer);
         let now = self.now_ms().get();
         let net = self.net.as_ref().cloned();
         let pstore = profile.store_handle();
-        let task = tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let _slot = slot;
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let deadline =
+                tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
+            let mut flow = worker_flow.lock().await;
+            let Some(flow) = flow.as_mut() else {
+                return Some("bounded history supervisor retained no Flow".to_owned());
+            };
+            // The proof barrier belongs after exclusive Flow ownership. While it is held, an
+            // actor panic can retire the controller but cannot adopt/park this Flow; its charge
+            // therefore remains truthfully attributed to the retiring actor generation.
+            job.hold_for_proof().await;
             if flow.needs_board() && !worker_fence.is_retired() {
                 if let Some(net) = net {
                     flow.admitted_authors = tokio::select! {
@@ -1536,10 +2654,25 @@ impl Node {
                 .await
                 .err()
                 .map(|e| e.to_string());
-            if let Ok(mut result) = output.lock() {
-                *result = Some(Returned { flow, error });
+            // The round is over: its flow state goes back here, in the step that ends it
+            // (ADR-038 FX-35), not when the actor next looks; a finished task holds no charge.
+            flow.park();
+            error
+        });
+        let task = tokio::spawn(async move {
+            let (error, panic) = match worker.await {
+                Ok(error) => (error, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            // The inner task can unwind before its normal `park`. Its supervisor owns the exact
+            // settlement edge and releases the running charge before publishing completion.
+            if let Some(flow) = settlement_flow.lock().await.as_mut() {
+                flow.park();
             }
-            let _ = tx.try_send(NetEvent::BoundedSyncProgress { token });
+            if let Ok(mut result) = output.lock() {
+                *result = Some(Returned { error, panic });
+            }
+            completion_wake.notify_one();
         });
         self.bounded_sync.running[index] = Some(Running {
             room,
@@ -1548,10 +2681,201 @@ impl Node {
             generation,
             request,
             archive,
+            lane,
+            retirement_key: running_retirement_key,
             fence,
+            flow,
             result,
             task,
+            started: std::time::Instant::now(),
         });
+        self.note_start(room, peer, "started");
         true
+    }
+}
+
+impl Controller {
+    /// The lane's flow slots as they stand, for `vox status --json` (`lanes.bounded`): a live
+    /// flow that never returns holds slot 0 and silences every room of the node, so a person
+    /// must be able to see it.
+    pub(super) fn lanes_json(&self) -> String {
+        use crate::node::link::b32_encode;
+        let retirement_errors = self
+            .retirement_ledger
+            .errors
+            .lock()
+            .map(|errors| errors.clone())
+            .unwrap_or_default();
+        let cleanup_errors = retirement_errors
+            .iter()
+            .map(|(key, error)| {
+                format!(
+                    "{{\"actor\":{},\"request\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{},\"error\":{}}}",
+                    key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
+                    key.request
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>(),
+                    b32_encode(&key.room),
+                    b32_encode(&key.peer),
+                    key.archive,
+                    serde_json::to_string(error).unwrap_or_else(|_| "null".to_owned())
+                )
+            })
+            .collect::<Vec<_>>();
+        let cleanup_error = retirement_errors.values().next().cloned();
+        let flow = |f: &Flow| {
+            format!(
+                "{{\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
+                b32_encode(&f.room),
+                b32_encode(&f.peer),
+                f.root_name(),
+                lane_name(f.lane()),
+                f.archive,
+                f.waiting,
+                f.inventory
+            )
+        };
+        let ready: Vec<String> = self
+            .ready
+            .iter()
+            .map(|r| r.as_ref().map_or_else(|| "null".to_owned(), flow))
+            .collect();
+        let running: Vec<String> = self
+            .running
+            .iter()
+            .map(|r| {
+                r.as_ref().map_or_else(
+                    || "null".to_owned(),
+                    |r| {
+                        format!(
+                            "{{\"room\":\"{}\",\"peer\":\"{}\",\"token\":{},\"archive\":{},\"lane\":\"{}\",\"age_ms\":{},\"finished\":{}}}",
+                            b32_encode(&r.room),
+                            b32_encode(&r.peer),
+                            r.token,
+                            r.archive.is_some(),
+                            lane_name(r.lane),
+                            u64::try_from(r.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            r.task.is_finished()
+                        )
+                    },
+                )
+            })
+            .collect();
+        let admission = |gate: &str,
+                         token: u64,
+                         room: Digest32,
+                         peer: Digest32,
+                         root: &str,
+                         lane: crate::node::history_budget::Lane,
+                         request: Option<stream::RequestId>| {
+            let request = request.map_or_else(
+                || "null".to_owned(),
+                |request| {
+                    format!(
+                        "\"{}\"",
+                        request
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    )
+                },
+            );
+            format!(
+                "{{\"admission\":{},\"gate\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"request\":{}}}",
+                token,
+                gate,
+                b32_encode(&room),
+                b32_encode(&peer),
+                root,
+                lane_name(lane),
+                request
+            )
+        };
+        let mut admissions = Vec::new();
+        if let Some(waiting) = &self.archive_admission {
+            admissions.push(admission(
+                "archive",
+                waiting.token,
+                waiting.room,
+                waiting.peer,
+                "archive",
+                crate::node::history_budget::Lane::Archive,
+                Some(waiting.request),
+            ));
+        }
+        admissions.extend(self.foreground_admission.iter().flatten().map(|waiting| {
+            admission(
+                "foreground",
+                waiting.token,
+                waiting.room,
+                waiting.peer,
+                waiting.root,
+                waiting.lane,
+                None,
+            )
+        }));
+        admissions.extend(self.room_admission.iter().map(|((room, peer), waiting)| {
+            admission(
+                "room",
+                waiting.token,
+                *room,
+                *peer,
+                waiting.root,
+                waiting.lane,
+                None,
+            )
+        }));
+        admissions.extend(self.secret_admission.iter().map(|((room, peer), waiting)| {
+            admission(
+                "secret",
+                waiting.token,
+                *room,
+                *peer,
+                waiting.root,
+                waiting.lane,
+                None,
+            )
+        }));
+        admissions.extend(self.byte_admission.iter().map(|((room, peer), waiting)| {
+            admission(
+                "bytes",
+                waiting.token,
+                *room,
+                *peer,
+                waiting.root,
+                waiting.lane,
+                None,
+            )
+        }));
+        admissions.extend(self.pool_admission.iter().map(|((room, peer), waiting)| {
+            admission(
+                waiting.gate,
+                waiting.token,
+                *room,
+                *peer,
+                waiting.root,
+                waiting.lane,
+                None,
+            )
+        }));
+        format!(
+            "{{\"ready\":[{}],\"running\":[{}],\"deferred\":{},\"retiring\":{},\"required\":{},\"admissions\":[{}],\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"pool_admissions\":{},\"cleanup\":{},\"cleanup_error\":{},\"cleanup_errors\":[{}]}}",
+            ready.join(","),
+            running.join(","),
+            self.deferred.len(),
+            self.retiring.len(),
+            self.required.len(),
+            admissions.join(","),
+            self.archive_admission.is_some(),
+            self.foreground_admission.iter().flatten().count(),
+            self.room_admission.len(),
+            self.secret_admission.len(),
+            self.byte_admission.len(),
+            self.pool_admission.len(),
+            self.cleanup.is_some(),
+            serde_json::to_string(&cleanup_error).unwrap_or_else(|_| "null".to_owned()),
+            cleanup_errors.join(",")
+        )
     }
 }

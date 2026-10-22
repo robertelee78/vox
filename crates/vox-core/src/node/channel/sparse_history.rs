@@ -801,12 +801,6 @@ impl ChannelState {
             bool,
             entry_store::sparse::ContiguousAdvance,
         )> {
-            let finished = FinishedHistoryEffect { hash: *hash };
-            let mut index = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            index.finish_history_effect(&entry, &finished, self.me())?;
-            index.seal()?;
             session_projection::private_index::observe_public(
                 &mut batch,
                 &self.sek,
@@ -848,7 +842,19 @@ impl ChannelState {
             let staged_deferred = body_expected && projection_deferred;
             self.queue_receivers(&mut batch)?;
             self.queue_private_generations(&mut batch)?;
-            if !(refill_pending || staged_deferred || body_unavailable) {
+            let effect_complete = !(refill_pending || staged_deferred || body_unavailable);
+            if effect_complete {
+                // Role-complete means the requested body was semantically admitted, not merely
+                // durable. `Deferred` and `Unavailable` deliberately leave both the effect
+                // obligation and contiguous receipt cursor behind this position, including
+                // across restart. A non-recipient package has no owed body and reaches this same
+                // point after its authenticated header's semantic dispatch.
+                let finished = FinishedHistoryEffect { hash: *hash };
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                index.finish_history_effect(&entry, &finished, self.me())?;
+                index.seal()?;
                 on_admitted(&mut batch, *hash)?;
             }
             // Settlement, obligation retirement, and the restart receipt cursor are one

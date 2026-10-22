@@ -115,7 +115,7 @@ pub(crate) async fn serve(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(room, store, preamble.epoch, peer, fence.clone(), deadline);
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
-    let generation = inbox.generation();
+    let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
     let result = serve_request(
         &source,

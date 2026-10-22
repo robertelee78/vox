@@ -155,7 +155,7 @@ impl Source {
         let work_envelope = envelope
             .checked_add(temporary)
             .ok_or(Error::SizeLimitExceeded("history read envelope"))?;
-        let Some(work_job) = job.record_job(work_envelope) else {
+        let Some(work_job) = job.record_job(work_envelope).await else {
             return Ok(Lookup::Busy);
         };
         let Some(charge) = work_job.reserve(envelope) else {

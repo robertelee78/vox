@@ -452,6 +452,15 @@ The decider then answered twelve questions, one at a time. His answers are the d
   pool full (16 of 16) by the first fifth of the run with 1,951 flows started before and none
   after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The product
   said only the symptom. "please make vox work"; "be methodical" (the decider, 2026-10-21).
+
+  > **Draft FX-35 amendment — pending the decider's sign-off, not a Decision.** Keep a fixed
+  > daemon-wide capacity of 16 **running** flow states. A full pool is ordinary admission
+  > pressure: retain the exact parked Flow, release its lane worker, byte charge and outbound
+  > slot, and resume it only from the running charge's release edge. Do not claim that the pool
+  > cannot fill, discard or reconstruct the work, depend on the ticker, or retire it by elapsed
+  > time, retry count, queue count, CPU use or machine load. Actor generations of one hosted node
+  > share two running slots. This draft replaces the wait-queue paragraphs above only if the
+  > decider accepts it.
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The

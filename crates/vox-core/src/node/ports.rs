@@ -269,6 +269,9 @@ pub struct Port {
     /// request and unconsumed, a round the port runs for it is a `periodic` round in
     /// `vox status` (ADR-038 FX-15, #996).
     pub periodic_req: u64,
+    /// Why the last `start_outbound` for this port ended as it did, and when: what
+    /// `vox status --json` names under `lanes.ports[].last_start` (ADR-038 FX-16).
+    pub last_start: Option<(&'static str, Instant)>,
 }
 
 impl Port {
@@ -292,6 +295,7 @@ impl Port {
             own_seq: 0,
             announced_seq: 0,
             periodic_req: 0,
+            last_start: None,
         }
     }
 
@@ -490,6 +494,13 @@ impl Slots {
     #[must_use]
     pub fn any_free(slots: &SharedSlots) -> bool {
         slots.lock().unwrap_or_else(PoisonError::into_inner).in_use < OUTBOUND_SLOTS
+    }
+
+    /// The slots in use now, overall and per peer, for `vox status --json`.
+    #[must_use]
+    pub fn snapshot(slots: &SharedSlots) -> (usize, Vec<(Digest32, usize)>) {
+        let s = slots.lock().unwrap_or_else(PoisonError::into_inner);
+        (s.in_use, s.per_peer.iter().map(|(p, n)| (*p, *n)).collect())
     }
 
     /// Take a slot for `peer`, if one is free; `on_free` runs when it is given back.

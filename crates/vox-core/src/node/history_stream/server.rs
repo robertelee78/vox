@@ -532,7 +532,7 @@ async fn entry(
     let record_job = if withhold_private_body {
         None
     } else {
-        let Some(record_job) = job.record_job(envelope) else {
+        let Some(record_job) = job.record_job(envelope).await else {
             result.status = Status::Busy;
             return Ok(result);
         };
