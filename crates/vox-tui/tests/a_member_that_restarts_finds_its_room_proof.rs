@@ -634,7 +634,8 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let key_hold = t.path().join("hold-after-received-key");
     let key_reached = key_hold.with_extension("reached");
-    let unheard = [
+    let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
+    let alice_env = [
         ("VOX_TEST_NO_NEARBY", "1".to_owned()),
         (
             "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
@@ -651,7 +652,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "alice",
         &format!("{IDENTITY}\n"),
         "127.0.0.1:0",
-        &unheard,
+        &alice_env,
     );
     let alice_at = listening(&alice);
     let bob_d = daemon(
@@ -686,7 +687,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &alice,
         "alice-1",
         &alice_at,
-        &unheard,
+        &alice_env,
         &room,
         "`vox trust add carol` returned",
     );
@@ -718,7 +719,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &alice,
         "alice-2",
         &alice_at,
-        &unheard,
+        &alice_env,
         &room,
         "her Session was listed",
     );
@@ -743,11 +744,24 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    let marker = std::fs::read_to_string(&key_reached)
+        .expect("APPARATUS: cannot read the reached received-key boundary");
+    let mut marker_fields = marker.split_whitespace();
+    let marked_author = marker_fields.next().unwrap_or_default();
+    let marked_seq = marker_fields
+        .next()
+        .and_then(|seq| seq.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert!(
+        marked_author == bob_fp && marked_seq != 0 && marker_fields.next().is_none(),
+        "APPARATUS: the received-key boundary was not bob's exact key-package entry: \
+         expected author {bob_fp}, got {marker:?}"
+    );
     ruled.from_bob = true;
     // Bob has made exactly his first sender generation; no other peer has posted to Alice.
     ruled.keys = Some(1);
-    let bob_pid = bob_d.0.id().to_string();
-    signal(&bob_pid, "STOP");
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
     drop(alice_d);
     std::fs::remove_file(&key_hold)
         .expect("APPARATUS: cannot release the received-key hold after SIGKILL");
@@ -759,7 +773,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "alice-3",
         &format!("{IDENTITY}\n{ROOMPASS}\n"),
         &alice_at,
-        &unheard,
+        &alice_env,
     );
     ruled_set_intact(
         &alice,
@@ -768,7 +782,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &ruled,
         "(3) a received key was the last write before the round's generic flush, bob frozen",
     );
-    signal(&bob_pid, "CONT");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
 
     // ---- (4) own posts, last -------------------------------------------------------------------
     for i in 1..=CRASH_POSTS {
@@ -780,7 +794,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         &alice,
         "alice-4",
         &alice_at,
-        &unheard,
+        &alice_env,
         &room,
         "`vox room post kept 3` returned",
     );
@@ -879,25 +893,20 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         );
         std::thread::sleep(Duration::from_millis(100));
     };
-    let pid = carol_d.0.id().to_string();
-    signal(&pid, "STOP");
-    let state = process_state(&pid);
-    assert!(
-        state.starts_with('T'),
-        "APPARATUS: carol's daemon is not stopped while its data root is copied: `ps` state {state:?}"
-    );
+    let pid = carol_d.0.id();
+    signal(pid, rustix::process::Signal::STOP, true);
     let copy = t.path().join("carol-copy");
     copy_dir(&carol, &copy);
-    signal(&pid, "CONT");
+    signal(pid, rustix::process::Signal::CONT, false);
     drop(carol_d);
     println!(
-        "[proof] (6) carol's data root copied {:?} after her join with her daemon stopped ({state}), \
+        "[proof] (6) carol's data root copied {:?} after her join after the kernel reported her stopped, \
          {partial} of {CRASH_BACKLOG} posts read and {flushed} flush(es) since the join",
         joined.elapsed()
     );
     // Alice frozen while the copy's daemon reads what it holds: no row or key can come from her.
-    let alice_pid = alice_d.0.id().to_string();
-    signal(&alice_pid, "STOP");
+    let alice_pid = alice_d.0.id();
+    signal(alice_pid, rustix::process::Signal::STOP, true);
     std::fs::create_dir_all(copy.join("cfg"))
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", copy.display()));
     let tag = "carol-copy";
@@ -919,7 +928,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     } else {
         (String::new(), Vec::new(), 0, String::new())
     };
-    signal(&alice_pid, "CONT");
+    signal(alice_pid, rustix::process::Signal::CONT, false);
     assert!(
         opened,
         "APPARATUS: before {APPARATUS_WATCHDOG:?}, the daemon started from a data root copied \
@@ -1079,22 +1088,30 @@ fn assert_open_line(line: &str, room: &str, when: &str) {
     );
 }
 
-/// `kill -<sig> <pid>`, or an APPARATUS red.
-fn signal(pid: &str, sig: &str) {
-    let sent = Command::new("kill")
-        .args([&format!("-{sig}"), pid])
-        .status()
-        .is_ok_and(|s| s.success());
-    assert!(sent, "APPARATUS: `kill -{sig} {pid}` did not take");
-}
-
-/// The process's state letter(s) as `ps` prints them (`T` = stopped).
-fn process_state(pid: &str) -> String {
-    let out = Command::new("ps")
-        .args(["-o", "state=", "-p", pid])
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: ps: {e}"));
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+/// Signal a proof daemon and consume that exact child-state transition before continuing.
+fn signal(pid: u32, signal: rustix::process::Signal, stopped: bool) {
+    let pid = rustix::process::Pid::from_raw(pid as _)
+        .unwrap_or_else(|| panic!("APPARATUS: daemon has invalid pid {pid}"));
+    rustix::process::kill_process(pid, signal)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not send {signal:?} to daemon {pid}: {e}"));
+    let options = if stopped {
+        rustix::process::WaitOptions::UNTRACED
+    } else {
+        rustix::process::WaitOptions::CONTINUED
+    };
+    let (_, state) = rustix::process::waitpid(Some(pid), options)
+        .unwrap_or_else(|e| {
+            panic!("APPARATUS: could not observe daemon {pid} after {signal:?}: {e}")
+        })
+        .unwrap_or_else(|| panic!("APPARATUS: daemon {pid} had no state after {signal:?}"));
+    assert!(
+        if stopped {
+            state.stopped()
+        } else {
+            state.continued()
+        },
+        "APPARATUS: daemon {pid} reported {state:?}, not the requested {signal:?} transition"
+    );
 }
 
 /// The `vox room list` line naming `room` as `dir`, or an empty string.

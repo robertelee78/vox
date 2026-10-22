@@ -30,7 +30,7 @@ pub(crate) struct HistoryHeadPage {
 const TEST_HOLD_AFTER_RECEIVED_KEY_ENV: &str = "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE";
 
 #[cfg(feature = "test-knobs")]
-fn hold_after_received_key_commit() {
+fn hold_after_received_key_commit(author: &Digest32, seq: u64) {
     let Some(gate) = std::env::var_os(TEST_HOLD_AFTER_RECEIVED_KEY_ENV) else {
         return;
     };
@@ -39,7 +39,8 @@ fn hold_after_received_key_commit() {
         return;
     }
     let reached = gate.with_extension("reached");
-    std::fs::write(&reached, b"received key batch committed\n").unwrap_or_else(|error| {
+    let exact = format!("{} {seq}\n", crate::node::link::b32_encode(author));
+    std::fs::write(&reached, exact).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: could not mark the received-key crash boundary at {}: {error}",
             reached.display()
@@ -51,7 +52,7 @@ fn hold_after_received_key_commit() {
 }
 
 #[cfg(not(feature = "test-knobs"))]
-fn hold_after_received_key_commit() {}
+fn hold_after_received_key_commit(_author: &Digest32, _seq: u64) {}
 
 /// A missing local body is not an authenticated expiry claim.
 pub(crate) enum HistoryPayload {
@@ -884,7 +885,7 @@ impl ChannelState {
                 && entry.payload.is_some()
                 && key_package_for(&entry, &self.me())
             {
-                hold_after_received_key_commit();
+                hold_after_received_key_commit(&entry.skeleton.author_id, entry.skeleton.seq);
             }
             // The settled-tip index and presence update are now durable in the same Batch.
             // A source-only entry cannot change membership, and a late earlier effect must
@@ -1088,7 +1089,7 @@ impl ChannelState {
             batch.commit()?;
             self.entries.committed();
             if kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me()) {
-                hold_after_received_key_commit();
+                hold_after_received_key_commit(&entry.skeleton.author_id, entry.skeleton.seq);
             }
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
