@@ -544,7 +544,12 @@ impl Node {
             .as_ref()
             .ok_or(Error::Profile("managed profile disappeared"))?;
         Self::computer_policy_active(deadline, cancelled)?;
-        if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable") {
+        // A live policy first makes its possible keyring commit recoverable. An expired policy
+        // is already recovery: its durable prepared record is the authority for `plan.denied`,
+        // and attempting to prepare it again would reject the expiry before revocation could be
+        // saved. If either following write is interrupted, startup repeats the same idempotent
+        // branch until `mark_expired_until` clears the records after the revoked keyring lands.
+        if !expired && !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable") {
             computer.prepare_application_until(me, revision, &covered, deadline)?;
         }
         Self::computer_policy_active(deadline, cancelled)?;
@@ -552,7 +557,9 @@ impl Node {
             Self::computer_policy_active(deadline, cancelled)
         })?;
         #[cfg(feature = "test-knobs")]
-        Self::crash_after_computer_keyring_commit_for_proof(me, revision, &covered);
+        if !expired {
+            Self::crash_after_computer_keyring_commit_for_proof(me, revision, &covered);
+        }
         Self::computer_policy_active(deadline, cancelled)?;
         self.trust = next;
         for (id, was) in changed_drive {

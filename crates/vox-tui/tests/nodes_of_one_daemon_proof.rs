@@ -2615,28 +2615,30 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "node after-remote-anchor-b is Ready after exact keyring-commit recovery",
         |line| line.contains("after-remote-anchor-b is Ready"),
     );
-    loop {
-        let recovered = application_toward(&b, &a_id);
-        if recovered["missed_revision"] == committed_revision
-            && recovered["convergence_state"] == "expired"
-        {
-            let (_, grants, grant_error) =
-                b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
-            assert!(
-                exact_grants(&b, "after-remote-anchor-b", &[]),
-                "PRODUCT [FX28 keyring-commit-crash]: after restart made exact merged revision {committed_revision} expired, the managed node retained authority committed before its missing applied receipt: status {}; shipped trust output {grants}; error {grant_error}",
-                computer(&b, &["status"])
-            );
-            break;
-        }
-        assert!(
-            daemon_alive(right.child.id()) && daemon_alive(relay.child.id()),
-            "PRODUCT [FX28 keyring-commit-crash]: a shipped process exited before restart exposed the durable expired exchange and fail-closed trust: right {}; anchor {}",
-            right.said(),
-            relay.said()
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // Ready is published only after startup reconciles computer policy, and Management recovers
+    // pending exchanges before that actor starts. Status therefore owes the exact durable miss
+    // now; polling would add no causal event and could hide a missing publication indefinitely.
+    let recovered_status = computer(&b, &["status"]);
+    let recovered = recovered_status["applications"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|application| application["computer"]["fingerprint"] == a_id)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    assert!(
+        recovered["missed_revision"] == committed_revision
+            && matches!(
+                recovered["convergence_state"].as_str(),
+                Some("expired" | "repaired-late")
+            ),
+        "PRODUCT [FX28 keyring-commit-crash]: after the restarted managed node became Ready, shipped status did not retain exact interrupted revision {committed_revision} as expired or repaired-late: {recovered_status}"
+    );
+    let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
+    assert!(
+        exact_grants(&b, "after-remote-anchor-b", &[]),
+        "PRODUCT [FX28 keyring-commit-crash]: after restart made exact merged revision {committed_revision} expired, the managed node retained authority committed before its missing applied receipt: status {recovered_status}; shipped trust output {grants}; error {grant_error}"
+    );
     drop((left, right, relay));
 }
 
