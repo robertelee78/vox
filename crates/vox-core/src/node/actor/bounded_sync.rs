@@ -730,17 +730,21 @@ impl Controller {
         peer: Digest32,
         waiting: PoolWait,
         job: &crate::node::history_budget::Job,
-    ) {
+        refused_at: &crate::node::history_budget::FlowReleaseEdge,
+    ) -> Result<(), crate::node::history_budget::FlowWaitError> {
         if self.pool_admission.contains_key(&(room, peer)) {
-            return;
+            return Ok(());
         }
         let token = *next_token;
         *next_token += 1;
-        let Some(ticket) =
-            job.flow_wait_ticket(room, peer, waiting.request, waiting.instance, token)
-        else {
-            return;
-        };
+        let ticket = job.flow_wait_ticket(
+            room,
+            peer,
+            waiting.request,
+            waiting.instance,
+            token,
+            refused_at,
+        )?;
         self.pool_admission.insert(
             (room, peer),
             PoolAdmission {
@@ -752,6 +756,7 @@ impl Controller {
                 handed_off: false,
             },
         );
+        Ok(())
     }
     /// Retiring work stays inside the same twelve-flow limit and retains its charge/lease.
     /// Other rooms may progress while one room waits for its next bounded cleanup slice.
@@ -2557,40 +2562,45 @@ impl Node {
                 .map(|admission| &mut admission.ticket);
             flow.resume(&state_job, state_bytes, waiter)
         };
-        match resumed {
+        let refused = match resumed {
             crate::node::history_stream::runtime::Resumed::Held => {
                 self.bounded_sync.cancel_pool_admission(room, peer);
+                None
             }
-            refused @ (crate::node::history_stream::runtime::Resumed::PoolFull
-            | crate::node::history_stream::runtime::Resumed::NodeBusy) => {
-                let (gate, reason) = match refused {
-                    crate::node::history_stream::runtime::Resumed::PoolFull => {
-                        ("pool", "flow_state_pool_full")
-                    }
-                    crate::node::history_stream::runtime::Resumed::NodeBusy => {
-                        ("node_slots", "flow_state_node_busy")
-                    }
-                    crate::node::history_stream::runtime::Resumed::Held => unreachable!(),
-                };
-                // Both refusals are impossible under the legal running-work bound, but they are
-                // different first gates. Do not call two occupied source-owned slots a full
-                // daemon pool: operators need the same cause here and on the retained admission.
-                self.note_start(room, peer, reason);
-                // This ordinary admission wait still owns all work consumed while constructing
-                // the Flow: archive dispatch, exact required dependency, or scalar hint. Retain
-                // it in its lane until a running completion releases capacity and wakes the
-                // actor; never reconstruct only the hint and strand the other two forms.
-                let mut flow = flow;
-                let root = flow.root_name();
-                let retirement_request = flow.retirement_request();
-                let instance = flow.instance;
-                flow.park();
-                debug_assert!(self.bounded_sync.ready[index].is_none());
-                self.bounded_sync.ready[index] = Some(flow);
-                // A granted claim was consumed by this failed attempt, if one existed. Replace
-                // its actor-owned record with the exact still-retained Flow and a later order.
-                self.bounded_sync.cancel_pool_admission(room, peer);
-                self.bounded_sync.wait_for_pool(
+            crate::node::history_stream::runtime::Resumed::PoolFull(edge) => {
+                Some(("pool", "flow_state_pool_full", Some(edge)))
+            }
+            crate::node::history_stream::runtime::Resumed::PoolOvercommitted(edge) => {
+                Some(("overcommitted", "flow_state_pool_overcommitted", Some(edge)))
+            }
+            crate::node::history_stream::runtime::Resumed::NodeBusy(edge) => {
+                Some(("node_slots", "flow_state_node_busy", Some(edge)))
+            }
+            crate::node::history_stream::runtime::Resumed::OwnerMissing => {
+                Some(("owner", "flow_state_owner_missing", None))
+            }
+        };
+        if let Some((gate, reason, refused_at)) = refused {
+            // Both refusals are impossible under the legal running-work bound, but they are
+            // different first gates. Do not call two occupied source-owned slots a full
+            // daemon pool: operators need the same cause here and on the retained admission.
+            self.note_start(room, peer, reason);
+            // This ordinary admission wait still owns all work consumed while constructing
+            // the Flow: archive dispatch, exact required dependency, or scalar hint. Retain
+            // it in its lane until a running completion releases capacity and wakes the
+            // actor; never reconstruct only the hint and strand the other two forms.
+            let mut flow = flow;
+            let root = flow.root_name();
+            let retirement_request = flow.retirement_request();
+            let instance = flow.instance;
+            flow.park();
+            debug_assert!(self.bounded_sync.ready[index].is_none());
+            self.bounded_sync.ready[index] = Some(flow);
+            // A granted claim was consumed by this failed attempt, if one existed. Replace
+            // its actor-owned record with the exact still-retained Flow and a later order.
+            self.bounded_sync.cancel_pool_admission(room, peer);
+            if let Some(refused_at) = refused_at {
+                if let Err(error) = self.bounded_sync.wait_for_pool(
                     &mut self.next_token,
                     room,
                     peer,
@@ -2601,9 +2611,23 @@ impl Node {
                         instance,
                     },
                     &state_job,
-                );
-                return false;
+                    &refused_at,
+                ) {
+                    self.note_start(
+                        room,
+                        peer,
+                        match error {
+                            crate::node::history_budget::FlowWaitError::OwnerMissing => {
+                                "flow_state_owner_missing"
+                            }
+                            crate::node::history_budget::FlowWaitError::OrderExhausted => {
+                                "flow_state_order_exhausted"
+                            }
+                        },
+                    );
+                }
             }
+            return false;
         }
         let Some(port) = self.ports.get_mut(&(room, peer)) else {
             self.dispose_rearming_hint(flow);

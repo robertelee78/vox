@@ -206,12 +206,16 @@ const _: () = assert!(
 pub(crate) enum Resumed {
     /// The round holds its flow state.
     Held,
-    /// Every fixed-capacity charge is held by a running round. The exact flow remains parked
-    /// until a charge release wakes it.
-    PoolFull,
+    /// Every pool position is occupied by a running charge or earlier release-edge promise. The
+    /// exact flow remains parked until a charge release wakes it.
+    PoolFull(crate::node::history_budget::FlowReleaseEdge),
+    /// Pool accounting already exceeds its limit; exact equality is reserved for `PoolFull`.
+    PoolOvercommitted(crate::node::history_budget::FlowReleaseEdge),
     /// The current and retiring actor generations already occupy this fingerprint's two shared
     /// running slots. Exact charge release, not a tick, wakes the retained round.
-    NodeBusy,
+    NodeBusy(crate::node::history_budget::FlowReleaseEdge),
+    /// The admitted worker's actor generation no longer owns pool capacity.
+    OwnerMissing,
 }
 
 impl Flow {
@@ -497,8 +501,8 @@ impl Flow {
     /// Reserve the flow state as the round begins, its bytes already held: the last gate before
     /// running, so a held charge always belongs to a running round. [`Resumed::NodeBusy`] when
     /// this fingerprint's current and retiring generations already hold its source-owned slots;
-    /// [`Resumed::PoolFull`] when every fixed-capacity charge is held by a running round. A flow
-    /// already holding its state keeps it, and the bytes go back.
+    /// [`Resumed::PoolFull`] when every pool position is occupied by a charge or release-edge
+    /// promise. A flow already holding its state keeps it, and the bytes go back.
     pub(crate) fn resume(
         &mut self,
         job: &Job,
@@ -520,8 +524,12 @@ impl Flow {
                 self.state_charge = Some(charge);
                 Resumed::Held
             }
-            crate::node::history_budget::FlowStateTry::PoolFull => Resumed::PoolFull,
-            crate::node::history_budget::FlowStateTry::NodeBusy => Resumed::NodeBusy,
+            crate::node::history_budget::FlowStateTry::PoolFull(edge) => Resumed::PoolFull(edge),
+            crate::node::history_budget::FlowStateTry::PoolOvercommitted(edge) => {
+                Resumed::PoolOvercommitted(edge)
+            }
+            crate::node::history_budget::FlowStateTry::NodeBusy(edge) => Resumed::NodeBusy(edge),
+            crate::node::history_budget::FlowStateTry::OwnerMissing => Resumed::OwnerMissing,
         }
     }
 

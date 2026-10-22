@@ -137,6 +137,26 @@ const TICK: Duration = Duration::from_secs(1);
 /// Proof-only: omit the periodic call to the bounded scheduler so exact wakes stand alone.
 pub const TEST_DISABLE_TICK_SCHEDULE_ENV: &str = "VOX_TEST_DISABLE_TICK_SCHEDULE";
 
+/// Proof-only: while this path exists, an actor leaves an exact release handoff unconsumed so a
+/// different hosted node can report the pool's promised/occupied state. This changes no pool
+/// accounting and is absent from installed builds (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_FLOW_RELEASE_ENV: &str = "VOX_TEST_HOLD_FLOW_RELEASE_FILE";
+
+#[cfg(feature = "test-knobs")]
+async fn hold_flow_release_for_proof() {
+    let Some(path) = std::env::var_os(TEST_HOLD_FLOW_RELEASE_ENV).map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    while path.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(not(feature = "test-knobs"))]
+async fn hold_flow_release_for_proof() {}
+
 #[cfg(feature = "test-knobs")]
 fn schedule_on_tick() -> bool {
     std::env::var_os(TEST_DISABLE_TICK_SCHEDULE_ENV).is_none()
@@ -6371,6 +6391,7 @@ impl Node {
                     self.schedule().await;
                 }
                 Some(release) = flow_release_rx.recv() => {
+                    hold_flow_release_for_proof().await;
                     if self.bounded_sync.accept_pool_release(release) {
                         self.sched_rooms.insert(release.room);
                         self.publish().await;
@@ -15139,7 +15160,7 @@ impl Node {
             })
             .collect::<Vec<_>>();
         format!(
-            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"actors\":[{}],\"running\":[{}],\"waiting\":[{}],\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"member_reach_serial\":{},\"member_reaches\":[{}],\"offline_fallbacks\":[{}],\"next_request_in_ms\":{},\"ports\":[{}]}}",
+            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"promised\":{},\"occupied\":{},\"limit\":{},\"by_node\":{{{}}},\"occupied_by_node\":{{{}}},\"actors\":[{}],\"running\":[{}],\"waiting\":[{}],\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"member_reach_serial\":{},\"member_reaches\":[{}],\"offline_fallbacks\":[{}],\"next_request_in_ms\":{},\"ports\":[{}]}}",
             crate::node::ports::OUTBOUND_SLOTS,
             per_peer.join(","),
             archive_nodes.join(","),
@@ -15152,8 +15173,15 @@ impl Node {
             b.queued[2],
             b.queued[3],
             b.flow_state_in_use,
+            b.flow_state_promised,
+            b.flow_state_occupied,
             b.flow_state_limit,
             b.flow_state_by_node
+                .iter()
+                .map(|(n, c)| format!("\"{}\":{c}", b32_encode(n)))
+                .collect::<Vec<_>>()
+                .join(","),
+            b.flow_state_occupied_by_node
                 .iter()
                 .map(|(n, c)| format!("\"{}\":{c}", b32_encode(n)))
                 .collect::<Vec<_>>()

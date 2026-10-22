@@ -719,6 +719,8 @@ struct Staged {
     hosted: usize,
     live_hold: Option<std::path::PathBuf>,
     archive_hold: Option<std::path::PathBuf>,
+    release_hold: Option<std::path::PathBuf>,
+    pool_floor: Option<std::path::PathBuf>,
     _tmp: tempfile::TempDir,
 }
 
@@ -970,10 +972,18 @@ fn stage_hosted_nodes(
     let keychain = attach::keychain(&host).to_string_lossy().into_owned();
     let live_hold = hold_live_jobs.then(|| root.join("hold-live-job"));
     let archive_hold = hold_live_jobs.then(|| root.join("hold-archive-job"));
+    let release_hold = hold_live_jobs.then(|| root.join("hold-flow-release"));
+    let pool_floor = hold_live_jobs.then(|| root.join("flow-state-floor"));
     let live_hold_text = live_hold
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let archive_hold_text = archive_hold
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let release_hold_text = release_hold
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let pool_floor_text = pool_floor
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let mut env: Vec<(&str, &str)> = vec![("VOX_TEST_KEYCHAIN", keychain.as_str())];
@@ -985,6 +995,12 @@ fn stage_hosted_nodes(
     }
     if let Some(path) = archive_hold_text.as_deref() {
         env.push(("VOX_TEST_HOLD_ARCHIVE_JOB_FILE", path));
+    }
+    if let Some(path) = release_hold_text.as_deref() {
+        env.push(("VOX_TEST_HOLD_FLOW_RELEASE_FILE", path));
+    }
+    if let Some(path) = pool_floor_text.as_deref() {
+        env.push(("VOX_TEST_FLOW_STATE_FLOOR_FILE", path));
     }
     if single_foreground_job {
         env.push(("VOX_TEST_FOREGROUND_JOBS", "1"));
@@ -1090,6 +1106,8 @@ fn stage_hosted_nodes(
         hosted: hosted.len(),
         live_hold,
         archive_hold,
+        release_hold,
+        pool_floor,
         _tmp: tmp,
     }
 }
@@ -1225,7 +1243,7 @@ fn parked_flow_charge_discriminator(staged: &Staged) {
 }
 
 /// The gates a start attempt can end at, in the order the daemon tests them (ADR-038 FX-35).
-const START_REASONS: [&str; 7] = [
+const START_REASONS: [&str; 10] = [
     "room_busy",
     "archive_budget_busy",
     "control_budget_busy",
@@ -1233,6 +1251,9 @@ const START_REASONS: [&str; 7] = [
     "no_outbound_slot",
     "flow_state_node_busy",
     "flow_state_pool_full",
+    "flow_state_pool_overcommitted",
+    "flow_state_owner_missing",
+    "flow_state_order_exhausted",
 ];
 
 /// User-visible health messages for this exact room, from one shipped status snapshot.
@@ -1788,6 +1809,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
                         .as_u64()
                         .zip(pool["limit"].as_u64())
                         .is_some_and(|(in_use, limit)| in_use < limit)
+                    && pool["occupied_by_node"][&running_fingerprint] == 2
                     && pool["limit"] == expected_limit,
                 "PRODUCT: `vox status --json` did not aggregate the retired and replacement \
                  actor into the same two node slots, or did not account its exact waiter: {}",
@@ -1874,7 +1896,12 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// `by_node` holding one member per node its daemon hosts, the asked node's member equal to its
 /// ports with `round_running` and `in_use` the sum; and every port's last start in the contract's
 /// words ([`start_words`]). Its limit is exactly the shared source constants'
-/// `max(floor, running slots × hosted nodes)`, not a copied count, so it is never full.
+/// `max(floor, running slots × hosted nodes)`, not a copied count, so it is never full in the
+/// production segment. A feature-gated apparatus file then temporarily selects that same
+/// source-defined floor to reach the otherwise impossible retained path: PoolFull requires
+/// `occupied == limit`; an unrelated hosted-identity registration enlarges the limit but does
+/// not grant work; and, after a real charge release, another hosted node observes the exact
+/// granted-but-unconsumed continuation included in `promised` and `occupied`.
 ///
 /// Measured before the fix (main, 2026-10-20, four runs of five): the four hosted nodes' parked
 /// hinted flows held all sixteen flow states, the inventory round that would have let them
@@ -1882,8 +1909,10 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// everyone; or a post was refused for 60 s while the room applied its last change.
 ///
 /// Mutants, one per claim: `Flow::park` keeping its charge turns convergence PRODUCT red;
-/// `scratchpad/mutant_fx35_undersized.py` obstructs the seventeenth reservation while still
-/// reporting the right limit, turning the unused-capacity PoolFull PRODUCT assertion red;
+/// reporting PoolFull from `in_use` while a grant is promised turns the exact `occupied == limit`
+/// assertion red; omitting promises from `occupied` turns the granted-but-unconsumed snapshot
+/// PRODUCT-red; restoring `Pool::resize`'s handoff makes unrelated registration grant the exact
+/// retained continuation and turns that assertion PRODUCT-red;
 /// `scratchpad/mutant_fx35_required.py` disposes the exact required root at an admission
 /// refusal, turning the retained-required-root PRODUCT assertion red at the PoolFull snapshot;
 /// `scratchpad/mutant_fx35_release_wake.py` removes the synchronous actor handoff after granting
@@ -1910,6 +1939,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         "VOX_TEST_FOREGROUND_JOBS",
         "VOX_TEST_HOLD_LIVE_JOB_FILE",
         "VOX_TEST_HOLD_ARCHIVE_JOB_FILE",
+        "VOX_TEST_HOLD_FLOW_RELEASE_FILE",
+        "VOX_TEST_FLOW_STATE_FLOOR_FILE",
         "VOX_TEST_DISABLE_TICK_SCHEDULE",
         "VOX_TEST_PANIC_ON_TEXT",
     ]);
@@ -1953,8 +1984,40 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     // barrier is installed before either request is made, so observing both admissions proves
     // they cannot finish before live pressure reaches the seventeenth reservation. A near-maximum
     // post by the peer in the shared room then makes one live round eligible on every hosted node.
-    // The barriers hold already-admitted jobs without changing product capacity: fifteen live plus
-    // the daemon's two source-owned archive jobs is the first legal population above the floor.
+    // The barriers hold already-admitted jobs. A feature-gated apparatus file temporarily asks
+    // the pool to use its own source-defined floor: fifteen live plus the daemon's two
+    // source-owned archive jobs then reaches the otherwise impossible retained path without a
+    // copied count. Removing the file restores the production dynamic formula in this same run.
+    let resize_probe = "fx35-resize-probe";
+    let pool_floor = staged
+        .pool_floor
+        .as_ref()
+        .expect("APPARATUS: flow-state floor path was not staged");
+    std::fs::File::create(pool_floor).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not create {}: {error}",
+            pool_floor.display()
+        )
+    });
+    let (ok, _, err) = vox(&staged.host, &["id", "--node", resize_probe], None);
+    assert!(ok, "APPARATUS: could not create resize probe: {err}");
+    unlock(&staged.host, resize_probe);
+    attached_as(&staged.host, "host", Some(resize_probe));
+    let (ok, out, err) = vox(&staged.host, &["node", "lock", resize_probe], None);
+    assert!(
+        ok,
+        "APPARATUS: could not lock resize probe after applying the source-defined pool floor: \
+         {out}{err}"
+    );
+    let floored = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
+    let floored: serde_json::Value = serde_json::from_str(&floored.status)
+        .expect("PRODUCT: source-defined pool-floor status was not JSON");
+    assert_eq!(
+        floored["lanes"]["budget"]["flow_state"]["limit"],
+        vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64,
+        "APPARATUS: the feature-gated pool floor was not staged: {}",
+        floored["lanes"]["budget"]["flow_state"]
+    );
     let archive_hold = staged
         .archive_hold
         .as_ref()
@@ -2019,9 +2082,9 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 .collect();
             if !full_ports.is_empty() {
                 assert_eq!(
-                    pool["in_use"], pool["limit"],
+                    pool["occupied"], pool["limit"],
                     "PRODUCT: {name} refused a legal flow-state reservation as PoolFull while \
-                     shipped status reported unused capacity: {}",
+                     shipped status reported unoccupied capacity: {}",
                     shown.status
                 );
                 for (room, peer) in &full_ports {
@@ -2103,6 +2166,68 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    if let Some((owner, _, wait_order, _)) = &live_pool_full {
+        let release_hold = staged
+            .release_hold
+            .as_ref()
+            .expect("APPARATUS: flow-release hold path was not staged");
+        std::fs::File::create(release_hold).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not create {}: {error}",
+                release_hold.display()
+            )
+        });
+        std::fs::remove_file(pool_floor).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not restore the dynamic pool at {}: {error}",
+                pool_floor.display()
+            )
+        });
+        // Registering an unrelated hosted identity changes only the pool's accounting limit.
+        // It is not a running-round release and therefore cannot grant this retained Flow.
+        unlock(&staged.host, resize_probe);
+        attached_as(&staged.host, "host", Some(resize_probe));
+        let observer = FX35_HOSTED
+            .iter()
+            .copied()
+            .find(|candidate| candidate != owner)
+            .expect("APPARATUS: no unrelated hosted observer");
+        let resized = fx35_synced(&staged.host, Some(observer));
+        let resized: serde_json::Value = serde_json::from_str(&resized.status)
+            .expect("PRODUCT: post-resize status was not JSON");
+        let retained = resized["lanes"]["budget"]["flow_state"]["waiting"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|continuation| continuation["order"] == *wait_order)
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: unrelated hosted-identity registration consumed or lost retained \
+                     continuation {wait_order}: {}",
+                    resized["lanes"]
+                )
+            });
+        assert_eq!(
+            retained["granted"], false,
+            "PRODUCT: unrelated hosted-identity registration granted retained continuation \
+             {wait_order} without a running-round charge release: {}",
+            resized["lanes"]
+        );
+        let resized_pool = &resized["lanes"]["budget"]["flow_state"];
+        assert!(
+            resized_pool["occupied"]
+                .as_u64()
+                .zip(resized_pool["limit"].as_u64())
+                .is_some_and(|(occupied, limit)| occupied < limit),
+            "PRODUCT: the unrelated registration did not expose unused dynamically resized \
+             capacity while the retained continuation stayed ungranted: {resized_pool}"
+        );
+        let (ok, out, err) = vox(&staged.host, &["node", "lock", resize_probe], None);
+        assert!(
+            ok,
+            "APPARATUS: could not lock unrelated resize probe: {out}{err}"
+        );
+    }
     std::fs::remove_file(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release {}: {error}", hold.display()));
     std::fs::remove_file(archive_hold).unwrap_or_else(|error| {
@@ -2127,6 +2252,45 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .iter()
             .find(|(_, _, candidate, _)| *candidate == name)
             .expect("APPARATUS: PoolFull owner disappeared from staged nodes");
+        let observer = staged.everyone[..staged.hosted]
+            .iter()
+            .find(|(_, _, candidate, _)| *candidate != name)
+            .expect("APPARATUS: no unrelated hosted observer for promised capacity");
+        loop {
+            let promised = fx35_synced(&observer.0, observer.1);
+            let promised: serde_json::Value = serde_json::from_str(&promised.status)
+                .expect("PRODUCT: granted-but-unconsumed status was not JSON");
+            let pool = &promised["lanes"]["budget"]["flow_state"];
+            let exact = pool["waiting"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|continuation| continuation["order"] == wait_order);
+            if exact.is_some_and(|continuation| continuation["granted"] == true) {
+                assert!(
+                    pool["promised"].as_u64().is_some_and(|count| count > 0)
+                        && pool["occupied"].as_u64()
+                            == pool["in_use"]
+                                .as_u64()
+                                .zip(pool["promised"].as_u64())
+                                .map(|(in_use, promised)| in_use + promised),
+                    "PRODUCT: another hosted node could see exact release grant {wait_order}, \
+                     but status did not include it in promised and occupied capacity: {pool}"
+                );
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let release_hold = staged
+            .release_hold
+            .as_ref()
+            .expect("APPARATUS: flow-release hold path disappeared");
+        std::fs::remove_file(release_hold).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not release {}: {error}",
+                release_hold.display()
+            )
+        });
         observe_flow_release_handoff(dir, *node, name, wait_order, pressure_room, &peer);
         pressure_tails
             .get(name)
@@ -2221,13 +2385,6 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     let mut most = 0u64;
     let mut limit: Option<u64> = None;
     let mut broken: Vec<String> = Vec::new();
-    if pool_full_seen {
-        broken.push(
-            "a legal round reached flow_state_pool_full; its retained work recovered before this \
-             invariant verdict"
-                .to_owned(),
-        );
-    }
     for (dir, node, name, fp) in &staged.everyone {
         let shown = fx35_synced(dir, *node);
         let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
@@ -2248,11 +2405,17 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             (Some(in_use), Some(l)) => {
                 most = most.max(in_use);
                 limit = Some(l);
+                let promised = pool["promised"].as_u64().unwrap_or(u64::MAX);
+                let occupied = pool["occupied"].as_u64().unwrap_or(u64::MAX);
                 let by_node = pool["by_node"].as_object();
+                let occupied_by_node = pool["occupied_by_node"].as_object();
                 let keys: BTreeSet<&str> = by_node
                     .map(|m| m.keys().map(String::as_str).collect())
                     .unwrap_or_default();
                 let sum: u64 = by_node
+                    .map(|m| m.values().filter_map(serde_json::Value::as_u64).sum())
+                    .unwrap_or(0);
+                let occupied_sum: u64 = occupied_by_node
                     .map(|m| m.values().filter_map(serde_json::Value::as_u64).sum())
                     .unwrap_or(0);
                 let actors = pool["actors"].as_array().cloned().unwrap_or_default();
@@ -2309,14 +2472,25 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     })
                     || actor_sum != in_use
                     || sum != in_use
+                    || occupied != in_use.saturating_add(promised)
+                    || occupied_sum != occupied
+                    || occupied_by_node
+                        .map(|values| values.keys().map(String::as_str).collect::<BTreeSet<_>>())
+                        .unwrap_or_default()
+                        != expected
                     || running.len() as u64 != in_use
                     || !running_exact
                     || retiring_said != retiring_expected
                 {
                     broken.push(format!(
                         "{name}: flow-state generations do not account exactly for in_use \
-                         {in_use} (by_node {}, actors {}, running {}, retiring_nodes {})",
-                        pool["by_node"], pool["actors"], pool["running"], pool["retiring_nodes"]
+                         {in_use} and occupied {occupied} (by_node {}, occupied_by_node {}, \
+                         actors {}, running {}, retiring_nodes {})",
+                        pool["by_node"],
+                        pool["occupied_by_node"],
+                        pool["actors"],
+                        pool["running"],
+                        pool["retiring_nodes"]
                     ));
                 }
                 if mine != Some(running_here) {
@@ -2328,10 +2502,10 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 let expected_limit = vox_core::node::history_budget::FLOW_STATE_CAPACITY
                     .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * keys.len())
                     as u64;
-                if l != expected_limit || in_use > l {
+                if l != expected_limit || occupied > l {
                     broken.push(format!(
                         "{name}: the pool allows {l}, not exactly {expected_limit}, flow states \
-                         for {} hosted nodes; {in_use} in use",
+                         for {} hosted nodes; {in_use} in use and {occupied} occupied",
                         keys.len(),
                     ));
                 }

@@ -428,7 +428,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   retries, retained continuations, CPU use or machine load MAY dispose, expire, refuse, retire,
   defer, delay, skip, space or reorder that work. A timeout or connection failure MAY end a
   running round; only its transition out of running releases the charge and causes the next
-  eligible continuation to run.
+  eligible continuation to run. Registering or unregistering a hosted identity MAY resize the
+  accounting limit but MUST NOT grant or wake a continuation. If a charge release races the
+  refusing Flow's enrollment, an unforgeable release-edge identity MAY carry that exact causal
+  edge across enrollment; a resize, tick or unrelated actor event cannot create such an edge.
 
   A start attempt is one scheduler invocation for an eligible port, including its flow-state
   reservation; it ends `started` only when it launches the bounded-sync round, otherwise
@@ -444,14 +447,19 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `live_lane_busy` (the node's live flow slot holds another flow), `no_outbound_slot` (the
   outbound slot could not be taken), `flow_state_node_busy` (the fingerprint's two source-owned
   running slots are held across its current and retiring actor generations) and
-  `flow_state_pool_full` (every charge of the daemon pool is held by a running round); and the
+  `flow_state_pool_full` (every daemon-pool position is occupied by a running charge or by an
+  earlier release-edge grant), `flow_state_pool_overcommitted` (`occupied > limit`, never
+  misreported as exact fullness), `flow_state_owner_missing` (the admitted worker no longer belongs
+  to a pool actor generation), and `flow_state_order_exhausted` (the process-lifetime monotonic
+  continuation identity space is exhausted); and the
   boolean `round_running`, true while a bounded-sync round of that port runs. A node-busy
   refusal MUST NOT be reported as pool-full: `flow_state_node_busy` is possible while
-  `in_use < limit`, whereas `flow_state_pool_full` requires `in_use == limit`. It MUST report
-  the pool under `lanes.budget.flow_state` as the integers `in_use`
-  and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by
+  `in_use < limit`, whereas `flow_state_pool_full` requires `occupied == limit`. It MUST report
+  the pool under `lanes.budget.flow_state` as the integers `in_use` (running charges), `promised`
+  (release-edge grants not yet consumed by their actors), `occupied` (`in_use + promised`), and
+  `limit` and, under `by_node` and `occupied_by_node`, objects with exactly one member per hosted node, keyed by
   that node's node ID, whose value is that node's integer in-use count; the member values MUST
-  sum to `in_use`; a node's `round_running` values and its own `by_node` member MUST be taken
+  sum to `in_use` and `occupied` respectively; a node's `round_running` values and its own `by_node` member MUST be taken
   from one snapshot, and that member MUST equal the number of that node's ports whose
   `round_running` is true. While at least one port in a room has a retained flow-state
   continuation waiting for the exact release edge, any "no completed sync" text shown for that
