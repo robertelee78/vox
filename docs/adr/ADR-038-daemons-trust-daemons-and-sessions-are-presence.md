@@ -319,8 +319,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   semantic handler only in the same atomic Batch, so a handler failure rolls the marker back;
   Content remains incomplete until the selected body is semantically admitted, and its retention
   and expiry decisions consume the transaction's already-authenticated exact entry rather than
-  pretending it was settled. A deferred or unavailable body therefore commits neither a false
-  receipt nor a public effect marker.
+  pretending it was settled. They preserve the source publication's sealed earliest first-seen
+  fact across every deferred retry and restart. A deferred or unavailable body therefore commits
+  neither a false receipt nor a public effect marker, and cannot extend its retention lifetime by
+  retrying.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
   power loss: a node's own entries, consent, trust, keys, Session records and the format marker
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person

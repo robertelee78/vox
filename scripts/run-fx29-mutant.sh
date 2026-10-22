@@ -26,7 +26,7 @@ case "${1-}" in
   track-content-through-settled-index)
     mutant=$1
     verdict='PRODUCT [FX29 sparse-content-publication]:'
-    staging='[proof] FX-29 sparse control publication apparatus staged:'
+    staging='[proof] FX-29 sparse Content publication apparatus staged:'
     ;;
   *)
     printf '%s\n' "usage: $0 {drop-resume-owed|finish-control-after-effect|track-content-through-settled-index}" >&2

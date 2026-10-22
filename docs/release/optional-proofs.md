@@ -189,7 +189,9 @@ removes only the `ResumeOwed` installation after the causally staged stale archi
 second restores the merge bug that tries to apply a sparse Presence before its position is
 semantically published; the third makes sparse Content retention rediscover the entry only through
 the still-unsettled public index instead of using the transaction's exact authenticated entry. The
-runner accepts only each exact named PRODUCT verdict after its exact staging line. Its
+Content verdict is attached only to Bob's first read of Alice's exact accepted post after Bob's
+own first post is accepted; later reads retain their own claims. The runner accepts only each exact
+named PRODUCT verdict after its exact staging line. Its
 transcript is written under `target/fx29-mutants/`. The required positive deadman is chosen by the
 operator for that machine and only turns a whole-proof wedge into APPARATUS; elapsed time never
 decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a release gate.

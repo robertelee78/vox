@@ -454,15 +454,18 @@ fn first_out_of_turn(order: &[usize]) -> Option<(usize, usize)> {
 /// Whether `vox room read` on `dir` shows `text` now. A read that fails is a red, never silence.
 fn reads(dir: &Path, room: &str, text: &str) -> bool {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    if !ok
-        && std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
-            == Ok("track-content-through-settled-index")
-    {
-        panic!(
-            "PRODUCT [FX29 sparse-content-publication]: `vox room read` refused after the exact sparse Content arrived: {out}{err}"
-        );
-    }
     assert!(ok, "PRODUCT: `vox room read` refused: {out}{err}");
+    out.contains(text)
+}
+
+/// The exact first read which consumes Alice's sparse Content after Bob's join. Only this causal
+/// operation may pronounce the sparse-Content mutant verdict; later reads retain their own claim.
+fn reads_first_sparse_content(dir: &Path, room: &str, text: &str) -> bool {
+    let (ok, out, err) = vox(dir, &["room", "read", room], None);
+    assert!(
+        ok,
+        "PRODUCT [FX29 sparse-content-publication]: Bob's first `vox room read` refused after Alice's exact post was accepted: {out}{err}"
+    );
     out.contains(text)
 }
 
@@ -639,6 +642,28 @@ fn arrivals(
         std::thread::sleep(Duration::from_millis(200));
     }
     (a, b)
+}
+
+/// The first two-way convergence after Bob's sparse join, with Bob's Content read carrying the
+/// exact publication verdict. Elapsed time remains the surrounding product claim, not this one.
+fn first_sparse_arrivals(
+    since: Instant,
+    alice: &Path,
+    bob: &Path,
+    room: &str,
+    limit: Duration,
+) -> (Option<Duration>, Option<Duration>) {
+    let (mut to_alice, mut to_bob) = (None, None);
+    while (to_alice.is_none() || to_bob.is_none()) && since.elapsed() < limit {
+        if to_alice.is_none() && reads(alice, room, "bob is here") {
+            to_alice = Some(since.elapsed());
+        }
+        if to_bob.is_none() && reads_first_sparse_content(bob, room, "post 1") {
+            to_bob = Some(since.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    (to_alice, to_bob)
 }
 
 /// The blocking arm: a backlog past the live window, read over several pages, the part below the
@@ -2967,13 +2992,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     );
     let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
     assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
-    let (to_alice, to_bob) = arrivals(
-        joined,
-        (&alice, "bob is here"),
-        (&bob, "post 1"),
-        &room,
-        BOUND,
+    eprintln!(
+        "[proof] FX-29 sparse Content publication apparatus staged: Alice's exact post 1 and Bob's own first post were accepted after Bob joined room {room}"
     );
+    let (to_alice, to_bob) = first_sparse_arrivals(joined, &alice, &bob, &room, BOUND);
     assert!(
         to_alice.is_some() && to_bob.is_some(),
         "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \

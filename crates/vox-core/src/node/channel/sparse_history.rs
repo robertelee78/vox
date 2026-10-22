@@ -767,8 +767,11 @@ impl ChannelState {
     }
 }
 
-/// Created only after the signed prior-control closure and the typed handler finish. The
-/// marker means semantic dispatch completed; encrypted key installation stays independent.
+/// Transaction-scoped authority for the exact typed effect. Content constructs it only after
+/// semantic admission. Non-Content may stage it before dispatch in the same Batch because its
+/// handler requires the marker; no marker becomes durable unless that handler and the Batch both
+/// succeed. A committed marker therefore always means semantic dispatch completed. Encrypted key
+/// installation stays independent.
 pub(super) struct FinishedHistoryEffect {
     hash: Digest32,
 }
@@ -1021,10 +1024,10 @@ impl ChannelState {
                     {
                         self.track_body_into(&mut batch, *hash, log, now.get())?;
                     } else {
-                        self.track_known_body_into(&mut batch, &entry, log, now.get())?;
+                        self.track_known_body_into(&mut batch, &entry, log)?;
                     }
                     #[cfg(not(feature = "test-knobs"))]
-                    self.track_known_body_into(&mut batch, &entry, log, now.get())?;
+                    self.track_known_body_into(&mut batch, &entry, log)?;
                     match self.render_content_into(
                         &mut batch,
                         entry.skeleton.author_id,

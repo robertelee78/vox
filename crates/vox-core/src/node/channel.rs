@@ -6103,22 +6103,6 @@ impl ChannelState {
         let entry = self
             .entry_at(Transaction::Batch(batch), &entry_hash)?
             .ok_or(Error::MalformedAtRest("tracked entry missing"))?;
-        self.track_known_body_into(batch, &entry, log_id, now_ms)
-    }
-
-    /// Queue the age of an exact, already-authenticated body while its sparse effect is still
-    /// being published. Sparse Content cannot be marked settled merely to make the ordinary
-    /// index lookup see it: settlement means its semantic projection completed. The caller's
-    /// typed effect owns this entry and the same Batch owns both its source and this retention
-    /// record, so the entry itself is the authoritative input until settlement is sealed.
-    fn track_known_body_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        entry: &Entry,
-        log_id: u64,
-        now_ms: u64,
-    ) -> Result<()> {
-        let entry_hash = entry.entry_hash();
         if entry.payload.as_deref().is_some_and(retained_control) {
             return Ok(());
         }
@@ -6147,6 +6131,73 @@ impl ChannelState {
                 first_seen_ms: now_ms,
                 claimed_ms,
                 cache_id: None,
+            }),
+        )
+    }
+
+    /// Queue the age of an exact, already-authenticated body while its sparse effect is still
+    /// being published. Sparse Content cannot be marked settled merely to make the ordinary
+    /// index lookup see it: settlement means its semantic projection completed. The caller's
+    /// typed effect owns this entry and the same Batch owns both its source and this retention
+    /// record, so the entry itself is the authoritative input until settlement is sealed.
+    fn track_known_body_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry: &Entry,
+        log_id: u64,
+    ) -> Result<()> {
+        let entry_hash = entry.entry_hash();
+        if entry.payload.as_deref().is_some_and(retained_control) {
+            return Ok(());
+        }
+        let body_steps = entry
+            .payload
+            .as_deref()
+            .is_some_and(|body| is_step_body(&self.channel_id, body));
+        let saved = batch
+            .get_segment(&self.channel_id, SegmentKind::Index, log_id)?
+            .ok_or(Error::MalformedAtRest("sparse Content age missing"))?;
+        let (source_first_seen, source_steps) = parse_first_seen(&open_segment(
+            &self.sek,
+            SegmentKind::Index,
+            log_id,
+            &saved,
+        )?)?;
+        let previous = self.retention_get_in(Transaction::Batch(batch), &entry_hash)?;
+        if previous.is_some_and(|tracked| tracked.log_id != log_id) {
+            return Err(Error::MalformedAtRest(
+                "sparse Content retention locator differs",
+            ));
+        }
+        let first_seen_ms = previous
+            .map(|tracked| tracked.first_seen_ms)
+            .unwrap_or(source_first_seen)
+            .min(source_first_seen);
+        let steps = body_steps || source_steps || previous.is_some_and(|tracked| tracked.steps);
+        if steps {
+            self.invalidate_display();
+            self.private_sessions.legacy_pending.insert(entry_hash);
+        }
+        let claimed_ms = previous
+            .and_then(|tracked| tracked.claimed_ms)
+            .or_else(|| steps.then_some(entry.skeleton.claimed_ms));
+        let cache_id = previous.and_then(|tracked| tracked.cache_id);
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            log_id,
+            &first_seen_bytes(first_seen_ms, steps),
+        )?;
+        batch.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg)?;
+        self.queue_retention(
+            batch,
+            entry_hash,
+            Some(Tracked {
+                log_id,
+                steps,
+                first_seen_ms,
+                claimed_ms,
+                cache_id,
             }),
         )
     }
