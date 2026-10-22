@@ -2948,9 +2948,15 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    eprintln!(
+        "[proof] FX-29 sparse control publication apparatus staged: Bob joined room {room} before Alice's next shipped post"
+    );
     let joined = Instant::now();
     let (ok, out, err) = vox(&alice, &["room", "post", &room, "post 1"], None);
-    assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
+    assert!(
+        ok,
+        "PRODUCT [FX29 sparse-control-publication]: Alice's post after Bob joined was refused: {out}{err}"
+    );
     let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
     assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
     let (to_alice, to_bob) = arrivals(

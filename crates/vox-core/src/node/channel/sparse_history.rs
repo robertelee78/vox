@@ -976,6 +976,24 @@ impl ChannelState {
             bool,
             entry_store::sparse::ContiguousAdvance,
         )> {
+            // Governance effects may update Presence, whose durable invariant requires this
+            // exact sparse position to be semantically published. Publish the effect first in
+            // the same transaction: any failure below rolls both changes back. Content remains
+            // delayed until its selected body is actually admitted (role-complete receipts).
+            #[cfg(feature = "test-knobs")]
+            let publish_before_effect = kind != SignedEntryKind::Content
+                && std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
+                    != Ok("finish-control-after-effect");
+            #[cfg(not(feature = "test-knobs"))]
+            let publish_before_effect = kind != SignedEntryKind::Content;
+            if publish_before_effect {
+                let finished = FinishedHistoryEffect { hash: *hash };
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                index.finish_history_effect(&entry, &finished, self.me())?;
+                index.seal()?;
+            }
             session_projection::private_index::observe_public(
                 &mut batch,
                 &self.sek,
@@ -1024,12 +1042,14 @@ impl ChannelState {
                 // obligation and contiguous receipt cursor behind this position, including
                 // across restart. A non-recipient package has no owed body and reaches this same
                 // point after its authenticated header's semantic dispatch.
-                let finished = FinishedHistoryEffect { hash: *hash };
-                let mut index = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.finish_history_effect(&entry, &finished, self.me())?;
-                index.seal()?;
+                if kind == SignedEntryKind::Content || !publish_before_effect {
+                    let finished = FinishedHistoryEffect { hash: *hash };
+                    let mut index = self
+                        .entries
+                        .write(&mut batch, &self.sek, &self.channel_id)?;
+                    index.finish_history_effect(&entry, &finished, self.me())?;
+                    index.seal()?;
+                }
                 on_admitted(&mut batch, *hash)?;
             }
             // Settlement, obligation retirement, and the restart receipt cursor are one

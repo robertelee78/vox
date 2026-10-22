@@ -1,5 +1,5 @@
 #!/bin/sh
-# Run the one FX-29 retained-archive-owner mutant against its shipped-binary journey. Success
+# Run one FX-29 mutant against its shipped-binary journey. Success
 # means the causal staging line precedes this mutant's exact PRODUCT red; any other stop is an
 # apparatus failure, not mutant evidence.
 set -eu
@@ -18,8 +18,13 @@ case "${1-}" in
     verdict='PRODUCT [FX29 archive-resume-owner]:'
     staging='[proof] FX-29 archive authorization-stale Control-busy apparatus staged:'
     ;;
+  finish-control-after-effect)
+    mutant=$1
+    verdict='PRODUCT [FX29 sparse-control-publication]:'
+    staging='[proof] FX-29 sparse control publication apparatus staged:'
+    ;;
   *)
-    printf '%s\n' "usage: $0 drop-resume-owed" >&2
+    printf '%s\n' "usage: $0 {drop-resume-owed|finish-control-after-effect}" >&2
     exit 2
     ;;
 esac
