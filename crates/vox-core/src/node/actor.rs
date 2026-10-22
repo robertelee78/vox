@@ -13024,10 +13024,13 @@ impl Node {
                 .await;
         }
         if !authority.current() {
-            let outcome =
-                self.reject_unpublished_live_channel(&parsed.channel_id, Fault::ComputerPolicy);
-            self.publish().await;
-            return outcome;
+            return self
+                .withdraw_and_reject_unpublished_live_channel(
+                    &parsed.channel_id,
+                    RoomPublicationOwnership::Joined,
+                    &authority,
+                )
+                .await;
         }
         // **Joining releases no sender key** (M17.6). This is the correction to
         // ADR-007 step 2, which read "the newcomer announces its own sender key … it
@@ -13072,10 +13075,13 @@ impl Node {
             })
             .is_none()
         {
-            let outcome =
-                self.reject_unpublished_live_channel(&parsed.channel_id, Fault::ComputerPolicy);
-            self.publish().await;
-            return outcome;
+            return self
+                .withdraw_and_reject_unpublished_live_channel(
+                    &parsed.channel_id,
+                    RoomPublicationOwnership::Joined,
+                    &authority,
+                )
+                .await;
         }
         Outcome::Done
     }
@@ -18449,9 +18455,13 @@ impl Node {
         self.publish_channel_to_anchors(&id, PublishCause::Opened)
             .await;
         if authority.publish_room_creation(|| ()).is_none() {
-            let outcome = self.reject_unpublished_live_channel(&id, Fault::ComputerPolicy);
-            self.publish().await;
-            return outcome;
+            return self
+                .withdraw_and_reject_unpublished_live_channel(
+                    &id,
+                    RoomPublicationOwnership::Created,
+                    &authority,
+                )
+                .await;
         }
         if authority
             .publish_room_creation(|| {
@@ -18463,9 +18473,13 @@ impl Node {
             })
             .is_none()
         {
-            let outcome = self.reject_unpublished_live_channel(&id, Fault::ComputerPolicy);
-            self.publish().await;
-            return outcome;
+            return self
+                .withdraw_and_reject_unpublished_live_channel(
+                    &id,
+                    RoomPublicationOwnership::Created,
+                    &authority,
+                )
+                .await;
         }
         Outcome::Done
     }
@@ -18656,6 +18670,32 @@ impl Node {
             Ok(()) => Outcome::Failed(fault),
             Err(error) => Outcome::Failed(fault_of(&error)),
         }
+    }
+
+    /// A create/join can finish its asynchronous board publication before its final Computer
+    /// authority fence. Narrow that already-visible material before purging the local room. If a
+    /// withdrawal cannot be built, retain the local room and its signing material: erasing the
+    /// only remaining ability to withdraw would make the remote publication permanent.
+    async fn withdraw_and_reject_unpublished_live_channel(
+        &mut self,
+        channel_id: &Digest32,
+        ownership: RoomPublicationOwnership,
+        authority: &computer::ComputerAuthority,
+    ) -> Outcome {
+        let scope = if ownership == RoomPublicationOwnership::Created {
+            crate::nat::withdraw::WithdrawScope::Room
+        } else {
+            crate::nat::withdraw::WithdrawScope::Member
+        };
+        if let Err(fault) = self
+            .withdraw_from_boards(channel_id, scope, authority)
+            .await
+        {
+            return Outcome::Failed(fault);
+        }
+        let outcome = self.reject_unpublished_live_channel(channel_id, Fault::ComputerPolicy);
+        self.publish().await;
+        outcome
     }
 
     /// Remove only the transient projection of a stored room.  An explicit open or startup
