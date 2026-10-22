@@ -1960,6 +1960,25 @@ impl Flow {
                     }
                 }
                 if result.busy {
+                    // Local admission deliberately collapses disk pressure and an occupied
+                    // sparse publication into `busy`. Recover the durable distinction here,
+                    // after retaining this exact continuation: a newer local task must not
+                    // park ahead of an older task in this Flow that owns the publication.
+                    // No-owner remains ordinary capacity waiting; another Flow's owner is
+                    // left untouched and its completion is the causal room wake.
+                    let owner = source
+                        .read(job, 0, |channel, store| {
+                            Ok(Some(channel.history_publication_request(store)?))
+                        })
+                        .await?;
+                    if let Lookup::Found(owner) = owner {
+                        if let Some(owner) = owner.value.filter(|owner| *owner != task.request) {
+                            if self.prioritize_publication_owner(owner) {
+                                return Ok(());
+                            }
+                            self.publication_wait = true;
+                        }
+                    }
                     self.waiting = true;
                     return Ok(());
                 }
