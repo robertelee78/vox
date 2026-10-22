@@ -190,6 +190,9 @@ pub(crate) struct Flow {
     /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
     /// and the actor's fold hook is asked to drive the fold.
     pub(crate) governance_wait: bool,
+    /// The last local slice found an unfinished sparse publication. Before retrying that newer
+    /// slice, select the exact older request in this Flow that owns the publication.
+    publication_wait: bool,
     governance_cycles: u8,
     last_head: Option<super::HeadHint>,
     /// Immutable identity of this cleanup obligation. `request` changes as continuations are
@@ -332,6 +335,7 @@ impl Flow {
             owners: [None, None],
             body_progress: false,
             governance_wait: false,
+            publication_wait: false,
             governance_cycles: 0,
             last_head: None,
             retirement_request: request,
@@ -454,6 +458,7 @@ impl Flow {
             owners: [None, None],
             body_progress: false,
             governance_wait: false,
+            publication_wait: false,
             governance_cycles: 0,
             last_head: None,
             retirement_request: request,
@@ -492,6 +497,26 @@ impl Flow {
         }
         self.tasks.push(task);
         Ok(())
+    }
+    /// Move this Flow's exact durable publication owner to the top of its bounded LIFO stack.
+    /// An owner outside the retained task/replay set belongs to another Flow and is untouched.
+    fn prioritize_publication_owner(&mut self, owner: RequestId) -> bool {
+        if let Some(at) = self.tasks.iter().rposition(|task| task.request == owner) {
+            let task = self.tasks.remove(at);
+            self.tasks.push(task);
+            return true;
+        }
+        if self
+            .replay
+            .as_ref()
+            .is_some_and(|task| task.request == owner)
+        {
+            if let Some(task) = self.replay.take() {
+                self.tasks.push(task);
+                return true;
+            }
+        }
+        false
     }
     /// Retain exact control closure above any ordinary-body work already on the LIFO stack.
     /// Source proof runs before effect application; a successor gets a distinct pair of tasks.
@@ -1016,6 +1041,31 @@ impl Flow {
             self.initialized = true;
             return Ok(());
         }
+        if self.publication_wait {
+            let owner = source
+                .read(job, 0, |channel, store| {
+                    Ok(Some(channel.history_publication_request(store)?))
+                })
+                .await?;
+            match owner {
+                Lookup::Found(owner) => match owner.value {
+                    None => self.publication_wait = false,
+                    Some(owner) if self.prioritize_publication_owner(owner) => {
+                        self.publication_wait = false;
+                    }
+                    Some(_) => {
+                        // Another live Flow owns the room's publication. Keep this exact task
+                        // parked; that owner's completion is the causal wake for this room.
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                },
+                Lookup::Busy | Lookup::Missing => {
+                    self.waiting = true;
+                    return Ok(());
+                }
+            }
+        }
         if self.tasks.is_empty() {
             if let Some(root) = self.replay.take() {
                 self.tasks.push(root);
@@ -1119,10 +1169,19 @@ impl Flow {
                             .map(|window| Some((window, through)))
                     })
                     .await?;
-                let Lookup::Found(found) = found else {
-                    self.push(task)?;
-                    self.waiting = true;
-                    return Ok(());
+                let found = match found {
+                    Lookup::Found(found) => found,
+                    Lookup::Missing => {
+                        self.publication_wait = true;
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    Lookup::Busy => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
                 };
                 let (window, target_through) = found.value;
                 // Report the exact authenticated Head(author) response that selected this
@@ -1217,10 +1276,19 @@ impl Flow {
                         Ok(Some(input.missing_contains(&author, window.next)?))
                     })
                     .await?;
-                let Lookup::Found(found) = found else {
-                    self.push(task)?;
-                    self.waiting = true;
-                    return Ok(());
+                let found = match found {
+                    Lookup::Found(found) => found,
+                    Lookup::Missing => {
+                        self.publication_wait = true;
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    Lookup::Busy => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
                 };
                 if found.value {
                     let request = request_id()?;
@@ -1322,10 +1390,19 @@ impl Flow {
                             .map(Some)
                     })
                     .await?;
-                if !matches!(advanced, Lookup::Found(_)) {
-                    self.push(task)?;
-                    self.waiting = true;
-                    return Ok(());
+                match advanced {
+                    Lookup::Found(_) => {}
+                    Lookup::Missing => {
+                        self.publication_wait = true;
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    Lookup::Busy => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
                 }
                 self.live_unavailable = None;
                 self.push(Task {
