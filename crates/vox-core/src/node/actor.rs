@@ -142,13 +142,30 @@ const PREPARE_RETRY: Duration = Duration::from_millis(50);
 /// re-queued every 50 ms for hours while `vox room list` said only "[preparing history]".
 const PREPARE_WAIT: Duration = Duration::from_secs(1);
 
-/// Test-only: while the file this names exists, the node opens none of the key-packages the log
-/// brings it; they stay queued, as between a sync session's entries and its end, so a proof can
-/// show what a member is told while one waits (`drive_given_on_an_idle_session_…`).
+/// Test-only: while the file this names exists, the node accepts no sender-key delivery: neither
+/// the ordinary logged-package worker, a package opened during room preparation, nor a live
+/// pairwise delivery. The first real attempt writes the same path with `.engaged` appended, so a
+/// proof can observe that the apparatus intercepted an acceptance rather than infer it from time.
+/// Logged work stays queued; live delivery answers not-accepted so the sender retains/retries it.
 /// **For proofs; nothing in a real deployment sets it.** Not compiled in without the
 /// `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_PACKAGES_ENV: &str = "VOX_TEST_HOLD_PACKAGES_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn held_packages_path() -> Option<std::path::PathBuf> {
+    std::env::var_os(TEST_HOLD_PACKAGES_ENV)
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.exists())
+}
+
+#[cfg(feature = "test-knobs")]
+fn note_package_hold_engaged(path: &std::path::Path) {
+    let mut engaged = path.as_os_str().to_owned();
+    engaged.push(".engaged");
+    let _ = std::fs::write(std::path::PathBuf::from(engaged), b"");
+}
 
 /// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
 /// between waits, and the next record names all of it.
@@ -16085,10 +16102,11 @@ impl Node {
 
     fn key_package_work_ready(&self) -> bool {
         #[cfg(feature = "test-knobs")]
-        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
-            .is_some_and(|f| std::path::Path::new(&f).exists())
-        {
-            return false;
+        if !self.key_package_rooms.is_empty() {
+            if let Some(path) = held_packages_path() {
+                note_package_hold_engaged(&path);
+                return false;
+            }
         }
         !self.key_package_rooms.is_empty()
     }
@@ -16141,9 +16159,8 @@ impl Node {
     /// replay from disk, including packages which failed to open or were not trusted.
     async fn install_key_packages(&mut self, channel_id: &Digest32) -> bool {
         #[cfg(feature = "test-knobs")]
-        if std::env::var_os(TEST_HOLD_PACKAGES_ENV)
-            .is_some_and(|f| std::path::Path::new(&f).exists())
-        {
+        if let Some(path) = held_packages_path() {
+            note_package_hold_engaged(&path);
             self.key_package_rooms.entry(*channel_id).or_insert(false);
             return false;
         }
@@ -17468,6 +17485,11 @@ impl Node {
         if !self.trust.is_trusted(&author) {
             return Err(KeyRefusal::NotTrusted);
         }
+        #[cfg(feature = "test-knobs")]
+        if let Some(path) = held_packages_path() {
+            note_package_hold_engaged(&path);
+            return Err(KeyRefusal::NotAccepted);
+        }
         let mut fresh = false;
         let backfilled = match (
             self.profile.as_ref(),
@@ -18663,6 +18685,15 @@ impl Node {
             ch.require_governance_ready(profile.store(), now)?;
         }
         if ch.needs_session_upgrade() && ch.key_packages_pending() {
+            #[cfg(feature = "test-knobs")]
+            if let Some(path) = held_packages_path() {
+                note_package_hold_engaged(&path);
+                prepared.wait_on(
+                    "test apparatus holding members' sender keys",
+                    self.now_ms().get(),
+                );
+                return Ok(false);
+            }
             let ctx = ch.join_context()?;
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let progress =

@@ -1203,6 +1203,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     let fold_hold = root.join("fx22-fold-hold");
     let carol_fold_hold = root.join("fx22-carol-fold-hold");
     let package_hold = root.join("fx22-package-hold");
+    let package_hold_engaged = root.join("fx22-package-hold.engaged");
     let render_hold = root.join("fx22-render-hold");
     let render_hold_ready = root.join("fx22-render-hold.ready");
     let render_hold_engaged = root.join("fx22-render-hold.engaged");
@@ -1394,6 +1395,11 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // elapsed time are not verdicts for this claim: the causal consent/key events below must
     // either make those same hashes readable or leave structural render work unfinished.
     bob_before_key.stop();
+    if package_hold_engaged.exists() {
+        std::fs::remove_file(&package_hold_engaged).unwrap_or_else(|error| {
+            panic!("APPARATUS: could not clear the first daemon's package-hold evidence: {error}")
+        });
+    }
 
     // Stage one same-name action while the fold is still held and prove the command appended one
     // exact authenticated room-order object. Command success alone is not the precondition: a
@@ -1471,6 +1477,17 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // zero received generations: the second hold is visibly engaged.
     let mut bob_daemon = daemon_env(&bob, "bob", &package_knob);
     attached(&bob, "bob");
+    while !package_hold_engaged.exists() {
+        for room in &rooms {
+            let status = room_status(&bob, "bob", room);
+            assert_eq!(
+                status.received_key_generations, 0,
+                "APPARATUS: Bob accepted a sender key before a real package/delivery attempt \
+                 causally engaged the package hold in room {room}: {status:?}"
+            );
+        }
+        std::thread::yield_now();
+    }
     for (i, room) in rooms.iter().enumerate() {
         wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
         wait_trust_detail(&bob, "bob", room, "carol", "you trust each other");
@@ -1513,6 +1530,17 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     });
     std::fs::remove_file(&package_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the package hold: {error}"));
+    std::fs::remove_file(&package_hold_engaged).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not clear the package-hold engagement evidence: {error}")
+    });
+    for (fingerprint, name) in [(&fps[0], "alice"), (&fps[2], "carol")] {
+        let (ok, out, err) = vox(&bob, &["trust", "add", fingerprint, "--name", name], None);
+        assert!(
+            ok,
+            "PRODUCT: Bob's idempotent `vox trust add {name}` could not causally replay the held \
+             sender-key package after release: {out}{err}"
+        );
+    }
 
     // The 96-byte apparatus marker is renamed only after this real daemon holds the sender keys
     // of both exact authors. Rendering stays parked, so neither package arrival can win a race
