@@ -191,9 +191,6 @@ impl Node {
         let Some(computer) = &self.computer else {
             return Some(publish());
         };
-        if !computer.grouped() && computer.binding_group().is_none() {
-            return Some(publish());
-        }
         let applied = self
             .computer_revision
             .load(std::sync::atomic::Ordering::Acquire);
