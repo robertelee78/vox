@@ -798,8 +798,8 @@ impl Drop for BufferCharge {
 /// `vox status --json` shows of it is one coordinated view: how many flow states it allows;
 /// which running rounds hold one (actor, node, room, peer); and the current actor's count per
 /// hosted node (one member per hosted node, 0 until it holds one). Retiring generations remain
-/// visible separately. The fixed [`FLOW_STATE_CAPACITY`] bounds only running rounds. A parked
-/// continuation holds no pool slot, and a full pool is an ordinary exact admission wait.
+/// visible separately. The limit is at least [`FLOW_STATE_CAPACITY`] and otherwise two per
+/// hosted identity; it bounds only running rounds. A parked continuation holds no pool slot.
 struct Pool {
     limit: usize,
     in_use: usize,
@@ -830,6 +830,21 @@ impl Default for Pool {
             active: BTreeMap::new(),
             owners: BTreeMap::new(),
         }
+    }
+}
+
+impl Pool {
+    /// Active registrations and a retired generation whose round is still returning both count
+    /// as hosted until that exact charge is gone. Distinct generations of one fingerprint never
+    /// widen its two legal running slots or its contribution to the daemon limit.
+    fn resize(&mut self) {
+        let hosted = self
+            .owners
+            .values()
+            .map(|owner| owner.node)
+            .collect::<BTreeSet<_>>()
+            .len();
+        self.limit = FLOW_STATE_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * hosted);
     }
 }
 
@@ -867,6 +882,7 @@ impl Drop for FlowPoolRegistration {
         {
             p.owners.remove(&self.owner);
         }
+        p.resize();
     }
 }
 
@@ -874,8 +890,9 @@ impl Drop for FlowPoolRegistration {
 pub(crate) enum FlowStateTry {
     /// The round holds its flow state.
     Reserved(FlowStateCharge),
-    /// Every fixed-capacity charge is held by a running round. The exact parked continuation
-    /// waits for a charge release without retaining a worker or flow-state slot.
+    /// Every dynamically sized charge is held by a running round. This is an invariant failure:
+    /// the exact parked continuation waits for the causally matching charge release without
+    /// retaining a worker or flow-state slot.
     PoolFull,
     /// Both bounded running slots of this fingerprint belong to its current or retiring actor
     /// generation. The retiring charge's release wakes the exact retained replacement work.
@@ -915,6 +932,7 @@ impl Drop for FlowStateCharge {
         {
             p.owners.remove(&self.owner);
         }
+        p.resize();
         drop(p);
         self.budget.flow_changed.notify_waiters();
     }
@@ -939,8 +957,8 @@ pub struct BudgetSnapshot {
     pub flow_state_in_use: usize,
     /// The running flow states the daemon allows at once.
     pub flow_state_limit: usize,
-    /// Current actor charges by node: one member per currently hosted node. Retiring actor
-    /// charges remain in `in_use`, `actors` and `running`, never attributed to the replacement.
+    /// Charges by hosted node: one member per fingerprint across its active and retiring actor
+    /// generations. The member values sum exactly to `flow_state_in_use`.
     pub flow_state_by_node: Vec<(Digest32, usize)>,
     /// Every active or retiring actor generation and its exact charge count.
     pub flow_state_actors: Vec<(u64, Digest32, bool, usize)>,
@@ -975,6 +993,7 @@ impl Budget {
         );
         p.owners
             .retain(|_, owner| owner.registered || owner.charges > 0);
+        p.resize();
         drop(p);
         FlowPoolRegistration {
             budget: Arc::clone(self),
@@ -1004,11 +1023,13 @@ impl Budget {
             // they stand together.
             flow_state_in_use: p.in_use,
             flow_state_limit: p.limit,
-            flow_state_by_node: p
-                .active
-                .iter()
-                .map(|(node, owner)| (*node, p.owners.get(owner).map_or(0, |owner| owner.charges)))
-                .collect(),
+            flow_state_by_node: {
+                let mut by_node = BTreeMap::new();
+                for owner in p.owners.values() {
+                    *by_node.entry(owner.node).or_insert(0) += owner.charges;
+                }
+                by_node.into_iter().collect()
+            },
             flow_state_actors: p
                 .owners
                 .iter()
@@ -1021,6 +1042,8 @@ impl Budget {
                 .values()
                 .filter(|owner| !owner.registered)
                 .map(|owner| owner.node)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect(),
             flow_state_running: p.running.keys().copied().collect(),
         }
