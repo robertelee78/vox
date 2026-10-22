@@ -158,6 +158,21 @@ The decider then answered twelve questions, one at a time. His answers are the d
   decider with its measurement (ADR-037 R13). Measured cause on 2026-10-19: the settlement tick
   offered the node's own head to every connected peer every second, and the lane never recorded
   a peer's acknowledgement, so the hinted round that fetched nothing ran again each tick.
+  Cross-story evidence on 2026-10-21 is diagnostic, not acceptance: the #986 shipped-binary
+  journey at exact candidate `2db45720f9af55adfca230e01b1208289a6b33d0` (based on
+  `b6e7b0d93`, without #996) restarted Alice, accepted Bob's post `after alice's daemon
+  restarted`, and then never showed that post to Alice while Alice reported Bob's lane at 608
+  completed rounds, zero failed or partial rounds, no running round, and eight board records
+  received. Fresh commands still answered and completed rounds kept increasing, so this was
+  structural non-delivery rather than a stopped process. That candidate still let
+  `offer_inventory` credit a peer's scalar echo of the sender's accepted own head even though
+  the echo proved neither the owed body nor its semantic effect; that reachable path could then
+  suppress the sender's own-head offer while empty rounds continued to complete. #996 removes
+  that inventory credit and accepts only an authenticated, role-complete receipt. The source
+  comparison therefore makes the #986 restart journey depend on #996 and names a concrete cause
+  consistent with the observation; it does not prove that #996 fixes that exact journey. The
+  #986 journey MUST run on the composed #996 candidate before either story cites this wedge as
+  fixed.
 - **FX-16.** `vox status` and the app MUST record each round the lane completes as the room's
   and the peer's last completed sync; "no completed sync" MUST fire only when it is true
   (ADR-034 §5 "Health is true", HL-1; PRD-001 R35).

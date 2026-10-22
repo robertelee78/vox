@@ -264,6 +264,26 @@ fn attached(dir: &Path, tag: &str) -> String {
     );
 }
 
+/// Wait for the shipped room list to say `room` is open. The proof's operator-selected watchdog
+/// owns any apparatus timebox; this causal wait has no elapsed product verdict of its own.
+fn wait_room_open(dir: &Path, room: &str, who: &str) {
+    loop {
+        let (ok, out, err) = vox(dir, &["room", "list"], None);
+        assert!(
+            ok,
+            "PRODUCT (staging): {who}'s shipped `vox room list` failed while waiting for its \
+             restarted room: {err}"
+        );
+        if out
+            .lines()
+            .any(|line| line.trim_start().starts_with(room) && !line.contains("[preparing"))
+        {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// What one profile holds of a room, walked in the **room's order** as a person pages back:
 /// the newest page first (`--json --limit`), then `--before` the oldest row of each page until a
 /// page comes back short.
@@ -832,10 +852,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     {
         assert!(
             Instant::now() < retained_deadline,
-            "APPARATUS: after Carol restarted with package installation held, her shipped \
-             role-complete cursor did not reach Alice's exact package-bearing feed position \
-             {package_feed_through} while her log gained the package/fact rows and package work \
-             remained pending; the exact private package segment was not retained\nalice said: \
+            "APPARATUS: after Carol restarted with package installation held, the load-bearing \
+             shipped role-complete cursor did not reach Alice's exact package-bearing feed \
+             position {package_feed_through}; supplemental only, her log also had to gain the \
+             package/fact rows and generic package maintenance had to remain pending\nalice said: \
              {}\ncarol said: {}",
             said(&alice, "alice"),
             said(&carol, "carol-package-held")
@@ -921,6 +941,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     ];
     let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_settlement_knob);
     attached(&bob, "bob-after-gap");
+    wait_room_open(&bob, &room, "bob-after-gap");
     let marker_deadline = Instant::now() + READY_WITHIN;
     while !reads(&bob, &room, &package_marker) {
         assert!(
@@ -1145,14 +1166,15 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     bob_after_interruption.stop();
     let _bob_after_restart = daemon(&bob, "bob-after-restart");
     attached(&bob, "bob-after-restart");
+    wait_room_open(&bob, &room, "bob-after-restart");
     let restart_deadline = Instant::now() + READY_WITHIN;
     while member_holds_through(&bob, &room, &fps[0]) != Some(marker_through)
         || member_holds_through(&bob, &room, &fps[2]) != Some(carol_tail_through)
     {
         assert!(
             Instant::now() < restart_deadline,
-            "PRODUCT: restarted Bob's `vox status --json` did not restore the exact durable \
-             role-complete cursors for Alice through {marker_through} and Carol through \
+            "PRODUCT: restarted Bob's `vox status --json` did not restore the exact authenticated \
+             contiguous feed heads for Alice through {marker_through} and Carol through \
              {carol_tail_through} within {READY_WITHIN:?}\nbob said: {}",
             said(&bob, "bob-after-restart")
         );
@@ -1166,10 +1188,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     alice_daemon.stop();
     let _carol_daemon = daemon_env(&carol, "carol-from-bob", &knob);
     attached(&carol, "carol-from-bob");
+    wait_room_open(&carol, &room, "carol-from-bob");
     assert!(
         !reads(&carol, &room, &package_marker),
-        "APPARATUS: carol read alice's marker while package opening was held; this binary lacks \
-         the required `test-knobs` staging"
+        "PRODUCT: Carol read Alice's marker while the confirmed package-installer hold remained \
+         armed; the product installed or served the held key-package past its causal hold"
     );
     std::fs::remove_file(&hold)
         .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
@@ -2081,7 +2104,8 @@ fn status_log_entries(dir: &Path, room: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// Whether the shipped status says this room still owes a retained key-package turn.
+/// Whether shipped status says the generic package-maintenance queue is pending. Supplemental
+/// only: the initial catalog scan also sets this bit, so it never identifies a package by itself.
 fn key_packages_pending(dir: &Path, room: &str) -> Option<bool> {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
     if !ok {

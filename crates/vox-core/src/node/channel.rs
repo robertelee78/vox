@@ -8582,8 +8582,10 @@ impl ChannelState {
         self.held.get(member).copied()
     }
 
-    /// Last authenticated, semantically complete position this node holds in `member`'s feed.
-    /// This is restored from the same durable cursor used to answer the member's receipt probe.
+    /// Last authenticated, role-complete contiguous position this node holds in `member`'s feed:
+    /// the channel DAG's verified head. This is not the sparse-history receipt cursor returned by
+    /// `history_held_through`, which separately records durable effect settlement before a receipt
+    /// probe may be answered.
     pub fn holds_through(&self, member: &Digest32) -> Option<u64> {
         let through = self.dag.verified_head(member);
         (through != 0).then_some(through)
