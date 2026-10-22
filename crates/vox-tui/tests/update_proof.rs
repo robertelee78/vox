@@ -365,7 +365,7 @@ fn allowed_gaps() -> Vec<String> {
 }
 
 /// Print every claim and receipt, then fail: `PRODUCT:` for a claim `vox` failed, and
-/// `CANNOT MEASURE:` for a claim the world could not be asked, unless that gap is accepted
+/// `APPARATUS:` for a claim whose staging could not ask the world, unless that gap is accepted
 /// (only where `accept_gaps`: an optional proof accepts none).
 fn dispose(title: &str, claims: &[Claim], receipts: &BTreeMap<String, String>, accept_gaps: bool) {
     let allowed = if accept_gaps {
@@ -406,7 +406,7 @@ fn dispose(title: &str, claims: &[Claim], receipts: &BTreeMap<String, String>, a
     );
     assert!(
         unproven.is_empty(),
-        "APPARATUS, CANNOT MEASURE: {} claim(s) unproven — close the gap, or name it in \
+        "APPARATUS: {} claim(s) unproven — close the staging gap, or name it in \
          VOX_PROOF_ALLOW_UNPROVEN to accept it deliberately:\n{}",
         unproven.len(),
         list(&unproven)
@@ -812,16 +812,20 @@ fn product_app_bundle_as(
     app
 }
 
-/// What an active bundle's Info.plist, or a deliberately non-launchable kept bundle's exact
-/// Info.plist.kept, says its version is; empty when neither exists.
+/// What an active bundle's real Info.plist says; kept metadata is never active-app evidence.
 #[cfg(target_os = "macos")]
-fn app_says(app: &Path) -> String {
-    let info = app.join("Contents/Info.plist");
-    let info = if info.is_file() {
-        info
-    } else {
-        app.join("Contents/Info.plist.kept")
-    };
+fn active_app_says(app: &Path) -> String {
+    plist_says(&app.join("Contents/Info.plist"))
+}
+
+/// What a deliberately non-launchable retained bundle's exact kept plist says.
+#[cfg(target_os = "macos")]
+fn kept_app_says(app: &Path) -> String {
+    plist_says(&app.join("Contents/Info.plist.kept"))
+}
+
+#[cfg(target_os = "macos")]
+fn plist_says(info: &Path) -> String {
     Command::new("/usr/libexec/PlistBuddy")
         .args(["-c", "Print :CFBundleShortVersionString"])
         .arg(info)
@@ -1050,9 +1054,9 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let text = said(&out);
         assert_light_hooks(home, &text);
         let cli = reports(&link);
-        let app = app_says(&apps.join("Vox.app"));
+        let app = active_app_says(&apps.join("Vox.app"));
         let prev_cli = reports(&apps.join(".Vox.app.previous/Contents/Helpers/vox"));
-        let prev_app = app_says(&apps.join(".Vox.app.previous"));
+        let prev_app = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.update_replaces_the_whole_bundle",
             out.status.success()
@@ -1195,7 +1199,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let out = vox(&link, home, &["update"], &env);
         let text = said(&out);
         let cli = reports(&link);
-        let app = app_says(&apps.join("Vox.app"));
+        let app = active_app_says(&apps.join("Vox.app"));
         let left: Vec<String> = std::fs::read_dir(&apps)
             .map(|d| {
                 d.filter_map(Result::ok)
@@ -1234,8 +1238,8 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let out = vox(&link, home, &["update", "--rollback"], &base);
         let text = said(&out);
         let cli = reports(&link);
-        let app = app_says(&apps.join("Vox.app"));
-        let kept = app_says(&apps.join(".Vox.app.previous"));
+        let app = active_app_says(&apps.join("Vox.app"));
+        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.rollback_restores_the_whole_previous_bundle",
             out.status.success()
@@ -1264,14 +1268,14 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
             .collect();
         let cut = vox(&link, home, &["update"], &env);
-        let cut_app = app_says(&apps.join("Vox.app"));
+        let cut_app = active_app_says(&apps.join("Vox.app"));
         // The release's helper is a version stub, not vox; the next transition is run by a vox,
         // so the stub is replaced by this build (the bundle's version is its Info.plist's).
         copy(Path::new(VOX), &apps.join("Vox.app/Contents/Helpers/vox"));
         let out = vox(&link, home, &["update", "--rollback"], &base);
         let text = said(&out);
-        let app = app_says(&apps.join("Vox.app"));
-        let kept = app_says(&apps.join(".Vox.app.previous"));
+        let app = active_app_says(&apps.join("Vox.app"));
+        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.a_cut_update_keeps_the_bundle_it_replaced",
             !cut.status.success()
@@ -1725,6 +1729,59 @@ fn signed(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn shipped_notarized(path: &Path) -> Result<(), String> {
+    signed(path)?;
+    let notarized = Command::new("/usr/bin/codesign")
+        .args([
+            "--verify",
+            "--strict",
+            "--deep",
+            "--all-architectures",
+            "--check-notarization",
+            "--test-requirement",
+            "=notarized",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not ask Apple about {}: {e}", path.display()))?;
+    if !notarized.status.success() {
+        return Err(format!(
+            "Apple did not verify {} as notarized: {}",
+            path.display(),
+            String::from_utf8_lossy(&notarized.stderr).trim()
+        ));
+    }
+    let details = Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(path)
+        .output()
+        .map_err(|e| {
+            format!(
+                "could not inspect {}'s signing identity: {e}",
+                path.display()
+            )
+        })?;
+    let words = String::from_utf8_lossy(&details.stderr);
+    if !details.status.success()
+        || !words
+            .lines()
+            .any(|line| line.starts_with("Authority=Developer ID Application:"))
+        || words.lines().any(|line| line == "TeamIdentifier=not set")
+        || !words.lines().any(|line| {
+            line.strip_prefix("TeamIdentifier=")
+                .is_some_and(|team| !team.is_empty() && team != "not set")
+        })
+    {
+        return Err(format!(
+            "{} is not a Developer ID Application artifact with a team identity: {}",
+            path.display(),
+            words.trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn last_line(words: &str) -> &str {
     words
         .lines()
@@ -1788,11 +1845,11 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
     let identifier = format!("us.vox.app.proof.m29a.{}.{}", std::process::id(), nonce);
-    let signed_app = std::env::var_os("VOX_PROOF_SIGNED_APP")
+    let shipped_app = std::env::var_os("VOX_PROOF_SHIPPED_APP")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             panic!(
-                "APPARATUS: VOX_PROOF_SIGNED_APP must name scripts/build-macos-app.sh's signed candidate"
+                "APPARATUS: VOX_PROOF_SHIPPED_APP must name the extracted Developer ID signed, notarized Vox.app from the release asset"
             )
         });
     let tree = tmpdir();
@@ -1800,7 +1857,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     let newer_vox = newer.path().join("vox");
     version_stub(&newer_vox, NEWER);
     let newer_app =
-        product_app_bundle_as(newer.path(), &signed_app, NEWER, &identifier, &newer_vox);
+        product_app_bundle_as(newer.path(), &shipped_app, NEWER, &identifier, &newer_vox);
     bundle_release_app(tree.path(), NEWER, &newer_app, &[("stable", None)]);
     let server = release_server::serve(tree.path())
         .unwrap_or_else(|why| panic!("APPARATUS: the scratch release server: {why}"));
@@ -1830,7 +1887,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let link = bundle_install_product(
             home,
             "stable",
-            &signed_app,
+            &shipped_app,
             VERSION,
             &identifier,
             Path::new(VOX),
@@ -1841,9 +1898,14 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let mut registrations = LaunchServicesCleanup::new();
         registrations.remember(&active);
         registrations.remember(&previous);
-        registrations
-            .register(&active)
-            .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        lsregister("-u", &active).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        let before_records =
+            launch_services_paths(&identifier).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        assert!(
+            !before_records.contains(&active),
+            "APPARATUS: the unique scratch identifier already resolved to {} before the update: {before_records:?}",
+            active.display()
+        );
         let out = vox(&link, home, &["update"], &base);
         let text = said(&out);
         registrations.remember(&active);
@@ -1871,7 +1933,10 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         ));
         claims.push(claim(
             "bundle.opening_the_identifier_selects_the_current_bundle",
-            opened.ok && opened.path.as_deref() == Some(active.as_path()),
+            out.status.success()
+                && records.contains(&active)
+                && opened.ok
+                && opened.path.as_deref() == Some(active.as_path()),
             format!(
                 "`open -b {identifier}` exit_ok={} opened {:?}, wanted {}; stderr {:?}",
                 opened.ok,
@@ -1881,8 +1946,9 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             ),
         ));
 
-        // `restore` is the rollback mutant seam: without its kept-plist rename the swap may move
-        // bytes, but it cannot restore a signed launchable prior app.
+        // Restoring the kept plist only under the non-application rollback staging name is the
+        // rollback mutant seam: without it the exchange moves bytes but cannot restore a signed,
+        // launchable prior app.
         let rollback = vox(&link, home, &["update", "--rollback"], &base);
         let rollback_text = said(&rollback);
         let records =
@@ -1900,7 +1966,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             rollback.status.success()
                 && opened.ok
                 && opened.path.as_deref() == Some(active.as_path())
-                && app_says(&active) == VERSION
+                && active_app_says(&active) == VERSION
                 && signature.is_ok()
                 && active.join("Contents/Info.plist").is_file()
                 && !previous.join("Contents/Info.plist").exists()
@@ -1912,7 +1978,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 opened.ok,
                 opened.path,
                 opened.error,
-                app_says(&active),
+                active_app_says(&active),
                 active.join("Contents/Info.plist").is_file(),
                 previous.join("Contents/Info.plist").exists(),
             ),
@@ -1947,7 +2013,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         use std::os::unix::fs::symlink;
         let mut evidence = Vec::new();
         let mut all_refused = true;
-        for kind in ["symlink", "file"] {
+        for kind in ["symlink", "file", "nested-contents-symlink"] {
             let tmp = tmpdir();
             let home = tmp.path();
             let link = bundle_install_as(
@@ -1961,11 +2027,17 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             let apps = home.join("Apps");
             let active = apps.join("Vox.app");
             let reserved = apps.join(".Vox.app.previous");
-            if kind == "symlink" {
-                symlink(&active, &reserved)
-                    .expect("APPARATUS: stage reserved-path symlink to active app");
-            } else {
-                write(&reserved, "not a bundle\n");
+            match kind {
+                "symlink" => symlink(&active, &reserved)
+                    .expect("APPARATUS: stage reserved-path symlink to active app"),
+                "file" => write(&reserved, "not a bundle\n"),
+                "nested-contents-symlink" => {
+                    std::fs::create_dir(&reserved)
+                        .expect("APPARATUS: stage direct reserved bundle directory");
+                    symlink(active.join("Contents"), reserved.join("Contents"))
+                        .expect("APPARATUS: stage nested Contents symlink to active app");
+                }
+                _ => unreachable!(),
             }
             let out = vox(&link, home, &["update"], &current_base);
             let text = said(&out);
@@ -1999,7 +2071,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let link = bundle_install_product(
             home,
             "stable",
-            &signed_app,
+            &shipped_app,
             VERSION,
             &identifier,
             Path::new(VOX),
@@ -2023,15 +2095,15 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             first.status.success()
                 && stale.status.success()
                 && rollback_id == after_id
-                && app_says(&active) == NEWER
-                && app_says(&previous) == VERSION
+                && active_app_says(&active) == NEWER
+                && kept_app_says(&previous) == VERSION
                 && said(&stale).contains("is current"),
             format!(
                 "first exit_ok={}; stale exit_ok={}; rollback inode {rollback_id}->{after_id}; active {:?}, previous {:?}; stale said {:?}",
                 first.status.success(),
                 stale.status.success(),
-                app_says(&active),
-                app_says(&previous),
+                active_app_says(&active),
+                kept_app_says(&previous),
                 said(&stale)
             ),
         ));
@@ -2075,16 +2147,16 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             "bundle.recovery_finishes_a_journalled_rollback_before_its_exchange",
             repaired.status.success()
                 && active_id == target_id
-                && app_says(&active) == "0.4.8"
+                && active_app_says(&active) == "0.4.8"
                 && !previous.join("Contents/Info.plist").exists()
                 && previous.join("Contents/Info.plist.kept").is_file()
                 && !journal.exists()
-                && last_line(&text).contains("without swapping Vox.app")
+                && last_line(&text).contains("completing its recorded Vox.app exchange")
                 && last_line(&text).contains("rollback cut short"),
             format!(
                 "repair exit_ok={}; target inode={target_id}, active inode={active_id}, version {:?}; previous kept={}; journal={}; final {:?}",
                 repaired.status.success(),
-                app_says(&active),
+                active_app_says(&active),
                 previous.join("Contents/Info.plist.kept").is_file(),
                 journal.exists(),
                 last_line(&text)
@@ -2101,7 +2173,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let link = bundle_install_product(
             home,
             "stable",
-            &signed_app,
+            &shipped_app,
             VERSION,
             &identifier,
             Path::new(VOX),
@@ -2109,6 +2181,9 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let apps = home.join("Apps");
         let active = apps.join("Vox.app");
         let previous = apps.join(".Vox.app.previous");
+        let mut registrations = LaunchServicesCleanup::new();
+        registrations.remember(&active);
+        registrations.remember(&previous);
         let updated = vox(&link, home, &["update"], &base);
         copy(Path::new(VOX), &active.join("Contents/Helpers/vox"));
         let cut_env: Vec<(&str, &str)> = current_base
@@ -2117,9 +2192,24 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
             .collect();
         let cut = vox(&link, home, &["update", "--rollback"], &cut_env);
+        let rollback_staged = apps.join(".Vox.rollback.partial");
+        registrations.remember(&rollback_staged);
         let before = std::fs::metadata(&active)
             .expect("APPARATUS: active app after interrupted rollback")
             .ino();
+        let interrupted_open = opened_bundle(
+            &identifier,
+            &no_data,
+            &no_config,
+            &home.join("interrupted-rollback-launch-home"),
+        )
+        .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+        let interrupted_has_one_application = active.join("Contents/Info.plist").is_file()
+            && !previous.exists()
+            && rollback_staged.join("Contents/Info.plist").is_file()
+            && !rollback_staged
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".app"));
         let repaired = vox(&link, home, &["update"], &current_base);
         let text = said(&repaired);
         let after = std::fs::metadata(&active)
@@ -2129,20 +2219,24 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             "bundle.recovery_finishes_an_interrupted_rollback_without_another_swap",
             updated.status.success()
                 && !cut.status.success()
+                && interrupted_has_one_application
+                && interrupted_open.ok
+                && interrupted_open.path.as_deref() == Some(active.as_path())
                 && repaired.status.success()
                 && before == after
-                && app_says(&active) == VERSION
+                && active_app_says(&active) == VERSION
                 && !previous.join("Contents/Info.plist").exists()
                 && previous.join("Contents/Info.plist.kept").is_file()
                 && !apps.join(".Vox.app.publishing").exists()
-                && last_line(&text).contains("without swapping Vox.app")
+                && last_line(&text).contains("without another Vox.app exchange")
                 && last_line(&text).contains("rollback cut short"),
             format!(
-                "update exit_ok={}; cut exit_ok={}; repair exit_ok={}; active inode {before}->{after}, version {:?}; previous kept={}; final {:?}",
+                "update exit_ok={}; cut exit_ok={}; interrupted one application={interrupted_has_one_application}, open selected {:?}; repair exit_ok={}; active inode {before}->{after}, version {:?}; previous kept={}; final {:?}",
                 updated.status.success(),
                 cut.status.success(),
+                interrupted_open.path,
                 repaired.status.success(),
-                app_says(&active),
+                active_app_says(&active),
                 previous.join("Contents/Info.plist.kept").is_file(),
                 last_line(&text)
             ),
@@ -2206,11 +2300,12 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 && previous_ok
                 && last_line(&text).contains("without swapping Vox.app")
                 && (if prior == "unversioned" {
-                    last_line(&text).contains("before its candidate was put in place")
+                    last_line(&text).contains("before its durable record")
                 } else {
                     last_line(&text).contains("before Vox 99.0.0 was put in place")
                 })
-                && last_line(&text).contains("discarded its unpublished candidate");
+                && (prior == "unversioned"
+                    || last_line(&text).contains("discarded its unpublished candidate"));
             all_repaired &= ok;
             evidence.push(format!(
                 "{prior}: exit_ok={}, inode {before}->{after}, partial={}, journal={}, previous_ok={previous_ok}, final {:?}",
@@ -2263,7 +2358,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             !cut.status.success()
                 && repaired.status.success()
                 && before == after
-                && app_says(&active) == NEWER
+                && active_app_says(&active) == NEWER
                 && apps.join(".Vox.app.previous/Contents/Info.plist.kept").is_file()
                 && !apps.join(".Vox.app.publishing").exists()
                 && last_line(&text).contains("without swapping Vox.app")
@@ -2272,7 +2367,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 "cut exit_ok={}; repair exit_ok={}; active inode {before}->{after}, version {:?}; final {:?}; said {text:?}",
                 cut.status.success(),
                 repaired.status.success(),
-                app_says(&active),
+                active_app_says(&active),
                 last_line(&text)
             ),
         ));
@@ -2539,16 +2634,16 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
 
     // The exact shipped app build supplied by the QE runner: signature, documented build-number
     // form, and strict increase over the previous release fact staged by the update journey.
-    // Mutant seam: restore CURRENT_PROJECT_VERSION=1 in scripts/build-macos-app.sh.
-    let short = plist_value(&signed_app, "CFBundleShortVersionString")
+    // Mutant seam: restore CURRENT_PROJECT_VERSION=1 in the release app build.
+    let short = plist_value(&shipped_app, "CFBundleShortVersionString")
         .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
-    let build = plist_value(&signed_app, "CFBundleVersion")
+    let build = plist_value(&shipped_app, "CFBundleVersion")
         .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
     let expected = expected_build_version(&short).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
     let previous = preceding_patch(&short).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
     let previous_build =
         expected_build_version(&previous).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
-    let signature = signed(&signed_app);
+    let signature = shipped_notarized(&shipped_app);
     let order = (
         semver::Version::parse(&build),
         semver::Version::parse(&previous_build),
@@ -2561,7 +2656,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             && matches!(order, (Ok(ref now), Ok(ref before)) if now > before),
         format!(
             "{} says short={short:?}, build={build:?}, expected={expected:?}, previous={previous_build:?}, signature={signature:?}",
-            signed_app.display()
+            shipped_app.display()
         ),
     ));
 
