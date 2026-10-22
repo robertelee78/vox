@@ -2964,10 +2964,19 @@ impl Computer {
     /// computer-managed grants are empty; observing the expiry marker alone is not settlement.
     pub(crate) fn application_settled(&self, node: &Digest32, revision: u64) -> bool {
         let state = lock(&self.state);
+        Self::application_settled_in(&state, node, revision)
+    }
+
+    fn application_settled_in(state: &State, node: &Digest32, revision: u64) -> bool {
+        // No computer group has policy to apply. Keep this decision under the same state lock as
+        // the grouped checks below, so establishing a group cannot race Ready publication.
+        if state.genesis.is_none() && state.intervals.is_empty() {
+            return true;
+        }
         if state.policy_revision != revision || state.prepared.contains_key(node) {
             return false;
         }
-        if Self::revision_expired(&state) {
+        if Self::revision_expired(state) {
             state
                 .applied
                 .get(node)
@@ -2978,6 +2987,36 @@ impl Computer {
                 .get(node)
                 .is_some_and(|applied| applied.revision == revision)
         }
+    }
+
+    /// Publish one synchronous startup boundary only while the durable application journal is
+    /// exactly settled. The state lock stays held through `publish`, so a same-revision expiry
+    /// cannot land between this final check and the daemon's Ready transition.
+    pub(crate) fn with_application_settled<T>(
+        &self,
+        node: &Digest32,
+        revision: u64,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = lock(&self.state);
+        Self::application_settled_in(&state, node, revision).then(publish)
+    }
+
+    /// Test apparatus predicate for identifying the exact successful applied receipt. It exposes
+    /// no authority and is compiled out of shipped builds.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn application_recorded_grant(
+        &self,
+        node: &Digest32,
+        revision: u64,
+        peer: &Digest32,
+    ) -> bool {
+        let state = lock(&self.state);
+        state.policy_revision == revision
+            && !state.prepared.contains_key(node)
+            && state.applied.get(node).is_some_and(|applied| {
+                applied.revision == revision && applied.grants.contains_key(peer)
+            })
     }
 
     /// The policy replaces a covered individual entry, including stronger drive. Aliases remain

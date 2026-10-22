@@ -6907,10 +6907,28 @@ impl Node {
         loop {
             // Only the receipt from this exact keyring application can open networking. Seeing
             // an expired marker is not completion: its durable revocation branch must finish.
-            if self
-                .apply_computer_keyring_at_until(0, deadline, &cancelled)?
-                .settled
-            {
+            let application = self.apply_computer_keyring_at_until(0, deadline, &cancelled)?;
+            if !application.settled {
+                continue;
+            }
+            let revision = self
+                .computer_revision
+                .load(std::sync::atomic::Ordering::Acquire);
+            let identity = self.profile.as_ref().map(Profile::fingerprint).or_else(|| {
+                self.headless.as_ref().map(|signer| {
+                    crate::identity::composite::RootSigner::fingerprint(signer.as_ref())
+                })
+            });
+            #[cfg(feature = "test-knobs")]
+            if let Some(identity) = identity {
+                self.hold_after_computer_application_receipt_for_proof(identity, revision)?;
+            }
+            // The receipt is only a result from its earlier Computer-state transaction. Expiry
+            // can commit immediately after it returns, so startup repeats the ordinary live
+            // path's exact durable settlement read before it opens networking.
+            if self.computer.as_ref().is_none_or(|computer| {
+                identity.is_some_and(|identity| computer.application_settled(&identity, revision))
+            }) {
                 break;
             }
         }

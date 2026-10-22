@@ -15,6 +15,13 @@ const TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV: &str =
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_ENV: &str =
     "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_FILE";
+/// **Test-only** (`test-knobs`): `<arm>\t<receipt>\t<release socket>\t<fault>`. `arm` contains
+/// the exact grant fingerprint. Startup publishes `receipt` only after the matching applied
+/// receipt removed its recovery record, then waits before the exact durable settlement reread.
+/// Shipped builds neither name nor read this variable.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_ENV: &str =
+    "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_FILE";
 use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
 
@@ -281,6 +288,23 @@ impl NodeHandle {
     ) -> crate::error::Result<()> {
         #[cfg(feature = "test-knobs")]
         self.hold_computer_reconcile_send_for_proof().await?;
+        self.reconcile_computer_inner(deadline).await
+    }
+
+    /// Startup's final Ready fence may discover that policy moved after the actor opened its
+    /// network. Reconcile that same actor without invoking the later-Attached-event proof hold;
+    /// Ready remains unpublished until the exact durable application is settled again.
+    pub async fn reconcile_computer_startup(
+        &self,
+        deadline: std::time::Instant,
+    ) -> crate::error::Result<()> {
+        self.reconcile_computer_inner(deadline).await
+    }
+
+    async fn reconcile_computer_inner(
+        &self,
+        deadline: std::time::Instant,
+    ) -> crate::error::Result<()> {
         let (reply, rx) = oneshot::channel();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let send = self.net_tx.send(NetEvent::ComputerPolicy {
@@ -315,6 +339,24 @@ impl NodeHandle {
                 Err(Error::Profile("computer trust did not apply before its causal deadline"))
             }
         }
+    }
+
+    /// Run the daemon's synchronous Ready publication only while the exact durable application
+    /// remains settled. This closes the gap between the actor's startup check and host Ready.
+    pub fn with_computer_application_settled<T>(&self, ready: impl FnOnce() -> T) -> Option<T> {
+        let Some(computer) = &self.computer else {
+            return Some(ready());
+        };
+        let revision = self
+            .computer_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let identity = self
+            .view_rx
+            .borrow()
+            .identity
+            .as_ref()
+            .map(|identity| identity.fingerprint)?;
+        computer.with_application_settled(&identity, revision, ready)
     }
 }
 
@@ -821,6 +863,88 @@ impl Node {
         listener
             .accept()
             .map_err(|error| fail(format!("prepared-application release failed: {error}")))?;
+        let _ = std::fs::remove_file(release);
+        Ok(())
+    }
+
+    /// Hold startup after the exact applied receipt succeeded and before its durable settlement
+    /// reread. The arm names authenticated semantic content; a prior receipt or another node
+    /// cannot satisfy it.
+    #[cfg(feature = "test-knobs")]
+    pub(super) fn hold_after_computer_application_receipt_for_proof(
+        &self,
+        node: Digest32,
+        revision: u64,
+    ) -> crate::error::Result<()> {
+        let Ok(spec) = std::env::var(TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_ENV) else {
+            return Ok(());
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(arm), Some(receipt), Some(release), Some(fault)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(Error::Profile("computer receipt proof hold is malformed"));
+        };
+        let arm = std::path::Path::new(arm);
+        let target = match std::fs::read_to_string(arm) {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                crate::node::computer::publish_proof_fault(
+                    std::path::Path::new(fault),
+                    &format!("could not read exact applied-receipt arm: {error}"),
+                );
+                return Err(Error::Profile("computer receipt proof hold failed"));
+            }
+        };
+        let target = crate::node::link::b32_decode(target.trim(), "applied-receipt proof grant")
+            .map_err(|error| {
+                crate::node::computer::publish_proof_fault(
+                    std::path::Path::new(fault),
+                    &format!("exact applied-receipt arm is not a fingerprint: {error}"),
+                );
+                Error::Profile("computer receipt proof hold failed")
+            })?;
+        let Some(computer) = &self.computer else {
+            return Ok(());
+        };
+        if !computer.application_recorded_grant(&node, revision, &target) {
+            return Ok(());
+        }
+        let fail = |detail: String| {
+            crate::node::computer::publish_proof_fault(std::path::Path::new(fault), &detail);
+            Error::Profile("computer receipt proof hold failed")
+        };
+        std::fs::remove_file(arm).map_err(|error| {
+            fail(format!(
+                "could not consume exact applied-receipt arm: {error}"
+            ))
+        })?;
+        let release = std::path::Path::new(release);
+        match std::fs::remove_file(release) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(fail(format!(
+                    "could not clear applied-receipt release socket: {error}"
+                )))
+            }
+        }
+        let listener = std::os::unix::net::UnixListener::bind(release)
+            .map_err(|error| fail(format!("could not bind applied-receipt release: {error}")))?;
+        let marker = format!(
+            "{}\t{revision}\t{}",
+            crate::node::link::b32_encode(&node),
+            crate::node::link::b32_encode(&target)
+        );
+        crate::node::computer::publish_proof_marker(
+            std::path::Path::new(receipt),
+            marker.as_bytes(),
+        )
+        .map_err(|error| fail(format!("could not publish applied-receipt marker: {error}")))?;
+        listener
+            .accept()
+            .map_err(|error| fail(format!("applied-receipt release failed: {error}")))?;
         let _ = std::fs::remove_file(release);
         Ok(())
     }

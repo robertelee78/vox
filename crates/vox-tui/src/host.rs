@@ -3293,6 +3293,10 @@ impl Router {
                 }
                 Step::NotAttached => return Err(Refusal::NotAttached { node: node.clone() }),
                 Step::Mine(tx) => {
+                    let failed = |why: String| Refusal::Failed {
+                        node: node.clone(),
+                        why,
+                    };
                     let w = match want.take() {
                         Some(Want::Checked) => Want::Explicit(None),
                         w => w.unwrap_or(Want::IfAttached),
@@ -3313,61 +3317,117 @@ impl Router {
                             })
                             .await;
                     }
-                    let mut slots = lock(&self.inner.slots);
+                    drop(manual);
                     return match started {
-                        Ok(mut a) => {
-                            a.implicit = !a.unprotected && !matches!(w, Want::Explicit(_));
-                            let mut granted = self.grant(node, &mut a, w);
-                            // Attaching succeeded even if the session registration was refused.
-                            // Publish ownership of the running actor before returning that refusal.
-                            if let Ok(granted) = &mut granted {
-                                granted.notes = a.notes.clone();
-                                granted.attached_now = true;
+                        Ok(a) => {
+                            let mut pending = Some((a, w));
+                            loop {
+                                let Some(handle) = pending
+                                    .as_ref()
+                                    .map(|(attached, _)| attached.handle.clone())
+                                else {
+                                    break Err(failed(
+                                        "its Ready publication lost the attaching node".into(),
+                                    ));
+                                };
+                                let published = {
+                                    let mut slots = lock(&self.inner.slots);
+                                    handle.with_computer_application_settled(|| {
+                                        let Some((mut a, w)) = pending.take() else {
+                                            return Err(failed(
+                                                "its Ready publication lost the attaching node"
+                                                    .into(),
+                                            ));
+                                        };
+                                        a.implicit =
+                                            !a.unprotected && !matches!(w, Want::Explicit(_));
+                                        let mut granted = self.grant(node, &mut a, w);
+                                        // Attaching succeeded even if session registration was
+                                        // refused. Publish ownership before returning that refusal.
+                                        if let Ok(granted) = &mut granted {
+                                            granted.notes = a.notes.clone();
+                                            granted.attached_now = true;
+                                        }
+                                        let implicit = a.implicit;
+                                        let fingerprint = a.fingerprint;
+                                        let registered = crate::wake::registered(&a.paths);
+                                        let opening_handle = a.handle.clone();
+                                        let opening_detached = a.detached.subscribe();
+                                        // Drive input from members with drive (ADR-029 §3), while
+                                        // attached.
+                                        self.serve_drive(node, &a.handle, a.detached.subscribe());
+                                        self.serve_attention(&a.handle, a.detached.subscribe());
+                                        slots.insert(node.clone(), Slot::Attached(a));
+                                        self.inner
+                                            .metrics
+                                            .nodes_attached
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let _ = tx.send(Some(Ok(())));
+                                        eprintln!(
+                                            "vox daemon: node {node} is Ready{}",
+                                            if implicit { " (implicitly)" } else { "" }
+                                        );
+                                        Ok((
+                                            granted,
+                                            fingerprint,
+                                            registered,
+                                            opening_handle,
+                                            opening_detached,
+                                        ))
+                                    })
+                                };
+                                match published {
+                                    Some(Ok((
+                                        granted,
+                                        fingerprint,
+                                        registered,
+                                        opening_handle,
+                                        opening_detached,
+                                    ))) => {
+                                        let _ = self.inner.events.send(DaemonEvent::Attached {
+                                            node: node.clone(),
+                                            fingerprint,
+                                        });
+                                        // A saved registration is a durable opening obligation.
+                                        for session in registered {
+                                            self.watch_harness(node, &session);
+                                            self.watch_title(node, &session);
+                                            self.open_registered(
+                                                node,
+                                                &opening_handle,
+                                                opening_detached.clone(),
+                                                &session,
+                                            );
+                                        }
+                                        break granted;
+                                    }
+                                    Some(Err(refusal)) => break Err(refusal),
+                                    None => {}
+                                }
+                                let deadline = std::time::Instant::now()
+                                    + vox_core::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
+                                if let Err(error) =
+                                    handle.reconcile_computer_startup(deadline).await
+                                {
+                                    let refusal = failed(format!(
+                                        "its startup computer trust did not settle: {error}"
+                                    ));
+                                    let Some((mut a, _)) = pending.take() else {
+                                        break Err(refusal);
+                                    };
+                                    if let Some(tasks) = a.tasks.take() {
+                                        tasks.stop().await;
+                                    }
+                                    stop_actor_fully(&a.handle, a.ended.clone()).await;
+                                    lock(&self.inner.slots).remove(node);
+                                    let _ = tx.send(Some(Err(refusal.clone())));
+                                    break Err(refusal);
+                                }
                             }
-                            let implicit = a.implicit;
-                            let fingerprint = a.fingerprint;
-                            let registered = crate::wake::registered(&a.paths);
-                            let opening_handle = a.handle.clone();
-                            let opening_detached = a.detached.subscribe();
-                            // Drive input from members with drive (ADR-029 §3), while attached.
-                            self.serve_drive(node, &a.handle, a.detached.subscribe());
-                            self.serve_attention(&a.handle, a.detached.subscribe());
-                            slots.insert(node.clone(), Slot::Attached(a));
-                            drop(slots);
-                            drop(manual);
-                            self.inner
-                                .metrics
-                                .nodes_attached
-                                .fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(Some(Ok(())));
-                            eprintln!(
-                                "vox daemon: node {node} is Ready{}",
-                                if implicit { " (implicitly)" } else { "" }
-                            );
-                            let _ = self.inner.events.send(DaemonEvent::Attached {
-                                node: node.clone(),
-                                fingerprint,
-                            });
-                            // A saved registration is a durable opening obligation. Restore its
-                            // harness/title readers and its idempotent room opening after the
-                            // attached slot is visible, so a daemon crash after acknowledgment
-                            // cannot strand the Session until another hook turn.
-                            for session in registered {
-                                self.watch_harness(node, &session);
-                                self.watch_title(node, &session);
-                                self.open_registered(
-                                    node,
-                                    &opening_handle,
-                                    opening_detached.clone(),
-                                    &session,
-                                );
-                            }
-                            granted
                         }
                         Err(r) => {
+                            let mut slots = lock(&self.inner.slots);
                             slots.remove(node);
-                            drop(slots);
-                            drop(manual);
                             let _ = tx.send(Some(Err(r.clone())));
                             Err(r)
                         }
