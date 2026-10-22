@@ -831,30 +831,56 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              private package was staged"
         )
     });
-    // Take the direct-failure baseline after the boundary append. That append can raise the
-    // port, so an earlier baseline would let its dial masquerade as the trust decision's path.
-    let reach_failures_before =
-        member_unreachable_failures(&alice, &room, &fps[2]).unwrap_or_else(|| {
-            panic!(
-                "APPARATUS: Alice's shipped status did not expose Carol's exact sync lane before \
-                 the offline trust decision"
-            )
-        });
+    // The actor's monotonic member-reach serial is the causal baseline. Any attempt already in
+    // flight because the boundary post raised a port has a serial at or below this one and cannot
+    // masquerade as the reach synchronously started by the trust command.
+    let reach_before = offline_fallback_observation(&alice, &room, &fps[2]).serial;
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
     assert!(
         ok,
         "PRODUCT: alice's `vox trust add` of carol failed: {err}"
     );
-    // Alice had no direct connection at the decision and Carol's process remains stopped. Wait
-    // only for the exact lane's next shipped failure generation. A status command that observes
-    // it is handled after ReachFailed finishes `deliver_through_log`, so it is a causal barrier:
-    // the two fallback appends must already be durable. The mutant that omits either append now
-    // reaches the PRODUCT equality below instead of drifting until an apparatus watchdog.
-    while member_unreachable_failures(&alice, &room, &fps[2])
-        .is_none_or(|failures| failures <= reach_failures_before)
-    {
+    // Alice had no direct connection at the decision and Carol's process remains stopped. The
+    // shipped snapshot must now show either the exact asked-for attempt or its exact fallback
+    // result. Once the attempt disappears, absence of that result is structurally a PRODUCT red;
+    // only an attempt still owned by the network may run until the external apparatus deadman.
+    let (fallback_attempt, package_seq, consent_seq) = loop {
+        let observation = offline_fallback_observation(&alice, &room, &fps[2]);
+        assert!(
+            observation.serial > reach_before,
+            "PRODUCT: `vox trust add` returned without starting Carol's exact member-delivery \
+             reach: serial remained {reach_before}"
+        );
+        if let Some((attempt, package_seq, consent_seq)) = observation
+            .fallback
+            .filter(|(attempt, _, _)| *attempt > reach_before)
+        {
+            break (attempt, package_seq, consent_seq);
+        }
+        assert!(
+            observation
+                .active
+                .iter()
+                .any(|attempt| *attempt > reach_before),
+            "PRODUCT: Carol's asked-for member reach completed but shipped status records no \
+             package/consent fallback result after serial {reach_before}"
+        );
         std::thread::yield_now();
-    }
+    };
+    assert_eq!(
+        package_seq,
+        Some(before_package_through.saturating_add(1)),
+        "PRODUCT: failed member reach {fallback_attempt} did not append Carol's exact key package \
+         at authenticated position {}",
+        before_package_through.saturating_add(1)
+    );
+    assert_eq!(
+        consent_seq,
+        Some(before_package_through.saturating_add(2)),
+        "PRODUCT: failed member reach {fallback_attempt} did not append Carol's exact consent at \
+         authenticated position {}",
+        before_package_through.saturating_add(2)
+    );
     let after_package_log = status_log_entries(&alice, &room).unwrap_or_else(|| {
         panic!(
             "PRODUCT: after Carol's exact failed-direct event, Alice's shipped status omitted \
@@ -2154,28 +2180,73 @@ fn key_packages_pending(dir: &Path, room: &str) -> Option<bool> {
         .as_bool()
 }
 
-/// The current unreachable-backoff generation for one exact room/peer sync lane. The room label
-/// may be the shipped short room ID; the peer match is the complete fingerprint, so a similarly
-/// prefixed member cannot satisfy this causal boundary.
-fn member_unreachable_failures(dir: &Path, room: &str, member: &str) -> Option<u64> {
-    let (ok, out, _) = vox(dir, &["status", "--json"], None);
-    if !ok {
-        return None;
+struct OfflineFallbackObservation {
+    serial: u64,
+    active: Vec<u64>,
+    fallback: Option<(u64, Option<u64>, Option<u64>)>,
+}
+
+/// One shipped snapshot of the exact member-delivery reach and its store-and-forward result.
+/// The actor publishes both under `lanes`, so a removed failure callback becomes a PRODUCT red
+/// (the attempt vanished without a result) rather than an external-watchdog diagnosis.
+fn offline_fallback_observation(
+    dir: &Path,
+    room: &str,
+    member: &str,
+) -> OfflineFallbackObservation {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: `vox status --json` refused while observing offline delivery: {out}{err}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: offline-delivery status was malformed JSON ({error}): {out}")
+    });
+    let lanes = &value["lanes"];
+    let serial = lanes["member_reach_serial"].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT: shipped status omitted the member-reach serial: {out}")
+    });
+    let active = lanes["member_reaches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("PRODUCT: shipped status omitted exact member reaches: {out}"))
+        .iter()
+        .filter(|row| {
+            row["room"]
+                .as_str()
+                .is_some_and(|candidate| candidate.starts_with(room))
+                && row["peer"].as_str() == Some(member)
+                && row["asked"].as_bool() == Some(true)
+        })
+        .filter_map(|row| row["attempt"].as_u64())
+        .collect();
+    let fallback = lanes["offline_fallbacks"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: shipped status omitted exact offline fallback results: {out}")
+        })
+        .iter()
+        .find(|row| {
+            row["source_room"]
+                .as_str()
+                .is_some_and(|candidate| candidate.starts_with(room))
+                && row["room"]
+                    .as_str()
+                    .is_some_and(|candidate| candidate.starts_with(room))
+                && row["peer"].as_str() == Some(member)
+                && row["asked"].as_bool() == Some(true)
+        })
+        .and_then(|row| {
+            Some((
+                row["attempt"].as_u64()?,
+                row["package_seq"].as_u64(),
+                row["consent_seq"].as_u64(),
+            ))
+        });
+    OfflineFallbackObservation {
+        serial,
+        active,
+        fallback,
     }
-    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
-    let lane = value["sync"].as_array()?.iter().find(|lane| {
-        lane["room"]
-            .as_str()
-            .is_some_and(|candidate| candidate.starts_with(room))
-            && lane["peer"].as_str() == Some(member)
-    })?;
-    let failures = lane["backoff"]["failures"].as_u64().unwrap_or(0);
-    if failures == 0 {
-        return Some(0);
-    }
-    (lane["backoff"]["kind"].as_str() == Some("unreachable")
-        && lane["last_failure"].as_str().is_some())
-    .then_some(failures)
 }
 
 /// Whether shipped status says one exact room member has a live connection. `None` means the

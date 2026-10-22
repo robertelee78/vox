@@ -1217,6 +1217,8 @@ enum NetEvent {
         anchor_attempt: Option<u64>,
         /// The peer that could not be reached.
         peer: Digest32,
+        /// Exact member-delivery reach, if that was this dial's owner.
+        member_attempt: Option<u64>,
         /// What the attempt reported.
         why: String,
     },
@@ -4952,6 +4954,24 @@ struct RoomPublication {
     kind: RoomPublicationKind,
 }
 
+#[derive(Clone, Copy)]
+struct MemberReachOwner {
+    room: Digest32,
+    peer: Digest32,
+    asked: bool,
+}
+
+#[derive(Clone, Copy)]
+struct OfflineFallback {
+    attempt: u64,
+    source_room: Digest32,
+    room: Digest32,
+    peer: Digest32,
+    asked: bool,
+    package_seq: Option<u64>,
+    consent_seq: Option<u64>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     history_demand: history_demand::Controller,
@@ -5073,6 +5093,13 @@ pub struct Node {
     anchor_last_reached: BTreeMap<Digest32, u64>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
+    /// Exact member-delivery reaches. Their monotonic serial makes the failed attempt which
+    /// selected store-and-forward visible instead of inferring it from an aggregate port count.
+    member_reach_serial: u64,
+    member_reaches: BTreeMap<u64, MemberReachOwner>,
+    /// Latest store-and-forward result per exact room/recipient. Replacement bounds this by the
+    /// rooms' membership graph while preserving the package and consent positions a user needs.
+    offline_fallbacks: BTreeMap<(Digest32, Digest32), OfflineFallback>,
     /// When each open room's own records are next renewed on this node's board and its anchors
     /// (V210-68, #258): half their lifetime after the last round that signed them (unix
     /// milliseconds).
@@ -5802,6 +5829,9 @@ impl Node {
             anchor_unreached_since: BTreeMap::new(),
             anchor_last_reached: BTreeMap::new(),
             sync_dials: BTreeSet::new(),
+            member_reach_serial: 0,
+            member_reaches: BTreeMap::new(),
+            offline_fallbacks: BTreeMap::new(),
             records_renew_at: BTreeMap::new(),
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
@@ -8246,6 +8276,7 @@ impl Node {
         self.nearby_dialed.clear();
         self.last_upgrade.clear();
         self.sync_dials.clear();
+        self.member_reaches.clear();
         for ((room, peer), port) in &mut self.ports {
             if port
                 .backoff
@@ -8689,6 +8720,7 @@ impl Node {
                             generation,
                             anchor_attempt: Some(attempt),
                             peer: id,
+                            member_attempt: None,
                             why: e.to_string(),
                         })
                         .await;
@@ -9173,6 +9205,7 @@ impl Node {
                 }
                 let peer = conn.peer_id();
                 self.sync_dials.remove(&peer);
+                self.member_reaches.retain(|_, owner| owner.peer != peer);
                 self.adopt_connection(Arc::clone(&conn));
                 // **And every connection the dial left retired** (#335): a reach files each
                 // connection its rungs made, and one it filed first can have been displaced by a
@@ -9539,7 +9572,14 @@ impl Node {
                 why,
                 generation,
                 anchor_attempt,
+                member_attempt,
             } => {
+                let member_owner = member_attempt.and_then(|attempt| {
+                    self.member_reaches
+                        .remove(&attempt)
+                        .filter(|owner| owner.peer == peer)
+                        .map(|owner| (attempt, owner))
+                });
                 if let Some(attempt) = anchor_attempt {
                     if !self.finish_anchor_dial(peer, generation, attempt) {
                         return;
@@ -9614,7 +9654,9 @@ impl Node {
                 }
                 // The fast path failed: what this node owes that member goes into the log,
                 // where an always-on member carries it (ADR-023 decision 4).
-                self.deliver_through_log(peer).await;
+                if let Some((attempt, owner)) = member_owner {
+                    self.deliver_through_log(attempt, owner).await;
+                }
                 // A joiner this node just let in is often gone from where it joined: `vox connect`
                 // joins in a process that then exits, and the node attached after it answers
                 // elsewhere. Said only once its join is past `JOINER_SEAL_GRACE` (#406).
@@ -15032,8 +15074,36 @@ impl Node {
                 )
             })
             .collect();
+        let member_reaches = self
+            .member_reaches
+            .iter()
+            .map(|(attempt, owner)| {
+                format!(
+                    "{{\"attempt\":{attempt},\"room\":\"{}\",\"peer\":\"{}\",\"asked\":{}}}",
+                    b32_encode(&owner.room),
+                    b32_encode(&owner.peer),
+                    owner.asked
+                )
+            })
+            .collect::<Vec<_>>();
+        let offline_fallbacks = self
+            .offline_fallbacks
+            .values()
+            .map(|fallback| {
+                format!(
+                    "{{\"attempt\":{},\"source_room\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"asked\":{},\"package_seq\":{},\"consent_seq\":{}}}",
+                    fallback.attempt,
+                    b32_encode(&fallback.source_room),
+                    b32_encode(&fallback.room),
+                    b32_encode(&fallback.peer),
+                    fallback.asked,
+                    fallback.package_seq.map_or_else(|| "null".to_owned(), |seq| seq.to_string()),
+                    fallback.consent_seq.map_or_else(|| "null".to_owned(), |seq| seq.to_string())
+                )
+            })
+            .collect::<Vec<_>>();
         format!(
-            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"actors\":[{}],\"running\":[{}],\"waiting\":[{}],\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
+            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"actors\":[{}],\"running\":[{}],\"waiting\":[{}],\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"member_reach_serial\":{},\"member_reaches\":[{}],\"offline_fallbacks\":[{}],\"next_request_in_ms\":{},\"ports\":[{}]}}",
             crate::node::ports::OUTBOUND_SLOTS,
             per_peer.join(","),
             archive_nodes.join(","),
@@ -15092,6 +15162,9 @@ impl Node {
                 .join(","),
             self.bounded_sync.lanes_json(),
             self.history_demand.lanes_json(),
+            self.member_reach_serial,
+            member_reaches.join(","),
+            offline_fallbacks.join(","),
             self.next_request_at.saturating_sub(self.now_ms().get()),
             ports.join(",")
         )
@@ -16187,7 +16260,8 @@ impl Node {
     ///
     /// The consent is issued exactly as the direct path issues it: the key is delivered by the
     /// log instead of the stream, and it is the same key.
-    async fn deliver_through_log(&mut self, peer: Digest32) {
+    async fn deliver_through_log(&mut self, attempt: u64, owner: MemberReachOwner) {
+        let peer = owner.peer;
         if self.net.is_none() {
             return;
         }
@@ -16207,6 +16281,7 @@ impl Node {
                 }
             };
             if owes_consent {
+                let before_package = shared.lock().await.own_verified_head();
                 // **The same release the pairwise stream would have carried** (`consent_release`):
                 // what this member may read depends on when it was trusted, never on the path its
                 // key took (V210-45, #226). A key taken now, when the dial failed, would start
@@ -16240,8 +16315,21 @@ impl Node {
                     release
                 };
                 if !self.post_key_package(&channel_id, peer, &skdm).await {
+                    self.offline_fallbacks.insert(
+                        (channel_id, peer),
+                        OfflineFallback {
+                            attempt,
+                            source_room: owner.room,
+                            room: channel_id,
+                            peer,
+                            asked: owner.asked,
+                            package_seq: None,
+                            consent_seq: None,
+                        },
+                    );
                     continue;
                 }
+                let package_seq = shared.lock().await.own_verified_head();
                 let now_ms = self.now_ms();
                 let issued = {
                     let Some(profile) = self.profile.as_ref() else {
@@ -16271,10 +16359,36 @@ impl Node {
                 };
                 if issued {
                     self.note_local_append(&channel_id);
+                    let consent_seq = shared.lock().await.own_verified_head();
+                    self.offline_fallbacks.insert(
+                        (channel_id, peer),
+                        OfflineFallback {
+                            attempt,
+                            source_room: owner.room,
+                            room: channel_id,
+                            peer,
+                            asked: owner.asked,
+                            package_seq: (package_seq > before_package).then_some(package_seq),
+                            consent_seq: (consent_seq > package_seq).then_some(consent_seq),
+                        },
+                    );
                     let _ = self.event_tx.send(NodeEvent::Consented {
                         channel_id,
                         target: peer,
                     });
+                } else {
+                    self.offline_fallbacks.insert(
+                        (channel_id, peer),
+                        OfflineFallback {
+                            attempt,
+                            source_room: owner.room,
+                            room: channel_id,
+                            peer,
+                            asked: owner.asked,
+                            package_seq: (package_seq > before_package).then_some(package_seq),
+                            consent_seq: None,
+                        },
+                    );
                 }
             }
             // What this member is still owed — history from its floor, or the live generation
@@ -17149,6 +17263,19 @@ impl Node {
             .is_some_and(|t| now.saturating_sub(*t) < MEMBER_REDIAL_MS);
         if asked || !recent {
             self.member_dialed_at.insert(target, now);
+            let mut member_attempt = self.member_reach_serial.wrapping_add(1);
+            while self.member_reaches.contains_key(&member_attempt) {
+                member_attempt = member_attempt.wrapping_add(1);
+            }
+            self.member_reach_serial = member_attempt;
+            self.member_reaches.insert(
+                member_attempt,
+                MemberReachOwner {
+                    room: *channel_id,
+                    peer: target,
+                    asked,
+                },
+            );
             let tx = self.net_tx.clone();
             let room = *channel_id;
             let generation = net.manager().network_generation();
@@ -17187,6 +17314,7 @@ impl Node {
                                 generation,
                                 anchor_attempt: None,
                                 peer: target,
+                                member_attempt: Some(member_attempt),
                                 why: e.to_string(),
                             })
                             .await;
@@ -17366,6 +17494,7 @@ impl Node {
                             generation,
                             anchor_attempt: None,
                             peer,
+                            member_attempt: None,
                             why: e.to_string(),
                         })
                         .await;
