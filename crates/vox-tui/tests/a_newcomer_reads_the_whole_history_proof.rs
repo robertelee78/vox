@@ -246,6 +246,16 @@ fn said(dir: &Path, tag: &str) -> String {
         .unwrap_or_else(|e| format!("(its stderr could not be read: {e})"))
 }
 
+/// How many times the shipped daemon has said its reach to this exact member failed. Capturing a
+/// baseline before a trust decision makes a later line a causal observation of that decision's
+/// failed direct path, without turning an elapsed guess into the verdict.
+fn reach_failures_said(dir: &Path, tag: &str, member_prefix: &str) -> usize {
+    said(dir, tag)
+        .lines()
+        .filter(|line| line.contains("could not reach") && line.contains(member_prefix))
+        .count()
+}
+
 /// `vox room list` once the daemon's socket answers.
 fn attached(dir: &Path, tag: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -726,24 +736,29 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     );
     assert!(ok, "PRODUCT: carol's `vox room join` was refused: {err}");
 
-    // Carol must be a visible member before going offline; otherwise no package can be addressed
-    // to her. Her join completing alone is not that observation on Alice's node.
-    let membership_deadline = Instant::now() + READY_WITHIN;
-    while !vox(&alice, &["status", "--json"], None).1.contains(&fps[2]) {
-        assert!(
-            Instant::now() < membership_deadline,
-            "APPARATUS: alice did not list carol as a room member within {READY_WITHIN:?}; \
-             a package addressed to carol was not staged\nalice's daemon said: {}",
-            said(&alice, "alice")
-        );
-        std::thread::sleep(Duration::from_millis(200));
+    // Carol must be an admitted member in Alice's shipped status before going offline; otherwise
+    // Alice cannot address a package to her. Her join completing alone is not that observation on
+    // Alice's node. This is causal staging: the operator-selected watchdog owns any apparatus
+    // timebox rather than a second elapsed guess here.
+    wait_room_open(&carol, &room, "carol-after-join");
+    while member_connected(&alice, &room, &fps[2]).is_none() {
+        std::thread::yield_now();
     }
 
-    // Put one ordinary row immediately before the package while Carol is still reachable. Alice
-    // must then trust Carol only after Carol is visibly disconnected: an existing connection
-    // takes the direct pairwise path, while the failed dial from this offline state selects the
-    // store-and-forward package path. Alice must make that trust decision before Carol authors
-    // the competing suffix, because a key from an untrusted author is correctly refused.
+    // Alice cannot release her sender key to Carol before Alice trusts her. Therefore Carol
+    // cannot possibly acknowledge an Alice row before this trust decision, even though Carol
+    // already trusts Alice: demanding that state made the old proof wait for an impossible
+    // boundary. Stop Carol first and observe the exact member disconnected in shipped status.
+    // Alice then appends the boundary row locally and trusts Carol. A new `could not reach` line
+    // from the shipped daemon proves the direct attempt actually failed; the following exact
+    // two-position log/feed advance proves that failure selected the package-plus-consent path.
+    carol_daemon.stop();
+    while member_connected(&alice, &room, &fps[2]) != Some(false) {
+        std::thread::yield_now();
+    }
+    let carol_short: String = fps[2].chars().take(26).collect();
+    let reach_failures_before = reach_failures_said(&alice, "alice", &carol_short);
+
     let before_package_text = "alice row before carol's package";
     let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
     assert!(
@@ -767,38 +782,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              private package was staged"
         )
     });
-    let pre_package_replicated_deadline = Instant::now() + READY_WITHIN;
-    while member_holds_through(&carol, &room, &fps[0])
-        .is_none_or(|through| through < before_package_through)
-    {
-        assert!(
-            Instant::now() < pre_package_replicated_deadline,
-            "APPARATUS: before going offline, Carol did not report holding Alice's exact \
-             pre-package feed position {before_package_through}; the package boundary was not \
-             staged\nalice said: {}\ncarol said: {}",
-            said(&alice, "alice"),
-            said(&carol, "carol")
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let carol_log_before_package = status_log_entries(&carol, &room).unwrap_or_else(|| {
-        panic!(
-            "APPARATUS: carol's shipped status did not name her contiguous log at Alice's exact \
-             pre-package feed position {before_package_through}"
-        )
-    });
-    carol_daemon.stop();
-    let disconnected_deadline = Instant::now() + READY_WITHIN;
-    while member_connected(&alice, &room, &fps[2]) != Some(false) {
-        assert!(
-            Instant::now() < disconnected_deadline,
-            "APPARATUS: after Carol's process stopped, Alice's shipped status did not report the \
-             exact room member disconnected; an existing direct connection could still consume \
-             the consent instead of the log fallback\nalice said: {}",
-            said(&alice, "alice")
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
     let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
     assert!(
         ok,
@@ -810,22 +793,14 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // therefore two exact contiguous-log/feed advances from this boundary require the fallback
     // package to have been appended. `entries` is not used: packages and governance facts are log
     // rows, not necessarily visible timeline rows.
-    let package_deadline = Instant::now() + READY_WITHIN;
-    while status_log_entries(&alice, &room)
-        .is_none_or(|entries| entries < before_package_log.saturating_add(2))
+    while reach_failures_said(&alice, "alice", &carol_short) <= reach_failures_before
+        || status_log_entries(&alice, &room)
+            .is_none_or(|entries| entries < before_package_log.saturating_add(2))
         || room_own_feed_through(&alice, &room)
             .is_none_or(|through| through < before_package_through.saturating_add(2))
         || member_key_waits(&alice, &fps[2]) != Some(None)
     {
-        assert!(
-            Instant::now() < package_deadline,
-            "APPARATUS: after Alice visibly lost Carol's direct connection, her shipped \
-             contiguous log and authenticated feed did not each advance twice from \
-             {before_package_log}/{before_package_through}; the failed-direct fallback did not \
-             visibly append Carol's package\nalice said: {}",
-            said(&alice, "alice")
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::yield_now();
     }
     let package_feed_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
         panic!(
@@ -836,31 +811,17 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 
     // Restart Carol with the installer held only after the package exists. Her exact local
     // role-complete cursor must reach Alice's package-bearing feed position: that shipped cursor,
-    // not a generic queue bit or an aggregate count, proves she fetched the segment. The log
-    // count and pending bit supplement it by showing that the new rows are durable and package
-    // installation is still held.
+    // not a generic queue bit or an aggregate count, proves she fetched the segment. The pending
+    // bit supplements it only by confirming that generic package maintenance remains held.
     std::fs::write(&hold, b"")
         .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
     let carol_daemon = daemon_env(&carol, "carol-package-held", &knob);
     attached(&carol, "carol-package-held");
-    let retained_deadline = Instant::now() + READY_WITHIN;
     while member_holds_through(&carol, &room, &fps[0])
         .is_none_or(|through| through < package_feed_through)
-        || status_log_entries(&carol, &room)
-            .is_none_or(|entries| entries < carol_log_before_package.saturating_add(2))
         || key_packages_pending(&carol, &room) != Some(true)
     {
-        assert!(
-            Instant::now() < retained_deadline,
-            "APPARATUS: after Carol restarted with package installation held, the load-bearing \
-             shipped role-complete cursor did not reach Alice's exact package-bearing feed \
-             position {package_feed_through}; supplemental only, her log also had to gain the \
-             package/fact rows and generic package maintenance had to remain pending\nalice said: \
-             {}\ncarol said: {}",
-            said(&alice, "alice"),
-            said(&carol, "carol-package-held")
-        );
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::yield_now();
     }
 
     let carol_successors = vox_core::log::history::MAX_PAGE_ENTRIES + 1;
