@@ -2669,7 +2669,11 @@ impl Computer {
             if let Some(applied) = s.applied.get(&node) {
                 denied.extend(applied.grants.keys().copied());
             }
-            if let Some(prepared) = s.prepared.get(&node) {
+            if let Some(prepared) = s
+                .prepared
+                .get(&node)
+                .filter(|_| !fx28_mutant("expired-plan-drops-prepared"))
+            {
                 denied.extend(prepared.grants.keys().copied());
             }
             return Ok(Some(PolicyPlan {
@@ -2887,10 +2891,7 @@ impl Computer {
             // the durable prepared rollback set and make the actor revoke the just-written grant
             // before it publishes the projection or starts networking. This check deliberately
             // shares the policy-state transaction with the receipt below.
-            if revision == s.policy_revision
-                && Self::revision_expired(s)
-                && !fx28_mutant("keyring-commit-accepts-expired")
-            {
+            if revision == s.policy_revision && Self::revision_expired(s) {
                 receipt = ApplicationReceipt::Reconcile;
                 return Ok(());
             }
@@ -2990,8 +2991,9 @@ impl Computer {
     }
 
     /// Publish one synchronous startup boundary only while the durable application journal is
-    /// exactly settled. The state lock stays held through `publish`, so a same-revision expiry
-    /// cannot land between this final check and the daemon's Ready transition.
+    /// exactly settled. The state lock stays held through `publish`, so policy movement after the
+    /// actor's applied receipt cannot land between this final check and the daemon's Ready
+    /// transition.
     pub(crate) fn with_application_settled<T>(
         &self,
         node: &Digest32,
@@ -2999,7 +3001,9 @@ impl Computer {
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
         let state = lock(&self.state);
-        Self::application_settled_in(&state, node, revision).then(publish)
+        (Self::application_settled_in(&state, node, revision)
+            || fx28_mutant("ready-fence-accepts-unsettled"))
+        .then(publish)
     }
 
     /// Test apparatus predicate for identifying the exact successful applied receipt. It exposes

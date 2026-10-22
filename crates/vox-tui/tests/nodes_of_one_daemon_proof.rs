@@ -1522,9 +1522,9 @@ fn computer_preview_and_approval_survive_a_crash() {
 /// discarding failed transport work means the remote anchor's return never causes registration;
 /// ignoring a marker-only authorization change leaves the causally staged grant in the shipped
 /// effective keyring; clearing a late success hides the missed contract before preview/restart;
-/// accepting an applied receipt after that exact revision expired lets Ready expose the grant;
-/// trusting that successful receipt without the startup durable-settlement reread likewise lets
-/// a same-revision expiry committed immediately afterward reach Ready with the grant;
+/// dropping the prepared rollback set from an expired plan leaves its exact grant effective;
+/// bypassing only the final state-locked Ready fence publishes the applied receipt after its
+/// revision durably expired;
 /// omitting the durable pre-keyring recovery record leaves a newly committed grant effective
 /// after an exact commit-boundary crash and restart.
 /// Each reaches a PRODUCT deadline/roster assertion, while inability to stage an exact race is
@@ -2570,8 +2570,9 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     // computer names the same revision missed and its late exchange makes the answerer's durable
     // status name it expired. Releasing the commit boundary may write the formerly-live grant,
     // but attach may say Ready only after the receipt notices expiry and durably revokes it.
-    // Mutant: accept that expired receipt as current; Ready then exposes the exact grant and the
-    // immediate shipped trust assertion turns PRODUCT red without an elapsed-time verdict.
+    // Mutant: omit the durable prepared rollback set from the expired plan. The just-committed
+    // grant then survives to Ready and the immediate shipped trust assertion turns PRODUCT red
+    // without an elapsed-time verdict.
     let (locked, locked_out, locked_err) = b.run(&["node", "lock", "after-remote-anchor-b"], "");
     assert!(
         locked,
@@ -2731,7 +2732,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let attached_err = String::from_utf8_lossy(&attached.stderr);
     assert!(
         attached.status.success(),
-        "PRODUCT [FX28 expiry-before-keyring-commit]: after exact prepared revision {prepare_race_revision} expired, the managed node did not become Ready through durable revocation: {attached_out}{attached_err}"
+        "PRODUCT [FX28 expiry-before-keyring-ready]: after exact prepared revision {prepare_race_revision} expired, the managed node did not become Ready through durable revocation: {attached_out}{attached_err}"
     );
     right.expect_apparatus_event(
         "managed node Ready after exact prepare/expiry reconciliation",
@@ -2771,14 +2772,12 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "PRODUCT [FX28 expiry-before-keyring-commit]: Ready preceded durable revocation of exact expired revision {prepare_race_revision}: status {remote}; shipped trust output {grants}; error {grant_error}"
     );
 
-    // A second exact revision stages the remaining startup race on the other side of the applied
+    // A second exact revision stages the final Ready fence on the other side of the applied
     // receipt. The receipt has removed `prepared` and recorded the grant before the hold. Only
-    // then does the initiating computer durably expire that same revision. Startup must reread
-    // exact durable settlement and revoke before networking/Ready; the later Attached-event
-    // reconciliation is held independently so it cannot rescue a stale startup decision.
-    // Mutant: let the shared exact-settlement predicate accept an expired applied grant. Both
-    // startup fences then admit this exact grant and the immediate shipped trust assertion turns
-    // PRODUCT red.
+    // then does the initiating computer durably expire that same revision. Live authority gates
+    // already fail closed; the daemon must reconcile the stale receipt before publishing Ready.
+    // Its isolated mutant bypasses only that final state-locked fence. The later Attached-event
+    // reconciliation is held independently so it cannot rescue the shipped trust assertion.
     stop_pid(right.child.id());
     right
         .child
@@ -2845,7 +2844,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         &receipt_reconcile_arm,
         format!("{bob}\t{receipt_race_revision}"),
     )
-    .expect("APPARATUS: arm exact later reconciliation after post-receipt race");
+    .expect("APPARATUS: arm exact later reconciliation after final Ready fence");
     let mut receipt_attach = b
         .cmd(&[
             "node",
@@ -2924,6 +2923,9 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     std::os::unix::net::UnixStream::connect(&application_receipt_release).unwrap_or_else(|error| {
         panic!("APPARATUS: release exact applied-receipt/startup-settlement boundary: {error}")
     });
+    println!(
+        "[proof] FX-28 startup Ready state-lock apparatus staged: node {bob}, applied revision {receipt_race_revision}, expired grant {expired_after_receipt}"
+    );
     let receipt_attached = receipt_attach
         .wait_with_output()
         .expect("APPARATUS: collect post-receipt expiry managed-node attach");
@@ -2931,7 +2933,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let receipt_attached_err = String::from_utf8_lossy(&receipt_attached.stderr);
     assert!(
         receipt_attached.status.success(),
-        "PRODUCT [FX28 expiry-after-applied-receipt]: after exact applied revision {receipt_race_revision} expired, the managed node did not become Ready through durable startup revocation: {receipt_attached_out}{receipt_attached_err}"
+        "PRODUCT [FX28 startup-ready-reconcile]: after exact applied revision {receipt_race_revision} expired, the managed node did not become Ready through final startup reconciliation: {receipt_attached_out}{receipt_attached_err}"
     );
     right.expect_apparatus_event(
         "managed node Ready after exact post-receipt expiry reconciliation",
@@ -2968,7 +2970,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
     assert!(
         exact_grants(&b, "after-remote-anchor-b", &[]),
-        "PRODUCT [FX28 expiry-after-applied-receipt]: Ready consumed stale settlement for exact expired revision {receipt_race_revision}: status {remote}; shipped trust output {grants}; error {grant_error}"
+        "PRODUCT [FX28 startup-ready-state-lock]: Ready published stale authority from exact expired applied revision {receipt_race_revision}: status {remote}; shipped trust output {grants}; error {grant_error}"
     );
 
     // Extend the same merge-before-reply journey through the exact crash window the durable

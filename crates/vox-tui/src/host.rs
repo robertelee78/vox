@@ -3309,7 +3309,7 @@ impl Router {
                         self.refresh_manual_anchors(&anchors).await;
                     }
                     let manual = self.inner.manual_anchors.lock().await;
-                    if let Ok(a) = &started {
+                    if let Ok((a, _, _)) = &started {
                         let _ = a
                             .handle
                             .apply(NodeCommand::SetAnchors {
@@ -3319,7 +3319,7 @@ impl Router {
                     }
                     drop(manual);
                     return match started {
-                        Ok(a) => {
+                        Ok((a, computer_deadline, startup_identity)) => {
                             let mut pending = Some((a, w));
                             loop {
                                 let Some(handle) = pending
@@ -3332,49 +3332,56 @@ impl Router {
                                 };
                                 let published = {
                                     let mut slots = lock(&self.inner.slots);
-                                    handle.with_computer_application_settled(|| {
-                                        let Some((mut a, w)) = pending.take() else {
-                                            return Err(failed(
-                                                "its Ready publication lost the attaching node"
-                                                    .into(),
-                                            ));
-                                        };
-                                        a.implicit =
-                                            !a.unprotected && !matches!(w, Want::Explicit(_));
-                                        let mut granted = self.grant(node, &mut a, w);
-                                        // Attaching succeeded even if session registration was
-                                        // refused. Publish ownership before returning that refusal.
-                                        if let Ok(granted) = &mut granted {
-                                            granted.notes = a.notes.clone();
-                                            granted.attached_now = true;
-                                        }
-                                        let implicit = a.implicit;
-                                        let fingerprint = a.fingerprint;
-                                        let registered = crate::wake::registered(&a.paths);
-                                        let opening_handle = a.handle.clone();
-                                        let opening_detached = a.detached.subscribe();
-                                        // Drive input from members with drive (ADR-029 §3), while
-                                        // attached.
-                                        self.serve_drive(node, &a.handle, a.detached.subscribe());
-                                        self.serve_attention(&a.handle, a.detached.subscribe());
-                                        slots.insert(node.clone(), Slot::Attached(a));
-                                        self.inner
-                                            .metrics
-                                            .nodes_attached
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        let _ = tx.send(Some(Ok(())));
-                                        eprintln!(
-                                            "vox daemon: node {node} is Ready{}",
-                                            if implicit { " (implicitly)" } else { "" }
-                                        );
-                                        Ok((
-                                            granted,
-                                            fingerprint,
-                                            registered,
-                                            opening_handle,
-                                            opening_detached,
-                                        ))
-                                    })
+                                    handle.with_computer_application_settled(
+                                        startup_identity,
+                                        || {
+                                            let Some((mut a, w)) = pending.take() else {
+                                                return Err(failed(
+                                                    "its Ready publication lost the attaching node"
+                                                        .into(),
+                                                ));
+                                            };
+                                            a.implicit =
+                                                !a.unprotected && !matches!(w, Want::Explicit(_));
+                                            let mut granted = self.grant(node, &mut a, w);
+                                            // Attaching succeeded even if session registration was
+                                            // refused. Publish ownership before returning that refusal.
+                                            if let Ok(granted) = &mut granted {
+                                                granted.notes = a.notes.clone();
+                                                granted.attached_now = true;
+                                            }
+                                            let implicit = a.implicit;
+                                            let fingerprint = a.fingerprint;
+                                            let registered = crate::wake::registered(&a.paths);
+                                            let opening_handle = a.handle.clone();
+                                            let opening_detached = a.detached.subscribe();
+                                            // Drive input from members with drive (ADR-029 §3), while
+                                            // attached.
+                                            self.serve_drive(
+                                                node,
+                                                &a.handle,
+                                                a.detached.subscribe(),
+                                            );
+                                            self.serve_attention(&a.handle, a.detached.subscribe());
+                                            slots.insert(node.clone(), Slot::Attached(a));
+                                            self.inner
+                                                .metrics
+                                                .nodes_attached
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            let _ = tx.send(Some(Ok(())));
+                                            eprintln!(
+                                                "vox daemon: node {node} is Ready{}",
+                                                if implicit { " (implicitly)" } else { "" }
+                                            );
+                                            Ok((
+                                                granted,
+                                                fingerprint,
+                                                registered,
+                                                opening_handle,
+                                                opening_detached,
+                                            ))
+                                        },
+                                    )
                                 };
                                 match published {
                                     Some(Ok((
@@ -3404,10 +3411,8 @@ impl Router {
                                     Some(Err(refusal)) => break Err(refusal),
                                     None => {}
                                 }
-                                let deadline = std::time::Instant::now()
-                                    + vox_core::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
                                 if let Err(error) =
-                                    handle.reconcile_computer_startup(deadline).await
+                                    handle.reconcile_computer_startup(computer_deadline).await
                                 {
                                     let refusal = failed(format!(
                                         "its startup computer trust did not settle: {error}"
@@ -3490,7 +3495,7 @@ impl Router {
         passphrase: Option<&Zeroizing<String>>,
         rooms: &[Zeroizing<String>],
         anchors: &[String],
-    ) -> Result<Box<Attached>, Refusal> {
+    ) -> Result<(Box<Attached>, std::time::Instant, Digest32), Refusal> {
         let failed = |why: String| Refusal::Failed {
             node: node.clone(),
             why,
@@ -3673,6 +3678,12 @@ impl Router {
             stop_actor_fully(&handle, ended.clone()).await;
             return Err(refusal);
         }
+        let Some((computer_deadline, startup_identity)) = handle.startup_computer_boundary() else {
+            stop_actor_fully(&handle, ended.clone()).await;
+            return Err(failed(
+                "its successful startup exposed no computer-trust boundary".into(),
+            ));
+        };
         for line in rooms {
             crate::app::open_rooms_by_line(&handle, line).await;
         }
@@ -3684,25 +3695,29 @@ impl Router {
         let tasks = anchor
             .is_none()
             .then(|| NodeTasks::start(&self.inner.rt, &handle, &paths));
-        let fingerprint = anchor.or_else(|| handle.view().identity.map(|i| i.fingerprint));
-        Ok(Box::new(Attached {
-            handle,
-            paths,
-            generation,
-            computer_reconciliation: None,
-            implicit: true,
-            unprotected: anchor.is_some() || pass.is_empty(),
-            keep: None,
-            holders: 0,
-            sessions: BTreeSet::new(),
-            tasks,
-            detached: watch::channel(false).0,
-            notes,
-            ended,
-            session_retirements: Some(session_retirements),
-            fingerprint,
-            anchor: anchor.is_some(),
-        }))
+        let fingerprint = Some(startup_identity);
+        Ok((
+            Box::new(Attached {
+                handle,
+                paths,
+                generation,
+                computer_reconciliation: None,
+                implicit: true,
+                unprotected: anchor.is_some() || pass.is_empty(),
+                keep: None,
+                holders: 0,
+                sessions: BTreeSet::new(),
+                tasks,
+                detached: watch::channel(false).0,
+                notes,
+                ended,
+                session_retirements: Some(session_retirements),
+                fingerprint,
+                anchor: anchor.is_some(),
+            }),
+            computer_deadline,
+            startup_identity,
+        ))
     }
 
     /// Detach `node` only if it is still the attach `generation` (a panic's detach, which must

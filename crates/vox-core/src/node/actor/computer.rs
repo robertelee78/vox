@@ -17,7 +17,8 @@ const TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_ENV: &str =
     "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_FILE";
 /// **Test-only** (`test-knobs`): `<arm>\t<receipt>\t<release socket>\t<fault>`. `arm` contains
 /// the exact grant fingerprint. Startup publishes `receipt` only after the matching applied
-/// receipt removed its recovery record, then waits before the exact durable settlement reread.
+/// receipt removed its recovery record, then waits before actor startup returns to the daemon's
+/// final state-locked Ready fence.
 /// Shipped builds neither name nor read this variable.
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_ENV: &str =
@@ -132,6 +133,16 @@ impl Node {
 }
 
 impl NodeHandle {
+    /// The actor-owned startup boundary, read once by the daemon after Unlock/startup completes.
+    /// Its identity is authoritative for headless actors whose `NodeView` intentionally has no
+    /// vault identity.
+    pub fn startup_computer_boundary(&self) -> Option<(std::time::Instant, Digest32)> {
+        *self
+            .startup_computer_boundary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Test apparatus: hold the later Attached-event reconciliation before it reaches the actor.
     /// The arm and marker both name the actor's authenticated identity and exact policy revision,
     /// so the shipped trust observation cannot accidentally follow asynchronous repair.
@@ -342,20 +353,18 @@ impl NodeHandle {
     }
 
     /// Run the daemon's synchronous Ready publication only while the exact durable application
-    /// remains settled. This closes the gap between the actor's startup check and host Ready.
-    pub fn with_computer_application_settled<T>(&self, ready: impl FnOnce() -> T) -> Option<T> {
+    /// remains settled. This closes the gap between the actor's applied receipt and host Ready.
+    pub fn with_computer_application_settled<T>(
+        &self,
+        identity: Digest32,
+        ready: impl FnOnce() -> T,
+    ) -> Option<T> {
         let Some(computer) = &self.computer else {
             return Some(ready());
         };
         let revision = self
             .computer_revision
             .load(std::sync::atomic::Ordering::Acquire);
-        let identity = self
-            .view_rx
-            .borrow()
-            .identity
-            .as_ref()
-            .map(|identity| identity.fingerprint)?;
         computer.with_application_settled(&identity, revision, ready)
     }
 }
@@ -867,9 +876,9 @@ impl Node {
         Ok(())
     }
 
-    /// Hold startup after the exact applied receipt succeeded and before its durable settlement
-    /// reread. The arm names authenticated semantic content; a prior receipt or another node
-    /// cannot satisfy it.
+    /// Hold startup after the exact applied receipt succeeded and before the daemon's final
+    /// state-locked Ready fence. The arm names authenticated semantic content; a prior receipt or
+    /// another node cannot satisfy it.
     #[cfg(feature = "test-knobs")]
     pub(super) fn hold_after_computer_application_receipt_for_proof(
         &self,

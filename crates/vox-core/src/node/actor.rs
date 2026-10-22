@@ -4089,6 +4089,9 @@ pub struct NodeHandle {
     display_incarnation: Digest32,
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
+    /// The exact identity and one monotonic deadline minted by this actor's latest successful
+    /// startup. The daemon reads this once and spends the same boundary through Ready.
+    startup_computer_boundary: Arc<std::sync::Mutex<Option<(std::time::Instant, Digest32)>>>,
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
     /// Posts waiting for one room's bounded publication owner to yield. The command queue does
     /// not bound sleeping client futures, so their retained text has its own fixed node budget.
@@ -4912,6 +4915,7 @@ pub struct Node {
     bind: Option<Bind>,
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
+    startup_computer_boundary: Arc<std::sync::Mutex<Option<(std::time::Instant, Digest32)>>>,
     /// One sequence for this actor, including rooms closed and reopened between snapshots.
     display_sequence: std::sync::atomic::AtomicU64,
     /// The headless transport identity, if this node runs without a vault.
@@ -5687,6 +5691,7 @@ impl Node {
             bind,
             computer,
             computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            startup_computer_boundary: Arc::new(std::sync::Mutex::new(None)),
             display_sequence: std::sync::atomic::AtomicU64::new(1),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
@@ -5932,11 +5937,13 @@ impl Node {
         let decisions = node.decisions.clone();
         let computer = node.computer.clone();
         let computer_revision = Arc::clone(&node.computer_revision);
+        let startup_computer_boundary = Arc::clone(&node.startup_computer_boundary);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
             display_incarnation,
             computer,
             computer_revision,
+            startup_computer_boundary,
             cmd_tx,
             post_slots,
             view_rx,
@@ -6900,8 +6907,25 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
+        let identity = self.profile.as_ref().map(Profile::fingerprint).or_else(|| {
+            self.headless
+                .as_ref()
+                .map(|signer| crate::identity::composite::RootSigner::fingerprint(signer.as_ref()))
+        });
+        let Some(identity) = identity else {
+            return Err(crate::error::Error::Profile("no identity on this node"));
+        };
+        // Identity unlocking and its KDF are complete here: this boundary measures computer-trust
+        // startup, not passphrase work. One actor-owned deadline covers the successful policy
+        // application and every daemon Ready reconciliation. Retries spend what remains; nobody
+        // downstream mints a replacement. The identity travels with it so headless actors do not
+        // depend on a vault projection appearing in `NodeView`.
         let deadline =
             std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
+        *self
+            .startup_computer_boundary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((deadline, identity));
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         self.prepare_computer_binding_causal(deadline, &cancelled, true)?;
         loop {
@@ -6911,26 +6935,17 @@ impl Node {
             if !application.settled {
                 continue;
             }
-            let revision = self
-                .computer_revision
-                .load(std::sync::atomic::Ordering::Acquire);
-            let identity = self.profile.as_ref().map(Profile::fingerprint).or_else(|| {
-                self.headless.as_ref().map(|signer| {
-                    crate::identity::composite::RootSigner::fingerprint(signer.as_ref())
-                })
-            });
             #[cfg(feature = "test-knobs")]
-            if let Some(identity) = identity {
+            {
+                let revision = self
+                    .computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire);
                 self.hold_after_computer_application_receipt_for_proof(identity, revision)?;
             }
-            // The receipt is only a result from its earlier Computer-state transaction. Expiry
-            // can commit immediately after it returns, so startup repeats the ordinary live
-            // path's exact durable settlement read before it opens networking.
-            if self.computer.as_ref().is_none_or(|computer| {
-                identity.is_some_and(|identity| computer.application_settled(&identity, revision))
-            }) {
-                break;
-            }
+            // The receipt is this actor's causal completion. Live use-time authority gates fail
+            // closed against later policy movement; the daemon's state-locked fence independently
+            // reconciles that movement before publishing Ready.
+            break;
         }
         let Some(bind) = self.bind.as_ref() else {
             return Ok(());
