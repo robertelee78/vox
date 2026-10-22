@@ -274,6 +274,9 @@ pub struct StatusReport {
     pub identity: Option<Digest32>,
     /// Whether it is on the network.
     pub networked: bool,
+    /// Whether the actor has bounded governance maintenance queued. A room's displayed
+    /// projection remains the last complete one while this is true.
+    pub governance_pending: bool,
     /// When the machine's network last changed, unix milliseconds, and the change in one line
     /// (ADR-012 N-52); `None` if it has not since the daemon started.
     pub network_changed: Option<(u64, String)>,
@@ -426,6 +429,7 @@ impl StatusReport {
             self.identity.map_or("null".into(), |d| q(&b32_encode(&d)))
         );
         let _ = write!(j, "\"networked\":{},", self.networked);
+        let _ = write!(j, "\"governance_pending\":{},", self.governance_pending);
         let _ = write!(
             j,
             "\"keyring_open_secs\":{},",

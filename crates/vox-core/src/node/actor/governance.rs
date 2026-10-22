@@ -39,6 +39,12 @@ pub(super) struct Maintenance {
 }
 
 impl Maintenance {
+    /// Whether bounded governance maintenance is queued. This is current actor state for
+    /// `vox status`, not an inference from a room's last published semantic revision.
+    pub(super) fn pending(&self) -> bool {
+        self.pending || self.again || self.removal.is_some()
+    }
+
     pub(super) fn next_deadline(&self) -> Option<u64> {
         self.deadline_order.first().map(|(deadline, _)| *deadline)
     }

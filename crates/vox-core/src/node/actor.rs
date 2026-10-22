@@ -20308,6 +20308,7 @@ impl Node {
             started: self.status.started,
             identity: me,
             networked: self.net.is_some(),
+            governance_pending: self.governance_work.pending(),
             network_changed: self
                 .presence
                 .as_ref()

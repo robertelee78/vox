@@ -513,6 +513,7 @@ struct RoomStatus {
     log_entries: u64,
     received_key_generations: u64,
     governance_revision: u64,
+    governance_pending: bool,
     render_backfill_pending: bool,
 }
 
@@ -556,6 +557,9 @@ fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
         }),
         governance_revision: row["governance_revision"].as_u64().unwrap_or_else(|| {
             panic!("PRODUCT: {reader}'s room status has no numeric `governance_revision`: {row}")
+        }),
+        governance_pending: value["governance_pending"].as_bool().unwrap_or_else(|| {
+            panic!("PRODUCT: {reader}'s node status has no boolean `governance_pending`: {value}")
         }),
         render_backfill_pending: row["render_backfill_pending"].as_bool().unwrap_or_else(|| {
             panic!(
@@ -1834,51 +1838,39 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     }
     let (last_rotated_hash, last_rotated_text) = last_rotated
         .unwrap_or_else(|| panic!("APPARATUS: the source-owned rotation bound was empty"));
-    // The source transaction fixes the semantic identity without sampling an intermediate row
-    // count: its Presence is the first non-post row, its offline fallback awaits an optional key
-    // package and then appends consent last, and those exact two governance facts each revise the
-    // quiet room. Wait for both transitions before reading their immutable identities.
+    // The source transaction fixes the semantic identity without sampling semantic revision as
+    // completion: its Presence is the first non-post row, its offline fallback awaits an optional
+    // key package and then appends consent last. The actor cannot answer a shipped room-order read
+    // between that package and consent append, so Presence plus a later non-post row is the exact
+    // source-owned completion boundary. Only then wait for the authority-dependent page to settle
+    // and assert that both source facts changed canonical meaning. With grant₂'s semantic change
+    // mutated away, source completion and settlement still occur and the revision assertion is a
+    // PRODUCT red rather than a watchdog NO RESULT.
     let grant2_revision = semantic_before_rotation
         .governance_revision
         .checked_add(2)
         .expect("PRODUCT: Alice's governance revision overflowed during the repeated grant");
-    let semantic_after_grant2 = loop {
-        let status = room_status(&alice, "alice", &rooms[0]);
+    let (after_grant2, transition_rows) = loop {
+        let order = room_hashes(&alice, "alice", &rooms[0]);
+        let rows: Vec<_> = order
+            .iter()
+            .filter(|hash| {
+                !rotation_order_before.contains(hash) && !rotation_post_hashes.contains(hash)
+            })
+            .cloned()
+            .collect();
         assert!(
-            status.governance_revision <= grant2_revision,
-            "PRODUCT: Alice published more than the source-owned Presence→grant transitions \
-             while Bob was offline in quiet room {}: before {semantic_before_rotation:?}, now \
-             {status:?}",
-            rooms[0]
+            rows.len() <= 3,
+            "PRODUCT: the source-owned rotation appended rows beyond Presence, its optional key \
+             package and consent in quiet room {}: before {rotation_order_before:?}; posts \
+             {rotation_post_hashes:?}; after {order:?}; transition rows {rows:?}",
+            rooms[0],
         );
-        if status.governance_revision == grant2_revision {
-            wait_governance_current(
-                &alice,
-                "alice",
-                &rooms[0],
-                "the exact source-owned Presence→grant2 transitions never completed their \
-                 bounded fold",
-            );
-            let settled = room_status(&alice, "alice", &rooms[0]);
-            assert_eq!(
-                settled.governance_revision, grant2_revision,
-                "PRODUCT: Alice published an extra semantic revision while settling the one \
-                 source-owned repeated-grant sequence in quiet room {}: before \
-                 {semantic_before_rotation:?}, settled {settled:?}",
-                rooms[0]
-            );
-            break settled;
+        if rows.len() >= 2 {
+            break (order, rows);
         }
         std::thread::yield_now();
     };
-    let after_grant2 = room_hashes(&alice, "alice", &rooms[0]);
-    let transition_rows: Vec<_> = after_grant2
-        .iter()
-        .filter(|hash| {
-            !rotation_order_before.contains(hash) && !rotation_post_hashes.contains(hash)
-        })
-        .cloned()
-        .collect();
     assert!(
         matches!(transition_rows.len(), 2 | 3),
         "PRODUCT: the exact two source-owned semantic transitions did not expose Presence, then \
@@ -1896,6 +1888,14 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         .last()
         .expect("PRODUCT: source-owned transition completed without a consent row")
         .clone();
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "the source-complete Presence→grant2 sequence never settled its bounded governance \
+         work",
+    );
+    let semantic_after_grant2 = room_status(&alice, "alice", &rooms[0]);
     let ordered_positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
         .iter()
         .map(|hash| {
@@ -2070,15 +2070,48 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          achieved: {active}{err}",
         rooms[0]
     );
-    wait_admin_membership(&alice, "alice", &rooms[0], &fps[1], false);
-    let authority_expired = wait_room_status(
-        &alice,
-        "alice",
-        &rooms[0],
-        false,
-        "the quiet room's exact authority-expiry deadline did not publish its semantic revision",
-        |status| status.governance_revision > authority_active.governance_revision,
+    // The shipped authority page becomes refreshing when its exact source-owned deadline has
+    // fired. It may also move directly to the final absent answer when both bounded sweeps finish
+    // before the next observation. Once refreshing is observed, shipped status provides the
+    // causal terminal boundary: no governance maintenance remains queued. The behind-cursor
+    // second-sweep mutant reaches that boundary too, then the one-shot roster/revision assertions
+    // below turn PRODUCT red instead of waiting forever for the desired state.
+    let expired_without_refresh = loop {
+        let (ok, out, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
+        let contains_bob = out
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(fps[1].as_str()));
+        if ok && !contains_bob {
+            break true;
+        }
+        if ok {
+            std::thread::yield_now();
+            continue;
+        }
+        assert!(
+            err.contains("governance") && err.contains("refreshing"),
+            "PRODUCT: Alice's shipped admin page failed while its exact certificate expiry was \
+             becoming current in room {}: {out}{err}",
+            rooms[0]
+        );
+        break false;
+    };
+    if !expired_without_refresh {
+        while room_status(&alice, "alice", &rooms[0]).governance_pending {
+            std::thread::yield_now();
+        }
+    }
+    let (ok, expired, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
+    assert!(
+        ok && !expired
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(fps[1].as_str())),
+        "PRODUCT: after Alice's source-owned expiry work reached shipped governance idle, Bob \
+         still had administrator authority or the page stayed unavailable in room {}: \
+         {expired}{err}",
+        rooms[0]
     );
+    let authority_expired = room_status(&alice, "alice", &rooms[0]);
     assert_eq!(
         authority_expired.governance_revision,
         authority_active.governance_revision + 1,

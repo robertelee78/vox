@@ -68,6 +68,14 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
 /// The human renderer must not silently turn a missing or wrong-typed governance answer into
 /// revision zero or an idle backfill. JSON and human status are the same shipped contract.
 fn validate_governance_status(v: &Value) -> Result<(), AppError> {
+    if v.get("governance_pending")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Err(AppError::Usage(
+            "the node's report has no boolean governance_pending".into(),
+        ));
+    }
     let rooms = v
         .get("rooms")
         .and_then(Value::as_array)
@@ -175,6 +183,15 @@ fn render(v: &Value) -> Result<String, AppError> {
     if let Some(path) = v.get("log_path").and_then(Value::as_str) {
         let _ = writeln!(o, "daemon log: {path}");
     }
+    let _ = writeln!(
+        o,
+        "governance work: {}",
+        if v.get("governance_pending").and_then(Value::as_bool) == Some(true) {
+            "pending"
+        } else {
+            "idle"
+        }
+    );
     let empty = Vec::new();
     let arr = |k: &str| v.get(k).and_then(Value::as_array).unwrap_or(&empty);
     o.push_str(&render_anchors(v));
