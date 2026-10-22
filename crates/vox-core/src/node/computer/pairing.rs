@@ -620,6 +620,12 @@ impl Management {
                     s.retain_roster(event)?;
                 }
             }
+            // A reach record is transport state, not a later operator-policy cause. It must not
+            // make an expired policy current again or recreate the computer's applied receipt.
+            if Computer::revision_expired(s) {
+                s.receipts.remove(&local);
+                return Ok(());
+            }
             let Some(g) = &s.genesis else {
                 return Ok(());
             };
@@ -675,10 +681,10 @@ impl Management {
             policy.add_anchor(a.id);
         }
         net.policy().replace(policy);
-        let (current_revision, durable_misses) = computer.missed_exchanges();
+        let (current_policy_revision, durable_misses) = computer.missed_exchanges();
         let exchanged: BTreeMap<_, _> = durable_misses
             .into_iter()
-            .filter(|(_, (revision, _))| *revision == current_revision)
+            .filter(|(_, (revision, _))| *revision == current_policy_revision)
             .map(|(peer, (revision, repaired))| {
                 (
                     peer,
@@ -2282,6 +2288,7 @@ impl Management {
         self.hold_retry_ready_for_proof().await;
         let (peers, attempted, revision, mut next) = {
             let s = lock(&self.computer.state);
+            let policy_revision = s.policy_revision;
             let local = self.computer.signer.fingerprint();
             let mut peers: std::collections::BTreeSet<_> = s
                 .descriptions()
@@ -2347,7 +2354,8 @@ impl Management {
                 // exact state and needs no periodic retry. A later policy state is a new cause;
                 // it may make one attempt under its own already-created retry mark.
                 if let Some(record) = exchanged.get_mut(peer) {
-                    if record.missed_revision.is_some() && record.missed_revision != Some(revision)
+                    if record.missed_revision.is_some()
+                        && record.missed_revision != Some(policy_revision)
                     {
                         record.failures = 0;
                         record.deadline = None;
@@ -2358,7 +2366,7 @@ impl Management {
                     }
                 }
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
-                if record.repaired_late == Some(revision) {
+                if record.repaired_late == Some(policy_revision) {
                     return false;
                 }
                 let causal_mark = retry_ready.get(peer).copied();
@@ -2622,7 +2630,7 @@ impl Management {
                         result = &mut exchange => result.map_err(|e| e.to_string()),
                         () = tokio::time::sleep_until(deadline.into()) => {
                             match me.computer.record_missed_exchange(peer, revision, false) {
-                                Ok(()) => Err("the exchange did not finish before its causal convergence deadline".into()),
+                                Ok(_) => Err("the exchange did not finish before its causal convergence deadline".into()),
                                 Err(error) => Err(format!(
                                     "the missed exchange could not be recorded durably: {error}"
                                 )),
@@ -2672,19 +2680,24 @@ impl Management {
             return;
         }
         let completed = std::time::Instant::now();
+        let policy_revision = self.computer.policy_revision();
         let (retained_miss, was_repaired) =
             lock(&self.exchanged)
                 .get(&peer)
                 .map_or((false, false), |record| {
                     (
-                        record.missed_revision == Some(revision),
-                        record.repaired_late == Some(revision),
+                        record.missed_revision == Some(policy_revision),
+                        record.repaired_late == Some(policy_revision),
                     )
                 });
         let missed = retained_miss || completed >= deadline;
+        let mut missed_cause = None;
         let durable = if missed {
             self.computer
                 .record_missed_exchange(peer, revision, outcome.is_ok() || was_repaired)
+                .map(|cause| {
+                    missed_cause = Some(cause);
+                })
         } else if outcome.is_ok() {
             self.computer.record_timely_exchange(peer, revision)
         } else {
@@ -2708,6 +2721,7 @@ impl Management {
                 record.last_ms = Some(at_ms);
                 record.count = record.count.saturating_add(1);
                 if missed {
+                    let missed_revision = missed_cause.unwrap_or(policy_revision);
                     record.failures = record.failures.saturating_add(1).max(1);
                     record.deadline =
                         Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
@@ -2715,8 +2729,8 @@ impl Management {
                         "the exchange repaired state only after its causal convergence deadline"
                             .into(),
                     );
-                    record.repaired_late = Some(revision);
-                    record.missed_revision = Some(revision);
+                    record.repaired_late = Some(missed_revision);
+                    record.missed_revision = Some(missed_revision);
                 } else {
                     record.failures = 0;
                     record.deadline = None;
@@ -2741,11 +2755,11 @@ impl Management {
                     text
                 });
                 if missed {
-                    record.missed_revision = Some(revision);
+                    record.missed_revision = Some(missed_cause.unwrap_or(policy_revision));
                 }
                 if record
                     .repaired_late
-                    .is_none_or(|missed_revision| missed_revision != revision)
+                    .is_none_or(|held| held != missed_cause.unwrap_or(policy_revision))
                 {
                     record.repaired_late = None;
                 }
