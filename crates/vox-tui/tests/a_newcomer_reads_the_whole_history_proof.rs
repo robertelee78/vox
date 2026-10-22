@@ -20,7 +20,7 @@
 //!    pages back) and, each time he reaches the oldest row he holds, asks for the page before it
 //!    with `vox room read --history older --before <that row>`; each such page arrives within
 //!    [`PAGE_WITHIN`], and in the end he reads every `post <i>` **once each and in order**, within
-//!    [`BOUND`] of his join. Two sizes: [`BACKLOG`] (160: 32 below the window) **blocks**; 1,500
+//!    [`BOUND`] of his join. Two sizes: [`BACKLOG`] (257: 129 below the window) **blocks**; 1,500
 //!    (across the sender-key rotation at 1,000, ADR-006 `N`) is **optional** for its staging time.
 //!
 //! **The defect this began with.** Bob's paged read stopped at 500 posts, 1,001–1,500: a sender
@@ -45,10 +45,9 @@
 //! red: each was accepted. A read that fails is `PRODUCT`, never an empty page; a join the product
 //! turns away is `PRODUCT` with its reason.
 //!
-//! **Every participant is the shipped binary.** Nothing in this process runs a node or speaks a
-//! wire protocol; each step is a `vox` process with its own `VOX_DATA_DIR`/`VOX_CONFIG_DIR`,
-//! killed by its PID when dropped. The quiet-room proof reads each `store.redb` only at the two
-//! edges of its measured window, as the user's direct no-write artifact verdict.
+//! **Every participant is the shipped binary.** Nothing in this process runs a node, opens a
+//! store or speaks a wire protocol; each step is a `vox` process with its own
+//! `VOX_DATA_DIR`/`VOX_CONFIG_DIR`, killed by its PID when dropped.
 //!
 //! **Ordering.** Whether a generation was minted after bob was trusted is decided by the
 //! profile's logical consent order (one persisted counter every mint and every trust decision
@@ -70,7 +69,7 @@
 //!   red with bob short of 1,500 once the pages are asked for.
 
 // Two blocking-or-optional arms (decider, 2026-10-01: "Valid proofs block; rest optional"). The
-// 160-post history BLOCKS: a newcomer reads every post exactly once and in order, the part below
+// 257-post history BLOCKS: a newcomer reads every post exactly once and in order, the part below
 // the live window on demand. The timing claim (one wait, fresh or behind) and the 1,500-post
 // history are optional: CI only compiles them, and without `--features optional-proofs` a stand-in
 // says each was not run (`support/optional_proof.rs`).
@@ -82,8 +81,8 @@ mod optional_proof;
 optional_proof::not_run!(
     a_newcomer_trusted_before_every_post_reads_all_of_them,
     a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog,
-    a_quiet_room_costs_no_rounds_and_says_when_it_last_synced,
     hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port,
+    a_quiet_room_costs_no_rounds_and_says_when_it_last_synced,
 );
 
 #[path = "support/test_knobs.rs"]
@@ -97,29 +96,34 @@ mod attach;
 #[path = "support/typed.rs"]
 mod typed;
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "optional-proofs")]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::Write;
 #[cfg(feature = "optional-proofs")]
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
-/// How long bob has, from his join, to read the whole history.
+/// External deadman for the optional whole-journey timing measurement. The blocking catch-up
+/// claim does not use this to decide whether a page is wedged.
 const BOUND: Duration = Duration::from_secs(300);
 /// **The one wait** (ADR-037 R1): from bob's `vox room join` returning, alice reads his first
 /// post and he reads hers, in a fresh room and behind a backlog alike. The bound a member back in
 /// its room already meets both ways (`a_member_that_restarts_finds_its_room_proof`, 10 s); a
 /// fresh room measured well under it, and the backlog room must meet the same figure.
 const READY_WITHIN: Duration = Duration::from_secs(10);
-/// How long one page asked for with `--history older` has to arrive.
+/// Existing optional private-history responsiveness claim; the blocking connected catch-up arm
+/// uses structural owner/progress observations instead of this elapsed bound.
 const PAGE_WITHIN: Duration = Duration::from_secs(60);
-/// The backlog: past `MAX_PAGE_ENTRIES` (128), the live window a sparse join holds of one author,
-/// so 32 rows sit below the window and are read only on demand.
-const BACKLOG: usize = 160;
+/// The reproduced connected catch-up backlog: past `MAX_PAGE_ENTRIES` (128), so 129 rows sit
+/// below the live window and are read only on demand. The former 160-row arm did not cover the
+/// 257-row daemon wedge observed on the release base.
+const BACKLOG: usize = 257;
 /// Rows per page when bob pages back, so the blocking arm walks several pages.
 const PAGE: usize = 25;
 
@@ -134,7 +138,8 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
-    fn stop_in_place(&mut self) {
+    /// Stop it as a person does (SIGTERM, ADR-012: a clean stop), waiting for it to exit.
+    fn stop(mut self) {
         let _ = Command::new("kill")
             .args(["-TERM", &self.0.id().to_string()])
             .status();
@@ -145,11 +150,6 @@ impl Daemon {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-    }
-
-    /// Stop it as a person does (SIGTERM, ADR-012: a clean stop), waiting for it to exit.
-    fn stop(mut self) {
-        self.stop_in_place();
         // Drop kills what did not stop.
     }
 }
@@ -223,7 +223,7 @@ fn daemon_env(dir: &Path, tag: &str, env: &[(&str, &str)]) -> Daemon {
     daemon_with(dir, tag, &[], env)
 }
 
-/// The same, with more arguments (`--no-node`, say) after the listen address.
+/// The same, with more shipped daemon arguments (`--no-node`, for a multi-node host).
 fn daemon_with(dir: &Path, tag: &str, args: &[&str], env: &[(&str, &str)]) -> Daemon {
     let file = |kind: &str| {
         let at = dir.join(format!("daemon-{tag}.{kind}"));
@@ -265,15 +265,79 @@ fn attached(dir: &Path, tag: &str) -> String {
     attached_as(dir, tag, None)
 }
 
-/// The same, as `node` (one of several a daemon hosts).
+/// The same shipped readiness observation for one named node on a multi-node daemon.
 fn attached_as(dir: &Path, tag: &str, node: Option<&str>) -> String {
-    loop {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut last = String::new();
+    while Instant::now() < deadline {
         let (ok, out, err) = vox(dir, &as_node(&["room", "list"], node), None);
         if ok {
             return out;
         }
-        eprintln!("[apparatus] waiting for {tag}'s daemon to answer: {err}");
+        last = err;
         std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!(
+        "APPARATUS: {tag}'s daemon never answered `vox room list` in 90 s: {last}\nits stderr: {}",
+        said(dir, tag)
+    );
+}
+
+/// `args` as one named node on a multi-node daemon runs it.
+fn as_node<'a>(args: &[&'a str], node: Option<&'a str>) -> Vec<&'a str> {
+    let mut args = args.to_vec();
+    if let Some(node) = node {
+        args.extend(["--node", node]);
+    }
+    args
+}
+
+/// Make one named node Ready beside the others hosted by `vox daemon --no-node`.
+fn unlock(dir: &Path, node: &str) {
+    let args = attach::persistent_args(
+        dir,
+        &["node", "unlock", node, "--passphrase-file", "-"],
+        IDENTITY,
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (ok, out, err) = vox_plain(dir, &args, None);
+    assert!(
+        ok,
+        "APPARATUS: staging `vox node unlock {node}` failed: {out}{err}"
+    );
+}
+
+struct Fx35Status {
+    status: String,
+}
+
+/// One shipped, single-snapshot status document for the named hosted node.
+fn fx35_synced(dir: &Path, node: Option<&str>) -> Fx35Status {
+    let (ok, status, err) = vox(dir, &as_node(&["status", "--json"], node), None);
+    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
+    serde_json::from_str::<serde_json::Value>(&status).unwrap_or_else(|error| {
+        panic!("PRODUCT: `vox status --json` is not JSON: {error}: {status}")
+    });
+    Fx35Status { status }
+}
+
+/// Wait for the shipped room list to say `room` is open. The proof's operator-selected watchdog
+/// owns any apparatus timebox; this causal wait has no elapsed product verdict of its own.
+fn wait_room_open(dir: &Path, room: &str, who: &str) {
+    loop {
+        let (ok, out, err) = vox(dir, &["room", "list"], None);
+        assert!(
+            ok,
+            "PRODUCT (staging): {who}'s shipped `vox room list` failed while waiting for its \
+             restarted room: {err}"
+        );
+        if out
+            .lines()
+            .any(|line| line.trim_start().starts_with(room) && !line.contains("[preparing"))
+        {
+            return;
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -392,6 +456,154 @@ fn reads(dir: &Path, room: &str, text: &str) -> bool {
     out.contains(text)
 }
 
+/// The exact entry hash a person sees for `text`, walking the shipped JSON read pages.
+fn read_hash(dir: &Path, room: &str, text: &str) -> Option<String> {
+    let mut before: Option<String> = None;
+    loop {
+        let limit = PAGE.to_string();
+        let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
+        if let Some(oldest) = before.as_deref() {
+            args.extend(["--before", oldest]);
+        }
+        let (ok, out, err) = vox(dir, &args, None);
+        assert!(
+            ok,
+            "PRODUCT: `vox room read --json` refused while locating {text:?}: {out}{err}"
+        );
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: `vox room read --json` printed invalid JSON ({error}): {line}")
+                })
+            })
+            .collect();
+        if let Some(hash) = rows.iter().find_map(|row| {
+            (row["text"].as_str() == Some(text))
+                .then(|| row["entry_hash"].as_str().map(str::to_owned))
+                .flatten()
+        }) {
+            return Some(hash);
+        }
+        if rows.len() < PAGE {
+            return None;
+        }
+        before = rows
+            .first()
+            .and_then(|row| row["entry_hash"].as_str())
+            .map(str::to_owned);
+        assert!(
+            before.is_some(),
+            "PRODUCT: a `vox room read --json` row carries no entry_hash while locating {text:?}"
+        );
+    }
+}
+
+struct HistoryObservation {
+    phase: String,
+    remaining: u64,
+    request: Option<String>,
+}
+
+fn history_observation(dir: &Path, room: &str) -> HistoryObservation {
+    let (ok, out, err) = vox(
+        dir,
+        &["room", "read", room, "--json", "--history", "status"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: `vox room read --history status --json` was refused: {out}{err}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: `vox room read --history status --json` printed invalid JSON ({error}): {out}")
+    });
+    let status = &value["status"];
+    let phase = status["phase"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: history status named no phase: {value}"))
+        .to_owned();
+    let remaining = status["remaining"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("PRODUCT: history status named no remaining count: {value}"));
+    // The CLI renders the binary request id as a copyable hexadecimal string at the envelope;
+    // the nested status keeps its wire-shaped byte array.
+    let request = match &value["request"] {
+        serde_json::Value::String(request) => Some(request.to_owned()),
+        serde_json::Value::Null => None,
+        _ => panic!("PRODUCT: history status printed a non-string request id: {value}"),
+    };
+    HistoryObservation {
+        phase,
+        remaining,
+        request,
+    }
+}
+
+fn history_status(dir: &Path, room: &str) -> (String, u64) {
+    let observed = history_observation(dir, room);
+    (observed.phase, observed.remaining)
+}
+
+/// A requested page that has not arrived must still have an exact shipped owner. This detects
+/// the wedge itself: the history request is incomplete while neither its demand controller, its
+/// bounded flow nor an exact admission owns it. It does not infer failure from elapsed time,
+/// retry count, queue depth or CPU load.
+fn assert_history_owned(dir: &Path, room: &str, peer: &str, held: usize, expected: usize) {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: the shipped status command failed while {held} of {expected} requested rows \
+         were held: {err}"
+    );
+    let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: shipped status returned malformed JSON during catch-up: {error}: {out}")
+    });
+    let history = &status["lanes"]["history"];
+    let exact = |row: &serde_json::Value| {
+        row["room"]
+            .as_str()
+            .is_some_and(|candidate| candidate.starts_with(room))
+            && row["peer"].as_str() == Some(peer)
+    };
+    let demand_owned = history["owner"].as_object().is_some_and(|_| {
+        history["owner"]["room"]
+            .as_str()
+            .is_some_and(|candidate| candidate.starts_with(room))
+            && history["owner"]["peer"].as_str() == Some(peer)
+            && history["owner"]["request"].as_str().is_some()
+            && history["owner"]["instance"].as_str().is_some()
+    });
+    let bounded = &status["lanes"]["bounded"];
+    let flow_owned = [
+        "ready",
+        "running",
+        "deferred",
+        "retiring",
+        "required",
+        "admissions",
+    ]
+    .iter()
+    .any(|field| {
+        bounded[*field]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| !row.is_null() && exact(row)))
+    });
+    let cleanup_owned = bounded["cleanup"]
+        .as_object()
+        .is_some_and(|_| exact(&bounded["cleanup"]));
+    let release_owned = status["lanes"]["budget"]["flow_state"]["waiting"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(exact));
+    assert!(
+        demand_owned || flow_owned || cleanup_owned || release_owned,
+        "PRODUCT: connected catch-up is structurally wedged at {held} of {expected} requested \
+         rows: shipped status names no exact demand, flow, admission, dependency, cleanup or \
+         release-edge owner for room {room} and peer {peer}; status: {out}"
+    );
+}
+
 /// How long after `since` each side first read the other: alice `to_alice`, bob `to_bob`
 /// (`None` = not within `limit`).
 fn arrivals(
@@ -419,7 +631,7 @@ fn arrivals(
 #[test]
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_newcomer_reads_a_short_history_once_each_in_order() {
-    watchdog::arm_for_setup(1, 7);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     newcomer_reads_the_whole_history(tmp.path(), BACKLOG, PAGE);
 }
@@ -429,7 +641,7 @@ fn a_newcomer_reads_a_short_history_once_each_in_order() {
 #[test]
 #[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; optional, run it in release"]
 fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
-    watchdog::arm_for_setup(1, 7);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     newcomer_reads_the_whole_history(tmp.path(), 1_500, 500);
 }
@@ -441,7 +653,7 @@ fn a_newcomer_trusted_before_every_post_reads_all_of_them() {
 #[test]
 #[ignore = "a timing bound a person feels; real vox daemons; optional, run it in release on a real machine"]
 fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
-    watchdog::arm_for_setup(2, 14);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let mut measured = Vec::new();
     for (name, posts) in [("fresh", 0usize), ("backlog", BACKLOG)] {
@@ -470,12 +682,9 @@ fn a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog() {
     );
 }
 
-/// How long the converged rooms idle while their sync rounds, the hosting daemon's CPU time and
-/// traffic, and its answers are measured.
+/// How long the converged room idles while its sync rounds are counted.
 const IDLE: Duration = Duration::from_secs(60);
-/// The nodes one daemon hosts in the quiet rooms, as the decider's work Mac hosts a person's node
-/// and the agents' beside it on one `vox daemon --no-node`, each made Ready with `vox node unlock`.
-const HOSTED: [&str; 4] = ["robert", "claude", "codex", "opencode"];
+
 /// One live round per hosted node plus every daemon archive job exceeds the pool floor by one.
 /// This derives the required population from the product's two source-owned capacities.
 const FX35_HOSTED_COUNT: usize = vox_core::node::history_budget::FLOW_STATE_CAPACITY
@@ -489,39 +698,15 @@ const FX35_WAKE_HOSTED: [&str; 2] = ["wake-one", "wake-two"];
 const FX35_GENERATION_PANIC: &str = "fx35-generation-panic";
 /// The rooms every node is in; the first hosted node makes them.
 const QUIET_ROOMS: [&str; 2] = ["quiet-1", "quiet-2"];
-/// CPU time a daemon in quiet rooms may spend over [`IDLE`]: Activity Monitor's number, the
-/// issue's bound for the daemon hosting [`HOSTED`] (#986). Measured 2026-10-20 on the decider's
-/// work Mac on v0.4.6: 150–168% of a core, 90–100 s a minute.
-const IDLE_CPU: Duration = Duration::from_secs(6);
-/// How often `vox status --json` is asked of every hosted node during the idle minute; each
-/// answer is held to [`ANSWER_WITHIN`]. Measured on v0.4.6: 0.26–0.82 s.
-const ASK_EVERY: Duration = Duration::from_secs(5);
-/// How long a post is retried while the room says a previous change is still being applied:
-/// two periodic sync intervals, the staging's patience, not a claim.
-/// Bytes, in and out together, one sync round with nothing to fetch may cost the hosting daemon:
-/// the traffic bound is its lanes times the rounds each is allowed times this. A round between
-/// two nodes of one daemon crosses loopback and counts on both sides. 64 KiB is far above what
-/// an empty frontier round carries (a `HAVE` and a `WANT` of a few authors, under 1 KiB each
-/// way) and below what one re-fetched window costs; measured 2026-10-20 on main (v0.4.9 code,
-/// this staging), the host's daemon moved 13.2 MB in and 13.2 MB out in the idle minute, about
-/// 200 KiB per allowed round: the idle re-pull of a sparse author's hint (ADR-038 FX-29).
-const ROUND_BYTES: u64 = 64 * 1024;
-/// A fifth node hosted by the same daemon. It is trusted before anyone posts, but joins only
-/// after every holder has pruned those post bodies, leaving a real sparse history window.
-const SPARSE: &str = "late";
-/// Written to each holder's own retention file before the sparse member joins.
-const HOLD_FOR: &str = "default 1\n";
-
-/// Four nodes on one daemon and one on another, in two quiet rooms, as these proofs stage
-/// them: the roots, every node (its root, its `--node`, its name, its fingerprint; the hosted
-/// four first), the rooms, the two daemons (killed when dropped), when the posts were made and
-/// the longest a post waited for a room applying its last change.
+/// Source-derived hosted nodes on one daemon and one peer on another, in two quiet rooms, as this
+/// proof stages them: the roots, every node (its root, its `--node`, its name, its fingerprint;
+/// the hosted nodes first), the rooms, the two daemons (killed when dropped), when the posts were
+/// made and the longest a post waited for a room applying its last change.
 struct Staged {
     // The daemons first: they are killed before their directories go.
-    host_daemon: Daemon,
-    peer_daemon: Daemon,
+    _host_daemon: Daemon,
+    _peer_daemon: Daemon,
     host: std::path::PathBuf,
-    peer: std::path::PathBuf,
     everyone: Vec<(
         std::path::PathBuf,
         Option<&'static str>,
@@ -529,28 +714,23 @@ struct Staged {
         String,
     )>,
     rooms: Vec<String>,
-    links: Vec<String>,
-    late: Option<(
-        std::path::PathBuf,
-        Option<&'static str>,
-        &'static str,
-        String,
-    )>,
     posted: Instant,
     waited: Duration,
     hosted: usize,
     live_hold: Option<std::path::PathBuf>,
     archive_hold: Option<std::path::PathBuf>,
-    _tmp: Option<tempfile::TempDir>,
+    release_hold: Option<std::path::PathBuf>,
+    pool_floor: Option<std::path::PathBuf>,
+    _tmp: tempfile::TempDir,
 }
 
-/// A setup post uses the bounded-sync round's own product contract as apparatus patience. A
-/// different refusal is the product's exact output; an unchanged busy room is a failed staging
-/// precondition, never left to the global watchdog.
+/// Retry only the shipped room's explicit transient "still being applied" refusal. Every other
+/// refusal is the exact staging fault; only the proof's external APPARATUS deadman can stop a
+/// still-progressing retry sequence.
 fn stage_post(dir: &Path, node: Option<&str>, name: &str, room: &str, text: &str) -> Duration {
     let asked = Instant::now();
     loop {
-        let (ok, out, err) = bounded_stage_post(dir, node, room, text, false, asked);
+        let (ok, out, err) = stage_post_once(dir, node, room, text, false);
         if ok {
             return asked.elapsed();
         }
@@ -559,11 +739,6 @@ fn stage_post(dir: &Path, node: Option<&str>, name: &str, room: &str, text: &str
             busy,
             "APPARATUS: {name}'s staging post in {room} was refused before the measured moment: \
              {out}{err}"
-        );
-        assert!(
-            asked.elapsed() < vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE,
-            "APPARATUS NO RESULT: {name}'s staging post in {room} remained busy until the \
-             operator deadman: {out}{err}"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -578,7 +753,7 @@ fn stage_large_post(
 ) -> Duration {
     let asked = Instant::now();
     loop {
-        let (ok, out, err) = bounded_stage_post(dir, node, room, text, true, asked);
+        let (ok, out, err) = stage_post_once(dir, node, room, text, true);
         if ok {
             return asked.elapsed();
         }
@@ -588,58 +763,24 @@ fn stage_large_post(
             "APPARATUS: {name}'s large staging post in {room} was refused before the measured \
              moment: {out}{err}"
         );
-        assert!(
-            asked.elapsed() < vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE,
-            "APPARATUS NO RESULT: {name}'s large staging post in {room} remained busy until \
-             the operator deadman: {out}{err}"
-        );
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// Run one setup post under the bounded-round contract even if the client itself wedges. The
-/// command is still the shipped binary; this only gives the apparatus its own named watchdog.
-fn bounded_stage_post(
+/// Run one setup post through the shipped binary. This helper owns no product timeout; the proof's
+/// external deadman is the only wall-clock apparatus bound.
+fn stage_post_once(
     dir: &Path,
     node: Option<&str>,
     room: &str,
     text: &str,
     stdin: bool,
-    asked: Instant,
 ) -> (bool, String, String) {
-    let deadman = asked + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
-    let remaining = deadman.saturating_duration_since(Instant::now());
-    assert!(
-        !remaining.is_zero(),
-        "APPARATUS NO RESULT: staging post in {room} exhausted the operator deadman before \
-         its shipped client could start"
-    );
-    let dir = dir.to_owned();
-    let node = node.map(str::to_owned);
-    let room = room.to_owned();
-    let text = text.to_owned();
-    let room_for_error = room.clone();
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut args = vec![
-            "room".to_owned(),
-            "post".to_owned(),
-            room,
-            if stdin { "-".to_owned() } else { text.clone() },
-        ];
-        if let Some(node) = node {
-            args.extend(["--node".to_owned(), node]);
-        }
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = vox(&dir, &refs, stdin.then_some(text.as_str()));
-        let _ = result_tx.send(result);
-    });
-    result_rx.recv_timeout(remaining).unwrap_or_else(|error| {
-        panic!(
-            "APPARATUS NO RESULT: shipped staging post in {room_for_error} did not return \
-             before the operator deadman: {error}"
-        )
-    })
+    let mut args = vec!["room", "post", room, if stdin { "-" } else { text }];
+    if let Some(node) = node {
+        args.extend(["--node", node]);
+    }
+    vox(dir, &args, stdin.then_some(text))
 }
 
 /// Create ordinary shipped archive demand on two hosted nodes. The peer posts beyond the live
@@ -715,7 +856,6 @@ fn stage_two_archive_jobs(staged: &Staged) -> String {
 
     let page = vox_core::log::history::MAX_PAGE_ENTRIES.to_string();
     for (dir, node, name, _) in &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS] {
-        let ready_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
         let oldest = loop {
             let (ok, out, err) = vox(
                 dir,
@@ -745,12 +885,6 @@ fn stage_two_archive_jobs(staged: &Staged) -> String {
                     })
                     .to_owned();
             }
-            assert!(
-                Instant::now() < ready_deadman,
-                "APPARATUS NO RESULT: {name} did not hold the source-sized live window needed \
-                 to stage an older-history request before the operator deadman; held {} rows",
-                rows.len()
-            );
             std::thread::sleep(Duration::from_millis(200));
         };
         let (ok, out, err) = vox(
@@ -775,13 +909,12 @@ fn stage_two_archive_jobs(staged: &Staged) -> String {
         );
     }
 
-    let admitted_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     let expected: BTreeSet<&str> = staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS]
         .iter()
         .map(|(_, _, _, fingerprint)| fingerprint.as_str())
         .collect();
     loop {
-        let shown = synced(&staged.host, Some(FX35_HOSTED[0]));
+        let shown = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
         let value: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
         let archives: BTreeSet<&str> = value["lanes"]["budget"]["archive_nodes"]
             .as_array()
@@ -792,13 +925,6 @@ fn stage_two_archive_jobs(staged: &Staged) -> String {
         if archives == expected {
             return room;
         }
-        assert!(
-            Instant::now() < admitted_deadman,
-            "APPARATUS NO RESULT: the two shipped older-history requests did not occupy both \
-             source-owned archive jobs together before the operator deadman (expected \
-             {expected:?}, saw {archives:?}): {}",
-            shown.status
-        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -811,7 +937,6 @@ fn stage_hosted_nodes(
     hold_live_jobs: bool,
     single_foreground_job: bool,
     disable_tick_schedule: bool,
-    late: Option<&'static str>,
 ) -> Staged {
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
@@ -840,14 +965,6 @@ fn stage_hosted_nodes(
     let (ok, out, err) = vox(&peer, &["id"], None);
     assert!(ok, "APPARATUS: `vox id` failed while staging: {err}");
     everyone.push((peer.clone(), None, "bob", out.trim().to_owned()));
-    let late = late.map(|name| {
-        let (ok, out, err) = vox(&host, &["id", "--node", name], None);
-        assert!(
-            ok,
-            "APPARATUS: `vox id --node {name}` failed while staging: {err}"
-        );
-        (host.clone(), Some(name), name, out.trim().to_owned())
-    });
 
     // One daemon for the host's nodes, as the decider's Mac runs it: `vox daemon --no-node`, each
     // node made Ready in it with `vox node unlock`. The passphrases it remembers go to the proof's
@@ -855,10 +972,18 @@ fn stage_hosted_nodes(
     let keychain = attach::keychain(&host).to_string_lossy().into_owned();
     let live_hold = hold_live_jobs.then(|| root.join("hold-live-job"));
     let archive_hold = hold_live_jobs.then(|| root.join("hold-archive-job"));
+    let release_hold = hold_live_jobs.then(|| root.join("hold-flow-release"));
+    let pool_floor = hold_live_jobs.then(|| root.join("flow-state-floor"));
     let live_hold_text = live_hold
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let archive_hold_text = archive_hold
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let release_hold_text = release_hold
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let pool_floor_text = pool_floor
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned());
     let mut env: Vec<(&str, &str)> = vec![("VOX_TEST_KEYCHAIN", keychain.as_str())];
@@ -870,6 +995,12 @@ fn stage_hosted_nodes(
     }
     if let Some(path) = archive_hold_text.as_deref() {
         env.push(("VOX_TEST_HOLD_ARCHIVE_JOB_FILE", path));
+    }
+    if let Some(path) = release_hold_text.as_deref() {
+        env.push(("VOX_TEST_HOLD_FLOW_RELEASE_FILE", path));
+    }
+    if let Some(path) = pool_floor_text.as_deref() {
+        env.push(("VOX_TEST_FLOW_STATE_FLOOR_FILE", path));
     }
     if single_foreground_job {
         env.push(("VOX_TEST_FOREGROUND_JOBS", "1"));
@@ -885,10 +1016,6 @@ fn stage_hosted_nodes(
         unlock(&host, name);
         attached_as(&host, "host", Some(name));
     }
-    if let Some((_, Some(name), _, _)) = &late {
-        unlock(&host, name);
-        attached_as(&host, "host", Some(name));
-    }
     let peer_daemon = if disable_tick_schedule {
         daemon_env(&peer, "peer", &[("VOX_TEST_DISABLE_TICK_SCHEDULE", "1")])
     } else {
@@ -897,10 +1024,8 @@ fn stage_hosted_nodes(
     attached_as(&peer, "peer", None);
 
     // Trust in every direction before anyone posts.
-    let mut trusting = everyone.clone();
-    trusting.extend(late.iter().cloned());
-    for (dir, node, name, _) in &trusting {
-        for (_, _, other, fp) in &trusting {
+    for (dir, node, name, _) in &everyone {
+        for (_, _, other, fp) in &everyone {
             if other == name {
                 continue;
             }
@@ -918,7 +1043,6 @@ fn stage_hosted_nodes(
     // The rooms: the first hosted node makes each, and every other node joins by its link.
     let maker = Some(hosted[0]);
     let mut rooms = Vec::with_capacity(QUIET_ROOMS.len());
-    let mut links = Vec::with_capacity(QUIET_ROOMS.len());
     for name in QUIET_ROOMS {
         let (ok, _, err) = vox(
             &host,
@@ -958,9 +1082,8 @@ fn stage_hosted_nodes(
             );
         }
         rooms.push(room);
-        links.push(link);
     }
-    // One post each in each room; `converged` later judges delivery by exact terminal cycles. A post the
+    // One post each in each room, and every node reads every other's within BOUND. A post the
     // room turns away because its last change is still being applied ("this request made no
     // change") is retried for up to [`POST_WAIT`], as the person told so does; the longest such
     // wait is reported.
@@ -973,68 +1096,41 @@ fn stage_hosted_nodes(
         }
     }
     Staged {
-        host_daemon,
-        peer_daemon,
+        _host_daemon: host_daemon,
+        _peer_daemon: peer_daemon,
         host,
-        peer,
         everyone,
         rooms,
-        links,
-        late,
         posted,
         waited,
         hosted: hosted.len(),
         live_hold,
         archive_hold,
-        _tmp: Some(tmp),
+        release_hold,
+        pool_floor,
+        _tmp: tmp,
     }
 }
 
-/// Every member reads every other's post. Two terminal cycles on the exact reader/author lane
-/// without the earlier post are a structural wedge: the first cycle may have overlapped the post,
-/// but the next began after that cycle ended. No elapsed clock decides the verdict. While waiting,
-/// the product's own pool account must also remain exact (ADR-038 FX-35).
+/// Every member reads every other's post. Semantic completion and the product's own ownership
+/// invariants decide the verdict; elapsed time belongs only to the external APPARATUS deadman.
 fn converged(staged: &Staged) {
     let Staged {
         everyone, rooms, ..
     } = staged;
-    let cycle0: Vec<Synced> = everyone
-        .iter()
-        .map(|(dir, node, _, _)| synced(dir, *node))
-        .collect();
     let mut unread: Vec<String> = Vec::new();
     loop {
         unread.clear();
         for room in rooms {
-            for (reader_index, (dir, node, reader, _)) in everyone.iter().enumerate() {
+            for (dir, node, reader, _) in everyone {
                 let (ok, out, err) = vox(dir, &as_node(&["room", "read", room], *node), None);
                 assert!(
                     ok,
                     "PRODUCT: {reader}'s `vox room read` refused: {out}{err}"
                 );
-                let mut missing = Vec::new();
-                for (_, _, author, fingerprint) in everyone {
+                for (_, _, author, _) in everyone {
                     if author != reader && !out.contains(&format!("{author} is here")) {
                         unread.push(format!("{reader} has not read {author} in {room}"));
-                        missing.push((*author, fingerprint));
-                    }
-                }
-                if !missing.is_empty() {
-                    let now = synced(dir, *node);
-                    for (author, fingerprint) in missing {
-                        let before = lane_rounds(&cycle0[reader_index], room, fingerprint)
-                            .unwrap_or_default();
-                        let grown = lane_rounds(&now, room, fingerprint)
-                            .map(|lane| lane.since(before))
-                            .unwrap_or_default();
-                        assert!(
-                            grown.rounds() < 2,
-                            "PRODUCT: {reader}'s exact lane for {author} completed two terminal \
-                             cycles after the post but still did not show `{author} is here` in \
-                             {room}; this is a structural sync wedge, not an elapsed-time verdict: \
-                             {grown:?}; {}",
-                            now.status
-                        );
                     }
                 }
             }
@@ -1042,22 +1138,22 @@ fn converged(staged: &Staged) {
         if unread.is_empty() {
             break;
         }
-        // FX-35's park mutant must fail a structural product assertion: in the same shipped
-        // status document, this node's charge count is exactly its running ports and the daemon
-        // total is exactly the by-node sum.
+        // FX-35's park mutant must fail a structural product assertion, not wait for the
+        // apparatus watchdog: in the same shipped status document, this node's charge count
+        // is exactly its running controller Flows and the daemon total is exactly the by-node sum.
         for (dir, node, name, fingerprint) in everyone {
-            let shown = synced(dir, *node);
+            let shown = fx35_synced(dir, *node);
             let value: serde_json::Value =
                 serde_json::from_str(&shown.status).unwrap_or_else(|error| {
                     panic!(
                         "PRODUCT: {name}'s flow-state status was not JSON during convergence: \
-                         {error}: {}",
+                             {error}: {}",
                         shown.status
                     )
                 });
             let pool = &value["lanes"]["budget"]["flow_state"];
-            // The controller's actual worker slots are independent of the budget pool's charge
-            // ledger. Comparing those catches `Flow::park` retaining a charge; port
+            // The controller's actual worker slots are independent of the budget pool's
+            // charge ledger. Comparing those catches `Flow::park` retaining a charge; port
             // `round_running` cannot, because it is deliberately projected from that ledger.
             let running = value["lanes"]["bounded"]["running"]
                 .as_array()
@@ -1073,14 +1169,14 @@ fn converged(staged: &Staged) {
             assert!(
                 charged <= running,
                 "PRODUCT: {name}'s flow-state pool charged a parked/non-running flow during \
-                 convergence (charged {charged}, controller worker slots {running}): {}",
+                     convergence (charged {charged}, controller worker slots {running}): {}",
                 shown.status
             );
             assert_eq!(
                 pool["in_use"].as_u64(),
                 Some(by_node),
                 "PRODUCT: {name}'s flow-state pool total was not the exact by-node sum during \
-                 convergence: {}",
+                     convergence: {}",
                 shown.status
             );
         }
@@ -1090,16 +1186,16 @@ fn converged(staged: &Staged) {
 
 /// A pool charge can disappear before the actor consumes a finished worker, so equality is not
 /// required. The reverse is impossible: more charges than this controller's actual worker slots
-/// means a parked flow retained one. At the structural quiet edge, no Control job may remain
-/// without a worker owner. The clock is only an operator deadman and cannot decide either claim.
+/// means a parked flow retained one. Observe the structural quiet edge so the park mutant has its
+/// own PRODUCT discriminator, independent of the pool-derived port projection and of elapsed
+/// time.
 #[cfg(feature = "optional-proofs")]
 fn parked_flow_charge_discriminator(staged: &Staged) {
-    let quiet_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
         let mut active = Vec::new();
         let mut retained_control = Vec::new();
         for (dir, node, name, fingerprint) in &staged.everyone {
-            let shown = synced(dir, *node);
+            let shown = fx35_synced(dir, *node);
             let value: serde_json::Value =
                 serde_json::from_str(&shown.status).unwrap_or_else(|e| {
                     panic!(
@@ -1132,36 +1228,51 @@ fn parked_flow_charge_discriminator(staged: &Staged) {
                 retained_control.push(format!("{name}: {control}"));
             }
         }
-        if active.is_empty() {
-            assert!(
-                retained_control.is_empty(),
-                "PRODUCT: bounded controllers had no running worker at the structural quiet \
-                 edge, but parked flows still retained admitted Control jobs: \
-                 {retained_control:?}"
-            );
+        if active.is_empty() && retained_control.is_empty() {
             return;
         }
-        assert!(
-            Instant::now() < quiet_deadman,
-            "APPARATUS NO RESULT: actual bounded workers did not reach the structural quiet \
-             precondition before the operator deadman: {active:?}"
-        );
+        if active.is_empty() {
+            panic!(
+                "PRODUCT: bounded controllers have no running worker, but parked flows retain \
+                 admitted \
+                 Control jobs: {retained_control:?}"
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 /// The gates a start attempt can end at, in the order the daemon tests them (ADR-038 FX-35).
-const START_REASONS: [&str; 9] = [
+const START_REASONS: [&str; 10] = [
     "room_busy",
-    "retained_flow_limit",
     "archive_budget_busy",
-    "identity_busy",
     "control_budget_busy",
     "live_lane_busy",
     "no_outbound_slot",
     "flow_state_node_busy",
     "flow_state_pool_full",
+    "flow_state_pool_overcommitted",
+    "flow_state_owner_missing",
+    "flow_state_order_exhausted",
 ];
+
+/// User-visible health messages for this exact room, from one shipped status snapshot.
+#[cfg(feature = "optional-proofs")]
+fn room_health_messages<'a>(status: &'a serde_json::Value, room: &str) -> Vec<&'a str> {
+    let stale = format!("room-stale:{room}");
+    let retained = format!("room-flow-state-pool:{room}");
+    status["unhealthy"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|health| {
+            health["key"]
+                .as_str()
+                .is_some_and(|key| key == stale || key == retained)
+        })
+        .filter_map(|health| health["message"].as_str())
+        .collect()
+}
 
 /// What `vox status --json` must say of every port's last start attempt (ADR-038 FX-35), judged
 /// on one status document of `name`: `start_outcome` is `never_attempted`, `started` or
@@ -1275,10 +1386,8 @@ impl TailObserver {
     }
 
     fn wait_for_after(&self, target: &str, who: &str, product: bool, after: Option<Instant>) {
-        let deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
         loop {
-            let left = deadman.saturating_duration_since(Instant::now());
-            match self.lines.recv_timeout(left) {
+            match self.lines.recv() {
                 Ok((seen, Ok(line)))
                     if line.contains(target) && after.is_none_or(|after| seen >= after) =>
                 {
@@ -1292,19 +1401,16 @@ impl TailObserver {
                 Ok((_, Err(error))) if product => {
                     panic!("PRODUCT: {who}'s shipped room tail failed: {error}")
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if product => panic!(
-                    "PRODUCT: {who}'s already-running shipped room tail ended before showing \
-                     {target:?} from the exact release edge"
+                Err(error) if product => panic!(
+                    "PRODUCT: {who}'s already-running shipped room tail ended without showing \
+                     {target:?} from the exact release edge: {error}"
                 ),
                 Ok((_, Err(error))) => {
                     panic!("APPARATUS: {who}'s staging room tail failed: {error}")
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("APPARATUS: {who}'s staging room tail ended before showing {target:?}")
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-                    "APPARATUS NO RESULT: {who}'s room tail did not show {target:?} before the \
-                     operator deadman"
+                Err(error) => panic!(
+                    "APPARATUS: {who}'s staging room tail ended without showing {target:?}: \
+                     {error}"
                 ),
             }
         }
@@ -1319,6 +1425,108 @@ impl Drop for TailObserver {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+fn observe_flow_release_handoff(
+    dir: &Path,
+    node: Option<&str>,
+    who: &str,
+    wait_order: u64,
+    room: &str,
+    peer: &str,
+) {
+    loop {
+        let shown = fx35_synced(dir, node);
+        let status: serde_json::Value =
+            serde_json::from_str(&shown.status).unwrap_or_else(|error| {
+                panic!(
+                    "PRODUCT: {who}'s release-edge status was not JSON ({error}): {}",
+                    shown.status
+                )
+            });
+        let continuation = status["lanes"]["budget"]["flow_state"]["waiting"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|continuation| continuation["order"] == wait_order);
+        let admission = status["lanes"]["bounded"]["admissions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|admission| admission["wait_order"] == wait_order);
+        let Some(continuation) = continuation else {
+            // Consuming the exact promise removes both records before the round becomes visible;
+            // that is causal product progress, not a wall-clock inference.
+            assert!(
+                admission.is_none_or(|admission| admission["handed_off"] == true),
+                "PRODUCT: {who}'s actor still retains flow-state admission {wait_order} for \
+                 {room}/{peer} after its exact pool promise disappeared, but status says the \
+                 release was not handed off: {}",
+                shown.status
+            );
+            return;
+        };
+        if continuation["granted"] != true {
+            let pool = &status["lanes"]["budget"]["flow_state"];
+            let waiting = pool["waiting"].as_array().cloned().unwrap_or_default();
+            let promised = waiting
+                .iter()
+                .filter(|candidate| candidate["granted"] == true)
+                .count() as u64;
+            let capacity_available = pool["in_use"]
+                .as_u64()
+                .zip(pool["limit"].as_u64())
+                .is_some_and(|(in_use, limit)| in_use + promised < limit);
+            let earliest_eligible = capacity_available.then(|| {
+                waiting
+                    .iter()
+                    .filter(|candidate| candidate["granted"] != true)
+                    .filter(|candidate| {
+                        let Some(node) = candidate["node"].as_str() else {
+                            return false;
+                        };
+                        let charged = pool["by_node"][node].as_u64().unwrap_or(u64::MAX);
+                        let promised_here = waiting
+                            .iter()
+                            .filter(|other| {
+                                other["granted"] == true && other["node"].as_str() == Some(node)
+                            })
+                            .count() as u64;
+                        charged + promised_here
+                            < vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS as u64
+                    })
+                    .filter_map(|candidate| candidate["order"].as_u64())
+                    .min()
+            });
+            assert_ne!(
+                earliest_eligible.flatten(),
+                Some(wait_order),
+                "PRODUCT: flow-state continuation {wait_order} for {who} ({room}/{peer}) is the \
+                 earliest eligible retained Flow after capacity was released, but the pool did \
+                 not grant and hand it to its actor: {}",
+                shown.status
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let admission = admission.unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: flow-state continuation {wait_order} for {who} ({room}/{peer}) owns a \
+                 release promise but the actor no longer reports its exact retained admission: \
+                 {}",
+                shown.status
+            )
+        });
+        assert_eq!(
+            admission["handed_off"], true,
+            "PRODUCT: flow-state continuation {wait_order} for {who} ({room}/{peer}) owns the \
+             earliest eligible release promise, but its actor did not receive that causal \
+             handoff: {}",
+            shown.status
+        );
+        return;
     }
 }
 
@@ -1374,7 +1582,6 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
     let (peer_dir, peer_node, peer_name, _) = &staged.everyone[staged.hosted];
     stage_post(peer_dir, *peer_node, peer_name, room, target);
 
-    let entered_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     let (old_actor, running_name, running_fingerprint) = loop {
         let entered = charged_flow_hold_entries(hold);
         let held = entered.into_iter().find_map(|(actor, fingerprint, _)| {
@@ -1388,11 +1595,6 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         if let Some(held) = held {
             break held;
         }
-        assert!(
-            Instant::now() < entered_deadman,
-            "APPARATUS NO RESULT: no eligible shipped worker reached the charged-Flow barrier \
-             before the operator deadman"
-        );
         std::thread::sleep(Duration::from_millis(20));
     };
 
@@ -1408,9 +1610,8 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         !ok,
         "APPARATUS: the proof-only marker did not panic held actor {running_name}: {out}{err}"
     );
-    let retiring_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
-        let shown = synced(&staged.host, Some(FX35_HOSTED[0]));
+        let shown = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
         let value: serde_json::Value = serde_json::from_str(&shown.status)
             .expect("PRODUCT: post-panic generation status was not JSON");
         let old_retiring = value["lanes"]["budget"]["flow_state"]["actors"]
@@ -1426,12 +1627,6 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         if old_retiring {
             break;
         }
-        assert!(
-            Instant::now() < retiring_deadman,
-            "APPARATUS NO RESULT: shipped status did not expose actor {old_actor}'s retiring \
-             generation before the operator deadman; last status: {}",
-            shown.status
-        );
         std::thread::sleep(Duration::from_millis(20));
     }
     unlock(&staged.host, running_name);
@@ -1510,10 +1705,8 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         stage_post(dir, *node, name, successors[index].0, successors[index].2);
     }
 
-    let replacement_deadman =
-        Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     let refused = loop {
-        let replacement = synced(&staged.host, Some(running_name));
+        let replacement = fx35_synced(&staged.host, Some(running_name));
         let replacement: serde_json::Value = serde_json::from_str(&replacement.status)
             .expect("PRODUCT: generation-accounting status was not JSON");
         let pool = &replacement["lanes"]["budget"]["flow_state"];
@@ -1548,7 +1741,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         // pool admission that name its exact room, peer, root and lane. A refusal on some other
         // port cannot satisfy this claim.
         let bounded = &replacement["lanes"]["bounded"];
-        let bound_refusals: Vec<(usize, String, String, u64)> = successors
+        let bound_refusals: Vec<(usize, String, String, u64, u64)> = successors
             .iter()
             .enumerate()
             .filter_map(|(index, (room, peer, _))| {
@@ -1569,21 +1762,17 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
                 let root = admission["root"].as_str()?.to_owned();
                 let lane = admission["lane"].as_str()?.to_owned();
                 let token = admission["admission"].as_u64()?;
+                let wait_order = admission["wait_order"].as_u64()?;
                 bounded["ready"].as_array()?.iter().find(|flow| {
                     flow["room"] == *room
                         && flow["peer"] == *peer
                         && flow["root"].as_str() == Some(root.as_str())
                         && flow["lane"].as_str() == Some(lane.as_str())
                 })?;
-                Some((index, root, lane, token))
+                Some((index, root, lane, token, wait_order))
             })
             .collect();
         let exact_refusal = (bound_refusals.len() == 1).then(|| bound_refusals[0].clone());
-        let pool_full = replacement["lanes"]["ports"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|port| port["start_reason"] == "flow_state_pool_full");
         let by_node = pool["by_node"]
             .as_object()
             .expect("PRODUCT: generation-accounting status omitted by_node");
@@ -1597,50 +1786,71 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
             .filter_map(|actor| actor["in_use"].as_u64())
             .sum();
         let running_count = pool["running"].as_array().map_or(0, Vec::len) as u64;
-        if let Some(exact_refusal) =
-            exact_refusal.filter(|_| old.is_some() && new.is_some() && running_old && running_new)
-        {
+        if old.is_some() && new.is_some() && running_old && running_new {
+            let exact_refusal = exact_refusal.unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: the retired and replacement actor each own one running source slot, \
+                     but shipped status names no exact room/peer/root/lane `node_slots` waiter for \
+                     the third eligible Flow: {}",
+                    replacement["lanes"]
+                )
+            });
             assert!(
                 generations.len() == 2
                     && retiring
-                    && !pool_full
                     && by_node.len() == staged.hosted
                     && by_node
                         .get(&running_fingerprint)
                         .and_then(serde_json::Value::as_u64)
-                        == Some(1)
+                        == Some(2)
                     && pool["in_use"].as_u64() == Some(actor_sum)
                     && running_count == actor_sum
                     && pool["in_use"]
                         .as_u64()
                         .zip(pool["limit"].as_u64())
                         .is_some_and(|(in_use, limit)| in_use < limit)
+                    && pool["occupied_by_node"][&running_fingerprint] == 2
                     && pool["limit"] == expected_limit,
                 "PRODUCT: `vox status --json` did not aggregate the retired and replacement \
-                 actor into the same two node slots, or named the refusal PoolFull: {}",
+                 actor into the same two node slots, or did not account its exact waiter: {}",
                 pool
+            );
+            let retained_room = successors[exact_refusal.0].0;
+            let unrelated_room = successors[1 - exact_refusal.0].0;
+            let retained_health = room_health_messages(&replacement, retained_room);
+            assert!(
+                retained_health
+                    .iter()
+                    .any(|message| message.contains("flow-state pool")),
+                "PRODUCT: {running_name}'s exact retained continuation for {retained_room} is \
+                 absent from the room's shipped health diagnosis: {}",
+                replacement["unhealthy"]
+            );
+            assert!(
+                room_health_messages(&replacement, unrelated_room)
+                    .iter()
+                    .all(|message| !message.contains("flow-state pool")),
+                "PRODUCT: {running_name}'s shipped health diagnosis blamed the flow-state pool \
+                 for unrelated room {unrelated_room}, which has no retained continuation: {}",
+                replacement["unhealthy"]
             );
             break exact_refusal;
         }
-        assert!(
-            !pool_full,
-            "PRODUCT: a replacement actor reached PoolFull while its retired generation shared \
-             the same node's source-owned slots: {}",
-            replacement["lanes"]
-        );
-        assert!(
-            Instant::now() < replacement_deadman,
-            "APPARATUS NO RESULT: status did not expose the replacement, retired generation, \
-             and exact room/peer/root/lane NodeBusy refusal before the operator deadman: {}",
-            replacement["lanes"]
-        );
         std::thread::sleep(Duration::from_millis(20));
     };
 
     let release_started = Instant::now();
     std::fs::remove_file(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release {}: {error}", hold.display()));
-    let (refused_index, refused_root, refused_lane, refused_admission) = refused;
+    let (refused_index, refused_root, refused_lane, refused_admission, wait_order) = refused;
+    observe_flow_release_handoff(
+        &staged.host,
+        Some(running_name),
+        running_name,
+        wait_order,
+        successors[refused_index].0,
+        successors[refused_index].1,
+    );
     successor_tails[refused_index].wait_for_after(
         successors[refused_index].2,
         running_name,
@@ -1655,7 +1865,6 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 
     // The causal refused-flow verdict is complete before these ordinary reads. They retain the
     // broader generation-control claim, but cannot revive or substitute for the refused flow.
-    let released_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     for (room, text) in [
         (&staged.rooms[0], target),
         (&staged.rooms[0], "generation-accounting-successor-one"),
@@ -1674,11 +1883,6 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
             if out.contains(text) {
                 break;
             }
-            assert!(
-                Instant::now() < released_deadman,
-                "APPARATUS NO RESULT: generation-accounting control did not expose {text:?} \
-                 before the operator deadman"
-            );
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -1686,14 +1890,18 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 
 /// **More than eight hosted nodes read each other, and the flow-state pool holds no port**
 /// (ADR-038 FX-35; #986): [`FX35_HOSTED`] on one daemon and bob on another, two rooms, trust in every
-/// direction, one post each. Every member MUST eventually read every other; causal and structural
-/// observations decide the product verdict, while operator deadmen can only return NO RESULT.
-/// Then `vox status --json` on every node
+/// direction, one post each. Every member MUST eventually read every other; only the apparatus
+/// watchdog bounds the run, never the product verdict. Then `vox status --json` on every node
 /// MUST show `lanes.budget.flow_state` with
 /// `by_node` holding one member per node its daemon hosts, the asked node's member equal to its
 /// ports with `round_running` and `in_use` the sum; and every port's last start in the contract's
 /// words ([`start_words`]). Its limit is exactly the shared source constants'
-/// `max(floor, running slots × hosted nodes)`, not a copied count, so it is never full.
+/// `max(floor, running slots × hosted nodes)`, not a copied count, so it is never full in the
+/// production segment. A feature-gated apparatus file then temporarily selects that same
+/// source-defined floor to reach the otherwise impossible retained path: PoolFull requires
+/// `occupied == limit`; an unrelated hosted-identity registration enlarges the limit but does
+/// not grant work; and, after a real charge release, another hosted node observes the exact
+/// granted-but-unconsumed continuation included in `promised` and `occupied`.
 ///
 /// Measured before the fix (main, 2026-10-20, four runs of five): the four hosted nodes' parked
 /// hinted flows held all sixteen flow states, the inventory round that would have let them
@@ -1701,22 +1909,28 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// everyone; or a post was refused for 60 s while the room applied its last change.
 ///
 /// Mutants, one per claim: `Flow::park` keeping its charge turns convergence PRODUCT red;
-/// `scratchpad/mutant_fx35_undersized.py` obstructs the seventeenth reservation while still
-/// reporting the right limit, turning the unused-capacity PoolFull PRODUCT assertion red;
+/// reporting PoolFull from `in_use` while a grant is promised turns the exact `occupied == limit`
+/// assertion red; omitting promises from `occupied` turns the granted-but-unconsumed snapshot
+/// PRODUCT-red; restoring `Pool::resize`'s handoff makes unrelated registration grant the exact
+/// retained continuation and turns that assertion PRODUCT-red;
 /// `scratchpad/mutant_fx35_required.py` disposes the exact required root at an admission
 /// refusal, turning the retained-required-root PRODUCT assertion red at the PoolFull snapshot;
-/// `scratchpad/mutant_fx35_release_wake.py` drops both exact release wakes and leaves the shipped
-/// tail short of its target with periodic scheduling disabled and no post-release request; silence
-/// alone is NO RESULT, never a PRODUCT red. Dropping archive ownership instead turns the exact
-/// shipped archive request's structural ownership assertion red;
-/// `scratchpad/mutant_fx35_node_release.py` drops the charged worker's pool, lane and completion
-/// release notifications, so the exact room/peer/root/lane NodeBusy admission remains visible
-/// but its already-attached tail cannot supply positive causal evidence; a connected silent tail
-/// reaches only the operator's APPARATUS NO RESULT deadman;
+/// `scratchpad/mutant_fx35_release_wake.py` removes the synchronous actor handoff after granting
+/// the earliest exact continuation; one shipped status snapshot then reports the same release
+/// order `granted: true` and `handed_off: false`, immediately PRODUCT red before the already-
+/// attached tail is consulted; dropping archive ownership turns the exact shipped archive
+/// request's structural ownership assertion red; `scratchpad/mutant_fx35_node_release.py` removes
+/// `FlowStateCharge::drop`'s capacity-to-continuation handoff, so status shows the exact room/peer/
+/// root/lane NodeBusy admission as the earliest eligible ungranted Flow after its charge is gone,
+/// another terminating PRODUCT state without a scheduling command or tick;
 /// giving a replacement generation two new node slots instead of sharing the retired actor's
-/// source-owned pair may directly return PoolFull, which names that separate PRODUCT defect;
-/// absence of the expected NodeBusy observation is NO RESULT. Removing the post-quiet need re-arm
-/// leaves the positive observation incomplete and therefore also reaches only NO RESULT.
+/// source-owned pair prevents the exact NodeBusy verdict and makes the generation assertion
+/// PRODUCT-red; reporting NodeBusy as PoolFull makes the first-gate/in-use assertion PRODUCT-red;
+/// removing the retained-room health attribution makes that exact room's shipped diagnosis
+/// PRODUCT-red; attributing every open room to the flow-state pool makes the simultaneous
+/// unrelated-room negative diagnosis PRODUCT-red; removing the PoolFull port reason makes the
+/// full-pool admission's first-gate assertion PRODUCT-red; removing the
+/// post-quiet need re-arm leaves the waiting node short of the named `re-armed` posts.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "two real vox daemons, one hosting more than eight nodes; optional, run it in release"]
@@ -1725,6 +1939,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         "VOX_TEST_FOREGROUND_JOBS",
         "VOX_TEST_HOLD_LIVE_JOB_FILE",
         "VOX_TEST_HOLD_ARCHIVE_JOB_FILE",
+        "VOX_TEST_HOLD_FLOW_RELEASE_FILE",
+        "VOX_TEST_FLOW_STATE_FLOOR_FILE",
         "VOX_TEST_DISABLE_TICK_SCHEDULE",
         "VOX_TEST_PANIC_ON_TEXT",
     ]);
@@ -1737,7 +1953,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         u32::try_from(FX35_HOSTED.len() + FX35_WAKE_HOSTED.len() + 2)
             .expect("APPARATUS: unlock count does not fit the watchdog"),
     );
-    let staged = stage_hosted_nodes(&FX35_HOSTED, true, false, true, None);
+    let staged = stage_hosted_nodes(&FX35_HOSTED, true, false, true);
     converged(&staged);
     parked_flow_charge_discriminator(&staged);
     let converged_after = staged.posted.elapsed();
@@ -1750,8 +1966,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         .map(|(dir, node, name, _)| (*name, TailObserver::attach(dir, *node, pressure_room, None)))
         .collect();
     let ready = "pool-release-tails-attached";
-    let (pressure_dir, pressure_node, pressure_name, pressure_fingerprint) =
-        &staged.everyone[staged.hosted];
+    let (pressure_dir, pressure_node, pressure_name, _) = &staged.everyone[staged.hosted];
     stage_post(
         pressure_dir,
         *pressure_node,
@@ -1769,8 +1984,40 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     // barrier is installed before either request is made, so observing both admissions proves
     // they cannot finish before live pressure reaches the seventeenth reservation. A near-maximum
     // post by the peer in the shared room then makes one live round eligible on every hosted node.
-    // The barriers hold already-admitted jobs without changing product capacity: fifteen live plus
-    // the daemon's two source-owned archive jobs is the first legal population above the floor.
+    // The barriers hold already-admitted jobs. A feature-gated apparatus file temporarily asks
+    // the pool to use its own source-defined floor: fifteen live plus the daemon's two
+    // source-owned archive jobs then reaches the otherwise impossible retained path without a
+    // copied count. Removing the file restores the production dynamic formula in this same run.
+    let resize_probe = "fx35-resize-probe";
+    let pool_floor = staged
+        .pool_floor
+        .as_ref()
+        .expect("APPARATUS: flow-state floor path was not staged");
+    std::fs::File::create(pool_floor).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not create {}: {error}",
+            pool_floor.display()
+        )
+    });
+    let (ok, _, err) = vox(&staged.host, &["id", "--node", resize_probe], None);
+    assert!(ok, "APPARATUS: could not create resize probe: {err}");
+    unlock(&staged.host, resize_probe);
+    attached_as(&staged.host, "host", Some(resize_probe));
+    let (ok, out, err) = vox(&staged.host, &["node", "lock", resize_probe], None);
+    assert!(
+        ok,
+        "APPARATUS: could not lock resize probe after applying the source-defined pool floor: \
+         {out}{err}"
+    );
+    let floored = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
+    let floored: serde_json::Value = serde_json::from_str(&floored.status)
+        .expect("PRODUCT: source-defined pool-floor status was not JSON");
+    assert_eq!(
+        floored["lanes"]["budget"]["flow_state"]["limit"],
+        vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64,
+        "APPARATUS: the feature-gated pool floor was not staged: {}",
+        floored["lanes"]["budget"]["flow_state"]
+    );
     let archive_hold = staged
         .archive_hold
         .as_ref()
@@ -1808,39 +2055,54 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     );
     let mut pool_full_seen = false;
     let mut required_pool_full_seen = false;
-    let mut live_pool_full: Option<(&str, Instant)> = None;
+    let mut live_pool_full: Option<(&str, Instant, u64, String)> = None;
     let mut most_pressure = 0;
     let mut pressure_staged = false;
-    let pressure_snapshot_deadman =
-        Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     let observed = 'pressure: loop {
         for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
-            let shown = synced(dir, *node);
+            let shown = fx35_synced(dir, *node);
             let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
             let pool = &v["lanes"]["budget"]["flow_state"];
             let in_use = pool["in_use"].as_u64().unwrap_or(0);
             let archives = v["lanes"]["budget"]["archive_nodes"]
                 .as_array()
                 .map_or(0, Vec::len);
-            let full_ports: BTreeSet<(String, String)> = v["lanes"]["ports"]
+            let bounded = &v["lanes"]["bounded"];
+            let full_ports: BTreeSet<(String, String)> = bounded["admissions"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter(|port| port["start_reason"] == "flow_state_pool_full")
-                .filter_map(|port| {
+                .filter(|admission| admission["gate"] == "pool")
+                .filter_map(|admission| {
                     Some((
-                        port["room"].as_str()?.to_owned(),
-                        port["peer"].as_str()?.to_owned(),
+                        admission["room"].as_str()?.to_owned(),
+                        admission["peer"].as_str()?.to_owned(),
                     ))
                 })
                 .collect();
             if !full_ports.is_empty() {
                 assert_eq!(
-                    pool["in_use"], pool["limit"],
+                    pool["occupied"], pool["limit"],
                     "PRODUCT: {name} refused a legal flow-state reservation as PoolFull while \
-                     shipped status reported unused capacity: {}",
+                     shipped status reported unoccupied capacity: {}",
                     shown.status
                 );
+                for (room, peer) in &full_ports {
+                    assert!(
+                        v["lanes"]["ports"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|port| {
+                                port["room"] == *room
+                                    && port["peer"] == *peer
+                                    && port["start_reason"] == "flow_state_pool_full"
+                            }),
+                        "PRODUCT: {name}'s exact pool admission {room}/{peer} did not name the \
+                         first failed gate as flow_state_pool_full: {}",
+                        shown.status
+                    );
+                }
                 pool_full_seen = true;
             }
             if !pressure_staged {
@@ -1855,33 +2117,45 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     > vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64
                     || !full_ports.is_empty();
             }
-            let bounded = &v["lanes"]["bounded"];
-            let retained_required_ports: BTreeSet<(String, String)> = bounded["ready"]
+            for flow in bounded["ready"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .chain(bounded["admissions"].as_array().into_iter().flatten())
-                .filter_map(|flow| {
-                    (flow["root"] == "required").then_some(())?;
-                    Some((
-                        flow["room"].as_str()?.to_owned(),
-                        flow["peer"].as_str()?.to_owned(),
-                    ))
+                .filter(|flow| {
+                    flow["room"]
+                        .as_str()
+                        .zip(flow["peer"].as_str())
+                        .is_some_and(|(room, peer)| {
+                            full_ports.contains(&(room.to_owned(), peer.to_owned()))
+                        })
                 })
-                .collect();
-            let unowned_full: Vec<_> = full_ports
-                .difference(&retained_required_ports)
-                .cloned()
-                .collect();
-            assert!(
-                unowned_full.is_empty(),
-                "PRODUCT: {name}'s PoolFull ports had no exact retained required flow in the \
-                 same shipped status document: {unowned_full:?}: {}",
-                shown.status
-            );
-            required_pool_full_seen |= !full_ports.is_empty();
-            if full_ports.contains(&(pressure_room.to_string(), pressure_fingerprint.to_string())) {
-                live_pool_full = Some((*name, Instant::now()));
+            {
+                required_pool_full_seen |= flow["root"] == "required";
+            }
+            if let Some(admission) =
+                bounded["admissions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|admission| {
+                        admission["gate"] == "pool"
+                            && admission["root"] == "required"
+                            && admission["room"] == *pressure_room
+                    })
+            {
+                let wait_order = admission["wait_order"].as_u64().unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT: {name}'s exact PoolFull admission omitted its monotonic release \
+                         order: {}",
+                        shown.status
+                    )
+                });
+                let peer = admission["peer"]
+                    .as_str()
+                    .expect("PRODUCT: exact PoolFull admission omitted peer")
+                    .to_owned();
+                live_pool_full = Some((*name, Instant::now(), wait_order, peer));
                 most_pressure = most_pressure.max(in_use);
                 break 'pressure most_pressure;
             }
@@ -1890,15 +2164,70 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         if most_pressure > vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64 {
             break most_pressure;
         }
-        if Instant::now() >= pressure_snapshot_deadman {
-            panic!(
-                "APPARATUS NO RESULT: the source-derived legal population did not stage more \
-                 than the flow-state floor before the operator deadman (most {most_pressure}, \
-                 PoolFull observed {pool_full_seen})"
-            );
-        }
         std::thread::sleep(Duration::from_millis(20));
     };
+    if let Some((owner, _, wait_order, _)) = &live_pool_full {
+        let release_hold = staged
+            .release_hold
+            .as_ref()
+            .expect("APPARATUS: flow-release hold path was not staged");
+        std::fs::File::create(release_hold).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not create {}: {error}",
+                release_hold.display()
+            )
+        });
+        std::fs::remove_file(pool_floor).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not restore the dynamic pool at {}: {error}",
+                pool_floor.display()
+            )
+        });
+        // Registering an unrelated hosted identity changes only the pool's accounting limit.
+        // It is not a running-round release and therefore cannot grant this retained Flow.
+        unlock(&staged.host, resize_probe);
+        attached_as(&staged.host, "host", Some(resize_probe));
+        let observer = FX35_HOSTED
+            .iter()
+            .copied()
+            .find(|candidate| candidate != owner)
+            .expect("APPARATUS: no unrelated hosted observer");
+        let resized = fx35_synced(&staged.host, Some(observer));
+        let resized: serde_json::Value = serde_json::from_str(&resized.status)
+            .expect("PRODUCT: post-resize status was not JSON");
+        let retained = resized["lanes"]["budget"]["flow_state"]["waiting"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|continuation| continuation["order"] == *wait_order)
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: unrelated hosted-identity registration consumed or lost retained \
+                     continuation {wait_order}: {}",
+                    resized["lanes"]
+                )
+            });
+        assert_eq!(
+            retained["granted"], false,
+            "PRODUCT: unrelated hosted-identity registration granted retained continuation \
+             {wait_order} without a running-round charge release: {}",
+            resized["lanes"]
+        );
+        let resized_pool = &resized["lanes"]["budget"]["flow_state"];
+        assert!(
+            resized_pool["occupied"]
+                .as_u64()
+                .zip(resized_pool["limit"].as_u64())
+                .is_some_and(|(occupied, limit)| occupied < limit),
+            "PRODUCT: the unrelated registration did not expose unused dynamically resized \
+             capacity while the retained continuation stayed ungranted: {resized_pool}"
+        );
+        let (ok, out, err) = vox(&staged.host, &["node", "lock", resize_probe], None);
+        assert!(
+            ok,
+            "APPARATUS: could not lock unrelated resize probe: {out}{err}"
+        );
+    }
     std::fs::remove_file(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release {}: {error}", hold.display()));
     std::fs::remove_file(archive_hold).unwrap_or_else(|error| {
@@ -1913,19 +2242,62 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             "PRODUCT: a shipped bounded start reached PoolFull but status did not retain its \
              exact required root; the dependency was discarded instead of re-armed"
         );
-        let (name, observed_at) = live_pool_full.unwrap_or_else(|| {
+        let (name, observed_at, wait_order, peer) = live_pool_full.unwrap_or_else(|| {
             panic!(
                 "PRODUCT: a shipped bounded start reached PoolFull but no exact shared-room \
                  required admission remained for the release edge"
             )
         });
+        let (dir, node, _, _) = staged.everyone[..staged.hosted]
+            .iter()
+            .find(|(_, _, candidate, _)| *candidate == name)
+            .expect("APPARATUS: PoolFull owner disappeared from staged nodes");
+        let observer = staged.everyone[..staged.hosted]
+            .iter()
+            .find(|(_, _, candidate, _)| *candidate != name)
+            .expect("APPARATUS: no unrelated hosted observer for promised capacity");
+        loop {
+            let promised = fx35_synced(&observer.0, observer.1);
+            let promised: serde_json::Value = serde_json::from_str(&promised.status)
+                .expect("PRODUCT: granted-but-unconsumed status was not JSON");
+            let pool = &promised["lanes"]["budget"]["flow_state"];
+            let exact = pool["waiting"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|continuation| continuation["order"] == wait_order);
+            if exact.is_some_and(|continuation| continuation["granted"] == true) {
+                assert!(
+                    pool["promised"].as_u64().is_some_and(|count| count > 0)
+                        && pool["occupied"].as_u64()
+                            == pool["in_use"]
+                                .as_u64()
+                                .zip(pool["promised"].as_u64())
+                                .map(|(in_use, promised)| in_use + promised),
+                    "PRODUCT: another hosted node could see exact release grant {wait_order}, \
+                     but status did not include it in promised and occupied capacity: {pool}"
+                );
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let release_hold = staged
+            .release_hold
+            .as_ref()
+            .expect("APPARATUS: flow-release hold path disappeared");
+        std::fs::remove_file(release_hold).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not release {}: {error}",
+                release_hold.display()
+            )
+        });
+        observe_flow_release_handoff(dir, *node, name, wait_order, pressure_room, &peer);
         pressure_tails
             .get(name)
             .expect("APPARATUS: PoolFull node lost its pre-attached observer")
             .wait_for_after(pressure_target, name, true, Some(observed_at));
     }
     drop(pressure_tails);
-    let pressure_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
         let mut missing = Vec::new();
         for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
@@ -1942,11 +2314,6 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         if missing.is_empty() {
             break;
         }
-        assert!(
-            Instant::now() < pressure_deadman,
-            "APPARATUS NO RESULT: after exact pool capacity was released, the shipped pressure \
-             post did not reach every retained port before the operator deadman: {missing:?}"
-        );
         std::thread::sleep(Duration::from_millis(200));
     }
     // The two consumed archive dispatches must also finish. Under the undersized mutant, this
@@ -1955,10 +2322,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     for (dir, node, name, fingerprint) in
         &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS]
     {
-        let archive_deadman =
-            Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
         loop {
-            let shown = synced(dir, *node);
+            let shown = fx35_synced(dir, *node);
             let status: serde_json::Value =
                 serde_json::from_str(&shown.status).unwrap_or_else(|error| {
                     panic!(
@@ -2008,12 +2373,6 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                  archive ownership): {}",
                 shown.status
             );
-            assert!(
-                Instant::now() < archive_deadman,
-                "APPARATUS NO RESULT: {name}'s shipped archive request did not expose a \
-                 terminal phase before the operator deadman after pool capacity returned: {}",
-                shown.status
-            );
             std::thread::sleep(Duration::from_millis(200));
         }
     }
@@ -2026,15 +2385,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     let mut most = 0u64;
     let mut limit: Option<u64> = None;
     let mut broken: Vec<String> = Vec::new();
-    if pool_full_seen {
-        broken.push(
-            "a legal round reached flow_state_pool_full; its retained work recovered before this \
-             invariant verdict"
-                .to_owned(),
-        );
-    }
     for (dir, node, name, fp) in &staged.everyone {
-        let shown = synced(dir, *node);
+        let shown = fx35_synced(dir, *node);
         let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
         let pool = &v["lanes"]["budget"]["flow_state"];
         let ports = v["lanes"]["ports"].as_array().cloned().unwrap_or_default();
@@ -2053,11 +2405,17 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             (Some(in_use), Some(l)) => {
                 most = most.max(in_use);
                 limit = Some(l);
+                let promised = pool["promised"].as_u64().unwrap_or(u64::MAX);
+                let occupied = pool["occupied"].as_u64().unwrap_or(u64::MAX);
                 let by_node = pool["by_node"].as_object();
+                let occupied_by_node = pool["occupied_by_node"].as_object();
                 let keys: BTreeSet<&str> = by_node
                     .map(|m| m.keys().map(String::as_str).collect())
                     .unwrap_or_default();
                 let sum: u64 = by_node
+                    .map(|m| m.values().filter_map(serde_json::Value::as_u64).sum())
+                    .unwrap_or(0);
+                let occupied_sum: u64 = occupied_by_node
                     .map(|m| m.values().filter_map(serde_json::Value::as_u64).sum())
                     .unwrap_or(0);
                 let actors = pool["actors"].as_array().cloned().unwrap_or_default();
@@ -2070,11 +2428,6 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     .filter(|actor| actor["registered"] == true)
                     .filter_map(|actor| Some((actor["node"].as_str()?, actor["in_use"].as_u64()?)))
                     .collect();
-                let retiring_sum: u64 = actors
-                    .iter()
-                    .filter(|actor| actor["registered"] == false)
-                    .filter_map(|actor| actor["in_use"].as_u64())
-                    .sum();
                 let retiring_expected: BTreeSet<&str> = actors
                     .iter()
                     .filter(|actor| {
@@ -2101,6 +2454,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                         && round["node"].as_str().is_some()
                         && round["room"].as_str().is_some()
                         && round["peer"].as_str().is_some()
+                        && round["request"].as_str().is_some()
+                        && round["instance"].as_str().is_some()
                 });
                 let mine = by_node
                     .and_then(|m| m.get(fp.as_str()))
@@ -2116,15 +2471,26 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                         by_node.and_then(|values| values[*node].as_u64()) != Some(*count)
                     })
                     || actor_sum != in_use
-                    || sum.saturating_add(retiring_sum) != in_use
+                    || sum != in_use
+                    || occupied != in_use.saturating_add(promised)
+                    || occupied_sum != occupied
+                    || occupied_by_node
+                        .map(|values| values.keys().map(String::as_str).collect::<BTreeSet<_>>())
+                        .unwrap_or_default()
+                        != expected
                     || running.len() as u64 != in_use
                     || !running_exact
                     || retiring_said != retiring_expected
                 {
                     broken.push(format!(
                         "{name}: flow-state generations do not account exactly for in_use \
-                         {in_use} (by_node {}, actors {}, running {}, retiring_nodes {})",
-                        pool["by_node"], pool["actors"], pool["running"], pool["retiring_nodes"]
+                         {in_use} and occupied {occupied} (by_node {}, occupied_by_node {}, \
+                         actors {}, running {}, retiring_nodes {})",
+                        pool["by_node"],
+                        pool["occupied_by_node"],
+                        pool["actors"],
+                        pool["running"],
+                        pool["retiring_nodes"]
                     ));
                 }
                 if mine != Some(running_here) {
@@ -2136,10 +2502,10 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 let expected_limit = vox_core::node::history_budget::FLOW_STATE_CAPACITY
                     .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * keys.len())
                     as u64;
-                if l != expected_limit || in_use > l {
+                if l != expected_limit || occupied > l {
                     broken.push(format!(
                         "{name}: the pool allows {l}, not exactly {expected_limit}, flow states \
-                         for {} hosted nodes; {in_use} in use",
+                         for {} hosted nodes; {in_use} in use and {occupied} occupied",
                         keys.len(),
                     ));
                 }
@@ -2176,13 +2542,12 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
 /// is the only event that can wake the named waiter.
 #[cfg(feature = "optional-proofs")]
 fn foreground_release_wakes_without_a_tick() {
-    let staged = stage_hosted_nodes(&FX35_WAKE_HOSTED, true, true, true, None);
+    let staged = stage_hosted_nodes(&FX35_WAKE_HOSTED, true, true, true);
     converged(&staged);
-    let quiet_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
         let mut busy = Vec::new();
         for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
-            let shown = synced(dir, *node);
+            let shown = fx35_synced(dir, *node);
             let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
             let bounded = &v["lanes"]["bounded"];
             let running = bounded["running"]
@@ -2202,9 +2567,9 @@ fn foreground_release_wakes_without_a_tick() {
                 .count() as u64
                 + ["deferred", "retiring", "required"]
                     .into_iter()
-                    .filter_map(|key| bounded[key].as_u64())
+                    .filter_map(|key| bounded[key].as_array().map(|rows| rows.len() as u64))
                     .sum::<u64>()
-                + u64::from(bounded["cleanup"] == true);
+                + u64::from(!bounded["cleanup"].is_null());
             let in_use = v["lanes"]["budget"]["flow_state"]["in_use"]
                 .as_u64()
                 .unwrap_or(u64::MAX);
@@ -2217,11 +2582,6 @@ fn foreground_release_wakes_without_a_tick() {
         if busy.is_empty() {
             break;
         }
-        assert!(
-            Instant::now() < quiet_deadman,
-            "APPARATUS NO RESULT: could not establish the no-running/no-admission \
-             foreground-wake precondition before the operator deadman: {busy:?}"
-        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -2236,12 +2596,11 @@ fn foreground_release_wakes_without_a_tick() {
         let text = format!("{name} re-armed");
         stage_post(dir, *node, name, room, &text);
     }
-    let staged_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     let (waiting_dir, waiting_node, waiting_name, parked) = loop {
         let mut found = None;
         let mut running = 0u64;
         for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
-            let shown = synced(dir, *node);
+            let shown = fx35_synced(dir, *node);
             let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
             running = running.max(
                 v["lanes"]["budget"]["flow_state"]["in_use"]
@@ -2267,12 +2626,7 @@ fn foreground_release_wakes_without_a_tick() {
                 break waiter;
             }
         }
-        assert!(
-            Instant::now() < staged_deadman,
-            "APPARATUS NO RESULT: exactly one held round and its foreground waiter were not \
-             visible before the operator deadman (running {running}, waiter {})",
-            has_waiter
-        );
+        let _ = has_waiter;
         std::thread::sleep(Duration::from_millis(20));
     };
 
@@ -2345,22 +2699,16 @@ fn foreground_release_wakes_without_a_tick() {
     });
     let ready = format!("tail-attached-for-{waiting_name}");
     stage_post(&waiting_dir, waiting_node, waiting_name, room, &ready);
-    let attached_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
-        let left = attached_deadman.saturating_duration_since(Instant::now());
-        match lines_rx.recv_timeout(left) {
+        match lines_rx.recv() {
             Ok(Ok(line)) if line.contains(&ready) => break,
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 panic!("APPARATUS: release-observer tail could not read stdout: {error}")
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "APPARATUS: release-observer tail ended before showing its pre-release ready \
-                 marker"
-            ),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-                "APPARATUS NO RESULT: release-observer tail did not show its pre-release ready \
-                 marker before the operator deadman"
+            Err(error) => panic!(
+                "APPARATUS: release-observer tail ended without its pre-release ready marker: \
+                 {error}"
             ),
         }
     }
@@ -2368,7 +2716,7 @@ fn foreground_release_wakes_without_a_tick() {
     // Bind the decisive release to the same exact admission observed before any staging command.
     // This status request may schedule ports, but the held foreground job still owns capacity;
     // the original admission (same token, gate, room, peer, root and lane) must remain parked.
-    let shown = synced(&waiting_dir, waiting_node);
+    let shown = fx35_synced(&waiting_dir, waiting_node);
     let value: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_else(|error| {
         panic!(
             "PRODUCT: {waiting_name}'s final pre-release status was not JSON: {error}: {}",
@@ -2398,27 +2746,20 @@ fn foreground_release_wakes_without_a_tick() {
     // No status, read, post, or other actor request occurs after this point. The retained lane's
     // exact capacity-release notification is the only product event that can expose `target` to
     // the already-running shipped tail while periodic scheduling is disabled.
-    let released_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
-        let left = released_deadman.saturating_duration_since(Instant::now());
-        match lines_rx.recv_timeout(left) {
+        match lines_rx.recv() {
             Ok(Ok(line)) if line.contains(&target) => break,
             Ok(Ok(_)) => {}
             Ok(Err(error)) => panic!(
                 "PRODUCT: {waiting_name}'s shipped room tail failed after foreground release: {error}"
             ),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "PRODUCT: {waiting_name}'s shipped room tail ended after foreground release \
-                 before exposing the retained target; admission {parked}"
-            ),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-                "APPARATUS NO RESULT: {waiting_name}'s shipped room tail did not expose the \
-                 retained target after the exact foreground release edge before the operator \
-                 deadman; admission {parked}"
+            Err(error) => panic!(
+                "PRODUCT: {waiting_name}'s shipped tail ended without the retained target after \
+                 exact foreground release while periodic scheduling was disabled: {error}; \
+                 admission {parked}"
             ),
         }
     }
-    let rearmed_deadman = Instant::now() + vox_core::node::history_budget::BOUNDED_ROUND_PATIENCE;
     loop {
         let (ok, out, err) = vox(
             &waiting_dir,
@@ -2438,11 +2779,6 @@ fn foreground_release_wakes_without_a_tick() {
         if missing.is_empty() {
             break;
         }
-        assert!(
-            Instant::now() < rearmed_deadman,
-            "APPARATUS NO RESULT: {waiting_name} did not read every post that re-armed an exact \
-             port before the operator deadman after capacity released: {missing:?}"
-        );
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = tail.kill();
@@ -2450,495 +2786,584 @@ fn foreground_release_wakes_without_a_tick() {
     let _ = reader.join();
 }
 
-/// Prune the holders' already-read post bodies, then join the identity that was trusted before
-/// those posts. Its first walk records the declined missing bodies that FX-29 must leave quiet.
-fn stage_sparse_member(staged: &mut Staged) {
-    let late = staged
-        .late
-        .take()
-        .expect("APPARATUS: quiet-room staging has no sparse identity");
-    for (dir, node, name, _) in &staged.everyone {
-        let node_dir = node_dir_of(dir, *node);
-        let config = node_dir.join("config");
-        std::fs::create_dir_all(&config)
-            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", config.display()));
-        std::fs::write(config.join("retention"), HOLD_FOR)
-            .unwrap_or_else(|e| panic!("APPARATUS: could not write {name}'s retention file: {e}"));
-        let (ok, out, err) = vox(
-            dir,
-            &as_node(
-                &["room", "retention", &staged.rooms[0], "--steps", "7d"],
-                *node,
-            ),
-            None,
-        );
-        assert!(
-            ok,
-            "PRODUCT (staging): {name}'s shipped `vox room retention --steps 7d` was refused: \
-             {out}{err}"
-        );
-    }
-    let pruning = Instant::now();
-    let mut kept = Vec::new();
-    loop {
-        kept.clear();
-        for room in &staged.rooms {
-            for (dir, node, reader, _) in &staged.everyone {
-                let (ok, out, err) = vox(dir, &as_node(&["room", "read", room], *node), None);
-                assert!(
-                    ok,
-                    "PRODUCT: {reader}'s `vox room read` refused while staging sparse history: \
-                     {out}{err}"
-                );
-                for (_, _, author, _) in &staged.everyone {
-                    if out.contains(&format!("{author} is here")) {
-                        kept.push(format!("{reader} still shows {author} in {room}"));
-                    }
-                }
-            }
-        }
-        if kept.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    for (link, name) in staged.links.iter().zip(QUIET_ROOMS) {
-        let (ok, out, err) = vox(
-            &late.0,
-            &as_node(&["room", "join", "--passphrase-file", "-", link], late.1),
-            Some(&format!("{ROOMPASS}\n")),
-        );
-        assert!(
-            ok,
-            "PRODUCT: {}'s `vox room join {name}` was refused: {out}{err}",
-            late.2
-        );
-    }
-    let joined = Instant::now();
-    staged.everyone.push(late);
-    loop {
-        let sparse = synced(&staged.host, Some(SPARSE));
-        if sparse.recorded {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    println!(
-        "[proof] every holder pruned the posts' bodies after {:?}; {SPARSE} recorded its sparse \
-         first walk {:?} after joining",
-        pruning.elapsed(),
-        joined.elapsed()
-    );
-}
-
-/// Prove that the sparse member's exact refusal survives both an ordinary transport reconnect
-/// and reconstruction after its daemon restarts. The product verdict is causal: a returned lane
-/// either completes empty or two of its own terminal cycles prove it is making the wrong progress.
-fn prove_refusal_survives_reconnect_and_restart(staged: &mut Staged) {
-    let bob_fp = staged
-        .everyone
-        .iter()
-        .find(|(_, _, name, _)| *name == "bob")
-        .map(|(_, _, _, fingerprint)| fingerprint.clone())
-        .expect("APPARATUS: quiet staging has no bob identity");
-    let sparse_fp = staged
-        .everyone
-        .iter()
-        .find(|(_, _, name, _)| *name == SPARSE)
-        .map(|(_, _, _, fingerprint)| fingerprint.clone())
-        .expect("APPARATUS: quiet staging has no sparse identity");
-    let reconnect0 = synced(&staged.host, Some(SPARSE));
-    let reconnect_lane0 =
-        lane_rounds(&reconnect0, &staged.rooms[0], &bob_fp).unwrap_or_else(|| {
-            panic!(
-            "PRODUCT: `vox status --json` did not show {SPARSE}'s lane for bob before reconnect"
-        )
-        });
-    staged.peer_daemon.stop_in_place();
-    staged.peer_daemon = daemon(&staged.peer, "peer-reconnected");
-    attached_as(&staged.peer, "peer-reconnected", None);
-    let (reconnected, reconnect_served) = loop {
-        let now = synced(&staged.host, Some(SPARSE));
-        let bob_now = synced(&staged.peer, None);
-        let grown = lane_rounds(&now, &staged.rooms[0], &bob_fp)
-            .map(|rounds| rounds.since(reconnect_lane0))
-            .unwrap_or_default();
-        let served = lane_rounds(&bob_now, &staged.rooms[0], &sparse_fp).unwrap_or_default();
-        if grown.fetched_completed > 0 && served.served_completed > 0 {
-            break (grown, served);
-        }
-        assert!(
-            grown.rounds() < 2 && served.rounds() < 2,
-            "PRODUCT: reconnecting unchanged inventory completed two exact lane cycles without \
-             one empty fetched and served completion (ADR-038 FX-29): fetched {grown:?}; served \
-             {served:?}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    assert!(
-        reconnected.fetched_completed == reconnected.fetched_empty
-            && reconnected.history_fetched == 0
-            && reconnected.history_declined == 0
-            && reconnected.partial == 0
-            && reconnected.failed == 0,
-        "PRODUCT: reconnecting bob with unchanged inventory retried work on {SPARSE}'s lane \
-         instead of completing empty (ADR-038 FX-29): {reconnected:?}"
-    );
-    assert!(
-        reconnect_served.served_completed == reconnect_served.served_empty
-            && reconnect_served.history_served == 0
-            && reconnect_served.partial == 0
-            && reconnect_served.failed == 0,
-        "PRODUCT: after bob's reconnect, `vox status --json` says bob served repeated history \
-         to {SPARSE} from unchanged inventory (ADR-038 FX-29): {reconnect_served:?}"
-    );
-
-    // Stop every source before the sparse node returns. Its first round with each unchanged
-    // inventory must be empty and write-free, proving durable reconstruction rather than a
-    // lucky in-process cache.
-    staged.peer_daemon.stop_in_place();
-    staged.host_daemon.stop_in_place();
-    let keychain = attach::keychain(&staged.host)
-        .to_string_lossy()
-        .into_owned();
-    staged.host_daemon = daemon_with(
-        &staged.host,
-        "host-restarted",
-        &["--no-node"],
-        &[("VOX_TEST_KEYCHAIN", keychain.as_str())],
-    );
-    while !attach::Root::at(&staged.host, IDENTITY).daemon_running() {
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    unlock(&staged.host, SPARSE);
-    attached_as(&staged.host, "host-restarted", Some(SPARSE));
-    let restart0 = synced(&staged.host, Some(SPARSE));
-    for name in HOSTED {
-        unlock(&staged.host, name);
-        attached_as(&staged.host, "host-restarted", Some(name));
-    }
-    staged.peer_daemon = daemon(&staged.peer, "peer-after-host-restart");
-    attached_as(&staged.peer, "peer-after-host-restart", None);
-    let expected_late_lanes = staged.rooms.len() * (staged.hosted + 1);
-    let (restarted, restart_served) = loop {
-        let now = synced(&staged.host, Some(SPARSE));
-        let bob_now = synced(&staged.peer, None);
-        let lanes: Vec<LaneRounds> = now
-            .lanes
-            .iter()
-            .map(|(key, rounds)| rounds.since(restart0.lanes.get(key).copied().unwrap_or_default()))
-            .collect();
-        let served: Vec<LaneRounds> = staged
-            .rooms
-            .iter()
-            .map(|room| lane_rounds(&bob_now, room, &sparse_fp).unwrap_or_default())
-            .collect();
-        if lanes.len() == expected_late_lanes
-            && lanes.iter().all(|lane| lane.fetched_completed > 0)
-            && served.iter().all(|lane| lane.served_completed > 0)
-        {
-            break (lanes, served);
-        }
-        let cycled_wrong: Vec<_> = lanes
-            .iter()
-            .chain(&served)
-            .filter(|lane| lane.rounds() >= 2 && lane.completed == 0)
-            .collect();
-        assert!(
-            cycled_wrong.is_empty(),
-            "PRODUCT: after restart, unchanged inventory completed two terminal cycles on a lane \
-             without one completed round (ADR-038 FX-29): {cycled_wrong:?}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    let restarted_nonempty: Vec<_> = restarted
-        .iter()
-        .filter(|lane| {
-            lane.fetched_completed != lane.fetched_empty
-                || lane.history_fetched != 0
-                || lane.history_declined != 0
-                || lane.partial != 0
-                || lane.failed != 0
-        })
-        .collect();
-    assert!(
-        restarted_nonempty.is_empty(),
-        "PRODUCT: after {SPARSE}'s restart, unchanged inventories retried work instead of each \
-         first lane round completing empty (ADR-038 FX-29): {restarted_nonempty:?}"
-    );
-    let restart_served_nonempty: Vec<_> = restart_served
-        .iter()
-        .filter(|lane| {
-            lane.served_completed != lane.served_empty
-                || lane.history_served != 0
-                || lane.partial != 0
-                || lane.failed != 0
-        })
-        .collect();
-    assert!(
-        restart_served_nonempty.is_empty(),
-        "PRODUCT: after process restart, bob served repeated history to {SPARSE} from unchanged \
-         inventory instead of completing empty (ADR-038 FX-29): {restart_served_nonempty:?}"
-    );
-
-    // Every restarted node reaches the same observable empty-round edge before measurement.
-    let settling: Vec<Synced> = staged
-        .everyone
-        .iter()
-        .map(|(dir, node, _, _)| synced(dir, *node))
-        .collect();
-    loop {
-        let settled = staged
-            .everyone
-            .iter()
-            .enumerate()
-            .all(|(i, (dir, node, _, _))| {
-                let now = synced(dir, *node);
-                !settling[i].lanes.is_empty()
-                    && settling[i].lanes.iter().all(|(key, before)| {
-                        let grown = now
-                            .lanes
-                            .get(key)
-                            .copied()
-                            .unwrap_or_default()
-                            .since(*before);
-                        grown.completed > 0 && grown.completed == grown.empty
-                    })
-            });
-        if settled {
-            break;
-        }
-        let cycled_wrong: Vec<String> = staged
-            .everyone
-            .iter()
-            .enumerate()
-            .flat_map(|(i, (dir, node, name, _))| {
-                let now = synced(dir, *node);
-                settling[i].lanes.iter().filter_map(move |(key, before)| {
-                    let grown = now
-                        .lanes
-                        .get(key)
-                        .copied()
-                        .unwrap_or_default()
-                        .since(*before);
-                    (grown.rounds() >= 2
-                        && (grown.completed == 0 || grown.completed != grown.empty))
-                        .then(|| format!("{name} {key:?}: {grown:?}"))
-                })
-            })
-            .collect();
-        assert!(
-            cycled_wrong.is_empty(),
-            "PRODUCT: a lane completed two terminal cycles after restart without completing \
-             empty; quiet staging is structurally wedged: {cycled_wrong:?}"
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-/// **Quiet rooms cost no rounds, no CPU or repeated history, answer at once, and say
-/// when they last synced** (ADR-038 FX-15, FX-16, FX-17, FX-29; #979, #980, #986, #1021): one
-/// daemon hosts [`HOSTED`], four
-/// nodes as the decider's work Mac does, and a second daemon hosts bob; every node is in both
-/// [`QUIET_ROOMS`], trusts every other before anyone posts (a member trusted after a post never
-/// reads it), posts once in each room, and reads every other's post. Then nobody posts, and the
-/// minute begins after every exact lane has completed an empty post-restart cycle. That causal
-/// edge, rather than elapsed silence, establishes quiet. Over [`IDLE`]:
+/// **A quiet room costs nothing, writes nothing and says when it last synced** (ADR-038 FX-15,
+/// FX-16, FX-29; #979, #980, #996, #1021): alice and bob, each on a daemon of their own, read
+/// each other once. Carol joins,
+/// then goes offline; alice's consent must therefore travel as a key-package in her public feed.
+/// While Bob is offline, Alice and Carol each append more than the production history-page bound.
+/// On return he is hostile-sent Carol's private package body once: he must reject it before
+/// persistence, cross the authenticated header, and durably acknowledge both authors' exact
+/// tails across a restart. Over [`IDLE`] seconds nobody posts, no lane becomes partial merely
+/// because Bob correctly holds only that package's public header, and each profile completes no
+/// more sync rounds than the periodic
+/// request allows (one per [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS)
+/// plus the follow-up each may raise), and `vox status --json` names a last completed sync for
+/// the room and for the member. With Alice offline, Carol completes a sync with Bob but cannot
+/// read Alice's tail; once the actual package source returns she reads it and all three members
+/// still exchange visible posts. Measured before #996's role-aware settlement: the package's
+/// header-only position remained a missing body on Bob, whose periodic inventory probe ended
+/// partial forever. Across the quiet window, every exact shipped lane must complete at least one
+/// periodic round, every completed round must be empty, no lane may fetch, serve or re-decline
+/// history, and Alice's, Bob's and offline Carol's complete `store.redb` bytes and mtimes must be
+/// unchanged. The artifact is the user's storage verdict; no private database field substitutes.
 ///
-/// 1. **No rounds beyond the periodic ones** (FX-15): no lane (a room with a peer) of any node
-///    runs more sync rounds than the periodic request allows, one per
-///    [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS) from each side plus
-///    the follow-up each may raise. A round counts however it ended (`completed`, `partial` or
-///    `failed` in `vox status --json`): a round that ends partial, its requested entries
-///    unreceived, is the one that runs again a second later. Measured before the fix: one round
-///    per peer per second, the settlement tick re-offering the own head.
-/// 2. **The last sync is named** (FX-16): `vox status --json` on every node lists both rooms,
-///    every member of each, a lane for each room and peer (32 on the host's nodes, 8 on the
-///    peer's: a missing row must not read as quiet), and names a last completed sync for every
-///    room and every other member. Before: "last sync never".
-/// 3. **No CPU** (FX-15, #986): each daemon's CPU time, as Activity Monitor shows it, grows by at
-///    most [`IDLE_CPU`]; the hosting daemon's is the number the issue bounds.
-/// 4. **Answers at once** (FX-17, #986): every `vox status --json` asked of a hosted node, every
-///    [`ASK_EVERY`], answers within [`ANSWER_WITHIN`], and says every port's last start in the
-///    contract's words ([`start_words`], FX-35).
-/// 5. **No bytes beyond the periodic rounds** (FX-15, #986): the hosting daemon's network bytes,
-///    in and out as Activity Monitor counts them (`nettop`, unprivileged, read per socket and
-///    summed by [`NetMeter`], which keeps a closed socket's bytes), grow by at most the rounds
-///    its lanes are allowed times [`ROUND_BYTES`]: no window of entries is fetched again.
-///    Measured on v0.4.6: 27 GiB in and 20 GiB out over 4.9 hours of quiet rooms; on main
-///    2026-10-20 with the stall fixed, 13.7 MB in and 12.7 MB out a minute at 4 rounds per lane:
-///    every inventory round reads the peer's whole board (`RecordKinds::ALL`), which no clause
-///    yet bounds, so this red stands until one does. Off a Mac the bytes are not read and the
-///    proof says so; the rounds and the CPU stand.
-/// 6. **No store writes** (FX-29): every node's complete `store.redb` bytes and mtime are identical
-///    at the two edges of the quiet minute. This is the user's artifact, not a private database
-///    field or a status counter standing in for it.
-/// 7. **No repeated history work** (FX-29): `vox status --json` says no quiet lane fetched,
-///    served or re-declined history.
-/// 8. **Every completed round is empty** (FX-29): every lane's `empty` increase equals its
-///    `completed` increase in shipped status.
-/// 9. **Every lane ran**: each lane completes at least one periodic round, so quiet cannot pass
-///    merely because the pool stopped all work.
-///
-/// The staging is shared with
-/// [`hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port`], FX-35's own
-/// journey; this one measures the quiet minute after it.
-///
-/// Mutants: the own-head hint offered to every connected peer on every settlement tick again
-/// (the `held_through` filter in `settle_room` removed, #979's fix reverted) turns claims 1, 3
-/// and 5 red on their own numbers; the lane's completion no longer recording the sync
-/// (`note_lane_sync` removed) turns claim 2 red on `last_sync_ms`; offering a declined missing
-/// hint to that peer again turns claims 6 and 7 red. The isolated `held-inventory-write` mutant
-/// commits the already-filtered inventory without marking a status counter, so only claim 6's
-/// direct store artifact verdict turns red.
+/// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
+/// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
+/// the non-recipient package turns the exact held-through assertion red; restoring direct
+/// inventory credit turns the pre-release no-credit assertion red when Bob echoes Alice's merely
+/// committed head; granting body credit persists the hostile
+/// ciphertext and turns the Bob-only privacy assertion red; moving the archive cursor
+/// below the role-only header before its effect makes the interrupted request finish with debt;
+/// skipping the already-settled callback or rejecting its terminal replay strands the resumed
+/// request; dropping bounded continuation stalls the exact older-row assertion; each mutation
+/// has its own script and PRODUCT red. The lane's completion no longer recording the sync
+/// (`note_lane_sync` removed) turns the last-sync claim red. The isolated
+/// `held-inventory-write` mutant commits an unchanged inventory slice without changing the lane
+/// counters and turns only the complete-store artifact assertion red.
 #[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "an idle minute of two real vox daemons, one hosting four nodes; optional, run it in release"]
+#[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
 fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
-    // Two rooms joined by four nodes each; four unlocks on the host and the peer daemon's own.
-    watchdog::arm_for_setup(8, 10);
-    let mut staged = stage_hosted_nodes(&HOSTED, false, false, false, Some(SPARSE));
-    converged(&staged);
-    stage_sparse_member(&mut staged);
-    prove_refusal_survives_reconnect_and_restart(&mut staged);
-    // Keep the complete shipped profiles and daemon output if a verdict below goes red. A green
-    // removes them explicitly at the end.
-    let root = staged
-        ._tmp
-        .take()
-        .expect("APPARATUS: quiet-room staging lost its scratch root")
-        .keep();
-    let Staged {
-        host,
-        peer,
-        everyone,
-        rooms,
-        host_daemon,
-        peer_daemon,
-        waited,
-        ..
-    } = &staged;
+    test_knobs::require(&[
+        "VOX_TEST_HOLD_PACKAGES_FILE",
+        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
+        "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
+        "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
+    ]);
+    watchdog::arm();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+    let carol = root.join("carol");
+    for d in [&alice, &bob, &carol] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob, &carol] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [
+        (&alice, &fps[1], "bob"),
+        (&bob, &fps[0], "alice"),
+        (&carol, &fps[0], "alice"),
+        (&carol, &fps[1], "bob"),
+    ] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
+    let hostile = root.join("serve-private-body-once");
+    let hostile_path = hostile
+        .to_str()
+        .expect("APPARATUS: a UTF-8 hostile-body marker path")
+        .to_owned();
+    let alice_knob = [(
+        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
+        hostile_path.as_str(),
+    )];
+    let settlement_hold = root.join("hold-role-header-settlement");
+    let settlement_hold_path = settlement_hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 role-settlement hold path")
+        .to_owned();
+    let settlement_engaged =
+        std::path::PathBuf::from(format!("{}.engaged", settlement_hold.display()));
+    let body_durable = root.join("history-body-durable");
+    let body_durable_path = body_durable
+        .to_str()
+        .expect("APPARATUS: a UTF-8 durable-body marker path")
+        .to_owned();
+    let alice_daemon = daemon_env(&alice, "alice", &alice_knob);
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "quiet",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let joined = Instant::now();
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, "post 1"], None);
+    assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
+    let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
+    assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
+    let (to_alice, to_bob) = arrivals(
+        joined,
+        (&alice, "bob is here"),
+        (&bob, "post 1"),
+        &room,
+        BOUND,
+    );
+    assert!(
+        to_alice.is_some() && to_bob.is_some(),
+        "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \
+         {to_bob:?} (None = never)\nbob's daemon said: {}\nalice's daemon said: {}",
+        said(&bob, "bob"),
+        said(&alice, "alice")
+    );
+    // Bob is now a real returning member, but is offline while two authors build suffixes.  That
+    // makes his next Page settle newer positions before the older private-package header closes
+    // Alice's gap, and gives the durable continuation scheduler two authors to rotate.
+    bob_daemon.stop();
 
-    // ---- the minute is measured ------------------------------------------------------------
-    // `prove_refusal_survives_reconnect_and_restart` returned only after every exact lane
-    // completed one empty post-restart cycle. Snapshot every complete store now. Until the second
-    // edge below, the proof process performs no filesystem access to a store.
-    let before: Vec<Synced> = everyone
-        .iter()
-        .map(|(dir, node, _, _)| synced(dir, *node))
-        .collect();
-    let stores0 = store_snapshots(everyone);
-    let cpu0 = (cpu_time(host_daemon.0.id()), cpu_time(peer_daemon.0.id()));
-    let mut meter = NetMeter::default();
-    meter.sample(host_daemon.0.id());
+    // ---- a private package Carol is owed is a header-only, role-complete row on Bob --------
+    let hold = root.join("hold-carol-packages");
+    let hold_path = hold
+        .to_str()
+        .expect("APPARATUS: a UTF-8 package-hold path")
+        .to_owned();
+    let knob = [("VOX_TEST_HOLD_PACKAGES_FILE", hold_path.as_str())];
+    let carol_daemon = daemon_env(&carol, "carol", &knob);
+    attached(&carol, "carol");
+    let (ok, _, err) = vox(
+        &carol,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: carol's `vox room join` was refused: {err}");
+
+    // Carol must be an admitted member in Alice's shipped status before going offline; otherwise
+    // Alice cannot address a package to her. Her join completing alone is not that observation on
+    // Alice's node. This is causal staging: the operator-selected watchdog owns any apparatus
+    // timebox rather than a second elapsed guess here.
+    wait_room_open(&carol, &room, "carol-after-join");
+    while member_connected(&alice, &room, &fps[2]).is_none() {
+        std::thread::yield_now();
+    }
+
+    // Alice cannot release her sender key to Carol before Alice trusts her. Therefore Carol
+    // cannot possibly acknowledge an Alice row before this trust decision, even though Carol
+    // already trusts Alice: demanding that state made the old proof wait for an impossible
+    // boundary. Stop Carol first and observe the exact member disconnected in shipped status.
+    // Alice then appends the boundary row locally and trusts Carol. A new failure generation on
+    // Carol's exact full-fingerprint sync lane proves the direct attempt actually failed; the
+    // following exact two-position log/feed advance proves that failure selected the
+    // package-plus-consent path.
+    carol_daemon.stop();
+    while member_connected(&alice, &room, &fps[2]) != Some(false) {
+        std::thread::yield_now();
+    }
+    let before_package_text = "alice row before carol's package";
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, before_package_text], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's row before the private package was refused: {out}{err}"
+    );
+    let before_package_hash = read_hash(&alice, &room, before_package_text).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's shipped JSON read omitted the accepted row before the private package"
+        )
+    });
+    let before_package_log = status_log_entries(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not report her contiguous log before the \
+             private package was staged"
+        )
+    });
+    let before_package_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not name her authenticated feed before the \
+             private package was staged"
+        )
+    });
+    // The actor's monotonic member-reach serial is the causal baseline. Any attempt already in
+    // flight because the boundary post raised a port has a serial at or below this one and cannot
+    // masquerade as the reach synchronously started by the trust command.
+    let reach_before = offline_fallback_observation(&alice, &room, &fps[2]).serial;
+    let (ok, _, err) = vox(&alice, &["trust", "add", &fps[2], "--name", "carol"], None);
+    assert!(
+        ok,
+        "PRODUCT: alice's `vox trust add` of carol failed: {err}"
+    );
+    // Alice had no direct connection at the decision and Carol's process remains stopped. The
+    // shipped snapshot must now show either the exact asked-for attempt or its exact fallback
+    // result. Once the attempt disappears, absence of that result is structurally a PRODUCT red;
+    // only an attempt still owned by the network may run until the external apparatus deadman.
+    let (fallback_attempt, package_seq, consent_seq) = loop {
+        let observation = offline_fallback_observation(&alice, &room, &fps[2]);
+        assert!(
+            observation.serial > reach_before,
+            "PRODUCT: `vox trust add` returned without starting Carol's exact member-delivery \
+             reach: serial remained {reach_before}"
+        );
+        if let Some((attempt, package_seq, consent_seq)) = observation
+            .fallback
+            .filter(|(attempt, _, _)| *attempt > reach_before)
+        {
+            break (attempt, package_seq, consent_seq);
+        }
+        assert!(
+            observation
+                .active
+                .iter()
+                .any(|attempt| *attempt > reach_before),
+            "PRODUCT: Carol's asked-for member reach completed but shipped status records no \
+             package/consent fallback result after serial {reach_before}"
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(
+        package_seq,
+        Some(before_package_through.saturating_add(1)),
+        "PRODUCT: failed member reach {fallback_attempt} did not append Carol's exact key package \
+         at authenticated position {}",
+        before_package_through.saturating_add(1)
+    );
+    assert_eq!(
+        consent_seq,
+        Some(before_package_through.saturating_add(2)),
+        "PRODUCT: failed member reach {fallback_attempt} did not append Carol's exact consent at \
+         authenticated position {}",
+        before_package_through.saturating_add(2)
+    );
+    let after_package_log = status_log_entries(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: after Carol's exact failed-direct event, Alice's shipped status omitted \
+             the room's contiguous log"
+        )
+    });
+    assert_eq!(
+        after_package_log,
+        before_package_log.saturating_add(2),
+        "PRODUCT: after Carol's exact failed-direct event, Alice's contiguous log advanced from \
+         {before_package_log} to {after_package_log}, not by exactly the owed package and consent"
+    );
+    let package_feed_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: after Carol's exact failed-direct event, Alice's shipped status omitted \
+             her authenticated feed"
+        )
+    });
+    assert_eq!(
+        package_feed_through,
+        before_package_through.saturating_add(2),
+        "PRODUCT: after Carol's exact failed-direct event, Alice's authenticated feed advanced \
+         from {before_package_through} to {package_feed_through}, not by exactly the owed package \
+         and consent"
+    );
+    // `members[].key_waits` is deliberately not evidence here. A cached signed-prekey bundle
+    // lets this fallback proceed without ever entering that wait, so observing `null` would not
+    // establish either a prior wait or its clearance.
+
+    // Restart Carol with the installer held only after the package exists. Her exact local
+    // role-complete cursor must reach Alice's package-bearing feed position: that shipped cursor,
+    // not a generic queue bit or an aggregate count, proves she fetched the segment. The pending
+    // bit supplements it only by confirming that generic package maintenance remains held.
+    std::fs::write(&hold, b"")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
+    let carol_daemon = daemon_env(&carol, "carol-package-held", &knob);
+    attached(&carol, "carol-package-held");
+    while member_holds_through(&carol, &room, &fps[0])
+        .is_none_or(|through| through < package_feed_through)
+        || key_packages_pending(&carol, &room) != Some(true)
+    {
+        std::thread::yield_now();
+    }
+
+    let carol_successors = vox_core::log::history::MAX_PAGE_ENTRIES + 1;
+    for n in 0..carol_successors {
+        let text = format!("carol settled successor {n}");
+        let (ok, out, err) = vox(&carol, &["room", "post", &room, &text], None);
+        assert!(ok, "PRODUCT: carol's successor {n} was refused: {out}{err}");
+    }
+    let carol_tail_through = room_own_feed_through(&carol, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: carol's `vox status --json` did not name her authenticated feed after \
+             {carol_successors} accepted successors"
+        )
+    });
+    let carol_replicated_deadline = Instant::now() + READY_WITHIN;
+    while member_held_through(&carol, &room, &fps[0]) != Some(carol_tail_through) {
+        assert!(
+            Instant::now() < carol_replicated_deadline,
+            "APPARATUS: Alice did not acknowledge Carol's exact feed position \
+             {carol_tail_through} within {READY_WITHIN:?}; the offline two-author continuation \
+             was not staged\ncarol said: {}\nalice said: {}",
+            said(&carol, "carol"),
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
+    carol_daemon.stop();
+    let before_private_suffix = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not name her feed before the private \
+             package suffix"
+        )
+    });
+    let alice_successors = vox_core::log::history::MAX_PAGE_ENTRIES + 1;
+    for n in 0..alice_successors {
+        let text = format!("alice settled successor {n}");
+        let (ok, out, err) = vox(&alice, &["room", "post", &room, &text], None);
+        assert!(ok, "PRODUCT: alice's successor {n} was refused: {out}{err}");
+    }
+    let package_marker = format!("alice settled successor {}", alice_successors - 1);
+    let marker_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: alice's `vox status --json` did not name her authenticated room-feed \
+             position after the package marker"
+        )
+    });
+    assert!(
+        marker_through.saturating_sub(before_private_suffix)
+            > vox_core::log::history::MAX_PAGE_ENTRIES as u64,
+        "APPARATUS: Alice's authenticated feed advanced only from {before_private_suffix} to \
+         {marker_through}; the private-package suffix did not exceed the production page bound {}",
+        vox_core::log::history::MAX_PAGE_ENTRIES
+    );
+
+    // Turn Alice into a hostile authenticated server for exactly the first body frame of the
+    // package addressed to Carol. The server renames this marker only after sending that frame.
+    // Bob must reject it before staging/persistence, then retry the header-only role-complete
+    // entry and causally finish both authors' bounded suffixes.
+    std::fs::write(&hostile, b"")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hostile.display()));
+    std::fs::write(&settlement_hold, b"").unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not create {}: {e}",
+            settlement_hold.display()
+        )
+    });
+    let hostile_engaged = std::path::PathBuf::from(format!("{}.engaged", hostile.display()));
+    let bob_settlement_knob = [
+        (
+            "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
+            settlement_hold_path.as_str(),
+        ),
+        (
+            "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
+            body_durable_path.as_str(),
+        ),
+    ];
+    let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_settlement_knob);
+    attached(&bob, "bob-after-gap");
+    wait_room_open(&bob, &room, "bob-after-gap");
+    let marker_deadline = Instant::now() + READY_WITHIN;
+    while !reads(&bob, &room, &package_marker) {
+        assert!(
+            Instant::now() < marker_deadline,
+            "PRODUCT: Bob did not read Alice's newest marker within {READY_WITHIN:?}; the shipped \
+             archive request could not be staged\nbob said: {}",
+            said(&bob, "bob-after-gap")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let oldest_alice_live = format!(
+        "alice settled successor {}",
+        alice_successors - vox_core::log::history::MAX_PAGE_ENTRIES
+    );
+    let oldest = read_hash(&bob, &room, &oldest_alice_live).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: Bob's shipped JSON read omitted Alice's expected oldest live-window row \
+             {oldest_alice_live:?} before archive paging"
+        )
+    });
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "room",
+            "read",
+            &room,
+            "--history",
+            "older",
+            "--before",
+            &oldest,
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Bob's `vox room read --history older --before {oldest}` was refused: {out}{err}"
+    );
+    let hostile_deadline = Instant::now() + READY_WITHIN;
+    while !hostile_engaged.is_file() {
+        assert!(
+            Instant::now() < hostile_deadline,
+            "APPARATUS: Alice did not send the deliberately hostile non-recipient package body \
+             within {READY_WITHIN:?}; the privacy boundary was not exercised\nalice said: {}",
+            said(&alice, "alice")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let hostile_hash = std::fs::read(&hostile_engaged).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not read the exact hostile entry from {}: {e}",
+            hostile_engaged.display()
+        )
+    });
+    assert_eq!(
+        hostile_hash.len(),
+        32,
+        "APPARATUS: {} did not name one exact authenticated entry",
+        hostile_engaged.display()
+    );
+    let settlement_deadline = Instant::now() + READY_WITHIN;
+    while !settlement_engaged.is_file()
+        && std::fs::read(&body_durable).ok().as_deref() != Some(hostile_hash.as_slice())
+    {
+        assert!(
+            Instant::now() < settlement_deadline,
+            "APPARATUS: Bob neither durably parked Carol's role-only header nor durably stored the \
+             exact hostile body within {READY_WITHIN:?}; the interruption was not staged\n\
+             bob said: {}",
+            said(&bob, "bob-after-gap")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let refused_body = settlement_engaged.is_file();
+    if refused_body {
+        let held_status = history_status(&bob, &room);
+        assert!(
+            held_status.0 != "complete" && held_status.1 != 0,
+            "PRODUCT: before Carol's role-only header was semantically settled, Bob reported the \
+             archive request complete with no remaining debt: {held_status:?}"
+        );
+    } else {
+        assert_eq!(
+            std::fs::read(&body_durable).ok().as_deref(),
+            Some(hostile_hash.as_slice()),
+            "APPARATUS: Bob's receiver marker did not match Alice's exact hostile entry"
+        );
+    }
+    let bob_held_before_receipt =
+        member_held_through_state(&alice, &room, &fps[1]).unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: while Bob's role-complete receipt path was held, Alice's shipped \
+                 status did not name Bob with a null or numeric held_through receipt"
+            )
+        });
+    assert_ne!(
+        bob_held_before_receipt,
+        Some(marker_through),
+        "PRODUCT: while Bob's role-complete receipt path was held before settlement, Alice's \
+         shipped status credited Bob through her exact current feed position {marker_through}; \
+         his echoed inventory scalar was treated as a catch-up receipt (reported \
+         {bob_held_before_receipt:?})"
+    );
+    // Stop at the exact durable boundary, then resume through the shipped command. The healthy
+    // product parked the refused body at its header; the grant-credit mutant parked the exact
+    // forbidden body after append. Either restart must continue this request rather than invent an
+    // older cursor or a false terminal state.
+    bob_after_gap.stop();
+    let interruption = if refused_body {
+        &settlement_engaged
+    } else {
+        &body_durable
+    };
+    std::fs::remove_file(interruption).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not release {} after Bob stopped: {e}",
+            interruption.display()
+        )
+    });
+    let bob_after_interruption = daemon(&bob, "bob-after-interruption");
+    attached(&bob, "bob-after-interruption");
+    let (ok, out, err) = vox(&bob, &["room", "read", &room, "--history", "resume"], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's shipped `vox room read --history resume` was refused after interruption: \
+         {out}{err}"
+    );
+    // Reading a fresh later row is not proof of crossing a sparse gap: it can arrive and render
+    // independently. Alice must instead report Bob's authenticated receipt through the exact
+    // feed position after the package. That role-contiguous cursor cannot jump over Carol's
+    // package header, even though Bob must never receive its private body.
+    let crossed_deadline = Instant::now() + READY_WITHIN;
+    while member_held_through(&alice, &room, &fps[1]) != Some(marker_through) {
+        assert!(
+            Instant::now() < crossed_deadline,
+            "PRODUCT: within {READY_WITHIN:?}, alice did not report Bob holding her authenticated \
+             room feed through {marker_through}; Carol's header-only package did not settle \
+             contiguously for Bob's role\n\
+             bob's daemon said: {}",
+            said(&bob, "bob-after-interruption")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        read_hash(&bob, &room, before_package_text).as_deref()
+            == Some(before_package_hash.as_str()),
+        "PRODUCT: Bob's shipped archive read settled Alice's exact cursor through \
+         {marker_through}, but did not continue past Carol's header to the exact older row \
+         {before_package_hash}\nbob's daemon said: {}",
+        said(&bob, "bob-after-interruption")
+    );
+    let archive_status = history_status(&bob, &room);
+    assert_eq!(
+        archive_status,
+        ("complete".to_owned(), 0),
+        "PRODUCT: after the shipped archive read crossed Carol's role-complete header and \
+         returned the exact older row, its status was not exactly complete with zero remaining"
+    );
+    // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
+    let before = [synced(&alice), synced(&bob)];
+    let before_lanes = [lane_why(&before[0].2), lane_why(&before[1].2)];
+    let before_exact = [quiet_lanes(&before[0].2), quiet_lanes(&before[1].2)];
+    let quiet_profiles = [
+        ("alice", alice.as_path()),
+        ("bob", bob.as_path()),
+        ("carol", carol.as_path()),
+    ];
+    // No store is touched by the proof process between these two reads. Commands before and
+    // after the interval supply user-visible lane verdicts; the quiet storage verdict is the
+    // complete artifact itself at its two edges.
+    let stores_before = store_artifacts(&quiet_profiles);
     let counted = Instant::now();
-    let mut answers: Vec<(&str, Duration)> = Vec::new();
-    // The flow-state pool as every status in the minute shows it: the most in use and its limit,
-    // printed with the numbers (its claims are the FX-35 journey's).
-    let mut pool_most = 0u64;
-    let mut pool_limit: Option<u64> = None;
-    let mut start_breaches: Vec<String> = Vec::new();
-    while counted.elapsed() < IDLE {
-        std::thread::sleep(ASK_EVERY.min(IDLE.saturating_sub(counted.elapsed())));
-        for name in HOSTED.iter().chain([&SPARSE]) {
-            let asked = Instant::now();
-            let (ok, out, err) = vox(host, &["status", "--json", "--node", name], None);
-            assert!(
-                ok,
-                "PRODUCT: `vox status --json --node {name}` refused in the quiet minute: {err}"
-            );
-            answers.push((name, asked.elapsed()));
-            let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
-            let pool = &v["lanes"]["budget"]["flow_state"];
-            if let (Some(in_use), Some(limit)) = (pool["in_use"].as_u64(), pool["limit"].as_u64()) {
-                pool_most = pool_most.max(in_use);
-                pool_limit = Some(limit);
-            }
-            start_breaches.extend(start_words(name, &v));
-        }
-        meter.sample(host_daemon.0.id());
-    }
+    std::thread::sleep(IDLE);
+    let stores_after = store_artifacts(&quiet_profiles);
+    let after = [synced(&alice), synced(&bob)];
+    let after_lanes = [lane_why(&after[0].2), lane_why(&after[1].2)];
+    let after_exact = [quiet_lanes(&after[0].2), quiet_lanes(&after[1].2)];
     let idled = counted.elapsed();
-    let stores1 = store_snapshots(everyone);
-    let after: Vec<Synced> = everyone
-        .iter()
-        .map(|(dir, node, _, _)| synced(dir, *node))
+    let allowed = 2 * (idled.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
+    let grown: Vec<u64> = (0..2)
+        .map(|i| after[i].0.saturating_sub(before[i].0))
         .collect();
-    let cpu1 = (cpu_time(host_daemon.0.id()), cpu_time(peer_daemon.0.id()));
-    meter.sample(host_daemon.0.id());
-
-    // ---- the numbers ---------------------------------------------------------------------------
-    let interval = vox_core::node::syncstream::SYNC_INTERVAL_SECS;
-    let allowed = 2 * (idled.as_secs() / interval + 1);
-    let mut over: Vec<String> = Vec::new();
-    let mut most = LaneRounds::default();
-    let mut not_empty: Vec<String> = Vec::new();
-    let mut repeated_history: Vec<String> = Vec::new();
-    let mut idle_lanes: Vec<String> = Vec::new();
-    for (i, (_, _, name, _)) in everyone.iter().enumerate() {
-        for ((room, peer), n) in &after[i].lanes {
-            let was = before[i]
-                .lanes
-                .get(&(room.clone(), peer.clone()))
-                .copied()
-                .unwrap_or_default();
-            let grown = n.since(was);
-            if grown.rounds() > most.rounds() {
-                most = grown;
-            }
-            if grown.rounds() > allowed {
-                over.push(format!(
-                    "{name}'s lane {}/{}: {} rounds ({} completed, {} partial, {} failed)",
-                    &room[..room.len().min(8)],
-                    &peer[..peer.len().min(8)],
-                    grown.rounds(),
-                    grown.completed,
-                    grown.partial,
-                    grown.failed
-                ));
-            }
-            if grown.completed != grown.empty {
-                not_empty.push(format!(
-                    "{name}'s lane {}/{}: {} completed, {} empty",
-                    &room[..room.len().min(8)],
-                    &peer[..peer.len().min(8)],
-                    grown.completed,
-                    grown.empty
-                ));
-            }
-            if grown.history_fetched != 0
-                || grown.history_served != 0
-                || grown.history_declined != 0
-            {
-                repeated_history.push(format!(
-                    "{name}'s lane {}/{}: {} fetched, {} served, {} declined",
-                    &room[..room.len().min(8)],
-                    &peer[..peer.len().min(8)],
-                    grown.history_fetched,
-                    grown.history_served,
-                    grown.history_declined
-                ));
-            }
-            if grown.completed == 0 {
-                idle_lanes.push(format!(
-                    "{name}'s lane {}/{} ({} rounds)",
-                    &room[..room.len().min(8)],
-                    &peer[..peer.len().min(8)],
-                    grown.rounds()
-                ));
-            }
-        }
-    }
-    let wrote: Vec<String> = stores0
+    println!(
+        "[proof] over {idled:?} of quiet: alice completed {} rounds, bob {} (allowed {allowed}: \
+         one periodic every {} s and its follow-up); last sync recorded: alice {}, bob {}",
+        grown[0],
+        grown[1],
+        vox_core::node::syncstream::SYNC_INTERVAL_SECS,
+        after[0].1,
+        after[1].1
+    );
+    let wrote: Vec<String> = stores_before
         .iter()
         .filter_map(|(name, before)| {
-            let after = stores1
-                .get(name)
-                .unwrap_or_else(|| panic!("APPARATUS: {name}'s second store snapshot disappeared"));
+            let after = stores_after.get(name).unwrap_or_else(|| {
+                panic!("APPARATUS: {name}'s store disappeared from the second snapshot")
+            });
             (before.bytes != after.bytes || before.modified != after.modified).then(|| {
                 format!(
-                    "{name}: bytes changed {} ({} -> {} bytes), mtime changed {} ({:?} -> {:?}), \
-                     store {}",
+                    "{name}: bytes changed {} ({} -> {} bytes), mtime changed {} ({:?} -> {:?}), store {}",
                     before.bytes != after.bytes,
                     before.bytes.len(),
                     after.bytes.len(),
@@ -2950,427 +3375,314 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             })
         })
         .collect();
-    let host_lanes: usize = everyone
-        .iter()
-        .zip(&after)
-        .filter(|((dir, _, _, _), _)| dir == host)
-        .map(|(_, status)| status.lanes.len())
-        .sum();
-    let traffic_bound = host_lanes as u64 * allowed * ROUND_BYTES;
-    // The bytes moved, or why they are not known; judged after every number is printed.
-    let moved: Result<(u64, u64), String> = meter.moved();
-    // Every room, member and lane expected is shown: a missing `sync` row or member must not
-    // read as quiet.
-    let mut absent: Vec<String> = Vec::new();
-    for (i, (_, _, name, _)) in everyone.iter().enumerate() {
-        let shown = &after[i];
-        if shown.rooms.len() != rooms.len() {
-            absent.push(format!(
-                "{name}'s status lists {} rooms, not {}: {:?}",
-                shown.rooms.len(),
-                rooms.len(),
-                shown.rooms.keys().collect::<Vec<_>>()
+    assert!(
+        wrote.is_empty(),
+        "PRODUCT: sync rounds that brought nothing wrote to the nodes' complete store artifacts \
+         (ADR-038 FX-29, #1021): {}",
+        wrote.join("; ")
+    );
+    let mut missing_lanes = Vec::new();
+    let mut lanes_that_did_not_run = Vec::new();
+    let mut nonempty_lanes = Vec::new();
+    let mut repeated_history = Vec::new();
+    for (index, name) in ["alice", "bob"].into_iter().enumerate() {
+        if before_exact[index].is_empty() || after_exact[index].is_empty() {
+            missing_lanes.push(format!(
+                "{name}: before {:?}, after {:?}",
+                before_exact[index].keys().collect::<Vec<_>>(),
+                after_exact[index].keys().collect::<Vec<_>>()
             ));
         }
-        for room in rooms {
-            let Some(full) = shown.rooms.keys().find(|r| r.starts_with(room.as_str())) else {
-                absent.push(format!("{name}'s status does not list room {room}"));
+        for (lane, now) in &after_exact[index] {
+            let Some(was) = before_exact[index].get(lane) else {
+                missing_lanes.push(format!("{name}: lane {lane:?} appeared only after quiet"));
                 continue;
             };
-            let members = &shown.rooms[full];
-            for (_, _, other, fp) in everyone {
-                if !members.contains(fp) {
-                    absent.push(format!(
-                        "{name}'s status lists no member {other} in room {room}"
-                    ));
-                }
-                if other != name && !shown.lanes.contains_key(&(full.clone(), fp.clone())) {
-                    absent.push(format!(
-                        "{name}'s status shows no lane for {other} in room {room}"
-                    ));
-                }
+            let grown = now.since(*was);
+            if grown.completed == 0 {
+                lanes_that_did_not_run.push(format!("{name} {lane:?}: {grown:?}"));
+            }
+            if grown.completed != grown.empty {
+                nonempty_lanes.push(format!("{name} {lane:?}: {grown:?}"));
+            }
+            if grown.history_fetched != 0
+                || grown.history_served != 0
+                || grown.history_declined != 0
+            {
+                repeated_history.push(format!("{name} {lane:?}: {grown:?}"));
             }
         }
     }
-    let peer_lanes = everyone
-        .iter()
-        .zip(&after)
-        .filter(|((dir, _, _, _), _)| dir == peer)
-        .map(|(_, status)| status.lanes.len())
-        .sum::<usize>();
-    let spent = (cpu1.0.saturating_sub(cpu0.0), cpu1.1.saturating_sub(cpu0.1));
-    let slowest = answers.iter().map(|(_, d)| *d).max().unwrap_or_default();
-    let not_recorded: Vec<&str> = everyone
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !after[*i].recorded)
-        .map(|(_, (_, _, name, _))| *name)
-        .collect();
-    println!(
-        "[proof] over {idled:?} of quiet with {} nodes on the host's daemon and one on the peer's, \
-         in {} rooms (a post waited at most {waited:?} for a room applying its last change; the \
-         minute began after every lane completed an empty post-restart cycle): a lane \
-         ran at most {} rounds ({} completed, {} partial, {} failed; \
-         allowed {allowed}: one periodic every {interval} s from each side and its follow-up; \
-         lanes shown: {host_lanes} on the host's nodes, {peer_lanes} on the peer's; rooms, \
-         members or lanes missing: {}); last sync \
-         recorded on every node: {}; CPU time: the host's daemon +{:?}, the peer's +{:?} (bound \
-         {IDLE_CPU:?}); {} status answers, slowest {slowest:?} (bound {ANSWER_WITHIN:?}); the \
-         host's daemon moved {} over {} nettop samples (bound {traffic_bound} bytes = \
-         {host_lanes} lanes x {allowed} rounds x {ROUND_BYTES} bytes); flow-state pool at most \
-         {pool_most} of {} in use; stores changed: {}; repeated history outcomes: {}; non-empty \
-         completed lanes: {}; lanes with no completed round: {}",
-        HOSTED.len() + 1,
-        rooms.len(),
-        most.rounds(),
-        most.completed,
-        most.partial,
-        most.failed,
-        absent.len(),
-        not_recorded.is_empty(),
-        spent.0,
-        spent.1,
-        answers.len(),
-        match &moved {
-            Ok((i, o)) => format!("{i} bytes in and {o} bytes out"),
-            Err(why) => format!("bytes not measured: {why}"),
-        },
-        meter.samples,
-        pool_limit.map_or_else(|| "?".to_owned(), |l| l.to_string()),
-        if wrote.is_empty() {
-            "none".to_owned()
-        } else {
-            wrote.join("; ")
-        },
-        if repeated_history.is_empty() {
-            "none".to_owned()
-        } else {
-            repeated_history.join("; ")
-        },
-        if not_empty.is_empty() {
-            "none".to_owned()
-        } else {
-            not_empty.join("; ")
-        },
-        if idle_lanes.is_empty() {
-            "none".to_owned()
-        } else {
-            idle_lanes.join("; ")
-        }
+    assert!(
+        missing_lanes.is_empty(),
+        "PRODUCT: `vox status --json` did not expose the same exact quiet room/peer lanes at \
+         both artifact edges (ADR-038 FX-29, #1021): {missing_lanes:?}"
     );
-    // Each node's lanes over the minute: what `vox status --json` counted per room and peer.
-    for (i, (_, _, name, _)) in everyone.iter().enumerate() {
-        let lanes: Vec<String> = after[i]
-            .lanes
-            .iter()
-            .map(|((room, peer), n)| {
-                let g = n.since(
-                    before[i]
-                        .lanes
-                        .get(&(room.clone(), peer.clone()))
-                        .copied()
-                        .unwrap_or_default(),
-                );
-                format!(
-                    "{}/{}: +{} rounds ({} completed, {} empty, {} partial, {} failed; {} completed in all)",
-                    &room[..room.len().min(8)],
-                    &peer[..peer.len().min(8)],
-                    g.rounds(),
-                    g.completed,
-                    g.empty,
-                    g.partial,
-                    g.failed,
-                    n.completed
-                )
-            })
-            .collect();
-        println!(
-            "[proof] {name}'s lanes over the minute: {}",
-            lanes.join("; ")
+    assert!(
+        lanes_that_did_not_run.is_empty(),
+        "PRODUCT: a quiet lane completed no periodic round, so no-write could be a stopped \
+         scheduler rather than correct empty sync (ADR-038 FX-29, #1021): \
+         {lanes_that_did_not_run:?}"
+    );
+    assert!(
+        nonempty_lanes.is_empty(),
+        "PRODUCT: shipped status says completed quiet rounds brought something new instead of \
+         ending empty (ADR-038 FX-29, #1021): {nonempty_lanes:?}"
+    );
+    assert!(
+        repeated_history.is_empty(),
+        "PRODUCT: `vox status --json` says quiet lanes fetched, served or re-declined repeated \
+         history (ADR-038 FX-29, #1021): {repeated_history:?}"
+    );
+    assert!(
+        grown.iter().all(|g| *g <= allowed),
+        "PRODUCT: a quiet room ran sync rounds with nothing to sync (ADR-038 FX-15): over \
+         {idled:?}, alice completed {} and bob {} (allowed {allowed}, one per periodic request \
+         of {} s plus its follow-up)\nalice's status: {}\nbob's status: {}",
+        grown[0],
+        grown[1],
+        vox_core::node::syncstream::SYNC_INTERVAL_SECS,
+        after[0].2,
+        after[1].2
+    );
+    assert!(
+        after[0].1 && after[1].1,
+        "PRODUCT: `vox status` does not say when the room and the member last completed a sync \
+         (ADR-038 FX-16): alice {}, bob {}\nalice's status: {}\nbob's status: {}",
+        after[0].1,
+        after[1].1,
+        after[0].2,
+        after[1].2
+    );
+    let partial = [0usize, 1].map(|i| {
+        after_lanes[i]
+            .partial
+            .saturating_sub(before_lanes[i].partial)
+    });
+    assert_eq!(
+        partial,
+        [0, 0],
+        "PRODUCT: a quiet peer treated carol's private key-package body as owed after holding its \
+         authenticated header: partial syncs over {idled:?} were alice {}, bob {}\n\
+         alice's lane before: {}; after: {}\n\
+         bob's lane before: {}; after: {}",
+        partial[0],
+        partial[1],
+        before_lanes[0],
+        after_lanes[0],
+        before_lanes[1],
+        after_lanes[1]
+    );
+
+    // Restart Bob before the next receipt probe. Alice observing a newer completed sync and the
+    // same exact held-through position proves Bob reconstructed the durable cursor; it is not an
+    // in-memory acknowledgement left over from the first daemon.
+    bob_after_interruption.stop();
+    let _bob_after_restart = daemon(&bob, "bob-after-restart");
+    attached(&bob, "bob-after-restart");
+    wait_room_open(&bob, &room, "bob-after-restart");
+    let restart_deadline = Instant::now() + READY_WITHIN;
+    while member_holds_through(&bob, &room, &fps[0]) != Some(marker_through)
+        || member_holds_through(&bob, &room, &fps[2]) != Some(carol_tail_through)
+    {
+        assert!(
+            Instant::now() < restart_deadline,
+            "PRODUCT: restarted Bob's `vox status --json` did not restore the exact authenticated \
+             contiguous feed heads for Alice through {marker_through} and Carol through \
+             {carol_tail_through} within {READY_WITHIN:?}\nbob said: {}",
+            said(&bob, "bob-after-restart")
         );
-    }
-    // Every claim is judged, so a run that breaks several names each on its own number.
-    let mut reds: Vec<String> = Vec::new();
-    if !absent.is_empty() {
-        reds.push(format!(
-            "PRODUCT: `vox status --json` does not show every room, member and lane (ADR-038 \
-             FX-16): {absent:?}"
-        ));
-    }
-    if !wrote.is_empty() {
-        reds.push(format!(
-            "PRODUCT: sync rounds that brought nothing wrote to the nodes' store artifacts \
-             (ADR-038 FX-29, #1021): {}",
-            wrote.join("; ")
-        ));
-    }
-    if !over.is_empty() {
-        reds.push(format!(
-            "PRODUCT: a quiet room ran sync rounds with nothing to sync (ADR-038 FX-15): over \
-             {idled:?} these lanes ran more rounds than the {allowed} allowed (one periodic \
-             request of {interval} s from each side plus the follow-up each may raise; a partial \
-             or failed round is a round): {over:?}"
-        ));
-    }
-    if !not_recorded.is_empty() {
-        let statuses: Vec<String> = everyone
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !after[*i].recorded)
-            .map(|(i, (_, _, name, _))| format!("{name}'s status: {}", after[i].status))
-            .collect();
-        reds.push(format!(
-            "PRODUCT: `vox status` does not say when the room and the member last completed a \
-             sync (ADR-038 FX-16) on {not_recorded:?}\n{}",
-            statuses.join("\n")
-        ));
-    }
-    if spent.0 > IDLE_CPU || spent.1 > IDLE_CPU {
-        reds.push(format!(
-            "PRODUCT: a daemon in quiet rooms spent CPU with nothing to sync (ADR-038 FX-15, \
-             #986): the host's daemon ({} nodes) +{:?}, the peer's +{:?} over {idled:?} (bound \
-             {IDLE_CPU:?})",
-            HOSTED.len(),
-            spent.0,
-            spent.1
-        ));
-    }
-    if slowest > ANSWER_WITHIN {
-        reds.push(format!(
-            "PRODUCT: `vox status --json` answered in {slowest:?} in quiet rooms, over \
-             {ANSWER_WITHIN:?} (ADR-038 FX-17, #986); every answer: {answers:?}"
-        ));
-    }
-    if !start_breaches.is_empty() {
-        reds.push(format!(
-            "PRODUCT: `vox status --json` said a port's last start in other than the contract's \
-             words (ADR-038 FX-35) in the quiet minute: {start_breaches:?}"
-        ));
-    }
-    if !repeated_history.is_empty() {
-        reds.push(format!(
-            "PRODUCT: `vox status --json` says quiet lanes fetched, served or re-declined \
-             repeated history (ADR-038 FX-29, #1021): {}",
-            repeated_history.join("; ")
-        ));
-    }
-    if !not_empty.is_empty() {
-        reds.push(format!(
-            "PRODUCT: shipped status says completed quiet rounds fetched something new \
-             (ADR-038 FX-29, #1021): {}",
-            not_empty.join("; ")
-        ));
-    }
-    if !idle_lanes.is_empty() {
-        reds.push(format!(
-            "PRODUCT: these lanes completed no periodic round in the quiet minute: {}",
-            idle_lanes.join("; ")
-        ));
-    }
-    match moved {
-        Ok((i, o)) if i + o > traffic_bound => reds.push(format!(
-            "PRODUCT: a daemon in quiet rooms moved bytes beyond its periodic rounds \
-             (ADR-038 FX-15, #986): {i} in and {o} out over {idled:?}, more than its \
-             {host_lanes} lanes' {allowed} allowed rounds at {ROUND_BYTES} bytes each \
-             ({traffic_bound}): a window of entries, or the peer's whole board (every \
-             inventory round reads it with RecordKinds::ALL), was fetched again"
-        )),
-        Ok(_) => {}
-        // On a Mac the bytes are what Activity Monitor shows, and not reading them is a
-        // fault of the apparatus; elsewhere there is no `nettop`, and the claim is not made.
-        Err(why) if cfg!(target_os = "macos") => reds.push(format!(
-            "APPARATUS: the host daemon's network bytes could not be read: {why}"
-        )),
-        Err(why) => eprintln!(
-            "[proof] NOT MEASURED: the host daemon's network bytes ({why}); claim 5 rests on \
-             the lanes' rounds here"
-        ),
+        std::thread::sleep(Duration::from_millis(200));
     }
 
-    // A changed inventory must retire the exact declined record and wake once. Restore Bob's
-    // ordinary retention, append one successor through the shipped command, and require both
-    // sides' status to name a non-empty completion while the sparse member reads it.
-    let bob_fp = everyone
-        .iter()
-        .find(|(_, _, name, _)| *name == "bob")
-        .map(|(_, _, _, fingerprint)| fingerprint.clone())
-        .expect("APPARATUS: quiet staging has no bob identity");
-    let sparse_fp = everyone
-        .iter()
-        .find(|(_, _, name, _)| *name == SPARSE)
-        .map(|(_, _, _, fingerprint)| fingerprint.clone())
-        .expect("APPARATUS: quiet staging has no sparse identity");
-    let bob_config = node_dir_of(peer, None).join("config");
-    std::fs::write(bob_config.join("retention"), "default forever\n")
-        .unwrap_or_else(|e| panic!("APPARATUS: could not restore bob's retention file: {e}"));
+    // Alice now goes offline. Release Carol's package hold only after Carol and Bob are running,
+    // then wait for a completed Carol↔Bob sync (not elapsed silence). If Bob persisted the hostile
+    // ciphertext, he can serve it and Carol will show Alice's tail. The correct product completed
+    // that sync but has only the authenticated package header, so her shipped read remains absent.
+    alice_daemon.stop();
+    let _carol_daemon = daemon_env(&carol, "carol-from-bob", &knob);
+    attached(&carol, "carol-from-bob");
+    wait_room_open(&carol, &room, "carol-from-bob");
+    assert!(
+        !reads(&carol, &room, &package_marker),
+        "PRODUCT: Carol read Alice's marker while the confirmed package-installer hold remained \
+         armed; the product installed or served the held key-package past its causal hold"
+    );
+    std::fs::remove_file(&hold)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
+    let bob_only_deadline = Instant::now() + READY_WITHIN;
+    while member_last_sync(&carol, &room, &fps[1]) <= carol_bob_sync_before {
+        assert!(
+            Instant::now() < bob_only_deadline,
+            "PRODUCT: Carol did not complete a sync with reachable Bob within \
+             {READY_WITHIN:?} while Alice was offline\ncarol said: {}\nbob said: {}",
+            said(&carol, "carol-from-bob"),
+            said(&bob, "bob-after-restart")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        member_held_through(&carol, &room, &fps[1]) == Some(carol_tail_through),
+        "PRODUCT: after both authors exceeded the bounded continuation page and Carol completed \
+         a sync with restarted Bob, his receipt did not preserve her exact feed position \
+         {carol_tail_through}\ncarol said: {}\nbob said: {}",
+        said(&carol, "carol-from-bob"),
+        said(&bob, "bob-after-restart")
+    );
+    // A successful trust update causally releases retained key-package replay and advances its
+    // first bounded turn before the shipped command returns. Keep Alice offline, then wait on the
+    // shipped pending bit until every continuation is done: the privacy verdict is not a race
+    // with the separately scheduled package-maintenance turn.
+    let (ok, out, err) = vox(&carol, &["trust", "add", &fps[0], "--name", "alice"], None);
+    assert!(
+        ok,
+        "PRODUCT: Carol's idempotent shipped trust update could not start retained-package \
+         processing while Alice was offline: {out}{err}"
+    );
+    let packages_deadline = Instant::now() + READY_WITHIN;
+    while key_packages_pending(&carol, &room) != Some(false) {
+        assert!(
+            Instant::now() < packages_deadline,
+            "PRODUCT: Carol's shipped status did not report retained key-package processing \
+             complete within {READY_WITHIN:?} while Alice was offline\ncarol said: {}",
+            said(&carol, "carol-from-bob")
+        );
+        std::thread::yield_now();
+    }
+
+    // A completed inventory round is not evidence that Bob had to answer for Alice's history.
+    // Re-arm Carol's package hold before the shipped reader asks for the exact page below Alice's
+    // oldest live-window row. In the grant-credit mutant, the forbidden body crosses that request
+    // and schedules a separate package-maintenance turn. The hold keeps its shipped pending bit
+    // observable until the proof releases it, so the privacy read cannot win an actor-scheduling
+    // race. The healthy product has only the role-complete header and schedules no such turn.
+    std::fs::write(&hold, b"").unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not re-arm Carol's package hold at {} before the explicit history \
+             request: {e}",
+            hold.display()
+        )
+    });
+
+    // The bounded interval contains the package. Alice is offline and Bob is the only source, so
+    // the retained request bound to that exact authenticated Alice cursor and ending its quantum
+    // has given Bob the exact opportunity to serve every byte he holds in that interval.
     let (ok, out, err) = vox(
-        peer,
-        &["room", "retention", &rooms[0], "--steps", "7d"],
+        &carol,
+        &[
+            "room",
+            "read",
+            &room,
+            "--history",
+            "older",
+            "--before",
+            &oldest,
+        ],
         None,
     );
     assert!(
         ok,
-        "PRODUCT (staging): bob's shipped retention reload was refused: {out}{err}"
+        "PRODUCT: while Alice was offline, Carol's shipped history read through Bob was refused: \
+         {out}{err}"
     );
-    let late0 = synced(host, Some(SPARSE));
-    let bob0 = synced(peer, None);
-    let late_lane0 = lane_rounds(&late0, &rooms[0], &bob_fp);
-    let bob_lane0 = lane_rounds(&bob0, &rooms[0], &sparse_fp);
-    if late_lane0.is_none() {
-        reds.push(format!(
-            "PRODUCT: status showed no {SPARSE} fetched lane for bob in {} before changed \
-             inventory",
-            rooms[0]
-        ));
-    }
-    if bob_lane0.is_none() {
-        reds.push(format!(
-            "PRODUCT: status showed no bob served lane for {SPARSE} in {} before changed \
-             inventory",
-            rooms[0]
-        ));
-    }
-    let fresh = "bob changed his quiet inventory";
-    stage_post(peer, None, "bob", &rooms[0], fresh);
-    let changed = Instant::now();
-    let mut read = false;
-    let (fetched, served) = loop {
-        let (ok, out, err) = vox(host, &["room", "read", &rooms[0], "--node", SPARSE], None);
-        assert!(
-            ok,
-            "PRODUCT: {SPARSE}'s post-quiet read was refused: {out}{err}"
-        );
-        read |= out.contains(fresh);
-        let late_now = synced(host, Some(SPARSE));
-        let bob_now = synced(peer, None);
-        let fetched = late_lane0
-            .and_then(|before| {
-                lane_rounds(&late_now, &rooms[0], &bob_fp).map(|now| now.since(before))
-            })
-            .unwrap_or_default();
-        let served = bob_lane0
-            .and_then(|before| {
-                lane_rounds(&bob_now, &rooms[0], &sparse_fp).map(|now| now.since(before))
-            })
-            .unwrap_or_default();
-        if read {
-            break (fetched, served);
-        }
-        // The first terminal cycle may have already been in flight when Bob appended. If either
-        // exact lane completes a second cycle without exposing the earlier successor, later wall
-        // time cannot repair the lost causal work.
-        if fetched.rounds() >= 2 || served.rounds() >= 2 {
-            reds.push(format!(
-                "PRODUCT: after two exact terminal lane cycles, {SPARSE} did not read bob's \
-                 changed inventory successor; fetched {fetched:?}; served {served:?}"
-            ));
-            break (fetched, served);
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    println!(
-        "[proof] changed inventory reached {SPARSE} in {:?}; fetched {fetched:?}; served \
-         {served:?}",
-        changed.elapsed()
-    );
-    if fetched.fetched_completed <= fetched.fetched_empty || fetched.history_fetched == 0 {
-        reds.push(format!(
-            "PRODUCT: {SPARSE}'s fetched lane did not name the non-empty completion that delivered \
-             bob's changed inventory: {fetched:?}"
-        ));
-    }
-    if served.served_completed <= served.served_empty || served.history_served == 0 {
-        reds.push(format!(
-            "PRODUCT: bob's served lane did not name the non-empty completion that delivered its \
-             changed inventory to {SPARSE}: {served:?}"
-        ));
-    }
-    assert!(
-        fetched.history_rearmed > 0,
-        "PRODUCT: bob's successor head was read, but `vox status --json` did not say the old \
-         refusal was re-armed (ADR-038 FX-29): {fetched:?}"
-    );
-
-    // The first later completion must be empty in both directions. This proves the successor
-    // replaced the refusal rather than bypassing a stale record once. A second terminal cycle on
-    // either exact lane while the other has not completed is a structural wedge.
-    let successor_fetched0 = lane_rounds(&synced(host, Some(SPARSE)), &rooms[0], &bob_fp)
-        .unwrap_or_else(|| panic!("PRODUCT: status lost {SPARSE}'s successor lane for bob"));
-    let successor_served0 = lane_rounds(&synced(peer, None), &rooms[0], &sparse_fp)
-        .unwrap_or_else(|| panic!("PRODUCT: status lost bob's successor lane for {SPARSE}"));
-    let (successor_quiet_fetched, successor_quiet_served) = loop {
-        let fetched = lane_rounds(&synced(host, Some(SPARSE)), &rooms[0], &bob_fp)
-            .map(|now| now.since(successor_fetched0))
-            .unwrap_or_default();
-        let served = lane_rounds(&synced(peer, None), &rooms[0], &sparse_fp)
-            .map(|now| now.since(successor_served0))
-            .unwrap_or_default();
-        if fetched.fetched_completed > 0 && served.served_completed > 0 {
-            break (fetched, served);
+    let history_deadline = Instant::now() + PAGE_WITHIN;
+    let bob_only_history = loop {
+        let observed = history_observation(&carol, &room);
+        if observed.request.is_some() && matches!(observed.phase.as_str(), "more" | "complete") {
+            break observed;
         }
         assert!(
-            fetched.rounds() < 2 && served.rounds() < 2,
-            "PRODUCT: after bob's successor was read, two exact terminal cycles completed without \
-             the next fetched and served completion: fetched {fetched:?}; served {served:?}"
+            Instant::now() < history_deadline,
+            "PRODUCT: Carol's shipped history status did not finish the exact Alice page through \
+             reachable Bob within {PAGE_WITHIN:?} while Alice was offline; phase={}, request={:?}, \
+             remaining={}\ncarol said: {}\nbob said: {}",
+            observed.phase,
+            observed.request,
+            observed.remaining,
+            said(&carol, "carol-from-bob"),
+            said(&bob, "bob-after-restart")
         );
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::yield_now();
     };
+
+    if !refused_body {
+        let staged_deadline = Instant::now() + READY_WITHIN;
+        while key_packages_pending(&carol, &room) != Some(true) {
+            assert!(
+                Instant::now() < staged_deadline,
+                "APPARATUS: Bob's exact durably stored hostile package did not reach Carol's \
+                 shipped key-packages-pending state within {READY_WITHIN:?} after her explicit \
+                 Alice-history request; the grant-credit privacy precondition was not staged\n\
+                 carol said: {}\nbob said: {}",
+                said(&carol, "carol-from-bob"),
+                said(&bob, "bob-after-restart")
+            );
+            std::thread::yield_now();
+        }
+    }
+    std::fs::remove_file(&hold).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not release Carol's post-history package hold at {}: {e}",
+            hold.display()
+        )
+    });
+    let post_history_packages_deadline = Instant::now() + READY_WITHIN;
+    while key_packages_pending(&carol, &room) != Some(false) {
+        assert!(
+            Instant::now() < post_history_packages_deadline,
+            "PRODUCT: Carol's shipped status did not report post-history key-package processing \
+             complete within {READY_WITHIN:?} while Alice was offline\ncarol said: {}",
+            said(&carol, "carol-from-bob")
+        );
+        std::thread::yield_now();
+    }
     assert!(
-        successor_quiet_fetched.fetched_completed == successor_quiet_fetched.fetched_empty
-            && successor_quiet_fetched.history_fetched == 0
-            && successor_quiet_fetched.history_declined == 0
-            && successor_quiet_fetched.history_rearmed == 0
-            && successor_quiet_fetched.partial == 0
-            && successor_quiet_fetched.failed == 0,
-        "PRODUCT: after bob's successor was read, {SPARSE}'s next completed fetch repeated or \
-         re-armed that unchanged history (ADR-038 FX-29): {successor_quiet_fetched:?}"
-    );
-    assert!(
-        successor_quiet_served.served_completed == successor_quiet_served.served_empty
-            && successor_quiet_served.history_served == 0
-            && successor_quiet_served.partial == 0
-            && successor_quiet_served.failed == 0,
-        "PRODUCT: after bob's successor was read, bob's next completed serve transferred that \
-         unchanged history again (ADR-038 FX-29): {successor_quiet_served:?}"
+        !reads(&carol, &room, &package_marker),
+        "PRODUCT: after Bob exhausted Carol's explicit Alice-history quantum (phase={}, \
+         remaining={}) and retained-package replay completed while Alice was offline, Carol read \
+         Alice's private-package tail {package_marker:?}; Bob persisted and re-served ciphertext \
+         addressed only to Carol\ncarol said: {}\nbob said: {}",
+        bob_only_history.phase,
+        bob_only_history.remaining,
+        said(&carol, "carol-from-bob"),
+        said(&bob, "bob-after-restart")
     );
 
-    let pictures = if reds.is_empty() {
-        String::new()
-    } else {
-        let mut lines = Vec::new();
-        for (dir, node, name, _) in everyone {
-            let shown = synced(dir, *node);
-            let value: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
-            let mut starts: BTreeMap<String, usize> = BTreeMap::new();
-            for port in value["lanes"]["ports"].as_array().into_iter().flatten() {
-                let key = format!(
-                    "{}/{}",
-                    port["start_outcome"].as_str().unwrap_or("?"),
-                    port["start_reason"].as_str().unwrap_or("-")
-                );
-                *starts.entry(key).or_insert(0) += 1;
-            }
-            lines.push(format!(
-                "{name}: ports by last start {starts:?}; flow-state pool {}; lanes {}",
-                value["lanes"]["budget"]["flow_state"],
-                lanes_of(&shown.status)
-            ));
-        }
-        lines.push(format!(
-            "staging root kept at {} (node stores under */nodes/*/store.redb; daemon output under \
-             daemon-*.out and daemon-*.err)",
-            root.display()
-        ));
-        lines.join("\n")
-    };
+    // Bringing the actual source back is the one causal change that makes Carol's package
+    // available. Her exact tail appears, then all three shipped daemons still exchange content.
+    let _alice_after_privacy = daemon_env(&alice, "alice-after-privacy", &alice_knob);
+    attached(&alice, "alice-after-privacy");
+    let released_deadline = Instant::now() + READY_WITHIN;
+    while !reads(&carol, &room, &package_marker) {
+        assert!(
+            Instant::now() < released_deadline,
+            "PRODUCT: Carol did not read Alice's exact tail within {READY_WITHIN:?} after the \
+             actual package source returned\ncarol said: {}\nalice said: {}",
+            said(&carol, "carol-from-bob"),
+            said(&alice, "alice-after-privacy")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
     assert!(
-        reds.is_empty(),
-        "{}\n{pictures}\nthe host's daemon said: {}\nthe peer's daemon said: {}",
-        reds.join("\n\n"),
-        said(host, "host"),
-        said(peer, "peer")
+        ok,
+        "PRODUCT: Bob could not trust Carol immediately before their final healthy post: \
+         {out}{err}"
     );
-    let _ = std::fs::remove_dir_all(root);
+    let carol_reply = "carol sees the room";
+    let (ok, out, err) = vox(&carol, &["room", "post", &room, carol_reply], None);
+    assert!(ok, "PRODUCT: carol's post was refused: {out}{err}");
+    let converged_deadline = Instant::now() + READY_WITHIN;
+    while !(reads(&alice, &room, carol_reply) && reads(&bob, &room, carol_reply)) {
+        assert!(
+            Instant::now() < converged_deadline,
+            "PRODUCT: alice and bob did not both read carol's post within {READY_WITHIN:?} after \
+             her package landed\nalice's daemon said: {}\nbob's daemon said: {}",
+            said(&alice, "alice-after-privacy"),
+            said(&bob, "bob-after-restart")
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// How long the two agents work: a post a second from each into each of [`WORK_ROOMS`] rooms in
@@ -3403,7 +3715,7 @@ const ANSWER_WITHIN: Duration = Duration::from_millis(200);
 #[test]
 #[ignore = "a minute of two real vox daemons at work; optional, run it in release"]
 fn a_daemon_with_agents_at_work_stays_cheap_and_answers_at_once() {
-    watchdog::arm_for_setup(1, 8);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let alice = root.join("alice");
@@ -3611,6 +3923,13 @@ const COUNT_STILL_FOR: Duration = Duration::from_secs(1);
 /// Within this of the hook runs' end the count MUST have held still for [`COUNT_STILL_FOR`]; a
 /// count that never holds still is staging not achieved, not a verdict.
 const COUNT_STILL_WITHIN: Duration = Duration::from_secs(10);
+/// Live posts alice makes while bob fetches, each its own `vox room post`.
+const LIVE_POSTS: usize = 40;
+/// Rounds a lane may run in the window beyond the ones its live posts and periodic requests
+/// account for (ADR-038 FX-15, #996): the join's own rounds (the new port's first exchange, the
+/// new connection's, the member record's), the room's generation advancing as bob's rows land,
+/// and bob's few own heads (his join's entries). None of them scales with the minute.
+const ROUNDS_SLACK: u64 = 10;
 
 /// **The daemon answers the harness hook while it syncs** (ADR-038 FX-17; #981): alice holds a
 /// room with a [`BACKLOG`] of posts; bob joins, asks for the pages below his window as a reader
@@ -3630,15 +3949,30 @@ const COUNT_STILL_WITHIN: Duration = Duration::from_secs(10);
 /// on while `vox status` said 2, then 5: the length of his contiguous feed, which a late
 /// joiner's rows lie below.
 ///
-/// Mutants: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
+/// Mutant: the control acceptor made to wait on the actor's turn (a sleep past 500 ms in the
 /// hook's greeting path) turns the first assertion red on the hook's own sentence; the
 /// contiguous feed's length restored as the room's count (`entry_count()` in `summary_of`)
 /// turns the FX-16 claim red on its two numbers.
+///
+/// **And the serving lane runs no round without a need `vox status` names** (ADR-038 FX-15;
+/// #996). As the minute closes, alice's lane toward bob is read from her `vox status --json`:
+/// its `reasons` MUST add up to `completed`, and her own rounds (every reason but `served`,
+/// bob's requests she answered) MUST be at most the periodic requests in the window plus two
+/// per live post (one announcement, one acknowledgement probe) plus [`ROUNDS_SLACK`]. Measured
+/// 2026-10-20 in this staging on two shipped daemons: her lane completed 1,296 rounds in 81 s,
+/// of which 1,257 were requests she answered for bob's catch-up (about six per row he fetched)
+/// and 39 her own; the 953 "rounds" the issue counted were such requests, which the status
+/// now names as `served`.
+///
+/// Mutants: a round counted without its reason turns the reasons claim red; the lane never
+/// recording a peer's acknowledgement (bob's word on alice's feed not noted, so `held_through`
+/// stays unknown and the settlement tick offers her head to him every second: FX-15's measured
+/// cause) turns the own-round bound red on its own number.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "a timing bound a person feels; two real vox daemons; optional, run it in release"]
 fn a_daemon_answers_the_hook_while_syncing() {
-    watchdog::arm_for_setup(1, 8);
+    watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let alice = root.join("alice");
@@ -3692,6 +4026,7 @@ fn a_daemon_answers_the_hook_while_syncing() {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let joined_at = Instant::now();
     let held_at_join = held(&bob, &room, PAGE).order.len();
     // Bob pages back through the backlog while the hook runs: each page below his oldest row is
     // asked for on demand, as the TUI or a reader does, so his daemon's lane is fetching.
@@ -3730,7 +4065,7 @@ fn a_daemon_answers_the_hook_while_syncing() {
     let burst_dir = alice.clone();
     let burst = std::thread::spawn(move || {
         let mut refused = Vec::new();
-        for i in 1..=40 {
+        for i in 1..=LIVE_POSTS {
             let (ok, out, err) = vox(
                 &burst_dir,
                 &["room", "post", &burst_room, &format!("live {i}")],
@@ -3796,6 +4131,16 @@ fn a_daemon_answers_the_hook_while_syncing() {
         .join()
         .unwrap_or_else(|_| panic!("APPARATUS: the burst thread panicked"));
     let held_after = held(&bob, &room, PAGE).order.len();
+    // The lanes' rounds and why each ran, read as the minute closes (ADR-038 FX-15, #996).
+    let worked = joined_at.elapsed();
+    let (_, alice_status, _) = vox(&alice, &["status", "--json"], None);
+    let (_, bob_status, _) = vox(&bob, &["status", "--json"], None);
+    let alice_lane = lane_why(&alice_status);
+    let bob_lane = lane_why(&bob_status);
+    println!(
+        "[proof] over {worked:?} since bob's join, alice's lane toward bob: {alice_lane}; bob's \
+         toward alice: {bob_lane}"
+    );
     let slowest = runs.iter().map(|(d, _, _)| *d).max().unwrap_or_default();
     // The hook must have talked to the daemon: its output names the room or its news, never
     // nothing. Without this the timing claim could pass on a hook that never asked.
@@ -3899,7 +4244,6 @@ fn a_daemon_answers_the_hook_while_syncing() {
         runs.iter().map(|(d, _, _)| *d).collect::<Vec<_>>(),
         said(&bob, "bob")
     );
-
     // ---- `vox status` counts the rows bob reads (ADR-038 FX-16; #995) ------------------------
     // The fetch is let settle first: the room's count is read until every reading over
     // [`COUNT_STILL_FOR`] is the same, within [`COUNT_STILL_WITHIN`] (else staging not
@@ -3954,6 +4298,215 @@ fn a_daemon_answers_the_hook_while_syncing() {
          rooms[].entries said {counted} (still for {COUNT_STILL_FOR:?}) and {counted_after:?} \
          after, while `vox room read --json` paged {paged} rows of the room"
     );
+
+    // ---- the serving lane ran no round without a need the status names (ADR-038 FX-15, #996) --
+    let periodic_rounds = worked.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1;
+    let live_posts = LIVE_POSTS as u64;
+    assert!(
+        alice_lane.reasons_total() == alice_lane.completed,
+        "PRODUCT: alice's `vox status` does not name why every round of her lane ran (ADR-038 \
+         FX-15, #996): the reasons add up to {} of {} completed; her lane: {alice_lane}",
+        alice_lane.reasons_total(),
+        alice_lane.completed
+    );
+    let own = alice_lane
+        .completed
+        .saturating_sub(alice_lane.reason("served"));
+    assert!(
+        own <= periodic_rounds + 2 * live_posts + ROUNDS_SLACK,
+        "PRODUCT: alice's lane toward a member catching up ran {own} rounds of her own over \
+         {worked:?} (ADR-038 FX-15, #996); one announcement and one acknowledgement probe per \
+         live post ({live_posts}), the periodic requests ({periodic_rounds}) and {ROUNDS_SLACK} \
+         more is every need the status names; her lane: {alice_lane}; bob asked for \
+         {pages_asked} pages\nalice's daemon said: {}",
+        said(&alice, "alice")
+    );
+}
+
+/// What a node's lanes did, summed over its peers, from `vox status --json`: the completed
+/// rounds and why each ran (ADR-038 FX-15, #996), the partial and failed ones, and each lane's
+/// last failure in its own words.
+struct LaneWhy {
+    completed: u64,
+    partial: u64,
+    failed: u64,
+    last_failure: Vec<String>,
+    reasons: std::collections::BTreeMap<String, u64>,
+}
+
+/// One exact lane's shipped counters that distinguish a genuinely empty quiet round from
+/// repeated history work. The product publishes these per room and peer; summing them would let
+/// one busy lane hide behind another, so the FX-29 verdict compares each lane independently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(feature = "optional-proofs")]
+struct QuietLane {
+    completed: u64,
+    empty: u64,
+    history_fetched: u64,
+    history_served: u64,
+    history_declined: u64,
+}
+
+#[cfg(feature = "optional-proofs")]
+impl QuietLane {
+    fn since(self, before: Self) -> Self {
+        Self {
+            completed: self.completed.saturating_sub(before.completed),
+            empty: self.empty.saturating_sub(before.empty),
+            history_fetched: self.history_fetched.saturating_sub(before.history_fetched),
+            history_served: self.history_served.saturating_sub(before.history_served),
+            history_declined: self
+                .history_declined
+                .saturating_sub(before.history_declined),
+        }
+    }
+}
+
+/// The exact room/peer lanes in one shipped status document, with every FX-29 field required.
+#[cfg(feature = "optional-proofs")]
+fn quiet_lanes(status: &str) -> BTreeMap<(String, String), QuietLane> {
+    let value: serde_json::Value = serde_json::from_str(status).unwrap_or_else(|error| {
+        panic!("PRODUCT: `vox status --json` was not JSON for the quiet-lane verdict: {error}: {status}")
+    });
+    value["sync"]
+        .as_array()
+        .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` omitted its sync lanes: {status}"))
+        .iter()
+        .map(|lane| {
+            let text = |field: &str| {
+                lane[field]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("PRODUCT: a shipped sync lane omitted {field}: {lane}")
+                    })
+                    .to_owned()
+            };
+            let count = |field: &str| {
+                lane[field].as_u64().unwrap_or_else(|| {
+                    panic!("PRODUCT: a shipped sync lane omitted counter {field}: {lane}")
+                })
+            };
+            (
+                (text("room"), text("peer")),
+                QuietLane {
+                    completed: count("completed"),
+                    empty: count("empty"),
+                    history_fetched: count("history_fetched"),
+                    history_served: count("history_served"),
+                    history_declined: count("history_declined"),
+                },
+            )
+        })
+        .collect()
+}
+
+/// What a person can observe of a node's complete store artifact at one quiet-window edge.
+/// Bytes catch any durable mutation; mtime independently catches a write that happened to
+/// reproduce the same bytes. No private redb field decides this verdict.
+#[cfg(feature = "optional-proofs")]
+struct StoreArtifact {
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    modified: std::time::SystemTime,
+}
+
+#[cfg(feature = "optional-proofs")]
+fn store_artifacts(profiles: &[(&str, &Path)]) -> BTreeMap<String, StoreArtifact> {
+    profiles
+        .iter()
+        .map(|(name, root)| {
+            let nodes = root.join("nodes");
+            let mut stores: Vec<_> = std::fs::read_dir(&nodes)
+                .unwrap_or_else(|error| {
+                    panic!("APPARATUS: could not list {}: {error}", nodes.display())
+                })
+                .flatten()
+                .map(|entry| entry.path().join("store.redb"))
+                .filter(|path| path.is_file())
+                .collect();
+            assert_eq!(
+                stores.len(),
+                1,
+                "APPARATUS: {name}'s scratch profile does not contain exactly one shipped node store: {stores:?}"
+            );
+            let path = stores.remove(0);
+            let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("APPARATUS: could not snapshot {}: {error}", path.display())
+            });
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "APPARATUS: could not read {}'s modification time: {error}",
+                        path.display()
+                    )
+                });
+            (
+                (*name).to_owned(),
+                StoreArtifact {
+                    path,
+                    bytes,
+                    modified,
+                },
+            )
+        })
+        .collect()
+}
+
+impl LaneWhy {
+    fn reason(&self, name: &str) -> u64 {
+        self.reasons.get(name).copied().unwrap_or(0)
+    }
+    fn reasons_total(&self) -> u64 {
+        self.reasons.values().sum()
+    }
+}
+
+impl std::fmt::Display for LaneWhy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "completed {} (why: {}) partial {} failed {} last_failure {:?}",
+            self.completed,
+            self.reasons
+                .iter()
+                .map(|(name, n)| format!("{name} {n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.partial,
+            self.failed,
+            self.last_failure
+        )
+    }
+}
+
+fn lane_why(status: &str) -> LaneWhy {
+    let v: serde_json::Value = serde_json::from_str(status)
+        .unwrap_or_else(|e| panic!("APPARATUS: `vox status --json` is not JSON: {e}: {status}"));
+    let lanes = v["sync"]
+        .as_array()
+        .unwrap_or_else(|| panic!("APPARATUS: `vox status --json` has no `sync` lanes: {status}"));
+    let mut out = LaneWhy {
+        completed: 0,
+        partial: 0,
+        failed: 0,
+        last_failure: Vec::new(),
+        reasons: std::collections::BTreeMap::new(),
+    };
+    for lane in lanes {
+        out.completed += lane["completed"].as_u64().unwrap_or(0);
+        out.partial += lane["partial"].as_u64().unwrap_or(0);
+        out.failed += lane["failed"].as_u64().unwrap_or(0);
+        if let Some(why) = lane["reasons"].as_object() {
+            for (name, n) in why {
+                *out.reasons.entry(name.clone()).or_insert(0) += n.as_u64().unwrap_or(0);
+            }
+        }
+        if let Some(f) = lane["last_failure"].as_str() {
+            out.last_failure.push(f.to_owned());
+        }
+    }
+    out
 }
 
 /// What `vox status --json` counts for the room under `rooms[].entries`: the rows the node shows
@@ -3967,6 +4520,195 @@ fn status_rows(dir: &Path, room: &str) -> Option<u64> {
         .as_array()?
         .iter()
         .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["entries"]
+        .as_u64()
+}
+
+/// What `vox status --json` reports under `rooms[].log_entries`: every contiguous authenticated
+/// log row, including the control rows a person does not see in `vox room read`.
+fn status_log_entries(dir: &Path, room: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["log_entries"]
+        .as_u64()
+}
+
+/// Whether shipped status says the generic package-maintenance queue is pending. Supplemental
+/// only: the initial catalog scan also sets this bit, so it never identifies a package by itself.
+fn key_packages_pending(dir: &Path, room: &str) -> Option<bool> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(room)))?["key_packages_pending"]
+        .as_bool()
+}
+
+struct OfflineFallbackObservation {
+    serial: u64,
+    active: Vec<u64>,
+    fallback: Option<(u64, Option<u64>, Option<u64>)>,
+}
+
+/// One shipped snapshot of the exact member-delivery reach and its store-and-forward result.
+/// The actor publishes both under `lanes`, so a removed failure callback becomes a PRODUCT red
+/// (the attempt vanished without a result) rather than an external-watchdog diagnosis.
+fn offline_fallback_observation(
+    dir: &Path,
+    room: &str,
+    member: &str,
+) -> OfflineFallbackObservation {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: `vox status --json` refused while observing offline delivery: {out}{err}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: offline-delivery status was malformed JSON ({error}): {out}")
+    });
+    let lanes = &value["lanes"];
+    let serial = lanes["member_reach_serial"].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT: shipped status omitted the member-reach serial: {out}")
+    });
+    let active = lanes["member_reaches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("PRODUCT: shipped status omitted exact member reaches: {out}"))
+        .iter()
+        .filter(|row| {
+            row["room"]
+                .as_str()
+                .is_some_and(|candidate| candidate.starts_with(room))
+                && row["peer"].as_str() == Some(member)
+                && row["asked"].as_bool() == Some(true)
+        })
+        .filter_map(|row| row["attempt"].as_u64())
+        .collect();
+    let fallback = lanes["offline_fallbacks"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: shipped status omitted exact offline fallback results: {out}")
+        })
+        .iter()
+        .find(|row| {
+            row["source_room"]
+                .as_str()
+                .is_some_and(|candidate| candidate.starts_with(room))
+                && row["room"]
+                    .as_str()
+                    .is_some_and(|candidate| candidate.starts_with(room))
+                && row["peer"].as_str() == Some(member)
+                && row["asked"].as_bool() == Some(true)
+        })
+        .and_then(|row| {
+            Some((
+                row["attempt"].as_u64()?,
+                row["package_seq"].as_u64(),
+                row["consent_seq"].as_u64(),
+            ))
+        });
+    OfflineFallbackObservation {
+        serial,
+        active,
+        fallback,
+    }
+}
+
+/// Whether shipped status says one exact room member has a live connection. `None` means the
+/// command, room, member, or field was absent rather than silently meaning disconnected.
+fn member_connected(dir: &Path, room: &str, member: &str) -> Option<bool> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["connected"]
+        .as_bool()
+}
+
+fn room_own_feed_through(dir: &Path, room: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&out).ok()?["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["own_feed_through"]
+        .as_u64()
+}
+
+fn member_held_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
+    member_held_through_state(dir, room, member).flatten()
+}
+
+/// The shipped status observation for one member's receipt of this node's feed. Outer `None`
+/// means the command, room, member, or receipt field was absent or malformed; inner `None` is
+/// exclusively the valid JSON-null no-receipt state.
+fn member_held_through_state(dir: &Path, room: &str, member: &str) -> Option<Option<u64>> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let row = value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?;
+    match row.get("held_through")? {
+        serde_json::Value::Null => Some(None),
+        serde_json::Value::Number(value) => value.as_u64().map(Some),
+        _ => None,
+    }
+}
+
+/// The local role-complete cursor for `member` as the shipped status command reports it.
+fn member_holds_through(dir: &Path, room: &str, member: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["holds_through"]
+        .as_u64()
+}
+
+/// The last completed sync this profile reports for one exact room member. `None` is also the
+/// honest result before that pair has completed a session.
+fn member_last_sync(dir: &Path, room: &str, member: &str) -> Option<u64> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    if !ok {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&out).ok()?;
+    value["rooms"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))?["members"]
+        .as_array()?
+        .iter()
+        .find(|row| row["id"].as_str() == Some(member))?["last_sync_ms"]
         .as_u64()
 }
 
@@ -4640,130 +5382,22 @@ fn cpu_time(pid: u32) -> Duration {
     Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
 }
 
-/// One lane's counters as `vox status --json` shows them. A round is a round whichever way it
-/// ended (ADR-038 FX-15): completed, partial (its requested entries unreceived) or failed;
-/// `opened` and `admitted` grow for neither a hinted nor a periodic round and only tell
-/// stillness, as `running` (sessions on the lane now) does.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-struct LaneRounds {
-    opened: u64,
-    admitted: u64,
-    completed: u64,
-    empty: u64,
-    fetched_completed: u64,
-    fetched_empty: u64,
-    served_completed: u64,
-    served_empty: u64,
-    history_fetched: u64,
-    history_served: u64,
-    history_declined: u64,
-    history_offered: u64,
-    history_rearmed: u64,
-    partial: u64,
-    failed: u64,
-    running: u64,
-}
-
-impl LaneRounds {
-    fn rounds(self) -> u64 {
-        self.completed + self.partial + self.failed
-    }
-
-    /// The rounds since `before`, by how they ended.
-    fn since(self, before: Self) -> Self {
-        Self {
-            completed: self.completed.saturating_sub(before.completed),
-            empty: self.empty.saturating_sub(before.empty),
-            fetched_completed: self
-                .fetched_completed
-                .saturating_sub(before.fetched_completed),
-            fetched_empty: self.fetched_empty.saturating_sub(before.fetched_empty),
-            served_completed: self
-                .served_completed
-                .saturating_sub(before.served_completed),
-            served_empty: self.served_empty.saturating_sub(before.served_empty),
-            history_fetched: self.history_fetched.saturating_sub(before.history_fetched),
-            history_served: self.history_served.saturating_sub(before.history_served),
-            history_declined: self
-                .history_declined
-                .saturating_sub(before.history_declined),
-            history_offered: self.history_offered.saturating_sub(before.history_offered),
-            history_rearmed: self.history_rearmed.saturating_sub(before.history_rearmed),
-            partial: self.partial.saturating_sub(before.partial),
-            failed: self.failed.saturating_sub(before.failed),
-            ..Self::default()
-        }
-    }
-}
-
-/// What `vox status --json` shows of one node: its lanes (a room with a peer) and their
-/// counters, its rooms and their members, whether every room and every other member carry a
-/// last completed sync, and the raw status for a red.
-struct Synced {
-    lanes: BTreeMap<(String, String), LaneRounds>,
-    rooms: BTreeMap<String, Vec<String>>,
-    recorded: bool,
-    status: String,
-}
-
-fn synced(dir: &Path, node: Option<&str>) -> Synced {
-    let (ok, out, err) = vox(dir, &as_node(&["status", "--json"], node), None);
+/// `vox status --json` of one profile: completed sync rounds summed over its ports, whether the
+/// room and every other member carry a last completed sync, and the raw status for a red.
+fn synced(dir: &Path) -> (u64, bool, String) {
+    let (ok, out, err) = vox(dir, &["status", "--json"], None);
     assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` is not JSON: {e}: {out}"));
-    let mut lanes: BTreeMap<(String, String), LaneRounds> = BTreeMap::new();
-    for lane in v["sync"].as_array().into_iter().flatten() {
-        let name = |k: &str| {
-            lane[k]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("PRODUCT: a lane of `vox status --json` names no {k}: {lane}")
-                })
-                .to_owned()
-        };
-        let n = |k: &str| {
-            lane[k].as_u64().unwrap_or_else(|| {
-                panic!("PRODUCT: a lane of `vox status --json` counts no {k}: {lane}")
-            })
-        };
-        let room = name("room");
-        let peer = name("peer");
-        let l = lanes.entry((room.clone(), peer.clone())).or_default();
-        l.opened += n("opened");
-        l.admitted += n("admitted");
-        l.completed += n("completed");
-        l.empty += n("empty");
-        l.fetched_completed += n("fetched_completed");
-        l.fetched_empty += n("fetched_empty");
-        l.served_completed += n("served_completed");
-        l.served_empty += n("served_empty");
-        l.history_fetched += n("history_fetched");
-        l.history_served += n("history_served");
-        l.history_declined += n("history_declined");
-        l.history_offered += n("history_offered");
-        l.history_rearmed += n("history_rearmed");
-        l.partial += n("partial");
-        l.failed += n("failed");
-        l.running += lane["running"].as_array().map_or(0, Vec::len) as u64;
-    }
-    let rooms: BTreeMap<String, Vec<String>> = v["rooms"]
+    let completed = v["sync"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .map(|r| {
-            let id = r["id"]
-                .as_str()
-                .unwrap_or_else(|| panic!("PRODUCT: a room of `vox status --json` has no id: {r}"))
-                .to_owned();
-            let members = r["members"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|m| m["id"].as_str().map(str::to_owned))
-                .collect();
-            (id, members)
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|p| p["completed"].as_u64().unwrap_or(0))
+                .sum()
         })
-        .collect();
+        .unwrap_or(0);
     let recorded = v["rooms"].as_array().is_some_and(|rooms| {
         !rooms.is_empty()
             && rooms.iter().all(|r| {
@@ -4776,234 +5410,7 @@ fn synced(dir: &Path, node: Option<&str>) -> Synced {
                     })
             })
     });
-    Synced {
-        lanes,
-        rooms,
-        recorded,
-        status: out,
-    }
-}
-
-fn lane_rounds(synced: &Synced, room: &str, peer: &str) -> Option<LaneRounds> {
-    synced
-        .lanes
-        .iter()
-        .find(|((seen_room, seen_peer), _)| seen_room.starts_with(room) && seen_peer == peer)
-        .map(|(_, rounds)| *rounds)
-}
-
-/// The directory of `node` under a data root. A root with one unnamed node resolves to its only
-/// node directory, matching the shipped CLI's default-node selection.
-fn node_dir_of(dir: &Path, node: Option<&str>) -> std::path::PathBuf {
-    let nodes = dir.join("nodes");
-    match node {
-        Some(name) => nodes.join(name),
-        None => {
-            let mut dirs: Vec<_> = std::fs::read_dir(&nodes)
-                .unwrap_or_else(|e| panic!("APPARATUS: could not list {}: {e}", nodes.display()))
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
-                .collect();
-            assert_eq!(
-                dirs.len(),
-                1,
-                "APPARATUS: {} does not hold exactly one default node: {dirs:?}",
-                nodes.display()
-            );
-            dirs.remove(0)
-        }
-    }
-}
-
-/// What a person can observe of one node's store file at a quiet-window edge. Comparing the
-/// complete bytes proves the artifact did not change without depending on a private redb field;
-/// mtime independently names a write that happened to reproduce the same bytes.
-struct StoreSnapshot {
-    path: std::path::PathBuf,
-    bytes: Vec<u8>,
-    modified: SystemTime,
-}
-
-fn store_snapshots(
-    everyone: &[(std::path::PathBuf, Option<&str>, &str, String)],
-) -> BTreeMap<String, StoreSnapshot> {
-    everyone
-        .iter()
-        .map(|(dir, node, name, _)| {
-            let path = node_dir_of(dir, *node).join("store.redb");
-            let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-                panic!(
-                    "APPARATUS: could not snapshot {name}'s store {}: {error}",
-                    path.display()
-                )
-            });
-            let modified = std::fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "APPARATUS: could not read {name}'s store mtime {}: {error}",
-                        path.display()
-                    )
-                });
-            (
-                (*name).to_owned(),
-                StoreSnapshot {
-                    path,
-                    bytes,
-                    modified,
-                },
-            )
-        })
-        .collect()
-}
-
-/// `args` as `node` runs it: `--node <node>` appended; a root with one node names none.
-fn as_node<'a>(args: &[&'a str], node: Option<&'a str>) -> Vec<&'a str> {
-    let mut v = args.to_vec();
-    if let Some(n) = node {
-        v.extend(["--node", n]);
-    }
-    v
-}
-
-/// `vox node unlock <node>` in the daemon holding `dir`, as a person makes a second node Ready
-/// beside the first. The passphrase comes from a private file the proof writes
-/// (`attach::persistent_args`: stdin's `-` is read on a Mac only).
-fn unlock(dir: &Path, node: &str) {
-    let args = attach::persistent_args(
-        dir,
-        &["node", "unlock", node, "--passphrase-file", "-"],
-        IDENTITY,
-    );
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (ok, out, err) = vox_plain(dir, &args, None);
-    assert!(
-        ok,
-        "APPARATUS: staging `vox node unlock {node}` failed: {out}{err}"
-    );
-}
-
-/// Bytes in and bytes out.
-type Bytes = (u64, u64);
-/// A socket as `nettop` names it, and its place among rows of the same name.
-type SocketKey = (String, usize);
-
-/// A daemon's network bytes over a stretch of time, in and out, as Activity Monitor counts
-/// them: `nettop`'s per-socket cumulative counters (unprivileged on a Mac), sampled through the
-/// stretch. Each socket counts from its first sample (zero for one that appears later) to its
-/// last, so a socket that closes keeps what it carried up to its last sample, and one that
-/// replaces a closed one under the same label counts from zero. Why that is sound: `nettop`
-/// lists open sockets only, and a closed one vanishes with its bytes (its per-process row is
-/// that aggregate, so a snapshot before and after would drop a closed socket wholesale); sampled
-/// every [`ASK_EVERY`], at most the last interval of a closing socket is missed, and the
-/// daemon's sockets (a QUIC endpoint per node, the LAN group, the proxy listener) live as long
-/// as it does. Off a Mac there is no `nettop`, and [`NetMeter::moved`] says so.
-#[derive(Default)]
-struct NetMeter {
-    /// Per socket (its `nettop` label and its place among same-labelled rows): bytes in and out
-    /// at its first sample, and at its last.
-    sockets: BTreeMap<SocketKey, (Bytes, Bytes)>,
-    /// Bytes in and out of sockets that closed and were replaced under their label.
-    retired: Bytes,
-    samples: usize,
-    /// Why a sample could not be read, if one could not.
-    fault: Option<String>,
-}
-
-impl NetMeter {
-    fn sample(&mut self, pid: u32) {
-        let rows = match net_sockets(pid) {
-            Ok(rows) => rows,
-            Err(e) => {
-                self.fault.get_or_insert(e);
-                return;
-            }
-        };
-        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-        for (label, now) in rows {
-            let nth = seen.entry(label.clone()).or_insert(0);
-            let key = (label, *nth);
-            *nth += 1;
-            match self.sockets.get_mut(&key) {
-                Some((first, last)) if now.0 >= last.0 && now.1 >= last.1 => *last = now,
-                Some((first, last)) => {
-                    // A new socket under this label: the old one closed, and what it carried
-                    // up to its last sample is kept.
-                    self.retired.0 += last.0 - first.0;
-                    self.retired.1 += last.1 - first.1;
-                    *first = (0, 0);
-                    *last = now;
-                }
-                None => {
-                    let first = if self.samples == 0 { now } else { (0, 0) };
-                    self.sockets.insert(key, (first, now));
-                }
-            }
-        }
-        self.samples += 1;
-    }
-
-    /// Bytes in and out over the samples so far, or why they are not known.
-    fn moved(&self) -> Result<Bytes, String> {
-        if let Some(why) = &self.fault {
-            return Err(why.clone());
-        }
-        if self.samples < 2 {
-            return Err(format!("{} nettop sample(s), not two", self.samples));
-        }
-        let (i, o) = self
-            .sockets
-            .values()
-            .fold(self.retired, |(i, o), (first, last)| {
-                (i + (last.0 - first.0), o + (last.1 - first.1))
-            });
-        Ok((i, o))
-    }
-}
-
-/// A process's open sockets as `nettop` lists them, each with its bytes in and out so far: the
-/// label (`udp4 127.0.0.1:57671<->*:*`) and the two counters, in `nettop`'s order. `Err` says
-/// why they could not be read (there is no `nettop` off a Mac).
-fn net_sockets(pid: u32) -> Result<Vec<(String, Bytes)>, String> {
-    if !cfg!(target_os = "macos") {
-        return Err("no nettop on this platform".to_owned());
-    }
-    let out = Command::new("nettop")
-        .args(["-x", "-n", "-J", "bytes_in,bytes_out", "-p"])
-        .arg(pid.to_string())
-        .args(["-L", "1"])
-        .output()
-        .map_err(|e| format!("nettop: {e}"))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    // `time,,bytes_in,bytes_out,`, the process row `17:09:08.5,vox.83287,0,0,`, then a row per
-    // socket `17:09:08.5,udp4 127.0.0.1:57671<->*:*,0,0,` (a listener's counters are blank).
-    let process = format!(".{pid}");
-    let mut rows = Vec::new();
-    let mut seen_process = false;
-    for line in text.lines().skip(1) {
-        let cols: Vec<&str> = line.split(',').collect();
-        let Some(label) = cols.get(1).filter(|l| !l.is_empty()) else {
-            continue;
-        };
-        if label.ends_with(&process) {
-            seen_process = true;
-            continue;
-        }
-        let n = |i: usize| -> Result<u64, String> {
-            match cols.get(i).copied().unwrap_or("") {
-                "" => Ok(0),
-                c => c
-                    .parse::<u64>()
-                    .map_err(|e| format!("nettop row {line:?}: column {i} is not a count: {e}")),
-            }
-        };
-        rows.push(((*label).to_owned(), (n(2)?, n(3)?)));
-    }
-    if !seen_process {
-        return Err(format!("nettop printed no row for pid {pid}: {text}"));
-    }
-    Ok(rows)
+    (completed, recorded, out)
 }
 
 /// Alice posts `posts` times under `root`; bob, trusted before any of them and joining cold, is
@@ -5146,7 +5553,7 @@ fn newcomer_reads_the_whole_history(
             );
             last_count = history;
         }
-        if history >= posts || joined.elapsed() > BOUND {
+        if history >= posts {
             break;
         }
         let Some(oldest) = have.oldest.clone() else {
@@ -5178,7 +5585,6 @@ fn newcomer_reads_the_whole_history(
             &oldest[..12],
             err.trim()
         );
-        let asked = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let now = held(&bob, &room, page)
@@ -5189,18 +5595,7 @@ fn newcomer_reads_the_whole_history(
             if now > history {
                 break;
             }
-            if asked.elapsed() > PAGE_WITHIN {
-                let (_, status, status_err) =
-                    vox(&bob, &["room", "read", &room, "--history", "status"], None);
-                panic!(
-                    "PRODUCT: the page below the oldest row bob holds, asked for with `vox room \
-                     read --history older --before {oldest}`, never arrived within {PAGE_WITHIN:?}: \
-                     he still holds {history} of {posts} pre-join posts; `--history status` says: \
-                     {status}{status_err}\nbob's daemon said: {}\nalice's daemon said: {}",
-                    said(&bob, "bob"),
-                    said(&alice, "alice")
-                );
-            }
+            assert_history_owned(&bob, &room, &fps[0], now, posts);
         }
     }
     let took = joined.elapsed();
@@ -5215,8 +5610,8 @@ fn newcomer_reads_the_whole_history(
     );
     assert!(
         distinct.len() == posts,
-        "PRODUCT: a member trusted before every post must read all {posts} of them within \
-         {BOUND:?} of his join (V210-45), but read {}; missing posts {:?}",
+        "PRODUCT: a member trusted before every post must read all {posts} of them on explicit \
+         demand (V210-45), but read {}; missing posts {:?}",
         distinct.len(),
         missing_ranges(&distinct, posts)
     );
