@@ -3537,6 +3537,157 @@ fn a_kept_node_is_reached_again_at_its_address_after_a_restart() {
     );
 }
 
+/// #1020: manual trust is local to the person even while Computer policy is active, and removing
+/// a computer retires its group authority without detaching that computer's nodes from their own
+/// local keyrings. This deliberately has no room or Session premise: the verdict is exactly what
+/// the shipped computer/trust commands show before and after restart.
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn active_and_removed_computers_keep_local_manual_trust() {
+    watchdog::arm();
+    let a = Account::new();
+    let b = Account::new();
+    let outsider = Account::new();
+    let _ = a.make_node("alpha");
+    let _ = b.make_node("beta");
+    let before_removal = outsider.make_node("before-removal");
+    let after_removal = outsider.make_node("after-removal");
+    for (account, node) in [(&a, "alpha"), (&b, "beta")] {
+        let (ok, out, err) = account.run(&["node", "unlock", node, "--passphrase-file", "-"], PASS);
+        assert!(ok, "APPARATUS: ready scratch node {node}: {out}{err}");
+        computer(account, &["personal", node]);
+    }
+
+    let offered = computer(&a, &["invite"]);
+    let link = offered["invite_link"]
+        .as_str()
+        .expect("PRODUCT: Add Computer did not show a pairing link");
+    let preview = computer(&b, &["pair", link, "--preview"]);
+    let operation = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: pairing preview named no operation");
+    computer(&b, &["approve", operation]);
+    computer(&a, &["approve", operation]);
+    assert!(
+        wait_until(PAIR_WITHIN, || {
+            [&a, &b]
+                .into_iter()
+                .all(|account| computer(account, &["status"])["state"] == "confirmed")
+        }),
+        "PRODUCT: approved computers did not become confirmed"
+    );
+
+    let a_frontier = computer(&a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b_frontier = computer(&b, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (account, node) in [(&a, "alpha"), (&b, "beta")] {
+        let (ok, out, err) = account.run(
+            &[
+                "trust",
+                "add",
+                &before_removal,
+                "--name",
+                "chosen-before-removal",
+                "--node",
+                node,
+            ],
+            "",
+        );
+        assert!(
+            ok,
+            "PRODUCT: active computer refused unrelated manual trust on {node}: {out}{err}"
+        );
+        let (ok, shown, err) = account.run(&["trust", "list", "--node", node], "");
+        assert!(
+            ok && shown.contains(&before_removal) && shown.contains("chosen-before-removal"),
+            "PRODUCT: active computer did not show its manual trust on {node}: {shown}{err}"
+        );
+    }
+    assert_eq!(
+        computer(&a, &["status"])["frontier"],
+        a_frontier,
+        "PRODUCT: alpha's local manual trust changed the Computer policy frontier"
+    );
+    assert_eq!(
+        computer(&b, &["status"])["frontier"],
+        b_frontier,
+        "PRODUCT: beta's local manual trust changed the Computer policy frontier"
+    );
+
+    let a_id = computer(&a, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b_id = computer(&b, &["status"])["this_computer"]["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let frontier = computer(&a, &["status"])["frontier"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    computer(&a, &["remove", &b_id, "--confirm", &frontier]);
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            computer(&a, &["status"])["removed"]
+                .as_array()
+                .is_some_and(|removed| removed.iter().any(|entry| entry["fingerprint"] == b_id))
+                && computer(&b, &["status"])["state"] == "removed"
+        }),
+        "PRODUCT: removal did not reach both running computers"
+    );
+
+    for (account, node) in [(&a, "alpha"), (&b, "beta")] {
+        let (ok, out, err) = account.run(
+            &[
+                "trust",
+                "add",
+                &after_removal,
+                "--name",
+                "chosen-after-removal",
+                "--drive",
+                "--node",
+                node,
+            ],
+            "",
+        );
+        assert!(
+            ok,
+            "PRODUCT: active/removed computer refused later manual trust on {node}: {out}{err}"
+        );
+    }
+    offline_for_enrollment(&a, "active computer manual-trust restart");
+    offline_for_enrollment(&b, "removed computer manual-trust restart");
+    for (account, node) in [(&a, "alpha"), (&b, "beta")] {
+        let (ok, out, err) = account.run(&["node", "unlock", node, "--passphrase-file", "-"], PASS);
+        assert!(ok, "PRODUCT: restart detached {node}: {out}{err}");
+        let (ok, shown, err) = account.run(&["trust", "list", "--node", node], "");
+        assert!(
+            ok && shown.lines().any(|line| {
+                line.contains(&after_removal)
+                    && line.contains("chosen-after-removal")
+                    && line.contains("read + drive")
+            }),
+            "PRODUCT: restart lost later manual trust on {node}: {shown}{err}"
+        );
+    }
+    assert_eq!(
+        computer(&a, &["status"])["this_computer"]["fingerprint"],
+        a_id,
+        "PRODUCT: active computer identity changed across restart"
+    );
+    assert_eq!(
+        computer(&b, &["status"])["state"],
+        "removed",
+        "PRODUCT: removed computer's restart restored membership"
+    );
+}
+
 /// #801/#802: use the existing account/CLI journey's staging without replaying #799/#800's
 /// pairing, anchor, expired-invitation or storage-failure assertions. These three computers
 /// exercise only the changed roster, selection, removal and explicit binding outcomes.
@@ -4374,16 +4525,19 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     );
     let stopped_reader_arm = a.data.join("fx28-stopped-reader-arm");
     let stopped_reader_generation = b.data.join("fx28-stopped-reader-generation");
+    let stopped_reader_release = b.data.join("fx28-stopped-reader-release");
     let stopped_reader_answered = b.data.join("fx28-stopped-reader-all-answers");
     let stopped_reader_arm_spec = format!(
-        "{}\t{}\t{}",
+        "{}\t{}\t{}\t{}",
         stopped_reader_arm.display(),
         stopped_reader_generation.display(),
+        stopped_reader_release.display(),
         stopped_reader_answered.display()
     );
     let stopped_reader_answered_spec = format!(
-        "{}\t{}",
+        "{}\t{}\t{}",
         stopped_reader_generation.display(),
+        stopped_reader_release.display(),
         stopped_reader_answered.display()
     );
     let mut da = Daemon::start(
@@ -4528,7 +4682,11 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // ---- a change on either daemon shows on both despite the clock skew (#1020) -----------
     let gamma = a.make_node("gamma");
     let nodes_a = [("alpha", alpha.as_str()), ("gamma", gamma.as_str())];
-    for stale in [&stopped_reader_generation, &stopped_reader_answered] {
+    for stale in [
+        &stopped_reader_generation,
+        &stopped_reader_release,
+        &stopped_reader_answered,
+    ] {
         if stale.exists() {
             std::fs::remove_file(stale)
                 .expect("APPARATUS: clear an earlier stopped-reader generation marker");

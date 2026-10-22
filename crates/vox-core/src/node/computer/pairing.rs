@@ -45,16 +45,18 @@ const TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV: &str =
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_ENV: &str =
     "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE";
-/// **Test-only** (`test-knobs`): `<arm>\t<generation>\t<answered>`. The arm is consumed by an
-/// enrolled real Vox peer, which clears earlier apparatus state and creates a unique generation
-/// before opening one malformed management request per bounded answer slot, then deliberately
-/// leaves every response unread. This is peer apparatus; the verdict still comes from the other
-/// shipped daemon's status/trust projection.
+/// **Test-only** (`test-knobs`): `<arm>\t<generation>\t<release>\t<answered>`. The arm is consumed
+/// by an enrolled real Vox peer, which clears earlier apparatus state and creates a unique
+/// generation. It retains only requests whose authenticated hello was echoed (so admission, not
+/// an attempted stream, is counted), then releases all admitted answers together and stops
+/// reading. This is peer apparatus; the verdict still comes from the other shipped daemon's
+/// status/trust projection.
 #[cfg(feature = "test-knobs")]
 const TEST_STOPPED_READER_ARM_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ARM_FILE";
-/// **Test-only** (`test-knobs`): `<generation>\t<answered>`. The answering shipped daemon counts
-/// only errors in the exact generation created when the peer consumed its arm, and creates the
-/// answered marker after every bounded slot reaches the unread error-response boundary.
+/// **Test-only** (`test-knobs`): `<generation>\t<release>\t<answered>`. The answering shipped
+/// daemon counts only errors in the exact generation created when the peer consumed its arm. Each
+/// admitted request waits at a causal release boundary after echoing its hello, then the daemon
+/// creates the answered marker after every bounded slot reaches the unread error-response boundary.
 #[cfg(feature = "test-knobs")]
 const TEST_STOPPED_READER_ANSWERED_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE";
 
@@ -2178,6 +2180,11 @@ impl Management {
         *response_deadline = deadline;
         let echo = hello(op, &self.computer.description(), &id, remaining_ms);
         write_frame_until(send, &echo, deadline).await?;
+        #[cfg(feature = "test-knobs")]
+        if let Some(generation) = *stopped_reader_generation {
+            return Self::release_stopped_reader_answer_for_proof(generation, response_deadline)
+                .await;
+        }
         if op == REACHABILITY_WAKE_OP {
             return Ok(());
         }
@@ -2955,7 +2962,7 @@ impl Management {
         let conn = self.connect(peer, endpoints, link.as_ref()).await?;
         self.serve(Arc::clone(&conn));
         #[cfg(feature = "test-knobs")]
-        self.stage_stopped_reader_for_proof(&conn).await?;
+        self.stage_stopped_reader_for_proof(&conn, deadline).await?;
         let (payload, sent) = {
             let s = lock(&self.computer.state);
             (exchange(&s, &peer)?, s.revision)
@@ -2985,21 +2992,29 @@ impl Management {
     }
 
     /// Have this real shipped daemon act as the stopped reader. The peer sees ordinary
-    /// authenticated Computer streams. Their one-millisecond advertised request budget expires
-    /// because the sender withholds the next frame, and the receive halves remain alive but unread
-    /// for the production response patience. Correct code uses that request-owned deadline and
-    /// frees each slot; the mutant gives each error write a fresh interval and strands all slots
-    /// behind QUIC flow control. No sender-side sleep tries to guess when the receiver began its
-    /// clock.
+    /// authenticated Computer streams. An echoed hello causally proves that a request, rather than
+    /// unrelated management traffic, owns a bounded answer slot. After exactly all slots are
+    /// admitted, one release makes their request-owned deadlines expired and the receive halves
+    /// remain alive but unread for the production response patience. Correct code frees each slot;
+    /// the mutant gives each error write a fresh interval and strands all slots behind QUIC flow
+    /// control. No sender-side sleep or assumed free-slot count stages the claim.
     #[cfg(feature = "test-knobs")]
-    async fn stage_stopped_reader_for_proof(&self, conn: &Arc<VoxConnection>) -> Result<()> {
+    async fn stage_stopped_reader_for_proof(
+        &self,
+        conn: &Arc<VoxConnection>,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         let Ok(spec) = std::env::var(TEST_STOPPED_READER_ARM_ENV) else {
             return Ok(());
         };
         let mut fields = spec.split('\t');
-        let (Some(arm), Some(generation), Some(answered), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
+        let (Some(arm), Some(generation), Some(release), Some(answered), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
             return Ok(());
         };
         if std::fs::remove_file(arm).is_err() {
@@ -3009,20 +3024,52 @@ impl Management {
         // shared across that boundary. Clear an earlier completed marker first, then publish a
         // generation unique to this armed connection before any attack stream can be answered.
         let _ = std::fs::remove_file(generation);
+        let _ = std::fs::remove_file(release);
         let _ = std::fs::remove_file(answered);
         let generation_id = random_array::<32>()?;
         if std::fs::write(generation, generation_id).is_err() {
             return Ok(());
         }
         let mut held = Vec::with_capacity(MANAGEMENT_SLOTS);
-        for _ in 0..MANAGEMENT_SLOTS {
-            let (mut send, recv) = streams::open_typed(conn, StreamKind::Computer).await?;
-            write_frame(
+        while held.len() < MANAGEMENT_SLOTS {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Profile(
+                    "stopped-reader apparatus could not causally admit every bounded management slot",
+                ));
+            }
+            let Ok((mut send, mut recv)) = streams::open_typed(conn, StreamKind::Computer).await
+            else {
+                continue;
+            };
+            let remaining_ms = wire_budget(deadline);
+            if write_frame_until(
                 &mut send,
-                &hello(2, &self.computer.description(), &generation_id, 1),
+                &hello(
+                    2,
+                    &self.computer.description(),
+                    &generation_id,
+                    remaining_ms,
+                ),
+                deadline,
             )
-            .await?;
-            held.push((send, recv));
+            .await
+            .is_err()
+            {
+                continue;
+            }
+            match read_hello_until(&mut recv, conn, deadline).await {
+                Ok((2, _, echoed, echoed_remaining_ms))
+                    if echoed == generation_id && echoed_remaining_ms == remaining_ms =>
+                {
+                    held.push((send, recv));
+                }
+                _ => continue,
+            }
+        }
+        if std::fs::write(release, b"release every causally admitted answer\n").is_err() {
+            return Err(Error::Profile(
+                "stopped-reader apparatus could not publish its causal release",
+            ));
         }
         tokio::spawn(async move {
             let _unread = held;
@@ -3037,12 +3084,13 @@ impl Management {
         request_id: &Digest32,
         remaining_ms: u64,
     ) -> Option<Digest32> {
-        if op != 2 || remaining_ms != 1 {
+        if op != 2 || remaining_ms == 0 {
             return None;
         }
         let spec = std::env::var(TEST_STOPPED_READER_ANSWERED_ENV).ok()?;
         let mut fields = spec.split('\t');
-        let (Some(generation), Some(_marker), None) = (fields.next(), fields.next(), fields.next())
+        let (Some(generation), Some(_release), Some(_marker), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             return None;
         };
@@ -3058,8 +3106,8 @@ impl Management {
             return false;
         };
         let mut fields = spec.split('\t');
-        let (Some(generation_file), Some(marker), None) =
-            (fields.next(), fields.next(), fields.next())
+        let (Some(generation_file), Some(_release), Some(marker), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             return false;
         };
@@ -3089,6 +3137,44 @@ impl Management {
             );
         }
         true
+    }
+
+    /// Hold an admitted stopped-reader request at a causal boundary. The sender releases only
+    /// after it has read all eight echoed hellos, so reaching this helper proves that all bounded
+    /// slots are occupied by this generation. Expiring the already-owned request clock is the
+    /// apparatus condition under test: production code must not mint another clock for its error
+    /// response.
+    #[cfg(feature = "test-knobs")]
+    async fn release_stopped_reader_answer_for_proof(
+        generation: Digest32,
+        response_deadline: &mut std::time::Instant,
+    ) -> Result<()> {
+        let Ok(spec) = std::env::var(TEST_STOPPED_READER_ANSWERED_ENV) else {
+            return Ok(());
+        };
+        let mut fields = spec.split('\t');
+        let (Some(generation_file), Some(release), Some(_marker), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Ok(());
+        };
+        while !std::path::Path::new(release).is_file() {
+            if std::time::Instant::now() >= *response_deadline {
+                return Err(Error::Profile(
+                    "stopped-reader apparatus was not causally released before its request clock",
+                ));
+            }
+            tokio::task::yield_now().await;
+        }
+        if std::fs::read(generation_file).ok().as_deref() != Some(generation.as_slice()) {
+            return Err(Error::Profile(
+                "stopped-reader apparatus generation changed before its causal release",
+            ));
+        }
+        *response_deadline = std::time::Instant::now();
+        Err(Error::Profile(
+            "the computer exchange reached its causal convergence deadline",
+        ))
     }
 
     /// Park exactly the first selected exchange after its source-owned local-apply interval. The
