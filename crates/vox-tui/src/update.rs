@@ -314,6 +314,16 @@ fn bundle_apps_dir(exe: &Path) -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
     }
+    // Proof-only: let the built `vox` drive an exact signed/notarized scratch Vox.app without
+    // replacing that artifact's helper (which would invalidate its code signature). Packaged
+    // binaries do not contain this branch or read this variable (V210-105).
+    #[cfg(feature = "test-knobs")]
+    if let Some(apps) = std::env::var_os("VOX_TEST_BUNDLE_APPS_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(apps);
+    }
     let helpers = exe.parent()?;
     let contents = helpers.parent()?;
     let bundle = contents.parent()?;

@@ -70,6 +70,29 @@ struct Transition {
 #[cfg(feature = "test-knobs")]
 const TEST_ABORT_AFTER_SWAP_ENV: &str = "VOX_TEST_ABORT_AFTER_SWAP";
 
+/// **Test-only** named failure/crash injection at an app transition's durable boundaries. The
+/// value is `fail:<point>` or `abort:<point>`; packaged binaries contain neither the reader nor
+/// its names. This lets a proof drive the shipped command to a real boundary instead of forging
+/// internal state.
+#[cfg(feature = "test-knobs")]
+const TEST_TRANSITION_STOP_ENV: &str = "VOX_TEST_APP_TRANSITION_STOP";
+
+fn transition_boundary(_point: &str) -> Result<(), AppError> {
+    #[cfg(feature = "test-knobs")]
+    if let Some(stop) = std::env::var_os(TEST_TRANSITION_STOP_ENV) {
+        let stop = stop.to_string_lossy();
+        if stop == format!("abort:{_point}") {
+            std::process::abort();
+        }
+        if stop == format!("fail:{_point}") {
+            return Err(usage(format!(
+                "test apparatus stopped the app transition at {_point}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `vox update [--check]` for the Vox.app in `apps`.
 ///
 /// # Errors
@@ -106,6 +129,15 @@ pub(super) fn update(
     let _lock = InstallLock::acquire(apps)?;
     let repaired = recover(apps)?;
     let active = apps.join(BUNDLE);
+    if repaired.finished_rollback() {
+        return finish_recovered_rollback(apps, &active, exe, repaired);
+    }
+    // Recovery is a completed product action of its own. Say it before any later metadata or
+    // network operation can fail, rather than hiding that disk state changed.
+    repaired.say_before_transition();
+    if let Some(error) = repaired.later_error {
+        return Err(error);
+    }
     require_bundle(&active, BUNDLE)?;
     if !active.join(HELPER).is_file() {
         return Err(usage(format!(
@@ -113,10 +145,6 @@ pub(super) fn update(
             apps.display()
         )));
     }
-    if repaired.finished_rollback() {
-        return finish_recovered_rollback(apps, &active, exe, repaired);
-    }
-
     let (vox, app) = fetch_pair(channel, target)?;
     let installed_text = active_app_version(&active).ok_or_else(|| {
         usage(format!(
@@ -146,8 +174,6 @@ pub(super) fn update(
         "Vox {} is available on {channel} (installed: {installed})",
         vox.version_text
     );
-    repaired.say_before_transition();
-
     let mut downloading = tempfile::Builder::new()
         .prefix("vox-update.")
         .tempfile()
@@ -162,16 +188,25 @@ pub(super) fn update(
 
     let staged = unpack(apps, &zip)?;
     if let Err(refused) = verify(&active, &staged, &vox) {
-        let _ = clear(&staged);
-        return Err(refused);
+        return match clear(&staged) {
+            Ok(()) => Err(refused),
+            Err(cleanup) => Err(usage(format!(
+                "the candidate was refused ({refused}), and its reserved path could not be \
+                 cleared ({cleanup})"
+            ))),
+        };
     }
     let aside = publish(apps, &vox.version_text)?;
 
     println!("updated: {} -> Vox {}", active.display(), vox.version_text);
-    println!(
-        "         the previous Vox.app is kept at {} for `vox update --rollback`",
-        apps.join(PREVIOUS).display()
-    );
+    if aside.is_none() {
+        println!(
+            "         the previous Vox.app is kept at {} for `vox update --rollback`",
+            apps.join(PREVIOUS).display()
+        );
+    } else {
+        println!("         the recorded publication still needs `vox update` to finalize it");
+    }
     ask_to_restart(&installed_text, &vox.version_text);
     let detached = super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
@@ -233,7 +268,9 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     // inode identities let recovery advance any of these durable phases without guessing.
     fs::rename(&previous, &staged).map_err(AppError::Io)?;
     sync_dir(apps)?;
+    transition_boundary("rollback-target-staged")?;
     restore(&staged)?;
+    transition_boundary("rollback-plist-restored")?;
     if let Err(failed) = swap(&staged, &active) {
         // Nothing was swapped. The journal-backed recovery retries the exact rollback; if the
         // exchange failure was transient it completes the user's command, otherwise the journal
@@ -259,16 +296,29 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     // A failure is reported last, after the
     // active bundle is registered and the daemon restarted, so a failed step never leaves the
     // rest of the transition undone or invites a second --rollback that would reverse it.
-    let aside = set_aside(&staged).and_then(|changed| {
-        fs::rename(&staged, &previous).map_err(AppError::Io)?;
-        sync_dir(apps)?;
-        Ok(changed)
-    });
-    let registration = launch_services(true, &active);
-    if aside.is_ok() && registration.is_ok() {
-        finish_transition(apps)?;
-    }
-    let retained = if aside.is_ok() { &previous } else { &staged };
+    let aside = transition_boundary("rollback-exchanged")
+        .and_then(|()| set_aside(&staged))
+        .and_then(|changed| {
+            transition_boundary("rollback-displaced-set-aside")?;
+            fs::rename(&staged, &previous).map_err(AppError::Io)?;
+            sync_dir(apps)?;
+            transition_boundary("rollback-previous-retained")?;
+            Ok(changed)
+        });
+    let registration = launch_services(true, &active)
+        .map_err(usage)
+        .and_then(|()| transition_boundary("rollback-active-registered"));
+    let finalization = if aside.is_ok() && registration.is_ok() {
+        finish_transition(apps).and_then(|()| transition_boundary("rollback-journal-cleared"))
+    } else {
+        Ok(())
+    };
+    let retained_at_previous = path_exists(&previous);
+    let retained = if matches!(&retained_at_previous, Ok(true)) {
+        &previous
+    } else {
+        &staged
+    };
     let now = active_app_version(&active).unwrap_or(now);
     println!("rolled back: {} -> Vox {now}", active.display());
     println!(
@@ -279,24 +329,55 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
-    // Said, not failed: the rollback is committed, and a command that reports failure invites
-    // the same command again, which would roll back once more and reverse it. The repair is
-    // `vox update`, which sets the kept bundle aside under the lock without swapping anything.
-    if let Err(e) = aside {
-        println!(
-            "vox: the rollback is done, but the replaced Vox.app was not durably retained at {}: \
-             {e}; run `vox update` to repair (it makes no further exchange), and until then open \
-             Vox as {}",
-            previous.display(),
-            active.display()
-        );
+    // The rollback is committed, so say that first. A later finalization error must still leave a
+    // non-zero command result, but the directions explicitly say to run `vox update` rather than
+    // repeating --rollback (which would reverse the successful exchange).
+    let mut later_errors = Vec::new();
+    if let Err(e) = &aside {
+        if matches!(&retained_at_previous, Ok(true)) {
+            println!(
+                "vox: the rollback is done and the replaced app is retained at {}, but later \
+                 finalization stopped: {e}; run `vox update` to finish it",
+                previous.display()
+            );
+        } else {
+            println!(
+                "vox: the rollback is done, but the replaced Vox.app was not durably retained at \
+                 {}: {e}; run `vox update` to repair (it makes no further exchange), and until \
+                 then open Vox as {}",
+                previous.display(),
+                active.display()
+            );
+        }
+        later_errors.push(format!("retaining the replaced app: {e}"));
     }
-    if let Err(e) = registration {
+    if let Err(e) = &registration {
         println!(
             "vox: the rollback is done, but {e}; run `vox update` to retry the recorded \
              registration, and until then open Vox as {}",
             active.display()
         );
+        later_errors.push(format!("registering the active app: {e}"));
+    }
+    if let Err(e) = &finalization {
+        println!(
+            "vox: the rollback is done, but its journal was not durably cleared: {e}; run `vox \
+             update` to finish the recorded transition"
+        );
+        later_errors.push(format!("clearing the transition journal: {e}"));
+    }
+    if let Err(e) = &retained_at_previous {
+        println!(
+            "vox: the rollback is done, but its retained path could not be inspected: {e}; run \
+             `vox update` to verify the recorded transition"
+        );
+        later_errors.push(format!("inspecting the retained path: {e}"));
+    }
+    if !later_errors.is_empty() {
+        return Err(usage(format!(
+            "the rollback completed, but later finalization failed: {}",
+            later_errors.join("; ")
+        )));
     }
     Ok(())
 }
@@ -319,7 +400,10 @@ fn finish_recovered_rollback(
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
     repaired.say_finished_rollback();
-    Ok(())
+    match repaired.later_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Exchange two paths in one step (`renameatx_np` with `RENAME_SWAP`): each name holds a whole
@@ -345,6 +429,7 @@ fn begin_transition(apps: &Path, transition: &Transition) -> Result<(), AppError
     }
     fs::create_dir(&journal).map_err(AppError::Io)?;
     sync_dir(apps)?;
+    transition_boundary("journal-directory-synced")?;
     let kind = match transition.kind {
         TransitionKind::Publish => "publish",
         TransitionKind::Rollback => "rollback",
@@ -363,7 +448,8 @@ fn begin_transition(apps: &Path, transition: &Transition) -> Result<(), AppError
     .map_err(AppError::Io)?;
     file.sync_all().map_err(AppError::Io)?;
     sync_dir(&journal)?;
-    sync_dir(apps)
+    sync_dir(apps)?;
+    transition_boundary("journal-state-synced")
 }
 
 fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
@@ -373,9 +459,9 @@ fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(AppError::Io(e)),
     };
-    if meta.file_type().is_symlink() || !meta.is_file() {
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.nlink() != 1 {
         return Err(usage(format!(
-            "{} is not a direct transition-state file; leave it in place and report this",
+            "{} is not a direct, unaliased transition-state file; leave it in place and report this",
             state.display()
         )));
     }
@@ -466,6 +552,7 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
         fs::rename(&previous, journal.join(BUNDLE)).map_err(AppError::Io)?;
         sync_dir(&journal)?;
         sync_dir(apps)?;
+        transition_boundary("publish-older-moved")?;
     }
     if let Err(failed) = swap(&staged, &active) {
         // Nothing was swapped: the previous bundle goes back where it was.
@@ -478,44 +565,47 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
         };
     }
     sync_dir(apps)?;
+    let exchanged = transition_boundary("publish-exchanged");
     #[cfg(feature = "test-knobs")]
     if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
         std::process::abort();
     }
-    // The swap left the replaced bundle under the partial name.
-    fs::rename(&staged, &previous).map_err(AppError::Io)?;
-    sync_dir(apps)?;
-    let aside = set_aside(&previous);
-    let registration = launch_services(true, &active);
-    if let Err(error) = aside {
-        // The active app is committed. Keep the durable journal so the next update can finish
-        // disarming the displaced bundle before it considers another candidate.
-        return Ok(Some(usage(format!(
-            "Vox {version} is in place, but the replaced Vox.app was not set aside: {error}; run \
-             `vox update` again to finish the recorded transition, and until then open Vox as {}",
-            active.display()
-        ))));
-    }
-    if let Err(error) = registration {
-        return Ok(Some(usage(format!(
-            "Vox {version} is in place, but {error}; run `vox update` again to retry the \
-             recorded registration, and until then open Vox as {}",
-            active.display()
-        ))));
-    }
-    // The bundle that was previous before this publish goes, unless something still runs from
-    // it: then it is retired, and a later transition removes it (see [`sweep`]).
-    let older = journal.join(BUNDLE);
-    if path_exists(&older)? {
-        require_bundle(&older, "the journal's retained bundle")?;
-        if in_use(&older) {
-            retire(apps, &older)?;
-        } else {
-            clear(&older)?;
+    // The swap left the replaced bundle under a non-application staging name. Disarm it there,
+    // then give the kept bundle its `.previous` name. No crash boundary exposes two applications.
+    // From this point publication is committed: every later failure is returned as a warning so
+    // `update` first tells the person that the new app is in place.
+    let finish = || -> Result<(), AppError> {
+        exchanged?;
+        set_aside(&staged)?;
+        transition_boundary("publish-displaced-set-aside")?;
+        fs::rename(&staged, &previous).map_err(AppError::Io)?;
+        sync_dir(apps)?;
+        transition_boundary("publish-previous-retained")?;
+        launch_services(true, &active).map_err(usage)?;
+        transition_boundary("publish-active-registered")?;
+        // The bundle that was previous before this publish goes, unless something still runs from
+        // it: then it is retired, and a later transition removes it (see [`sweep`]).
+        let older = journal.join(BUNDLE);
+        if path_exists(&older)? {
+            require_bundle(&older, "the journal's retained bundle")?;
+            if in_use(&older) {
+                retire(apps, &older)?;
+            } else {
+                clear(&older)?;
+            }
+            transition_boundary("publish-older-cleaned")?;
         }
+        finish_transition(apps)?;
+        transition_boundary("publish-journal-cleared")
+    };
+    match finish() {
+        Ok(()) => Ok(None),
+        Err(error) => Ok(Some(usage(format!(
+            "Vox {version} is in place, but its recorded publication was not fully finalized: \
+             {error}; run `vox update` again to finish it, and until then open Vox as {}",
+            active.display()
+        )))),
     }
-    finish_transition(apps)?;
-    Ok(None)
 }
 
 /// Bundles retired by earlier transitions while code from them was running: `.Vox.app.retired.*`.
@@ -719,15 +809,20 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
     sweep(apps, &mut repaired)?;
     let active = apps.join(BUNDLE);
+    let unpacked = apps.join(UNPACK_PARTIAL);
     let staged = apps.join(PARTIAL);
     let rollback_staged = apps.join(ROLLBACK_PARTIAL);
     let previous = apps.join(PREVIOUS);
     let journal = apps.join(PUBLISHING);
     require_bundle(&active, BUNDLE)?;
+    require_optional_dir(&unpacked, UNPACK_PARTIAL)?;
     require_optional_bundle(&staged, PARTIAL)?;
     require_optional_bundle(&rollback_staged, ROLLBACK_PARTIAL)?;
     require_optional_bundle(&previous, PREVIOUS)?;
     require_optional_dir(&journal, PUBLISHING)?;
+    // Extraction never publishes state. Any directory left by an interrupted `ditto` is scratch,
+    // and is cleared before transition recovery can report completion.
+    clear(&unpacked)?;
     if !path_exists(&journal)? {
         if path_exists(&rollback_staged)? {
             return Err(usage(format!(
@@ -767,6 +862,7 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                         "the retained previous app changed",
                     ));
                 }
+                repaired.previous_set_aside |= set_aside(&previous)?;
             } else {
                 if !path_exists(&staged)? || file_id(&staged)? != transition.active_id {
                     return Err(transition_conflict(
@@ -774,10 +870,10 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                         "the replaced app is under neither recorded name",
                     ));
                 }
+                repaired.previous_set_aside |= set_aside(&staged)?;
                 fs::rename(&staged, &previous).map_err(AppError::Io)?;
                 sync_dir(apps)?;
             }
-            repaired.previous_set_aside |= set_aside(&previous)?;
             if path_exists(&kept)? {
                 if in_use(&kept) {
                     retire(apps, &kept)?;
@@ -878,13 +974,19 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
             ))
         }
     }
-    launch_services(true, &active).map_err(|said| {
-        usage(format!(
+    if let Err(said) = launch_services(true, &active) {
+        repaired.later_error = Some(usage(format!(
             "the recorded app transition is repaired, but {said}; its journal is retained so \
              `vox update` can retry registration"
-        ))
-    })?;
-    finish_transition(apps)?;
+        )));
+        return Ok(repaired);
+    }
+    if let Err(error) = finish_transition(apps) {
+        repaired.later_error = Some(usage(format!(
+            "the recorded app transition is repaired and registered, but its journal could not \
+             be durably cleared ({error}); run `vox update` to finish it"
+        )));
+    }
     Ok(repaired)
 }
 
@@ -904,6 +1006,7 @@ struct Recovery {
     previous_set_aside: bool,
     retired_set_aside: usize,
     retired_removed: usize,
+    later_error: Option<AppError>,
 }
 
 enum InterruptedTransition {
@@ -1026,8 +1129,10 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
         .output()
         .map_err(AppError::Io)?;
     if !out.status.success() {
-        let _ = clear(&unpacked);
-        return Err(usage("the downloaded Vox.app did not unpack"));
+        return Err(with_cleanup(
+            &unpacked,
+            usage("the downloaded Vox.app did not unpack"),
+        ));
     }
     let entries: Vec<String> = fs::read_dir(&unpacked)
         .map_err(AppError::Io)?
@@ -1038,19 +1143,44 @@ fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
         })
         .collect::<Result<_, _>>()?;
     let bundle = unpacked.join(BUNDLE);
-    let is_dir = fs::symlink_metadata(&bundle).is_ok_and(|m| m.is_dir());
+    let is_dir = match fs::symlink_metadata(&bundle) {
+        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(with_cleanup(&unpacked, AppError::Io(e))),
+    };
     if entries != [BUNDLE] || !is_dir {
-        let _ = clear(&unpacked);
-        return Err(usage(format!(
-            "the downloaded zip holds {entries:?}, not exactly {BUNDLE}"
-        )));
+        return Err(with_cleanup(
+            &unpacked,
+            usage(format!(
+                "the downloaded zip holds {entries:?}, not exactly {BUNDLE}"
+            )),
+        ));
     }
-    sync_tree(&bundle)?;
-    sync_dir(&unpacked)?;
-    fs::rename(&bundle, &staged).map_err(AppError::Io)?;
-    sync_dir(&unpacked)?;
-    sync_dir(apps)?;
-    clear(&unpacked)?;
+    let prepare = || -> Result<(), AppError> {
+        require_bundle(&bundle, "the unpacked candidate bundle")?;
+        // The archive necessarily names `Vox.app`. Disarm that nested name before flushing the
+        // tree, so no durable copied boundary contains a second application. Its bytes are
+        // untouched and its plist is restored only after the whole bundle has a non-application
+        // staging name.
+        set_aside(&bundle)?;
+        sync_tree(&bundle)?;
+        sync_dir(&unpacked)?;
+        transition_boundary("publish-candidate-tree-synced")
+    };
+    if let Err(error) = prepare() {
+        return Err(with_cleanup(&unpacked, error));
+    }
+    let stage = || -> Result<(), AppError> {
+        fs::rename(&bundle, &staged).map_err(AppError::Io)?;
+        sync_dir(&unpacked)?;
+        sync_dir(apps)?;
+        restore(&staged)?;
+        transition_boundary("publish-candidate-staged")?;
+        clear(&unpacked)
+    };
+    if let Err(error) = stage() {
+        return Err(with_cleanup(&unpacked, with_cleanup(&staged, error)));
+    }
     Ok(staged)
 }
 
@@ -1225,9 +1355,9 @@ fn require_optional_file(path: &Path, name: &str) -> Result<(), AppError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(AppError::Io(e)),
     };
-    if meta.file_type().is_symlink() || !meta.is_file() {
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.nlink() != 1 {
         return Err(usage(format!(
-            "reserved app-transition path {} ({name}) is not a direct regular file; no transition was attempted",
+            "reserved app-transition path {} ({name}) is not a direct, unaliased regular file; no transition was attempted",
             path.display()
         )));
     }
@@ -1289,8 +1419,10 @@ fn sha256_of(path: &Path) -> Result<[u8; 32], AppError> {
 /// about to be replaced. Read-only folders inside are made writable first: a folder's entries
 /// cannot be removed while it is read-only.
 fn clear(path: &Path) -> Result<(), AppError> {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return Ok(());
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::Io(e)),
     };
     let removed = if meta.is_dir() {
         writable(path)?;
@@ -1308,6 +1440,18 @@ fn clear(path: &Path) -> Result<(), AppError> {
         sync_dir(parent)?;
     }
     Ok(())
+}
+
+/// Preserve both the operation failure and a cleanup failure; reserved app state is never
+/// reported absent merely because the original operation had already failed.
+fn with_cleanup(path: &Path, primary: AppError) -> AppError {
+    match clear(path) {
+        Ok(()) => primary,
+        Err(cleanup) => usage(format!(
+            "{primary}; cleanup of {} also failed ({cleanup})",
+            path.display()
+        )),
+    }
 }
 
 fn writable(dir: &Path) -> Result<(), AppError> {
