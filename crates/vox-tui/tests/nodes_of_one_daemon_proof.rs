@@ -1339,12 +1339,16 @@ fn close_expired_pairing() {
 /// remains gone, then only the remote anchor returns. Both revisions still cross within the first
 /// revision's causal return contract. The split-family staging makes direct packets impossible
 /// without firewall/root.
+/// A final outage is held until shipped status names the causal deadline miss; restoration repairs
+/// that revision late, and the miss remains visible through a same-state failed preview and daemon
+/// restart.
 ///
 /// Independent mutants: removing the stale-flight deadline handoff makes the first revision's
 /// deadline move; omitting `retry_ready` from operator takeover lets the shipped preview outlive
 /// that deadline; omitting the post-reservation supersession check lets a stale operator pairing
 /// survive the newer policy revision; requiring a retained peer connection strands the repair;
-/// discarding failed transport work means the remote anchor's return never causes registration.
+/// discarding failed transport work means the remote anchor's return never causes registration;
+/// clearing a late success hides the missed contract before preview/restart.
 /// Each reaches a PRODUCT deadline/roster assertion, while inability to stage an exact race is
 /// APPARATUS.
 #[test]
@@ -1731,9 +1735,19 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    assert!(
+        anchor_currently_has(&relay, &[&a_id, &b_id]),
+        "APPARATUS: after the shipped takeover completed, the restored anchor's latest view no longer named both exact computer identities; no PRODUCT verdict follows:\n{}",
+        relay.said()
+    );
     let takeover_output = takeover
         .wait_with_output()
         .expect("APPARATUS: could not collect the completed operator takeover command");
+    assert!(
+        anchor_currently_has(&relay, &[&a_id, &b_id]),
+        "APPARATUS: the restored anchor's latest view changed while the completed takeover output was collected; no PRODUCT verdict follows:\n{}",
+        relay.said()
+    );
     assert!(
         takeover_output.status.success(),
         "PRODUCT: the retry-ready-only operator takeover exited unsuccessfully: stdout {}; stderr {}",
@@ -1901,6 +1915,99 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&a, &["status"]),
         computer(&b, &["status"])
     );
+
+    // Exercise the late-repair branch itself. The anchor goes away, a real policy revision is
+    // made, and shipped status—not a sleep—causally says that revision missed its retained
+    // convergence deadline. After the exact anchor identities return, the late exchange repairs
+    // the roster but MUST keep the missed contract visible. Mutant: clear the late-success branch
+    // in `record_exchange`; the failure count/problem assertions below turn PRODUCT red.
+    stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
+    relay
+        .child
+        .wait()
+        .expect("APPARATUS: stopped anchor did not exit");
+    let late = a.make_node("anchor-return-late");
+    let revision_before_late = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "anchor-return-late",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(ok, "PRODUCT: attach the late-repair node: {out}{err}");
+    let late_revision = computer(&a, &["status"])["revision"]
+        .as_u64()
+        .filter(|revision| *revision > revision_before_late)
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: attaching the late-repair node moved no policy revision")
+        });
+    loop {
+        let status = computer(&a, &["status"]);
+        let application = application_toward(&a, &b_id);
+        if application["exchange_failures"].as_u64().unwrap_or(0) > 0
+            && status["problem"]
+                .as_str()
+                .is_some_and(|problem| problem.contains("causal convergence deadline"))
+        {
+            break;
+        }
+        assert!(
+            daemon_alive(left.child.id()),
+            "APPARATUS: left daemon exited before shipped status named the deliberately staged missed causal deadline"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    relay = start_anchor(&anchor_listen);
+    wait_for_current_anchor_peers(&mut relay, &[&a_id, &b_id]);
+    loop {
+        let left_status = computer(&a, &["status"]);
+        let right_status = computer(&b, &["status"]);
+        let application = application_toward(&a, &b_id);
+        let repaired = application["last_started_exchange"]["sent_revision"]
+            .as_u64()
+            .is_some_and(|revision| revision >= late_revision)
+            && right_status["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|node| node["fingerprint"] == late.as_str());
+        if repaired {
+            assert!(
+                application["exchange_failures"].as_u64().unwrap_or(0) > 0
+                    && left_status["problem"]
+                        .as_str()
+                        .is_some_and(|problem| problem.contains("repaired state only after")),
+                "PRODUCT: the late exchange repaired revision {late_revision} but cleared its missed causal contract: status {left_status}; application {application}"
+            );
+            break;
+        }
+        assert!(
+            anchor_currently_has(&relay, &[&a_id, &b_id]),
+            "APPARATUS: exact restored anchor registrations were lost before the late-repair verdict"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (preview_ok, preview_out, preview_err) =
+        a.run(&["computer", "pair", &race_link, "--preview", "--json"], "");
+    assert!(
+        !preview_ok,
+        "PRODUCT: the cancelled same-state preview unexpectedly succeeded after a missed contract: {preview_out}{preview_err}"
+    );
+    let after_preview = computer(&a, &["status"]);
+    assert!(
+        after_preview["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains("repaired state only after"))
+            && application_toward(&a, &b_id)["exchange_failures"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+        "PRODUCT: a same-state failed preview cleared or re-enabled the durable missed contract: {after_preview}"
+    );
     let before_restart = (
         full_roster(&computer(&a, &["status"])).unwrap_or_else(|| {
             panic!(
@@ -1951,7 +2058,16 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     loop {
         if full_roster(&computer(&a, &["status"])) == Some(before_restart.0.clone())
             && full_roster(&computer(&b, &["status"])) == Some(before_restart.1.clone())
-            && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
+            && exact_grants(
+                &b,
+                "after-remote-anchor-b",
+                &[
+                    (first.as_str(), "read"),
+                    (second.as_str(), "read"),
+                    (third.as_str(), "read"),
+                    (late.as_str(), "read"),
+                ],
+            )
         {
             break;
         }
@@ -1968,6 +2084,17 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let restarted_late = computer(&a, &["status"]);
+    assert!(
+        restarted_late["problem"]
+            .as_str()
+            .is_some_and(|problem| problem.contains("repaired state only after"))
+            && application_toward(&a, &b_id)["exchange_failures"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0,
+        "PRODUCT: restarting the daemon cleared the durable missed causal contract without a newer policy revision: {restarted_late}"
+    );
     for (account, node) in [(&a, "anchor-return-first"), (&b, "after-remote-anchor-b")] {
         let (ok, out, err) = account.run(&["room", "list", "--node", node], "");
         assert!(
@@ -3661,7 +3788,6 @@ fn change_shows_on_both(
     // it, the one its status names as started with that revision sent. The proof-process
     // monotonic clock begins only after that shipped status has causally exposed the completed
     // exchange; neither daemon's Unix clock participates in the bound.
-    let started = Instant::now();
     let mut exchange_observed: Option<Instant> = None;
     loop {
         if exchange_observed.is_none() {
@@ -3710,7 +3836,7 @@ fn change_shows_on_both(
             );
         }
         assert!(
-            started.elapsed() < RETURN_WITHIN,
+            attached.elapsed() < RETURN_WITHIN,
             "PRODUCT: within {RETURN_WITHIN:?} of {new_node} attaching, {}'s daemon \
              completed no exchange it started toward {}'s computer with revision {revision_here} \
              sent: {}\nits daemon said: {}",

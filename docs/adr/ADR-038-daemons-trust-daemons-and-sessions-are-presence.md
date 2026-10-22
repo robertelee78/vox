@@ -283,13 +283,16 @@ The decider then answered twelve questions, one at a time. His answers are the d
   local reconciliation. Its hello carries only the duration budget remaining when the hello is
   sent. Immediately when the complete authenticated hello is received—before echoing it or reading
   its payload—the answerer caps that duration to the operation's public contract and applies it to
-  its own monotonic clock. There is no second outer timeout: it would truncate the ten-minute
+  its own monotonic clock. Every later frame read uses the remainder of that same deadline, never
+  a fresh fixed patience interval, and the state transaction checks it both before executing and
+  before saving. There is no second outer timeout: it would truncate the ten-minute
   pairing contract or mint a fresh ordinary-exchange clock. This bounds remote transaction and
   reconciliation work without claiming to reconstruct the initiator's instant. Network transit
   continues to consume the initiator's original deadline. If repair completes only after that
   retained deadline, its exchange and repaired state remain visible, periodic retry stops, and the
-  missed cause remains a failure; only a later policy change can create a new cause and clear it by
-  meeting its own deadline. Thus a late answer cannot turn the original miss into an on-time
+  missed cause is saved in the signed local computer state and remains a failure across daemon
+  restart and a same-state failed preview; only a later policy change can create a new cause and
+  clear it by meeting its own deadline. Thus a late answer cannot turn the original miss into an on-time
   result. The shipped journey restarts one daemon with its Unix clock one hour ahead and then
   proves changes in both directions from a causal observation on the proof process's monotonic
   clock, never by comparing either daemon's Unix timestamp. A recovery proof evaluates no PRODUCT
@@ -300,9 +303,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the real restoration event. Absence of idle derivation is compared across the next dated,
   completed fallback exchange named by the same shipped status snapshot as the binding evidence,
   not an arbitrary quiet window: the unchanged revision is a structural cause boundary and every
-  binding's durable derivation record must remain identical across it. CLI JSON and the app FFI
-  both expose that policy revision, per-peer exchange record/counters and per-node binding revision
-  and derivation moment; neither client has to infer currentness from elapsed time.
+  binding's durable derivation record must remain identical across it. CLI JSON, the app FFI and
+  the native Computer Trust screen all expose that policy revision, per-peer exchange
+  record/counters and per-node binding revision and derivation moment; neither client has to infer
+  currentness from elapsed time.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its

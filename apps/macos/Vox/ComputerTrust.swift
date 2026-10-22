@@ -92,6 +92,9 @@ struct ComputerTrustView: View {
                         Text(status.policy)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("computer-trust-policy")
+                        Text("Policy revision \(status.revision)")
+                            .font(Theme.mono).secondaryText()
+                            .accessibilityIdentifier("computer-policy-revision")
                         if !model.reachable {
                             Text("Last known state. Checking with Vox…").secondaryText()
                         }
@@ -120,6 +123,12 @@ struct ComputerTrustView: View {
                                                 .fixedSize(horizontal: false, vertical: true)
                                             Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
                                                 .secondaryText()
+                                            if let revision = node.bindingRevision,
+                                               let derived = node.bindingDerivedMs {
+                                                Text("Binding derived at policy revision \(revision) · Unix ms \(derived)")
+                                                    .font(Theme.mono).secondaryText()
+                                                    .accessibilityIdentifier("computer-binding-evidence-" + node.fingerprint)
+                                            }
                                         }
                                     }
                                     Button(application.computer.fingerprint == status.thisComputer.fingerprint
@@ -132,6 +141,17 @@ struct ComputerTrustView: View {
                                     Text(applicationState(application, status: status))
                                         .secondaryText()
                                         .accessibilityIdentifier("computer-application-" + application.computer.fingerprint)
+                                    Text("Exchanged \(application.exchanges) time(s) in \(application.exchangeAttempts) attempt(s) · \(application.exchangeFailures) failed in a row")
+                                        .font(Theme.mono).secondaryText()
+                                        .accessibilityIdentifier("computer-exchange-counts-" + application.computer.fingerprint)
+                                    if let exchange = application.lastStartedExchange {
+                                        Text("Last started exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                            .font(Theme.mono).secondaryText()
+                                    }
+                                    if let exchange = application.lastAnsweredExchange {
+                                        Text("Last answered exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                            .font(Theme.mono).secondaryText()
+                                    }
                                 }
                             }
                         }

@@ -917,6 +917,9 @@ pub(crate) struct State {
     /// (ADR-038 FX-28): a binding is derived once per revision, across restarts too, and a node
     /// whose record names the current revision is left alone.
     pub derived: BTreeMap<Digest32, DerivedBinding>,
+    /// Peers for which this exact local revision was repaired only after its causal deadline.
+    /// This operational truth is durable so restart cannot turn a missed contract into success.
+    pub missed_exchanges: BTreeMap<Digest32, (u64, bool)>,
     intervals: BTreeMap<Digest32, Vec<MembershipInterval>>,
     retired_nodes: BTreeMap<Digest32, u64>,
     individual: BTreeMap<Digest32, BTreeMap<Digest32, u64>>,
@@ -1505,7 +1508,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(26)
+        e.array(27)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1630,14 +1633,20 @@ impl State {
         for (node, d) in &self.derived {
             e.array(3).bytes(node).uint(d.revision).uint(d.at_ms);
         }
+        e.array(self.missed_exchanges.len());
+        for (peer, (revision, repaired)) in &self.missed_exchanges {
+            e.array(3)
+                .bytes(peer)
+                .uint(*revision)
+                .uint(u64::from(*repaired));
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        // 26 elements; a state written before the derived record existed has 25 and no record,
-        // so every binding is derived once more at its revision.
+        // 27 elements; older current-version states have no durable missed-exchange record.
         let fields = count(&mut d)?;
-        if fields != 25 && fields != 26 {
+        if fields != 25 && fields != 26 && fields != 27 {
             return Err(bad());
         }
         let description = Description::decode(d.bytes()?)?;
@@ -1888,7 +1897,7 @@ impl State {
             }
         }
         let mut derived = BTreeMap::new();
-        if fields == 26 {
+        if fields >= 26 {
             for _ in 0..count(&mut d)? {
                 arity(&mut d, 3)?;
                 let node = digest(&mut d)?;
@@ -1909,8 +1918,25 @@ impl State {
                 }
             }
         }
+        let mut missed_exchanges = BTreeMap::new();
+        if fields == 27 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 3)?;
+                let peer = digest(&mut d)?;
+                let at = d.uint()?;
+                let repaired = match d.uint()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(bad()),
+                };
+                if at > revision || missed_exchanges.insert(peer, (at, repaired)).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            missed_exchanges,
             derived,
             retired_groups,
             binding_approvals,
@@ -2769,6 +2795,7 @@ impl Computer {
             pending: None,
             applied: BTreeMap::new(),
             derived: BTreeMap::new(),
+            missed_exchanges: BTreeMap::new(),
         };
         let c = Arc::new(Self {
             path,
@@ -2815,6 +2842,11 @@ impl Computer {
     ) -> Result<T> {
         let mut held = lock(&self.state);
         self.storage_ready()?;
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Profile(
+                "the computer change reached its causal convergence deadline before its transaction began",
+            ));
+        }
         let mut next = held.clone();
         let value = match f(&mut next) {
             Ok(value) => value,
@@ -2825,6 +2857,11 @@ impl Computer {
             Err(error) => return Err(error),
         };
         if held.body() != next.body() {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Profile(
+                    "the computer change reached its causal convergence deadline before it could be saved",
+                ));
+            }
             if let Err(error) = self.save(&next) {
                 self.storage_failure();
                 return Err(error);
@@ -2847,6 +2884,30 @@ impl Computer {
             }
         }
         Ok(value)
+    }
+
+    pub(crate) fn missed_exchanges(&self) -> (u64, BTreeMap<Digest32, (u64, bool)>) {
+        let state = lock(&self.state);
+        (state.revision, state.missed_exchanges.clone())
+    }
+
+    pub(crate) fn record_missed_exchange(
+        &self,
+        peer: Digest32,
+        revision: u64,
+        repaired: bool,
+    ) -> Result<()> {
+        self.change(|state| {
+            state.missed_exchanges.insert(peer, (revision, repaired));
+            Ok(())
+        })
+    }
+
+    pub(crate) fn clear_missed_exchange(&self, peer: Digest32) -> Result<()> {
+        self.change(|state| {
+            state.missed_exchanges.remove(&peer);
+            Ok(())
+        })
     }
     /// Publish into an existing room gate only while its node's durable keyring matches
     /// current policy. Register the same gate for synchronous invalidation on later changes.

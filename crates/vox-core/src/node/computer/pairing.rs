@@ -342,10 +342,12 @@ struct Exchanged {
     involved: bool,
     /// The last failure's words, while failures stand.
     problem: Option<String>,
+    /// Revision whose causal deadline was missed, whether or not repair has completed yet.
+    missed_revision: Option<u64>,
     /// The state which was repaired only after its causal deadline. Its completed exchange is
     /// still useful evidence and stops redundant retries, but the missed contract remains a
     /// visible failure until a newer state creates a new cause and deadline.
-    repaired_late: Option<(u64, bool)>,
+    repaired_late: Option<u64>,
     /// The last completed exchange this node started, and the last one it answered.
     last_started: Option<ExchangeRecord>,
     last_answered: Option<ExchangeRecord>,
@@ -647,6 +649,31 @@ impl Management {
             policy.add_anchor(a.id);
         }
         net.policy().replace(policy);
+        let (current_revision, durable_misses) = computer.missed_exchanges();
+        let exchanged: BTreeMap<_, _> = durable_misses
+            .into_iter()
+            .filter(|(_, (revision, _))| *revision == current_revision)
+            .map(|(peer, (revision, repaired))| {
+                (
+                    peer,
+                    Exchanged {
+                        failures: 1,
+                        revision,
+                        problem: Some(if repaired {
+                            "the exchange repaired state only after its causal convergence deadline"
+                                .into()
+                        } else {
+                            "the exchange did not finish before its causal convergence deadline"
+                                .into()
+                        }),
+                        missed_revision: Some(revision),
+                        repaired_late: repaired.then_some(revision),
+                        ..Exchanged::default()
+                    },
+                )
+            })
+            .collect();
+        let problem = exchanged.values().find_map(|record| record.problem.clone());
         let me = Arc::new(Self {
             computer,
             net,
@@ -654,11 +681,11 @@ impl Management {
             serving: Mutex::new(Default::default()),
             inflight: Mutex::new(BTreeMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(8)),
-            problem: Mutex::new(None),
+            problem: Mutex::new(problem),
             pending_nodes: Mutex::new(Vec::new()),
             transport_cache: Mutex::new(BTreeMap::new()),
             revoked_transport: Mutex::new(Default::default()),
-            exchanged: Mutex::new(BTreeMap::new()),
+            exchanged: Mutex::new(exchanged),
             retry_wake: Arc::new(tokio::sync::Notify::new()),
             retry_ready: Mutex::new(BTreeMap::new()),
             transport_wake: Arc::new(tokio::sync::Notify::new()),
@@ -1921,11 +1948,12 @@ impl Management {
             &hello(1, &self.computer.description(), &link.invite, remaining_ms),
         )
         .await?;
-        let (op, peer, _, echoed_remaining_ms) = read_hello(&mut recv, &conn).await?;
+        let (op, peer, _, echoed_remaining_ms) =
+            read_hello_until(&mut recv, &conn, deadline).await?;
         if op != 1 || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
-        let f = frame(&mut recv).await?;
+        let f = frame_until(&mut recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 3)?;
         let sid = d.bytes()?.to_vec();
@@ -1962,7 +1990,7 @@ impl Management {
             .bytes(&share)
             .bytes(&pop::seal_pop(isk.as_ref(), &proof)?);
         write_frame(&mut send, &e.finish()).await?;
-        let f = frame(&mut recv).await?;
+        let f = frame_until(&mut recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 2)?;
         let proof = pop::open_pop(isk.as_ref(), d.bytes()?)?;
@@ -2020,13 +2048,13 @@ impl Management {
             return Ok(());
         }
         if op == 2 {
-            let payload = frame(recv).await?;
-            // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
-            // reply is the merged state, encoded under the same lock, so the revision the
-            // record names is the revision the reply carries.
             let Some(deadline) = deadline else {
                 return Err(bad());
             };
+            let payload = frame_until(recv, deadline).await?;
+            // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
+            // reply is the merged state, encoded under the same lock, so the revision the
+            // record names is the revision the reply carries.
             let (merged, reply) = self.computer.change_until(deadline, |s| {
                 merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
                 Ok((s.revision, exchange(s)?))
@@ -2079,7 +2107,7 @@ impl Management {
         let mut e = Encoder::new();
         e.array(3).bytes(&sid).bytes(&g.encode()).bytes(&share);
         write_frame(send, &e.finish()).await?;
-        let f = frame(recv).await?;
+        let f = frame_until(recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 2)?;
         let remote_share: [u8; 32] = d.bytes()?.try_into().map_err(|_| bad())?;
@@ -2251,18 +2279,17 @@ impl Management {
                 // exact state and needs no periodic retry. A later policy state is a new cause;
                 // it may make one attempt under its own already-created retry mark.
                 if let Some(record) = exchanged.get_mut(peer) {
-                    if record.repaired_late.is_some()
-                        && record.repaired_late != Some((revision, involved == Some(*peer)))
-                    {
+                    if record.repaired_late.is_some() && record.repaired_late != Some(revision) {
                         record.failures = 0;
                         record.deadline = None;
                         record.problem = None;
+                        record.missed_revision = None;
                         record.repaired_late = None;
                         changed = true;
                     }
                 }
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
-                if record.repaired_late == Some((revision, involved == Some(*peer))) {
+                if record.repaired_late == Some(revision) {
                     return false;
                 }
                 let causal_mark = retry_ready.get(peer).copied();
@@ -2520,21 +2547,44 @@ impl Management {
         revision: u64,
         involved: bool,
         deadline: std::time::Instant,
-        outcome: std::result::Result<(u64, u64), String>,
+        mut outcome: std::result::Result<(u64, u64), String>,
     ) {
+        let completed = std::time::Instant::now();
+        let (retained_miss, was_repaired) =
+            lock(&self.exchanged)
+                .get(&peer)
+                .map_or((false, false), |record| {
+                    (
+                        record.missed_revision == Some(revision),
+                        record.repaired_late == Some(revision),
+                    )
+                });
+        let missed = retained_miss || completed > deadline;
+        let durable = if missed {
+            self.computer
+                .record_missed_exchange(peer, revision, outcome.is_ok() || was_repaired)
+        } else if outcome.is_ok() {
+            self.computer.clear_missed_exchange(peer)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = durable {
+            outcome = Err(format!(
+                "the exchange result could not be recorded durably: {error}"
+            ));
+        }
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
-        let completed = std::time::Instant::now();
         record.last = Some(completed);
         record.revision = revision;
         record.involved = involved;
-        let failed = outcome.is_err();
+        let failed = outcome.is_err() && !was_repaired;
         match outcome {
             Ok((sent_revision, merged_revision)) => {
                 let at_ms = now();
                 record.last_ms = Some(at_ms);
                 record.count = record.count.saturating_add(1);
-                if completed > deadline {
+                if missed {
                     record.failures = record.failures.saturating_add(1).max(1);
                     record.deadline =
                         Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
@@ -2542,11 +2592,13 @@ impl Management {
                         "the exchange repaired state only after its causal convergence deadline"
                             .into(),
                     );
-                    record.repaired_late = Some((revision, involved));
+                    record.repaired_late = Some(revision);
+                    record.missed_revision = Some(revision);
                 } else {
                     record.failures = 0;
                     record.deadline = None;
                     record.problem = None;
+                    record.missed_revision = None;
                     record.repaired_late = None;
                 }
                 record.last_started = Some(ExchangeRecord {
@@ -2558,8 +2610,22 @@ impl Management {
             Err(text) => {
                 record.failures = record.failures.saturating_add(1);
                 record.deadline = Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
-                record.problem = Some(text);
-                record.repaired_late = None;
+                record.problem = Some(if was_repaired {
+                    "the exchange repaired state only after its causal convergence deadline".into()
+                } else if missed {
+                    "the exchange did not finish before its causal convergence deadline".into()
+                } else {
+                    text
+                });
+                if missed {
+                    record.missed_revision = Some(revision);
+                }
+                if record
+                    .repaired_late
+                    .is_none_or(|missed_revision| missed_revision != revision)
+                {
+                    record.repaired_late = None;
+                }
             }
         }
         *lock(&self.problem) = exchanged
@@ -2657,12 +2723,12 @@ impl Management {
             &hello(2, &self.computer.description(), &[0; 32], remaining_ms),
         )
         .await?;
-        let (op, _, _, echoed_remaining_ms) = read_hello(&mut recv, &conn).await?;
+        let (op, _, _, echoed_remaining_ms) = read_hello_until(&mut recv, &conn, deadline).await?;
         if op != 2 || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
         write_frame(&mut send, &payload).await?;
-        let f = frame(&mut recv).await?;
+        let f = frame_until(&mut recv, deadline).await?;
         // A merge that moves this daemon's revision is a change here: `change` wakes the
         // daemon's follower on it (ADR-038 FX-28).
         let merged = self.computer.change_until(deadline, |s| {
@@ -2919,6 +2985,14 @@ async fn read_hello(
     let f = frame(recv).await?;
     parse_hello(&f, conn)
 }
+async fn read_hello_until(
+    recv: &mut RecvStream,
+    conn: &VoxConnection,
+    deadline: std::time::Instant,
+) -> Result<(u64, Description, Digest32, u64)> {
+    let f = frame_until(recv, deadline).await?;
+    parse_hello(&f, conn)
+}
 fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Digest32, u64)> {
     let mut d = Decoder::new(f);
     arity(&mut d, 6)?;
@@ -2938,7 +3012,19 @@ fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Dige
     Ok((op, desc, id, remaining_ms))
 }
 async fn frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
-    let f = read_frame_within(recv, MAX_FRAME, PATIENCE)
+    frame_within(recv, PATIENCE).await
+}
+async fn frame_until(recv: &mut RecvStream, deadline: std::time::Instant) -> Result<Vec<u8>> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(Error::Profile(
+            "the computer exchange reached its causal convergence deadline",
+        ));
+    }
+    frame_within(recv, remaining).await
+}
+async fn frame_within(recv: &mut RecvStream, within: Duration) -> Result<Vec<u8>> {
+    let f = read_frame_within(recv, MAX_FRAME, within)
         .await?
         .ok_or(Error::Profile(
             "computer pairing peer closed before answering",
