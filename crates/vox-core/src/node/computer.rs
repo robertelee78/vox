@@ -922,6 +922,10 @@ pub(crate) struct State {
     /// Peers for which this exact local revision was repaired only after its causal deadline.
     /// This operational truth is durable so restart cannot turn a missed contract into success.
     pub missed_exchanges: BTreeMap<Digest32, (u64, bool)>,
+    /// A causal exchange obligation is recorded before any network work begins. A timely merge
+    /// removes it in the same durable transaction; after a crash an unresolved obligation is a
+    /// miss, never permission to manufacture a fresh convergence clock.
+    pub pending_exchanges: BTreeMap<Digest32, u64>,
     intervals: BTreeMap<Digest32, Vec<MembershipInterval>>,
     retired_nodes: BTreeMap<Digest32, u64>,
     individual: BTreeMap<Digest32, BTreeMap<Digest32, u64>>,
@@ -1510,7 +1514,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(27)
+        e.array(28)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1642,13 +1646,17 @@ impl State {
                 .uint(*revision)
                 .uint(u64::from(*repaired));
         }
+        e.array(self.pending_exchanges.len());
+        for (peer, revision) in &self.pending_exchanges {
+            e.array(2).bytes(peer).uint(*revision);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        // 27 elements; older current-version states have no durable missed-exchange record.
+        // 28 elements; older current-version states have no durable convergence obligation.
         let fields = count(&mut d)?;
-        if fields != 25 && fields != 26 && fields != 27 {
+        if !(25..=28).contains(&fields) {
             return Err(bad());
         }
         let description = Description::decode(d.bytes()?)?;
@@ -1921,7 +1929,7 @@ impl State {
             }
         }
         let mut missed_exchanges = BTreeMap::new();
-        if fields == 27 {
+        if fields >= 27 {
             for _ in 0..count(&mut d)? {
                 arity(&mut d, 3)?;
                 let peer = digest(&mut d)?;
@@ -1936,8 +1944,20 @@ impl State {
                 }
             }
         }
+        let mut pending_exchanges = BTreeMap::new();
+        if fields >= 28 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let peer = digest(&mut d)?;
+                let at = d.uint()?;
+                if at > revision || pending_exchanges.insert(peer, at).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            pending_exchanges,
             missed_exchanges,
             derived,
             retired_groups,
@@ -2172,6 +2192,9 @@ pub struct PolicyPlan {
     pub grants: Vec<(Digest32, String, crate::node::trust::Capability)>,
     /// Covered grants that must be purged before networking.
     pub denied: Vec<Digest32>,
+    /// This revision missed its causal convergence boundary. The plan is revocation-only and
+    /// must never be recorded as an ordinary applied policy.
+    pub(crate) expired: bool,
 }
 
 /// One persistent management identity and transaction domain, owned by its account daemon.
@@ -2219,9 +2242,10 @@ impl Computer {
     /// Whether `node`'s binding was derived at the current policy revision.
     pub fn binding_current(&self, node: &Digest32) -> bool {
         let s = lock(&self.state);
-        s.derived
-            .get(node)
-            .is_some_and(|d| d.revision == s.revision)
+        !Self::revision_expired(&s)
+            && s.derived
+                .get(node)
+                .is_some_and(|d| d.revision == s.revision)
     }
 
     /// A failed policy write invalidates current grants even when the durable revision did not
@@ -2229,7 +2253,9 @@ impl Computer {
     pub(crate) fn policy_current(&self, applied: u64) -> bool {
         let s = lock(&self.state);
         (s.genesis.is_none() && s.intervals.is_empty())
-            || (self.storage_ready().is_ok() && s.revision == applied)
+            || (self.storage_ready().is_ok()
+                && !Self::revision_expired(&s)
+                && s.revision == applied)
     }
 
     pub(crate) fn storage_ready(&self) -> Result<()> {
@@ -2243,7 +2269,7 @@ impl Computer {
         }
     }
 
-    fn invalidate_reachers(&self) {
+    pub(crate) fn invalidate_reachers(&self) {
         lock(&self.reachers).retain(|weak| {
             if let Some(gate) = weak.upgrade() {
                 crate::node::tunnel::publish_reachers(&gate, Default::default());
@@ -2429,13 +2455,27 @@ impl Computer {
             return Ok(None);
         }
         self.storage_ready()?;
-        if s.missed_exchanges
-            .values()
-            .any(|(revision, _)| *revision == s.revision)
-        {
-            return Err(Error::Profile(
-                "this policy revision expired before convergence; a newer policy change must replace it",
-            ));
+        if Self::revision_expired(&s) {
+            let denied = s
+                .applied
+                .get(&node)
+                .filter(|applied| applied.revision == s.revision)
+                .map(|applied| {
+                    applied
+                        .grants
+                        .iter()
+                        .filter_map(|(peer, introduced)| {
+                            (*introduced == s.revision).then_some(*peer)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(Some(PolicyPlan {
+                revision: s.revision,
+                grants: Vec::new(),
+                denied,
+                expired: true,
+            }));
         }
         // Derived once per revision (ADR-038 FX-28): every input of the plan moves the
         // revision when it changes (`fold_history`, `retain_roster`, `merge`), so a plan at the
@@ -2452,6 +2492,10 @@ impl Computer {
 
     pub(crate) fn current_revision_expired(&self) -> bool {
         let s = lock(&self.state);
+        Self::revision_expired(&s)
+    }
+
+    fn revision_expired(s: &State) -> bool {
         s.missed_exchanges
             .values()
             .any(|(revision, _)| *revision == s.revision)
@@ -2562,15 +2606,18 @@ impl Computer {
             revision: s.revision,
             grants,
             denied,
+            expired: false,
         })
     }
 
     /// Is this exact local policy revision durably applied to this node's keyring?
     pub fn applied(&self, node: &Digest32, revision: u64) -> bool {
-        lock(&self.state)
-            .applied
-            .get(node)
-            .is_some_and(|a| a.revision == revision)
+        let state = lock(&self.state);
+        !Self::revision_expired(&state)
+            && state
+                .applied
+                .get(node)
+                .is_some_and(|a| a.revision == revision)
     }
 
     /// Record application only after the actor saved the complete keyring under the ordinary
@@ -2612,6 +2659,30 @@ impl Computer {
                 applied.grants.entry(*peer).or_insert(revision);
             }
             applied.revision = revision;
+            Ok(())
+        })
+    }
+
+    /// Record that all computer-managed grants for an expired revision were removed. The miss
+    /// itself remains durable; an old applied receipt can therefore never resurrect them.
+    pub(crate) fn mark_expired_until(
+        &self,
+        node: Digest32,
+        revision: u64,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        self.change_until(deadline, |state| {
+            if state.revision != revision || !Self::revision_expired(state) {
+                return Err(Error::Profile(
+                    "computer policy changed while expired trust was being revoked",
+                ));
+            }
+            if let Some(applied) = state.applied.get_mut(&node) {
+                applied
+                    .grants
+                    .retain(|_, introduced| *introduced != revision);
+            }
+            state.receipts.remove(&node);
             Ok(())
         })
     }
@@ -2851,6 +2922,7 @@ impl Computer {
             applied: BTreeMap::new(),
             derived: BTreeMap::new(),
             missed_exchanges: BTreeMap::new(),
+            pending_exchanges: BTreeMap::new(),
         };
         let c = Arc::new(Self {
             path,
@@ -2936,12 +3008,21 @@ impl Computer {
                 self.storage_failure();
                 return Err(error);
             }
+            let committed_late = std::time::Instant::now() >= deadline;
             let moved = held.revision != next.revision;
-            if moved {
+            let authorization_changed =
+                moved || Self::revision_expired(&held) != Self::revision_expired(&next);
+            if authorization_changed {
                 self.invalidate_reachers();
             }
             *held = next;
-            if moved {
+            if committed_late {
+                self.invalidate_reachers();
+                return Err(Error::Profile(
+                    "the computer change committed at its causal boundary but returned after it; no live authorization was published",
+                ));
+            }
+            if authorization_changed {
                 // A change here, or a merged exchange that moved this daemon's revision: either
                 // is a change here (ADR-038 FX-28), and the daemon reconciles its nodes on it.
                 // The local apply contract may shorten an outer return deadline, never extend it.
@@ -2967,10 +3048,89 @@ impl Computer {
         revision: u64,
         repaired: bool,
     ) -> Result<()> {
-        self.change(|state| {
-            state.missed_exchanges.insert(peer, (revision, repaired));
+        self.change_durable(|state| {
+            let held = state
+                .missed_exchanges
+                .entry(peer)
+                .or_insert((revision, repaired));
+            if revision > held.0 || (revision == held.0 && repaired) {
+                *held = (revision, repaired);
+            }
+            if state.pending_exchanges.get(&peer) == Some(&revision) {
+                state.pending_exchanges.remove(&peer);
+            }
             Ok(())
         })
+    }
+
+    /// Own the consequence of a causal exchange before opening a socket. This write has no
+    /// elapsed product verdict: it either commits, or the exchange is not allowed to start.
+    pub(crate) fn record_pending_exchange(&self, peer: Digest32, revision: u64) -> Result<bool> {
+        self.change_durable(|state| {
+            if state.revision != revision {
+                return Ok(false);
+            }
+            state.pending_exchanges.insert(peer, revision);
+            Ok(true)
+        })
+    }
+
+    /// Clear a precommitted obligation only after the complete exchange returned within its
+    /// causal boundary. A crash before this durable acknowledgement leaves the conservative
+    /// unresolved record for startup to expire; it can never erase a real miss.
+    pub(crate) fn record_timely_exchange(&self, peer: Digest32, revision: u64) -> Result<()> {
+        self.change_durable(|state| {
+            if state.pending_exchanges.get(&peer) == Some(&revision) {
+                state.pending_exchanges.remove(&peer);
+            }
+            Ok(())
+        })
+    }
+
+    /// A process exit cannot reset a causal clock. An exchange that was durably in progress has
+    /// no proof of timely completion after restart, so recovery promotes it to an exact miss.
+    pub(crate) fn recover_pending_exchanges(&self) -> Result<()> {
+        self.change_durable(|state| {
+            for (peer, revision) in std::mem::take(&mut state.pending_exchanges) {
+                let held = state
+                    .missed_exchanges
+                    .entry(peer)
+                    .or_insert((revision, false));
+                if revision > held.0 {
+                    *held = (revision, false);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Persistence used by convergence bookkeeping whose truth must survive a crash and which
+    /// has no wall-clock success criterion of its own.
+    fn change_durable<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let mut held = lock(&self.state);
+        self.storage_ready()?;
+        let mut next = held.clone();
+        let value = f(&mut next)?;
+        if held.body() != next.body() {
+            if let Err(error) = self.save_before(&next, None) {
+                self.storage_failure();
+                return Err(error);
+            }
+            let authorization_changed =
+                Self::revision_expired(&held) != Self::revision_expired(&next);
+            if authorization_changed {
+                self.invalidate_reachers();
+            }
+            *held = next;
+            if authorization_changed {
+                let _ = self.changed.send(ComputerChange {
+                    revision: held.revision,
+                    apply_deadline: std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+                    return_deadline: std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
+                });
+            }
+        }
+        Ok(value)
     }
 
     /// Publish into an existing room gate only while its node's durable keyring matches
@@ -2989,7 +3149,9 @@ impl Computer {
         crate::node::tunnel::publish_reachers(
             gate,
             if (state.genesis.is_none() && state.intervals.is_empty())
-                || (self.storage_ready().is_ok() && applied == state.revision)
+                || (self.storage_ready().is_ok()
+                    && !Self::revision_expired(&state)
+                    && applied == state.revision)
             {
                 next
             } else {

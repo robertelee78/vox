@@ -317,6 +317,38 @@ The decider then answered twelve questions, one at a time. His answers are the d
   late, and whether it is expired, replaced, pending or converged, alongside policy revision,
   per-peer exchange records/counters and per-node binding revision/derivation moment. Neither
   client has to infer currentness from elapsed time or free-text failure wording.
+  Crash and late-marker amendment, 2026-10-21: before a causal exchange opens its stream, the
+  initiator durably records the exact peer and local policy revision as unresolved. Only the
+  complete exchange returning within its boundary durably clears that obligation; a crash after
+  merge but before that acknowledgement therefore fails closed rather than inventing success.
+  Deadline expiry promotes it to missed before any late repair proceeds; after a process crash, an
+  unresolved obligation is likewise recovered as missed, because restart has no evidence that
+  it completed within the lost monotonic interval and MUST NOT create a replacement clock. A
+  newer operator revision owns its own already-created causal deadline; an older unresolved or
+  missed revision is historical `replaced` evidence and cannot shorten that new clock.
+
+  Revision numbers remain local and are never translated by ordinal position. A wire miss marker
+  therefore carries a digest of the exact canonical policy frontier (genesis, pending enrollment
+  and signed history; not receipts, convergence observations or local revision numbers). The
+  receiver maps it to its current local revision only when that digest exactly matches after
+  merge. A marker for an older frontier cannot expire unrelated newer local policy. When the
+  matching marker arrives after that policy was already applied, its durable transition itself
+  invalidates all live authorization gates and wakes reconciliation even though the journal
+  revision did not move. Reconciliation removes grants introduced by that expired revision,
+  removes its receipt, and never records it as an ordinary applied policy; restart repeats this
+  safely before networking. A later marker is thus a causal revocation, not status decoration.
+
+  The answerer's hello echo and every response frame share the same local absolute deadline as
+  its read and transaction, including both the frame length and body; a peer which stops reading
+  cannot retain one of the bounded answer slots past that deadline. Actor publication checks the
+  same deadline and cancellation after the durable application receipt and after every live
+  publication stage; a late boundary empties registered reacher gates. Startup reconciliation
+  uses one causal Unlock boundary and continues on actual revision movement, with no eight-pass
+  verdict and no per-pass renewed deadline. The optional shipped-binary journey parks an answer
+  after its merge, proves the answerer's effective keyring contains the newly applied grant,
+  observes the initiator's structural missed-revision state, then releases that exact answer and
+  proves the later matching marker removes the grant. Its mutant suppresses marker-only
+  invalidation, so the effective-keyring assertion—not elapsed sampling—turns PRODUCT red.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its

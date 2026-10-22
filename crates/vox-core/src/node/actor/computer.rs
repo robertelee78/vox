@@ -177,7 +177,7 @@ impl NodeHandle {
 }
 
 impl Node {
-    fn computer_policy_active(
+    pub(super) fn computer_policy_active(
         deadline: std::time::Instant,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> crate::error::Result<()> {
@@ -192,15 +192,6 @@ impl Node {
         }
     }
 
-    pub(super) fn prepare_computer_binding(&self) -> crate::error::Result<()> {
-        let cancelled = std::sync::atomic::AtomicBool::new(false);
-        self.prepare_computer_binding_causal(
-            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
-            &cancelled,
-            true,
-        )
-    }
-
     pub(super) fn prepare_computer_binding_until(
         &self,
         deadline: std::time::Instant,
@@ -209,7 +200,7 @@ impl Node {
         self.prepare_computer_binding_causal(deadline, cancelled, false)
     }
 
-    fn prepare_computer_binding_causal(
+    pub(super) fn prepare_computer_binding_causal(
         &self,
         deadline: std::time::Instant,
         cancelled: &std::sync::atomic::AtomicBool,
@@ -263,17 +254,18 @@ impl Node {
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> crate::error::Result<()> {
         Self::computer_policy_active(deadline, cancelled)?;
-        let Some(c) = &self.computer else {
+        let Some(c) = self.computer.clone() else {
             return Ok(());
         };
         if c.grouped() {
             c.storage_ready()?;
         }
         if !c.grouped()
-            || self
-                .computer_revision
-                .load(std::sync::atomic::Ordering::Acquire)
-                == c.revision()
+            || (!c.current_revision_expired()
+                && self
+                    .computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == c.revision())
         {
             return Ok(());
         }
@@ -296,8 +288,7 @@ impl Node {
             }
             // The existing room machinery performs pending removals, sender-key rotation, and
             // consent delivery. Computer policy does not create a second room authorization path.
-            self.refresh_reachers().await;
-            Self::computer_policy_active(deadline, cancelled)?;
+            self.refresh_reachers_until(deadline, cancelled).await?;
             for prepared in self.preparing_rooms.values_mut() {
                 prepared.channel.get_mut().release_held_packages();
             }
@@ -316,9 +307,18 @@ impl Node {
             self.deliver_owed_consents(None).await;
             Self::computer_policy_active(deadline, cancelled)?;
             self.tend_drive_keys().await;
-            Self::computer_policy_active(deadline, cancelled)?;
+            if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+                c.invalidate_reachers();
+                return Err(error);
+            }
             self.publish().await;
-            Self::computer_policy_active(deadline, cancelled)?;
+            if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+                c.invalidate_reachers();
+                return Err(error);
+            }
+            if c.current_revision_expired() {
+                return Ok(());
+            }
             if self.computer.as_ref().is_none_or(|c| {
                 c.revision()
                     == self
@@ -330,19 +330,7 @@ impl Node {
         }
     }
 
-    pub(super) fn apply_computer_keyring_at(
-        &mut self,
-        floor: u64,
-    ) -> crate::error::Result<Vec<(Digest32, crate::node::consent_order::Stamp)>> {
-        let cancelled = std::sync::atomic::AtomicBool::new(false);
-        self.apply_computer_keyring_at_until(
-            floor,
-            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN,
-            &cancelled,
-        )
-    }
-
-    fn apply_computer_keyring_at_until(
+    pub(super) fn apply_computer_keyring_at_until(
         &mut self,
         floor: u64,
         deadline: std::time::Instant,
@@ -357,16 +345,19 @@ impl Node {
         }
         computer.storage_ready()?;
         let revision = computer.revision();
-        if self
-            .computer_revision
-            .load(std::sync::atomic::Ordering::Acquire)
-            == revision
+        if !computer.current_revision_expired()
+            && self
+                .computer_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                == revision
         {
             return Ok(Vec::new());
         }
         let Some(profile) = &self.profile else {
             if let Some(signer) = &self.headless {
-                if !computer.applied(&signer.fingerprint(), revision) {
+                if computer.current_revision_expired() {
+                    computer.mark_expired_until(signer.fingerprint(), revision, deadline)?;
+                } else if !computer.applied(&signer.fingerprint(), revision) {
                     computer.mark_applied_until(signer.fingerprint(), revision, &[], deadline)?;
                 }
                 self.computer_revision
@@ -388,6 +379,7 @@ impl Node {
         let Some(plan) = computer.plan(me)? else {
             return Ok(Vec::new());
         };
+        let expired = plan.expired;
         let revision = plan.revision;
         let covered: Vec<_> = plan
             .grants
@@ -483,7 +475,15 @@ impl Node {
         for (id, was) in changed_drive {
             self.note_capability(id, was);
         }
-        computer.mark_applied_until(me, revision, &covered, deadline)?;
+        if expired {
+            computer.mark_expired_until(me, revision, deadline)?;
+        } else {
+            computer.mark_applied_until(me, revision, &covered, deadline)?;
+        }
+        if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+            computer.invalidate_reachers();
+            return Err(error);
+        }
         self.view_tx.send_modify(|view| {
             view.trusted = self.trust_rows();
             view.drive = self

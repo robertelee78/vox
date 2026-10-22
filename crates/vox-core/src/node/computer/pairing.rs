@@ -37,6 +37,13 @@ const TEST_HOLD_COMPUTER_RETRY_READY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_RETRY_R
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV: &str =
     "VOX_TEST_HOLD_COMPUTER_OPERATOR_RESERVED_FILE";
+/// **Test-only** (`test-knobs`): `<arm>\t<engaged>\t<release socket>`. The answerer parks only
+/// after atomically merging the request and before writing its reply. A shipped-binary journey
+/// can observe the resulting effective keyring, let the initiator's causal deadline expire, then
+/// release this exact answer so the later marker must revoke the already-published grant.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_ENV: &str =
+    "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE";
 // An exchange carries retained records from the same bounded transaction, never a smaller
 // unrelated limit that would strand an otherwise valid roster as nodes are added.
 const MAX_FRAME: usize = MAX_STATE as usize;
@@ -369,6 +376,7 @@ struct Exchanged {
 #[derive(Clone, Copy, Debug)]
 struct RetryMark {
     token: u64,
+    revision: u64,
     deadline: std::time::Instant,
 }
 
@@ -655,6 +663,7 @@ impl Management {
         presence: Arc<NetPresence>,
         anchors: BootstrapSet,
     ) -> Result<Arc<Self>> {
+        computer.recover_pending_exchanges()?;
         let mut link = presence.attach_management(Arc::clone(&computer.signer))?;
         let net = Arc::new(NodeNet::new(
             link.endpoint,
@@ -674,6 +683,7 @@ impl Management {
                 (
                     peer,
                     Exchanged {
+                        attempts: 1,
                         failures: 1,
                         revision,
                         problem: Some(if repaired {
@@ -1984,9 +1994,10 @@ impl Management {
             .await?;
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         let remaining_ms = wire_budget(deadline);
-        write_frame(
+        write_frame_until(
             &mut send,
             &hello(1, &self.computer.description(), &link.invite, remaining_ms),
+            deadline,
         )
         .await?;
         let (op, peer, _, echoed_remaining_ms) =
@@ -2030,7 +2041,7 @@ impl Management {
         e.array(2)
             .bytes(&share)
             .bytes(&pop::seal_pop(isk.as_ref(), &proof)?);
-        write_frame(&mut send, &e.finish()).await?;
+        write_frame_until(&mut send, &e.finish(), deadline).await?;
         let f = frame_until(&mut recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 2)?;
@@ -2080,11 +2091,12 @@ impl Management {
             1 | 2 => return Err(bad()),
             _ => return Err(bad()),
         };
-        write_frame(
-            send,
-            &hello(op, &self.computer.description(), &id, remaining_ms),
-        )
-        .await?;
+        let echo = hello(op, &self.computer.description(), &id, remaining_ms);
+        if let Some(deadline) = deadline {
+            write_frame_until(send, &echo, deadline).await?;
+        } else {
+            write_frame(send, &echo).await?;
+        }
         if op == REACHABILITY_WAKE_OP {
             return Ok(());
         }
@@ -2100,7 +2112,9 @@ impl Management {
                 merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
                 Ok((s.revision, exchange(s, &conn.peer_id())?))
             })?;
-            write_frame(send, &reply).await?;
+            #[cfg(feature = "test-knobs")]
+            self.hold_answer_after_merge_for_proof(conn.peer_id()).await;
+            write_frame_until(send, &reply, deadline).await?;
             self.record_answered(conn.peer_id(), merged);
             return Ok(());
         }
@@ -2147,7 +2161,7 @@ impl Management {
         )?;
         let mut e = Encoder::new();
         e.array(3).bytes(&sid).bytes(&g.encode()).bytes(&share);
-        write_frame(send, &e.finish()).await?;
+        write_frame_until(send, &e.finish(), deadline).await?;
         let f = frame_until(recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 2)?;
@@ -2192,7 +2206,7 @@ impl Management {
         e.array(2)
             .bytes(&pop::seal_pop(isk.as_ref(), &proof)?)
             .bytes(&payload);
-        write_frame(send, &e.finish()).await?;
+        write_frame_until(send, &e.finish(), deadline).await?;
         // The enrollment handshake is an exchange this daemon answered (ADR-038 FX-28).
         self.record_answered(conn.peer_id(), revision);
         Ok(())
@@ -2200,33 +2214,39 @@ impl Management {
     /// Wake one failed peer from authenticated connection/application activity. A peer that has
     /// no failed exchange cannot spend work by sending streams: it is not put on this set.
     fn retry_peer_now(&self, peer: Digest32) {
-        let deadline = lock(&self.exchanged).get(&peer).and_then(|record| {
+        let cause = lock(&self.exchanged).get(&peer).and_then(|record| {
             (record.failures > 0).then(|| {
-                record
-                    .deadline
-                    .unwrap_or(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN)
+                (
+                    record.revision,
+                    record
+                        .deadline
+                        .unwrap_or(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN),
+                )
             })
         });
-        if let Some(deadline) = deadline {
-            self.mark_retry(peer, deadline);
+        if let Some((revision, deadline)) = cause {
+            self.mark_retry(peer, revision, deadline);
             self.retry_wake.notify_one();
         }
     }
 
-    fn mark_retry(&self, peer: Digest32, deadline: std::time::Instant) {
+    fn mark_retry(&self, peer: Digest32, revision: u64, deadline: std::time::Instant) {
         let mut ready = lock(&self.retry_ready);
         match ready.entry(peer) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(RetryMark {
                     token: next_flight(),
+                    revision,
                     deadline,
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut entry)
-                if deadline < entry.get().deadline =>
+                if revision > entry.get().revision
+                    || (revision == entry.get().revision && deadline < entry.get().deadline) =>
             {
                 entry.insert(RetryMark {
                     token: next_flight(),
+                    revision,
                     deadline,
                 });
             }
@@ -2238,14 +2258,20 @@ impl Management {
     /// of that revision uses the same absolute end through exchange and local reconciliation.
     fn retry_changed_now(&self, deadline: std::time::Instant) {
         let local = self.computer.signer.fingerprint();
-        let peers: Vec<_> = lock(&self.computer.state)
-            .descriptions()
-            .into_keys()
-            .filter(|peer| *peer != local)
-            .collect();
+        let (revision, peers): (u64, Vec<_>) = {
+            let state = lock(&self.computer.state);
+            (
+                state.revision,
+                state
+                    .descriptions()
+                    .into_keys()
+                    .filter(|peer| *peer != local)
+                    .collect(),
+            )
+        };
         if !peers.is_empty() {
             for peer in peers {
-                self.mark_retry(peer, deadline);
+                self.mark_retry(peer, revision, deadline);
             }
             self.retry_wake.notify_one();
         }
@@ -2296,11 +2322,12 @@ impl Management {
             let mut retry_ready = lock(&self.retry_ready);
             let mut selected_deadlines = BTreeMap::new();
             let mut selected_tokens = BTreeMap::new();
+            let mut selected_causal = BTreeSet::new();
             // A computer no longer paired (removed, or its pairing cancelled) keeps its
             // counts, which are "since the daemon started" and survive its re-enrollment, but
             // not its failure: that must not stand in the status for good.
             let known: std::collections::BTreeSet<Digest32> = peers.iter().copied().collect();
-            retry_ready.retain(|peer, _| known.contains(peer));
+            retry_ready.retain(|peer, mark| known.contains(peer) && mark.revision == revision);
             let mut changed = false;
             for (peer, record) in exchanged.iter_mut() {
                 if !known.contains(peer) && (record.failures > 0 || record.problem.is_some()) {
@@ -2320,7 +2347,8 @@ impl Management {
                 // exact state and needs no periodic retry. A later policy state is a new cause;
                 // it may make one attempt under its own already-created retry mark.
                 if let Some(record) = exchanged.get_mut(peer) {
-                    if record.repaired_late.is_some() && record.repaired_late != Some(revision) {
+                    if record.missed_revision.is_some() && record.missed_revision != Some(revision)
+                    {
                         record.failures = 0;
                         record.deadline = None;
                         record.problem = None;
@@ -2392,6 +2420,17 @@ impl Management {
                 if let Some(mark) = causal_mark {
                     selected_tokens.insert(*peer, mark.token);
                 }
+                let acknowledged = s
+                    .receipts
+                    .get(peer)
+                    .is_some_and(|receipt| valid_receipt(&s, peer, receipt).unwrap_or(false));
+                if causal_mark.is_some()
+                    || !acknowledged
+                    || involved == Some(*peer)
+                    || record.failures > 0
+                {
+                    selected_causal.insert(*peer);
+                }
                 true
             });
             if changed {
@@ -2419,7 +2458,7 @@ impl Management {
                         // Transfer the first unfinished change's end before cutting the stale
                         // work. The replacement may carry newer state, but never gets a newer
                         // convergence clock.
-                        self.mark_retry(*peer, flight.deadline);
+                        self.mark_retry(*peer, flight.revision, flight.deadline);
                         flight.superseded = true;
                         #[cfg(feature = "test-knobs")]
                         if flight.origin == Origin::Operator && flight.abort.is_none() {
@@ -2465,7 +2504,7 @@ impl Management {
                     true
                 });
             }
-            let attempted: Vec<(Digest32, bool, u64, std::time::Instant)> = {
+            let attempted: Vec<(Digest32, bool, u64, std::time::Instant, bool)> = {
                 let inflight = lock(&self.inflight);
                 peers
                     .iter()
@@ -2478,6 +2517,7 @@ impl Management {
                                 .get(p)
                                 .copied()
                                 .unwrap_or(now + COMPUTER_RETURN_SHOWN_WITHIN),
+                            selected_causal.contains(p),
                         )
                     })
                     .collect()
@@ -2508,10 +2548,12 @@ impl Management {
         };
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
-            let (involved, serial, deadline) =
-                attempted.iter().find(|(p, _, _, _)| *p == peer).map_or(
-                    (false, 0, std::time::Instant::now()),
-                    |(_, involved, serial, deadline)| (*involved, *serial, *deadline),
+            let (involved, serial, deadline, causal) =
+                attempted.iter().find(|(p, _, _, _, _)| *p == peer).map_or(
+                    (false, 0, std::time::Instant::now(), false),
+                    |(_, involved, serial, deadline, causal)| {
+                        (*involved, *serial, *deadline, *causal)
+                    },
                 );
             // The guard exists before the task does and travels with it: a task cut before
             // its first poll drops the guard all the same, so no reservation ever leaks.
@@ -2524,12 +2566,38 @@ impl Management {
                 deadline,
                 recorded: false,
             };
+            if causal {
+                match self.computer.record_pending_exchange(peer, revision) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Some(flight) = lock(&self.inflight).get_mut(&peer) {
+                            if flight.serial == serial {
+                                flight.superseded = true;
+                            }
+                        }
+                        drop(guard);
+                        continue;
+                    }
+                    Err(error) => {
+                        guard.done(Err(format!(
+                            "the exchange obligation could not be recorded durably: {error}"
+                        )));
+                        continue;
+                    }
+                }
+            }
             let task = tokio::spawn(async move {
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
                 // attempt. Exchange and reconciliation share the causal return deadline; this
                 // stage neither subtracts a private budget nor starts a new one.
                 let outcome = if deadline <= std::time::Instant::now() {
+                    if let Err(error) = me.computer.record_missed_exchange(peer, revision, false) {
+                        guard.done(Err(format!(
+                            "the missed exchange could not be recorded durably: {error}"
+                        )));
+                        return;
+                    }
                     // The product already missed the causal contract, but repair must continue.
                     // A local operational bound prevents the transport from being held forever;
                     // `guard` still records the original deadline, so completion remains a
@@ -2552,9 +2620,14 @@ impl Management {
                         // a reachable peer.
                         biased;
                         result = &mut exchange => result.map_err(|e| e.to_string()),
-                        () = tokio::time::sleep_until(deadline.into()) => Err(
-                            "the exchange did not finish before its causal convergence deadline".into(),
-                        ),
+                        () = tokio::time::sleep_until(deadline.into()) => {
+                            match me.computer.record_missed_exchange(peer, revision, false) {
+                                Ok(()) => Err("the exchange did not finish before its causal convergence deadline".into()),
+                                Err(error) => Err(format!(
+                                    "the missed exchange could not be recorded durably: {error}"
+                                )),
+                            }
+                        },
                     }
                 };
                 guard.done(outcome);
@@ -2612,6 +2685,8 @@ impl Management {
         let durable = if missed {
             self.computer
                 .record_missed_exchange(peer, revision, outcome.is_ok() || was_repaired)
+        } else if outcome.is_ok() {
+            self.computer.record_timely_exchange(peer, revision)
         } else {
             Ok(())
         };
@@ -2766,21 +2841,23 @@ impl Management {
         };
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         let remaining_ms = wire_budget(deadline);
-        write_frame(
+        write_frame_until(
             &mut send,
             &hello(2, &self.computer.description(), &[0; 32], remaining_ms),
+            deadline,
         )
         .await?;
         let (op, _, _, echoed_remaining_ms) = read_hello_until(&mut recv, &conn, deadline).await?;
         if op != 2 || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
-        write_frame(&mut send, &payload).await?;
+        write_frame_until(&mut send, &payload, deadline).await?;
         let f = frame_until(&mut recv, deadline).await?;
         // A merge that moves this daemon's revision is a change here: `change` wakes the
         // daemon's follower on it (ADR-038 FX-28).
         let merged = self.computer.change_until(deadline, |s| {
-            merge(s, &f, peer, self.computer.signer.as_ref()).map(|()| s.revision)
+            merge(s, &f, peer, self.computer.signer.as_ref())?;
+            Ok(s.revision)
         })?;
         let _ = send.finish();
         Ok((sent, merged))
@@ -2949,6 +3026,36 @@ impl Management {
         let _ = std::fs::remove_file(release);
     }
 
+    /// Park an answer only after its policy merge is durable. The marker and socket are staging
+    /// apparatus; all verdicts in the journey come from shipped status and trust commands.
+    #[cfg(feature = "test-knobs")]
+    async fn hold_answer_after_merge_for_proof(&self, peer: Digest32) {
+        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(arm), Some(engaged), Some(release)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
+            return;
+        };
+        if std::fs::remove_file(arm).is_err() {
+            let _ = std::fs::remove_file(release);
+            return;
+        }
+        if std::fs::write(engaged, text_id(&peer)).is_err() {
+            let _ = std::fs::remove_file(release);
+            return;
+        }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(engaged);
+        let _ = std::fs::remove_file(release);
+    }
+
     /// Mark the exact event the reserve-to-handle-install proof waits for: the scheduler has
     /// observed a newer policy revision and marked the parked operator flight superseded while it
     /// still has no abort handle.
@@ -3074,6 +3181,23 @@ async fn frame_until(recv: &mut RecvStream, deadline: std::time::Instant) -> Res
             "computer pairing peer closed before answering",
         ))
 }
+async fn write_frame_until(
+    send: &mut SendStream,
+    body: &[u8],
+    deadline: std::time::Instant,
+) -> Result<()> {
+    if std::time::Instant::now() >= deadline {
+        return Err(Error::Profile(
+            "the computer exchange reached its causal convergence deadline",
+        ));
+    }
+    tokio::time::timeout_at(deadline.into(), write_frame(send, body))
+        .await
+        .map_err(|_| {
+            Error::Profile("the computer exchange reached its causal convergence deadline")
+        })??;
+    Ok(())
+}
 async fn frame_within(recv: &mut RecvStream, within: Duration) -> Result<Vec<u8>> {
     let f = read_frame_within(recv, MAX_FRAME, within)
         .await?
@@ -3181,9 +3305,10 @@ fn exchange(s: &State, peer: &Digest32) -> Result<Vec<u8>> {
         .filter(|(revision, _)| *revision == s.revision)
     {
         e.array(1)
-            .array(2)
+            .array(3)
             .uint(*revision)
-            .uint(u64::from(*repaired));
+            .uint(u64::from(*repaired))
+            .bytes(&policy_frontier(s)?);
     } else {
         e.array(0);
     }
@@ -3305,29 +3430,33 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     let missed = match count(&mut d)? {
         0 => None,
         1 => {
-            arity(&mut d, 2)?;
+            arity(&mut d, 3)?;
             let revision = d.uint()?;
             let repaired = match d.uint()? {
                 0 => false,
                 1 => true,
                 _ => return Err(bad()),
             };
-            Some((revision, repaired))
+            Some((revision, repaired, digest(&mut d)?))
         }
         _ => return Err(bad()),
     };
     d.finish()?;
     activate(s, signer)?;
-    if let Some((_sender_revision, repaired)) = missed {
-        // Revision numbers are local journal order. The marker describes the exact state carried
-        // by this payload; after its atomic merge, that state is this daemon's current revision.
-        let local_revision = s.revision;
-        let held = s
-            .missed_exchanges
-            .entry(peer)
-            .or_insert((local_revision, repaired));
-        if local_revision > held.0 || (local_revision == held.0 && repaired) {
-            *held = (local_revision, repaired);
+    if let Some((_sender_revision, repaired, sender_frontier)) = missed {
+        // Revision numbers are local journal order. Only an identical canonical policy frontier
+        // can translate the peer's marker onto this daemon's current local revision. A receiver
+        // with independent newer policy therefore cannot have that policy poisoned by an older
+        // remote miss.
+        if sender_frontier == policy_frontier(s)? {
+            let local_revision = s.revision;
+            let held = s
+                .missed_exchanges
+                .entry(peer)
+                .or_insert((local_revision, repaired));
+            if local_revision > held.0 || (local_revision == held.0 && repaired) {
+                *held = (local_revision, repaired);
+            }
         }
     }
     for (author, receipt) in receipts {
@@ -3343,6 +3472,38 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
         }
     }
     Ok(())
+}
+
+/// Stable identity of policy content shared by paired computers. Receipts and operational
+/// convergence markers are deliberately excluded: they are observations about this policy, not
+/// policy inputs. Local revision numbers are excluded because they are not distributed clocks.
+fn policy_frontier(s: &State) -> Result<Digest32> {
+    let group = s.group().ok_or_else(bad)?;
+    let mut e = Encoder::new();
+    e.array(3)
+        .bytes(
+            &s.genesis
+                .as_ref()
+                .or(s.group_genesis.as_ref())
+                .map(Enrollment::encode)
+                .unwrap_or_default(),
+        )
+        .bytes(
+            &s.pending
+                .as_ref()
+                .map(Enrollment::encode)
+                .unwrap_or_default(),
+        );
+    let current: Vec<_> = s
+        .history
+        .iter()
+        .filter(|(_, record)| record.event().ok().is_some_and(|v| v.group == group))
+        .collect();
+    e.array(current.len());
+    for (id, record) in current {
+        e.array(2).bytes(id).bytes(&record.signed.encode());
+    }
+    Ok(sha256(&e.finish()))
 }
 
 fn receipt_body(s: &State, revision: u64) -> Result<Vec<u8>> {

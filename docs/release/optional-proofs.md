@@ -153,6 +153,13 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 `update_proof`'s other test, `vox_update_replaces_an_install_it_owns_and_refuses_the_rest`, measures this build's refusals, record lookup, `--check` and `--rollback`, and is not optional.
 
+### Computer convergence journeys
+
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, a missed revision becomes ordinary trust, or a marker arriving after remote application fails to revoke the exact late-derived grant across restart. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
+
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 
 | Proof | Helps troubleshoot | Run | Needs | Time |

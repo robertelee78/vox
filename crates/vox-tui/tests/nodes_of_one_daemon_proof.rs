@@ -11,6 +11,7 @@
 //!    address its member holds, and they read each other again.
 
 #![allow(clippy::unwrap_used)]
+#![cfg_attr(not(feature = "optional-proofs"), allow(dead_code, unused_imports))]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -28,13 +29,24 @@ mod port_forward;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(
+    computer_pairing_uses_an_anchor_without_room_membership_and_reconnects,
+    two_paired_computers_that_are_idle_exchange_nothing,
+);
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+#[cfg(feature = "optional-proofs")]
 use vox_core::node::computer::{
-    computer_exchange_backoff, COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
-    COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED, COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
+    computer_exchange_backoff, COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED,
+};
+use vox_core::node::computer::{
+    COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN,
+    COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
 };
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
@@ -216,7 +228,10 @@ impl Daemon {
         }
         let child = c
             .stdin(Stdio::null())
-            .stdout(f.try_clone().unwrap())
+            .stdout(
+                f.try_clone()
+                    .expect("APPARATUS: clone scratch anchor transcript"),
+            )
             .stderr(f)
             .spawn()
             .unwrap();
@@ -1348,17 +1363,20 @@ fn close_expired_pairing() {
 /// that deadline; omitting the post-reservation supersession check lets a stale operator pairing
 /// survive the newer policy revision; requiring a retained peer connection strands the repair;
 /// discarding failed transport work means the remote anchor's return never causes registration;
-/// clearing a late success hides the missed contract before preview/restart.
+/// ignoring a marker-only authorization change leaves the causally staged grant in the shipped
+/// effective keyring; clearing a late success hides the missed contract before preview/restart.
 /// Each reaches a PRODUCT deadline/roster assertion, while inability to stage an exact race is
 /// APPARATUS.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "real binaries with production Argon2id; run in release"]
+#[ignore = "optional real binaries with production Argon2id; run in release with optional-proofs"]
 fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     watchdog::arm();
     test_knobs::require(&[
         "VOX_TEST_HOLD_FIRST_COMPUTER_EXCHANGE_FILE",
         "VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE",
         "VOX_TEST_HOLD_COMPUTER_OPERATOR_RESERVED_FILE",
+        "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
     ]);
     let anchor = Account::new();
     let a = Account::new();
@@ -1369,7 +1387,10 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         let child = anchor
             .cmd(&["node", "--listen", listen, "--serve", "anyone"])
             .stdin(Stdio::null())
-            .stdout(f.try_clone().unwrap())
+            .stdout(
+                f.try_clone()
+                    .expect("APPARATUS: clone scratch anchor transcript"),
+            )
             .stderr(f)
             .spawn()
             .expect("APPARATUS: start scratch anchor");
@@ -1386,8 +1407,13 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .map(str::trim)
         .find(|line| line.contains('@') && line.contains("/udp/"))
         .expect("APPARATUS: anchor address");
-    let (fp, addr) = spec.split_once('@').unwrap();
-    let port = addr.rsplit('/').next().unwrap();
+    let (fp, addr) = spec
+        .split_once('@')
+        .expect("APPARATUS: advertised anchor address had no identity separator");
+    let port = addr
+        .rsplit('/')
+        .next()
+        .expect("APPARATUS: advertised anchor address had no UDP port");
     let v4 = format!("{fp}@/ip4/127.0.0.1/udp/{port}");
     let v6 = format!("{fp}@/ip6/::1/udp/{port}");
     let anchor_listen = format!("[::]:{port}");
@@ -1420,6 +1446,15 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         operator_superseded.display(),
         operator_reserved_release.display()
     );
+    let answer_after_merge_arm = b.data.join("hold-computer-answer-after-merge");
+    let answer_after_merge_engaged = b.data.join("held-computer-answer-after-merge");
+    let answer_after_merge_release = b.data.join("release-computer-answer-after-merge.sock");
+    let answer_after_merge_spec = format!(
+        "{}\t{}\t{}",
+        answer_after_merge_arm.display(),
+        answer_after_merge_engaged.display(),
+        answer_after_merge_release.display()
+    );
     let start = |account: &Account, listen: &str, anchor: &str, env: &[(&str, &str)]| {
         let mut daemon = Daemon::start(
             account,
@@ -1445,13 +1480,23 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             ),
         ],
     );
-    let mut right = start(&b, "[::1]:0", &v6, &[]);
+    let mut right = start(
+        &b,
+        "[::1]:0",
+        &v6,
+        &[(
+            "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
+            &answer_after_merge_spec,
+        )],
+    );
     let invitation = computer(&a, &["invite"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: node-free computer invitation missing");
     let preview = computer(&b, &["pair", link, "--preview"]);
-    let op = preview["pairing"]["operation_id"].as_str().unwrap();
+    let op = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: pairing preview omitted its operation identity");
     computer(&a, &["approve", op]);
     computer(&b, &["approve", op]);
     loop {
@@ -1916,6 +1961,81 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&b, &["status"])
     );
 
+    // Principal FX-28 race: the answerer durably merges and applies this grant before its reply
+    // is allowed to leave. Shipped trust output must first show that effective grant. The
+    // initiator then names the missed causal revision; after releasing the exact parked answer,
+    // its later marker must revoke the already-published grant on the answerer. Mutant: ignore a
+    // marker-only change in `change_until`; the final effective-keyring assertion stays granted
+    // and turns PRODUCT red.
+    std::fs::write(&answer_after_merge_arm, b"armed")
+        .expect("APPARATUS: arm post-merge answer hold");
+    let applied_then_late = a.make_node("applied-before-late-marker");
+    let revision_before_applied_late = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "applied-before-late-marker",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(ok, "PRODUCT: attach post-merge-held node: {out}{err}");
+    let applied_late_revision = computer(&a, &["status"])["revision"]
+        .as_u64()
+        .filter(|revision| *revision > revision_before_applied_late)
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: attaching the post-merge-held node moved no policy revision")
+        });
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || answer_after_merge_engaged.is_file()),
+        "APPARATUS: answerer never reached the exact durable-merge-before-reply boundary; left {}; right {}; anchor {}",
+        computer(&a, &["status"]),
+        computer(&b, &["status"]),
+        relay.said()
+    );
+    let mut applied_grants = expected_bob_grants.to_vec();
+    applied_grants.push((applied_then_late.as_str(), "read"));
+    assert!(
+        wait_until(CHANGE_SHOWN_WITHIN, || {
+            exact_grants(&b, "after-remote-anchor-b", &applied_grants)
+        }),
+        "PRODUCT: the answerer merged revision {applied_late_revision} but its shipped effective keyring never showed the grant before the held reply: {}",
+        computer(&b, &["status"])
+    );
+    loop {
+        let left_status = computer(&a, &["status"]);
+        let application = application_toward(&a, &b_id);
+        if application["missed_revision"] == applied_late_revision
+            && application["convergence_state"] == "expired"
+        {
+            break;
+        }
+        assert!(
+            daemon_alive(left.child.id()) && daemon_alive(right.child.id()),
+            "APPARATUS: a daemon exited before shipped status named the post-merge held reply's missed revision: {left_status}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::os::unix::net::UnixStream::connect(&answer_after_merge_release)
+        .unwrap_or_else(|error| panic!("APPARATUS: release post-merge answer hold: {error}"));
+    loop {
+        let remote = application_toward(&b, &a_id);
+        if matches!(
+            remote["convergence_state"].as_str(),
+            Some("expired" | "repaired-late")
+        ) && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
+        {
+            break;
+        }
+        assert!(
+            anchor_currently_has(&relay, &[&a_id, &b_id]),
+            "APPARATUS: exact anchor registrations disappeared before the later marker's shipped effective-keyring verdict"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     // Exercise the late-repair branch itself. The anchor goes away, a real policy revision is
     // made, and shipped status—not a sleep—causally says that revision missed its retained
     // convergence deadline. After the exact anchor identities return, the late exchange repairs
@@ -2140,6 +2260,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         ("anchor-return-first", first.as_str()),
         ("anchor-return-second", second.as_str()),
         ("anchor-return-third", third.as_str()),
+        ("applied-before-late-marker", applied_then_late.as_str()),
         ("anchor-return-late", late.as_str()),
         ("after-expired-revision", replacement.as_str()),
         ("after-remote-anchor-b", bob.as_str()),
@@ -2148,6 +2269,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         (first.as_str(), "read"),
         (second.as_str(), "read"),
         (third.as_str(), "read"),
+        (applied_then_late.as_str(), "read"),
         (late.as_str(), "read"),
         (replacement.as_str(), "read"),
     ];
@@ -3264,8 +3386,9 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// PRODUCT red; (8) restore actor-tick policy application and bypass its current-revision guard:
 /// the idle binding-derived moments move and turn PRODUCT red. The stuck-node phase begins behind
 /// saturated backoff, so resetting either exchange or apply clocks turns its return bound red.
+#[cfg(feature = "optional-proofs")]
 #[test]
-#[ignore = "five minutes of two real vox daemons paired as computers; run in release"]
+#[ignore = "optional five minutes of two real vox daemons paired as computers; run in release with optional-proofs"]
 fn two_paired_computers_that_are_idle_exchange_nothing() {
     watchdog::arm();
     test_knobs::require(&[

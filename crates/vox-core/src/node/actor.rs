@@ -6900,21 +6900,19 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
-        self.prepare_computer_binding()?;
-        for attempt in 0..8 {
-            self.apply_computer_keyring_at(0)?;
+        let deadline =
+            std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        self.prepare_computer_binding_causal(deadline, &cancelled, true)?;
+        loop {
+            self.apply_computer_keyring_at_until(0, deadline, &cancelled)?;
             if self.computer.as_ref().is_none_or(|c| {
                 c.policy_current(
                     self.computer_revision
                         .load(std::sync::atomic::Ordering::Acquire),
-                )
+                ) || c.current_revision_expired()
             }) {
                 break;
-            }
-            if attempt == 7 {
-                return Err(Error::Profile(
-                    "computer policy is still changing; try Unlock again after it settles",
-                ));
             }
         }
         let Some(bind) = self.bind.as_ref() else {
@@ -10795,10 +10793,6 @@ impl Node {
                     }
                     Err(e) => Err(e),
                 };
-                if result.is_ok() {
-                    self.refresh_reachers().await;
-                    self.tend_drive_keys().await;
-                }
                 #[cfg(feature = "test-knobs")]
                 if let Some(delay) = reply_delay {
                     tokio::spawn(async move {
@@ -20408,6 +20402,25 @@ impl Node {
     /// Called whenever either input moves — the keyring (`Trust`/`Revoke`) or a channel's
     /// author set (any board admission) — and once per accept as a backstop.
     async fn refresh_reachers(&mut self) {
+        let _ = self.refresh_reachers_causal(None).await;
+    }
+
+    /// Recompute reachers for one computer-policy event. The event's absolute boundary is
+    /// checked after every await and immediately before each publication; crossing it empties
+    /// every registered computer gate instead of publishing late authority.
+    async fn refresh_reachers_until(
+        &mut self,
+        deadline: std::time::Instant,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> crate::error::Result<()> {
+        self.refresh_reachers_causal(Some((deadline, cancelled)))
+            .await
+    }
+
+    async fn refresh_reachers_causal(
+        &mut self,
+        causal: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+    ) -> crate::error::Result<()> {
         // A **locked** node is not a node that withdrew its trust. `lock` clears the keyring
         // because it is sealed under the identity (ADR-020 §3), so recomputing here would
         // produce an empty set and read as "everyone was withdrawn" — tearing down every live
@@ -20415,11 +20428,19 @@ impl Node {
         // about what this node can *read*, so live tunnels are left alone and the sets keep
         // their last values until the next unlock.
         if self.profile.is_none() {
-            return;
+            return Ok(());
         }
         let trusted = self.trust.trusted();
         for (cid, shared) in &self.channels {
             let ch = shared.lock().await;
+            if let Some((deadline, cancelled)) = causal {
+                if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+                    if let Some(computer) = &self.computer {
+                        computer.invalidate_reachers();
+                    }
+                    return Err(error);
+                }
+            }
             // (in this node's ring) AND (a current author of this room). Neither alone:
             // trust is room-independent so it cannot name the room, and membership is a
             // passphrase and a proof of work rather than a decision about a person.
@@ -20435,6 +20456,12 @@ impl Node {
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
             if let Some(computer) = &self.computer {
+                if let Some((deadline, cancelled)) = causal {
+                    if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+                        computer.invalidate_reachers();
+                        return Err(error);
+                    }
+                }
                 computer.publish_reachers(
                     slot,
                     next,
@@ -20466,8 +20493,17 @@ impl Node {
             }
             held
         });
+        if let Some((deadline, cancelled)) = causal {
+            if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+                if let Some(computer) = &self.computer {
+                    computer.invalidate_reachers();
+                }
+                return Err(error);
+            }
+        }
         // The app layer reads the same live sets, for both halves of its gate.
         self.app.set_reachers(&self.reachers);
+        Ok(())
     }
 
     /// Append the complete signed room set, preserving independent machine/other-room scopes.
