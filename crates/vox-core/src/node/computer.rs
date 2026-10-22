@@ -3080,7 +3080,13 @@ impl Computer {
         repaired: bool,
     ) -> Result<u64> {
         self.change_durable(|state| {
-            let pending = state.pending_exchanges.get(&peer).copied();
+            // A superseded older flight cannot consume or expire the newer operator cause which
+            // replaced its obligation before the scheduler cut it.
+            let pending = state
+                .pending_exchanges
+                .get(&peer)
+                .copied()
+                .filter(|cause| *cause <= revision);
             let retained = state
                 .missed_exchanges
                 .get(&peer)
@@ -3100,7 +3106,9 @@ impl Computer {
             if cause > held.0 || (cause == held.0 && repaired) {
                 *held = (cause, repaired);
             }
-            state.pending_exchanges.remove(&peer);
+            if pending.is_some() {
+                state.pending_exchanges.remove(&peer);
+            }
             Ok(cause)
         })
     }
