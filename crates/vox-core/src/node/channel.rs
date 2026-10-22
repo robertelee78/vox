@@ -46,50 +46,6 @@ fn key_package_for(entry: &Entry, recipient: &Digest32) -> bool {
         .is_some_and(|package| package.recipient == *recipient)
 }
 
-/// Test-only exact crash boundary for FX-30. The gate contains the expected
-/// `<author> <sender-generation>` pair. Only the newly persisted receiver chain matching that
-/// exact pair marks `<gate-with-extension-reached>` and waits, after the ruled key commit and
-/// before its caller can reach a later generic received flush. Compiled out of packaged binaries.
-#[cfg(feature = "test-knobs")]
-fn hold_after_received_key_commit(store: &Store, author: &Digest32, generation: u64) {
-    let Some(gate) = std::env::var_os("VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE") else {
-        return;
-    };
-    let gate = std::path::PathBuf::from(gate);
-    let Ok(armed) = std::fs::read_to_string(&gate) else {
-        return;
-    };
-    let exact = format!("{} {generation}", crate::node::link::b32_encode(author));
-    if armed.trim() != exact {
-        return;
-    }
-    if store.any_received_debt() {
-        let fault = gate.with_extension("fault");
-        let _ = std::fs::write(
-            &fault,
-            "another receive flow still owned durability debt at the key boundary\n",
-        );
-        return;
-    }
-    let reached = gate.with_extension("reached");
-    if let Err(error) = std::fs::write(&reached, format!("{exact}\n")) {
-        let _ = std::fs::write(
-            gate.with_extension("fault"),
-            format!(
-                "could not mark the received-key crash boundary at {}: {error}\n",
-                reached.display()
-            ),
-        );
-        return;
-    }
-    while gate.exists() {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-#[cfg(not(feature = "test-knobs"))]
-fn hold_after_received_key_commit(_store: &Store, _author: &Digest32, _generation: u64) {}
-
 #[cfg(feature = "test-knobs")]
 fn mutant_received_key_not_durable() -> bool {
     std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("received-key-not-durable")
@@ -6336,8 +6292,8 @@ impl ChannelState {
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
         let received = ReceivedFlow::new(self.channel_id);
-        let mut out = self.absorb_arrived(store, &before, now_ms, &received)?;
-        if let Some(debt) = received.take() {
+        let mut out = received.scope(|| self.absorb_arrived(store, &before, now_ms, &received))?;
+        if let Some(debt) = received.debt(store)? {
             store.flush_received_through(debt)?;
         }
         if let Ok(n) = session {
@@ -6881,7 +6837,9 @@ impl ChannelState {
             out: std::cell::RefCell::new(SyncOutcome::default()),
             fatal: std::cell::RefCell::new(None),
         };
-        let session = crate::log::sync::frontier_session_room(transport, &room);
+        let session = room
+            .received
+            .scope(|| crate::log::sync::frontier_session_room(transport, &room));
         // Whatever arrived without a signature and was never chained to a signed entry is not
         // authentic; it was never persisted, and it is taken back here on every path out of the
         // session (ADR-023 decision 3).
@@ -6899,26 +6857,29 @@ impl ChannelState {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             };
             if let Some(mut ch) = guard.filter(|ch| ch.sek.key_bytes().is_ok()) {
-                let cleanup = if let Some(request) = legacy {
-                    if let Ok(Some(state)) = ch.legacy_provisional_state(store) {
-                        room.out.borrow_mut().legacy_next = Some(state.tail_seq.saturating_add(1));
-                        room.out.borrow_mut().legacy_pending = state.pending_witness != 0
-                            || ch
-                                .legacy_publication_progress(store, request.owner)
-                                .ok()
-                                .flatten()
-                                .is_some();
+                let cleanup = room.received.scope(|| {
+                    if let Some(request) = legacy {
+                        if let Ok(Some(state)) = ch.legacy_provisional_state(store) {
+                            room.out.borrow_mut().legacy_next =
+                                Some(state.tail_seq.saturating_add(1));
+                            room.out.borrow_mut().legacy_pending = state.pending_witness != 0
+                                || ch
+                                    .legacy_publication_progress(store, request.owner)
+                                    .ok()
+                                    .flatten()
+                                    .is_some();
+                        }
+                        ch.finish_legacy_sync(store, request).map(|()| 0)
+                    } else {
+                        match ch.legacy_provisional_state(store) {
+                            // A current session may finish between explicit recovery's lock
+                            // slices. It never owns that attached suffix or its durable spool.
+                            Ok(Some(_)) => Ok(0),
+                            Ok(None) => ch.discard_unverified(store),
+                            Err(error) => Err(error),
+                        }
                     }
-                    ch.finish_legacy_sync(store, request).map(|()| 0)
-                } else {
-                    match ch.legacy_provisional_state(store) {
-                        // A current session may finish between explicit recovery's lock
-                        // slices. It never owns that attached suffix or its durable spool.
-                        Ok(Some(_)) => Ok(0),
-                        Ok(None) => ch.discard_unverified(store),
-                        Err(error) => Err(error),
-                    }
-                };
+                });
                 match cleanup {
                     Ok(_) => {}
                     Err(error) => {
@@ -6929,7 +6890,14 @@ impl ChannelState {
                 }
             }
         }
-        if let Some(debt) = room.received.take() {
+        let debt = match room.received.debt(store) {
+            Ok(debt) => debt,
+            Err(error) => {
+                *room.fatal.borrow_mut() = Some(error);
+                None
+            }
+        };
+        if let Some(debt) = debt {
             if let Err(error) = store.flush_received_through(debt) {
                 *room.fatal.borrow_mut() = Some(error);
             }
@@ -6982,6 +6950,7 @@ impl ChannelState {
             if widened {
                 let saved = (|| -> Result<()> {
                     let mut batch = store.batch()?;
+                    batch.ruled();
                     self.queue_receivers(&mut batch)?;
                     let mut writer = self
                         .entries
@@ -7007,6 +6976,7 @@ impl ChannelState {
         // retry ciphertext accepted before the key arrived.
         let queued = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.received_key_boundary(author, chain_id, !mutant_received_key_not_durable());
             self.queue_receivers(&mut batch)?;
             {
                 let mut writer = self
@@ -7022,7 +6992,6 @@ impl ChannelState {
             return Err(error);
         }
         self.entries.committed();
-        hold_after_received_key_commit(store, &author, chain_id);
         self.drain_backfill(store, now_ms)
     }
 
@@ -8175,14 +8144,9 @@ impl ChannelState {
 
     /// Queue the receiver chains, as they stand now, into `batch`.
     fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
-        // Other members' sender keys and the drive keys: keys are flushed (ADR-038 FX-30).
-        if mutant_received_key_not_durable() {
-            // Isolated FX-30 proof mutant: remove only receiver-key durability. This branch is
-            // compiled out of packaged builds and must make the received-key crash assertion red.
-            batch.derived();
-        } else {
-            batch.ruled();
-        }
+        // Persist the current receiver state in the caller's transaction. A newly accepted key
+        // marks that exact transaction ruled at `received_key_boundary`; ordinary chain/cursor
+        // advances remain part of their receive flow and are flushed once before its ACK.
         let receivers_seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,

@@ -1646,10 +1646,13 @@ impl Receiver {
         F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
     {
         let grant = self.grant();
+        let received = self.received.clone();
         self.source
             .read(job, envelope, move |room, store| {
-                grant.check(room, store)?;
-                read(room, store)
+                received.scope(|| {
+                    grant.check(room, store)?;
+                    read(room, store)
+                })
             })
             .await
     }
@@ -1665,10 +1668,13 @@ impl Receiver {
         F: FnOnce(&mut ChannelState, &Store, &Record) -> Result<Option<T>> + Send + 'static,
     {
         let grant = self.grant();
+        let received = self.received.clone();
         self.source
             .read_precharged(job, envelope, record, move |room, store, record| {
-                grant.check(room, store)?;
-                read(room, store, record)
+                received.scope(|| {
+                    grant.check(room, store)?;
+                    read(room, store, record)
+                })
             })
             .await
     }

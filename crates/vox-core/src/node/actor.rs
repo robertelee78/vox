@@ -19686,49 +19686,6 @@ impl Node {
         self.offer_own_head(channel_id, own_hint, own_targets);
     }
 
-    /// Flush the exact durability debt detached from one receive flow, off the actor. A queued
-    /// worker whose epoch was already covered returns without adopting newer store-global debt;
-    /// a flow that received nothing never calls this at all (ADR-038 FX-30).
-    fn flush_received_off_actor(
-        &self,
-        debt: crate::node::store::ReceivedDebt,
-        room: Digest32,
-        peer: Digest32,
-    ) {
-        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
-            return;
-        };
-        tokio::task::spawn_blocking(move || {
-            #[cfg(not(feature = "test-knobs"))]
-            let _ = (room, peer);
-            #[cfg(feature = "test-knobs")]
-            if let Some(gate) = std::env::var_os("VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE") {
-                let gate = std::path::PathBuf::from(gate);
-                let exact = format!(
-                    "{} {}",
-                    crate::node::link::b32_encode(&room),
-                    crate::node::link::b32_encode(&peer)
-                );
-                if std::fs::read_to_string(&gate).is_ok_and(|armed| armed.trim() == exact) {
-                    let reached = gate.with_extension("reached");
-                    if let Err(error) = std::fs::write(&reached, format!("{exact}\n")) {
-                        eprintln!(
-                            "APPARATUS: could not mark the received-flow flush boundary at {}: {error}",
-                            reached.display()
-                        );
-                        return;
-                    }
-                    while gate.exists() {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-            }
-            if let Err(e) = store.flush_received_through(debt) {
-                eprintln!("vox: the store could not flush received entries to disk: {e}");
-            }
-        });
-    }
-
     /// Record what lane rounds learned about how far each peer holds this node's own feed
     /// (ADR-028 R-6): the evidence that lets the settlement tick stop asking a peer that
     /// already holds the own head (ADR-038 FX-15).
@@ -20246,11 +20203,6 @@ impl Node {
             .unwrap_or_default();
         let mut report = StatusReport {
             now,
-            store: self
-                .profile
-                .as_ref()
-                .map(|p| p.store().counts())
-                .unwrap_or_default(),
             log_path: self.paths.account().log_file().display().to_string(),
             refusals: self.decisions.recent(
                 crate::node::decisions::REFUSALS_SHOWN,

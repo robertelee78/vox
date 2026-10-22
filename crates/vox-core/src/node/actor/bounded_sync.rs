@@ -345,9 +345,19 @@ impl Controller {
             // bounded reopen recovery owns any durable cursor/publication still present.
             // Memory admission may still be held by a fenced actual worker. Keep this
             // owner until a later bounded slice observes the erased key.
-            if matches!(flow.retire_slice().await, Ok(false)) {
-                self.retiring.push_back(flow);
-                tokio::task::yield_now().await;
+            match flow.retire_slice().await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.retiring.push_back(flow);
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    // Shutdown cannot discard the sole owner of received durability debt. Keep
+                    // the flow and retry its exact settlement; no unrelated writer may carry it.
+                    eprintln!("vox: history shutdown settlement is pending: {error}");
+                    self.retiring.push_back(flow);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
     }
@@ -559,12 +569,6 @@ impl Node {
             let Some(mut returned) = returned else {
                 continue;
             };
-            // Detach only the debt created by this exact returned flow slice. Do this before
-            // any route, retry or disposal branch so every successful receive owns its flush,
-            // while an empty slice owns none and cannot flush another lane's write (FX-30).
-            if let Some(debt) = returned.flow.take_received_debt() {
-                self.flush_received_off_actor(debt, work.room, work.peer);
-            }
             let Some(work) = self.bounded_sync.running[index].take() else {
                 self.dispose_rearming_hint(returned.flow);
                 continue;

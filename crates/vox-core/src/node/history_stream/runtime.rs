@@ -12,7 +12,7 @@ use crate::node::channel::entry_store::sparse::LiveWindow;
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
-use crate::node::store::{ReceivedDebt, ReceivedFlow, Store};
+use crate::node::store::{ReceivedFlow, Store};
 use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -492,6 +492,10 @@ impl Flow {
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
     pub(crate) async fn retire_slice(&mut self) -> Result<bool> {
+        // Retirement, cancellation and shutdown retain this flow until its exact received debt
+        // is durable. A failed flush leaves both the owner and the flow queued for another slice.
+        self.settle_received(Arc::clone(&self.cleanup_store))
+            .await?;
         if !self.initialized {
             self.cancel();
             return Ok(true);
@@ -624,8 +628,57 @@ impl Flow {
         )
     }
 
-    pub(crate) fn take_received_debt(&self) -> Option<ReceivedDebt> {
-        self.received.take()
+    async fn settle_received(&self, store: Arc<Store>) -> Result<()> {
+        let Some(debt) = self.received.debt(&store)? else {
+            return Ok(());
+        };
+        let room = self.room;
+        let peer = self.peer;
+        tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "test-knobs")]
+            if let Some(gate) = std::env::var_os("VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE") {
+                let gate = std::path::PathBuf::from(gate);
+                let exact = format!(
+                    "{} {}",
+                    crate::node::link::b32_encode(&room),
+                    crate::node::link::b32_encode(&peer)
+                );
+                if std::fs::read_to_string(&gate).is_ok_and(|armed| {
+                    let mut fields = armed.split_whitespace();
+                    let mut expected = exact.split_whitespace();
+                    fields.next() == expected.next() && fields.next() == expected.next()
+                }) {
+                    let reached = gate.with_extension("reached");
+                    if let Err(error) =
+                        std::fs::write(&reached, format!("{exact} {}\n", debt.transaction()))
+                    {
+                        let _ = std::fs::write(
+                            gate.with_extension("fault"),
+                            format!(
+                                "could not mark the received-flow transaction at {}: {error}\n",
+                                reached.display()
+                            ),
+                        );
+                        return Err(Error::Storage {
+                            op: "mark received-flow boundary",
+                            detail: error.to_string(),
+                        });
+                    }
+                    while gate.exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+            store
+                .flush_received_through_with(
+                    debt,
+                    |_| Ok(true),
+                    |debt| crate::node::store::hold_after_received_flow_flush(debt, room, peer),
+                )
+                .map(|_| ())
+        })
+        .await
+        .map_err(|_| Error::Unreachable("history received flush worker stopped"))?
     }
     fn binding(&self) -> Binding {
         Binding {
@@ -664,7 +717,7 @@ impl Flow {
         // serving three joiners at once read their first posts after 30 s (#934).
         let started = tokio::time::Instant::now();
         let mut slices = 0u32;
-        let result = loop {
+        let mut result = loop {
             let result = self
                 .turn_inner(
                     store.clone(),
@@ -701,7 +754,7 @@ impl Flow {
             )
         }) {
             self.authorization_changed = true;
-            return Ok(());
+            result = Ok(());
         }
         if self.owners.iter().any(Option::is_some)
             && self.waiting
@@ -710,7 +763,7 @@ impl Flow {
         {
             self.no_progress = self.no_progress.saturating_add(1);
             if self.no_progress >= 3 {
-                return Err(Error::Unreachable(
+                result = Err(Error::Unreachable(
                     "current work repeatedly busy; retiring its body slot",
                 ));
             }
@@ -718,6 +771,13 @@ impl Flow {
             // A successful metadata/local slice or durable body chunk is progress. Retain
             // its exact body slot across progressing multi-quantum current entries.
             self.no_progress = 0;
+        }
+        // A successful partial turn keeps this exact owner inside the returned Flow, allowing a
+        // sparse source and its later semantic effect to share one durability debt. Every path
+        // which stops carrying the flow forward settles first; a failure keeps the Flow owned by
+        // retirement, which retries this same debt instead of lending it to a later transaction.
+        if result.is_err() || self.authorization_changed || self.done() {
+            self.settle_received(store).await?;
         }
         result
     }

@@ -786,6 +786,10 @@ impl ChannelState {
             Err(error) => return Err(error),
         }
         let mut batch = store.received_batch(received)?;
+        // The source transaction owns this entry's one received durability debt. Its semantic
+        // indexes/rendering rebuild from that durable source after a crash; only a governance or
+        // key-package effect below upgrades this batch to independently ruled durability.
+        batch.derived();
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;

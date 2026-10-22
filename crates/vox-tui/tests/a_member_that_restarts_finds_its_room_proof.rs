@@ -74,14 +74,14 @@
 //!   which the design flushes before). Alice is frozen so she cannot re-offer it, then his daemon
 //!   is killed; back on his port his room is open, he reads it, and his trust and alice's key are
 //!   there. Carol: (6) trusted before alice's [`CRASH_BACKLOG`] posts, she joins cold; once her
-//!   read shows some of them and not all and her store has flushed since the join, her daemon is
-//!   frozen (SIGSTOP, `ps` state `T`), her data root copied, her daemon resumed and killed; with
-//!   alice frozen a daemon started from the copy on carol's port opens the room, lists some of
-//!   the posts and not all (else the image was not mid-fetch: APPARATUS), none twice, alice's
-//!   trust and key; alice resumed, and before the proof's apparatus watchdog it shows every post
-//!   exactly once, the cursors and heads the copy lost rebuilt from her. A copy of a frozen process is a crash
-//!   image: redb advances its on-disk commit slot only on a flushed commit, so what was
-//!   committed without one is absent from the copy as it is after a power loss. Independent
+//!   read shows some of them and not all, the exact receive owner marks its post-flush boundary
+//!   while still holding the store writer. Her daemon is frozen there (SIGSTOP, `ps` state `T`),
+//!   her data root copied, her daemon resumed and killed; with alice frozen a daemon started from
+//!   the copy on carol's port opens the room, lists some of the posts and not all (else the image
+//!   was not mid-fetch: APPARATUS), none twice, alice's trust and key; alice resumed, and before
+//!   the proof's apparatus watchdog it shows every post exactly once, the cursors and heads the
+//!   copy lost rebuilt from her. The marker is causal apparatus, not a store counter or PRODUCT
+//!   proxy: the verdict is only the rows shown by shipped `vox`. Independent
 //!   mutations make the trust, Session, received key, own-entry and acknowledged-received-entry
 //!   durability promises red at (1), (2), (3), (4) and (5), respectively; each mutation changes
 //!   only the persistence path for the promise whose product assertion it must trip. The two
@@ -633,6 +633,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "VOX_TEST_NO_NEARBY",
         "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
         "VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE",
+        "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
         "VOX_TEST_FX30_MUTANT",
     ]);
     let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
@@ -641,6 +642,9 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     let key_fault = key_hold.with_extension("fault");
     let received_flush_hold = t.path().join("hold-received-flow-flush");
     let received_flush_reached = received_flush_hold.with_extension("reached");
+    let received_ack_reached = received_flush_hold.with_extension("ack-reached");
+    let durable_flow_hold = t.path().join("hold-after-received-flow-flush");
+    let durable_flow_reached = durable_flow_hold.with_extension("reached");
     let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
     let mutant = std::env::var("VOX_FX30_MUTANT").ok();
     assert!(
@@ -776,8 +780,8 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     while !key_reached.exists() {
         if key_fault.exists() {
             panic!(
-                "APPARATUS: the received-key boundary still had earlier receive-flow debt, so a \
-                 queued owner could carry the mutant: {}",
+                "APPARATUS: the exact received-key transaction committed, but its crash-boundary \
+                 marker could not be published while that transaction still owned the writer: {}",
                 std::fs::read_to_string(&key_fault).unwrap_or_default()
             );
         }
@@ -795,12 +799,17 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     let marked_generation = marker_fields
         .next()
         .and_then(|generation| generation.parse::<u64>().ok());
+    let marked_transaction = marker_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
     assert!(
         marked_author == bob_fp
             && marked_generation == Some(expected_generation)
+            && marked_transaction.is_some_and(|transaction| transaction > 0)
             && marker_fields.next().is_none(),
         "APPARATUS: the received-key boundary was not bob's exact sender generation: \
-         expected {bob_fp} generation {expected_generation}, got {marker:?}"
+         expected {bob_fp} generation {expected_generation} and one nonzero transaction, got \
+         {marker:?}"
     );
     // Bob has made exactly his first sender generation; no other peer has posted to Alice. The
     // independently delivered post may still be behind the held room mutex, so this crash
@@ -854,9 +863,29 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
 
     // ---- (5) a post bob's node said it holds, last before bob's SIGKILL ------------------------
     let exact_received_flow = format!("{room} {alice_fp}");
-    std::fs::write(&received_flush_hold, format!("{exact_received_flow}\n"))
-        .expect("APPARATUS: cannot arm bob's exact receive-flow flush boundary");
+    // Stop Bob before Alice commits the post, so no inventory or head response can acknowledge
+    // it before the gate carries that row's exact shipped entry id.
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
     post(&alice, &room, "acked");
+    let local_at = Instant::now();
+    let acked_entry = loop {
+        if let Some((_, _, entry)) = held_on(&alice, &room, "acked") {
+            break entry;
+        }
+        assert!(
+            local_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: alice's accepted `acked` post did not appear in her shipped read, so its \
+             exact acknowledgement boundary could not be armed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::write(
+        &received_flush_hold,
+        format!("{exact_received_flow} {acked_entry}\n"),
+    )
+    .expect("APPARATUS: cannot arm bob's exact received-entry acknowledgement boundary");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
     let flow_staged_at = Instant::now();
     while !received_flush_reached.exists() {
         assert!(
@@ -868,15 +897,24 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     }
     let marked_flow = std::fs::read_to_string(&received_flush_reached)
         .expect("APPARATUS: cannot read bob's received-flow flush marker");
-    assert_eq!(
-        marked_flow.trim(),
-        exact_received_flow,
-        "APPARATUS: the parked received-flow flush belonged to another room or peer"
+    let mut flow_fields = marked_flow.split_whitespace();
+    let flow_room = flow_fields.next().unwrap_or_default();
+    let flow_peer = flow_fields.next().unwrap_or_default();
+    let flow_transaction = flow_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        flow_room == room
+            && flow_peer == alice_fp
+            && flow_transaction.is_some_and(|transaction| transaction > 0)
+            && flow_fields.next().is_none(),
+        "APPARATUS: the parked received-flow flush was not alice's exact nonzero transaction in \
+         this room: expected `{exact_received_flow} <transaction>`, got {marked_flow:?}"
     );
     let asked = Instant::now();
     let held_on_bob = loop {
         match held_on(&alice, &room, "acked") {
-            Some((held, _)) if held >= 1 => break asked.elapsed(),
+            Some((held, _, entry)) if held >= 1 && entry == acked_entry => break asked.elapsed(),
             seen => {
                 assert!(
                     asked.elapsed() < APPARATUS_WATCHDOG,
@@ -892,6 +930,29 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
             }
         }
     };
+    let ack_marker = std::fs::read_to_string(&received_ack_reached).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: alice observed bob's acknowledgement, but its exact durability-boundary \
+             marker was absent: {error}"
+        )
+    });
+    let mut ack_fields = ack_marker.split_whitespace();
+    let ack_room = ack_fields.next().unwrap_or_default();
+    let ack_peer = ack_fields.next().unwrap_or_default();
+    let ack_transaction = ack_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    let ack_boundary = ack_fields.next().unwrap_or_default();
+    assert!(
+        ack_room == room
+            && ack_peer == alice_fp
+            && ack_transaction == flow_transaction
+            && ack_boundary == acked_entry
+            && ack_fields.next().is_none(),
+        "APPARATUS: bob's shipped acknowledgement was not causally bound to the exact parked \
+         transaction and alice post: fallback {marked_flow:?}, acknowledgement {ack_marker:?}, \
+         row entry {acked_entry:?}"
+    );
     let bobs_keys = received_key_generations(&bob, &room);
     // The exact flow-owned fallback remains parked. Freeze Alice before Bob dies so neither a
     // resend nor a different lane can replace the acknowledgement whose durability is asserted.
@@ -942,33 +1003,54 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     for i in 1..=CRASH_BACKLOG {
         post(&alice, &room, &format!("post {i}"));
     }
+    let exact_carol_flow = format!("{room} {alice_fp}");
+    let carol_env = vec![
+        ("VOX_TEST_NO_NEARBY", "1".to_owned()),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+            durable_flow_hold.to_string_lossy().into_owned(),
+        ),
+    ];
     let carol_d = daemon(
         &carol,
         "carol",
         &format!("{IDENTITY}\n"),
         "127.0.0.1:0",
-        &unheard,
+        &carol_env,
     );
     let carol_at = listening(&carol);
     join(&alice, &carol, &room);
+    // Arm only after `vox room join` returns: the boundary is for the background history fetch,
+    // never a writer that the join command itself still needs in order to answer.
+    std::fs::write(&durable_flow_hold, format!("{exact_carol_flow}\n"))
+        .expect("APPARATUS: cannot arm carol's post-flush receive-flow boundary");
     let joined = Instant::now();
-    // Counted once the join has returned: the join's own flushed commits are behind it, and
-    // what the fetch brings is flushed at the end of each round that received something.
-    let flushes_at_join = flushes_of(&carol);
-    // Caught under way, with part of it on disk: her read shows some of the backlog and not
-    // all, and her store has flushed since the join (a round that received something ended).
-    let (partial, flushed) = loop {
+    // Caught under way at an exact owner boundary: the marker is written after that owner's
+    // flush commits and while it still holds the writer, so the copied bytes contain the shown
+    // prefix and no later flow or ordinary writer can change the image before SIGSTOP.
+    let (partial, durable_transaction) = loop {
         let n = holds(&read(&carol, &room), "post", CRASH_BACKLOG);
-        let flushed = flushes_of(&carol);
-        if (1..CRASH_BACKLOG).contains(&n) && flushed > flushes_at_join {
-            break (n, flushed - flushes_at_join);
+        let marker = std::fs::read_to_string(&durable_flow_reached).ok();
+        let transaction = marker.as_deref().and_then(|marker| {
+            let mut fields = marker.split_whitespace();
+            let marked_room = fields.next()?;
+            let marked_peer = fields.next()?;
+            let transaction = fields.next()?.parse::<u64>().ok()?;
+            (marked_room == room
+                && marked_peer == alice_fp
+                && transaction > 0
+                && fields.next().is_none())
+            .then_some(transaction)
+        });
+        if (1..CRASH_BACKLOG).contains(&n) && transaction.is_some() {
+            break (n, transaction.unwrap_or_default());
         }
         assert!(
             joined.elapsed() < APPARATUS_WATCHDOG,
             "APPARATUS: staging not achieved: before {APPARATUS_WATCHDOG:?} after her join carol's \
-             read never showed some but not all of the {CRASH_BACKLOG} posts with a flush since \
-             the join (last: {n} posts, {} flushes), so no copy could be taken mid-fetch",
-            flushed - flushes_at_join
+             read never showed some but not all of the {CRASH_BACKLOG} posts at alice's exact \
+             post-flush receive-flow boundary (last: {n} posts, marker {marker:?}), so no causal \
+             copy could be taken mid-fetch"
         );
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -978,9 +1060,11 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     copy_dir(&carol, &copy);
     signal(pid, rustix::process::Signal::CONT, false);
     drop(carol_d);
+    std::fs::remove_file(&durable_flow_hold)
+        .expect("APPARATUS: cannot release carol's durable receive-flow boundary after SIGKILL");
     println!(
         "[proof] (6) carol's data root copied {:?} after her join after the kernel reported her stopped, \
-         {partial} of {CRASH_BACKLOG} posts read and {flushed} flush(es) since the join",
+         {partial} of {CRASH_BACKLOG} posts read at exact durable transaction {durable_transaction}",
         joined.elapsed()
     );
     // Alice frozen while the copy's daemon reads what it holds: no row or key can come from her.
@@ -1247,16 +1331,6 @@ fn received_key_generations(dir: &Path, room: &str) -> u64 {
         .unwrap_or_else(|| panic!("PRODUCT: `vox status --json` does not count received key generations for the room {room}: {v}"))
 }
 
-/// How many commits `dir`'s store has flushed to disk since its daemon started (`store.flushes`).
-fn flushes_of(dir: &Path) -> u64 {
-    let v = status_json(dir);
-    v["store"]["flushes"].as_u64().unwrap_or_else(|| {
-        panic!(
-            "PRODUCT: `vox status --json` does not count the store's flushes (ADR-038 FX-30): {v}"
-        )
-    })
-}
-
 /// One run of the shipped harness hook (`vox agent hook`) for `dir`'s node in `room`, fed a
 /// Claude Code `UserPromptSubmit` event: it opens the node's Session in the room.
 fn hook(dir: &Path, room: &str, work: &Path, prompt: &str) {
@@ -1299,7 +1373,7 @@ fn hook(dir: &Path, room: &str, work: &Path, prompt: &str) {
 /// `vox room read --json` of `room` as `dir`: the own row with `text`'s `held`/`others` footer
 /// (ADR-028 R-6, on how many other members' nodes it is held), `None` while the row or its
 /// footer is not shown.
-fn held_on(dir: &Path, room: &str, text: &str) -> Option<(u64, u64)> {
+fn held_on(dir: &Path, room: &str, text: &str) -> Option<(u64, u64, String)> {
     let (ok, out, _) = vox(
         dir,
         &["room", "read", room, "--json", "--limit", "64"],
@@ -1311,7 +1385,13 @@ fn held_on(dir: &Path, room: &str, text: &str) -> Option<(u64, u64)> {
     out.lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find(|row| row["text"].as_str() == Some(text))
-        .and_then(|row| Some((row["held"].as_u64()?, row["others"].as_u64()?)))
+        .and_then(|row| {
+            Some((
+                row["held"].as_u64()?,
+                row["others"].as_u64()?,
+                row["entry_hash"].as_str()?.to_owned(),
+            ))
+        })
 }
 
 /// (d) — see the module doc.

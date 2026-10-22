@@ -27,8 +27,8 @@
 //! the node schedules it after pruning (ADR-016 §Consequences).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -203,103 +203,133 @@ fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
     }
 }
 
-/// What a store has committed since it was opened, for `vox status` (ADR-038 FX-30).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StoreCounts {
-    /// Write transactions committed, at any durability.
-    pub commits: u64,
-    /// Of those, the ones flushed to disk (redb `Durability::Immediate`, one `F_FULLFSYNC`
-    /// each): the ruled set's commits and the flushes that carry received entries.
-    pub flushes: u64,
+#[derive(Debug)]
+struct ReceivedOwner {
+    room: Digest32,
 }
 
-/// The store's running counts, for `vox status`.
-#[derive(Default)]
-struct Counting {
-    /// Even while the published pair is stable, odd while its one writer publishes it.
-    sequence: AtomicU64,
-    commits: AtomicU64,
-    flushes: AtomicU64,
+/// One exact flow's consecutive received transactions. Pointer identity distinguishes two lanes
+/// in the same room. `fenced` freezes the exact last transaction included in a head/inventory
+/// snapshot: no later transaction, even from this owner, can join it before settlement.
+struct PendingReceived {
+    owner: Arc<ReceivedOwner>,
+    through: u64,
+    fenced: bool,
 }
 
-impl Counting {
-    fn committed(&self, flushed: bool) {
-        // Store writes are already serialized by `Store::writer`; this sequence only makes the
-        // two counters one coherent, nonblocking status snapshot.
-        self.sequence.fetch_add(1, Ordering::AcqRel);
-        self.commits.fetch_add(1, Ordering::Relaxed);
-        if flushed {
-            self.flushes.fetch_add(1, Ordering::Relaxed);
-        }
-        self.sequence.fetch_add(1, Ordering::Release);
-    }
-
-    fn snapshot(&self) -> StoreCounts {
-        loop {
-            let before = self.sequence.load(Ordering::Acquire);
-            if before & 1 != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let counts = StoreCounts {
-                commits: self.commits.load(Ordering::Relaxed),
-                flushes: self.flushes.load(Ordering::Relaxed),
-            };
-            if self.sequence.load(Ordering::Acquire) == before {
-                return counts;
-            }
-        }
-    }
-}
-
-/// Whether a received entry committed without a flush is still waiting for one (ADR-038
-/// FX-30), as two epochs under the store's writer mutex: a Received commit raises `received`
-/// once its transaction has committed, and a flushed commit sets `flushed` to `received` once
-/// it is durable, both while the mutex is held, so a flush covers exactly the Received commits
-/// before it and no two callers flush one epoch. Pending = received > flushed. A reader of the
-/// epochs takes the mutex too, so it never runs between a commit and its mark.
 #[derive(Default)]
 struct Epochs {
-    received: u64,
-    flushed: u64,
-    received_room: Option<Digest32>,
-    /// The received epoch copied into an installed fresh database whose directory entry has not
+    /// Identity for every transaction. Exhaustion is rejected before commit, never after it.
+    next_transaction: u64,
+    pending: Option<PendingReceived>,
+    /// A database replacement whose directory entry has not
     /// yet been synced. This debt survives reopen or directory-sync failure and gates every
     /// later write and acknowledgement until the exact replacement becomes durable.
-    replacement: Option<u64>,
+    replacement: bool,
 }
 
-/// The exact store epoch created by one receive flow. It is deliberately scalar: a queued
-/// worker may finish this debt, but may never adopt a later flow's debt merely because it uses
-/// the same store (ADR-038 FX-30).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReceivedDebt(u64);
+/// An exact room/flow/transaction durability obligation. A stale token is a no-op; it can never
+/// adopt a later flow's bytes merely because both use the same store.
+#[derive(Debug, Clone)]
+pub(crate) struct ReceivedDebt {
+    owner: Arc<ReceivedOwner>,
+    through: u64,
+}
+
+impl ReceivedDebt {
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn transaction(&self) -> u64 {
+        self.through
+    }
+}
+
+/// Hold one exact receive owner's post-durability boundary for a crash-image proof. The gate
+/// contains `<room> <peer>`; the marker adds the exact transaction identity. This callback is
+/// invoked while the store still holds its writer after the flush commit, so neither another
+/// receive flow nor an ordinary writer can add bytes before the apparatus stops the process.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn hold_after_received_flow_flush(
+    debt: &ReceivedDebt,
+    room: Digest32,
+    peer: Digest32,
+) -> Result<()> {
+    let Some(gate) = std::env::var_os("VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE") else {
+        return Ok(());
+    };
+    let gate = PathBuf::from(gate);
+    let exact = format!(
+        "{} {}",
+        crate::node::link::b32_encode(&room),
+        crate::node::link::b32_encode(&peer)
+    );
+    if !std::fs::read_to_string(&gate).is_ok_and(|armed| armed.trim() == exact) {
+        return Ok(());
+    }
+    let reached = gate.with_extension("reached");
+    std::fs::write(&reached, format!("{exact} {}\n", debt.transaction())).map_err(|error| {
+        Error::Storage {
+            op: "mark durable received-flow boundary",
+            detail: error.to_string(),
+        }
+    })?;
+    while gate.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) fn hold_after_received_flow_flush(
+    _debt: &ReceivedDebt,
+    _room: Digest32,
+    _peer: Digest32,
+) -> Result<()> {
+    Ok(())
+}
 
 /// Shared ownership of the Received commits made by one bounded flow. Clones belong to that
-/// flow's receiver handoffs only. Taking the debt detaches exactly the epochs already committed;
-/// a later handoff records a new debt for the next return to the actor.
+/// flow's receiver handoffs only. A successful partial turn carries this owner forward; a final,
+/// failed or retired turn fences and settles exactly its transactions.
 #[derive(Debug, Clone)]
 pub(crate) struct ReceivedFlow {
-    room: Digest32,
-    through: Arc<AtomicU64>,
+    owner: Arc<ReceivedOwner>,
 }
 
 impl ReceivedFlow {
     pub(crate) fn new(room: Digest32) -> Self {
         Self {
-            room,
-            through: Arc::new(AtomicU64::new(0)),
+            owner: Arc::new(ReceivedOwner { room }),
         }
     }
 
-    fn record(&self, epoch: u64) {
-        self.through.fetch_max(epoch, Ordering::Release);
+    /// Run one complete synchronous received publication under this exact flow. Nested store
+    /// batches inherit the owner, so post-publication cursor/index writes cannot flush or orphan
+    /// the entry's debt.
+    pub(crate) fn scope<T>(&self, body: impl FnOnce() -> T) -> T {
+        RECEIVED_SCOPE.with(|scope| scope.borrow_mut().push(self.clone()));
+        struct Pop;
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                RECEIVED_SCOPE.with(|scope| {
+                    scope.borrow_mut().pop();
+                });
+            }
+        }
+        let _pop = Pop;
+        body()
     }
 
-    pub(crate) fn take(&self) -> Option<ReceivedDebt> {
-        let epoch = self.through.swap(0, Ordering::AcqRel);
-        (epoch != 0).then_some(ReceivedDebt(epoch))
+    fn current() -> Option<Self> {
+        RECEIVED_SCOPE.with(|scope| scope.borrow().last().cloned())
     }
+
+    pub(crate) fn debt(&self, store: &Store) -> Result<Option<ReceivedDebt>> {
+        store.fence_received_owner(&self.owner)
+    }
+}
+
+thread_local! {
+    static RECEIVED_SCOPE: std::cell::RefCell<Vec<ReceivedFlow>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What a [`Batch`] holds, which decides how it commits (ADR-038 FX-30). Only what a person
@@ -325,11 +355,11 @@ enum Class {
 pub struct Store {
     db: RwLock<Backing>,
     path: PathBuf,
-    counts: Counting,
     /// The store's one writer (ADR-038 FX-30): every write transaction is begun, committed and
-    /// its epochs moved while this is held, so the commit's visibility and its mark are one
+    /// its received ownership moved while this is held, so the commit's visibility and its mark are one
     /// step to every other holder. redb admits one writer at a time anyway; this names it.
     writer: Mutex<Epochs>,
+    received_settled: Condvar,
     /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
     /// `db` so it is released only after the database is closed: the store goes with its last
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
@@ -390,8 +420,8 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
-            counts: Counting::default(),
             writer: Mutex::new(Epochs::default()),
+            received_settled: Condvar::new(),
             _lock: None,
         };
         store.init_schema()?;
@@ -414,8 +444,8 @@ impl Store {
         let store = Self {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
-            counts: Counting::default(),
             writer: Mutex::new(Epochs::default()),
+            received_settled: Condvar::new(),
             _lock: None,
         };
         if store.schema_is_current()? {
@@ -449,8 +479,7 @@ impl Store {
         // Keep one lock order for every writer, including `rewrite_fresh`: writer before db.
         // Taking the read snapshot first would let a rewrite hold `writer` while waiting for
         // this `db` read, and this recovery wait for `writer` in the other direction.
-        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        self.finish_replacement(&mut epochs)?;
+        let mut epochs = self.writer_for(None)?;
         let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(db) = &*backing else {
             return Err(Error::Storage {
@@ -542,8 +571,7 @@ impl Store {
         // A write transaction can outlive the `db` guard that created it (`Cached` above).
         // Serialize the complete snapshot and replacement with every such transaction, or one
         // can commit to the old inode after the snapshot and disappear at the rename.
-        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        self.finish_replacement(&mut epochs)?;
+        let mut epochs = self.writer_for(None)?;
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(old) = &*backing else {
             return Err(Error::Storage {
@@ -606,7 +634,7 @@ impl Store {
         // synced. Record that exact debt before either fallible step. A failed reopen leaves the
         // backing closed; a failed directory sync leaves it writable; both refuse a false peer
         // acknowledgement and are retried by the next writer.
-        epochs.replacement = Some(epochs.received);
+        epochs.replacement = true;
         *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
         drop(backing);
         self.finish_replacement(&mut epochs)?;
@@ -615,11 +643,11 @@ impl Store {
 
     /// Finish an installed store replacement before any later write can hide its directory-sync
     /// debt. Returns whether this call made the replacement durable (and therefore flushed its
-    /// captured received epoch).
+    /// captured received debt).
     fn finish_replacement(&self, epochs: &mut Epochs) -> Result<bool> {
-        let Some(covered) = epochs.replacement else {
+        if !epochs.replacement {
             return Ok(false);
-        };
+        }
         {
             let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
             if matches!(*backing, Backing::Closed) {
@@ -636,12 +664,7 @@ impl Store {
         // Clear the debt only after the directory entry is durable. If this fails, every later
         // writer and every pending-received acknowledgement comes back through this exact step.
         super::paths::sync_dir(&self.path)?;
-        self.counts.committed(true);
-        epochs.flushed = epochs.flushed.max(covered);
-        if epochs.flushed >= epochs.received {
-            epochs.received_room = None;
-        }
-        epochs.replacement = None;
+        epochs.replacement = false;
         Ok(true)
     }
 
@@ -655,9 +678,29 @@ impl Store {
 
     /// Begin a write transaction, holding the store's writer — refused, writing nothing, while
     /// the store is read-only.
-    fn begin_write(&self) -> Result<(MutexGuard<'_, Epochs>, Cached<redb::WriteTransaction>)> {
+    fn writer_for(&self, owner: Option<&Arc<ReceivedOwner>>) -> Result<MutexGuard<'_, Epochs>> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        self.finish_replacement(&mut epochs)?;
+        loop {
+            self.finish_replacement(&mut epochs)?;
+            let available = match (&epochs.pending, owner) {
+                (None, _) => true,
+                (Some(pending), Some(owner)) => {
+                    Arc::ptr_eq(&pending.owner, owner) && !pending.fenced
+                }
+                (Some(_), None) => false,
+            };
+            if available {
+                return Ok(epochs);
+            }
+            epochs = self
+                .received_settled
+                .wait(epochs)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn begin_write(&self) -> Result<(MutexGuard<'_, Epochs>, Cached<redb::WriteTransaction>)> {
+        let epochs = self.writer_for(None)?;
         match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => {
                 Ok((epochs, db.begin_write().map_err(storage("begin write"))?))
@@ -774,6 +817,9 @@ impl Store {
         seg: &SealedSegment,
     ) -> Result<()> {
         let mut b = self.batch()?;
+        // This convenience writes durable state. Say so explicitly because a call made while a
+        // receive flow owns the thread-local batch scope must not silently inherit Received.
+        b.ruled();
         b.put_segment(channel, kind, id, seg)?;
         b.commit()
     }
@@ -987,6 +1033,9 @@ impl Store {
     /// ruled set begin through [`Self::received_batch`]. A batch that then queues something of the
     /// ruled set is flushed anyway ([`Batch::ruled`]) (ADR-038 FX-30).
     pub fn batch(&self) -> Result<Batch<'_>> {
+        if let Some(flow) = ReceivedFlow::current() {
+            return self.received_batch(&flow);
+        }
         let (epochs, txn) = self.begin_write()?;
         Ok(Batch {
             txn,
@@ -994,32 +1043,17 @@ impl Store {
             class: Class::Unsaid,
             received_flow: None,
             epochs,
+            #[cfg(feature = "test-knobs")]
+            received_key: None,
         })
     }
 
-    /// Begin a batch owned by one receive flow. Before its transaction exists, settle any older
-    /// receive debt under the same writer lock. Therefore an already queued older worker can
-    /// never carry this batch: its fixed target is covered before these bytes are written.
-    /// Empty/derived rounds never call this and cannot flush anybody else's debt.
+    /// Begin a batch owned by one exact receive flow. Consecutive transactions from that owner may
+    /// join its debt; a different flow or ordinary writer waits for the owner's explicit flush.
+    /// Once an acknowledgement fences the debt, even the same flow waits until that exact snapshot
+    /// is settled. No later transaction can carry an earlier owner's bytes.
     pub(crate) fn received_batch(&self, flow: &ReceivedFlow) -> Result<Batch<'_>> {
-        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        self.finish_replacement(&mut epochs)?;
-        if epochs.received > epochs.flushed {
-            let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
-                Backing::Writable(db) => db
-                    .begin_write()
-                    .map_err(storage("begin predecessor received flush"))?,
-                Backing::ReadOnly(_) | Backing::Closed => {
-                    return Err(Error::Storage {
-                        op: "begin predecessor received flush",
-                        detail:
-                            "received entries are pending but the store is not open for writing"
-                                .into(),
-                    })
-                }
-            };
-            self.commit_flushed(txn, &mut epochs, "flush predecessor received debt")?;
-        }
+        let epochs = self.writer_for(Some(&flow.owner))?;
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin received write"))?,
             Backing::ReadOnly(_) | Backing::Closed => {
@@ -1035,6 +1069,8 @@ impl Store {
             class: Class::Received,
             received_flow: Some(flow.clone()),
             epochs,
+            #[cfg(feature = "test-knobs")]
+            received_key: None,
         })
     }
 
@@ -1049,7 +1085,7 @@ impl Store {
     /// # Errors
     /// The transaction cannot be begun or committed.
     pub fn flush(&self) -> Result<()> {
-        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut epochs = self.writer_for(None)?;
         if self.finish_replacement(&mut epochs)? {
             return Ok(());
         }
@@ -1060,36 +1096,68 @@ impl Store {
         self.commit_flushed(txn, &mut epochs, "flush")
     }
 
-    /// Snapshot the exact durability debt visible after an acknowledgement's source read.
-    /// The returned scalar never grows, so a delayed acknowledgement worker cannot flush a
-    /// later receive flow's otherwise unrelated write.
-    pub(crate) fn received_debt(&self, room: &Digest32) -> Option<ReceivedDebt> {
-        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        (epochs.replacement.is_some()
-            || (epochs.received > epochs.flushed && epochs.received_room.as_ref() == Some(room)))
-        .then_some(ReceivedDebt(epochs.received))
+    /// Fence the exact durability debt visible inside an acknowledgement's room snapshot.
+    /// The returned owner/transaction pair never grows, so a delayed acknowledgement worker
+    /// cannot flush a later receive flow's otherwise unrelated write.
+    pub(crate) fn received_debt(&self, room: &Digest32) -> Result<Option<ReceivedDebt>> {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
+        let Some(pending) = epochs
+            .pending
+            .as_mut()
+            .filter(|pending| pending.owner.room == *room)
+        else {
+            return Ok(None);
+        };
+        pending.fenced = true;
+        Ok(Some(ReceivedDebt {
+            owner: Arc::clone(&pending.owner),
+            through: pending.through,
+        }))
     }
 
-    #[cfg(feature = "test-knobs")]
-    pub(crate) fn any_received_debt(&self) -> bool {
-        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        epochs.replacement.is_some() || epochs.received > epochs.flushed
+    fn fence_received_owner(&self, owner: &Arc<ReceivedOwner>) -> Result<Option<ReceivedDebt>> {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
+        let Some(pending) = epochs
+            .pending
+            .as_mut()
+            .filter(|pending| Arc::ptr_eq(&pending.owner, owner))
+        else {
+            return Ok(None);
+        };
+        pending.fenced = true;
+        Ok(Some(ReceivedDebt {
+            owner: Arc::clone(&pending.owner),
+            through: pending.through,
+        }))
     }
 
-    /// Flush through one exact receive-owned epoch. If another durable commit already covered
+    /// Flush one exact receive-owned transaction. If another durable commit already covered
     /// it, return without beginning a transaction even when newer debt exists. This is the
     /// ownership boundary that makes an empty/unrelated round write nothing (ADR-038 FX-30).
     ///
     /// # Errors
     /// As [`Self::flush`].
     pub(crate) fn flush_received_through(&self, debt: ReceivedDebt) -> Result<bool> {
+        self.flush_received_through_with(debt, |_| Ok(true), |_| Ok(()))
+    }
+
+    pub(crate) fn flush_received_through_with(
+        &self,
+        debt: ReceivedDebt,
+        before: impl FnOnce(&ReceivedDebt) -> Result<bool>,
+        after: impl FnOnce(&ReceivedDebt) -> Result<()>,
+    ) -> Result<bool> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        // An installed replacement's directory entry is durability debt even when no newer
-        // Received epoch exists. Finish it before the fast return so a head/inventory ACK can
-        // never claim bytes whose rename was not made durable.
-        let replacement_flushed = self.finish_replacement(&mut epochs)?;
-        if debt.0 <= epochs.flushed {
-            return Ok(replacement_flushed);
+        self.finish_replacement(&mut epochs)?;
+        let current = epochs.pending.as_ref().is_some_and(|pending| {
+            Arc::ptr_eq(&pending.owner, &debt.owner)
+                && pending.through == debt.through
+                && pending.fenced
+        });
+        if !current || !before(&debt)? {
+            return Ok(false);
         }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
@@ -1101,28 +1169,26 @@ impl Store {
                 })
             }
         };
-        self.commit_flushed(txn, &mut epochs, "flush")?;
+        txn.commit().map_err(storage("flush received debt"))?;
+        // Keep the writer through the exact post-durability boundary. Proof apparatus can stop a
+        // process here and copy its crash image knowing that no later transaction carried or
+        // followed this owner's bytes. Packaged builds pass a no-op callback.
+        epochs.pending = None;
+        let after = after(&debt);
+        self.received_settled.notify_all();
+        after?;
         Ok(true)
     }
 
-    /// What this store has committed since it was opened (ADR-038 FX-30).
-    #[must_use]
-    pub fn counts(&self) -> StoreCounts {
-        self.counts.snapshot()
-    }
-
-    /// Commit a raw transaction flushed to disk, counted; under the writer it covers every
-    /// Received commit so far.
+    /// Commit a raw transaction flushed to disk. Admission guarantees that no other receive
+    /// owner has pending debt which this commit could accidentally carry.
     fn commit_flushed(
         &self,
         txn: Cached<redb::WriteTransaction>,
-        epochs: &mut Epochs,
+        _epochs: &mut Epochs,
         op: &'static str,
     ) -> Result<()> {
         txn.commit().map_err(storage(op))?;
-        self.counts.committed(true);
-        epochs.flushed = epochs.received;
-        epochs.received_room = None;
         Ok(())
     }
 
@@ -1290,6 +1356,8 @@ pub struct Batch<'a> {
     received_flow: Option<ReceivedFlow>,
     /// The store's writer, held from the batch's beginning to its commit's mark.
     epochs: MutexGuard<'a, Epochs>,
+    #[cfg(feature = "test-knobs")]
+    received_key: Option<(Digest32, u64)>,
 }
 
 impl Batch<'_> {
@@ -1297,7 +1365,7 @@ impl Batch<'_> {
     /// rides to disk with the next flushed commit. Said once, at the top of the batch; a later
     /// [`Self::ruled`] overrides it.
     pub fn derived(&mut self) {
-        if matches!(self.class, Class::Unsaid) {
+        if !matches!(self.class, Class::Ruled) {
             self.class = Class::Derived;
         }
     }
@@ -1307,6 +1375,32 @@ impl Batch<'_> {
     /// it (ADR-038 FX-30). The writers of such things say so themselves.
     pub fn ruled(&mut self) {
         self.class = Class::Ruled;
+    }
+
+    /// Bind the exact receiver-key transaction to the FX-30 crash boundary. The marker is emitted
+    /// after commit while this batch still holds the one writer, so no later transaction can
+    /// rescue the mutant before the proof's crash.
+    pub(crate) fn received_key_boundary(
+        &mut self,
+        author: Digest32,
+        generation: u64,
+        durable: bool,
+    ) {
+        if durable {
+            self.class = Class::Ruled;
+        } else if self.received_flow.is_some() {
+            // The isolated mutant leaves this exact key transaction owned by its receive flow;
+            // the post-commit hold below then crashes it before the owner's flush can run.
+            self.class = Class::Received;
+        } else {
+            self.class = Class::Derived;
+        }
+        #[cfg(feature = "test-knobs")]
+        {
+            self.received_key = Some((author, generation));
+        }
+        #[cfg(not(feature = "test-knobs"))]
+        let _ = (author, generation);
     }
 
     /// Read a fixed metadata incarnation inside the same serialized publication transaction.
@@ -1550,28 +1644,86 @@ impl Batch<'_> {
             class,
             received_flow,
             mut epochs,
+            #[cfg(feature = "test-knobs")]
+            received_key,
         } = self;
         let flushed = matches!(class, Class::Unsaid | Class::Ruled);
         if !flushed {
             txn.set_durability(redb::Durability::None)
                 .map_err(storage("set durability"))?;
         }
-        // Under the store's writer: a Received commit that succeeded raises `received`, and a
-        // flushed commit that succeeded covers every Received commit so far, before any other
-        // holder can look (see `Epochs`). A commit that failed moves nothing.
+        // Allocate the exact transaction identity before committing. Exhaustion therefore leaves
+        // both the store and its durability ownership unchanged.
+        let transaction = epochs
+            .next_transaction
+            .checked_add(1)
+            .ok_or(Error::Storage {
+                op: "commit",
+                detail: "store transaction identity exhausted".into(),
+            })?;
         txn.commit().map_err(storage("commit"))?;
-        if matches!(class, Class::Received) {
-            epochs.received += 1;
+        epochs.next_transaction = transaction;
+        if flushed {
+            if let Some(pending) = epochs.pending.as_ref() {
+                debug_assert!(
+                    received_flow
+                        .as_ref()
+                        .is_some_and(|flow| Arc::ptr_eq(&pending.owner, &flow.owner)),
+                    "only the pending receive owner can make its debt durable"
+                );
+            }
+            epochs.pending = None;
+            store.received_settled.notify_all();
+        } else if matches!(class, Class::Received) {
             if let Some(flow) = received_flow {
-                epochs.received_room = Some(flow.room);
-                flow.record(epochs.received);
+                match epochs.pending.as_mut() {
+                    Some(pending) if Arc::ptr_eq(&pending.owner, &flow.owner) => {
+                        pending.through = transaction;
+                    }
+                    None => {
+                        epochs.pending = Some(PendingReceived {
+                            owner: Arc::clone(&flow.owner),
+                            through: transaction,
+                            fenced: false,
+                        });
+                    }
+                    Some(_) => unreachable!("the writer admitted a different received owner"),
+                }
             }
         }
-        store.counts.committed(flushed);
-        if flushed {
-            epochs.flushed = epochs.received;
-            epochs.received_room = None;
+        #[cfg(feature = "test-knobs")]
+        if let Some((author, generation)) = received_key {
+            hold_after_received_key_commit(&author, generation, transaction);
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-knobs")]
+fn hold_after_received_key_commit(author: &Digest32, generation: u64, transaction: u64) {
+    let Some(gate) = std::env::var_os("VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE") else {
+        return;
+    };
+    let gate = PathBuf::from(gate);
+    let Ok(armed) = std::fs::read_to_string(&gate) else {
+        return;
+    };
+    let exact = format!("{} {generation}", crate::node::link::b32_encode(author));
+    if armed.trim() != exact {
+        return;
+    }
+    let reached = gate.with_extension("reached");
+    if let Err(error) = std::fs::write(&reached, format!("{exact} {transaction}\n")) {
+        let _ = std::fs::write(
+            gate.with_extension("fault"),
+            format!(
+                "could not mark the received-key transaction at {}: {error}\n",
+                reached.display()
+            ),
+        );
+        return;
+    }
+    while gate.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }

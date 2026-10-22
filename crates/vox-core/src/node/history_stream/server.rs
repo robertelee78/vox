@@ -149,11 +149,16 @@ async fn respond(
         }
         Query::Head(author) => {
             let receipt = author == source.peer;
+            let exact_ack = source.received_ack_probe().map(|(_, entry)| entry);
+            if exact_ack.is_some() && !receipt {
+                return Ok((Status::Busy, None));
+            }
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
                     let Some(head) = room.history_head(store, &author)? else {
                         return Ok(None);
                     };
+                    let mut boundary = None;
                     if receipt {
                         // Delivery acknowledgement cannot precede the required body/effect.
                         // Merely verifying a signed nonempty head or inclusion never proves
@@ -181,9 +186,18 @@ async fn respond(
                             {
                                 return Ok(None);
                             }
+                            boundary = Some(tip.entry_hash());
                         }
                     }
-                    Ok(Some(head))
+                    if exact_ack.as_deref().is_some_and(|expected| {
+                        boundary
+                            .as_ref()
+                            .is_none_or(|hash| crate::node::link::b32_encode(hash) != expected)
+                    }) {
+                        return Ok(None);
+                    }
+                    let debt = store.received_debt(&room.channel_id())?;
+                    Ok(Some((head, debt, boundary)))
                 })
                 .await?;
             let held = match found {
@@ -193,8 +207,9 @@ async fn respond(
             };
             // The head was read; what it covers is on disk before the peer hears of it
             // (ADR-038 FX-30).
-            source.flush_received_before_ack().await?;
-            let wire = held.value.to_wire();
+            let (head, debt, boundary) = held.value;
+            source.flush_received_before_ack(debt, boundary).await?;
+            let wire = head.to_wire();
             let status = match send(
                 source,
                 io,
