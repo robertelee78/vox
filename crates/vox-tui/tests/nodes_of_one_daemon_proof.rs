@@ -82,11 +82,12 @@ impl Account {
             } else {
                 "/tmp"
             })
-            .unwrap();
+            .expect("APPARATUS: create isolated account directory");
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::create_dir_all(tmp.path().join("home")).unwrap();
+        std::fs::create_dir_all(&cfg).expect("APPARATUS: create isolated config directory");
+        std::fs::create_dir_all(tmp.path().join("home"))
+            .expect("APPARATUS: create isolated home directory");
         Self {
             _tmp: tmp,
             data,
@@ -129,8 +130,17 @@ impl Account {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("APPARATUS: spawn vox {args:?}: {e}"));
-        let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
-        let out = child.wait_with_output().unwrap();
+        let mut input = child
+            .stdin
+            .take()
+            .expect("APPARATUS: shipped vox command had no staged stdin");
+        input
+            .write_all(stdin.as_bytes())
+            .expect("APPARATUS: write staged input to shipped vox command");
+        drop(input);
+        let out = child
+            .wait_with_output()
+            .expect("APPARATUS: collect shipped vox command output");
         (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -182,7 +192,7 @@ fn daemons_of(data: &Path) -> Vec<u32> {
     let out = Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output()
-        .unwrap();
+        .expect("APPARATUS: list processes serving the isolated account");
     let data = data.to_string_lossy().into_owned();
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -221,7 +231,7 @@ impl Daemon {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let out = a.data.with_extension(format!("daemon-{n}.out"));
-        let f = std::fs::File::create(&out).unwrap();
+        let f = std::fs::File::create(&out).expect("APPARATUS: create isolated daemon transcript");
         let mut c = a.cmd(&[&["daemon"], args].concat());
         for (k, v) in env {
             c.env(k, v);
@@ -234,7 +244,7 @@ impl Daemon {
             )
             .stderr(f)
             .spawn()
-            .unwrap();
+            .expect("APPARATUS: start shipped vox daemon");
         eprintln!("[test] vox daemon {args:?} pid {}", child.id());
         Self { child, out }
     }
@@ -1961,6 +1971,28 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&b, &["status"])
     );
 
+    // Establish an older computer-managed capability upgrade. The next expired revision must
+    // revoke this too, not merely the grant introduced by that next revision.
+    computer(&a, &["personal", "anchor-return-first"]);
+    let expected_bob_grants_with_drive = [
+        (first.as_str(), "read + drive"),
+        (second.as_str(), "read"),
+        (third.as_str(), "read"),
+    ];
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            exact_grants(
+                &b,
+                "after-remote-anchor-b",
+                &expected_bob_grants_with_drive,
+            ) && computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: the deliberate computer capability change did not converge before the late-marker race: left {}; right {}",
+        computer(&a, &["status"]),
+        computer(&b, &["status"])
+    );
+
     // Principal FX-28 race: the answerer durably merges and applies this grant before its reply
     // is allowed to leave. Shipped trust output must first show that effective grant. The
     // initiator then names the missed causal revision; after releasing the exact parked answer,
@@ -1995,7 +2027,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&b, &["status"]),
         relay.said()
     );
-    let mut applied_grants = expected_bob_grants.to_vec();
+    let mut applied_grants = expected_bob_grants_with_drive.to_vec();
     applied_grants.push((applied_then_late.as_str(), "read"));
     assert!(
         wait_until(CHANGE_SHOWN_WITHIN, || {
@@ -2025,8 +2057,14 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         if matches!(
             remote["convergence_state"].as_str(),
             Some("expired" | "repaired-late")
-        ) && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
-        {
+        ) {
+            let (_, grants, grant_error) =
+                b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
+            assert!(
+                exact_grants(&b, "after-remote-anchor-b", &[]),
+                "PRODUCT: after shipped status named the received operator-policy revision expired, the managed node retained computer authority in its effective keyring: status {}; shipped trust output {grants}; error {grant_error}",
+                computer(&b, &["status"]),
+            );
             break;
         }
         assert!(
@@ -2190,7 +2228,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     loop {
         if full_roster(&computer(&a, &["status"])) == Some(before_restart.0.clone())
             && full_roster(&computer(&b, &["status"])) == Some(before_restart.1.clone())
-            && exact_grants(&b, "after-remote-anchor-b", &expected_bob_grants)
+            && exact_grants(&b, "after-remote-anchor-b", &[])
         {
             break;
         }
@@ -2266,7 +2304,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         ("after-remote-anchor-b", bob.as_str()),
     ];
     let final_grants = [
-        (first.as_str(), "read"),
+        (first.as_str(), "read + drive"),
         (second.as_str(), "read"),
         (third.as_str(), "read"),
         (applied_then_late.as_str(), "read"),

@@ -643,12 +643,14 @@ impl Management {
                 if !s
                     .applied
                     .get(&b.verify(&local, &g.incarnation())?)
-                    .is_some_and(|a| a.revision == s.revision && a.interval == g.incarnation())
+                    .is_some_and(|a| {
+                        a.revision == s.policy_revision && a.interval == g.incarnation()
+                    })
                 {
                     return Ok(());
                 }
             }
-            let body = receipt_body(s, s.revision)?;
+            let body = receipt_body(s, s.policy_revision)?;
             if s.receipts.get(&local).is_some_and(|r| r.body == body) {
                 return Ok(());
             }
@@ -865,7 +867,14 @@ impl Management {
                     if let Err(e) = result {
                         let mut f = Encoder::new();
                         f.array(2).uint(0).text(&e.to_string());
-                        let _ = write_frame(&mut send, &f.finish()).await;
+                        // A peer which stopped reading cannot retain one of the bounded answer
+                        // slots forever merely because its error response is backpressured.
+                        let _ = write_frame_until(
+                            &mut send,
+                            &f.finish(),
+                            std::time::Instant::now() + PATIENCE,
+                        )
+                        .await;
                     }
                     let _ = send.finish();
                 });
@@ -1354,6 +1363,7 @@ impl Management {
                 .take()
                 .ok_or(Error::Profile("there is no established group to retire"))?;
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            s.policy_revision = s.revision;
             for intervals in s.intervals.values_mut() {
                 if let Some(interval) = intervals.last_mut().filter(|i| i.retirement.is_none()) {
                     interval.retirement = Some(s.revision);
@@ -1460,16 +1470,16 @@ impl Management {
             .map(|(id, d)| {
                 let record = exchanged.get(id).cloned().unwrap_or_default();
                 let missed = s.missed_exchanges.get(id).copied();
-                let expired = missed.is_some_and(|(revision, _)| revision == s.revision);
+                let expired = missed.is_some_and(|(revision, _)| revision == s.policy_revision);
                 let confirmed = !storage_failed
                     && !expired
                     && s.receipts
                         .get(id)
                         .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false));
                 let convergence_state = match missed {
-                    Some((revision, true)) if revision == s.revision => "repaired-late",
-                    Some((revision, false)) if revision == s.revision => "expired",
-                    Some((revision, _)) if revision < s.revision && !confirmed => "replaced",
+                    Some((revision, true)) if revision == s.policy_revision => "repaired-late",
+                    Some((revision, false)) if revision == s.policy_revision => "expired",
+                    Some((revision, _)) if revision < s.policy_revision && !confirmed => "replaced",
                     _ if confirmed => "converged",
                     _ => "pending",
                 };
@@ -1588,7 +1598,7 @@ impl Management {
             this_computer: ComputerIdentity::of(&s.description)?,
             policy: POLICY.into(),
             state: state.into(),
-            revision: s.revision,
+            revision: s.policy_revision,
             invite_link,
             invite_id: invitation.map(|i| text_id(&i.id)),
             invite_expires_ms: invitation.map(|i| i.expires),
@@ -2089,27 +2099,18 @@ impl Management {
     ) -> Result<()> {
         let (op, peer, id, remaining_ms) = read_hello(recv, conn).await?;
         let deadline = match op {
-            REACHABILITY_WAKE_OP => None,
-            1 if remaining_ms > 0 => Some(local_deadline(remaining_ms, PAIR_WITHIN)),
-            2 if remaining_ms > 0 => {
-                Some(local_deadline(remaining_ms, COMPUTER_RETURN_SHOWN_WITHIN))
-            }
+            REACHABILITY_WAKE_OP => std::time::Instant::now() + PATIENCE,
+            1 if remaining_ms > 0 => local_deadline(remaining_ms, PAIR_WITHIN),
+            2 if remaining_ms > 0 => local_deadline(remaining_ms, COMPUTER_RETURN_SHOWN_WITHIN),
             1 | 2 => return Err(bad()),
             _ => return Err(bad()),
         };
         let echo = hello(op, &self.computer.description(), &id, remaining_ms);
-        if let Some(deadline) = deadline {
-            write_frame_until(send, &echo, deadline).await?;
-        } else {
-            write_frame(send, &echo).await?;
-        }
+        write_frame_until(send, &echo, deadline).await?;
         if op == REACHABILITY_WAKE_OP {
             return Ok(());
         }
         if op == 2 {
-            let Some(deadline) = deadline else {
-                return Err(bad());
-            };
             let payload = frame_until(recv, deadline).await?;
             // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
             // reply is the merged state, encoded under the same lock, so the revision the
@@ -2121,12 +2122,9 @@ impl Management {
             #[cfg(feature = "test-knobs")]
             self.hold_answer_after_merge_for_proof(conn.peer_id()).await;
             write_frame_until(send, &reply, deadline).await?;
-            self.record_answered(conn.peer_id(), merged);
+            self.record_answered(conn.peer_id(), merged)?;
             return Ok(());
         }
-        let Some(deadline) = deadline else {
-            return Err(bad());
-        };
         let (invite, mut g) = {
             let s = lock(&self.computer.state);
             let i=s.invitations.iter().find(|i|i.id==id&&!i.cancelled&&i.expires>now()).ok_or(Error::Profile("computer pairing code expired, cancelled, or unknown; no new trust was established"))?;
@@ -2214,7 +2212,7 @@ impl Management {
             .bytes(&payload);
         write_frame_until(send, &e.finish(), deadline).await?;
         // The enrollment handshake is an exchange this daemon answered (ADR-038 FX-28).
-        self.record_answered(conn.peer_id(), revision);
+        self.record_answered(conn.peer_id(), revision)?;
         Ok(())
     }
     /// Wake one failed peer from authenticated connection/application activity. A peer that has
@@ -2691,15 +2689,18 @@ impl Management {
                     )
                 });
         let missed = retained_miss || completed >= deadline;
+        let durable_revision = outcome
+            .as_ref()
+            .map_or(revision, |(_, merged_revision)| *merged_revision);
         let mut missed_cause = None;
         let durable = if missed {
             self.computer
-                .record_missed_exchange(peer, revision, outcome.is_ok() || was_repaired)
+                .record_missed_exchange(peer, durable_revision, outcome.is_ok() || was_repaired)
                 .map(|cause| {
                     missed_cause = Some(cause);
                 })
         } else if outcome.is_ok() {
-            self.computer.record_timely_exchange(peer, revision)
+            self.computer.record_timely_exchange(peer, durable_revision)
         } else {
             Ok(())
         };
@@ -3091,13 +3092,17 @@ impl Management {
 
     /// Record an exchange `peer` started and this node answered, now: what a person reads as
     /// the last exchange answered, with this daemon's revision after the merge (what it sent).
-    fn record_answered(&self, peer: Digest32, revision: u64) {
+    fn record_answered(&self, peer: Digest32, revision: u64) -> Result<()> {
+        // A policy merge records its obligation in the same transaction. Only a complete reply
+        // proves the initiating peer received this state and can clear that durable obligation.
+        self.computer.record_timely_exchange(peer, revision)?;
         let mut exchanged = lock(&self.exchanged);
         exchanged.entry(peer).or_default().last_answered = Some(ExchangeRecord {
             at_ms: now(),
             sent_revision: revision,
             merged_revision: revision,
         });
+        Ok(())
     }
 }
 fn side(g: &Enrollment, id: &Digest32) -> Result<usize> {
@@ -3260,6 +3265,7 @@ fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
             s.genesis = Some(g);
             s.fold_history()?;
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            s.policy_revision = s.revision;
             s.receipts.clear();
         }
     } else {
@@ -3276,6 +3282,7 @@ fn activate(s: &mut State, signer: &dyn RootSigner) -> Result<()> {
             }
             s.fold_history()?;
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+            s.policy_revision = s.revision;
             s.receipts.clear();
         }
     }
@@ -3316,7 +3323,7 @@ fn exchange(s: &State, peer: &Digest32) -> Result<Vec<u8>> {
     if let Some((revision, repaired)) = s
         .missed_exchanges
         .get(peer)
-        .filter(|(revision, _)| *revision == s.revision)
+        .filter(|(revision, _)| *revision == s.policy_revision)
     {
         e.array(1)
             .array(3)
@@ -3463,7 +3470,7 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
         // with independent newer policy therefore cannot have that policy poisoned by an older
         // remote miss.
         if sender_frontier == policy_frontier(s)? {
-            let local_revision = s.revision;
+            let local_revision = s.policy_revision;
             let held = s
                 .missed_exchanges
                 .entry(peer)
@@ -3488,9 +3495,10 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     Ok(())
 }
 
-/// Stable identity of policy content shared by paired computers. Receipts and operational
-/// convergence markers are deliberately excluded: they are observations about this policy, not
-/// policy inputs. Local revision numbers are excluded because they are not distributed clocks.
+/// Stable identity of operator-policy content shared by paired computers. Receipts, reachability
+/// records and operational convergence markers are deliberately excluded: they are observations
+/// about this policy, not replacements for it. Local revision numbers are excluded because they
+/// are not distributed clocks.
 fn policy_frontier(s: &State) -> Result<Digest32> {
     let group = s.group().ok_or_else(bad)?;
     let mut e = Encoder::new();
@@ -3511,7 +3519,12 @@ fn policy_frontier(s: &State) -> Result<Digest32> {
     let current: Vec<_> = s
         .history
         .iter()
-        .filter(|(_, record)| record.event().ok().is_some_and(|v| v.group == group))
+        .filter(|(_, record)| {
+            record
+                .event()
+                .ok()
+                .is_some_and(|event| event.group == group && event.reach.is_none())
+        })
         .collect();
     e.array(current.len());
     for (id, record) in current {

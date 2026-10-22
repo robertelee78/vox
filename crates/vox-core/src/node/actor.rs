@@ -21388,18 +21388,48 @@ impl Node {
 
     /// [`Self::tend_drive_keys_in`] in every open room.
     async fn tend_drive_keys(&mut self) -> bool {
+        self.tend_drive_keys_guarded(None).await.unwrap_or(false)
+    }
+
+    async fn tend_drive_keys_until(
+        &mut self,
+        deadline: std::time::Instant,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> crate::error::Result<bool> {
+        self.tend_drive_keys_guarded(Some((deadline, cancelled)))
+            .await
+    }
+
+    async fn tend_drive_keys_guarded(
+        &mut self,
+        guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+    ) -> crate::error::Result<bool> {
         let holders = self.drive_holders();
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         let mut changed = false;
         for channel_id in channels {
+            self.computer_drive_guard(guard)?;
             let before = self.session_projection_revision(&channel_id).await;
-            self.tend_drive_keys_in(&channel_id, &holders).await;
+            self.computer_drive_guard(guard)?;
+            self.tend_drive_keys_in_guarded(&channel_id, &holders, guard)
+                .await?;
+            self.computer_drive_guard(guard)?;
             let after = self.session_projection_revision(&channel_id).await;
+            self.computer_drive_guard(guard)?;
             // A failed read also schedules publication, where its actual error is
             // reported/poisoned; it must not silently look like an unchanged token.
             changed |= before.is_err() || after.is_err() || before.ok() != after.ok();
         }
-        changed
+        Ok(changed)
+    }
+
+    fn computer_drive_guard(
+        &self,
+        guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+    ) -> crate::error::Result<()> {
+        guard.map_or(Ok(()), |(deadline, cancelled)| {
+            Self::computer_policy_active(deadline, cancelled)
+        })
     }
 
     async fn session_projection_revision(
@@ -21422,41 +21452,58 @@ impl Node {
     /// longer holds it. A member whose prekeys this node has not read yet stays owed, and the tick
     /// tries again.
     async fn tend_drive_keys_in(&mut self, channel_id: &Digest32, holders: &BTreeSet<Digest32>) {
+        let _ = self
+            .tend_drive_keys_in_guarded(channel_id, holders, None)
+            .await;
+    }
+
+    async fn tend_drive_keys_in_guarded(
+        &mut self,
+        channel_id: &Digest32,
+        holders: &BTreeSet<Digest32>,
+        guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+    ) -> crate::error::Result<()> {
+        self.computer_drive_guard(guard)?;
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return;
+            return Ok(());
         };
         let now_ms = self.now_ms();
         let now_millis = (self.millis_clock)();
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
-                return;
+                return Ok(());
             };
             let mut ch = shared.lock().await;
+            self.computer_drive_guard(guard)?;
             // Pending policy cannot authorize private expiry or a drive-key release.
             // The shared maintenance branch advances governance independently. The token is
             // the proof the release and the drive-generation choice take (ADR-037 R3).
             let Ok(current) = ch.require_governance_ready(profile.store(), now_ms) else {
-                return;
+                return Ok(());
             };
             // Recovery/control catch-up must run before an announcement can refuse
             // for pending facts, or the same refusal would starve its own repair.
             if ch.advance_sessions(profile.store(), now_millis).is_err() {
-                return;
+                return Ok(());
             }
+            self.computer_drive_guard(guard)?;
             // Ordinary-key declarations name only this node's authenticated legacy hashes.
             // They let read-only peers identify withheld steps without granting drive.
             if ch.announce_legacy_sessions(profile, now_millis).is_err() {
-                return;
+                return Ok(());
             }
+            self.computer_drive_guard(guard)?;
             if ch.announce_private_support(profile, now_millis).is_err() {
-                return;
+                return Ok(());
             }
+            self.computer_drive_guard(guard)?;
             if ch
                 .rotate_drive_if_lost(profile.store(), holders, now_ms, current)
                 .is_err()
             {
-                return;
+                return Ok(());
             }
+            self.computer_drive_guard(guard)?;
             use crate::node::channel::session_projection::{Query, Reply};
             let has_session = match ch.session_query(
                 profile.store(),
@@ -21468,28 +21515,32 @@ impl Node {
             ) {
                 Ok(Reply::HasOpen(open)) => open,
                 // A rebuilding or failed projection does not assert absence or release keys.
-                _ => return,
+                _ => return Ok(()),
             };
+            self.computer_drive_guard(guard)?;
             if has_session
                 && ch
                     .ensure_drive(profile.store(), holders, now_ms, current)
                     .is_err()
             {
-                return;
+                return Ok(());
             }
+            self.computer_drive_guard(guard)?;
             let owed = match ch.owed_drive(profile, holders, now_ms) {
                 Ok(owed) => owed,
-                Err(_) => return,
+                Err(_) => return Ok(()),
             };
+            self.computer_drive_guard(guard)?;
             if !owed.is_empty()
                 && !ch
                     .refresh_session_records(profile, holders, &owed, now_millis)
                     .is_ok_and(|refresh| refresh == SessionRefresh::Complete)
             {
-                return;
+                return Ok(());
             }
             let mut releases = Vec::new();
             for member in owed {
+                self.computer_drive_guard(guard)?;
                 if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member, current) {
                     releases.push((member, skdm, generation));
                 }
@@ -21497,16 +21548,34 @@ impl Node {
             releases
         };
         for (member, skdm, generation) in releases {
-            if !self.post_key_package(channel_id, member, &skdm).await {
+            self.computer_drive_guard(guard)?;
+            let posted = if let Some((deadline, _cancelled)) = guard {
+                match tokio::time::timeout_at(
+                    deadline.into(),
+                    self.post_key_package(channel_id, member, &skdm),
+                )
+                .await
+                {
+                    Ok(posted) => posted,
+                    Err(_) => {
+                        return Err(Error::Profile(
+                            "computer trust key publication crossed its causal deadline",
+                        ))
+                    }
+                }
+            } else {
+                self.post_key_package(channel_id, member, &skdm).await
+            };
+            if !posted {
                 continue;
             }
+            self.computer_drive_guard(guard)?;
             let Some(profile) = self.profile.as_ref() else {
-                return;
+                return Ok(());
             };
-            let _ = shared
-                .lock()
-                .await
-                .note_drive_delivered(profile.store(), member, generation);
+            let mut channel = shared.lock().await;
+            self.computer_drive_guard(guard)?;
+            let _ = channel.note_drive_delivered(profile.store(), member, generation);
         }
         // The member that lost drive still holds the old key: until an entry is sealed under the
         // new one, nothing tells it the key changed. Written once every member that keeps drive
@@ -21514,22 +21583,25 @@ impl Node {
         // then, the tick tries again.
         let written = {
             let Some(profile) = self.profile.as_ref() else {
-                return;
+                return Ok(());
             };
             let mut ch = shared.lock().await;
+            self.computer_drive_guard(guard)?;
             let unsaid = match ch.key_change_unsaid(profile.store()) {
                 Ok(unsaid) => unsaid,
                 Err(error) => {
                     ch.poison(&error);
-                    return;
+                    return Ok(());
                 }
             };
+            self.computer_drive_guard(guard)?;
             unsaid
                 && ch
                     .owed_drive(profile, holders, now_ms)
                     .is_ok_and(|owed| owed.is_empty())
-                && ch
-                    .append_session(
+                && {
+                    self.computer_drive_guard(guard)?;
+                    ch.append_session(
                         profile,
                         crate::node::drive::KEY_CHANGED,
                         r#"{"kind":"drive-key"}"#,
@@ -21537,10 +21609,12 @@ impl Node {
                         now_millis,
                     )
                     .is_ok()
+                }
         };
         if written {
             self.note_local_append(channel_id);
         }
+        Ok(())
     }
 
     async fn send_text(

@@ -265,7 +265,7 @@ impl Node {
                 && self
                     .computer_revision
                     .load(std::sync::atomic::Ordering::Acquire)
-                    == c.revision())
+                    == c.policy_revision())
         {
             return Ok(());
         }
@@ -306,7 +306,7 @@ impl Node {
             }
             self.deliver_owed_consents(None).await;
             Self::computer_policy_active(deadline, cancelled)?;
-            self.tend_drive_keys().await;
+            self.tend_drive_keys_until(deadline, cancelled).await?;
             if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
                 c.invalidate_reachers();
                 return Err(error);
@@ -320,7 +320,7 @@ impl Node {
                 return Ok(());
             }
             if self.computer.as_ref().is_none_or(|c| {
-                c.revision()
+                c.policy_revision()
                     == self
                         .computer_revision
                         .load(std::sync::atomic::Ordering::Acquire)
@@ -344,7 +344,7 @@ impl Node {
             return Ok(Vec::new());
         }
         computer.storage_ready()?;
-        let revision = computer.revision();
+        let revision = computer.policy_revision();
         if !computer.current_revision_expired()
             && self
                 .computer_revision

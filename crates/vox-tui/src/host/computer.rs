@@ -42,9 +42,10 @@ impl Router {
         self.inner.rt.spawn(async move {
             // Daemon start is the first cause. Every later pass carries the deadline of the
             // event that caused it; a remote merge does not get a new reconciliation clock.
-            let mut deadline =
-                vox_core::node::computer::ComputerChange::now(management.computer.revision())
-                    .apply_deadline();
+            let mut deadline = vox_core::node::computer::ComputerChange::now(
+                management.computer.policy_revision(),
+            )
+            .apply_deadline();
             let mut advertised = endpoints.borrow_and_update().clone();
             loop {
                 let Some(inner) = weak.upgrade() else {
@@ -76,7 +77,7 @@ impl Router {
                         }
                         advertised = now;
                         vox_core::node::computer::ComputerChange::now(
-                            management.computer.revision(),
+                            management.computer.policy_revision(),
                         ).apply_deadline()
                     }
                     event = nodes.recv() => {
@@ -84,7 +85,7 @@ impl Router {
                             Ok(DaemonEvent::Attached { .. } | DaemonEvent::Detached { .. })
                             | Err(broadcast::error::RecvError::Lagged(_)) => {
                                 vox_core::node::computer::ComputerChange::now(
-                                    management.computer.revision(),
+                                management.computer.policy_revision(),
                                 ).apply_deadline()
                             }
                             Err(broadcast::error::RecvError::Closed) => return,

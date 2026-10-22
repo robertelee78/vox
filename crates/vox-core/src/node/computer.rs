@@ -2240,14 +2240,9 @@ pub struct DerivedBinding {
     pub at_ms: u64,
 }
 impl Computer {
-    /// Local durable policy revision.
-    pub fn revision(&self) -> u64 {
-        lock(&self.state).revision
-    }
-
     /// Journal revision of the last effective operator-policy change. Transport-only journal
     /// movement cannot replace a missed policy contract.
-    pub(crate) fn policy_revision(&self) -> u64 {
+    pub fn policy_revision(&self) -> u64 {
         lock(&self.state).policy_revision
     }
 
@@ -2263,7 +2258,7 @@ impl Computer {
         !Self::revision_expired(&s)
             && s.derived
                 .get(node)
-                .is_some_and(|d| d.revision == s.revision)
+                .is_some_and(|d| d.revision == s.policy_revision)
     }
 
     /// A failed policy write invalidates current grants even when the durable revision did not
@@ -2273,7 +2268,7 @@ impl Computer {
         (s.genesis.is_none() && s.intervals.is_empty())
             || (self.storage_ready().is_ok()
                 && !Self::revision_expired(&s)
-                && s.revision == applied)
+                && s.policy_revision == applied)
     }
 
     pub(crate) fn storage_ready(&self) -> Result<()> {
@@ -2457,7 +2452,7 @@ impl Computer {
             s.derived.insert(
                 key,
                 DerivedBinding {
-                    revision: s.revision,
+                    revision: s.policy_revision,
                     at_ms: pairing::now(),
                 },
             );
@@ -2466,7 +2461,7 @@ impl Computer {
     }
 
     /// Exact policy for an attached node, from verified durable rosters. No roster grants room
-    /// membership. The revision is local journal order, not a distributed membership clock.
+    /// membership. The revision is the local operator-policy cause, not a distributed clock.
     pub fn plan(&self, node: Digest32) -> Result<Option<PolicyPlan>> {
         let s = lock(&self.state);
         if s.genesis.is_none() && s.intervals.is_empty() {
@@ -2484,22 +2479,21 @@ impl Computer {
                 .map(|applied| applied.grants.keys().copied().collect())
                 .unwrap_or_default();
             return Ok(Some(PolicyPlan {
-                revision: s.revision,
+                revision: s.policy_revision,
                 grants: Vec::new(),
                 denied,
                 expired: true,
             }));
         }
-        // Derived once per revision (ADR-038 FX-28): every input of the plan moves the
-        // revision when it changes (`fold_history`, `retain_roster`, `merge`), so a plan at the
-        // current revision is the plan.
+        // Derived once per operator-policy revision (ADR-038 FX-28). Reachability journal
+        // records do not change trust and cannot make an expired policy current again.
         if let Some((revision, plan)) = lock(&self.plans).get(&node) {
-            if *revision == s.revision {
+            if *revision == s.policy_revision {
                 return Ok(Some(plan.clone()));
             }
         }
         let plan = Self::derive_plan(&s, self.signer.fingerprint(), node)?;
-        lock(&self.plans).insert(node, (s.revision, plan.clone()));
+        lock(&self.plans).insert(node, (s.policy_revision, plan.clone()));
         Ok(Some(plan))
     }
 
@@ -2616,7 +2610,7 @@ impl Computer {
             })
             .collect();
         Ok(PolicyPlan {
-            revision: s.revision,
+            revision: s.policy_revision,
             grants,
             denied,
             expired: false,
@@ -2651,7 +2645,7 @@ impl Computer {
         deadline: std::time::Instant,
     ) -> Result<()> {
         self.change_until(deadline, |s| {
-            if revision > s.revision {
+            if revision > s.policy_revision {
                 return Err(bad());
             }
             // Another authenticated roster may have arrived during the node store write.
@@ -2685,7 +2679,7 @@ impl Computer {
         deadline: std::time::Instant,
     ) -> Result<()> {
         self.change_until(deadline, |state| {
-            if state.revision != revision || !Self::revision_expired(state) {
+            if state.policy_revision != revision || !Self::revision_expired(state) {
                 return Err(Error::Profile(
                     "computer policy changed while expired trust was being revoked",
                 ));
@@ -3050,7 +3044,7 @@ impl Computer {
                 if moved || authorization_changed {
                     let now = std::time::Instant::now();
                     let _ = self.changed.send(ComputerChange {
-                        revision: held.revision,
+                        revision: held.policy_revision,
                         apply_deadline: now,
                         return_deadline: deadline,
                     });
@@ -3064,7 +3058,7 @@ impl Computer {
                 // is a change here (ADR-038 FX-28), and the daemon reconciles its nodes on it.
                 // The local apply contract may shorten an outer return deadline, never extend it.
                 let _ = self.changed.send(ComputerChange {
-                    revision: held.revision,
+                    revision: held.policy_revision,
                     apply_deadline: deadline
                         .min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN),
                     return_deadline: deadline,
@@ -3086,11 +3080,19 @@ impl Computer {
         repaired: bool,
     ) -> Result<u64> {
         self.change_durable(|state| {
-            let cause = state
-                .pending_exchanges
+            let pending = state.pending_exchanges.get(&peer).copied();
+            let retained = state
+                .missed_exchanges
                 .get(&peer)
-                .copied()
-                .unwrap_or(revision);
+                .map(|(cause, _)| *cause)
+                .filter(|cause| *cause == state.policy_revision);
+            let cause = pending.or(retained).unwrap_or(revision);
+            // A failed fallback or reachability-only journal exchange is transport evidence, not
+            // an expired operator policy. Policy causes are always atomically pending; equality
+            // retains the conservative migration behavior for a pre-amendment state.
+            if pending.is_none() && retained.is_none() && revision != state.policy_revision {
+                return Ok(revision);
+            }
             let held = state
                 .missed_exchanges
                 .entry(peer)
@@ -3166,7 +3168,7 @@ impl Computer {
             *held = next;
             if authorization_changed {
                 let _ = self.changed.send(ComputerChange {
-                    revision: held.revision,
+                    revision: held.policy_revision,
                     apply_deadline: std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
                     return_deadline: std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
                 });
