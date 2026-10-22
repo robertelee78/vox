@@ -4817,7 +4817,6 @@ impl ChannelState {
             e,
             Error::Profile(legacy_provisional::LEGACY_HISTORY_REQUIRED)
                 | Error::Profile(crate::node::history_demand::CANCELLED)
-                | Error::Profile("computer policy changed before the room mutation")
                 | Error::OwnHistoryBehind
                 | Error::RoomNotSynced
         ) || governance::refreshing(e)
@@ -9527,6 +9526,24 @@ impl ChannelState {
         }
         if !self.is_member(member) {
             return Err(Error::Profile("that identity is not a member of the room"));
+        }
+        if self.is_admin(profile.store(), member, now)? {
+            return Err(Error::Profile("that identity is already a room admin"));
+        }
+        let mut after = None;
+        let mut admins = 0_usize;
+        loop {
+            let page = self.admin_page(profile.store(), after, 64, now)?;
+            admins = admins.saturating_add(page.targets.len());
+            if admins >= crate::nat::withdraw::MAX_ROSTER {
+                return Err(Error::Profile(
+                    "this room already has its maximum 512 admins",
+                ));
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
         }
         let key = self
             .authors

@@ -2592,6 +2592,31 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         );
     }
 
+    // Expiry removes only Computer-managed authority. Keep one ordinary, unrelated manual trust
+    // in the returning node so every Ready assertion below distinguishes a correctly reconciled
+    // keyring from both (a) a stale managed grant and (b) the empty held-back projection shown
+    // while reconciliation is unfinished. This makes the final Ready-fence mutant observable in
+    // the shipped `vox trust list`, rather than mistaking an empty fail-closed view for success.
+    let outsider = Account::new();
+    let manual_outsider = outsider.make_node("manual-outsider");
+    let (ok, out, err) = b.run(
+        &[
+            "trust",
+            "add",
+            &manual_outsider,
+            "--name",
+            "manual-outsider",
+            "--node",
+            "after-remote-anchor-b",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT: unrelated manual trust was refused while Computer policy was current: {out}{err}"
+    );
+    let manual_only = [(manual_outsider.as_str(), "read")];
+
     // Exact live two-store race: keep the answerer's managed node Locked while a new policy
     // revision merges, then start its shipped attach. The actor durably prepares that revision's
     // rollback set and is held before its node-keyring commit. While held, the initiating
@@ -2796,7 +2821,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let remote = application_toward(&b, &a_id);
     let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
     assert!(
-        exact_grants(&b, "after-remote-anchor-b", &[]),
+        exact_grants(&b, "after-remote-anchor-b", &manual_only),
         "PRODUCT [FX28 expiry-before-keyring-commit]: Ready preceded durable revocation of exact expired revision {prepare_race_revision}: status {remote}; shipped trust output {grants}; error {grant_error}"
     );
 
@@ -2997,7 +3022,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let remote = application_toward(&b, &a_id);
     let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
     assert!(
-        exact_grants(&b, "after-remote-anchor-b", &[]),
+        exact_grants(&b, "after-remote-anchor-b", &manual_only),
         "PRODUCT [FX28 startup-ready-state-lock]: Ready published stale authority from exact expired applied revision {receipt_race_revision}: status {remote}; shipped trust output {grants}; error {grant_error}"
     );
 
@@ -3136,7 +3161,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
     let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
     assert!(
-        exact_grants(&b, "after-remote-anchor-b", &[]),
+        exact_grants(&b, "after-remote-anchor-b", &manual_only),
         "PRODUCT [FX28 keyring-commit-crash]: after restart made exact merged revision {committed_revision} expired, the managed node retained authority committed before its missing applied receipt: status {recovered_status}; shipped trust output {grants}; error {grant_error}"
     );
     drop((left, right, relay));
@@ -4975,8 +5000,10 @@ fn change_shows_on_both(
     );
     assert!(
         ok,
-        "APPARATUS: attach {new_node} on {}'s computer: {out}{err}",
-        names_here[0]
+        "APPARATUS: attach {new_node} on {}'s computer: {out}{err}\nactor log:\n{}\ndaemon transcript:\n{}",
+        names_here[0],
+        changer.log(),
+        changer_daemon.said(),
     );
     // On the daemon where the change was made. The clock is read after each status/trust look,
     // and a success seen past the bound is as red as none.

@@ -2986,10 +2986,11 @@ impl Management {
 
     /// Have this real shipped daemon act as the stopped reader. The peer sees ordinary
     /// authenticated Computer streams. Their one-millisecond advertised request budget expires
-    /// before the malformed payload is sent, and the receive halves remain alive but unread for
-    /// the production response patience. Correct code uses the expired request deadline and frees
-    /// each slot; the mutant gives each write a fresh interval and strands all slots behind QUIC
-    /// flow control.
+    /// because the sender withholds the next frame, and the receive halves remain alive but unread
+    /// for the production response patience. Correct code uses that request-owned deadline and
+    /// frees each slot; the mutant gives each error write a fresh interval and strands all slots
+    /// behind QUIC flow control. No sender-side sleep tries to guess when the receiver began its
+    /// clock.
     #[cfg(feature = "test-knobs")]
     async fn stage_stopped_reader_for_proof(&self, conn: &Arc<VoxConnection>) -> Result<()> {
         let Ok(spec) = std::env::var(TEST_STOPPED_READER_ARM_ENV) else {
@@ -3022,12 +3023,6 @@ impl Management {
             )
             .await?;
             held.push((send, recv));
-        }
-        // Apparatus staging only: pass the one-millisecond request budget before supplying the
-        // deliberately malformed payload. No verdict is inferred from this wait.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        for (send, _) in &mut held {
-            write_frame(send, &[0xff]).await?;
         }
         tokio::spawn(async move {
             let _unread = held;

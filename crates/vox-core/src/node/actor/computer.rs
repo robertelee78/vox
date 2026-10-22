@@ -534,10 +534,7 @@ impl NodeHandle {
             .identity
             .as_ref()
             .map(|id| id.fingerprint);
-        me.is_some_and(|me| {
-            computer.policy_current(applied, me)
-                && (computer.current_revision_expired() || computer.binding_current(&me))
-        })
+        me.is_some_and(|me| computer.policy_current(applied, me))
     }
 
     /// Ask the already attached node to sign its management binding and durably apply policy.
@@ -618,11 +615,9 @@ impl NodeHandle {
 }
 
 impl Node {
-    /// Journal an explicit per-node trust choice, then reconcile that exact new Computer
-    /// revision before the keyring command captures its authority token.  Previously the
-    /// command advanced policy here and immediately tried to save under the actor's old
-    /// revision, so every grouped Trust/SetCapability/Untrust of an unmanaged peer rejected
-    /// itself after making the durable policy change.
+    /// Journal an explicit per-node trust choice only when retired Computer history would
+    /// otherwise remove it. This is local node policy, not a new Computer policy revision: it
+    /// neither wakes the other nodes nor creates an exchange obligation to another machine.
     pub(super) async fn choose_individual_trust(
         &mut self,
         peer: Digest32,
@@ -640,14 +635,7 @@ impl Node {
             .map(Profile::fingerprint)
             .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()))
             .ok_or(Error::Profile("managed node has no unlocked identity"))?;
-        // The explicit choice and the reconciliation it causes share one causal boundary; the
-        // command must not mint a replacement clock after the policy transaction commits.
-        let deadline =
-            std::time::Instant::now() + crate::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN;
-        computer.individual_choice_until(node, peer, deadline)?;
-        let cancelled = std::sync::atomic::AtomicBool::new(false);
-        self.apply_computer_keyring_until(deadline, &cancelled)
-            .await
+        computer.individual_choice(node, peer)
     }
 
     /// Run one synchronous irreversible room write while this actor's computer-policy projection
@@ -751,16 +739,11 @@ impl Node {
             ));
         };
         if !may_replace_expired && computer.current_revision_expired() {
-            let revision = computer.policy_revision();
-            if computer.application_settled(&signer.fingerprint(), revision) {
-                // The missed revision is permanently visible as expired, but its grants are
-                // gone.  Requiring an unrelated operator change here took every managed node
-                // out of service even though the safe fail-closed result had already landed.
-                return Ok(());
-            }
-            return Err(Error::Profile(
-                "this policy revision expired before its managed grants were removed",
-            ));
+            // Reconciliation must enter `apply_computer_keyring_until` to remove the expired
+            // revision's managed grants in place. Refusing here detached the node before the
+            // only revocation path could run. Startup may deliberately replace an expired cause
+            // by binding a newly attached node; an already-running actor may not.
+            return Ok(());
         }
         computer.bind_node_until(signer, name, deadline)
     }
@@ -1045,11 +1028,21 @@ impl Node {
         // branch until `mark_expired_until` clears the records after the revoked keyring lands.
         if !expired {
             #[cfg(feature = "test-knobs")]
-            if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable") {
-                computer.prepare_application_until(me, revision, &covered, deadline)?;
+            if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable")
+                && !computer.prepare_application_until(me, revision, &covered, deadline)?
+            {
+                return Ok(KeyringApplication {
+                    changes: Vec::new(),
+                    settled: false,
+                });
             }
             #[cfg(not(feature = "test-knobs"))]
-            computer.prepare_application_until(me, revision, &covered, deadline)?;
+            if !computer.prepare_application_until(me, revision, &covered, deadline)? {
+                return Ok(KeyringApplication {
+                    changes: Vec::new(),
+                    settled: false,
+                });
+            }
         }
         Self::computer_policy_active(deadline, cancelled)?;
         next.save_checked(profile.store(), profile.signer()?, || {

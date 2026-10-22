@@ -1615,7 +1615,7 @@ impl Fault {
             Fault::WrongPassphrase => {
                 "the passphrase is wrong\n       check it and type it again"
             }
-            Fault::ComputerPolicy => "trust comes from computer mode; stop trusting the computer before choosing individual node permissions",
+            Fault::ComputerPolicy => "computer trust changed while this command was being applied\n       review the current policy and retry the command",
             Fault::PassphraseNeeded => {
                 "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       type it, and the change is made: `vox trust` asks for it at a terminal"
             }

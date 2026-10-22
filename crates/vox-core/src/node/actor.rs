@@ -6931,6 +6931,7 @@ impl Node {
                     // The identity is usable but the ring is not: lock again rather
                     // than run without key-agreement keys.
                     drop(self.lock_all().await);
+                    eprintln!("vox node: identity unlock could not load its prekey ring: {e}");
                     // The passphrase was just proved by the vault, so a blob that will not open
                     // is not a wrong passphrase (V210-40).
                     return Outcome::Failed(match e {
@@ -6940,6 +6941,7 @@ impl Node {
                 }
                 if let Err(e) = self.start_network() {
                     drop(self.lock_all().await);
+                    eprintln!("vox node: identity unlock could not start networking: {e}");
                     return Outcome::Failed(fault_of(&e));
                 }
                 // **Attaching opens no keyring window** (ADR-028 K-12): only a passphrase
@@ -7846,10 +7848,6 @@ impl Node {
                 return;
             }
         }
-        if waiting.reopening {
-            self.reopening.remove(&room);
-            waiting.reopening = false;
-        }
         if let Some((authority, ownership)) = &waiting.authority {
             let current = if *ownership == RoomPublicationOwnership::Created {
                 authority.publish_room_creation(|| ()).is_some()
@@ -7857,6 +7855,31 @@ impl Node {
                 authority.current()
             };
             if !current {
+                if *ownership == RoomPublicationOwnership::Existing {
+                    // Opening or startup reopening does not own this durable room. Keep its live
+                    // projection and original reply, then retry under the revision which made
+                    // the old authority token stale. Retracting it here silently closed a saved
+                    // room for the rest of the daemon session.
+                    waiting.authority = self
+                        .computer_authority()
+                        .map(|authority| (authority, RoomPublicationOwnership::Existing));
+                    self.publication_again |= waiting.authority.is_some();
+                    self.publish_waiters.insert(room, waiting);
+                    return;
+                }
+                // Create/join may already have put this room or member on a board before the
+                // final authority fence discovered the concurrent Computer change. Publish the
+                // narrowing withdrawal first and retain it for later anchors; only then may the
+                // local unpublished room be purged.
+                let scope = if *ownership == RoomPublicationOwnership::Created {
+                    crate::nat::withdraw::WithdrawScope::Room
+                } else {
+                    crate::nat::withdraw::WithdrawScope::Member
+                };
+                if let Err(fault) = self.withdraw_from_boards(&room, scope, authority).await {
+                    self.fail_room_publication(room, waiting, fault);
+                    return;
+                }
                 let outcome =
                     self.reject_room_publication(&room, *ownership, Fault::ComputerPolicy);
                 self.publish().await;
@@ -7865,6 +7888,10 @@ impl Node {
                 }
                 return;
             }
+        }
+        if waiting.reopening {
+            self.reopening.remove(&room);
+            waiting.reopening = false;
         }
         // Node Ready is independent of room preparation. Explicit create/join/open
         // replies keep their original routing condition.
@@ -18621,7 +18648,7 @@ impl Node {
     /// The durable room and reopen entry are removed in the same store batch before failure is
     /// reported, so a rejected authority can leave no live or restart-visible partial room.
     fn reject_unpublished_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
-        self.retract_live_channel(channel_id);
+        self.retract_live_channel(channel_id, true);
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -18634,7 +18661,7 @@ impl Node {
     /// Remove only the transient projection of a stored room.  An explicit open or startup
     /// reopen never owns the room rows and therefore must not reuse create/join rollback.
     fn reject_existing_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
-        self.retract_live_channel(channel_id);
+        self.retract_live_channel(channel_id, false);
         Outcome::Failed(fault)
     }
 
@@ -18654,11 +18681,13 @@ impl Node {
         }
     }
 
-    fn retract_live_channel(&mut self, channel_id: &Digest32) {
+    fn retract_live_channel(&mut self, channel_id: &Digest32, keep_withdrawal: bool) {
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
-        self.withdrawn.remove(channel_id);
+        if !keep_withdrawal {
+            self.withdrawn.remove(channel_id);
+        }
         if let Some(net) = self.net.as_ref() {
             net.membership().clear_channel(channel_id);
             net.forget_room_on_board(channel_id);
@@ -21278,6 +21307,16 @@ impl Node {
                     next,
                     self.computer_revision
                         .load(std::sync::atomic::Ordering::Acquire),
+                    self.profile
+                        .as_ref()
+                        .filter(|profile| profile.is_unlocked())
+                        .map(Profile::fingerprint)
+                        .or_else(|| {
+                            self.headless.as_ref().map(|signer| {
+                                crate::identity::composite::RootSigner::fingerprint(signer.as_ref())
+                            })
+                        })
+                        .ok_or(Error::Profile("managed node has no unlocked identity"))?,
                 );
             } else {
                 crate::node::tunnel::publish_reachers(slot, next);

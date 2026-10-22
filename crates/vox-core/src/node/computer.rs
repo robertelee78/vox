@@ -2430,10 +2430,11 @@ impl Computer {
         let s = lock(&self.state);
         (s.genesis.is_none() && s.intervals.is_empty())
             || (self.storage_ready().is_ok() && s.policy_revision == applied)
-                && if Self::revision_expired(&s) {
+                && if Self::revision_expired(&s) || s.grant(&self.signer.fingerprint()).is_none() {
                     // Expiry revokes the missed revision's managed grants; it does not make the
-                    // node unusable forever.  The actor may publish again only after its exact
-                    // node keyring is durably settled with no retained managed grant.
+                    // node unusable forever. A retired local computer follows the same rule. The
+                    // actor may publish again only after its exact node keyring is durably settled
+                    // with no retained managed grant.
                     Self::application_settled_in(&s, &node, applied)
                 } else {
                     s.derived
@@ -2457,7 +2458,9 @@ impl Computer {
         let current = unmanaged
             || (self.storage_ready().is_ok()
                 && state.policy_revision == applied
-                && if Self::revision_expired(&state) {
+                && if Self::revision_expired(&state)
+                    || state.grant(&self.signer.fingerprint()).is_none()
+                {
                     // The expired policy itself is not authority.  The safe, durably-revoked
                     // projection is: it lets manual/unmanaged work continue without allowing a
                     // grant from the missed revision to survive or reappear.
@@ -2859,12 +2862,19 @@ impl Computer {
         revision: u64,
         covered: &[Digest32],
         deadline: std::time::Instant,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.change_until(deadline, |state| {
-            if state.policy_revision != revision || Self::revision_expired(state) {
-                return Err(Error::Profile(
-                    "computer policy changed before its keyring application was prepared",
-                ));
+            let current = state.policy_revision;
+            let expired = Self::revision_expired(state);
+            if current != revision || expired {
+                // This plan lost a race with another authenticated policy revision before the
+                // node keyring commit. Nothing from it became authority, so keep the caller's
+                // original causal deadline and derive the now-current plan instead of making a
+                // normal concurrent change fail node startup.
+                eprintln!(
+                    "vox node: computer keyring plan at policy revision {revision} became stale before preparation (current revision {current}, expired {expired}); deriving the current plan within the original causal boundary"
+                );
+                return Ok(false);
             }
             let interval = state
                 .genesis
@@ -2879,7 +2889,7 @@ impl Computer {
                     grants: covered.iter().map(|peer| (*peer, revision)).collect(),
                 },
             );
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -3160,29 +3170,26 @@ impl Computer {
         Ok(!managers.iter().any(|m| s.quarantined.contains(m)))
     }
     /// The ordinary explicit Trust command after retirement chooses individual mode. Journal
-    /// that choice before its keyring write; a failed write grants nothing and can be retried.
-    pub(crate) fn individual_choice_until(
-        &self,
-        node: Digest32,
-        peer: Digest32,
-        deadline: std::time::Instant,
-    ) -> Result<()> {
-        if self.capability(node, &peer)?.is_some() {
+    /// that local choice before its keyring write; a failed write grants nothing and can be
+    /// retried. A peer that Computer policy never covered needs no Computer journal entry.
+    pub(crate) fn individual_choice(&self, node: Digest32, peer: Digest32) -> Result<()> {
+        let Some(plan) = self.plan(node)? else {
+            return Ok(());
+        };
+        if !plan.denied.contains(&peer) {
             return Ok(());
         }
         if !self.individual_permitted(node, &peer)? {
             return Err(Error::SignatureInvalid);
         }
-        self.change_until(deadline, |s| {
+        self.change_durable(|s| {
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
-            s.policy_revision = s.revision;
-            s.individual
-                .entry(node)
-                .or_default()
-                .insert(peer, s.revision);
-            s.receipts.clear();
+            let revision = s.revision;
+            s.individual.entry(node).or_default().insert(peer, revision);
             Ok(())
-        })
+        })?;
+        lock(&self.plans).remove(&node);
+        Ok(())
     }
 
     /// Open or atomically create the separate unattended software vault. Corrupt, unsupported,
@@ -3582,6 +3589,7 @@ impl Computer {
         gate: &crate::node::tunnel::Reachers,
         next: std::collections::BTreeSet<Digest32>,
         applied: u64,
+        node: Digest32,
     ) {
         let state = lock(&self.state);
         let mut gates = lock(&self.reachers);
@@ -3592,8 +3600,17 @@ impl Computer {
             gate,
             if (state.genesis.is_none() && state.intervals.is_empty())
                 || (self.storage_ready().is_ok()
-                    && !Self::revision_expired(&state)
-                    && applied == state.policy_revision)
+                    && applied == state.policy_revision
+                    && if Self::revision_expired(&state)
+                        || state.grant(&self.signer.fingerprint()).is_none()
+                    {
+                        Self::application_settled_in(&state, &node, applied)
+                    } else {
+                        state
+                            .derived
+                            .get(&node)
+                            .is_some_and(|derived| derived.revision == state.policy_revision)
+                    })
             {
                 next
             } else {

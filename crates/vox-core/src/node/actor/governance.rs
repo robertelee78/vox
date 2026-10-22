@@ -104,15 +104,15 @@ impl Node {
             }
             drop(channel);
             if let Err(fault) = self.publish_admin_roster(&work.room).await {
-                if matches!(fault, Fault::ComputerPolicy) {
-                    // The durable removal remains the exact owner of this publication. A fresh
-                    // Computer reconciliation retries it; never answer Done while boards still
-                    // carry the roster which the removal replaced.
-                    self.governance_work.removal = Some(work);
-                } else {
-                    let _ = work.reply.send(Outcome::Failed(fault));
-                }
-                return;
+                // The certificate removal is already durable. Report that truthfully and retain
+                // the board projection as owed work; a failed secondary publication must not
+                // turn a successful removal into a false command failure.
+                self.governance_work.admin_rosters.insert(work.room);
+                self.governance_work.again |= matches!(fault, Fault::GovernanceRefreshing);
+                eprintln!(
+                    "vox node: removed the room admin; its board roster remains pending: {}",
+                    fault.explain()
+                );
             }
             self.publish().await;
             let _ = work.reply.send(Outcome::Done);
@@ -352,8 +352,9 @@ impl Node {
                 Err(fault) => {
                     self.governance_work.admin_rosters.insert(room);
                     // A policy handoff is woken by its own event.  Immediate self-requeue here
-                    // can monopolize the actor while authority is necessarily stale.
-                    self.governance_work.again |= !matches!(fault, Fault::ComputerPolicy);
+                    // can monopolize the actor while authority is necessarily stale. Permanent
+                    // faults likewise remain visible as owed work without spinning this actor.
+                    self.governance_work.again |= matches!(fault, Fault::GovernanceRefreshing);
                 }
             }
         }
