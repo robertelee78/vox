@@ -46,6 +46,38 @@ fn key_package_for(entry: &Entry, recipient: &Digest32) -> bool {
         .is_some_and(|package| package.recipient == *recipient)
 }
 
+/// Test-only exact crash boundary for FX-30. The gate contains the expected
+/// `<author> <sender-generation>` pair. Only the newly persisted receiver chain matching that
+/// exact pair marks `<gate-with-extension-reached>` and waits, after the ruled key commit and
+/// before its caller can reach a later generic received flush. Compiled out of packaged binaries.
+#[cfg(feature = "test-knobs")]
+fn hold_after_received_key_commit(author: &Digest32, generation: u64) {
+    let Some(gate) = std::env::var_os("VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE") else {
+        return;
+    };
+    let gate = std::path::PathBuf::from(gate);
+    let Ok(armed) = std::fs::read_to_string(&gate) else {
+        return;
+    };
+    let exact = format!("{} {generation}", crate::node::link::b32_encode(author));
+    if armed.trim() != exact {
+        return;
+    }
+    let reached = gate.with_extension("reached");
+    std::fs::write(&reached, format!("{exact}\n")).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not mark the received-key crash boundary at {}: {error}",
+            reached.display()
+        )
+    });
+    while gate.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(feature = "test-knobs"))]
+fn hold_after_received_key_commit(_author: &Digest32, _generation: u64) {}
+
 mod attention;
 mod diagnostics;
 pub(crate) mod entry_store;
@@ -6896,7 +6928,8 @@ impl ChannelState {
             return self.accept_drive_skdm(store, skdm, &key, now_ms);
         }
         let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
-        let slot = (author, chain.chain_id());
+        let chain_id = chain.chain_id();
+        let slot = (author, chain_id);
         // A second SKDM for a generation we already hold would rewind the chain
         // head and re-enable consumed iterations; keep the live one. An earlier authenticated
         // history release widens only the separate history floor. Persist that floor with the
@@ -6946,6 +6979,7 @@ impl ChannelState {
             return Err(error);
         }
         self.entries.committed();
+        hold_after_received_key_commit(&author, chain_id);
         self.drain_backfill(store, now_ms)
     }
 

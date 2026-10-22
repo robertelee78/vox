@@ -732,8 +732,17 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     );
 
     // ---- (3) a received key, last: exact post-commit hold; bob frozen through the restart -----
-    std::fs::write(&key_hold, b"hold\n")
-        .expect("APPARATUS: cannot arm the received-key crash boundary");
+    assert_eq!(
+        received_key_generations(&alice, &room),
+        0,
+        "APPARATUS: alice already held a sender-key generation from bob before the exact crash \
+         boundary was armed, so a duplicate could rescue the durability mutant"
+    );
+    // This fresh room has not rotated Bob's sender chain: its first and only generation is 0.
+    // Bind the apparatus to that exact author/generation rather than accepting any later package.
+    let expected_generation = 0;
+    std::fs::write(&key_hold, format!("{bob_fp} {expected_generation}\n"))
+        .expect("APPARATUS: cannot arm the exact received-key crash boundary");
     post(&bob, &room, "from bob");
     let staged_at = Instant::now();
     while !key_reached.exists() {
@@ -748,17 +757,19 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         .expect("APPARATUS: cannot read the reached received-key boundary");
     let mut marker_fields = marker.split_whitespace();
     let marked_author = marker_fields.next().unwrap_or_default();
-    let marked_seq = marker_fields
+    let marked_generation = marker_fields
         .next()
-        .and_then(|seq| seq.parse::<u64>().ok())
-        .unwrap_or_default();
+        .and_then(|generation| generation.parse::<u64>().ok());
     assert!(
-        marked_author == bob_fp && marked_seq != 0 && marker_fields.next().is_none(),
-        "APPARATUS: the received-key boundary was not bob's exact key-package entry: \
-         expected author {bob_fp}, got {marker:?}"
+        marked_author == bob_fp
+            && marked_generation == Some(expected_generation)
+            && marker_fields.next().is_none(),
+        "APPARATUS: the received-key boundary was not bob's exact sender generation: \
+         expected {bob_fp} generation {expected_generation}, got {marker:?}"
     );
-    ruled.from_bob = true;
-    // Bob has made exactly his first sender generation; no other peer has posted to Alice.
+    // Bob has made exactly his first sender generation; no other peer has posted to Alice. The
+    // independently delivered post may still be behind the held room mutex, so this crash
+    // boundary claims only the exact key that Alice has actually committed.
     ruled.keys = Some(1);
     let bob_pid = bob_d.0.id();
     signal(bob_pid, rustix::process::Signal::STOP, true);
