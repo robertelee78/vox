@@ -45,14 +45,16 @@ const TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV: &str =
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_ENV: &str =
     "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE";
-/// **Test-only** (`test-knobs`): an arm file consumed by an enrolled real Vox peer. It opens one
-/// malformed management request per bounded answer slot, then deliberately leaves every response
-/// unread. This is peer apparatus; the verdict still comes from the other shipped daemon's
-/// status/trust projection.
+/// **Test-only** (`test-knobs`): `<arm>\t<generation>\t<answered>`. The arm is consumed by an
+/// enrolled real Vox peer, which clears earlier apparatus state and creates a unique generation
+/// before opening one malformed management request per bounded answer slot, then deliberately
+/// leaves every response unread. This is peer apparatus; the verdict still comes from the other
+/// shipped daemon's status/trust projection.
 #[cfg(feature = "test-knobs")]
 const TEST_STOPPED_READER_ARM_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ARM_FILE";
-/// **Test-only** (`test-knobs`): marker created by the answering shipped daemon after every
-/// bounded slot has reached the unread error-response boundary.
+/// **Test-only** (`test-knobs`): `<generation>\t<answered>`. The answering shipped daemon counts
+/// only errors in the exact generation created when the peer consumed its arm, and creates the
+/// answered marker after every bounded slot reaches the unread error-response boundary.
 #[cfg(feature = "test-knobs")]
 const TEST_STOPPED_READER_ANSWERED_ENV: &str = "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE";
 // An exchange carries retained records from the same bounded transaction, never a smaller
@@ -869,8 +871,17 @@ impl Management {
                     // hello arrives. A second outer timeout would either truncate pairing's
                     // longer public contract or mint a fresh ordinary-exchange clock.
                     let mut response_deadline = std::time::Instant::now() + PATIENCE;
+                    #[cfg(feature = "test-knobs")]
+                    let mut stopped_reader_generation = false;
                     let result = me
-                        .answer(&c, &mut send, &mut recv, &mut response_deadline)
+                        .answer(
+                            &c,
+                            &mut send,
+                            &mut recv,
+                            &mut response_deadline,
+                            #[cfg(feature = "test-knobs")]
+                            &mut stopped_reader_generation,
+                        )
                         .await;
                     // Only a fully parsed and meaningfully answered request on this
                     // authenticated computer stream proves the path is usable. A typed but
@@ -884,16 +895,16 @@ impl Management {
                         #[cfg(feature = "test-knobs")]
                         let problem = {
                             let mut problem = problem;
-                            if problem.contains("causal convergence deadline") {
-                                Self::mark_stopped_reader_answer_for_proof();
+                            if stopped_reader_generation
+                                && problem.contains("causal convergence deadline")
+                                && Self::mark_stopped_reader_answer_for_proof()
+                            {
                                 // Each response exceeds one eighth of the transaction cap. Eight
                                 // unread streams therefore exceed the connection's whole bounded
                                 // transaction allowance without inventing another size constant.
                                 // This is invariant apparatus for both product and mutant runs;
                                 // the mutant changes only the response deadline's ownership.
-                                if std::env::var_os(TEST_STOPPED_READER_ANSWERED_ENV).is_some() {
-                                    problem.push_str(&"x".repeat(MAX_FRAME / MANAGEMENT_SLOTS));
-                                }
+                                problem.push_str(&"x".repeat(MAX_FRAME / MANAGEMENT_SLOTS));
                             }
                             problem
                         };
@@ -2144,8 +2155,15 @@ impl Management {
         send: &mut SendStream,
         recv: &mut RecvStream,
         response_deadline: &mut std::time::Instant,
+        #[cfg(feature = "test-knobs")] stopped_reader_generation: &mut bool,
     ) -> Result<()> {
         let (op, peer, id, remaining_ms) = read_hello_until(recv, conn, *response_deadline).await?;
+        #[cfg(feature = "test-knobs")]
+        {
+            // Only the exact attack requests advertise this deliberately tiny budget. Ordinary
+            // exchange deadline failures in the same process never enter its generation count.
+            *stopped_reader_generation = op == 2 && remaining_ms == 1;
+        }
         let deadline = match op {
             REACHABILITY_WAKE_OP => std::time::Instant::now() + PATIENCE,
             1 if remaining_ms > 0 => local_deadline(remaining_ms, COMPUTER_PAIR_WITHIN),
@@ -2967,10 +2985,29 @@ impl Management {
     /// flow control.
     #[cfg(feature = "test-knobs")]
     async fn stage_stopped_reader_for_proof(&self, conn: &Arc<VoxConnection>) -> Result<()> {
-        let Ok(arm) = std::env::var(TEST_STOPPED_READER_ARM_ENV) else {
+        let Ok(spec) = std::env::var(TEST_STOPPED_READER_ARM_ENV) else {
             return Ok(());
         };
-        if std::fs::remove_file(&arm).is_err() {
+        let mut fields = spec.split('\t');
+        let (Some(arm), Some(generation), Some(answered), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Ok(());
+        };
+        if std::fs::remove_file(arm).is_err() {
+            return Ok(());
+        }
+        // The answerer is a separate shipped process, so the generation file is the causal reset
+        // shared across that boundary. Clear an earlier completed marker first, then publish a
+        // generation unique to this armed connection before any attack stream can be answered.
+        let _ = std::fs::remove_file(generation);
+        let _ = std::fs::remove_file(answered);
+        if std::fs::write(
+            generation,
+            format!("{}:{}:{}\n", std::process::id(), conn.serial(), now()),
+        )
+        .is_err()
+        {
             return Ok(());
         }
         let mut held = Vec::with_capacity(MANAGEMENT_SLOTS);
@@ -2997,18 +3034,38 @@ impl Management {
     }
 
     #[cfg(feature = "test-knobs")]
-    fn mark_stopped_reader_answer_for_proof() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static ANSWERS: AtomicUsize = AtomicUsize::new(0);
-        let Ok(marker) = std::env::var(TEST_STOPPED_READER_ANSWERED_ENV) else {
-            return;
+    fn mark_stopped_reader_answer_for_proof() -> bool {
+        use std::sync::{Mutex, OnceLock};
+        static ANSWERS: OnceLock<Mutex<(String, usize)>> = OnceLock::new();
+        let Ok(spec) = std::env::var(TEST_STOPPED_READER_ANSWERED_ENV) else {
+            return false;
         };
-        if ANSWERS.fetch_add(1, Ordering::AcqRel) + 1 == MANAGEMENT_SLOTS {
+        let mut fields = spec.split('\t');
+        let (Some(generation), Some(marker), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        let Ok(generation) = std::fs::read_to_string(generation) else {
+            return false;
+        };
+        let mut answers = ANSWERS
+            .get_or_init(|| Mutex::new((String::new(), 0)))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if answers.0 != generation {
+            *answers = (generation, 0);
+        }
+        let completed = answers.1 + 1 == MANAGEMENT_SLOTS;
+        if answers.1 < MANAGEMENT_SLOTS {
+            answers.1 += 1;
+        }
+        if completed {
             let _ = std::fs::write(
                 marker,
                 b"all bounded management slots reached unread replies\n",
             );
         }
+        true
     }
 
     /// Park exactly the first selected exchange after its source-owned local-apply interval. The

@@ -382,8 +382,8 @@ fn wait_for_command_marker(
         );
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: the shipped command and daemon remained live but never reached {what} \
-             before the operation's source-owned product deadline"
+            "APPARATUS: the shipped command and daemon remained live but the test-knob marker \
+             never established {what} before the staging deadline"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -408,8 +408,8 @@ fn wait_for_daemon_marker(marker: &Path, daemon: &mut Daemon, deadline: Instant,
         }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT: the shipped daemon remained live but never reached {what} before the \
-             operation's source-owned product deadline; it said:\n{}",
+            "APPARATUS: the shipped daemon remained live but the test-knob marker never \
+             established {what} before the staging deadline; it said:\n{}",
             daemon.said()
         );
         std::thread::sleep(Duration::from_millis(50));
@@ -3647,9 +3647,19 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         status_returned.display()
     );
     let stopped_reader_arm = a.data.join("fx28-stopped-reader-arm");
+    let stopped_reader_generation = b.data.join("fx28-stopped-reader-generation");
     let stopped_reader_answered = b.data.join("fx28-stopped-reader-all-answers");
-    let stopped_reader_arm_spec = stopped_reader_arm.to_string_lossy().into_owned();
-    let stopped_reader_answered_spec = stopped_reader_answered.to_string_lossy().into_owned();
+    let stopped_reader_arm_spec = format!(
+        "{}\t{}\t{}",
+        stopped_reader_arm.display(),
+        stopped_reader_generation.display(),
+        stopped_reader_answered.display()
+    );
+    let stopped_reader_answered_spec = format!(
+        "{}\t{}",
+        stopped_reader_generation.display(),
+        stopped_reader_answered.display()
+    );
     let mut da = Daemon::start(
         &a,
         &["--node", "alpha"],
@@ -3779,6 +3789,12 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // ---- a change on either daemon shows on both despite the clock skew (#1020) -----------
     let gamma = a.make_node("gamma");
     let nodes_a = [("alpha", alpha.as_str()), ("gamma", gamma.as_str())];
+    for stale in [&stopped_reader_generation, &stopped_reader_answered] {
+        if stale.exists() {
+            std::fs::remove_file(stale)
+                .expect("APPARATUS: clear an earlier stopped-reader generation marker");
+        }
+    }
     std::fs::write(
         &stopped_reader_arm,
         b"open real management streams and stop reading\n",

@@ -18820,12 +18820,17 @@ impl Node {
         // A refresh that did bounded work comes back at once; one that could do nothing yet
         // says what it waits for and is paced like every other wait (ADR-038 FX-24): a step
         // that reports progress while doing nothing re-queued the decider's room every 50 ms.
-        match ch.refresh_session_records(
-            profile,
-            &self.drive_holders(),
-            &[],
-            self.now_ms().get(),
-        )? {
+        // Every await in room preparation is complete before this publication. Derive the
+        // holder set while the current Computer authority is held, and retain that authority
+        // through the synchronous rotation/floor/Session writes performed by the refresh.
+        let Some(refresh) = self.with_current_computer_authority(|| {
+            let holders = self.drive_holders();
+            ch.refresh_session_records(profile, &holders, &[], self.now_ms().get())
+        }) else {
+            prepared.wait_on("current computer trust", self.now_ms().get());
+            return Ok(false);
+        };
+        match refresh? {
             SessionRefresh::Complete => {}
             SessionRefresh::Progressed => {
                 prepared.progressed("refreshing its Session records", self.now_ms().get());
@@ -21684,7 +21689,12 @@ impl Node {
                 }
             }
             self.computer_drive_guard(guard)?;
-            let owed = match ch.owed_drive(profile, holders, now_ms) {
+            let Some(owed) =
+                self.with_current_computer_authority(|| ch.owed_drive(profile, holders, now_ms))
+            else {
+                return Ok(());
+            };
+            let owed = match owed {
                 Ok(owed) => owed,
                 Err(_) => return Ok(()),
             };
@@ -21769,15 +21779,19 @@ impl Node {
                 }
             };
             self.computer_drive_guard(guard)?;
-            if !unsaid
-                || !ch
-                    .owed_drive(profile, holders, now_ms)
-                    .is_ok_and(|owed| owed.is_empty())
-            {
+            if !unsaid {
                 false
             } else {
                 self.computer_drive_guard(guard)?;
                 self.with_current_computer_authority(|| {
+                    // `owed_drive` may publish Session floors. Keep both that prerequisite and
+                    // the key-change Session under one exact current-policy authority.
+                    if !ch
+                        .owed_drive(profile, holders, now_ms)
+                        .is_ok_and(|owed| owed.is_empty())
+                    {
+                        return false;
+                    }
                     ch.append_session(
                         profile,
                         crate::node::drive::KEY_CHANGED,
