@@ -522,12 +522,12 @@ impl Job {
 
     /// Proof-only: keep one admitted Live or Archive job until apparatus removes its lane's
     /// named file. The caller invokes this only after it exclusively owns the charged Flow.
-    /// A `<hold>.entered.<actor>.<job>` file containing the node fingerprint is the apparatus
-    /// edge which proves that ownership; observing admission/status before this edge is
+    /// A `<hold>.entered.<actor>.<job>` file containing the node, room and peer is the apparatus
+    /// edge which proves that exact ownership; observing admission/status before this edge is
     /// insufficient because the controller can still adopt a Flow whose worker has not locked
     /// it. Production builds contain neither variable, marker nor pause.
     #[cfg(feature = "test-knobs")]
-    pub(crate) async fn hold_for_proof(&self) {
+    pub(crate) async fn hold_for_proof(&self, room: Digest32, peer: Digest32) {
         let variable = match self.0.lane {
             Lane::Archive => TEST_HOLD_ARCHIVE_JOB_ENV,
             Lane::Live => TEST_HOLD_LIVE_JOB_ENV,
@@ -547,12 +547,13 @@ impl Job {
             "{}.entered.{owner}.{job}",
             std::path::Path::new(&path).display()
         ));
-        if std::fs::write(
-            &entered,
-            crate::node::link::b32_encode(&self.0.node).as_bytes(),
-        )
-        .is_err()
-        {
+        let identity = format!(
+            "{}\nroom={}\npeer={}\n",
+            crate::node::link::b32_encode(&self.0.node),
+            crate::node::link::b32_encode(&room),
+            crate::node::link::b32_encode(&peer),
+        );
+        if std::fs::write(&entered, identity.as_bytes()).is_err() {
             return;
         }
         while std::path::Path::new(&path).exists() {
@@ -562,7 +563,7 @@ impl Job {
     }
 
     #[cfg(not(feature = "test-knobs"))]
-    pub(crate) async fn hold_for_proof(&self) {}
+    pub(crate) async fn hold_for_proof(&self, _room: Digest32, _peer: Digest32) {}
 
     /// Reserve flow state for a port's round (ADR-038 FX-35), the Control bytes it costs already
     /// reserved by the caller (the control budget's refusal is its own gate, never the pool's).

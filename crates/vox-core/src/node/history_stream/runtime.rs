@@ -119,6 +119,9 @@ pub(crate) struct Flow {
     pub(crate) wants_board: bool,
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
+    /// Exact required control root removed from the actor queue when this foreground flow was
+    /// built. An authorization retirement must return this owner just as it returns a hint.
+    pub(crate) required_root: Option<(Digest32, u64)>,
     pub(crate) hint: Option<super::HeadHint>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
@@ -168,6 +171,9 @@ pub(crate) struct Flow {
     /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
     /// the controller re-arms its exact scalar hint under the new generation.
     pub(crate) authorization_changed: bool,
+    /// A refusal reached the peer successfully but could not be recorded in the local store.
+    /// The actor re-arms the exact owner without charging this failure to the peer.
+    pub(crate) local_retry: Option<String>,
     tasks: Vec<Task>,
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
@@ -290,6 +296,7 @@ impl Flow {
             wants_board: false,
             departure_probe,
             archive_request: None,
+            required_root: required,
             state_charge: None,
             hint,
             hint_peer: peer,
@@ -313,6 +320,7 @@ impl Flow {
             route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
+            local_retry: None,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
             slots,
@@ -410,6 +418,7 @@ impl Flow {
             wants_board: false,
             departure_probe: false,
             archive_request: Some(request),
+            required_root: None,
             state_charge: None,
             hint: None,
             hint_peer: peer,
@@ -433,6 +442,7 @@ impl Flow {
             route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
+            local_retry: None,
             slots,
             owners: [None, None],
             body_progress: false,
@@ -604,7 +614,21 @@ impl Flow {
         author: Digest32,
         head: Digest32,
     ) -> Result<()> {
-        let remembered = source.remember_decline(job, author, head).await?;
+        let remembered = match source.remember_decline(job, author, head).await {
+            Ok(remembered) => remembered,
+            Err(Error::Profile(message)) if message.contains("history authorization changed") => {
+                self.authorization_changed = true;
+                self.waiting = true;
+                return Ok(());
+            }
+            Err(error) => {
+                self.local_retry = Some(format!(
+                    "local history refusal was not durably recorded: {error}"
+                ));
+                self.waiting = true;
+                return Ok(());
+            }
+        };
         inbox.finish(self.room, source.peer, author, head);
         self.declined = self.declined.saturating_add(u64::from(remembered));
         Ok(())

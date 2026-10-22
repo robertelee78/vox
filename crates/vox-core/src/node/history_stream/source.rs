@@ -58,6 +58,35 @@ pub(super) struct Source {
 }
 
 impl Source {
+    #[cfg(feature = "test-knobs")]
+    async fn hold_decline_for_proof(&self, author: Digest32, head: Digest32) {
+        const VARIABLE: &str = "VOX_TEST_HOLD_HISTORY_DECLINE_FILE";
+        let Some(path) = std::env::var_os(VARIABLE) else {
+            return;
+        };
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        let entered =
+            std::path::PathBuf::from(format!("{}.entered", std::path::Path::new(&path).display()));
+        let identity = format!(
+            "peer={} author={} head={}\n",
+            crate::node::link::b32_encode(&self.peer),
+            crate::node::link::b32_encode(&author),
+            crate::node::link::b32_encode(&head),
+        );
+        if std::fs::write(&entered, identity).is_err() {
+            return;
+        }
+        while std::path::Path::new(&path).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_file(entered);
+    }
+
+    #[cfg(not(feature = "test-knobs"))]
+    async fn hold_decline_for_proof(&self, _author: Digest32, _head: Digest32) {}
+
     /// Durably remember that this exact source refused this author's advertised head before the
     /// live flow treats the refusal as complete. A restart reconstructs the inbox from it.
     pub(super) async fn remember_decline(
@@ -66,6 +95,9 @@ impl Source {
         author: Digest32,
         head: Digest32,
     ) -> Result<bool> {
+        // The marker is apparatus only: it proves that a real shipped flow carrying its captured
+        // authorization has reached the durability edge before a proof changes trust.
+        self.hold_decline_for_proof(author, head).await;
         let peer = self.peer;
         let authorization = self.authorization.ok_or(Error::Unreachable(
             "history refusal has no captured authorization",

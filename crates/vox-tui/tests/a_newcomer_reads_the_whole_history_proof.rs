@@ -1552,8 +1552,9 @@ fn charged_flow_hold_entries(hold: &Path) -> Vec<(u64, String, std::path::PathBu
                 .next()?
                 .parse()
                 .ok()?;
-            let node = std::fs::read_to_string(entry.path()).ok()?;
-            Some((actor, node.trim().to_owned(), entry.path()))
+            let identity = std::fs::read_to_string(entry.path()).ok()?;
+            let node = identity.lines().next()?;
+            Some((actor, node.to_owned(), entry.path()))
         })
         .collect()
 }
@@ -2826,13 +2827,14 @@ fn foreground_release_wakes_without_a_tick() {
 /// (`note_lane_sync` removed) turns the last-sync claim red. The isolated
 /// `held-inventory-write` mutant commits an unchanged inventory slice without changing the lane
 /// counters and turns only the complete-store artifact assertion red. Removing the indexed
-/// refusal write makes the reconnect assertion re-decline; omitting indexed reconstruction makes
-/// the restart assertion re-decline; labeling the refusal with the callback's current grant
-/// instead of the flow's captured grant, or dropping the authorization comparison, leaves the
-/// trust-regrant lane empty rather than re-armed and newly declined; retaining the departed
-/// room/member refusal suppresses the rejoined lifetime's decline; and treating a changed head
-/// as the old decision prevents the successor's read/re-armed assertion. Each mutant reaches its
-/// own exact terminal PRODUCT red.
+/// refusal write makes the post-disconnect reconnect cycle re-decline; omitting indexed
+/// reconstruction makes the first flow released after the requester-start barrier re-decline;
+/// labeling the refusal with the callback's current grant instead of the Flow's captured grant,
+/// or dropping the authorization comparison, makes the transaction-barrier cycle decline without
+/// the shipped lane first reporting the stale old Flow. Retaining the departed room/member
+/// refusal suppresses the rejoined lifetime's decline; treating a changed head as the old
+/// decision prevents the successor's read/re-armed assertion. Each mutant reaches its own exact
+/// terminal PRODUCT red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
@@ -2842,6 +2844,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
         "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
         "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
+        "VOX_TEST_HOLD_LIVE_JOB_FILE",
+        "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
     ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -3799,8 +3803,13 @@ fn prove_declined_refusal_lifecycle(
 
     // A transport reconnect does not change the peer, author, authorization or room lifetime.
     // Its first completed exact lane cycle must therefore be empty and must not decide again.
-    let reconnect_before = exact_lane(late, room, &fps[1], "before Bob reconnects");
     bob_daemon.stop();
+    while member_connected(late, room, &fps[1]) != Some(false) {
+        std::thread::yield_now();
+    }
+    // The baseline is deliberately after shipped status reports the disconnect. A completion
+    // from the old connection therefore cannot satisfy the reconnect claim.
+    let reconnect_before = exact_lane(late, room, &fps[1], "after Bob disconnected");
     let bob_daemon = daemon(bob, "bob-refusal-reconnected");
     attached(bob, "bob-refusal-reconnected");
     let reconnect = await_lane_claim(
@@ -3823,10 +3832,37 @@ fn prove_declined_refusal_lifecycle(
     // Reconstruct the requester from disk. The first exact lane completion after restart is the
     // durable observation: an in-memory suppression cannot survive this edge.
     late_daemon.stop();
-    let late_daemon = daemon(late, "late-refusal-restarted");
+    let restart_hold = late.join("hold-refusal-restart-live");
+    let decline_hold = late.join("hold-refusal-generation-write");
+    std::fs::File::create(&restart_hold).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not arm the requester-restart flow barrier: {error}")
+    });
+    let restart_hold_text = restart_hold.to_string_lossy().into_owned();
+    let decline_hold_text = decline_hold.to_string_lossy().into_owned();
+    let late_daemon = daemon_env(
+        late,
+        "late-refusal-restarted",
+        &[
+            ("VOX_TEST_HOLD_LIVE_JOB_FILE", restart_hold_text.as_str()),
+            (
+                "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
+                decline_hold_text.as_str(),
+            ),
+        ],
+    );
     attached(late, "late-refusal-restarted");
     wait_room_open(late, room, "late-refusal-restarted");
+    wait_exact_bounded_running(
+        late,
+        room,
+        &fps[1],
+        &restart_hold,
+        "requester restart barrier",
+    );
     let restart_before = exact_lane(late, room, &fps[1], "after late's restart");
+    std::fs::remove_file(&restart_hold).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not release the requester-restart flow barrier: {error}")
+    });
     let restarted = await_lane_claim(
         late,
         room,
@@ -3844,11 +3880,36 @@ fn prove_declined_refusal_lifecycle(
          durable refusal instead of completing empty: {restarted:?}"
     );
 
-    // A real keyring removal and regrant changes the authorization generation. The unchanged Bob
-    // inventory must be eligible exactly once under that fresh grant, then settle as a new
-    // missing-body decision. Recomputing the generation inside the old flow, or omitting the
-    // generation from the refusal key, turns this assertion red after two terminal cycles.
-    let grant_before = exact_lane(late, room, &fps[1], "before Bob's authorization changes");
+    // Stage a distinct unavailable Bob head, then hold the real refusal write after its Flow has
+    // captured the old grant. The trust edit below therefore races an actually in-flight stale
+    // Flow, rather than merely hoping a periodic round overlaps two sequential commands.
+    let stale_body = "bob body whose refusal races an authorization generation";
+    std::fs::File::create(&decline_hold).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not arm the stale-refusal durability barrier: {error}")
+    });
+    let (ok, out, err) = vox(bob, &["room", "post", room, stale_body], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's stale-generation staging post was refused: {out}{err}"
+    );
+    while [alice, bob, carol]
+        .iter()
+        .any(|holder| reads(holder, room, stale_body))
+    {
+        std::thread::yield_now();
+    }
+    let decline_entered = std::path::PathBuf::from(format!("{}.entered", decline_hold.display()));
+    while !decline_entered.exists() {
+        std::thread::yield_now();
+    }
+    let staged = std::fs::read_to_string(&decline_entered).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not read the stale-refusal marker: {error}")
+    });
+    assert!(
+        staged.contains(&format!("peer={}", fps[1])),
+        "APPARATUS: the held refusal belonged to a different peer: {staged}"
+    );
+    let grant_before = exact_lane(late, room, &fps[1], "with Bob's old-grant flow in flight");
     let (ok, out, err) = vox(late, &["trust", "remove", &fps[1]], None);
     assert!(
         ok,
@@ -3859,16 +3920,19 @@ fn prove_declined_refusal_lifecycle(
         ok,
         "PRODUCT: late's shipped fresh trust grant to Bob was refused: {out}{err}"
     );
+    std::fs::remove_file(&decline_hold).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not release the stale-refusal durability barrier: {error}")
+    });
     let regranted = await_lane_claim(
         late,
         room,
         &fps[1],
         grant_before,
         "Bob's fresh authorization generation",
-        |grown| grown.history_rearmed > 0 && grown.history_declined > 0,
+        |grown| grown.stale > 0 && grown.history_rearmed > 0 && grown.history_declined > 0,
     );
     assert!(
-        !reads(late, room, pruned),
+        !reads(late, room, stale_body),
         "PRODUCT: changing authorization made a body every holder pruned appear; exact lane \
          outcome {regranted:?}"
     );
@@ -3949,6 +4013,40 @@ fn prove_declined_refusal_lifecycle(
 
     drop(late_daemon);
     drop(bob_daemon);
+}
+
+#[cfg(feature = "optional-proofs")]
+fn wait_exact_bounded_running(dir: &Path, room: &str, peer: &str, hold: &Path, claim: &str) {
+    let room_line = format!("room={room}");
+    let peer_line = format!("peer={peer}");
+    loop {
+        let marker = charged_flow_hold_entries(hold)
+            .into_iter()
+            .any(|(_, _, path)| {
+                std::fs::read_to_string(path).is_ok_and(|identity| {
+                    identity.lines().any(|line| line == room_line)
+                        && identity.lines().any(|line| line == peer_line)
+                })
+            });
+        let (ok, out, err) = vox(dir, &["status", "--json"], None);
+        assert!(ok, "PRODUCT: shipped status failed at {claim}: {err}");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: shipped status was not JSON at {claim}: {error}: {out}")
+        });
+        let exact = value["lanes"]["bounded"]["running"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|row| {
+                !row.is_null()
+                    && row["room"].as_str() == Some(room)
+                    && row["peer"].as_str() == Some(peer)
+            });
+        if marker && exact {
+            return;
+        }
+        std::thread::yield_now();
+    }
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -4661,6 +4759,7 @@ struct QuietLane {
     history_declined: u64,
     history_offered: u64,
     history_rearmed: u64,
+    stale: u64,
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -4676,6 +4775,7 @@ impl QuietLane {
                 .saturating_sub(before.history_declined),
             history_offered: self.history_offered.saturating_sub(before.history_offered),
             history_rearmed: self.history_rearmed.saturating_sub(before.history_rearmed),
+            stale: self.stale.saturating_sub(before.stale),
         }
     }
 }
@@ -4714,6 +4814,7 @@ fn quiet_lanes(status: &str) -> BTreeMap<(String, String), QuietLane> {
                     history_declined: count("history_declined"),
                     history_offered: count("history_offered"),
                     history_rearmed: count("history_rearmed"),
+                    stale: count("stale"),
                 },
             )
         })

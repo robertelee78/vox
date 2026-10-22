@@ -1600,6 +1600,129 @@ impl Node {
                     .channels
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
+            // Authorization and local-durability exits carry ownership themselves. Handle them
+            // even when the trust edit also retired the port/fence; generic stale disposal would
+            // otherwise discard the only hint, required root, or archive controller dispatch.
+            if flow.authorization_changed || flow.local_retry.is_some() {
+                if let Some(seq) = flow.mine_held.take() {
+                    self.held_notes.push((work.room, work.peer, seq));
+                }
+                if flow.admitted_authors > 0 {
+                    flow.admitted_authors = 0;
+                    let _ = self.net_tx.try_send(NetEvent::BoardGrew {
+                        channel_id: work.room,
+                    });
+                }
+                if flow.published {
+                    flow.published = false;
+                    self.governance_work.pending = true;
+                    self.key_package_rooms.entry(work.room).or_insert(false);
+                    let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
+                        channel_id: work.room,
+                        rendered: flow.rendered,
+                        governance: flow.governance,
+                    });
+                    if let Some(archive) = self.bounded_sync.ready[1].as_mut() {
+                        archive.waiting = false;
+                        self.sched_rooms.insert(archive.room);
+                    }
+                }
+                if let Some((head, seq)) = flow.external.take() {
+                    let need = RequiredOwner {
+                        room: work.room,
+                        peer: work.peer,
+                        head,
+                        seq,
+                        request: flow.retirement_request(),
+                        instance: flow.instance,
+                    };
+                    if !self.bounded_sync.required.contains(&need) {
+                        self.bounded_sync.required.push_back(need);
+                    }
+                }
+            }
+            if flow.authorization_changed {
+                let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
+                let archive = flow.archive_request.map(|request| {
+                    self.history_demand.failed(
+                        request,
+                        flow.generation,
+                        "Authorization changed while this history page was running; the exact request is being resumed.",
+                    );
+                    (request, flow.instance)
+                });
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
+                }
+                if let Some((head, seq)) = flow.required_root {
+                    let need = RequiredOwner {
+                        room: work.room,
+                        peer: flow.hint_peer,
+                        head,
+                        seq,
+                        request: flow.retirement_request(),
+                        instance: flow.instance,
+                    };
+                    if !self.bounded_sync.required.contains(&need) {
+                        self.bounded_sync.required.push_front(need);
+                    }
+                }
+                self.bounded_sync.dispose(flow);
+                crate::node::status::SyncBook::with(
+                    &self.sync_book,
+                    work.room,
+                    work.peer,
+                    |counts| {
+                        counts.stale += 1;
+                        counts.backoff = None;
+                    },
+                );
+                if let Some(port) = self.ports.get_mut(&(work.room, retry_peer)) {
+                    port.raise();
+                    port.clear_backoff();
+                }
+                if let Some((request, instance)) = archive {
+                    let _ = self.begin_history_demand(
+                        work.room,
+                        instance,
+                        crate::node::api::HistoryDemandAction::Resume { request },
+                    );
+                }
+                self.sched_rooms.insert(work.room);
+                continue;
+            }
+            if let Some(error) = flow.local_retry.take() {
+                let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
+                if let Some(hint) = flow.hint {
+                    self.history_hints
+                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
+                }
+                if let Some((head, seq)) = flow.required_root {
+                    let need = RequiredOwner {
+                        room: work.room,
+                        peer: flow.hint_peer,
+                        head,
+                        seq,
+                        request: flow.retirement_request(),
+                        instance: flow.instance,
+                    };
+                    if !self.bounded_sync.required.contains(&need) {
+                        self.bounded_sync.required.push_front(need);
+                    }
+                }
+                self.bounded_sync.dispose(flow);
+                if let Some(port) = self.ports.get_mut(&(work.room, retry_peer)) {
+                    // Keep the exact work requested, but do not immediately schedule it: an
+                    // unrelated actor event or the ordinary maintenance pass may retry after the
+                    // local store fault clears. Immediate re-scheduling would spin on a durable
+                    // local failure, while peer Busy/Unreachable backoff would blame the wire.
+                    port.raise();
+                    port.clear_backoff();
+                }
+                eprintln!("vox: {error}");
+                continue;
+            }
             if !valid {
                 self.dispose_rearming_hint(flow);
                 continue;
@@ -1712,29 +1835,6 @@ impl Node {
                 crate::node::status::SyncBook::with(&self.sync_book, work.room, target, |counts| {
                     counts.backoff = None
                 });
-                self.sched_rooms.insert(work.room);
-                continue;
-            }
-            if flow.authorization_changed {
-                let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
-                if let Some(hint) = flow.hint {
-                    self.history_hints
-                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
-                }
-                self.bounded_sync.dispose(flow);
-                crate::node::status::SyncBook::with(
-                    &self.sync_book,
-                    work.room,
-                    work.peer,
-                    |counts| {
-                        counts.stale += 1;
-                        counts.backoff = None;
-                    },
-                );
-                if let Some(port) = self.ports.get_mut(&(work.room, retry_peer)) {
-                    port.raise();
-                    port.clear_backoff();
-                }
                 self.sched_rooms.insert(work.room);
                 continue;
             }
@@ -2742,7 +2842,7 @@ impl Node {
             // The proof barrier belongs after exclusive Flow ownership. While it is held, an
             // actor panic can retire the controller but cannot adopt/park this Flow; its charge
             // therefore remains truthfully attributed to the retiring actor generation.
-            job.hold_for_proof().await;
+            job.hold_for_proof(room, peer).await;
             if flow.needs_board() && !worker_fence.is_retired() {
                 if let Some(net) = net {
                     flow.admitted_authors = tokio::select! {
