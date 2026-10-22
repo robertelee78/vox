@@ -10915,7 +10915,7 @@ impl Node {
                         // publication, rather than every network event or the one-second ticker,
                         // wakes its bounded settlement. A superseded current fact still settles
                         // its frontier but does not revise/invalidate the checked projection.
-                        self.governance_work.pending = true;
+                        self.governance_work.wake_room(channel_id);
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(&channel_id, PublishCause::Governance)
                             .await;
@@ -13047,6 +13047,9 @@ impl Node {
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
         );
+        // A close followed by a join can reuse the same room id before a maintenance sweep has
+        // pruned its old instance. The new instance must establish its own checked fold.
+        self.governance_work.wake_room(parsed.channel_id);
         // Every member whose bundle is on the board is an admitted author **on the
         // M17.6 evidence its record carries** — a self-signed record proves possession
         // of a key and nothing else. Sync hard-fails on an entry from an author we
@@ -14669,7 +14672,7 @@ impl Node {
     /// bounded governance projection. Content, status and unrelated network traffic never use
     /// this path merely to poll sealed governance state.
     fn note_local_governance_append(&mut self, channel_id: &Digest32) {
-        self.governance_work.pending = true;
+        self.governance_work.wake_room(*channel_id);
         self.note_local_append(channel_id);
     }
 
@@ -19565,6 +19568,9 @@ impl Node {
         self.remember_or_say(&ch);
         self.channels
             .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        // Reopening replaces the room instance. Never inherit a settled marker retained for the
+        // prior instance while it was absent from the open-room map.
+        self.governance_work.wake_room(channel_id);
         self.governance_work
             .set_deadline(channel_id, governance_deadline);
         // Preparation established current decisions and completed all pending narrowing.

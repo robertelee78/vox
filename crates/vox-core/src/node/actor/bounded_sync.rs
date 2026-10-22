@@ -1646,7 +1646,11 @@ impl Node {
                 }
                 if flow.published {
                     flow.published = false;
-                    self.governance_work.pending = true;
+                    if flow.governance {
+                        self.governance_work.wake_room(work.room);
+                    } else {
+                        self.governance_work.pending = true;
+                    }
                     self.key_package_rooms.entry(work.room).or_insert(false);
                     let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
                         channel_id: work.room,
@@ -1773,7 +1777,9 @@ impl Node {
                 flow.published = false;
                 // Ordinary content publication has no governance work. The history worker's
                 // signed-kind result names the causal control publication that does.
-                self.governance_work.pending |= flow.governance;
+                if flow.governance {
+                    self.governance_work.wake_room(work.room);
+                }
                 self.sched_rooms.insert(work.room);
                 // A bounded publication may have made an addressed key-package durable. Its
                 // catalog is authoritative even when the best-effort presentation event below
@@ -2158,7 +2164,7 @@ impl Node {
                 if flow.governance_wait {
                     // The flow found the fold pending: the actor's fold hook drives it (ADR-037
                     // R2 b), and the flow's next round finds it ready.
-                    self.governance_work.pending = true;
+                    self.governance_work.wake_room(work.room);
                 }
                 if index == 0 {
                     // The controller-wide retained-flow permit already bounds this collection.

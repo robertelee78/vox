@@ -32,6 +32,10 @@ pub(super) struct Maintenance {
     pub pending: bool,
     after: Option<Digest32>,
     again: bool,
+    /// Rooms whose checked governance fold is current. Other retained room work must not reopen
+    /// and re-evaluate the same sealed facts; an exact governance input or authority deadline
+    /// removes only its room from this set.
+    settled: BTreeSet<Digest32>,
     consent_after: BTreeMap<Digest32, Digest32>,
     deadlines: BTreeMap<Digest32, u64>,
     deadline_order: BTreeSet<(u64, Digest32)>,
@@ -67,6 +71,7 @@ impl Maintenance {
             }
             self.deadline_order.remove(&(deadline, room));
             self.deadlines.remove(&room);
+            self.settled.remove(&room);
             // A deadline can expire while a bounded sweep is already beyond this room.  The
             // current sweep cannot observe it, and its completion replaces `pending` with
             // `again`; carry a second sweep explicitly instead of waiting for unrelated work.
@@ -88,6 +93,19 @@ impl Maintenance {
         for room in stale {
             self.set_deadline(room, None);
         }
+    }
+
+    /// Wake the exact room whose governance input changed. This is deliberately separate from
+    /// `pending`: render, sparse-history and key-package continuations need actor maintenance but
+    /// do not invalidate an already checked governance fold.
+    pub(super) fn wake_room(&mut self, room: Digest32) {
+        self.settled.remove(&room);
+        // If the active ordered sweep has already visited this room, its completion replaces
+        // `pending` with `again`. Carry the wake across that boundary instead of losing it.
+        if self.after.is_some_and(|after| room <= after) {
+            self.again = true;
+        }
+        self.pending = true;
     }
 }
 
@@ -259,6 +277,7 @@ impl Node {
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             self.governance_work.pending = false;
             self.governance_work.after = None;
+            self.governance_work.settled.clear();
             self.governance_work.deadlines.clear();
             self.governance_work.deadline_order.clear();
             return;
@@ -274,6 +293,9 @@ impl Node {
             self.governance_work
                 .consent_after
                 .retain(|room, _| self.channels.contains_key(room));
+            self.governance_work
+                .settled
+                .retain(|room| self.channels.contains_key(room));
             let rooms = self.channels.keys().copied().collect();
             self.governance_work.retain_deadlines(&rooms);
             self.governance_work.pending = std::mem::take(&mut self.governance_work.again);
@@ -294,18 +316,28 @@ impl Node {
             self.governance_work.again = true;
             return;
         };
-        let progress = match channel.advance_governance(&store, self.now_ms()) {
-            Ok(progress) => progress,
-            Err(error) => {
-                channel.poison(&error);
-                return;
-            }
-        };
-        if progress.ready {
+        let (governance_ready, governance_pending, governance_changed) =
+            if self.governance_work.settled.contains(&room) {
+                (true, false, false)
+            } else {
+                match channel.advance_governance(&store, self.now_ms()) {
+                    Ok(progress) => {
+                        if progress.ready && !progress.pending {
+                            self.governance_work.settled.insert(room);
+                        }
+                        (progress.ready, progress.pending, progress.changed)
+                    }
+                    Err(error) => {
+                        channel.poison(&error);
+                        return;
+                    }
+                }
+            };
+        if governance_ready {
             self.governance_work
                 .set_deadline(room, channel.governance_deadline());
         }
-        self.governance_work.again |= progress.pending;
+        self.governance_work.again |= governance_pending;
         match channel.legacy_cache_only(&store) {
             Ok(true) => {
                 // Current trust narrowing is still immediate; all publication-dependent
@@ -314,7 +346,7 @@ impl Node {
                     channel.poison(&error);
                 }
                 drop(channel);
-                if progress.changed {
+                if governance_changed {
                     self.publish().await;
                 }
                 return;
@@ -341,7 +373,7 @@ impl Node {
             // The durable queue and shipped status remain pending. Apparatus owns the next wake
             // after it observes the causally held turn; do not spin while its marker is engaged.
             drop(channel);
-            if progress.changed || backfilled > 0 {
+            if governance_changed || backfilled > 0 {
                 self.publish().await;
             }
             self.governance_work.pending = false;
@@ -358,7 +390,7 @@ impl Node {
         // bounded sealed scan in this same round-robin room turn; a quiet room must not
         // need another sync to finish, and an unresolved absent target is not busy work.
         let mut legacy_finished = false;
-        if progress.ready {
+        if governance_ready {
             let was_pending = channel.legacy_classification_pending(&store);
             match was_pending.and_then(|pending| {
                 channel
@@ -376,7 +408,7 @@ impl Node {
             }
         }
         let mut views_finished = false;
-        if progress.ready {
+        if governance_ready {
             match channel.advance_room_views(&store) {
                 Ok((more, finished)) => {
                     self.governance_work.again |= more;
@@ -390,13 +422,13 @@ impl Node {
         let settle_pending =
             !channel.is_settled() && channel.uses_sparse_history(&store).unwrap_or(false);
         drop(channel);
-        if progress.ready && settle_pending {
+        if governance_ready && settle_pending {
             self.settle_sparse_room(&room).await;
         }
         // The own-history conflict detector (ADR-037 R5): a member seen holding more of this
         // node's own feed than this node does means a restored older profile. Said once, and
         // the room refuses this node's writes from here on, instead of letting it equivocate.
-        if progress.ready {
+        if governance_ready {
             let noted = match shared.try_lock() {
                 Ok(mut channel) => match channel.uses_sparse_history(&store) {
                     Ok(true) => match channel.own_history_conflict(&store) {
@@ -420,8 +452,8 @@ impl Node {
                 });
             }
         }
-        if progress.ready
-            && (progress.changed || self.governance_work.consent_after.contains_key(&room))
+        if governance_ready
+            && (governance_changed || self.governance_work.consent_after.contains_key(&room))
         {
             // A changed governance projection starts one bounded scan for stale consent; its
             // retained cursor finishes that scan even after the causal change has settled. Do
@@ -437,12 +469,12 @@ impl Node {
                 }
             }
         }
-        if progress.ready && progress.changed {
+        if governance_ready && governance_changed {
             self.adopt_channel_anchors(&room).await;
             self.refresh_network_view().await;
             self.publish_admin_roster(&room).await;
         }
-        if progress.changed || backfilled > 0 || legacy_finished || views_finished {
+        if governance_changed || backfilled > 0 || legacy_finished || views_finished {
             self.publish().await;
         }
     }
