@@ -48,6 +48,10 @@ pub(super) struct Source {
     pub(super) peer: Digest32,
     pub(super) fence: Arc<Fence>,
     pub(super) deadline: Instant,
+    /// The exact authorization grant captured by a client flow. A server source has no client
+    /// grant and cannot persist a refusal. The refusal transaction rechecks this pair in its
+    /// own store batch instead of relabeling an old flow with a later grant.
+    authorization: Option<(Digest32, Digest32)>,
     // Only a server clone bound to Control/Head(peer) may return a departed peer receipt.
     own_head_receipt: bool,
     work_committed: Arc<AtomicBool>,
@@ -63,11 +67,19 @@ impl Source {
         head: Digest32,
     ) -> Result<bool> {
         let peer = self.peer;
+        let authorization = self.authorization.ok_or(Error::Unreachable(
+            "history refusal has no captured authorization",
+        ))?;
         let committed = Arc::clone(&self.work_committed);
         match self
             .read_charged(job, 0, 0, move |room, store| {
                 Ok(Some(room.remember_history_decline(
-                    store, peer, author, head, &committed,
+                    store,
+                    peer,
+                    author,
+                    head,
+                    authorization,
+                    &committed,
                 )?))
             })
             .await?
@@ -79,6 +91,7 @@ impl Source {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         room: Arc<Mutex<ChannelState>>,
         store: Arc<Store>,
@@ -86,6 +99,7 @@ impl Source {
         peer: Digest32,
         fence: Arc<Fence>,
         deadline: Instant,
+        authorization: Option<(Digest32, Digest32)>,
         work_committed: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -95,6 +109,7 @@ impl Source {
             peer,
             fence,
             deadline,
+            authorization,
             own_head_receipt: false,
             work_committed,
         }

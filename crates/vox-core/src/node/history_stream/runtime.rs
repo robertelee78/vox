@@ -876,6 +876,7 @@ impl Flow {
                 Error::Profile(
                     "history authorization changed"
                         | "history authorization changed before publication"
+                        | "history authorization changed before refusal"
                         | "live window authorization changed"
                         | "live retry authorization changed"
                 )
@@ -910,6 +911,7 @@ impl Flow {
             self.peer,
             fence.clone(),
             deadline,
+            Some((self.node, self.generation)),
             Arc::clone(&self.work_committed),
         );
         if !self.initialized {

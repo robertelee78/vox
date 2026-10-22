@@ -78,8 +78,10 @@ impl ChannelState {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
+        authorization: (Digest32, Digest32),
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<bool> {
+        let (node, expected_authorization) = authorization;
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
                 .ok_or(Error::MalformedGovernance(
@@ -88,30 +90,50 @@ impl ChannelState {
         let author_incarnation = self.history_author_inventory_incarnation(&author).ok_or(
             Error::MalformedGovernance("declined history author is not admitted"),
         )?;
-        let authorization = crate::node::history_stream::authorization_generation(
-            store,
-            self.me(),
-            self.channel_id(),
-            self.history_instance(store)?,
-            self.epoch(),
+        if node != self.me() {
+            return Err(Error::Profile(
+                "history authorization changed before refusal",
+            ));
+        }
+        let room = self.channel_id();
+        let instance = self.history_instance(store)?;
+        let epoch = self.epoch();
+        // The trust nonce read and refusal replacement share one store transaction. If a trust
+        // save commits first, this old flow is rejected here. If this transaction commits first,
+        // the later trust nonce makes the recorded generation stale. Cancellation after either
+        // commit cannot relabel the refusal because no current generation is read outside it.
+        let mut batch = store.batch()?;
+        let current = crate::node::history_stream::authorization_generation_in(
+            &batch, node, room, instance, epoch,
         )?;
-        let read = self.history_read(store)?;
-        if read.history_declined_head(&peer, &author)?
-            == Some((head, authorization, peer_incarnation, author_incarnation))
+        if current != expected_authorization {
+            return Err(Error::Profile(
+                "history authorization changed before refusal",
+            ));
+        }
+        let mut index = self.entries.write(&mut batch, &self.sek, &room)?;
+        if index.history_declined_head(&peer, &author)?
+            == Some((
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            ))
         {
             return Ok(false);
         }
-        drop(read);
-        self.history_write_tracked(store, committed, |index| {
-            index.keep_history_declined_head(
-                peer,
-                author,
-                head,
-                authorization,
-                peer_incarnation,
-                author_incarnation,
-            )
-        })?;
+        index.keep_history_declined_head(
+            peer,
+            author,
+            head,
+            expected_authorization,
+            peer_incarnation,
+            author_incarnation,
+        )?;
+        index.seal()?;
+        batch.commit()?;
+        self.entries.committed();
+        committed.store(true, std::sync::atomic::Ordering::Release);
         Ok(true)
     }
 

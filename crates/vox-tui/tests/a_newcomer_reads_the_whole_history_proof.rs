@@ -2806,6 +2806,12 @@ fn foreground_release_wakes_without_a_tick() {
 /// periodic round, every completed round must be empty, no lane may fetch, serve or re-decline
 /// history, and Alice's, Bob's and offline Carol's complete `store.redb` bytes and mtimes must be
 /// unchanged. The artifact is the user's storage verdict; no private database field substitutes.
+/// The same journey then admits a member trusted before the posts only after every holder has
+/// visibly pruned one body. Its exact durable refusal must survive a transport reconnect and its
+/// own daemon restart; a trust removal/regrant and a leave/rejoin must invalidate the old
+/// authorization and room/member lifetimes; and Bob's successor must be read while shipped
+/// status names the exact refusal re-armed. Those waits are bounded by completed lane cycles,
+/// never an elapsed PRODUCT deadline.
 ///
 /// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
 /// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
@@ -2819,7 +2825,14 @@ fn foreground_release_wakes_without_a_tick() {
 /// has its own script and PRODUCT red. The lane's completion no longer recording the sync
 /// (`note_lane_sync` removed) turns the last-sync claim red. The isolated
 /// `held-inventory-write` mutant commits an unchanged inventory slice without changing the lane
-/// counters and turns only the complete-store artifact assertion red.
+/// counters and turns only the complete-store artifact assertion red. Removing the indexed
+/// refusal write makes the reconnect assertion re-decline; omitting indexed reconstruction makes
+/// the restart assertion re-decline; labeling the refusal with the callback's current grant
+/// instead of the flow's captured grant, or dropping the authorization comparison, leaves the
+/// trust-regrant lane empty rather than re-armed and newly declined; retaining the departed
+/// room/member refusal suppresses the rejoined lifetime's decline; and treating a changed head
+/// as the old decision prevents the successor's read/re-armed assertion. Each mutant reaches its
+/// own exact terminal PRODUCT red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
@@ -2836,12 +2849,13 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let alice = root.join("alice");
     let bob = root.join("bob");
     let carol = root.join("carol");
-    for d in [&alice, &bob, &carol] {
+    let late = root.join("late");
+    for d in [&alice, &bob, &carol, &late] {
         std::fs::create_dir_all(d.join("cfg"))
             .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
     }
     let mut fps = Vec::new();
-    for dir in [&alice, &bob, &carol] {
+    for dir in [&alice, &bob, &carol, &late] {
         let (ok, out, err) = vox(dir, &["id"], None);
         assert!(ok, "PRODUCT: `vox id` failed: {err}");
         fps.push(out.trim().to_owned());
@@ -2851,6 +2865,12 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         (&bob, &fps[0], "alice"),
         (&carol, &fps[0], "alice"),
         (&carol, &fps[1], "bob"),
+        (&alice, &fps[3], "late"),
+        (&bob, &fps[3], "late"),
+        (&carol, &fps[3], "late"),
+        (&late, &fps[0], "alice"),
+        (&late, &fps[1], "bob"),
+        (&late, &fps[2], "carol"),
     ] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
@@ -3393,6 +3413,15 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
                 after_exact[index].keys().collect::<Vec<_>>()
             ));
         }
+        let before_keys = before_exact[index].keys().cloned().collect::<BTreeSet<_>>();
+        let after_keys = after_exact[index].keys().cloned().collect::<BTreeSet<_>>();
+        if before_keys != after_keys {
+            missing_lanes.push(format!(
+                "{name}: exact lane keys changed: before-only {:?}, after-only {:?}",
+                before_keys.difference(&after_keys).collect::<Vec<_>>(),
+                after_keys.difference(&before_keys).collect::<Vec<_>>()
+            ));
+        }
         for (lane, now) in &after_exact[index] {
             let Some(was) = before_exact[index].get(lane) else {
                 missing_lanes.push(format!("{name}: lane {lane:?} appeared only after quiet"));
@@ -3478,7 +3507,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // same exact held-through position proves Bob reconstructed the durable cursor; it is not an
     // in-memory acknowledgement left over from the first daemon.
     bob_after_interruption.stop();
-    let _bob_after_restart = daemon(&bob, "bob-after-restart");
+    let bob_after_restart = daemon(&bob, "bob-after-restart");
     attached(&bob, "bob-after-restart");
     wait_room_open(&bob, &room, "bob-after-restart");
     let restart_deadline = Instant::now() + READY_WITHIN;
@@ -3682,6 +3711,291 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             said(&bob, "bob-after-restart")
         );
         std::thread::sleep(Duration::from_millis(200));
+    }
+    prove_declined_refusal_lifecycle(
+        &alice,
+        &bob,
+        &carol,
+        &late,
+        &room,
+        &link,
+        &fps,
+        bob_after_restart,
+    );
+}
+
+/// Continue the quiet-room journey through the durable refusal's actual user lifecycle. `late`
+/// was mutually trusted with every author before any room post, but joins only after every holder
+/// has visibly pruned one Bob body. Therefore its first missing-body decision is authorized and
+/// real; no forged frame or database inspection stands in for the shipped product.
+///
+/// Every wait below is fenced by exact terminal lane cycles. The process-wide proof watchdog is
+/// only an external APPARATUS deadman for a lane that makes no observable progress at all.
+#[cfg(feature = "optional-proofs")]
+#[allow(clippy::too_many_arguments)]
+fn prove_declined_refusal_lifecycle(
+    alice: &Path,
+    bob: &Path,
+    carol: &Path,
+    late: &Path,
+    room: &str,
+    link: &str,
+    fps: &[String],
+    bob_daemon: Daemon,
+) {
+    const LOCAL_RETENTION: &str = "default 1\n";
+    let pruned = "bob body retained only until the late member joins";
+    for (name, dir) in [("alice", alice), ("bob", bob), ("carol", carol)] {
+        std::fs::write(dir.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not stage {name}'s local retention file for the refusal: {error}"
+            )
+        });
+        let (ok, out, err) = vox(dir, &["room", "retention", room, "--steps", "7d"], None);
+        assert!(
+            ok,
+            "PRODUCT: {name}'s shipped retention reload was refused while staging the late-member \
+             lifecycle: {out}{err}"
+        );
+    }
+    let (ok, out, err) = vox(bob, &["room", "post", room, pruned], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's authorized refusal-lifecycle post was refused: {out}{err}"
+    );
+    while [alice, bob, carol]
+        .iter()
+        .any(|holder| reads(holder, room, pruned))
+    {
+        std::thread::yield_now();
+    }
+
+    let late_daemon = daemon(late, "late-refusal");
+    attached(late, "late-refusal");
+    let (ok, out, err) = vox(
+        late,
+        &["room", "join", "--passphrase-file", "-", link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: the member trusted before the pruned post could not join through the shipped \
+         command: {out}{err}"
+    );
+    wait_room_open(late, room, "late-refusal");
+    let declined = await_lane_claim(
+        late,
+        room,
+        &fps[1],
+        QuietLane::default(),
+        "late member's first missing-body decision",
+        |grown| grown.history_declined > 0,
+    );
+    assert!(
+        !reads(late, room, pruned),
+        "PRODUCT: the late member read Bob's body after every shipped holder had pruned it; \
+         status named its missing-body decision as {declined:?}"
+    );
+
+    // A transport reconnect does not change the peer, author, authorization or room lifetime.
+    // Its first completed exact lane cycle must therefore be empty and must not decide again.
+    let reconnect_before = exact_lane(late, room, &fps[1], "before Bob reconnects");
+    bob_daemon.stop();
+    let bob_daemon = daemon(bob, "bob-refusal-reconnected");
+    attached(bob, "bob-refusal-reconnected");
+    let reconnect = await_lane_claim(
+        late,
+        room,
+        &fps[1],
+        reconnect_before,
+        "unchanged inventory after Bob reconnects",
+        |grown| grown.completed > 0,
+    );
+    assert!(
+        reconnect.completed == reconnect.empty
+            && reconnect.history_fetched == 0
+            && reconnect.history_declined == 0
+            && reconnect.history_rearmed == 0,
+        "PRODUCT: reconnecting Bob made the late member retry or forget an unchanged durable \
+         refusal instead of completing empty: {reconnect:?}"
+    );
+
+    // Reconstruct the requester from disk. The first exact lane completion after restart is the
+    // durable observation: an in-memory suppression cannot survive this edge.
+    late_daemon.stop();
+    let late_daemon = daemon(late, "late-refusal-restarted");
+    attached(late, "late-refusal-restarted");
+    wait_room_open(late, room, "late-refusal-restarted");
+    let restart_before = exact_lane(late, room, &fps[1], "after late's restart");
+    let restarted = await_lane_claim(
+        late,
+        room,
+        &fps[1],
+        restart_before,
+        "unchanged inventory after the requester's restart",
+        |grown| grown.completed > 0,
+    );
+    assert!(
+        restarted.completed == restarted.empty
+            && restarted.history_fetched == 0
+            && restarted.history_declined == 0
+            && restarted.history_rearmed == 0,
+        "PRODUCT: after the requester's daemon restart, its first Bob lane retried or forgot the \
+         durable refusal instead of completing empty: {restarted:?}"
+    );
+
+    // A real keyring removal and regrant changes the authorization generation. The unchanged Bob
+    // inventory must be eligible exactly once under that fresh grant, then settle as a new
+    // missing-body decision. Recomputing the generation inside the old flow, or omitting the
+    // generation from the refusal key, turns this assertion red after two terminal cycles.
+    let grant_before = exact_lane(late, room, &fps[1], "before Bob's authorization changes");
+    let (ok, out, err) = vox(late, &["trust", "remove", &fps[1]], None);
+    assert!(
+        ok,
+        "PRODUCT: late's shipped trust removal of Bob was refused: {out}{err}"
+    );
+    let (ok, out, err) = vox(late, &["trust", "add", &fps[1], "--name", "bob"], None);
+    assert!(
+        ok,
+        "PRODUCT: late's shipped fresh trust grant to Bob was refused: {out}{err}"
+    );
+    let regranted = await_lane_claim(
+        late,
+        room,
+        &fps[1],
+        grant_before,
+        "Bob's fresh authorization generation",
+        |grown| grown.history_rearmed > 0 && grown.history_declined > 0,
+    );
+    assert!(
+        !reads(late, room, pruned),
+        "PRODUCT: changing authorization made a body every holder pruned appear; exact lane \
+         outcome {regranted:?}"
+    );
+
+    // Leaving deletes the local room, including its refusal namespace. Rejoining the same room
+    // is a new local room/member lifetime; its missing-body decision cannot be suppressed by the
+    // deleted lifetime's scalar. These are user commands and the visible room list is the fence.
+    let room_before = exact_lane(late, room, &fps[1], "before late leaves the room");
+    let (ok, out, err) = vox(late, &["room", "leave", room], None);
+    assert!(
+        ok,
+        "PRODUCT: late's shipped room leave was refused: {out}{err}"
+    );
+    let (ok, listed, err) = vox(late, &["room", "list"], None);
+    assert!(ok, "PRODUCT: late's room list failed after leave: {err}");
+    assert!(
+        !listed.contains(room),
+        "PRODUCT: `vox room leave` returned but late's shipped room list still named {room}: \
+         {listed}"
+    );
+    let (ok, out, err) = vox(
+        late,
+        &["room", "join", "--passphrase-file", "-", link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(
+        ok,
+        "PRODUCT: late could not rejoin the room after its visible leave: {out}{err}"
+    );
+    wait_room_open(late, room, "late-refusal-rejoined");
+    let reincarnated = await_lane_claim(
+        late,
+        room,
+        &fps[1],
+        room_before,
+        "the rejoined room/member lifetime",
+        |grown| grown.history_declined > 0,
+    );
+    assert!(
+        !reads(late, room, pruned),
+        "PRODUCT: the rejoined room exposed Bob's pruned body instead of recording the new \
+         lifetime's refusal: {reincarnated:?}"
+    );
+
+    // Restore ordinary local retention through the same shipped reload command. Bob's next
+    // authenticated head is the author successor that ends the refusal. The exact user-visible
+    // post and history_rearmed counter independently prove delivery and invalidation.
+    for (name, dir) in [("alice", alice), ("bob", bob), ("carol", carol)] {
+        std::fs::write(dir.join("cfg/retention"), "default forever\n").unwrap_or_else(|error| {
+            panic!("APPARATUS: could not restore {name}'s local retention: {error}")
+        });
+        let (ok, out, err) = vox(dir, &["room", "retention", room, "--steps", "7d"], None);
+        assert!(
+            ok,
+            "PRODUCT: {name}'s shipped retention restore was refused: {out}{err}"
+        );
+    }
+    let successor_before = exact_lane(late, room, &fps[1], "before Bob's successor");
+    let successor = "bob successor after the exact declined head";
+    let (ok, out, err) = vox(bob, &["room", "post", room, successor], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's successor to the declined inventory head was refused: {out}{err}"
+    );
+    let successor_lane = await_lane_claim(
+        late,
+        room,
+        &fps[1],
+        successor_before,
+        "Bob's authenticated successor head",
+        |grown| reads(late, room, successor) && grown.history_rearmed > 0,
+    );
+    assert!(
+        successor_lane.history_fetched > 0,
+        "PRODUCT: late read Bob's successor but shipped status did not name fetched history on \
+         that exact lane: {successor_lane:?}"
+    );
+
+    drop(late_daemon);
+    drop(bob_daemon);
+}
+
+#[cfg(feature = "optional-proofs")]
+fn exact_lane(dir: &Path, room: &str, peer: &str, when: &str) -> QuietLane {
+    let (_, _, status) = synced(dir);
+    quiet_lanes(&status)
+        .get(&(room.to_owned(), peer.to_owned()))
+        .copied()
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox status --json` omitted the exact {room}/{peer} lane {when}: \
+                 {status}"
+            )
+        })
+}
+
+#[cfg(feature = "optional-proofs")]
+fn await_lane_claim(
+    dir: &Path,
+    room: &str,
+    peer: &str,
+    before: QuietLane,
+    claim: &str,
+    done: impl Fn(QuietLane) -> bool,
+) -> QuietLane {
+    loop {
+        let now = exact_lane(dir, room, peer, claim);
+        // Leaving and rejoining creates a new room actor and may reset its lane counters. Treat
+        // that truthful new generation as its own baseline; saturating every field against the
+        // retired actor would otherwise hide all of the new lifetime's visible work.
+        let grown = if now.completed < before.completed
+            || now.history_declined < before.history_declined
+            || now.history_rearmed < before.history_rearmed
+        {
+            now
+        } else {
+            now.since(before)
+        };
+        if done(grown) {
+            return grown;
+        }
+        assert!(
+            grown.completed < 2,
+            "PRODUCT: the exact {room}/{peer} lane completed two terminal cycles without proving \
+             {claim}; its shipped counter delta was {grown:?}"
+        );
+        std::thread::yield_now();
     }
 }
 
@@ -4345,6 +4659,8 @@ struct QuietLane {
     history_fetched: u64,
     history_served: u64,
     history_declined: u64,
+    history_offered: u64,
+    history_rearmed: u64,
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -4358,6 +4674,8 @@ impl QuietLane {
             history_declined: self
                 .history_declined
                 .saturating_sub(before.history_declined),
+            history_offered: self.history_offered.saturating_sub(before.history_offered),
+            history_rearmed: self.history_rearmed.saturating_sub(before.history_rearmed),
         }
     }
 }
@@ -4394,6 +4712,8 @@ fn quiet_lanes(status: &str) -> BTreeMap<(String, String), QuietLane> {
                     history_fetched: count("history_fetched"),
                     history_served: count("history_served"),
                     history_declined: count("history_declined"),
+                    history_offered: count("history_offered"),
+                    history_rearmed: count("history_rearmed"),
                 },
             )
         })

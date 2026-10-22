@@ -120,6 +120,7 @@ pub(crate) async fn serve(
         peer,
         fence.clone(),
         deadline,
+        None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);

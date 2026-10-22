@@ -1122,6 +1122,48 @@ pub(crate) enum SourceProgress {
 }
 
 impl Write<'_, '_> {
+    /// Read one refusal from this writer's transaction. This is deliberately the same batch
+    /// that checks the authorization nonce and, when needed, replaces the refusal record.
+    pub(crate) fn history_declined_head(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        let key = declined_head_key(peer, author);
+        let Some(id) = Source::Batch(self.batch).number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.declined_heads,
+            &key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let bytes =
+            Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 7 || d.uint()? != 2 || d.bytes()? != peer || d.bytes()? != author {
+            return Err(invalid("declined history head binding"));
+        }
+        let head = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history head"))?;
+        let authorization = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history authorization generation"))?;
+        let peer_incarnation = d.uint()?;
+        let author_incarnation = d.uint()?;
+        d.finish()?;
+        Ok(Some((
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+        )))
+    }
+
     pub(crate) fn keep_history_declined_head(
         &mut self,
         peer: Digest32,

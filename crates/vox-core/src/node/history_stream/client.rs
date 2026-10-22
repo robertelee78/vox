@@ -117,7 +117,16 @@ impl Receiver {
         work_committed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
-            source: Source::new(room, store, epoch, peer, fence, deadline, work_committed),
+            source: Source::new(
+                room,
+                store,
+                epoch,
+                peer,
+                fence,
+                deadline,
+                Some((node, generation)),
+                work_committed,
+            ),
             generation,
             node,
             staging,
