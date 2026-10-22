@@ -7990,6 +7990,10 @@ impl ChannelState {
             self.save_error = Some(e.to_string());
             return Err(e);
         }
+        // The cursor moves even when this page renders no plaintext row. Drop the entry-store
+        // read cache at the commit boundary or the next maintenance turn sees the old queue root
+        // and commits the same page forever.
+        self.entries.committed();
         self.chains_advanced = false;
         let rendered = rows.len();
         self.place_committed(store, rows, &expired)?;
@@ -8191,6 +8195,10 @@ impl ChannelState {
                 return Err(error);
             }
         };
+        // An unrendered page still advances or removes its durable cursor. `place_committed`
+        // clears the cache only when it has a visible row to seal, so clear it here for every
+        // successful queue commit.
+        self.entries.committed();
         self.chains_advanced = false;
         let rendered = rows.len();
         #[cfg(feature = "test-knobs")]
