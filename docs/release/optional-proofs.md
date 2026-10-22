@@ -161,12 +161,13 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's seven executable mutants are run one at a time with
+FX-28's ten executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`,
 `stale-flight-clears-newer`, `stale-tick-authority`, or
 `keyring-commit-not-recoverable`, `expired-plan-drops-prepared`, or
-`ready-fence-accepts-unsettled`. Each mode selects the journey which stages that fault and accepts
+`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-trust-projection`, or
+`stale-rekey-authority`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
 not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
 authenticated peer which fills the other daemon's bounded management slots and leaves every
@@ -176,14 +177,19 @@ the interrupted grant. `expired-plan-drops-prepared` removes the exact durable r
 after expiry between preparation and keyring commit, so the managed node says Ready with that
 grant still effective. `ready-fence-accepts-unsettled` bypasses only the daemon's final
 state-locked publication fence after a successful receipt, so Ready publishes the exact expired
-grant before reconciliation. Full
+grant before reconciliation. `stale-post-authority` bypasses the durable-policy fence around an
+ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
+trusted rows; `stale-rekey-authority` bypasses the final fence around exact sender-key queue
+admission after every preceding await. Full
 transcripts are written under `target/fx28-mutants/`. These are
 on-demand diagnostics, not CI or release gates, and are serialized like the journeys.
 
 Startup has no separate pre-network durable-reread claim: every authority-bearing use checks the
 current durable policy and fails closed, which the independent `stale-tick-authority` mutant
-proves through a shipped room command. The startup-specific boundary is the state-locked Ready
-publication above; duplicating its predicate in the actor made either mutant rescue the other.
+proves through a shipped room command. Ordinary text append and sender-key admission have their
+own independent use-boundary mutants above. The startup-specific boundary is the state-locked
+Ready publication above; duplicating its predicate in the actor made either mutant rescue the
+other.
 
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 

@@ -4362,15 +4362,27 @@ impl NodeHandle {
         query_history(&self.net_tx, channel_id, query).await
     }
 
-    /// Borrow metadata directly: cloning NodeView also clones every room's complete order.
-    pub(crate) fn inspect_view<T>(&self, read: impl FnOnce(&NodeView, bool) -> T) -> T {
-        let policy_current = self.computer.as_ref().is_none_or(|c| {
-            c.policy_current(
-                self.computer_revision
-                    .load(std::sync::atomic::Ordering::Acquire),
-            )
-        });
-        read(&self.view_rx.borrow(), policy_current)
+    /// Clone one metadata projection, then classify that exact copy against durable policy. The
+    /// order matters: a revocation that lands before classification suppresses its trust rows;
+    /// one that lands afterward overlaps this read, which linearizes at the classification. No
+    /// potentially large view clone or formatting holds the Computer state lock.
+    pub(crate) fn coherent_view(&self) -> (NodeView, bool) {
+        let view = self.view_rx.borrow().clone();
+        let applied = self
+            .computer_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let policy_current = self
+            .computer
+            .as_ref()
+            .is_none_or(|computer| computer.policy_current(applied))
+            || crate::node::computer::fx28_mutant("stale-trust-projection");
+        (view, policy_current)
+    }
+
+    /// Inspect the published view without cloning its complete room orders. The work-board caller
+    /// reads room membership only; authority-bearing trust projections use `coherent_view`.
+    pub(crate) fn inspect_published_view<T>(&self, read: impl FnOnce(&NodeView) -> T) -> T {
+        read(&self.view_rx.borrow())
     }
 
     /// Resolve a `.vox` name against this node's rooms and keyring (PRD-001 R20): the
@@ -4482,15 +4494,12 @@ impl NodeHandle {
     /// The latest view (cheap clone of the watch value).
     #[must_use]
     pub fn view(&self) -> NodeView {
-        let mut view = self.view_rx.borrow().clone();
-        if let Some(c) = &self.computer {
-            if !c.policy_current(
-                self.computer_revision
-                    .load(std::sync::atomic::Ordering::Acquire),
-            ) {
-                // Fail closed while the actor reconciles the newly durable policy.
-                view.drive.clear();
-            }
+        let (mut view, policy_current) = self.coherent_view();
+        if !policy_current {
+            // Fail closed while the actor reconciles the newly durable policy. Read trust is
+            // authority too: callers must not turn an old keyring row into an effective grant.
+            view.trusted.clear();
+            view.drive.clear();
         }
         view
     }
@@ -13837,9 +13846,44 @@ impl Node {
                 self.history_in_flight.insert(pair, (watched, !all_sent));
             }
             // The complete batch was admitted before sealing. Reserved sends cannot fail or
-            // wait, and this peer's writer preserves ratchet order (V210-71).
-            for (queue, job) in jobs {
-                queue.send(job);
+            // wait, and this peer's writer preserves ratchet order (V210-71). Every preceding
+            // connection, room and session operation awaited, so durable Computer policy is
+            // checked once more under its state lock at the irreversible queue admission.
+            #[cfg(feature = "test-knobs")]
+            let held_for_proof = self.hold_rekey_enqueue_for_proof(target).await;
+            let published = if crate::node::computer::fx28_mutant("stale-rekey-authority") {
+                for (queue, job) in jobs {
+                    queue.send(job);
+                }
+                true
+            } else {
+                self.with_current_computer_authority(|| {
+                    for (queue, job) in jobs {
+                        queue.send(job);
+                    }
+                    true
+                })
+                .unwrap_or(false)
+            };
+            if !published {
+                // Preparation counted these exact frames as in flight. Since none reached its
+                // writer, unwind only those volatile counters; the durable obligation and sealed
+                // retry frame remain, ready for the reconciled actor to send under current policy.
+                for _ in 0..watched {
+                    self.key_landed(*channel_id, target);
+                }
+                if owes_history {
+                    self.history_in_flight.remove(&pair);
+                }
+                #[cfg(feature = "test-knobs")]
+                if held_for_proof {
+                    self.mark_rekey_authority_decision_for_proof(false);
+                }
+                continue;
+            }
+            #[cfg(feature = "test-knobs")]
+            if held_for_proof {
+                self.mark_rekey_authority_decision_for_proof(true);
             }
             if all_sent {
                 delivered += 1;
@@ -21879,9 +21923,19 @@ impl Node {
         // composed from two clock reads can go backwards across a second boundary, which is the
         // ordering inversion this change exists to remove.
         let now_millis = (self.millis_clock)();
-        let appended = match ch.append_text(profile, text, now_millis) {
-            Ok(r) => row_of(&r),
-            Err(error) => {
+        // The room lock follows every await. Hold durable Computer policy across the exact append
+        // so a revision that moved after command admission cannot publish with stale authority.
+        #[cfg(feature = "test-knobs")]
+        self.hold_text_append_publication_for_proof().await;
+        let appended = if crate::node::computer::fx28_mutant("stale-post-authority") {
+            Some(ch.append_text(profile, text, now_millis))
+        } else {
+            self.with_current_computer_authority(|| ch.append_text(profile, text, now_millis))
+        };
+        let appended = match appended {
+            None => return Outcome::Failed(Fault::ComputerPolicy),
+            Some(Ok(r)) => row_of(&r),
+            Some(Err(error)) => {
                 let fault = fault_of(&error);
                 if matches!(fault, Fault::Internal) {
                     // Internal promises a log detail. Keep only the error and public room ID,
@@ -21902,7 +21956,15 @@ impl Node {
         // A rotation that cannot persist poisons the channel, which the *next*
         // command reports; it does not un-send the message that just went out, so the
         // append is still reported as the success it was.
-        let rotated = ch.should_rotate_sender(now_ms) && ch.rotate_sender(profile, now_ms).is_ok();
+        #[cfg(feature = "test-knobs")]
+        let proof_rotation = std::env::var_os("VOX_TEST_FX28_ROTATE_AFTER_POST")
+            .is_some_and(|value| !value.is_empty());
+        #[cfg(not(feature = "test-knobs"))]
+        let proof_rotation = false;
+        let rotated = (ch.should_rotate_sender(now_ms) || proof_rotation)
+            && self
+                .with_current_computer_authority(|| ch.rotate_sender(profile, now_ms))
+                .is_some_and(|rotated| rotated.is_ok());
         let detail = {
             let published = self.view_tx.borrow();
             detail_of(

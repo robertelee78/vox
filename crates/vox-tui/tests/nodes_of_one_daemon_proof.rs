@@ -389,6 +389,28 @@ fn wait_for_command_marker(
     }
 }
 
+fn read_daemon_marker(marker: &Path, daemon_pid: u32, what: &str) -> String {
+    let deadline = Instant::now() + RETURN_WITHIN;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(marker) {
+            return contents;
+        }
+        let fault = marker.with_extension("fault");
+        if let Ok(contents) = std::fs::read_to_string(&fault) {
+            panic!("APPARATUS: daemon could not publish {what}: {contents}");
+        }
+        assert!(
+            daemon_alive(daemon_pid),
+            "APPARATUS: daemon {daemon_pid} exited before {what}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: the daemon remained live but did not publish {what} before the staging deadline"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Wait for a file boundary created by the daemon-side apparatus. Process death is attributable;
 /// elapsed wall time is deliberately not the verdict.
 fn wait_for_daemon_marker(marker: &Path, daemon: &mut Daemon, deadline: Instant, what: &str) {
@@ -1481,6 +1503,9 @@ fn computer_preview_and_approval_survive_a_crash() {
             && approved["pairing"]["approved_here"] == true,
         "APPARATUS: shipped approval did not stage the displayed operation before crash: {approved}"
     );
+    println!(
+        "[proof] FX-28 preview-approval-crash apparatus staged: beta durably recorded the exact authenticated preview and local approval before its daemon crash"
+    );
     let _ = db.crash();
     let restarted = Instant::now();
     let mut db = Daemon::start(&b, &["--node", "beta"], &[]);
@@ -2066,6 +2091,9 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         ("after-remote-anchor-b", bob.as_str()),
     ];
     let expected_bob_grants_before_race = [(first.as_str(), "read"), (second.as_str(), "read")];
+    println!(
+        "[proof] FX-28 stale-flight-newer-obligation apparatus staged: the first exact flight was superseded by two durable revisions, its source-owned retry crossed the retained causal deadline, and the restored anchor named both exact computers"
+    );
     let converged = wait_until(
         first_deadline.saturating_duration_since(Instant::now()),
         || {
@@ -4219,6 +4247,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_HOLD_COMPUTER_POLICY",
         "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY",
         "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION",
+        "VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION",
+        "VOX_TEST_HOLD_REKEY_ENQUEUE",
+        "VOX_TEST_FX28_ROTATE_AFTER_POST",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
         "VOX_TEST_FX28_MUTANT",
         "VOX_TEST_FX28_STOPPED_READER_ARM_FILE",
@@ -4260,6 +4291,26 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         stale_pause_arm.display(),
         stale_pause_engaged.display(),
         stale_pause_release.display()
+    );
+    let stale_post_arm = b.data.join("hold-delta-stale-post-arm");
+    let stale_post_engaged = b.data.join("hold-delta-stale-post-engaged");
+    let stale_post_release = b.data.join("hold-delta-stale-post-release.sock");
+    let stale_post_spec = format!(
+        "delta\t{}\t{}\t{}",
+        stale_post_arm.display(),
+        stale_post_engaged.display(),
+        stale_post_release.display()
+    );
+    let stale_rekey_arm = b.data.join("hold-delta-stale-rekey-arm");
+    let stale_rekey_engaged = b.data.join("hold-delta-stale-rekey-engaged");
+    let stale_rekey_release = b.data.join("hold-delta-stale-rekey-release.sock");
+    let stale_rekey_decision = b.data.join("hold-delta-stale-rekey-decision");
+    let stale_rekey_spec = format!(
+        "delta\t{}\t{}\t{}\t{}",
+        stale_rekey_arm.display(),
+        stale_rekey_engaged.display(),
+        stale_rekey_release.display(),
+        stale_rekey_decision.display()
     );
     let status_arm = a.data.join("mark-computer-status");
     let status_accepted = a.data.join("accepted-computer-status");
@@ -4305,6 +4356,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_TEST_HOLD_COMPUTER_POLICY", &hold_spec),
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", &reply_spec),
             ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", &stale_pause_spec),
+            ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", &stale_post_spec),
+            ("VOX_TEST_HOLD_REKEY_ENQUEUE", &stale_rekey_spec),
+            ("VOX_TEST_FX28_ROTATE_AFTER_POST", "1"),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
                 &stopped_reader_answered_spec,
@@ -4406,6 +4460,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             hold_spec: &hold_spec,
             reply_spec: &reply_spec,
             stale_pause_spec: &stale_pause_spec,
+            stale_post_spec: &stale_post_spec,
+            stale_rekey_spec: &stale_rekey_spec,
             stopped_reader_answered: &stopped_reader_answered_spec,
         },
     );
@@ -4439,12 +4495,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     change_shows_on_both((&b, &db, &nodes_b), (&a, &da, &nodes_a), "delta", None);
 
     // ---- a stale actor cannot publish a remote drive mutation -----------------------------
-    let epsilon = stale_remote_pause_is_refused(
+    let (epsilon, stale_room, stale_room_link) = stale_remote_pause_is_refused(
         (&a, &da),
         (&b, &db),
         &stale_pause_arm,
         &stale_pause_engaged,
         &stale_pause_release,
+        &stale_post_arm,
+        &stale_post_engaged,
+        &stale_post_release,
         (&beta, &delta),
     );
     let nodes_a = [
@@ -4645,6 +4704,20 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &hold_engaged,
         &hold_release,
         &forward,
+    );
+    stale_rekey_is_not_delivered(
+        (&a, &da),
+        (&b, &db),
+        &stale_room,
+        &stale_room_link,
+        &epsilon,
+        &hold_arm,
+        &hold_engaged,
+        &hold_release,
+        &stale_rekey_arm,
+        &stale_rekey_engaged,
+        &stale_rekey_release,
+        &stale_rekey_decision,
     );
 }
 
@@ -5020,6 +5093,8 @@ struct RestartComputerSide<'a> {
     hold_spec: &'a str,
     reply_spec: &'a str,
     stale_pause_spec: &'a str,
+    stale_post_spec: &'a str,
+    stale_rekey_spec: &'a str,
     stopped_reader_answered: &'a str,
 }
 
@@ -5035,6 +5110,8 @@ fn a_restart_derives_nothing(
         hold_spec,
         reply_spec,
         stale_pause_spec,
+        stale_post_spec,
+        stale_rekey_spec,
         stopped_reader_answered,
     } = side;
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
@@ -5054,6 +5131,9 @@ fn a_restart_derives_nothing(
             ("VOX_TEST_HOLD_COMPUTER_POLICY", hold_spec),
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", reply_spec),
             ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", stale_pause_spec),
+            ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", stale_post_spec),
+            ("VOX_TEST_HOLD_REKEY_ENQUEUE", stale_rekey_spec),
+            ("VOX_TEST_FX28_ROTATE_AFTER_POST", "1"),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
                 stopped_reader_answered,
@@ -5413,14 +5493,18 @@ fn change_reaches_a_live_computer(
 /// policy through another shipped action, then judge the released request by what shipped
 /// `vox room pause` tells its caller. The marker proves causal staging; no elapsed silence is a
 /// PRODUCT verdict.
+#[allow(clippy::too_many_arguments)]
 fn stale_remote_pause_is_refused(
     (a, da): (&Account, &Daemon),
     (b, db): (&Account, &Daemon),
     hold_arm: &Path,
     hold_engaged: &Path,
     hold_release: &Path,
+    post_arm: &Path,
+    post_engaged: &Path,
+    post_release: &Path,
     (beta, delta): (&str, &str),
-) -> String {
+) -> (String, String, String) {
     let room = make_room(b, "delta");
     let (ok, link, err) = b.run(&["room", "link", &room, "--node", "delta"], "");
     assert!(ok, "APPARATUS: link delta's stale-publication room: {err}");
@@ -5523,7 +5607,251 @@ fn stale_remote_pause_is_refused(
         }),
         "APPARATUS: nodes did not settle after the stale-publication refusal"
     );
-    epsilon
+
+    // The same final-use rule covers an ordinary local post. Hold it after its room lock and all
+    // awaits, move durable policy through a shipped personal-node change, then release it. The
+    // command itself is the terminal product observation; elapsed silence is never a verdict.
+    std::fs::write(post_arm, b"hold delta's exact text append\n")
+        .expect("APPARATUS: arm the stale text-append publication hold");
+    let mut post = b
+        .cmd(&[
+            "room",
+            "post",
+            &room,
+            "STALE-AUTHORITY-TEXT",
+            "--node",
+            "delta",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the shipped stale-authority text post");
+    wait_for_command_marker(
+        post_engaged,
+        &mut post,
+        db.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "delta's ordinary text append at its final publication boundary",
+    );
+    let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
+    computer(a, &["personal", "gamma"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            computer(b, &["status"])["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > before)
+                && grant_words(b, "beta", &epsilon).is_some()
+        }),
+        "APPARATUS: durable policy did not move on beta while delta's text append was held"
+    );
+    assert!(
+        post_engaged.is_file(),
+        "APPARATUS: delta's exact text append was not held through durable policy movement"
+    );
+    println!(
+        "[proof] FX-28 stale-trust-projection apparatus staged: durable Computer policy moved while delta retained an unreconciled keyring projection"
+    );
+    let (trust_ok, stale_trust, trust_error) = b.run(&["trust", "list", "--node", "delta"], "");
+    assert!(
+        trust_ok
+            && stale_trust.contains("no trusted identities")
+            && !stale_trust.contains(&epsilon),
+        "PRODUCT [FX28 stale-trust-projection]: after durable Computer policy moved but before delta reconciled it, shipped `vox trust list --node delta` exposed or failed to suppress the old trusted rows: stdout {stale_trust}; stderr {trust_error}"
+    );
+    println!(
+        "[proof] FX-28 stale-post-authority apparatus staged: durable Computer policy moved while delta's exact ordinary text append remained held at its final publication boundary"
+    );
+    std::os::unix::net::UnixStream::connect(post_release).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: release delta's held text append at {}: {error}",
+            post_release.display()
+        )
+    });
+    let posted = post
+        .wait_with_output()
+        .expect("APPARATUS: collect the causally released text-post command");
+    assert!(
+        !posted.status.success(),
+        "PRODUCT [FX28 stale-post-authority]: after durable Computer policy moved while its exact ordinary append was held, shipped `vox room post` still published and acknowledged stale-authority text: stdout {}; stderr {}",
+        String::from_utf8_lossy(&posted.stdout),
+        String::from_utf8_lossy(&posted.stderr)
+    );
+    let (_, read, read_error) = b.run(&["room", "read", &room, "--node", "beta"], "");
+    assert!(
+        !read.contains("STALE-AUTHORITY-TEXT"),
+        "PRODUCT [FX28 stale-post-authority]: beta's shipped room read exposed text appended after its author's durable Computer authority became stale: {read}{read_error}"
+    );
+    computer(a, &["personal", "alpha"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
+                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+        }),
+        "APPARATUS: nodes did not settle after the stale text-append refusal"
+    );
+
+    (epsilon, room, link.trim().to_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stale_rekey_is_not_delivered(
+    (a, _da): (&Account, &Daemon),
+    (b, db): (&Account, &Daemon),
+    room: &str,
+    link: &str,
+    epsilon: &str,
+    hold_arm: &Path,
+    hold_engaged: &Path,
+    hold_release: &Path,
+    rekey_arm: &Path,
+    rekey_engaged: &Path,
+    rekey_release: &Path,
+    rekey_decision: &Path,
+) {
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            roster_current(&computer(b, &["status"]), &["beta", "delta"])
+                && b.run(&["node", "list"], "").1.lines().any(|line| {
+                    line.split_whitespace().next() == Some("delta")
+                        && line.starts_with("delta Ready")
+                })
+        }),
+        "APPARATUS: delta did not become current before final rekey-authority staging"
+    );
+    let (ok, out, err) = a.run(
+        &[
+            "room",
+            "join",
+            "--node",
+            "epsilon",
+            "--passphrase-file",
+            "-",
+            link,
+        ],
+        ROOM_PASS,
+    );
+    assert!(ok, "APPARATUS: join epsilon for rekey staging: {out}{err}");
+    let (ok, out, err) = b.run(
+        &["room", "post", room, "REKEY-BASELINE", "--node", "delta"],
+        "",
+    );
+    assert!(ok, "APPARATUS: post the rekey baseline: {out}{err}");
+    assert!(
+        wait_until(RETURN_WITHIN, || a
+            .run(&["room", "read", room, "--node", "epsilon"], "")
+            .1
+            .contains("REKEY-BASELINE")),
+        "APPARATUS: epsilon did not read the baseline through the staged sender-key path"
+    );
+    let rekey_fault = rekey_decision.with_extension("fault");
+    for stale in [rekey_engaged, rekey_decision, &rekey_fault] {
+        let _ = std::fs::remove_file(stale);
+    }
+    std::fs::write(rekey_arm, format!("{epsilon}\n"))
+        .expect("APPARATUS: arm epsilon's exact stale rekey enqueue");
+    std::fs::write(hold_arm, b"hold delta's revocation policy message\n")
+        .expect("APPARATUS: arm delta's reconciliation behind the rekey decision");
+    let mut rotating_post = b
+        .cmd(&[
+            "room",
+            "post",
+            room,
+            "STALE-AUTHORITY-REKEY",
+            "--node",
+            "delta",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the shipped post which rotates epsilon's sender key");
+    wait_for_command_marker(
+        rekey_engaged,
+        &mut rotating_post,
+        db.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "epsilon's prepared sender-key batch at final queue admission",
+    );
+    let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
+    let a_id = computer_id(a);
+    let status = computer(b, &["status"]);
+    computer(
+        b,
+        &[
+            "remove",
+            &a_id,
+            "--confirm",
+            status["frontier"].as_str().unwrap_or_default(),
+        ],
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            computer(b, &["status"])["revision"]
+                .as_u64()
+                .is_some_and(|revision| revision > before)
+                && grant_words(b, "beta", epsilon).is_none()
+        }),
+        "APPARATUS: beta did not expose epsilon's durable revocation while delta's exact rekey was held"
+    );
+    assert!(
+        rekey_engaged.is_file(),
+        "APPARATUS: epsilon's exact rekey was not still held after durable revocation"
+    );
+    println!(
+        "[proof] FX-28 stale-rekey-authority apparatus staged: epsilon was durably revoked while its exact prepared sender-key batch remained held at final queue admission"
+    );
+    std::os::unix::net::UnixStream::connect(rekey_release).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: release epsilon's held rekey at {}: {error}",
+            rekey_release.display()
+        )
+    });
+    let post_result = rotating_post
+        .wait_with_output()
+        .expect("APPARATUS: collect the shipped sender-rotation post");
+    assert!(
+        post_result.status.success(),
+        "APPARATUS: the pre-revocation append did not complete after its rekey decision: {}{}",
+        String::from_utf8_lossy(&post_result.stdout),
+        String::from_utf8_lossy(&post_result.stderr)
+    );
+    let decision = read_daemon_marker(
+        rekey_decision,
+        db.child.id(),
+        "the exact rekey authority decision",
+    );
+    if decision.trim() == "enqueued" {
+        assert!(
+            wait_until(RETURN_WITHIN, || a
+                .run(&["room", "read", room, "--node", "epsilon"], "")
+                .1
+                .contains("STALE-AUTHORITY-REKEY")),
+            "APPARATUS: the mutant enqueued epsilon's exact key but the shipped recipient never exposed its delivery"
+        );
+        panic!("PRODUCT [FX28 stale-rekey-authority]: after epsilon's durable revocation, its shipped room read exposed text unlocked by the stale sender-key batch");
+    }
+    assert_eq!(
+        decision.trim(),
+        "rejected",
+        "APPARATUS: the rekey authority boundary published an unknown decision: {decision}"
+    );
+    let read = a.run(&["room", "read", room, "--node", "epsilon"], "").1;
+    assert!(
+        !read.contains("STALE-AUTHORITY-REKEY"),
+        "PRODUCT [FX28 stale-rekey-authority]: epsilon's shipped room read exposed text whose sender key was prepared before its durable revocation: {read}"
+    );
+    read_daemon_marker(
+        hold_engaged,
+        db.child.id(),
+        "delta's held revocation reconciliation",
+    );
+    std::os::unix::net::UnixStream::connect(hold_release).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: release delta's held revocation reconciliation at {}: {error}",
+            hold_release.display()
+        )
+    });
 }
 
 /// One node whose actor queue is held must be visibly non-attached within FX-28's five seconds;

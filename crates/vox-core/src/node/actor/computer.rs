@@ -43,9 +43,43 @@ const TEST_HOLD_COMPUTER_POLICY_REPLY_ENV: &str = "VOX_TEST_HOLD_COMPUTER_POLICY
 const TEST_HOLD_COMPUTER_RECONCILE_SEND_ENV: &str = "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE";
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION";
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_TEXT_APPEND_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION";
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_REKEY_ENQUEUE_ENV: &str = "VOX_TEST_HOLD_REKEY_ENQUEUE";
 
 #[cfg(feature = "test-knobs")]
 impl Node {
+    async fn hold_authority_use_for_proof(&self, variable: &str, action: &str) {
+        let Ok(spec) = std::env::var(variable) else {
+            return;
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(node), Some(arm), Some(engaged), Some(release)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        let mine = self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str());
+        if mine != Some(node) || std::fs::remove_file(arm).is_err() {
+            return;
+        }
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
+            return;
+        };
+        if std::fs::write(engaged, format!("{action} held\n")).is_err() {
+            return;
+        }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(engaged);
+        let _ = std::fs::remove_file(release);
+    }
+
     pub(super) async fn hold_computer_policy_for_proof(&self) {
         let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV) else {
             return;
@@ -129,6 +163,80 @@ impl Node {
         let _ = listener.accept().await;
         let _ = std::fs::remove_file(engaged);
         let _ = std::fs::remove_file(release);
+    }
+
+    /// Test apparatus: hold an ordinary text command after its room lock and every await, at the
+    /// final durable-policy fence before append. The marker stages only; shipped output judges.
+    pub(super) async fn hold_text_append_publication_for_proof(&self) {
+        self.hold_authority_use_for_proof(
+            TEST_HOLD_TEXT_APPEND_PUBLICATION_ENV,
+            "text append publication",
+        )
+        .await;
+    }
+
+    /// Test apparatus: hold a prepared sender/history-key batch after every await and immediately
+    /// before its final durable-policy fence and queue admission.
+    pub(super) async fn hold_rekey_enqueue_for_proof(&self, target: Digest32) -> bool {
+        let Ok(spec) = std::env::var(TEST_HOLD_REKEY_ENQUEUE_ENV) else {
+            return false;
+        };
+        let mut fields = spec.splitn(5, '\t');
+        let (Some(node), Some(arm), Some(engaged), Some(release), Some(_decision)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            return false;
+        };
+        let mine = self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str());
+        let armed_target = std::fs::read_to_string(arm).ok();
+        let target = crate::node::link::b32_encode(&target);
+        if mine != Some(node)
+            || armed_target.as_deref().map(str::trim) != Some(target.as_str())
+            || std::fs::remove_file(arm).is_err()
+        {
+            return false;
+        }
+        let _ = std::fs::remove_file(release);
+        let Ok(listener) = tokio::net::UnixListener::bind(release) else {
+            return false;
+        };
+        if std::fs::write(engaged, b"rekey enqueue held\n").is_err() {
+            return false;
+        }
+        let _ = listener.accept().await;
+        let _ = std::fs::remove_file(engaged);
+        let _ = std::fs::remove_file(release);
+        true
+    }
+
+    pub(super) fn mark_rekey_authority_decision_for_proof(&self, published: bool) {
+        let Ok(spec) = std::env::var(TEST_HOLD_REKEY_ENQUEUE_ENV) else {
+            return;
+        };
+        let Some(decision) = spec.splitn(5, '\t').nth(4) else {
+            return;
+        };
+        if let Err(error) = crate::node::computer::publish_proof_marker(
+            std::path::Path::new(decision),
+            if published {
+                b"enqueued\n"
+            } else {
+                b"rejected\n"
+            },
+        ) {
+            crate::node::computer::publish_proof_fault(
+                &std::path::Path::new(decision).with_extension("fault"),
+                &format!("could not publish rekey authority decision: {error}"),
+            );
+        }
     }
 }
 
