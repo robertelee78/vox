@@ -4647,6 +4647,46 @@ impl ChannelState {
         self.with_consent_facts(|facts| facts.can_read(target, &me))
     }
 
+    /// Page through admitted members this identity currently consents to, from the same
+    /// in-memory projection as [`Self::has_consented`]. Sender-key delivery uses this bounded
+    /// page on its periodic retry; it must not reopen and decrypt the sealed governance index
+    /// every second while that projection already stands current. Explicit governance queries
+    /// and trust narrowing retain sealed pagination because they must include off-roster targets.
+    pub(crate) fn consented_member_page(
+        &self,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> Result<GovernanceTargets> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let me = self.me();
+        self.with_consent_facts(|facts| {
+            let mut cursor = after;
+            let mut targets = Vec::new();
+            for _ in 0..limit.clamp(1, governance::PAGE_ROWS) {
+                let Some(target) = self
+                    .authors
+                    .range((cursor.map_or(Unbounded, Excluded), Unbounded))
+                    .next()
+                    .map(|(target, _)| *target)
+                else {
+                    return GovernanceTargets {
+                        targets,
+                        next: None,
+                    };
+                };
+                cursor = Some(target);
+                if facts.can_read(&target, &me) {
+                    targets.push(target);
+                }
+            }
+            GovernanceTargets {
+                targets,
+                next: cursor,
+            }
+        })
+    }
+
     /// **Who trusts each member here** (ADR-028 K-7): for every member some other member consents
     /// to reading it, those other members, off the log like [`Self::consent_page`]. This
     /// identity's own entry is who consents to it reading them, the inbound half of `consented`
@@ -4835,7 +4875,11 @@ impl ChannelState {
     /// was updated. A consenter with no ledger row counts as owed; re-delivering a
     /// generation it already holds is ignored by
     /// [`ChannelState::accept_skdm`], so the safe direction is to send.
-    pub fn owed_rekeys(&self, store: &Store, after: Option<Digest32>) -> Result<GovernanceTargets> {
+    pub fn owed_rekeys(
+        &self,
+        _store: &Store,
+        after: Option<Digest32>,
+    ) -> Result<GovernanceTargets> {
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -4847,7 +4891,7 @@ impl ChannelState {
         }
         let me = self.me();
         let current = self.sender.chain_id();
-        let mut page = self.consent_page(store, &me, after, 64)?;
+        let mut page = self.consented_member_page(after, 64)?;
         page.targets.retain(|target| {
             *target != me
                 && !self.has_left(target)
