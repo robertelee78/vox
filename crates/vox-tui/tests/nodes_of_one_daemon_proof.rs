@@ -4248,6 +4248,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY",
         "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION",
         "VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION",
+        "VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION",
         "VOX_TEST_HOLD_REKEY_ENQUEUE",
         "VOX_TEST_FX28_END_KEY_UNANSWERED_FILE",
         "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
@@ -4302,6 +4303,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         stale_post_arm.display(),
         stale_post_engaged.display(),
         stale_post_release.display()
+    );
+    let stale_create_arm = b.data.join("hold-delta-stale-create-arm");
+    let stale_create_engaged = b.data.join("hold-delta-stale-create-engaged");
+    let stale_create_release = b.data.join("hold-delta-stale-create-release.sock");
+    let stale_create_spec = format!(
+        "delta\t{}\t{}\t{}",
+        stale_create_arm.display(),
+        stale_create_engaged.display(),
+        stale_create_release.display()
     );
     let stale_rekey_arm = b.data.join("hold-delta-stale-rekey-arm");
     let stale_rekey_engaged = b.data.join("hold-delta-stale-rekey-engaged");
@@ -4374,6 +4384,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", &reply_spec),
             ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", &stale_pause_spec),
             ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", &stale_post_spec),
+            ("VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION", &stale_create_spec),
             ("VOX_TEST_HOLD_REKEY_ENQUEUE", &stale_rekey_spec),
             (
                 "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
@@ -4482,6 +4493,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             reply_spec: &reply_spec,
             stale_pause_spec: &stale_pause_spec,
             stale_post_spec: &stale_post_spec,
+            stale_create_spec: &stale_create_spec,
             stale_rekey_spec: &stale_rekey_spec,
             older_selected_spec: &older_selected_spec,
             stopped_reader_answered: &stopped_reader_answered_spec,
@@ -4526,6 +4538,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &stale_post_arm,
         &stale_post_engaged,
         &stale_post_release,
+        &stale_create_arm,
+        &stale_create_engaged,
+        &stale_create_release,
         (&beta, &delta),
     );
     let nodes_a = [
@@ -5121,6 +5136,7 @@ struct RestartComputerSide<'a> {
     reply_spec: &'a str,
     stale_pause_spec: &'a str,
     stale_post_spec: &'a str,
+    stale_create_spec: &'a str,
     stale_rekey_spec: &'a str,
     older_selected_spec: &'a str,
     stopped_reader_answered: &'a str,
@@ -5139,6 +5155,7 @@ fn a_restart_derives_nothing(
         reply_spec,
         stale_pause_spec,
         stale_post_spec,
+        stale_create_spec,
         stale_rekey_spec,
         older_selected_spec,
         stopped_reader_answered,
@@ -5161,6 +5178,7 @@ fn a_restart_derives_nothing(
             ("VOX_TEST_HOLD_COMPUTER_POLICY_REPLY", reply_spec),
             ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", stale_pause_spec),
             ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", stale_post_spec),
+            ("VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION", stale_create_spec),
             ("VOX_TEST_HOLD_REKEY_ENQUEUE", stale_rekey_spec),
             (
                 "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
@@ -5536,6 +5554,9 @@ fn stale_remote_pause_is_refused(
     post_arm: &Path,
     post_engaged: &Path,
     post_release: &Path,
+    create_arm: &Path,
+    create_engaged: &Path,
+    create_release: &Path,
     (beta, delta): (&str, &str),
 ) -> (String, String, String) {
     let room = make_room(b, "delta");
@@ -5722,6 +5743,84 @@ fn stale_remote_pause_is_refused(
                 && roster_current(&computer(b, &["status"]), &["beta", "delta"])
         }),
         "APPARATUS: nodes did not settle after the stale text-append refusal"
+    );
+
+    // Room sealing is off actor and can finish after durable policy moved. Hold the exact sealed
+    // create at its first store commit, move policy through a shipped personal-node command, and
+    // require both the create answer and room list to remain fail closed.
+    std::fs::write(create_arm, b"hold delta's sealed room create\n")
+        .expect("APPARATUS: arm the stale room-create publication hold");
+    let mut create = b
+        .cmd(&[
+            "room",
+            "create",
+            "--node",
+            "delta",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "stale-create",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the shipped stale-authority room create");
+    create
+        .stdin
+        .take()
+        .expect("APPARATUS: room create stdin")
+        .write_all(ROOM_PASS.as_bytes())
+        .expect("APPARATUS: give the room create its passphrase");
+    wait_for_command_marker(
+        create_engaged,
+        &mut create,
+        db.child.id(),
+        Instant::now() + RETURN_WITHIN,
+        "delta's sealed room create at its first durable commit",
+    );
+    let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
+    computer(a, &["personal", "gamma"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || computer(b, &["status"])["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > before)),
+        "APPARATUS: durable policy did not move on beta while delta's sealed room create was held"
+    );
+    assert!(
+        create_engaged.is_file(),
+        "APPARATUS: delta's exact sealed room create was not held through policy movement"
+    );
+    println!(
+        "[proof] FX-28 stale-room-create-authority apparatus staged: durable Computer policy moved while delta's exact sealed room create remained held at its first durable commit"
+    );
+    std::os::unix::net::UnixStream::connect(create_release).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: release delta's held room create at {}: {error}",
+            create_release.display()
+        )
+    });
+    let created = create
+        .wait_with_output()
+        .expect("APPARATUS: collect the causally released room-create command");
+    assert!(
+        !created.status.success(),
+        "PRODUCT [FX28 stale-room-create-authority]: after durable Computer policy moved while its exact sealed room was held, shipped `vox room create` still committed and acknowledged it: stdout {}; stderr {}",
+        String::from_utf8_lossy(&created.stdout),
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let (listed, rooms, list_error) = b.run(&["room", "list", "--node", "delta"], "");
+    assert!(
+        listed && !rooms.contains("stale-create"),
+        "PRODUCT [FX28 stale-room-create-authority]: delta's shipped room list exposed the stale-authority room after its create was refused: {rooms}{list_error}"
+    );
+    computer(a, &["personal", "alpha"]);
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
+                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+        }),
+        "APPARATUS: nodes did not settle after the stale room-create refusal"
     );
 
     (epsilon, room, link.trim().to_owned())

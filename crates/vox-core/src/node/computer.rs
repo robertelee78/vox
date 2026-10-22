@@ -52,11 +52,6 @@ pub(crate) fn fx28_mutant(named: &str) -> bool {
     std::env::var("VOX_TEST_FX28_MUTANT").as_deref() == Ok(named)
 }
 
-#[cfg(not(feature = "test-knobs"))]
-pub(crate) const fn fx28_mutant(_named: &str) -> bool {
-    false
-}
-
 /// Publish a populated proof marker in one namespace operation, without replacing an existing
 /// marker. Test-knob call sites use this only for causal staging; shipped builds compile every
 /// caller out.
@@ -2669,11 +2664,14 @@ impl Computer {
             if let Some(applied) = s.applied.get(&node) {
                 denied.extend(applied.grants.keys().copied());
             }
-            if let Some(prepared) = s
+            #[cfg(feature = "test-knobs")]
+            let prepared = s
                 .prepared
                 .get(&node)
-                .filter(|_| !fx28_mutant("expired-plan-drops-prepared"))
-            {
+                .filter(|_| !fx28_mutant("expired-plan-drops-prepared"));
+            #[cfg(not(feature = "test-knobs"))]
+            let prepared = s.prepared.get(&node);
+            if let Some(prepared) = prepared {
                 denied.extend(prepared.grants.keys().copied());
             }
             return Ok(Some(PolicyPlan {
@@ -3001,9 +2999,12 @@ impl Computer {
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
         let state = lock(&self.state);
-        (Self::application_settled_in(&state, node, revision)
-            || fx28_mutant("ready-fence-accepts-unsettled"))
-        .then(publish)
+        #[cfg(feature = "test-knobs")]
+        let settled = Self::application_settled_in(&state, node, revision)
+            || fx28_mutant("ready-fence-accepts-unsettled");
+        #[cfg(not(feature = "test-knobs"))]
+        let settled = Self::application_settled_in(&state, node, revision);
+        settled.then(publish)
     }
 
     /// Test apparatus predicate for identifying the exact successful applied receipt. It exposes

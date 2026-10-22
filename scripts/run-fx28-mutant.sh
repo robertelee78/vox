@@ -52,6 +52,12 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stale-post-authority]:'
     staging='[proof] FX-28 stale-post-authority apparatus staged:'
     ;;
+  stale-room-create-authority)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 stale-room-create-authority]:'
+    staging='[proof] FX-28 stale-room-create-authority apparatus staged:'
+    ;;
   stale-trust-projection)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
@@ -71,7 +77,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority|keyring-commit-not-recoverable|expired-plan-drops-prepared|ready-fence-accepts-unsettled|stale-post-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority|keyring-commit-not-recoverable|expired-plan-drops-prepared|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac

@@ -161,12 +161,12 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's eleven executable mutants are run one at a time with
+FX-28's twelve executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`,
 `stale-flight-clears-newer`, `stale-tick-authority`, or
 `keyring-commit-not-recoverable`, `expired-plan-drops-prepared`, or
-`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-trust-projection`, or
+`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`, `stale-trust-projection`, or
 `stale-rekey-authority`, or `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
 not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
@@ -179,7 +179,9 @@ grant still effective. `ready-fence-accepts-unsettled` bypasses only the daemon'
 state-locked publication fence after a successful receipt, so Ready publishes the exact expired
 grant before reconciliation. `stale-post-authority` bypasses the durable-policy fence around an
 ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
-trusted rows; `stale-rekey-authority` bypasses the final fence around exact sender-key queue
+trusted rows; `stale-room-create-authority` bypasses only the first durable commit of an exact
+sealed room create, so its shipped create answer and room list expose stale authority;
+`stale-rekey-authority` bypasses the final fence around exact sender-key queue
 admission after every preceding await. `legacy-ended-unanswered-not-selected` suppresses only
 the real `ENDED_UNANSWERED` compatibility-route selection; the shipped roster then fails to say
 that the exact peer runs an older Vox, before the authority race is staged. Full transcripts are

@@ -31,6 +31,44 @@ pub(super) struct KeyringApplication {
     pub(super) settled: bool,
 }
 
+/// A captured actor projection whose final use is checked against durable Computer state. The
+/// token contains no authority by itself: [`ComputerAuthority::publish`] takes the state lock and
+/// revalidates the exact revision and binding through the synchronous irreversible operation.
+#[derive(Clone)]
+pub(super) enum ComputerAuthority {
+    Unmanaged,
+    Managed {
+        computer: Arc<crate::node::computer::Computer>,
+        applied: u64,
+        node: Digest32,
+    },
+}
+
+impl ComputerAuthority {
+    pub(super) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("stale-tick-authority") {
+            return Some(publish());
+        }
+        match self {
+            Self::Unmanaged => Some(publish()),
+            Self::Managed {
+                computer,
+                applied,
+                node,
+            } => computer.publish_with_current_authority(*applied, *node, publish),
+        }
+    }
+
+    pub(super) fn publish_room_creation<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("stale-room-create-authority") {
+            return Some(publish());
+        }
+        self.publish(publish)
+    }
+}
+
 /// **Test-only** (`test-knobs`): `<node>\t<arm>\t<engaged>\t<release socket>`. The actor consumes
 /// `arm`, creates `engaged`, and waits for one connection to `release`. The shipped-binary proof
 /// can therefore hold and release the exact actor message causally, without a sleep standing in
@@ -45,6 +83,8 @@ const TEST_HOLD_COMPUTER_RECONCILE_SEND_ENV: &str = "VOX_TEST_HOLD_COMPUTER_RECO
 const TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION";
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_TEXT_APPEND_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION";
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION";
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_REKEY_ENQUEUE_ENV: &str = "VOX_TEST_HOLD_REKEY_ENQUEUE";
 #[cfg(feature = "test-knobs")]
@@ -251,6 +291,16 @@ impl Node {
         self.hold_authority_use_for_proof(
             TEST_HOLD_TEXT_APPEND_PUBLICATION_ENV,
             "text append publication",
+        )
+        .await;
+    }
+
+    /// Test apparatus: hold one completed room seal after all off-actor work and immediately
+    /// before the durable room commit. The marker stages only; shipped create/list output judges.
+    pub(super) async fn hold_room_create_publication_for_proof(&self) {
+        self.hold_authority_use_for_proof(
+            TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV,
+            "room create publication",
         )
         .await;
     }
@@ -566,11 +616,15 @@ impl Node {
         &self,
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
-        if crate::node::computer::fx28_mutant("stale-tick-authority") {
-            return Some(publish());
-        }
+        self.computer_authority()?.publish(publish)
+    }
+
+    /// Capture the actor's exact applied revision and node identity before asynchronous
+    /// preparation. The returned token must span only the final synchronous write/queue boundary;
+    /// it deliberately remains valid to carry across awaits because `publish` rechecks it.
+    pub(super) fn computer_authority(&self) -> Option<ComputerAuthority> {
         let Some(computer) = &self.computer else {
-            return Some(publish());
+            return Some(ComputerAuthority::Unmanaged);
         };
         let applied = self
             .computer_revision
@@ -581,7 +635,11 @@ impl Node {
             .filter(|profile| profile.is_unlocked())
             .map(Profile::fingerprint)
             .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()))?;
-        computer.publish_with_current_authority(applied, me, publish)
+        Some(ComputerAuthority::Managed {
+            computer: Arc::clone(computer),
+            applied,
+            node: me,
+        })
     }
 
     /// Whether this actor's live trust/key projection belongs to the current durable computer
@@ -922,7 +980,12 @@ impl Node {
         // and attempting to prepare it again would reject the expiry before revocation could be
         // saved. If either following write is interrupted, startup repeats the same idempotent
         // branch until `mark_expired_until` clears the records after the revoked keyring lands.
-        if !expired && !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable") {
+        if !expired {
+            #[cfg(feature = "test-knobs")]
+            if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable") {
+                computer.prepare_application_until(me, revision, &covered, deadline)?;
+            }
+            #[cfg(not(feature = "test-knobs"))]
             computer.prepare_application_until(me, revision, &covered, deadline)?;
         }
         Self::computer_policy_active(deadline, cancelled)?;

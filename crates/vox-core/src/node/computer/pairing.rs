@@ -914,6 +914,7 @@ impl Management {
                         f.array(2).uint(0).text(&problem);
                         // A peer which stopped reading cannot retain one of the bounded answer
                         // slots forever merely because its error response is backpressured.
+                        #[cfg(feature = "test-knobs")]
                         let response_deadline =
                             if crate::node::computer::fx28_mutant("stopped-reader-fresh-write") {
                                 std::time::Instant::now() + PATIENCE
@@ -2776,9 +2777,15 @@ impl Management {
         // Only the snapshot this flight actually sent can acknowledge a local obligation. The
         // merged revision may include a newer local cause which arose while this flight was away.
         let durable_revision = outcome.as_ref().map_or(revision, |(sent, merged)| {
+            #[cfg(feature = "test-knobs")]
             if crate::node::computer::fx28_mutant("stale-flight-clears-newer") {
                 *merged
             } else {
+                *sent
+            }
+            #[cfg(not(feature = "test-knobs"))]
+            {
+                let _ = merged;
                 *sent
             }
         });

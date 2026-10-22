@@ -104,7 +104,13 @@ impl Node {
             let _ = work.reply.send(Outcome::Done);
             return;
         }
-        let result = channel.remove_admin(profile, &work.member, work.after, self.now_ms());
+        let result = self.with_current_computer_authority(|| {
+            channel.remove_admin(profile, &work.member, work.after, self.now_ms())
+        });
+        let Some(result) = result else {
+            let _ = work.reply.send(Outcome::Failed(Fault::ComputerPolicy));
+            return;
+        };
         drop(channel);
         match result {
             Err(error) if ChannelState::governance_refreshing(&error) => {
