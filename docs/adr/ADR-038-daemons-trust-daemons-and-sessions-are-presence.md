@@ -158,6 +158,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   decider with its measurement (ADR-037 R13). Measured cause on 2026-10-19: the settlement tick
   offered the node's own head to every connected peer every second, and the lane never recorded
   a peer's acknowledgement, so the hinted round that fetched nothing ran again each tick.
+  Decision (the decider, 2026-10-21): `held_through` is the last authenticated feed position the
+  peer has completely satisfied for that peer's role. An authenticated header whose private
+  payload and effect are addressed only to another member counts as satisfied without the other
+  member's payload; it MUST NOT cause a permanent receipt probe, partial round or repeated offer.
 - **FX-16.** `vox status` and the app MUST record each round the lane completes as the room's
   and the peer's last completed sync; "no completed sync" MUST fire only when it is true
   (ADR-034 §5 "Health is true", HL-1; PRD-001 R35).
@@ -299,9 +303,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   windows) MAY be lost in such a crash, and after one the daemon MUST rebuild what it lost from
   the proofs it holds and from the peers it can reach, so the room syncs on. A sync round that persists only derived state MUST make no full flush:
   `vox status --json` names the daemon's count of full flushes, and over a quiet minute it MUST
-  NOT move. Decision: derived state commits at redb `Durability::None` or `Eventual` (a later
-  durable commit carries it) and the ruled set stays `Immediate` however it arrived: a
-  received consent, trust change, key package or Session record is flushed like the node's own.
+  NOT move. Decision: derived state commits at redb `Durability::None` (redb 4.3.0 has no
+  `Eventual`; a later durable commit carries it) and the ruled set stays `Immediate` however it
+  arrived: a received consent, trust change, key package or Session record is flushed like the
+  node's own.
   Any other received entry commits with the derived state that admitted it and reaches disk
   with the next durable commit, before this node acknowledges holding it to its sender (ADR-028
   R-6), so a crash in between loses only what the sender has not yet seen acknowledged and
@@ -381,33 +386,38 @@ The decider then answered twelve questions, one at a time. His answers are the d
   round. Terms: a port is eligible when it has a need (ADR-037 R7: a raised request or a head
   newer than it served), a connection to its peer and no bounded-sync round running for that
   port; a flow is parked while it sits in `ready`, `deferred`, `retiring` or `cleanup` and no
-  task runs it; the flow-state pool is `RETAINED_FLOWS` charges per daemon (16 today, each 128
-  KiB), shared by every hosted node. Decision: each running bounded-sync round MUST hold exactly
-  one flow-state charge, and each flow-state charge that is held MUST be held by exactly one running bounded-sync round; acquisition of the charge and the round's transition to running MUST be
-  one atomic state transition for accounting and status; every transition out of running, by
-  completion, failure or cancellation, MUST release the charge; a flow in `ready`, `deferred`,
-  `retiring` or `cleanup`, and a flow shelved without starting a round, MUST hold no charge. So
+  task runs it. The flow-state pool is shared by every hosted node, each charge is 128 KiB, and
+  its limit MUST be `max(16, 2 × currently hosted node identities)`. That limit meets or exceeds
+  the maximum legal running work because each hosted node MUST run at most two bounded-sync
+  rounds at once. Each running bounded-sync round MUST hold exactly one flow-state charge, and
+  each held flow-state charge MUST be held by exactly one running bounded-sync round.
+  Acquisition of the charge and the round's transition to running MUST be one atomic state
+  transition for accounting and status; every transition out of running, by completion, failure
+  or cancellation, MUST release the charge. A flow in `ready`, `deferred`, `retiring` or
+  `cleanup`, a flow shelved without starting a round, and an exact continuation retained while
+  waiting for a charge MUST hold no worker, byte charge, outbound slot or flow-state charge. So
   the pool bounds rounds running at once, never flows at rest. Each node's bounded controller
   MUST retain at most twelve flows in all across `ready`, `running`, `deferred`, `retiring` and
-  `cleanup`, and MUST run at most two bounded-sync rounds at once; the daemon-wide number of
-  running rounds is therefore at most the smaller of `RETAINED_FLOWS` and twice the hosted
-  nodes. When an eligible port cannot reserve flow state because every charge is held by a
-  running round, the daemon MUST dispose the flow whose resume made that reservation attempt,
-  MUST re-arm all and only work still outstanding under FX-29 without creating a need from a
-  hint the node already holds, MUST release every room, lane-job, live-flow, outbound-slot and
-  flow-state reservation the attempt acquired, and MUST re-queue the port with its need
-  preserved. The port MUST then have exactly one entry in a daemon-wide first-come flow-state
-  wait queue; it MUST retain that entry until it is selected or ceases to be eligible, and the
-  daemon MUST remove it immediately when either occurs. Whenever a charge is available and at least one eligible waiter remains, the daemon MUST select the earliest-enqueued eligible waiter, remove its entry and run one start
-  attempt for it before permitting a port not selected from that queue to reserve the charge; if
-  that attempt ends before reserving the charge, the daemon MUST repeat this selection while a
-  charge and an eligible waiter remain; ties in enqueue order MAY be broken arbitrarily. No
-  count or threshold of periods, turns, elapsed time or CPU time MAY dispose, expire or defer a
-  parked flow, or delay, skip or space a start attempt (FX-27); flow-state release MUST be
-  caused solely by a round's transition out of running, which a timeout or a connection failure
-  MAY cause. A start attempt is one scheduler invocation for an eligible port, including its
-  flow-state reservation; it ends `started` only when it launches the bounded-sync round,
-  otherwise `not_started`. `vox status --json` MUST report, for every port under
+  `cleanup`.
+
+  There is no daemon-wide flow-state wait queue. A failure to reserve flow state is an impossible
+  invariant violation under the legal running-work limit above. If it nevertheless occurs, the
+  daemon MUST retain that exact `Flow` as an event-owned continuation, release every worker,
+  byte, room, lane-job, live-flow, outbound-slot and flow-state reservation the failed attempt
+  acquired, and record its eligibility in monotonically increasing order. The exact transition
+  of a running round out of `running` that releases a charge MUST select and wake the earliest
+  retained eligible continuation before a new contender can reserve that charge; a continuation
+  that has ceased to be eligible MUST be removed immediately. Vox MUST NOT discard or
+  reconstruct the work, create a need from a hint the node already holds, or depend on a tick,
+  retry, timer or polling pass to wake it. No count or threshold of periods, turns, elapsed time,
+  retries, retained continuations, CPU use or machine load MAY dispose, expire, refuse, retire,
+  defer, delay, skip, space or reorder that work. A timeout or connection failure MAY end a
+  running round; only its transition out of running releases the charge and causes the next
+  eligible continuation to run.
+
+  A start attempt is one scheduler invocation for an eligible port, including its flow-state
+  reservation; it ends `started` only when it launches the bounded-sync round, otherwise
+  `not_started`. `vox status --json` MUST report, for every port under
   `lanes.ports[]`: `start_outcome`, equal to `never_attempted` until the first start attempt in
   the current daemon process ends and thereafter equal to `started` or `not_started` for the
   most recently ended attempt (an in-progress attempt does not replace that value, and a daemon
@@ -424,10 +434,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
   that node's node ID, whose value is that node's integer in-use count; the member values MUST
   sum to `in_use`; a node's `round_running` values and its own `by_node` member MUST be taken
   from one snapshot, and that member MUST equal the number of that node's ports whose
-  `round_running` is true. While at least one port in a room has an entry in the daemon-wide
-  flow-state wait queue, any "no completed sync" text shown for that room in `vox status` or in
-  the app MUST contain the literal text `flow-state pool`; when no port in the room has such an
-  entry, that text MUST NOT identify the flow-state pool as the cause. Measured cause,
+  `round_running` is true. While at least one port in a room has a retained flow-state
+  continuation waiting for the exact release edge, any "no completed sync" text shown for that
+  room in `vox status` or in the app MUST contain the literal text `flow-state pool`; when no port
+  in the room has such a continuation, that text MUST NOT identify the flow-state pool as the
+  cause. Measured cause,
   2026-10-21 (UTC, as every date in this record): on the decider's daemon (four hosted nodes,
   three rooms, restarted 02:32Z) every port of every node had started no round, `queued` froze,
   every room said "no completed sync in 10 minutes", and posts moved neither between the two
