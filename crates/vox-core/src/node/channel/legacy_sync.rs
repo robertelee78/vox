@@ -189,6 +189,7 @@ impl ChannelState {
                     )],
                     now.get(),
                     Some(count),
+                    None,
                     Some(request),
                 )?;
                 out.applied = got.applied;

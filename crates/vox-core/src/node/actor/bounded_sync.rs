@@ -559,6 +559,12 @@ impl Node {
             let Some(mut returned) = returned else {
                 continue;
             };
+            // Detach only the debt created by this exact returned flow slice. Do this before
+            // any route, retry or disposal branch so every successful receive owns its flush,
+            // while an empty slice owns none and cannot flush another lane's write (FX-30).
+            if let Some(debt) = returned.flow.take_received_debt() {
+                self.flush_received_off_actor(debt, work.room, work.peer);
+            }
             let Some(work) = self.bounded_sync.running[index].take() else {
                 self.dispose_rearming_hint(returned.flow);
                 continue;
@@ -809,10 +815,6 @@ impl Node {
                 // sync" while its counters climbed into the thousands (the decider's daemon,
                 // 2026-10-19).
                 self.note_lane_sync(work.room, work.peer);
-                // A round that admitted a received entry without a flush ends with one, off
-                // the actor, so what this node tells the next peer it holds is on disk
-                // (ADR-038 FX-30).
-                self.flush_received_off_actor();
                 let origin_room =
                     crate::node::ports::RoomRef::Channel(Arc::downgrade(&returned.flow.shared));
                 let origin_live = self
@@ -991,10 +993,6 @@ impl Node {
                 // sync" while its counters climbed into the thousands (the decider's daemon,
                 // 2026-10-19).
                 self.note_lane_sync(work.room, work.peer);
-                // A round that admitted a received entry without a flush ends with one, off
-                // the actor, so what this node tells the next peer it holds is on disk
-                // (ADR-038 FX-30).
-                self.flush_received_off_actor();
             } else {
                 let waiting = returned.flow.waiting;
                 let body_progress = returned.flow.body_progress;

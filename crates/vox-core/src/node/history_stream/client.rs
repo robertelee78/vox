@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::{entry_store::sparse::CursorBinding, ChannelState};
 use crate::node::history_demand::{self as demand, Active, Context};
-use crate::node::store::Store;
+use crate::node::store::{ReceivedFlow, Store};
 use crate::wire::WireError;
 
 use super::admission::{self, Advanced, Staged};
@@ -33,6 +33,7 @@ pub(crate) struct Receiver {
     source: Source,
     generation: Digest32,
     node: Digest32,
+    received: ReceivedFlow,
     staging: Option<Staging>,
     historical: bool,
 }
@@ -84,21 +85,24 @@ impl Receiver {
     // The receiver retains one exact room, peer, grant, staging slot and cancellation scope.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        room_id: Digest32,
         room: Arc<Mutex<ChannelState>>,
         store: Arc<Store>,
         peer: Digest32,
         epoch: u64,
         generation: Digest32,
         node: Digest32,
+        received: ReceivedFlow,
         staging: Option<Staging>,
         historical: bool,
         fence: Arc<crate::transport::stream_transport::Fence>,
         deadline: tokio::time::Instant,
     ) -> Self {
         Self {
-            source: Source::new(room, store, epoch, peer, fence, deadline),
+            source: Source::new(room_id, room, store, epoch, peer, fence, deadline),
             generation,
             node,
+            received,
             staging,
             historical,
         }
@@ -852,6 +856,7 @@ impl Receiver {
         }
         let job = record.job.clone();
         let grant = self.grant();
+        let received = self.received.clone();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             if binding.room != room.channel_id()
                 || binding.author != record.entry.skeleton.author_id
@@ -862,7 +867,7 @@ impl Receiver {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
-            room.commit_history_source(store, &record.entry, now, |batch| {
+            room.commit_history_source(store, &record.entry, now, &received, |batch| {
                 grant.check_batch(batch, room_id, instance, epoch)
             })?;
             // Publication is now Switched, not Idle. Keep the exact verifier until the
@@ -930,6 +935,7 @@ impl Receiver {
         let staging = self.staging.clone();
         let grant = self.grant();
         let historical = self.historical;
+        let received = self.received.clone();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
@@ -941,6 +947,7 @@ impl Receiver {
                 now,
                 body_expected,
                 historical,
+                &received,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
             )?;
@@ -960,6 +967,7 @@ impl Receiver {
         let staging = self.staging.clone();
         let grant = self.grant();
         let historical = self.historical;
+        let received = self.received.clone();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             use crate::node::channel::governance::{PayloadValidation, TypedSparseBody};
             let key = room
@@ -982,6 +990,7 @@ impl Receiver {
                 &body,
                 now,
                 historical,
+                &received,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
             )

@@ -19686,20 +19686,44 @@ impl Node {
         self.offer_own_head(channel_id, own_hint, own_targets);
     }
 
-    /// Flush the store once, off the actor, if a received entry committed without a flush is
-    /// waiting for one (ADR-038 FX-30): called when a lane round completes. A round that
-    /// persisted only derived state, or nothing, costs no `F_FULLFSYNC` here. The inventory and
-    /// head answers this node serves flush for themselves before they speak, so a peer is never
-    /// told of an entry that is not on disk even while a round still runs.
-    fn flush_received_off_actor(&self) {
+    /// Flush the exact durability debt detached from one receive flow, off the actor. A queued
+    /// worker whose epoch was already covered returns without adopting newer store-global debt;
+    /// a flow that received nothing never calls this at all (ADR-038 FX-30).
+    fn flush_received_off_actor(
+        &self,
+        debt: crate::node::store::ReceivedDebt,
+        room: Digest32,
+        peer: Digest32,
+    ) {
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             return;
         };
-        if !store.received_pending() {
-            return;
-        }
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = store.flush_if_received_pending() {
+            #[cfg(not(feature = "test-knobs"))]
+            let _ = (room, peer);
+            #[cfg(feature = "test-knobs")]
+            if let Some(gate) = std::env::var_os("VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE") {
+                let gate = std::path::PathBuf::from(gate);
+                let exact = format!(
+                    "{} {}",
+                    crate::node::link::b32_encode(&room),
+                    crate::node::link::b32_encode(&peer)
+                );
+                if std::fs::read_to_string(&gate).is_ok_and(|armed| armed.trim() == exact) {
+                    let reached = gate.with_extension("reached");
+                    if let Err(error) = std::fs::write(&reached, format!("{exact}\n")) {
+                        eprintln!(
+                            "APPARATUS: could not mark the received-flow flush boundary at {}: {error}",
+                            reached.display()
+                        );
+                        return;
+                    }
+                    while gate.exists() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+            if let Err(e) = store.flush_received_through(debt) {
                 eprintln!("vox: the store could not flush received entries to disk: {e}");
             }
         });

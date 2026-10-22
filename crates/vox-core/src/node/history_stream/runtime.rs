@@ -12,7 +12,7 @@ use crate::node::channel::entry_store::sparse::LiveWindow;
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
-use crate::node::store::Store;
+use crate::node::store::{ReceivedDebt, ReceivedFlow, Store};
 use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -143,6 +143,9 @@ pub(crate) struct Flow {
     /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
     /// the controller re-arms its exact scalar hint under the new generation.
     pub(crate) authorization_changed: bool,
+    /// Durability debt created by this flow alone. It follows every receiver handoff and is
+    /// detached whenever the flow returns to the actor.
+    received: ReceivedFlow,
     tasks: Vec<Task>,
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
@@ -237,6 +240,7 @@ impl Flow {
             route_origin: None,
             route_complete: false,
             authorization_changed: false,
+            received: ReceivedFlow::new(room),
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
             slots,
@@ -347,6 +351,7 @@ impl Flow {
             route_origin: None,
             route_complete: false,
             authorization_changed: false,
+            received: ReceivedFlow::new(room),
             slots,
             owners: [None, None],
             no_progress: 0,
@@ -604,17 +609,23 @@ impl Flow {
         deadline: tokio::time::Instant,
     ) -> Receiver {
         Receiver::new(
+            self.room,
             self.shared.clone(),
             store,
             self.peer,
             self.epoch,
             self.generation,
             self.node,
+            self.received.clone(),
             self.stage(purpose),
             purpose == Purpose::History,
             fence,
             deadline,
         )
+    }
+
+    pub(crate) fn take_received_debt(&self) -> Option<ReceivedDebt> {
+        self.received.take()
     }
     fn binding(&self) -> Binding {
         Binding {
@@ -725,6 +736,7 @@ impl Flow {
         now: u64,
     ) -> Result<()> {
         let source = Source::new(
+            self.room,
             self.shared.clone(),
             store.clone(),
             self.epoch,

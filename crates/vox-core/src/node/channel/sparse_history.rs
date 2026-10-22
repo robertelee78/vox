@@ -488,6 +488,7 @@ impl ChannelState {
         store: &Store,
         entry: &Entry,
         now: crate::time::Ms,
+        received: &crate::node::store::ReceivedFlow,
         on_publish: impl FnOnce(&mut Batch<'_>) -> Result<()>,
     ) -> Result<()> {
         if self.poisoned {
@@ -506,10 +507,9 @@ impl ChannelState {
         }
         let late = read.child_after(&hash, None)?.is_some();
         drop(read);
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
         // Received source entries, promoted (ADR-038 FX-30): flushed before this node
         // acknowledges them; their semantic effects follow in `advance_history_effect`.
-        batch.received();
         on_publish(&mut batch)?;
         let mut index = self
             .entries
@@ -649,6 +649,7 @@ impl ChannelState {
         now: crate::time::Ms,
         body_expected: bool,
         historical: bool,
+        received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -784,13 +785,12 @@ impl ChannelState {
             }
             Err(error) => return Err(error),
         }
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
         // A received entry's effect (ADR-038 FX-30): flushed before this node acknowledges it;
         // governance and key packages say `ruled` below and are flushed at once.
-        batch.received();
         let applied = (|| -> Result<(bool, bool, bool, bool)> {
             let finished = FinishedHistoryEffect { hash: *hash };
             let mut index = self
@@ -941,6 +941,7 @@ impl ChannelState {
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
         historical: bool,
+        received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -989,13 +990,12 @@ impl ChannelState {
                 Err(error) => return Err(error),
             }
         }
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
         // A received body (ADR-038 FX-30): flushed before this node acknowledges it, at once
         // when it is a key package or governance.
-        batch.received();
         if matches!(
             kind,
             SignedEntryKind::Governance | SignedEntryKind::StepPolicy | SignedEntryKind::KeyPackage

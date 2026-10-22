@@ -262,10 +262,44 @@ impl Counting {
 struct Epochs {
     received: u64,
     flushed: u64,
+    received_room: Option<Digest32>,
     /// The received epoch copied into an installed fresh database whose directory entry has not
     /// yet been synced. This debt survives reopen or directory-sync failure and gates every
     /// later write and acknowledgement until the exact replacement becomes durable.
     replacement: Option<u64>,
+}
+
+/// The exact store epoch created by one receive flow. It is deliberately scalar: a queued
+/// worker may finish this debt, but may never adopt a later flow's debt merely because it uses
+/// the same store (ADR-038 FX-30).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceivedDebt(u64);
+
+/// Shared ownership of the Received commits made by one bounded flow. Clones belong to that
+/// flow's receiver handoffs only. Taking the debt detaches exactly the epochs already committed;
+/// a later handoff records a new debt for the next return to the actor.
+#[derive(Debug, Clone)]
+pub(crate) struct ReceivedFlow {
+    room: Digest32,
+    through: Arc<AtomicU64>,
+}
+
+impl ReceivedFlow {
+    pub(crate) fn new(room: Digest32) -> Self {
+        Self {
+            room,
+            through: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn record(&self, epoch: u64) {
+        self.through.fetch_max(epoch, Ordering::Release);
+    }
+
+    pub(crate) fn take(&self) -> Option<ReceivedDebt> {
+        let epoch = self.through.swap(0, Ordering::AcqRel);
+        (epoch != 0).then_some(ReceivedDebt(epoch))
+    }
 }
 
 /// What a [`Batch`] holds, which decides how it commits (ADR-038 FX-30). Only what a person
@@ -274,7 +308,7 @@ struct Epochs {
 /// verifier contexts, held positions, sweeps) commits without a flush and is rebuilt after a
 /// crash from the entries, the proofs and the peers. Any other received entry commits without a
 /// flush too, and reaches disk with the next durable commit, before this node acknowledges
-/// holding it ([`Store::flush_if_received_pending`]).
+/// holding it through the exact [`ReceivedDebt`] which created it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
     /// Nothing said: flushed, as every commit was before FX-30. The safe default.
@@ -604,6 +638,9 @@ impl Store {
         super::paths::sync_dir(&self.path)?;
         self.counts.committed(true);
         epochs.flushed = epochs.flushed.max(covered);
+        if epochs.flushed >= epochs.received {
+            epochs.received_room = None;
+        }
         epochs.replacement = None;
         Ok(true)
     }
@@ -946,8 +983,8 @@ impl Store {
 
     /// Begin an atomic multi-write batch. Nothing is visible until
     /// [`Batch::commit`]; a dropped batch writes nothing. It commits flushed to disk unless it
-    /// says it holds only derived state ([`Batch::derived`]) or a received entry outside the
-    /// ruled set ([`Batch::received`]); a batch that says so and then queues something of the
+    /// says it holds only derived state ([`Batch::derived`]); received entries outside the
+    /// ruled set begin through [`Self::received_batch`]. A batch that then queues something of the
     /// ruled set is flushed anyway ([`Batch::ruled`]) (ADR-038 FX-30).
     pub fn batch(&self) -> Result<Batch<'_>> {
         let (epochs, txn) = self.begin_write()?;
@@ -955,6 +992,48 @@ impl Store {
             txn,
             store: self,
             class: Class::Unsaid,
+            received_flow: None,
+            epochs,
+        })
+    }
+
+    /// Begin a batch owned by one receive flow. Before its transaction exists, settle any older
+    /// receive debt under the same writer lock. Therefore an already queued older worker can
+    /// never carry this batch: its fixed target is covered before these bytes are written.
+    /// Empty/derived rounds never call this and cannot flush anybody else's debt.
+    pub(crate) fn received_batch(&self, flow: &ReceivedFlow) -> Result<Batch<'_>> {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
+        if epochs.received > epochs.flushed {
+            let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+                Backing::Writable(db) => db
+                    .begin_write()
+                    .map_err(storage("begin predecessor received flush"))?,
+                Backing::ReadOnly(_) | Backing::Closed => {
+                    return Err(Error::Storage {
+                        op: "begin predecessor received flush",
+                        detail:
+                            "received entries are pending but the store is not open for writing"
+                                .into(),
+                    })
+                }
+            };
+            self.commit_flushed(txn, &mut epochs, "flush predecessor received debt")?;
+        }
+        let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
+            Backing::Writable(db) => db.begin_write().map_err(storage("begin received write"))?,
+            Backing::ReadOnly(_) | Backing::Closed => {
+                return Err(Error::Storage {
+                    op: "begin received write",
+                    detail: "the store is read-only until the identity is unlocked".into(),
+                })
+            }
+        };
+        Ok(Batch {
+            txn,
+            store: self,
+            class: Class::Received,
+            received_flow: Some(flow.clone()),
             epochs,
         })
     }
@@ -965,7 +1044,7 @@ impl Store {
     /// flush, every row on disk after a SIGKILL). It holds redb's one writer for the whole disk
     /// flush. No measured duration is a correctness bound: FX-31 moves flush latency off paths
     /// that do not depend on it. Nothing to flush costs one `F_FULLFSYNC` all the same, so callers
-    /// ask [`Self::flush_if_received_pending`] (ADR-038 FX-30).
+    /// present an exact [`ReceivedDebt`] (ADR-038 FX-30).
     ///
     /// # Errors
     /// The transaction cannot be begun or committed.
@@ -981,22 +1060,35 @@ impl Store {
         self.commit_flushed(txn, &mut epochs, "flush")
     }
 
-    /// Flush, if a received entry committed without a flush is still waiting for one: after
-    /// this node has read what it will tell a peer it holds (its inventory, its answer to a
-    /// head probe) and before it says so, and at the end of a sync round that received
-    /// something (ADR-038 FX-30). Decided and done under the store's writer: a Received commit
-    /// that was visible to the caller's read has raised `received` by then, and one flush
-    /// covers an epoch however many callers found it pending. Returns whether it flushed.
+    /// Snapshot the exact durability debt visible after an acknowledgement's source read.
+    /// The returned scalar never grows, so a delayed acknowledgement worker cannot flush a
+    /// later receive flow's otherwise unrelated write.
+    pub(crate) fn received_debt(&self, room: &Digest32) -> Option<ReceivedDebt> {
+        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        (epochs.replacement.is_some()
+            || (epochs.received > epochs.flushed && epochs.received_room.as_ref() == Some(room)))
+        .then_some(ReceivedDebt(epochs.received))
+    }
+
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn any_received_debt(&self) -> bool {
+        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        epochs.replacement.is_some() || epochs.received > epochs.flushed
+    }
+
+    /// Flush through one exact receive-owned epoch. If another durable commit already covered
+    /// it, return without beginning a transaction even when newer debt exists. This is the
+    /// ownership boundary that makes an empty/unrelated round write nothing (ADR-038 FX-30).
     ///
     /// # Errors
     /// As [`Self::flush`].
-    pub fn flush_if_received_pending(&self) -> Result<bool> {
+    pub(crate) fn flush_received_through(&self, debt: ReceivedDebt) -> Result<bool> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         // An installed replacement's directory entry is durability debt even when no newer
         // Received epoch exists. Finish it before the fast return so a head/inventory ACK can
         // never claim bytes whose rename was not made durable.
         let replacement_flushed = self.finish_replacement(&mut epochs)?;
-        if epochs.received <= epochs.flushed {
+        if debt.0 <= epochs.flushed {
             return Ok(replacement_flushed);
         }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
@@ -1011,21 +1103,6 @@ impl Store {
         };
         self.commit_flushed(txn, &mut epochs, "flush")?;
         Ok(true)
-    }
-
-    /// Whether a received entry committed without a flush may be waiting for one: a look
-    /// without waiting, for the actor at a round's end. A writer busy at that moment counts as
-    /// pending; [`Self::flush_if_received_pending`] decides under the writer.
-    #[must_use]
-    pub fn received_pending(&self) -> bool {
-        match self.writer.try_lock() {
-            Ok(epochs) => epochs.replacement.is_some() || epochs.received > epochs.flushed,
-            Err(std::sync::TryLockError::WouldBlock) => true,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                let epochs = poisoned.into_inner();
-                epochs.replacement.is_some() || epochs.received > epochs.flushed
-            }
-        }
     }
 
     /// What this store has committed since it was opened (ADR-038 FX-30).
@@ -1045,6 +1122,7 @@ impl Store {
         txn.commit().map_err(storage(op))?;
         self.counts.committed(true);
         epochs.flushed = epochs.received;
+        epochs.received_room = None;
         Ok(())
     }
 
@@ -1209,6 +1287,7 @@ pub struct Batch<'a> {
     txn: Cached<redb::WriteTransaction>,
     store: &'a Store,
     class: Class,
+    received_flow: Option<ReceivedFlow>,
     /// The store's writer, held from the batch's beginning to its commit's mark.
     epochs: MutexGuard<'a, Epochs>,
 }
@@ -1220,16 +1299,6 @@ impl Batch<'_> {
     pub fn derived(&mut self) {
         if matches!(self.class, Class::Unsaid) {
             self.class = Class::Derived;
-        }
-    }
-
-    /// This batch admits a received entry outside the ruled set, with the derived state that
-    /// admitted it (ADR-038 FX-30): it commits without a flush, and the store remembers that a
-    /// flush is owed before this node acknowledges holding anything to a peer. A later
-    /// [`Self::ruled`] overrides it.
-    pub fn received(&mut self) {
-        if !matches!(self.class, Class::Ruled) {
-            self.class = Class::Received;
         }
     }
 
@@ -1479,6 +1548,7 @@ impl Batch<'_> {
             mut txn,
             store,
             class,
+            received_flow,
             mut epochs,
         } = self;
         let flushed = matches!(class, Class::Unsaid | Class::Ruled);
@@ -1492,10 +1562,15 @@ impl Batch<'_> {
         txn.commit().map_err(storage("commit"))?;
         if matches!(class, Class::Received) {
             epochs.received += 1;
+            if let Some(flow) = received_flow {
+                epochs.received_room = Some(flow.room);
+                flow.record(epochs.received);
+            }
         }
         store.counts.committed(flushed);
         if flushed {
             epochs.flushed = epochs.received;
+            epochs.received_room = None;
         }
         Ok(())
     }

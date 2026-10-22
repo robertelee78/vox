@@ -51,7 +51,7 @@ fn key_package_for(entry: &Entry, recipient: &Digest32) -> bool {
 /// exact pair marks `<gate-with-extension-reached>` and waits, after the ruled key commit and
 /// before its caller can reach a later generic received flush. Compiled out of packaged binaries.
 #[cfg(feature = "test-knobs")]
-fn hold_after_received_key_commit(author: &Digest32, generation: u64) {
+fn hold_after_received_key_commit(store: &Store, author: &Digest32, generation: u64) {
     let Some(gate) = std::env::var_os("VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE") else {
         return;
     };
@@ -63,20 +63,42 @@ fn hold_after_received_key_commit(author: &Digest32, generation: u64) {
     if armed.trim() != exact {
         return;
     }
+    if store.any_received_debt() {
+        let fault = gate.with_extension("fault");
+        let _ = std::fs::write(
+            &fault,
+            "another receive flow still owned durability debt at the key boundary\n",
+        );
+        return;
+    }
     let reached = gate.with_extension("reached");
-    std::fs::write(&reached, format!("{exact}\n")).unwrap_or_else(|error| {
-        panic!(
-            "APPARATUS: could not mark the received-key crash boundary at {}: {error}",
-            reached.display()
-        )
-    });
+    if let Err(error) = std::fs::write(&reached, format!("{exact}\n")) {
+        let _ = std::fs::write(
+            gate.with_extension("fault"),
+            format!(
+                "could not mark the received-key crash boundary at {}: {error}\n",
+                reached.display()
+            ),
+        );
+        return;
+    }
     while gate.exists() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
 #[cfg(not(feature = "test-knobs"))]
-fn hold_after_received_key_commit(_author: &Digest32, _generation: u64) {}
+fn hold_after_received_key_commit(_store: &Store, _author: &Digest32, _generation: u64) {}
+
+#[cfg(feature = "test-knobs")]
+fn mutant_received_key_not_durable() -> bool {
+    std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("received-key-not-durable")
+}
+
+#[cfg(not(feature = "test-knobs"))]
+fn mutant_received_key_not_durable() -> bool {
+    false
+}
 
 mod attention;
 mod diagnostics;
@@ -141,7 +163,7 @@ use crate::node::content::{Content, Decoded};
 use crate::node::drive::{drive_channel, DriveState, SessionRow};
 use crate::node::profile::Profile;
 use crate::node::retention::Tracked;
-use crate::node::store::Store;
+use crate::node::store::{ReceivedFlow, Store};
 use crate::suite::{algo, SuiteFloor};
 
 /// Segment id of the manifest in `KeyMaterial`.
@@ -6313,7 +6335,11 @@ impl ChannelState {
 
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
-        let mut out = self.absorb_arrived(store, &before, now_ms)?;
+        let received = ReceivedFlow::new(self.channel_id);
+        let mut out = self.absorb_arrived(store, &before, now_ms, &received)?;
+        if let Some(debt) = received.take() {
+            store.flush_received_through(debt)?;
+        }
         if let Ok(n) = session {
             out.applied = n;
         }
@@ -6344,6 +6370,7 @@ impl ChannelState {
         store: &Store,
         before: &BTreeMap<Digest32, u64>,
         now_ms: u64,
+        received: &ReceivedFlow,
     ) -> Result<SyncOutcome> {
         self.keep_forks(store)?;
         let result = (|| -> Result<SyncOutcome> {
@@ -6414,7 +6441,8 @@ impl ChannelState {
                             },
                         )?;
                         let count = arrived.len() as u64;
-                        let got = self.absorb_batch(store, arrived, now_ms, Some(count))?;
+                        let got =
+                            self.absorb_batch(store, arrived, now_ms, Some(count), received)?;
                         out.applied += got.applied;
                         out.rendered += got.rendered;
                         out.governance += got.governance;
@@ -6478,6 +6506,7 @@ impl ChannelState {
                         )],
                         now_ms,
                         Some(count),
+                        received,
                     )?;
                     out.applied += count as usize;
                     out.rendered += got.rendered;
@@ -6506,6 +6535,7 @@ impl ChannelState {
                     vec![(entry.skeleton.author_id, hash, entry.payload, Some(id))],
                     now_ms,
                     None,
+                    received,
                 )?;
                 out.applied += got.applied;
                 out.rendered += got.rendered;
@@ -6531,8 +6561,9 @@ impl ChannelState {
         arrived: Vec<Arrived>,
         now_ms: u64,
         promotion: Option<u64>,
+        received: &ReceivedFlow,
     ) -> Result<SyncOutcome> {
-        self.absorb_batch_authorized(store, arrived, now_ms, promotion, None)
+        self.absorb_batch_authorized(store, arrived, now_ms, promotion, Some(received), None)
     }
 
     fn absorb_batch_authorized(
@@ -6541,6 +6572,7 @@ impl ChannelState {
         arrived: Vec<Arrived>,
         now_ms: u64,
         promotion: Option<u64>,
+        received: Option<&ReceivedFlow>,
         authorization: Option<LegacySync>,
     ) -> Result<SyncOutcome> {
         let mut out = SyncOutcome {
@@ -6563,18 +6595,23 @@ impl ChannelState {
         let mut packages = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let mut chains_advanced = false;
-        let mut batch = match store.batch() {
-            Ok(b) => b,
-            Err(e) => {
-                self.poisoned = true;
-                self.save_error = Some(e.to_string());
-                return Err(e);
-            }
-        };
+        let mut batch =
+            match received.map_or_else(|| store.batch(), |flow| store.received_batch(flow)) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.poisoned = true;
+                    self.save_error = Some(e.to_string());
+                    return Err(e);
+                }
+            };
         // Received entries with the derived state that admits them (ADR-038 FX-30): committed
         // without a flush, flushed before this node acknowledges holding them; a key package, a
         // governance entry or a key written below says `ruled` and the batch is flushed.
-        batch.received();
+        if received.is_none() {
+            // Explicit legacy recovery does not retain a receive-flow capability across actor
+            // quanta, so make its promoted witness durable in its own transaction.
+            batch.ruled();
+        }
         if let Some(request) = authorization {
             request.check_in(self, &batch)?;
         }
@@ -6806,7 +6843,7 @@ impl ChannelState {
     ) -> SessionReport {
         let now_ms = now.get();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let epoch = loop {
+        let (epoch, channel_id) = loop {
             if fence.is_retired() || std::time::Instant::now() >= deadline {
                 return SessionReport::failed(SyncFailure::Session(
                     crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
@@ -6825,7 +6862,7 @@ impl ChannelState {
                         ),
                     ));
                 }
-                break ch.epoch;
+                break (ch.epoch, ch.channel_id);
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
@@ -6838,6 +6875,7 @@ impl ChannelState {
             fence,
             on_stored,
             legacy,
+            received: ReceivedFlow::new(channel_id),
             observe_tip: std::cell::Cell::new(None),
             deadline,
             out: std::cell::RefCell::new(SyncOutcome::default()),
@@ -6889,6 +6927,11 @@ impl ChannelState {
                         *room.fatal.borrow_mut() = Some(error);
                     }
                 }
+            }
+        }
+        if let Some(debt) = room.received.take() {
+            if let Err(error) = store.flush_received_through(debt) {
+                *room.fatal.borrow_mut() = Some(error);
             }
         }
         let fatal = room.fatal.take();
@@ -6979,7 +7022,7 @@ impl ChannelState {
             return Err(error);
         }
         self.entries.committed();
-        hold_after_received_key_commit(&author, chain_id);
+        hold_after_received_key_commit(store, &author, chain_id);
         self.drain_backfill(store, now_ms)
     }
 
@@ -8133,7 +8176,13 @@ impl ChannelState {
     /// Queue the receiver chains, as they stand now, into `batch`.
     fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
         // Other members' sender keys and the drive keys: keys are flushed (ADR-038 FX-30).
-        batch.ruled();
+        if mutant_received_key_not_durable() {
+            // Isolated FX-30 proof mutant: remove only receiver-key durability. This branch is
+            // compiled out of packaged builds and must make the received-key crash assertion red.
+            batch.derived();
+        } else {
+            batch.ruled();
+        }
         let receivers_seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
@@ -8328,9 +8377,9 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_entry(store, &entry, kind, &key, now_ms)?;
             let mut batch = store.batch()?;
-            // A received entry (ADR-038 FX-30): flushed before this node acknowledges it, at
-            // once when it is consent, governance or a key package.
-            batch.received();
+            // This legacy direct API has no retained receive-flow owner, so its remote entry is
+            // durable in this transaction. Bounded/session receive paths use exact flow debt.
+            batch.ruled();
             if gov.is_some()
                 || entry
                     .payload
@@ -9791,6 +9840,7 @@ struct ChannelSessionRoom<'a> {
     /// Called after a batch persisted entries (ADR-025 D1a: stores report themselves).
     on_stored: &'a dyn Fn(),
     legacy: Option<LegacySync>,
+    received: ReceivedFlow,
     observe_tip: std::cell::Cell<Option<crate::log::sync::LegacyGap>>,
     deadline: std::time::Instant,
     out: std::cell::RefCell<SyncOutcome>,
@@ -10307,7 +10357,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             report.fail = Some(crate::wire::WireError::TransportFailed);
             return report;
         }
-        match ch.absorb_arrived(self.store, &before, self.now_ms) {
+        match ch.absorb_arrived(self.store, &before, self.now_ms, &self.received) {
             Ok(got) => {
                 let mut out = self.out.borrow_mut();
                 out.rendered += got.rendered;

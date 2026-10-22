@@ -39,6 +39,7 @@ pub(super) enum Lookup<T> {
 
 #[derive(Clone)]
 pub(super) struct Source {
+    room_id: Digest32,
     pub(super) room: Arc<Mutex<ChannelState>>,
     pub(super) store: Arc<Store>,
     pub(super) epoch: u64,
@@ -51,6 +52,7 @@ pub(super) struct Source {
 
 impl Source {
     pub(super) fn new(
+        room_id: Digest32,
         room: Arc<Mutex<ChannelState>>,
         store: Arc<Store>,
         epoch: u64,
@@ -59,6 +61,7 @@ impl Source {
         deadline: Instant,
     ) -> Self {
         Self {
+            room_id,
             room,
             store,
             epoch,
@@ -400,13 +403,20 @@ impl Source {
     /// entry committed without a flush is waiting for one, so the acknowledgement never
     /// precedes the disk (ADR-038 FX-30, ADR-028 R-6). Read first, then flush: a commit that
     /// the read saw has raised the store's received epoch by the time the flush decides, under
-    /// the store's writer. Nothing pending costs nothing.
+    /// the store's writer. The scalar debt is fixed here: a delayed worker cannot adopt a
+    /// later receive flow's debt. Nothing pending costs nothing.
     pub(super) async fn flush_received_before_ack(&self) -> Result<()> {
-        if !self.store.received_pending() {
+        let Some(debt) = self.store.received_debt(&self.room_id) else {
+            return Ok(());
+        };
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("received-ack-not-flushed") {
+            // Isolated FX-30 proof mutant: the source still sends its real acknowledgement,
+            // but omits only the exact durability fence which must precede it.
             return Ok(());
         }
         let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || store.flush_if_received_pending().map(|_| ()))
+        tokio::task::spawn_blocking(move || store.flush_received_through(debt).map(|_| ()))
             .await
             .map_err(|_| Error::Unreachable("history flush worker stopped"))?
     }
