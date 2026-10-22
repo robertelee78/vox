@@ -13172,14 +13172,15 @@ impl Node {
         if self.net.is_none() {
             return Outcome::Failed(Fault::NotNetworked);
         }
-        let now_ms = self.now_ms();
-        let decision = self.trust_decision(&target);
-        let plan: Option<Vec<(u64, u64)>>;
-        let skdm = {
-            let (Some(profile), Some(shared)) = (
-                self.profile.as_ref(),
-                self.channels.get(channel_id).map(Arc::clone),
-            ) else {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::UnknownChannel);
+        };
+        // Reject cheap room-state and delivery preconditions before deriving and signing an
+        // SKDM. `deliver_owed_consents` is called by ordinary actor events; doing the expensive
+        // release first made every retry for a member whose board still lacked a prekey bundle
+        // monopolize the actor and room lock without making durable progress.
+        {
+            let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::UnknownChannel);
             };
             let channel = shared.lock().await;
@@ -13199,6 +13200,49 @@ impl Node {
             }
             // A consent key release is irreversible: an admin removal this node holds but has
             // not folded must not be released past (ADR-037 R3). The fold is one turn away.
+            if let Err(error) = channel.require_governance_ready(profile.store(), self.now_ms()) {
+                return Outcome::Failed(fault_of(&error));
+            }
+        }
+        let Some(conn) = self.reach_member(channel_id, target, asked).await else {
+            return Outcome::Failed(Fault::Unreachable);
+        };
+        let modern = !matches!(self.older.get(&(*channel_id, target)), Some(false));
+        let mut older = if modern {
+            if let Err(wait) = self
+                .delivery_bundle_waiting(channel_id, target, false)
+                .await
+            {
+                self.say_key_waits(channel_id, target, wait);
+                return Outcome::Failed(Fault::Unreachable);
+            }
+            None
+        } else {
+            let route = self.older_route(channel_id, target).await;
+            if !self.sessions.contains_key(&(*channel_id, target)) {
+                return Outcome::Failed(Fault::Unreachable);
+            }
+            route
+        };
+        let now_ms = self.now_ms();
+        let decision = self.trust_decision(&target);
+        let plan: Option<Vec<(u64, u64)>>;
+        let skdm = {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::UnknownChannel);
+            };
+            let channel = shared.lock().await;
+            // Reach and bundle checks awaited without this lock. Revalidate every authority and
+            // publication condition before the irreversible release is signed.
+            if !channel.is_author(&target) {
+                return Outcome::Failed(Fault::NotAdmitted);
+            }
+            if !channel.is_settled() {
+                return Outcome::Failed(Fault::RoomNotSynced);
+            }
+            if channel.own_history_behind() {
+                return Outcome::Failed(Fault::OwnHistoryBehind);
+            }
             let current = match channel.require_governance_ready(profile.store(), now_ms) {
                 Ok(current) => current,
                 Err(error) => return Outcome::Failed(fault_of(&error)),
@@ -13221,9 +13265,6 @@ impl Node {
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
         };
-        let Some(conn) = self.reach_member(channel_id, target, asked).await else {
-            return Outcome::Failed(Fault::Unreachable);
-        };
         // **In a session of its own** (ADR-030 D-1, D-3): retrust, a consent grant and a history
         // release seal the key as a rotation does, in a session this node opens now against the
         // member's current bundle, never in the pair's long-lived one.
@@ -13232,7 +13273,6 @@ impl Node {
         // the member's prekey bundle, read from this node's board; with none there, or a stale one
         // (P-2), the consent fails on every tick's retry and writes nothing. Said once per member
         // and room, until the key goes, each reason as itself.
-        let modern = !matches!(self.older.get(&(*channel_id, target)), Some(false));
         let Some(admitted) = self.reserve_key_deliveries(
             channel_id,
             target,
@@ -13246,7 +13286,6 @@ impl Node {
             return Outcome::Failed(Fault::DeliveryBusy);
         };
         let PairwiseAdmission { queue, job, .. } = admission;
-        let mut older = self.older_route(channel_id, target).await;
         let Some((frames, carries_hello, session)) =
             self.key_frames(channel_id, target, &skdm, &mut older).await
         else {
