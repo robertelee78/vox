@@ -1785,6 +1785,11 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // and Alice's automatic, equal grant to every still-trusted reader. Bob's sparse catch-up
     // admits the newest control fact before filling the older reset, which is the reachable
     // grant₁ → reset → identical grant₂ → late-reset order: sequence, not arrival, must win.
+    //
+    // Take the semantic baseline before that source-owned transition starts. A baseline after
+    // the post command races its asynchronous offline fallback: it can already include grant₂,
+    // or can observe only the reset. The same-name rename above independently proves the
+    // semantic-no-op rule; this genuinely newer post-reset grant must advance the revision.
     assert_eq!(
         trust_detail(&bob, "bob", &rooms[0], "alice"),
         "you trust each other",
@@ -1792,6 +1797,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          repeated-grant sequence"
     );
     let rotation_order_before = room_hashes(&alice, "alice", &rooms[0]);
+    let semantic_before_rotation = room_status(&alice, "alice", &rooms[0]);
     let grant1_hash = &grant1_hashes[0];
     assert!(
         rotation_order_before.contains(grant1_hash),
@@ -1828,62 +1834,21 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     }
     let (last_rotated_hash, last_rotated_text) = last_rotated
         .unwrap_or_else(|| panic!("APPARATUS: the source-owned rotation bound was empty"));
-    let after_presence = room_hashes(&alice, "alice", &rooms[0]);
-    let reset_candidates: Vec<_> = after_presence
-        .iter()
-        .filter(|hash| {
-            !rotation_order_before.contains(hash) && !rotation_post_hashes.contains(hash)
-        })
-        .cloned()
-        .collect();
-    assert_eq!(
-        reset_candidates.len(),
-        1,
-        "PRODUCT: the source-owned sender rotation did not append exactly one identifiable authenticated Presence reset; before {rotation_order_before:?}; posts {rotation_post_hashes:?}; after {after_presence:?}; candidates {reset_candidates:?}"
-    );
-    let reset_hash = reset_candidates[0].clone();
-    let grant1_at = after_presence
-        .iter()
-        .position(|hash| hash == grant1_hash)
-        .expect("PRODUCT: exact grant1 missing after Presence rotation");
-    let reset_at = after_presence
-        .iter()
-        .position(|hash| hash == &reset_hash)
-        .expect("PRODUCT: exact Presence reset missing from Alice's order");
-    assert!(
-        grant1_at < reset_at,
-        "PRODUCT: Alice's shipped room order did not place grant1 {grant1_hash} before Presence reset {reset_hash}: {after_presence:?}"
-    );
-    // Wait until the real Presence rotation has reached the semantic projection, then take the
-    // revision baseline. The next equality can therefore measure only the identical grant2.
-    wait_governance_current(
-        &alice,
-        "alice",
-        &rooms[0],
-        "the source-owned Presence reset never completed its bounded governance fold",
-    );
-    let semantic_after_reset = room_status(&alice, "alice", &rooms[0]);
-    // `trust add` is idempotent as a human decision. With Bob offline its retained release is
-    // deliberately asynchronous: the fallback may append its key package before the consent.
-    // Therefore command success is not the durability boundary and an immediate row-count delta
-    // cannot identify grant₂. The next semantic projection revision is the causal product
-    // observation: after the already-folded reset, only the new grant changes canonical meaning.
-    let (ok, out, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
-    assert!(
-        ok,
-        "PRODUCT: Alice's idempotent shipped trust decision did not finish the rotated \
-         generation's retained grant while Bob was offline: {out}{err}"
-    );
-    let grant2_revision = semantic_after_reset
+    // The source transaction fixes the semantic identity without sampling an intermediate row
+    // count: its Presence is the first non-post row, its offline fallback awaits an optional key
+    // package and then appends consent last, and those exact two governance facts each revise the
+    // quiet room. Wait for both transitions before reading their immutable identities.
+    let grant2_revision = semantic_before_rotation
         .governance_revision
-        .checked_add(1)
-        .expect("PRODUCT: Alice's governance revision overflowed before the repeated grant");
-    let (after_grant2, semantic_after_grant2) = loop {
+        .checked_add(2)
+        .expect("PRODUCT: Alice's governance revision overflowed during the repeated grant");
+    let semantic_after_grant2 = loop {
         let status = room_status(&alice, "alice", &rooms[0]);
         assert!(
             status.governance_revision <= grant2_revision,
-            "PRODUCT: Alice published more than the one reset→grant semantic transition while \
-             Bob was offline in quiet room {}: reset {semantic_after_reset:?}, now {status:?}",
+            "PRODUCT: Alice published more than the source-owned Presence→grant transitions \
+             while Bob was offline in quiet room {}: before {semantic_before_rotation:?}, now \
+             {status:?}",
             rooms[0]
         );
         if status.governance_revision == grant2_revision {
@@ -1891,37 +1856,45 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
                 &alice,
                 "alice",
                 &rooms[0],
-                "the exact reset→grant2 semantic transition never completed its bounded fold",
+                "the exact source-owned Presence→grant2 transitions never completed their \
+                 bounded fold",
             );
             let settled = room_status(&alice, "alice", &rooms[0]);
             assert_eq!(
                 settled.governance_revision, grant2_revision,
                 "PRODUCT: Alice published an extra semantic revision while settling the one \
-                 repeated grant in quiet room {}: reset {semantic_after_reset:?}, settled \
-                 {settled:?}",
+                 source-owned repeated-grant sequence in quiet room {}: before \
+                 {semantic_before_rotation:?}, settled {settled:?}",
                 rooms[0]
             );
-            break (room_hashes(&alice, "alice", &rooms[0]), settled);
+            break settled;
         }
         std::thread::yield_now();
     };
-    let grant2_candidates: Vec<_> = after_grant2
+    let after_grant2 = room_hashes(&alice, "alice", &rooms[0]);
+    let transition_rows: Vec<_> = after_grant2
         .iter()
-        .filter(|hash| !after_presence.contains(hash))
+        .filter(|hash| {
+            !rotation_order_before.contains(hash) && !rotation_post_hashes.contains(hash)
+        })
         .cloned()
         .collect();
     assert!(
-        matches!(grant2_candidates.len(), 1 | 2),
-        "PRODUCT: at the exact reset→grant2 semantic revision, Alice's offline fallback did not \
-         expose its authenticated consent alone or after its one key package; before \
-         {after_presence:?}; after {after_grant2:?}; candidates {grant2_candidates:?}"
+        matches!(transition_rows.len(), 2 | 3),
+        "PRODUCT: the exact two source-owned semantic transitions did not expose Presence, then \
+         optional key package, then consent in Alice's shipped room order; before \
+         {rotation_order_before:?}; posts {rotation_post_hashes:?}; after {after_grant2:?}; \
+         transition rows {transition_rows:?}"
     );
+    let reset_hash = transition_rows
+        .first()
+        .expect("PRODUCT: source-owned transition completed without a Presence row")
+        .clone();
     // The fallback awaits the optional key-package append before it records consent. Room order
-    // is causal, so the final candidate at the exact one-revision boundary uniquely names grant₂
-    // whether the already-held package made the delta one row or the fallback made it two.
-    let grant2_hash = grant2_candidates
+    // is causal, so the final row at the exact two-transition boundary uniquely names grant₂.
+    let grant2_hash = transition_rows
         .last()
-        .expect("PRODUCT: reset→grant2 revision advanced without an authenticated room row")
+        .expect("PRODUCT: source-owned transition completed without a consent row")
         .clone();
     let ordered_positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
         .iter()
@@ -1940,8 +1913,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     assert_eq!(
         semantic_after_grant2.governance_revision, grant2_revision,
         "PRODUCT: Alice's newer post-reset grant did not make exactly one required semantic \
-         transition, or invented an extra displayed revision: reset {semantic_after_reset:?}, \
-         grant2 {semantic_after_grant2:?}"
+         transition after its Presence reset, or the sequence invented an extra displayed \
+         revision: before {semantic_before_rotation:?}, after {semantic_after_grant2:?}"
     );
 
     bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
