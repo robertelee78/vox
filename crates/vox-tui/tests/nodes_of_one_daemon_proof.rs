@@ -236,6 +236,9 @@ impl Daemon {
         for (k, v) in env {
             c.env(k, v);
         }
+        if let Ok(mutant) = std::env::var("VOX_TEST_FX28_MUTANT") {
+            c.env("VOX_TEST_FX28_MUTANT", mutant);
+        }
         let child = c
             .stdin(Stdio::null())
             .stdout(
@@ -3376,8 +3379,7 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// within [`CHANGE_SHOWN_WITHIN`] of the attach alpha's `vox computer status` names gamma with
 /// every binding derived at the policy revision the change made and every node there trusting
 /// every node of both computers (`vox trust list`); within [`CHANGE_SHOWN_WITHIN`] of the
-/// proof-process monotonic observation of the shipped status naming the completed exchange alpha's
-/// daemon started for beta with that revision sent, beta's status names gamma under alpha's
+/// same proof-process monotonic clock, begun before the attach command, beta's status names gamma under alpha's
 /// computer with every binding there derived at beta's new revision, and every node there trusts
 /// every node of both computers. Then
 /// delta is attached on beta's computer and the same holds the other way. Both confirm each
@@ -3399,9 +3401,10 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// name its next completed, dated fallback exchange. Across that causal boundary it MUST count
 /// exactly that one attempt/exchange, no earlier round, and every node's binding MUST stand derived
 /// at the current policy revision at the same durable moment as before the unchanged-state
-/// exchange. There is no arbitrary quiet window: lack of the named boundary yields no result, and
-/// the status observations name unnecessary work directly. A machine-dependent CPU cutoff is not
-/// a product verdict. Measured before this (2026-10-20, the decider's work Mac): the pairing
+/// exchange. There is no arbitrary quiet window: the source-owned fallback cadence plus its
+/// existing return contract bounds the named boundary, and the status observations name
+/// unnecessary work directly. A machine-dependent CPU cutoff is not a product verdict. Measured
+/// before this (2026-10-20, the decider's work Mac): the pairing
 /// manager exchanged the whole signed history with every computer every 2 s and re-verified it,
 /// and a 1 s tick re-derived every attached node's binding with nothing changed.
 /// Finally, a test-only causal release keeps delta's exact actor message queued while epsilon
@@ -3410,6 +3413,10 @@ fn enrolled_computers_follow_node_changes_and_retire_removed_authority() {
 /// on its healthy node and `vox node list` shows delta no longer attached. Cleanup may continue;
 /// queued room/node work cannot turn a late observation into an apparent pass. The proof then
 /// releases that exact message and proves its expired work did not move delta's durable binding.
+///
+/// Every elapsed verdict begins before the shipped command or path-restoration action which owns
+/// it. Observing a completed exchange is evidence about progress, never permission to restart the
+/// stopwatch; a quick final apply therefore cannot conceal an exchange which was already late.
 ///
 /// Independent mutants: (1) remove the need filter in `Management::retry`: extra attempts before
 /// the fallback boundary turn PRODUCT red (unchanged means no network); (2) remove the
@@ -3435,6 +3442,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_HOLD_COMPUTER_POLICY",
         "VOX_TEST_HOLD_COMPUTER_POLICY_REPLY",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
+        "VOX_TEST_FX28_MUTANT",
     ]);
     let a = Account::new();
     let b = Account::new();
@@ -3552,6 +3560,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         .as_str()
         .expect("PRODUCT: the pairing preview names no operation")
         .to_owned();
+    let approval_started = Instant::now();
     computer(&b, &["approve", &operation]);
     computer(&a, &["approve", &operation]);
     loop {
@@ -3561,8 +3570,9 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             break;
         }
         assert!(
-            daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
-            "PRODUCT: a daemon exited before the two computers both reached `confirmed`: alpha {}, beta {}\n{}\n{}",
+            approval_started.elapsed() < RETURN_WITHIN,
+            "PRODUCT: {RETURN_WITHIN:?} after the first shipped approval was asked, the two \
+             computers were not both confirmed: alpha {}, beta {}\n{}\n{}",
             computer(&a, &["status"])["state"],
             computer(&b, &["status"])["state"],
             da.said(),
@@ -3660,7 +3670,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     // completed fallback exchange it started. That status transition is the causal boundary: a
     // timer restored anywhere in binding derivation crosses it and moves the durable derivation
     // record; a too-eager exchange moves attempts before this boundary and is counted below.
-    // Lack of a boundary yields no verdict until an operator's optional watchdog says NO RESULT.
+    // A fallback is itself a product cadence. If its named interval plus the product's existing
+    // return contract passes without one, that is a PRODUCT wrong-state verdict, not a watchdog
+    // or a made-up harness timeout.
+    let fallback_deadline = Instant::now() + FALLBACK_NAMED + RETURN_WITHIN;
     let (
         (ea1, aa1, last_a, confirmed_a, shown_a1, derived_a1),
         (eb1, ab1, last_b, confirmed_b, shown_b1, derived_b1),
@@ -3671,13 +3684,15 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             break (after_a, after_b);
         }
         assert!(
-                daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
-                "PRODUCT: a paired daemon exited before its status named the next quiet fallback exchange: alpha {}; beta {}\n{}\n{}",
-                after_a.4,
-                after_b.4,
-                da.said(),
-                db.said()
-            );
+            Instant::now() < fallback_deadline,
+            "PRODUCT: after the named {FALLBACK_NAMED:?} quiet cadence plus its existing \
+                 {RETURN_WITHIN:?} return contract, shipped status still named no next completed \
+                 fallback exchange: alpha {}; beta {}\n{}\n{}",
+            after_a.4,
+            after_b.4,
+            da.said(),
+            db.said()
+        );
         std::thread::sleep(Duration::from_millis(100));
     };
     for (who, before, after) in [("alpha", last_a0, last_a), ("beta", last_b0, last_b)] {
@@ -3968,9 +3983,8 @@ fn computer_id(acct: &Account) -> String {
 /// made on the changer's account and listed in its nodes, is attached there. Within
 /// [`CHANGE_SHOWN_WITHIN`] of the attach being asked, the changer's `vox computer status` lists
 /// every node of its own with a binding derived at the policy revision the change made, and
-/// every node there trusts every node of both computers. Within [`CHANGE_SHOWN_WITHIN`] of the
-/// exchange the changer's daemon started for the other that sent that revision completing (the
-/// changer's status names it), the other's status lists the new node under the changer's
+/// every node there trusts every node of both computers. Within the same
+/// [`CHANGE_SHOWN_WITHIN`] clock, begun before the attach command, the other's status lists the new node under the changer's
 /// computer with every binding of its own derived at its new revision, and every node there
 /// trusts every node of both computers. Then both computers confirm each other again.
 fn change_shows_on_both(
@@ -4026,85 +4040,68 @@ fn change_shows_on_both(
         attached.elapsed(),
         names_here[0]
     );
-    // On the other daemon: the change travels in an exchange the changer's daemon starts for
-    // it, the one its status names as started with that revision sent. The proof-process
-    // monotonic clock begins only after that shipped status has causally exposed the completed
-    // exchange; neither daemon's Unix clock participates in the bound.
-    let mut exchange_observed: Option<Instant> = None;
+    // On the other daemon the status must both name an exchange which carried this revision and
+    // show the applied result. The same clock began before the triggering attach; observing an
+    // exchange later cannot reset it and turn a late product result green.
     loop {
-        if exchange_observed.is_none() {
-            let toward = application_toward(changer, &other_id);
-            let record = &toward["last_started_exchange"];
-            if record["sent_revision"]
-                .as_u64()
-                .is_some_and(|r| r >= revision_here)
-            {
-                exchange_observed = Some(Instant::now());
-            }
-        }
-        if let Some(observed) = exchange_observed {
-            let status = computer(other, &["status"]);
-            let names_it = status["nodes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|n| n["name"] == new_node && n["computer"] == changer_id.as_str());
-            let keyrings = keyrings_complete(other, there, &all);
-            let shown = names_it && roster_current(&status, &names_there) && keyrings.is_ok();
-            let elapsed = observed.elapsed();
-            if shown && elapsed <= CHANGE_SHOWN_WITHIN {
-                println!(
-                    "[proof] {new_node} shown applied on {}'s computer {elapsed:?} after the shipped status causally exposed the exchange {}'s daemon started with revision {revision_here} sent (bound {CHANGE_SHOWN_WITHIN:?})",
-                    names_there[0], names_here[0]
-                );
-                break;
-            }
-            assert!(
-                !shown && elapsed < CHANGE_SHOWN_WITHIN,
-                "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after the exchange {}'s daemon started for {}'s \
-                 with revision {revision_here} sent was causally observed, {}'s `vox computer status` does not \
-                 show the change applied (ADR-038 FX-28, #1020): it should list {new_node} under \
-                 {}'s computer with {names_there:?} derived at its policy revision, and every node \
-                 there should trust every node of both computers; status: revision {} nodes {}; \
-                 keyrings: {}\nits daemon said: {}",
-                names_here[0],
-                names_there[0],
-                names_there[0],
-                names_here[0],
-                status["revision"],
-                status["nodes"],
-                keyrings.err().unwrap_or_else(|| "complete".into()),
-                other_daemon.said()
+        let toward = application_toward(changer, &other_id);
+        let carried = toward["last_started_exchange"]["sent_revision"]
+            .as_u64()
+            .is_some_and(|revision| revision >= revision_here);
+        let status = computer(other, &["status"]);
+        let names_it = status["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|n| n["name"] == new_node && n["computer"] == changer_id.as_str());
+        let keyrings = keyrings_complete(other, there, &all);
+        let shown =
+            carried && names_it && roster_current(&status, &names_there) && keyrings.is_ok();
+        let elapsed = attached.elapsed();
+        if shown && elapsed <= CHANGE_SHOWN_WITHIN {
+            println!(
+                "[proof] {new_node} shown applied on {}'s computer {elapsed:?} after the attach was asked; shipped status names revision {revision_here} carried (bound {CHANGE_SHOWN_WITHIN:?})",
+                names_there[0]
             );
+            break;
         }
         assert!(
-            attached.elapsed() < RETURN_WITHIN,
-            "PRODUCT: within {RETURN_WITHIN:?} of {new_node} attaching, {}'s daemon \
-             completed no exchange it started toward {}'s computer with revision {revision_here} \
-             sent: {}\nits daemon said: {}",
+            !shown && elapsed < CHANGE_SHOWN_WITHIN,
+            "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after `vox node attach {new_node}` was asked, {}'s \
+             daemon had not both carried revision {revision_here} to {} and applied it there \
+             (ADR-038 FX-28, #1020; shown {shown} after {elapsed:?}): carried {carried}; remote \
+             names node {names_it}; remote bindings current {}; keyrings {}; exchange {}; remote \
+             nodes {}\nchanger daemon: {}\nremote daemon: {}",
             names_here[0],
             names_there[0],
-            application_toward(changer, &other_id),
-            changer_daemon.said()
+            roster_current(&status, &names_there),
+            keyrings.err().unwrap_or_else(|| "complete".into()),
+            toward,
+            status["nodes"],
+            changer_daemon.said(),
+            other_daemon.said()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
     // Both confirm each other again: the other's receipt for the new state comes back.
-    assert!(
-        wait_until(RETURN_WITHIN, || {
-            computer(changer, &["status"])["state"] == "confirmed"
-                && computer(other, &["status"])["state"] == "confirmed"
-        }),
-        "PRODUCT: after {new_node} attached on {}'s computer the two computers did not both \
-         confirm again within {RETURN_WITHIN:?}: {}'s {}, {}'s {}\n{}\n{}",
-        names_here[0],
-        names_here[0],
-        computer(changer, &["status"])["state"],
-        names_there[0],
-        computer(other, &["status"])["state"],
-        changer_daemon.said(),
-        other_daemon.said()
-    );
+    loop {
+        let here_state = computer(changer, &["status"])["state"].clone();
+        let there_state = computer(other, &["status"])["state"].clone();
+        if here_state == "confirmed" && there_state == "confirmed" {
+            break;
+        }
+        assert!(
+            attached.elapsed() < RETURN_WITHIN,
+            "PRODUCT: {RETURN_WITHIN:?} after `vox node attach {new_node}` was asked on {}'s \
+             computer, the pair was still not confirmed: {}'s {here_state}, {}'s {there_state}\n{}\n{}",
+            names_here[0],
+            names_here[0],
+            names_there[0],
+            changer_daemon.said(),
+            other_daemon.said()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A UDP port nothing holds right now, for a daemon to listen on for the whole proof.
@@ -4201,6 +4198,7 @@ fn replacement_generation_survives(
     let zeta = a.make_node("zeta");
     std::fs::write(reply_marker, b"hold the old generation's reply")
         .unwrap_or_else(|e| panic!("APPARATUS: could not stage delayed old-generation reply: {e}"));
+    let changed = Instant::now();
     let (ok, out, err) = a.run(&["node", "attach", "zeta", "--passphrase-file", "-"], PASS);
     assert!(
         ok,
@@ -4208,8 +4206,9 @@ fn replacement_generation_survives(
     );
     while reply_marker.is_file() {
         assert!(
-            daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
-            "APPARATUS: a daemon exited before delta's old actor accepted the policy event whose reply was to be held\n{}\n{}",
+            changed.elapsed() < CHANGE_SHOWN_WITHIN,
+            "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after `vox node attach zeta` was asked, delta's \
+             actor had not accepted the policy event whose reply the proof was to hold\n{}\n{}",
             da.said(),
             db.said()
         );
@@ -4255,8 +4254,8 @@ fn replacement_generation_survives(
 /// FX-28; #1020). The userspace forward is the pair's only path. It closes while both daemons
 /// stay alive; gamma becomes alpha's personal node and alpha reaches six failed exchanges,
 /// saturating its ordinary backoff. Opening that same path lets the one retained authenticated
-/// wake stream land. The forward adds three seconds each way so a mutant that waits out that
-/// saturated backoff cannot squeeze a late exchange under the return bound. Only after beta's final
+/// wake stream land. The forward adds one second each way so restoration remains observable while
+/// the five-second product clock still starts before restoration is triggered. Only after beta's final
 /// status and trust observations, and both computers' final confirmation observations, is the
 /// elapsed time sampled.
 fn change_reaches_a_live_computer(
@@ -4333,8 +4332,10 @@ fn change_reaches_a_live_computer(
             break;
         }
         assert!(
-            daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
-            "APPARATUS: a daemon exited before the closed live path produced the sixth failed exchange toward beta: {}\nits daemon said: {}",
+            changed.elapsed() < RETURN_WITHIN,
+            "PRODUCT: {RETURN_WITHIN:?} after `vox computer personal gamma` was asked with the \
+             live path closed, shipped status had not exposed the sixth failed exchange toward \
+             beta needed to show bounded retry progress: {}\nits daemon said: {}",
             application_toward(a, &b_id),
             da.said()
         );
@@ -4361,8 +4362,11 @@ fn change_reaches_a_live_computer(
     // APPARATUS. The forward returns a monotonic instant sampled after that causal probe succeeds;
     // the clock is not sampled again until every
     // final product observation below has returned.
-    forward.set_delay(Duration::from_secs(3));
-    let restored = forward.open_and_verify();
+    forward.set_delay(Duration::from_secs(1));
+    // The person's causal action is opening the path. The product clock begins before the
+    // apparatus verifies that action, so even a slow verification cannot make a late heal green.
+    let restored = Instant::now();
+    let _verified = forward.open_and_verify();
     let applied_at = loop {
         let status = computer(b, &["status"]);
         let gamma_personal = status["nodes"].as_array().into_iter().flatten().any(|n| {
@@ -4440,6 +4444,7 @@ fn delayed_node_does_not_make_a_late_pass(
     std::fs::write(hold_arm, b"hold delta's next policy message")
         .unwrap_or_else(|e| panic!("APPARATUS: could not stage the held delta marker: {e}"));
     forward.close();
+    let changed = Instant::now();
     let (ok, out, err) = a.run(
         &["node", "attach", "epsilon", "--passphrase-file", "-"],
         PASS,
@@ -4456,33 +4461,27 @@ fn delayed_node_does_not_make_a_late_pass(
             break;
         }
         assert!(
-            daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
-            "APPARATUS: a daemon exited before the closed path saturated exchange backoff for the stuck-apply heal: {}\n{}",
+            changed.elapsed() < RETURN_WITHIN,
+            "PRODUCT: {RETURN_WITHIN:?} after `vox node attach epsilon` was asked with the path \
+             closed, shipped status had not exposed the sixth failed exchange needed to show \
+             bounded retry progress: {}\n{}",
             application_toward(a, &b_id),
             da.said()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    forward.set_delay(Duration::from_secs(3));
-    let restored = forward.open_and_verify();
+    forward.set_delay(Duration::from_secs(1));
+    let restored = Instant::now();
+    let _verified = forward.open_and_verify();
 
-    let mut carried_observed = None;
     loop {
         let status_a = computer(a, &["status"]);
-        if carried_observed.is_none()
-            && status_a["revision"]
+        let sent_revision = status_a["revision"].as_u64().unwrap_or(0);
+        let record = application_toward(a, &b_id)["last_started_exchange"].clone();
+        let carried = sent_revision > before_revision
+            && record["sent_revision"]
                 .as_u64()
-                .is_some_and(|revision| revision > before_revision)
-        {
-            let sent_revision = status_a["revision"].as_u64().unwrap_or(0);
-            let record = application_toward(a, &b_id)["last_started_exchange"].clone();
-            if record["sent_revision"]
-                .as_u64()
-                .is_some_and(|revision| revision >= sent_revision)
-            {
-                carried_observed = Some(Instant::now());
-            }
-        }
+                .is_some_and(|revision| revision >= sent_revision);
         let status_b = computer(b, &["status"]);
         let beta_grant = grant_words(b, "beta", &epsilon);
         let (listed_ok, listed, listed_err) = b.run(&["node", "list"], "");
@@ -4501,24 +4500,23 @@ fn delayed_node_does_not_make_a_late_pass(
         let shown =
             local_current && beta_current && beta_grant.is_some() && delta_non_attached && alive;
         // All final status/trust/list observations are complete before this sample.
-        if let Some(observed) = carried_observed {
-            let elapsed = observed.elapsed();
-            let returned = restored.elapsed();
-            if shown && elapsed <= CHANGE_SHOWN_WITHIN && returned <= RETURN_WITHIN {
+        let elapsed = restored.elapsed();
+        if carried {
+            if shown && elapsed <= CHANGE_SHOWN_WITHIN {
                 assert!(
                     hold_engaged.is_file(),
                     "APPARATUS: delta was not causally held in its computer-policy actor before the non-attached verdict"
                 );
                 println!(
-                    "[proof] after {returned:?} from saturated-backoff heal and {elapsed:?} from exchange, beta applied epsilon on its healthy node and lists held delta non-attached ({delta_line:?}); bounds {RETURN_WITHIN:?}/{CHANGE_SHOWN_WITHIN:?}"
+                    "[proof] {elapsed:?} after path restoration was triggered, shipped status names epsilon carried, beta applied it on its healthy node and lists held delta non-attached ({delta_line:?}); bound {CHANGE_SHOWN_WITHIN:?}"
                 );
                 break;
             }
             assert!(
-                !shown && elapsed < CHANGE_SHOWN_WITHIN && returned < RETURN_WITHIN,
-                "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after the exchange carrying epsilon completed, \
+                !shown && elapsed < CHANGE_SHOWN_WITHIN,
+                "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after path restoration was triggered, \
                  beta did not apply-or-detach every attached node (ADR-038 FX-28, #1020; shown \
-                 {shown} only after {elapsed:?} from exchange/{returned:?} from heal): alpha bindings current {local_current}; beta \
+                 {shown} only after {elapsed:?}): alpha bindings current {local_current}; beta \
                  binding current {beta_current}; beta's grant for epsilon {beta_grant:?}; delta \
                  line {delta_line:?}; daemons alive {alive}; alpha status nodes {}; beta status nodes {}\nalpha \
                  daemon:\n{}\nbeta daemon:\n{}",
@@ -4529,9 +4527,9 @@ fn delayed_node_does_not_make_a_late_pass(
             );
         } else {
             assert!(
-                restored.elapsed() < RETURN_WITHIN,
-                "PRODUCT: after the exact userspace path proved a round trip, alpha completed no exchange carrying epsilon to beta within \
-                 {RETURN_WITHIN:?}: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
+                elapsed < CHANGE_SHOWN_WITHIN,
+                "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after path restoration was triggered, alpha \
+                 completed no exchange carrying epsilon to beta: {}\nalpha daemon:\n{}\nbeta daemon:\n{}",
                 application_toward(a, &b_id),
                 da.said(),
                 db.said()
@@ -4547,8 +4545,9 @@ fn delayed_node_does_not_make_a_late_pass(
     });
     while hold_engaged.is_file() {
         assert!(
-            daemon_alive(db.child.id()),
-            "APPARATUS: beta daemon exited before delta consumed the causal actor release"
+            restored.elapsed() < RETURN_WITHIN,
+            "PRODUCT: delta did not consume its causally released computer-policy work before \
+             the restoration action's {RETURN_WITHIN:?} contract ended"
         );
         std::thread::yield_now();
     }

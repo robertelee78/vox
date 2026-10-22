@@ -160,6 +160,14 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, a missed revision becomes ordinary trust, or a marker arriving after remote application fails to revoke the exact late-derived grant across restart. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
+FX-28's four executable mutants are run one at a time with
+`scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
+`preview-approval-not-durable`, `stopped-reader-fresh-write`,
+`stale-flight-clears-newer`, or `stale-tick-authority`. The runner accepts only a non-zero journey
+result containing an attributed `PRODUCT:` red and writes the full transcript under
+`target/fx28-mutants/`. These are on-demand diagnostics, not CI or release gates, and are serialized
+like the journey itself.
+
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 
 | Proof | Helps troubleshoot | Run | Needs | Time |

@@ -177,6 +177,31 @@ impl NodeHandle {
 }
 
 impl Node {
+    /// Whether this actor's live trust/key projection belongs to the current durable computer
+    /// policy. Periodic work is an authorization path too: a queued policy event must fence the
+    /// old projection before the next tick can publish consent, drive keys, or private attention.
+    pub(super) fn computer_authority_current(&self) -> bool {
+        if crate::node::computer::fx28_mutant("stale-tick-authority") {
+            return true;
+        }
+        let Some(computer) = &self.computer else {
+            return true;
+        };
+        if !computer.grouped() && computer.binding_group().is_none() {
+            return true;
+        }
+        let applied = self
+            .computer_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let me = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .map(Profile::fingerprint)
+            .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()));
+        computer.policy_current(applied) && me.is_some_and(|me| computer.binding_current(&me))
+    }
+
     pub(super) fn computer_policy_active(
         deadline: std::time::Instant,
         cancelled: &std::sync::atomic::AtomicBool,

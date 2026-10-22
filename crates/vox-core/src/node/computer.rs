@@ -44,6 +44,19 @@ pub fn computer_exchange_backoff(failures: u32) -> Duration {
 /// A confirmed computer with no state to settle is not exchanged before this fallback cadence.
 pub const COMPUTER_QUIET_EXCHANGE_AFTER: Duration = Duration::from_secs(60);
 
+/// Test-knob build only: select one deliberately faulty FX-28 behavior. The release binary does
+/// not contain the variable or mode names; each mode is run separately so one red cannot satisfy
+/// another claim's mutant.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn fx28_mutant(named: &str) -> bool {
+    std::env::var("VOX_TEST_FX28_MUTANT").as_deref() == Ok(named)
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) const fn fx28_mutant(_named: &str) -> bool {
+    false
+}
+
 /// One durable policy revision and the absolute ends of the two user-visible contracts its
 /// cause began. A remote merge may shorten the local apply deadline, but never restarts the
 /// outer return deadline shared by exchange and reconciliation.
@@ -940,6 +953,28 @@ pub(crate) struct State {
     retired_groups: BTreeMap<Digest32, Enrollment>,
 }
 impl State {
+    /// Advance the durable journal for a management fact which is exchanged but is not yet an
+    /// operator-policy fact. The later activation/fold owns `policy_revision`; preview and one-
+    /// sided approval still need their own crash-recoverable exchange obligation.
+    fn advance_journal(&mut self) -> Result<()> {
+        self.revision = self.revision.checked_add(1).ok_or_else(bad)?;
+        self.receipts.clear();
+        Ok(())
+    }
+
+    /// Every identity which can be affected by the current management transaction. A pending
+    /// enrollment precedes membership, so `descriptions` alone loses exactly the peer which must
+    /// learn a preview or one-sided approval.
+    fn exchange_peers(&self) -> Result<BTreeSet<Digest32>> {
+        let mut peers: BTreeSet<_> = self.descriptions().into_keys().collect();
+        if let Some(pending) = &self.pending {
+            for computer in &pending.computers {
+                peers.insert(computer.fingerprint()?);
+            }
+        }
+        Ok(peers)
+    }
+
     fn group(&self) -> Option<Digest32> {
         self.genesis
             .as_ref()
@@ -3006,17 +3041,35 @@ impl Computer {
             }
             Err(error) => return Err(error),
         };
-        // The obligation is part of the same durable transaction as its policy cause. A crash
-        // after this save can only recover the exact cause as missed; it can never manufacture a
-        // fresh clock for policy which was already published locally.
-        if held.policy_revision != next.policy_revision {
+        // The obligation is part of the same durable transaction as its exchanged cause. This
+        // includes authenticated preview and one-sided approval, before activation makes either
+        // one operator policy. A crash after this save therefore recovers the exact unfinished
+        // journal cause; it can never manufacture a fresh clock after restart.
+        if held.revision != next.revision {
             let local = self.signer.fingerprint();
+            let policy_moved = held.policy_revision != next.policy_revision;
             for peer in next
-                .descriptions()
-                .into_keys()
+                .exchange_peers()?
+                .into_iter()
                 .filter(|peer| *peer != local)
             {
-                next.pending_exchanges.insert(peer, next.policy_revision);
+                // A transport-only journal movement cannot overwrite an unfinished policy
+                // cause: after a crash that would turn a real policy miss into an irrelevant
+                // reach revision. A newer operator policy does replace the durable cause (and
+                // `mark_retry` independently keeps the earlier absolute deadline in memory).
+                match next.pending_exchanges.entry(peer) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(if policy_moved {
+                            next.policy_revision
+                        } else {
+                            next.revision
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) if policy_moved => {
+                        entry.insert(next.policy_revision);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
             }
         }
         if held.body() != next.body() {
@@ -3132,7 +3185,13 @@ impl Computer {
     /// unresolved record for startup to expire; it can never erase a real miss.
     pub(crate) fn record_timely_exchange(&self, peer: Digest32, revision: u64) -> Result<()> {
         self.change_durable(|state| {
-            if state.revision == revision {
+            // The completed flight may acknowledge only the state it actually sent. A newer
+            // obligation which appeared while it was in flight remains pending.
+            if state
+                .pending_exchanges
+                .get(&peer)
+                .is_some_and(|cause| *cause <= revision)
+            {
                 state.pending_exchanges.remove(&peer);
             }
             Ok(())
@@ -3203,7 +3262,7 @@ impl Computer {
             if (state.genesis.is_none() && state.intervals.is_empty())
                 || (self.storage_ready().is_ok()
                     && !Self::revision_expired(&state)
-                    && applied == state.revision)
+                    && applied == state.policy_revision)
             {
                 next
             } else {

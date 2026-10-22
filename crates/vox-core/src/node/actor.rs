@@ -13513,7 +13513,7 @@ impl Node {
     /// Nothing here waits for a dial (see `reach_member`); consent follows on `Dialed`. Waiting
     /// made `vox trust add` freeze the node for 10s per offline trusted member per room.
     async fn deliver_owed_consents(&mut self, asked_for: Option<Digest32>) {
-        if self.net.is_none() {
+        if self.net.is_none() || !self.computer_authority_current() {
             return;
         }
         self.deliver_reopens().await;
@@ -13573,6 +13573,11 @@ impl Node {
                 );
             }
             for target in owed {
+                // A computer-policy event may have entered the queue while room state was read.
+                // Do not spend authority derived from the older projection after that point.
+                if !self.computer_authority_current() {
+                    return;
+                }
                 // `consent` emits `Consented` on success; a failure here is a peer
                 // that is not reachable yet, which the next tick retries.
                 let asked = asked_for == Some(target);
@@ -20809,6 +20814,9 @@ impl Node {
             .filter(|p| p.is_unlocked())
             .ok_or("this node is locked")?;
         let owner = profile.fingerprint();
+        if by != owner && !self.computer_authority_current() {
+            return Err("attention waits for current computer trust".into());
+        }
         if by != owner
             && (!matches!(operation, crate::node::attention::Operation::Page(_))
                 || !self.trust.has_drive(&by)
@@ -21404,6 +21412,7 @@ impl Node {
         &mut self,
         guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
     ) -> crate::error::Result<bool> {
+        self.computer_drive_guard(guard)?;
         let holders = self.drive_holders();
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         let mut changed = false;
@@ -21427,9 +21436,16 @@ impl Node {
         &self,
         guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
     ) -> crate::error::Result<()> {
-        guard.map_or(Ok(()), |(deadline, cancelled)| {
-            Self::computer_policy_active(deadline, cancelled)
-        })
+        if let Some((deadline, cancelled)) = guard {
+            Self::computer_policy_active(deadline, cancelled)?;
+        }
+        if self.computer_authority_current() {
+            Ok(())
+        } else {
+            Err(Error::Profile(
+                "computer trust is pending application on this node",
+            ))
+        }
     }
 
     async fn session_projection_revision(

@@ -6,7 +6,7 @@ use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::node::network::NodeNet;
 use crate::node::presence::NetPresence;
 use crate::transport::{
-    framing::{read_frame, read_frame_until as read_frame_before, read_frame_within, write_frame},
+    framing::{read_frame_until as read_frame_before, write_frame},
     quic::VoxConnection,
     streams::{self, StreamKind},
 };
@@ -857,7 +857,10 @@ impl Management {
                     // `answer` derives its one host-local deadline from the hello as soon as the
                     // hello arrives. A second outer timeout would either truncate pairing's
                     // longer public contract or mint a fresh ordinary-exchange clock.
-                    let result = me.answer(&c, &mut send, &mut recv).await;
+                    let mut response_deadline = std::time::Instant::now() + PATIENCE;
+                    let result = me
+                        .answer(&c, &mut send, &mut recv, &mut response_deadline)
+                        .await;
                     // Only a fully parsed and meaningfully answered request on this
                     // authenticated computer stream proves the path is usable. A typed but
                     // malformed/refused/timed-out stream cannot bypass retry backoff.
@@ -869,12 +872,13 @@ impl Management {
                         f.array(2).uint(0).text(&e.to_string());
                         // A peer which stopped reading cannot retain one of the bounded answer
                         // slots forever merely because its error response is backpressured.
-                        let _ = write_frame_until(
-                            &mut send,
-                            &f.finish(),
-                            std::time::Instant::now() + PATIENCE,
-                        )
-                        .await;
+                        let response_deadline =
+                            if crate::node::computer::fx28_mutant("stopped-reader-fresh-write") {
+                                std::time::Instant::now() + PATIENCE
+                            } else {
+                                response_deadline
+                            };
+                        let _ = write_frame_until(&mut send, &f.finish(), response_deadline).await;
                     }
                     let _ = send.finish();
                 });
@@ -1236,6 +1240,8 @@ impl Management {
         let id = crate::node::link::b32_decode(operation, "computer pairing operation")?;
         let local = self.computer.signer.fingerprint();
         self.computer.change(|s| {
+            let before_revision = s.revision;
+            let before_pending = s.pending.as_ref().map(Enrollment::body);
             if s.genesis.as_ref().is_some_and(|g| g.operation() == id)
                 || s.history.values().any(|r| {
                     r.event()
@@ -1276,6 +1282,12 @@ impl Management {
                 )?);
             }
             activate(s, self.computer.signer.as_ref())?;
+            if !crate::node::computer::fx28_mutant("preview-approval-not-durable")
+                && s.pending.as_ref().map(Enrollment::body) != before_pending
+                && s.revision == before_revision
+            {
+                s.advance_journal()?;
+            }
             Ok(())
         })?;
         self.status()
@@ -2069,6 +2081,7 @@ impl Management {
             // The revision this node stood at when it accepted the pairing, read in the
             // transaction that merges the computer's state, and the revision after.
             let before = s.revision;
+            let before_pending = s.pending.as_ref().map(Enrollment::body);
             if s.pending
                 .as_ref()
                 .is_some_and(|p| !enrolled(s, p) && p.body() != g.body())
@@ -2086,6 +2099,12 @@ impl Management {
             s.pending_expires = link.expires;
             s.pair_link = Some(Zeroizing::new(url.to_owned()));
             merge(s, &exchange, link.target, self.computer.signer.as_ref())?;
+            if !crate::node::computer::fx28_mutant("preview-approval-not-durable")
+                && s.pending.as_ref().map(Enrollment::body) != before_pending
+                && s.revision == before
+            {
+                s.advance_journal()?;
+            }
             Ok((before, s.revision))
         })?;
         let _ = send.finish();
@@ -2096,8 +2115,9 @@ impl Management {
         conn: &VoxConnection,
         send: &mut SendStream,
         recv: &mut RecvStream,
+        response_deadline: &mut std::time::Instant,
     ) -> Result<()> {
-        let (op, peer, id, remaining_ms) = read_hello(recv, conn).await?;
+        let (op, peer, id, remaining_ms) = read_hello_until(recv, conn, *response_deadline).await?;
         let deadline = match op {
             REACHABILITY_WAKE_OP => std::time::Instant::now() + PATIENCE,
             1 if remaining_ms > 0 => local_deadline(remaining_ms, PAIR_WITHIN),
@@ -2105,6 +2125,9 @@ impl Management {
             1 | 2 => return Err(bad()),
             _ => return Err(bad()),
         };
+        // An error response belongs to the request's already-owned clock. The server must not
+        // mint another PATIENCE interval after the operation has exhausted that clock.
+        *response_deadline = deadline;
         let echo = hello(op, &self.computer.description(), &id, remaining_ms);
         write_frame_until(send, &echo, deadline).await?;
         if op == REACHABILITY_WAKE_OP {
@@ -2182,6 +2205,8 @@ impl Management {
         let proof = pop::open_pop(isk.as_ref(), sealed)?;
         pop::verify(&proof, &ci, &transcript, &conn.peer_id())?;
         let recorded = self.computer.change_until(deadline, |s| {
+            let before_revision = s.revision;
+            let before_pending = s.pending.as_ref().map(Enrollment::body);
             let i = s
                 .invitations
                 .iter_mut()
@@ -2201,6 +2226,12 @@ impl Management {
             }
             s.pending = Some(g);
             s.pending_expires = invite.expires;
+            if !crate::node::computer::fx28_mutant("preview-approval-not-durable")
+                && s.pending.as_ref().map(Enrollment::body) != before_pending
+                && s.revision == before_revision
+            {
+                s.advance_journal()?;
+            }
             // The state sent back, encoded with the pairing just recorded, and its revision.
             Ok((s.revision, exchange(s, &conn.peer_id())?))
         })?;
@@ -2244,17 +2275,21 @@ impl Management {
                     deadline,
                 });
             }
-            std::collections::btree_map::Entry::Occupied(mut entry)
-                if revision > entry.get().revision
-                    || (revision == entry.get().revision && deadline < entry.get().deadline) =>
-            {
-                entry.insert(RetryMark {
-                    token: next_flight(),
-                    revision,
-                    deadline,
-                });
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                // Revision says what the replacement carries; deadline says when the earliest
+                // unfinished cause must finish. Neither is permitted to replace the other.
+                let merged_revision = entry.get().revision.max(revision);
+                let merged_deadline = entry.get().deadline.min(deadline);
+                if merged_revision != entry.get().revision
+                    || merged_deadline != entry.get().deadline
+                {
+                    entry.insert(RetryMark {
+                        token: next_flight(),
+                        revision: merged_revision,
+                        deadline: merged_deadline,
+                    });
+                }
             }
-            std::collections::btree_map::Entry::Occupied(_) => {}
         }
     }
 
@@ -2267,8 +2302,9 @@ impl Management {
             (
                 state.revision,
                 state
-                    .descriptions()
-                    .into_keys()
+                    .exchange_peers()
+                    .unwrap_or_else(|_| state.descriptions().into_keys().collect())
+                    .into_iter()
                     .filter(|peer| *peer != local)
                     .collect(),
             )
@@ -2332,7 +2368,9 @@ impl Management {
             // counts, which are "since the daemon started" and survive its re-enrollment, but
             // not its failure: that must not stand in the status for good.
             let known: std::collections::BTreeSet<Digest32> = peers.iter().copied().collect();
-            retry_ready.retain(|peer, mark| known.contains(peer) && mark.revision == revision);
+            // A later journal revision changes the payload, not the deadline owned by an older
+            // unfinished cause. `mark_retry` carries that earliest clock onto the current state.
+            retry_ready.retain(|peer, _| known.contains(peer));
             let mut changed = false;
             for (peer, record) in exchanged.iter_mut() {
                 if !known.contains(peer) && (record.failures > 0 || record.problem.is_some()) {
@@ -2689,9 +2727,15 @@ impl Management {
                     )
                 });
         let missed = retained_miss || completed >= deadline;
-        let durable_revision = outcome
-            .as_ref()
-            .map_or(revision, |(_, merged_revision)| *merged_revision);
+        // Only the snapshot this flight actually sent can acknowledge a local obligation. The
+        // merged revision may include a newer local cause which arose while this flight was away.
+        let durable_revision = outcome.as_ref().map_or(revision, |(sent, merged)| {
+            if crate::node::computer::fx28_mutant("stale-flight-clears-newer") {
+                *merged
+            } else {
+                *sent
+            }
+        });
         let mut missed_cause = None;
         let durable = if missed {
             self.computer
@@ -2790,6 +2834,12 @@ impl Management {
         if waiters.contains_key(&peer) {
             return;
         }
+        let Some(deadline) = lock(&self.exchanged)
+            .get(&peer)
+            .and_then(|record| record.deadline)
+        else {
+            return;
+        };
         let serial = next_flight();
         let start = Arc::new(tokio::sync::Notify::new());
         let started = Arc::clone(&start);
@@ -2799,12 +2849,13 @@ impl Management {
             started.notified().await;
             let result = async {
                 let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
-                write_frame(
+                write_frame_until(
                     &mut send,
                     &hello(REACHABILITY_WAKE_OP, &description, &[0; 32], 0),
+                    deadline,
                 )
                 .await?;
-                let response = read_frame(&mut recv, MAX_FRAME)
+                let response = read_frame_before(&mut recv, MAX_FRAME, deadline)
                     .await?
                     .ok_or(Error::Profile(
                         "computer reachability peer closed before answering",
@@ -3152,13 +3203,6 @@ fn hello(op: u64, d: &Description, id: &Digest32, remaining_ms: u64) -> Vec<u8> 
         .uint(remaining_ms);
     e.finish()
 }
-async fn read_hello(
-    recv: &mut RecvStream,
-    conn: &VoxConnection,
-) -> Result<(u64, Description, Digest32, u64)> {
-    let f = frame(recv).await?;
-    parse_hello(&f, conn)
-}
 async fn read_hello_until(
     recv: &mut RecvStream,
     conn: &VoxConnection,
@@ -3184,9 +3228,6 @@ fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Dige
         return Err(Error::SignatureInvalid);
     }
     Ok((op, desc, id, remaining_ms))
-}
-async fn frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
-    frame_within(recv, PATIENCE).await
 }
 async fn frame_until(recv: &mut RecvStream, deadline: std::time::Instant) -> Result<Vec<u8>> {
     if std::time::Instant::now() >= deadline {
@@ -3216,22 +3257,6 @@ async fn write_frame_until(
             Error::Profile("the computer exchange reached its causal convergence deadline")
         })??;
     Ok(())
-}
-async fn frame_within(recv: &mut RecvStream, within: Duration) -> Result<Vec<u8>> {
-    let f = read_frame_within(recv, MAX_FRAME, within)
-        .await?
-        .ok_or(Error::Profile(
-            "computer pairing peer closed before answering",
-        ))?;
-    let mut d = Decoder::new(&f);
-    if d.array().ok() == Some(2) && d.uint().ok() == Some(0) {
-        let message = d.text()?.to_owned();
-        d.finish()?;
-        return Err(Error::Handshake(crate::transport::quic::peer_text(
-            &message,
-        )));
-    }
-    Ok(f)
 }
 fn enrolled(s: &State, g: &Enrollment) -> bool {
     if g.group.is_none() {
