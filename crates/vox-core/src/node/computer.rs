@@ -57,6 +57,64 @@ pub(crate) const fn fx28_mutant(_named: &str) -> bool {
     false
 }
 
+/// Publish a populated proof marker in one namespace operation, without replacing an existing
+/// marker. Test-knob call sites use this only for causal staging; shipped builds compile every
+/// caller out.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn publish_proof_marker(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> core::result::Result<(), String> {
+    use std::io::Write as _;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+    let staged = path.with_file_name(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| format!("could not create {}: {e}", staged.display()))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let cleanup = std::fs::remove_file(&staged).err();
+        return Err(format!(
+            "could not populate {}: {error}; cleanup: {cleanup:?}",
+            staged.display()
+        ));
+    }
+    drop(file);
+    if let Err(error) = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &staged,
+        rustix::fs::CWD,
+        path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        let cleanup = std::fs::remove_file(&staged).err();
+        return Err(format!(
+            "could not publish {} without replacement: {error}; cleanup: {cleanup:?}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Make a hook setup failure causally visible to the shipped-binary journey. If even the fault
+/// marker cannot be published, process termination is the journey's independent apparatus signal.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn publish_proof_fault(path: &std::path::Path, detail: &str) {
+    if let Err(error) = publish_proof_marker(path, detail.as_bytes()) {
+        eprintln!(
+            "APPARATUS: could not publish proof fault {}: {error}",
+            path.display()
+        );
+        std::process::exit(70);
+    }
+}
+
 /// One durable policy revision and the absolute ends of the two user-visible contracts its
 /// cause began. A remote merge may shorten the local apply deadline, but never restarts the
 /// outer return deadline shared by exchange and reconciliation.
@@ -947,6 +1005,9 @@ pub(crate) struct State {
     pub pending: Option<Enrollment>,
     /// Exact local policy application revision for each attached node; never a distributed clock.
     pub applied: BTreeMap<Digest32, AppliedPolicy>,
+    /// Exact policy-covered grants durably prepared before a node keyring commit. Application
+    /// moves these into `applied`; crash recovery includes them in fail-closed revocation.
+    prepared: BTreeMap<Digest32, AppliedPolicy>,
     /// Per node of this computer, the revision its binding was last derived at and when
     /// (ADR-038 FX-28): a binding is derived once per revision, across restarts too, and a node
     /// whose record names the current revision is left alone.
@@ -1570,7 +1631,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(29)
+        e.array(30)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1706,14 +1767,25 @@ impl State {
         for (peer, revision) in &self.pending_exchanges {
             e.array(2).bytes(peer).uint(*revision);
         }
-        e.uint(self.policy_revision);
+        e.uint(self.policy_revision).array(self.prepared.len());
+        for (id, prepared) in &self.prepared {
+            e.array(4)
+                .bytes(id)
+                .uint(prepared.revision)
+                .bytes(&prepared.interval)
+                .array(prepared.grants.len());
+            for (peer, created) in &prepared.grants {
+                e.array(2).bytes(peer).uint(*created);
+            }
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        // 29 elements; older current-version states have no distinct operator-policy revision.
+        // 30 elements; older current-version states have no distinct operator-policy revision or
+        // durable pre-keyring application record.
         let fields = count(&mut d)?;
-        if !(25..=29).contains(&fields) {
+        if !(25..=30).contains(&fields) {
             return Err(bad());
         }
         let description = Description::decode(d.bytes()?)?;
@@ -2016,8 +2088,45 @@ impl State {
         if policy_revision > revision {
             return Err(bad());
         }
+        let mut prepared = BTreeMap::new();
+        if fields >= 30 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 4)?;
+                let id = digest(&mut d)?;
+                let prepared_revision = d.uint()?;
+                let interval = digest(&mut d)?;
+                let mut grants = BTreeMap::new();
+                for _ in 0..count(&mut d)? {
+                    arity(&mut d, 2)?;
+                    let peer = digest(&mut d)?;
+                    let created = d.uint()?;
+                    if created == 0
+                        || created > prepared_revision
+                        || grants.insert(peer, created).is_some()
+                    {
+                        return Err(bad());
+                    }
+                }
+                if prepared_revision == 0
+                    || prepared_revision > revision
+                    || prepared
+                        .insert(
+                            id,
+                            AppliedPolicy {
+                                revision: prepared_revision,
+                                interval,
+                                grants,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            prepared,
             pending_exchanges,
             missed_exchanges,
             derived,
@@ -2542,19 +2651,22 @@ impl Computer {
         }
         self.storage_ready()?;
         if Self::revision_expired(&s) {
-            let denied = s
-                .applied
-                .get(&node)
-                // An expired operator policy is fail closed. Capability changes and grants from
-                // earlier revisions are still computer-managed authority; leaving them in the
-                // effective keyring would let a late exchange preserve the very authority whose
-                // causal application contract was missed.
-                .map(|applied| applied.grants.keys().copied().collect())
-                .unwrap_or_default();
+            // An expired operator policy is fail closed. Capability changes and grants from
+            // earlier revisions are still computer-managed authority; so are grants prepared
+            // durably before a node keyring commit whose applied receipt was interrupted by a
+            // crash. Leaving either set effective would preserve the authority whose causal
+            // application contract was missed.
+            let mut denied = BTreeSet::new();
+            if let Some(applied) = s.applied.get(&node) {
+                denied.extend(applied.grants.keys().copied());
+            }
+            if let Some(prepared) = s.prepared.get(&node) {
+                denied.extend(prepared.grants.keys().copied());
+            }
             return Ok(Some(PolicyPlan {
                 revision: s.policy_revision,
                 grants: Vec::new(),
-                denied,
+                denied: denied.into_iter().collect(),
                 expired: true,
             }));
         }
@@ -2710,6 +2822,41 @@ impl Computer {
             std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
         )
     }
+
+    /// Persist the exact revocation set before committing the node's keyring. This is not an
+    /// applied receipt: the actor must still save the keyring and call `mark_applied_until`.
+    /// If the process ends between those writes, startup expiry can revoke everything that the
+    /// interrupted commit may have made effective.
+    pub(crate) fn prepare_application_until(
+        &self,
+        node: Digest32,
+        revision: u64,
+        covered: &[Digest32],
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        self.change_until(deadline, |state| {
+            if state.policy_revision != revision || Self::revision_expired(state) {
+                return Err(Error::Profile(
+                    "computer policy changed before its keyring application was prepared",
+                ));
+            }
+            let interval = state
+                .genesis
+                .as_ref()
+                .map(Enrollment::incarnation)
+                .unwrap_or([0; 32]);
+            state.prepared.insert(
+                node,
+                AppliedPolicy {
+                    revision,
+                    interval,
+                    grants: covered.iter().map(|peer| (*peer, revision)).collect(),
+                },
+            );
+            Ok(())
+        })
+    }
+
     pub(crate) fn mark_applied_until(
         &self,
         node: Digest32,
@@ -2739,6 +2886,12 @@ impl Computer {
                 applied.grants.entry(*peer).or_insert(revision);
             }
             applied.revision = revision;
+            if s.prepared
+                .get(&node)
+                .is_some_and(|prepared| prepared.revision == revision)
+            {
+                s.prepared.remove(&node);
+            }
             Ok(())
         })
     }
@@ -2760,6 +2913,7 @@ impl Computer {
             if let Some(applied) = state.applied.get_mut(&node) {
                 applied.grants.clear();
             }
+            state.prepared.remove(&node);
             // Receipts are statements by computers, not by their managed nodes.
             state.receipts.remove(&self.signer.fingerprint());
             Ok(())
@@ -3001,6 +3155,7 @@ impl Computer {
             rosters: BTreeMap::new(),
             pending: None,
             applied: BTreeMap::new(),
+            prepared: BTreeMap::new(),
             derived: BTreeMap::new(),
             missed_exchanges: BTreeMap::new(),
             pending_exchanges: BTreeMap::new(),

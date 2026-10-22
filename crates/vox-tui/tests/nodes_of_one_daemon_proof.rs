@@ -1521,7 +1521,9 @@ fn computer_preview_and_approval_survive_a_crash() {
 /// survive the newer policy revision; requiring a retained peer connection strands the repair;
 /// discarding failed transport work means the remote anchor's return never causes registration;
 /// ignoring a marker-only authorization change leaves the causally staged grant in the shipped
-/// effective keyring; clearing a late success hides the missed contract before preview/restart.
+/// effective keyring; clearing a late success hides the missed contract before preview/restart;
+/// omitting the durable pre-keyring recovery record leaves a newly committed grant effective
+/// after an exact commit-boundary crash and restart.
 /// Each reaches a PRODUCT deadline/roster assertion, while inability to stage an exact race is
 /// APPARATUS.
 #[cfg(feature = "optional-proofs")]
@@ -1534,6 +1536,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE",
         "VOX_TEST_HOLD_COMPUTER_OPERATOR_RESERVED_FILE",
         "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
+        "VOX_TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_FILE",
     ]);
     let anchor = Account::new();
     let a = Account::new();
@@ -1616,6 +1619,15 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         answer_after_merge_arm.display(),
         answer_after_merge_engaged.display(),
         answer_after_merge_release.display()
+    );
+    let keyring_commit_crash_arm = b.data.join("crash-after-keyring-commit-arm");
+    let keyring_commit_crash_committed = b.data.join("crash-after-keyring-commit-durable");
+    let keyring_commit_crash_fault = b.data.join("crash-after-keyring-commit-fault");
+    let keyring_commit_crash_spec = format!(
+        "{}\t{}\t{}",
+        keyring_commit_crash_arm.display(),
+        keyring_commit_crash_committed.display(),
+        keyring_commit_crash_fault.display()
     );
     let start = |account: &Account, listen: &str, anchor: &str, env: &[(&str, &str)]| {
         let mut daemon = Daemon::start(
@@ -2487,6 +2499,143 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             ok && out.trim() == "no rooms",
             "PRODUCT: computer transport introduced a room: {out}{err}"
         );
+    }
+
+    // Extend the same merge-before-reply journey through the exact crash window the durable
+    // stores cannot make atomic. The answerer first parks its reply after the merge. Its managed
+    // actor then durably prepares the exact rollback set, commits the node keyring, publishes the
+    // causal boundary marker and exits before the ordinary applied receipt. On restart, shipped
+    // status must name the unresolved exchange expired and shipped trust must show no authority.
+    // Mutant: omit only the durable pre-keyring record; the new grant survives recovery and this
+    // assertion turns red on its own user-visible output.
+    stop_pid(right.child.id());
+    right
+        .child
+        .wait()
+        .expect("APPARATUS: stop right daemon before exact keyring-commit crash staging");
+    right = start(
+        &b,
+        "[::1]:0",
+        &v6,
+        &[
+            (
+                "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
+                &answer_after_merge_spec,
+            ),
+            (
+                "VOX_TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_FILE",
+                &keyring_commit_crash_spec,
+            ),
+        ],
+    );
+    assert!(
+        !answer_after_merge_engaged.exists()
+            && !keyring_commit_crash_committed.exists()
+            && !keyring_commit_crash_fault.exists(),
+        "APPARATUS: an earlier hook invocation left an exact-boundary marker in the scratch account"
+    );
+    std::fs::write(&answer_after_merge_arm, b"armed")
+        .expect("APPARATUS: arm exact merge-before-reply hold for crash recovery");
+    let committed_then_crashed = a.make_node("committed-before-receipt-crash");
+    std::fs::write(&keyring_commit_crash_arm, &committed_then_crashed)
+        .expect("APPARATUS: arm exact post-keyring/pre-receipt crash");
+    let before_commit_crash = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "committed-before-receipt-crash",
+            "--passphrase-file",
+            "-",
+        ],
+        PASS,
+    );
+    assert!(
+        ok,
+        "PRODUCT: attach exact keyring-commit crash node: {out}{err}"
+    );
+    let committed_revision = computer(&a, &["status"])["revision"]
+        .as_u64()
+        .filter(|revision| *revision > before_commit_crash)
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: attaching the keyring-commit crash node moved no policy revision")
+        });
+    let staging_deadline = Instant::now() + RETURN_WITHIN;
+    loop {
+        if keyring_commit_crash_fault.is_file() {
+            panic!(
+                "APPARATUS: exact keyring-commit crash hook failed: {}",
+                std::fs::read_to_string(&keyring_commit_crash_fault).unwrap_or_default()
+            );
+        }
+        if keyring_commit_crash_committed.is_file() {
+            break;
+        }
+        if let Some(status) = right
+            .child
+            .try_wait()
+            .expect("APPARATUS: inspect exact keyring-commit crash daemon")
+        {
+            panic!(
+                "APPARATUS: answerer exited {status} without publishing the exact durable keyring-commit boundary: {}",
+                right.said()
+            );
+        }
+        assert!(
+            Instant::now() < staging_deadline,
+            "APPARATUS: answerer remained live but never reached the exact durable keyring-commit boundary"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let crash_marker = std::fs::read_to_string(&keyring_commit_crash_committed)
+        .expect("APPARATUS: read exact durable keyring-commit marker");
+    assert_eq!(
+        crash_marker,
+        format!("{bob}\t{committed_revision}\t{committed_then_crashed}"),
+        "APPARATUS: keyring-commit crash marker named a different node, revision, or grant"
+    );
+    assert!(
+        answer_after_merge_engaged.is_file(),
+        "APPARATUS: keyring commit occurred without the exchange parked at merge-before-reply"
+    );
+    let crash_status = right
+        .child
+        .wait()
+        .expect("APPARATUS: reap exact keyring-commit crash daemon");
+    assert_eq!(
+        crash_status.code(),
+        Some(86),
+        "APPARATUS: exact keyring-commit hook did not own the staged process exit"
+    );
+    println!(
+        "[proof] FX-28 keyring-commit recovery apparatus staged: revision {committed_revision}, node {bob}, grant {committed_then_crashed}"
+    );
+    right = start(&b, "[::1]:0", &v6, &[]);
+    right.expect_apparatus_event(
+        "node after-remote-anchor-b is Ready after exact keyring-commit recovery",
+        |line| line.contains("after-remote-anchor-b is Ready"),
+    );
+    loop {
+        let recovered = application_toward(&b, &a_id);
+        if recovered["missed_revision"] == committed_revision
+            && recovered["convergence_state"] == "expired"
+        {
+            let (_, grants, grant_error) =
+                b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
+            assert!(
+                exact_grants(&b, "after-remote-anchor-b", &[]),
+                "PRODUCT [FX28 keyring-commit-crash]: after restart made exact merged revision {committed_revision} expired, the managed node retained authority committed before its missing applied receipt: status {}; shipped trust output {grants}; error {grant_error}",
+                computer(&b, &["status"])
+            );
+            break;
+        }
+        assert!(
+            daemon_alive(right.child.id()) && daemon_alive(relay.child.id()),
+            "PRODUCT [FX28 keyring-commit-crash]: a shipped process exited before restart exposed the durable expired exchange and fail-closed trust: right {}; anchor {}",
+            right.said(),
+            relay.said()
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
     drop((left, right, relay));
 }

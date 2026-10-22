@@ -1,5 +1,13 @@
 //! Computer policy is daemon-owned. No public node command can forge a management binding.
 use super::*;
+
+/// **Test-only** (`test-knobs`): `<arm>\t<committed>\t<fault>`. The arm contains the exact peer
+/// fingerprint whose grant the journey introduced. After the durable recovery record and node
+/// keyring commit, but before the applied receipt, the actor publishes `committed` and exits.
+/// Shipped builds neither name nor read this variable.
+#[cfg(feature = "test-knobs")]
+const TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV: &str =
+    "VOX_TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_FILE";
 use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
 
@@ -536,9 +544,15 @@ impl Node {
             .as_ref()
             .ok_or(Error::Profile("managed profile disappeared"))?;
         Self::computer_policy_active(deadline, cancelled)?;
+        if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable") {
+            computer.prepare_application_until(me, revision, &covered, deadline)?;
+        }
+        Self::computer_policy_active(deadline, cancelled)?;
         next.save_checked(profile.store(), profile.signer()?, || {
             Self::computer_policy_active(deadline, cancelled)
         })?;
+        #[cfg(feature = "test-knobs")]
+        Self::crash_after_computer_keyring_commit_for_proof(me, revision, &covered);
         Self::computer_policy_active(deadline, cancelled)?;
         self.trust = next;
         for (id, was) in changed_drive {
@@ -565,6 +579,68 @@ impl Node {
         self.computer_revision
             .store(revision, std::sync::atomic::Ordering::Release);
         Ok(changes)
+    }
+
+    /// End the proof daemon at the exact two-store boundary: its keyring is durable, while the
+    /// computer transaction still contains only the pre-commit recovery record. The populated
+    /// marker is apparatus evidence of that operation boundary, never a product verdict.
+    #[cfg(feature = "test-knobs")]
+    fn crash_after_computer_keyring_commit_for_proof(
+        node: Digest32,
+        revision: u64,
+        covered: &[Digest32],
+    ) {
+        let Ok(spec) = std::env::var(TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(arm), Some(committed), Some(fault)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            eprintln!("APPARATUS: malformed {TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV}");
+            std::process::exit(70);
+        };
+        let arm_path = std::path::Path::new(arm);
+        let target = match std::fs::read_to_string(arm_path) {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                crate::node::computer::publish_proof_fault(
+                    std::path::Path::new(fault),
+                    &format!("could not read exact keyring-commit arm: {error}"),
+                );
+                std::process::exit(70);
+            }
+        };
+        let target = target.trim();
+        if !covered
+            .iter()
+            .any(|peer| crate::node::link::b32_encode(peer) == target)
+        {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(arm_path) {
+            crate::node::computer::publish_proof_fault(
+                std::path::Path::new(fault),
+                &format!("could not consume exact keyring-commit arm: {error}"),
+            );
+            std::process::exit(70);
+        }
+        let marker = format!(
+            "{}\t{revision}\t{target}",
+            crate::node::link::b32_encode(&node)
+        );
+        if let Err(error) = crate::node::computer::publish_proof_marker(
+            std::path::Path::new(committed),
+            marker.as_bytes(),
+        ) {
+            crate::node::computer::publish_proof_fault(
+                std::path::Path::new(fault),
+                &format!("could not publish exact keyring-commit marker: {error}"),
+            );
+            std::process::exit(70);
+        }
+        std::process::exit(86);
     }
 
     pub(super) fn computer_change_refused(&self, command: &NodeCommand) -> bool {

@@ -26,8 +26,14 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stale-tick-authority]:'
     staging='[proof] FX-28 stale-tick-authority apparatus staged:'
     ;;
+  keyring-commit-not-recoverable)
+    mutant=$1
+    journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
+    verdict='PRODUCT [FX28 keyring-commit-crash]:'
+    staging='[proof] FX-28 keyring-commit recovery apparatus staged:'
+    ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority|keyring-commit-not-recoverable" >&2
     exit 2
     ;;
 esac
