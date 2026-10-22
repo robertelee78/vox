@@ -693,6 +693,23 @@ impl Controller {
         self.pool_admission.remove(&(room, peer));
     }
 
+    /// A real connection-close edge retires every exact continuation for that peer before the
+    /// scheduler publishes or considers other work. Return the rooms whose parked Flows remain
+    /// owned and must be reconsidered after reach/reconnect.
+    pub(super) fn cancel_peer_pool_admissions(&mut self, peer: Digest32) -> BTreeSet<Digest32> {
+        let waiting: Vec<(Digest32, Digest32)> = self
+            .pool_admission
+            .keys()
+            .filter(|(_, waiting_peer)| *waiting_peer == peer)
+            .copied()
+            .collect();
+        let rooms = waiting.iter().map(|(room, _)| *room).collect();
+        for (room, peer) in waiting {
+            self.cancel_pool_admission(room, peer);
+        }
+        rooms
+    }
+
     pub(super) fn accept_pool_release(
         &mut self,
         release: crate::node::history_budget::FlowRelease,

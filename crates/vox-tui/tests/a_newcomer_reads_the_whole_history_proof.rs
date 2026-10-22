@@ -766,7 +766,7 @@ const QUIET_ROOMS: [&str; 2] = ["quiet-1", "quiet-2"];
 struct Staged {
     // The daemons first: they are killed before their directories go.
     _host_daemon: Daemon,
-    _peer_daemon: Daemon,
+    peer_daemon: Option<Daemon>,
     host: std::path::PathBuf,
     everyone: Vec<(
         std::path::PathBuf,
@@ -1158,7 +1158,7 @@ fn stage_hosted_nodes(
     }
     Staged {
         _host_daemon: host_daemon,
-        _peer_daemon: peer_daemon,
+        peer_daemon: Some(peer_daemon),
         host,
         everyone,
         rooms,
@@ -2005,6 +2005,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         "VOX_TEST_FLOW_STATE_FLOOR_FILE",
         "VOX_TEST_DISABLE_TICK_SCHEDULE",
         "VOX_TEST_PANIC_ON_TEXT",
+        "VOX_TEST_FX35_KEEP_CLOSED_POOL_ADMISSION",
     ]);
     watchdog::arm_for_setup(
         u32::try_from(
@@ -2015,7 +2016,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         u32::try_from(FX35_HOSTED.len() + FX35_WAKE_HOSTED.len() + 2)
             .expect("APPARATUS: unlock count does not fit the watchdog"),
     );
-    let staged = stage_hosted_nodes(&FX35_HOSTED, true, false, true);
+    let mut staged = stage_hosted_nodes(&FX35_HOSTED, true, false, true);
     converged(&staged);
     parked_flow_charge_discriminator(&staged);
     let converged_after = staged.posted.elapsed();
@@ -2228,6 +2229,90 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    // A real connection close is an eligibility edge, not something the periodic scheduler may
+    // notice later. Stop the exact peer behind the retained required Flow, wait until shipped
+    // status says that member is disconnected, and require both actor admission and daemon pool
+    // continuation to be gone in the same observation. The parked Flow remains owned and is
+    // re-enrolled after the peer returns, allowing the release-edge claims below to use a fresh
+    // exact continuation.
+    if let Some((owner, _, disconnected_order, disconnected_peer)) = live_pool_full.clone() {
+        let (owner_dir, owner_node, _, _) = staged.everyone[..staged.hosted]
+            .iter()
+            .find(|(_, _, candidate, _)| *candidate == owner)
+            .expect("APPARATUS: PoolFull owner disappeared before disconnect");
+        staged
+            .peer_daemon
+            .take()
+            .expect("APPARATUS: peer daemon disappeared before disconnect")
+            .stop();
+        while member_connected(owner_dir, pressure_room, &disconnected_peer) != Some(false) {
+            std::thread::yield_now();
+        }
+        let disconnected = fx35_synced(owner_dir, *owner_node);
+        let disconnected_status: serde_json::Value = serde_json::from_str(&disconnected.status)
+            .expect("PRODUCT: disconnected PoolFull status was not JSON");
+        let retained_by_actor = disconnected_status["lanes"]["bounded"]["admissions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|admission| admission["wait_order"] == disconnected_order);
+        let retained_by_pool = disconnected_status["lanes"]["budget"]["flow_state"]["waiting"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|continuation| continuation["order"] == disconnected_order);
+        eprintln!(
+            "[proof] FX-35 exact retained port disconnected: owner={owner} peer={disconnected_peer} order={disconnected_order}"
+        );
+        assert!(
+            !retained_by_actor && !retained_by_pool,
+            "PRODUCT [FX35 disconnected-pool-admission]: shipped status says peer \
+             {disconnected_peer} is disconnected but still retains flow-state continuation \
+             {disconnected_order}: {}",
+            disconnected.status
+        );
+
+        let peer_root = &staged.everyone[staged.hosted].0;
+        staged.peer_daemon = Some(daemon_env(
+            peer_root,
+            "peer-after-pool-disconnect",
+            &[("VOX_TEST_DISABLE_TICK_SCHEDULE", "1")],
+        ));
+        attached_as(peer_root, "peer-after-pool-disconnect", None);
+        while member_connected(owner_dir, pressure_room, &disconnected_peer) != Some(true) {
+            std::thread::yield_now();
+        }
+        live_pool_full = 'restaged: loop {
+            for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+                let shown = fx35_synced(dir, *node);
+                let status: serde_json::Value = serde_json::from_str(&shown.status)
+                    .expect("PRODUCT: reconnected PoolFull status was not JSON");
+                if let Some(admission) = status["lanes"]["bounded"]["admissions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|admission| {
+                        admission["gate"] == "pool"
+                            && admission["root"] == "required"
+                            && admission["room"] == *pressure_room
+                    })
+                {
+                    let order = admission["wait_order"].as_u64().unwrap_or_else(|| {
+                        panic!(
+                            "PRODUCT: reconnected exact PoolFull admission omitted order: {}",
+                            shown.status
+                        )
+                    });
+                    let peer = admission["peer"]
+                        .as_str()
+                        .expect("PRODUCT: reconnected exact PoolFull admission omitted peer")
+                        .to_owned();
+                    break 'restaged Some((*name, Instant::now(), order, peer));
+                }
+            }
+            std::thread::yield_now();
+        };
+    }
     if let Some((owner, _, wait_order, _)) = &live_pool_full {
         let release_hold = staged
             .release_hold
@@ -2894,10 +2979,12 @@ fn foreground_release_wakes_without_a_tick() {
 /// or dropping the authorization comparison, makes the transaction-barrier cycle decline without
 /// the shipped lane first reporting the stale old Flow. Retaining the departed room/member
 /// refusal suppresses the rejoined lifetime's decline; treating a changed head as the old
-/// decision prevents the successor's read/re-armed assertion. `drop-resume-owed` removes only the
-/// replacement owner after an archive Flow becomes authorization-stale while an earlier Control
-/// waiter owns admission; the exact shipped `lanes.history.owner` assertion turns red. Each mutant
-/// reaches its own exact terminal PRODUCT red.
+/// decision prevents the successor's read/re-armed assertion. Resetting a settled Content
+/// header's original first-seen time when its body arrives later exposes an already-expired row
+/// after a younger shipped witness has disappeared. `drop-resume-owed` removes only the replacement
+/// owner after an archive Flow becomes authorization-stale while an earlier Control waiter owns
+/// admission; the exact shipped `lanes.history.owner` assertion turns red. Each mutant reaches its
+/// own exact terminal PRODUCT red.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
@@ -2912,6 +2999,9 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_FOREGROUND_JOBS",
         "VOX_TEST_FX29_MUTANT",
         "VOX_TEST_FX29_CONTENT_OUTCOME_FILE",
+        "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE",
+        "VOX_TEST_FX29_CONTENT_REFILL_HASH",
+        "VOX_TEST_HOLD_RETENTION_SWEEP_FILE",
     ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -3757,7 +3847,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     // ciphertext, he can serve it and Carol will show Alice's tail. The correct product completed
     // that sync but has only the authenticated package header, so her shipped read remains absent.
     alice_daemon.stop();
-    let _carol_daemon = daemon_env(&carol, "carol-from-bob", &knob);
+    let carol_from_bob_daemon = daemon_env(&carol, "carol-from-bob", &knob);
     attached(&carol, "carol-from-bob");
     wait_room_open(&carol, &room, "carol-from-bob");
     assert!(
@@ -3933,13 +4023,18 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         &link,
         &fps,
         bob_after_restart,
+        carol_from_bob_daemon,
     );
 }
 
 /// Continue the quiet-room journey through the durable refusal's actual user lifecycle. `late`
-/// was mutually trusted with every author before any room post, but joins only after every holder
-/// has visibly pruned one Bob body. Therefore its first missing-body decision is authorized and
-/// real; no forged frame or database inspection stands in for the shipped product.
+/// was mutually trusted with every author before any room post. Alice and Bob visibly prune one
+/// Bob body while its only retaining source is offline, so late settles its authenticated header
+/// and records a real missing-body decision. A later local post visibly aging out proves that
+/// header's sealed retention origin is already expired. Carol then returns with the body while a
+/// proof-only sweep hold preserves the exact post-refill observation: the old body must not become
+/// visible merely because its bytes arrived later. No forged frame or database inspection stands
+/// in for the shipped product.
 ///
 /// Every wait below is fenced by exact terminal lane cycles. The process-wide proof watchdog is
 /// only an external APPARATUS deadman for a lane that makes no observable progress at all.
@@ -3954,10 +4049,11 @@ fn prove_declined_refusal_lifecycle(
     link: &str,
     fps: &[String],
     bob_daemon: Daemon,
+    carol_daemon: Daemon,
 ) {
     const LOCAL_RETENTION: &str = "default 1\n";
     let pruned = "bob body retained only until the late member joins";
-    for (name, dir) in [("alice", alice), ("bob", bob), ("carol", carol)] {
+    for (name, dir) in [("alice", alice), ("bob", bob)] {
         std::fs::write(dir.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
             panic!(
                 "APPARATUS: could not stage {name}'s local retention file for the refusal: {error}"
@@ -3970,19 +4066,57 @@ fn prove_declined_refusal_lifecycle(
              lifecycle: {out}{err}"
         );
     }
-    let (ok, out, err) = vox(bob, &["room", "post", room, pruned], None);
+    std::fs::write(carol.join("cfg/retention"), "default forever\n").unwrap_or_else(|error| {
+        panic!("APPARATUS: could not preserve Carol as the delayed body source: {error}")
+    });
+    let (ok, out, err) = vox(carol, &["room", "retention", room, "--steps", "7d"], None);
+    assert!(
+        ok,
+        "PRODUCT: Carol's shipped retention reload was refused while staging the delayed body: \
+         {out}{err}"
+    );
+    std::fs::write(late.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not stage late's local retention file: {error}")
+    });
+    let (ok, out, err) = vox(bob, &["room", "post", room, "--json", pruned], None);
     assert!(
         ok,
         "PRODUCT: Bob's authorized refusal-lifecycle post was refused: {out}{err}"
     );
-    while [alice, bob, carol]
-        .iter()
-        .any(|holder| reads(holder, room, pruned))
-    {
+    let posted: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|error| {
+        panic!("PRODUCT: Bob's delayed-refill post response was not JSON: {error}: {out}")
+    });
+    let pruned_hash = posted["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: Bob's delayed-refill post named no entry hash: {out}"))
+        .to_owned();
+    while !reads(carol, room, pruned) || !reads(alice, room, pruned) {
+        std::thread::yield_now();
+    }
+    carol_daemon.stop();
+    while reads(alice, room, pruned) || reads(bob, room, pruned) {
         std::thread::yield_now();
     }
 
-    let late_daemon = daemon(late, "late-refusal");
+    let refill_outcome = late.join("fx29-content-refill-outcome");
+    let refill_hold = late.join("hold-retention-after-content-refill");
+    let refill_outcome_text = refill_outcome.to_string_lossy().into_owned();
+    let refill_hold_text = refill_hold.to_string_lossy().into_owned();
+    let late_daemon = daemon_env(
+        late,
+        "late-refusal",
+        &[
+            (
+                "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE",
+                refill_outcome_text.as_str(),
+            ),
+            ("VOX_TEST_FX29_CONTENT_REFILL_HASH", pruned_hash.as_str()),
+            (
+                "VOX_TEST_HOLD_RETENTION_SWEEP_FILE",
+                refill_hold_text.as_str(),
+            ),
+        ],
+    );
     attached(late, "late-refusal");
     let (ok, out, err) = vox(
         late,
@@ -3995,6 +4129,11 @@ fn prove_declined_refusal_lifecycle(
          command: {out}{err}"
     );
     wait_room_open(late, room, "late-refusal");
+    let (ok, out, err) = vox(late, &["room", "retention", room, "--steps", "7d"], None);
+    assert!(
+        ok,
+        "PRODUCT: late's shipped retention reload was refused after join: {out}{err}"
+    );
     let declined = await_lane_claim(
         late,
         room,
@@ -4008,6 +4147,67 @@ fn prove_declined_refusal_lifecycle(
         "PRODUCT: the late member read Bob's body after every shipped holder had pruned it; \
          status named its missing-body decision as {declined:?}"
     );
+
+    // The witness is younger than the already-settled Bob header. Its disappearance from the
+    // shipped read is therefore a causal proof that the header's original retention age has
+    // expired; no elapsed threshold decides this verdict. Freeze only later retention sweeps,
+    // return the sole body source, and wait for the exact committed refill marker. One shipped
+    // read while the sweep is held distinguishes preserved age from the mutant's reset age.
+    let witness = "late retention witness after Bob header settlement";
+    let (ok, out, err) = vox(late, &["room", "post", room, witness], None);
+    assert!(
+        ok,
+        "PRODUCT: late's retention witness post was refused: {out}{err}"
+    );
+    assert!(
+        reads(late, room, witness),
+        "PRODUCT: late's accepted retention witness was never visible in its shipped room read"
+    );
+    while reads(late, room, witness) {
+        std::thread::yield_now();
+    }
+    std::fs::write(&refill_hold, b"").unwrap_or_else(|error| {
+        panic!("APPARATUS: could not hold retention after the exact refill: {error}")
+    });
+    let _carol_after_refill = daemon(carol, "carol-delayed-refill-source");
+    attached(carol, "carol-delayed-refill-source");
+    wait_room_open(carol, room, "carol-delayed-refill-source");
+    while !refill_outcome.is_file() {
+        std::thread::yield_now();
+    }
+    let refill = std::fs::read_to_string(&refill_outcome).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not read the exact sparse-Content refill marker: {error}")
+    });
+    assert_eq!(
+        refill,
+        format!("accepted:{pruned_hash}"),
+        "APPARATUS: sparse-Content refill marker named a different entry"
+    );
+    eprintln!(
+        "[proof] FX-29 settled Content delayed-refill apparatus staged: hash={pruned_hash} older witness visibly expired"
+    );
+    assert!(
+        !reads(late, room, pruned),
+        "PRODUCT [FX29 settled-content-refill-age]: delayed bytes made expired Bob body \
+         {pruned_hash} visible after its younger shipped retention witness had already disappeared"
+    );
+    std::fs::remove_file(&refill_hold).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not release post-refill retention maintenance: {error}")
+    });
+    std::fs::write(carol.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
+        panic!("APPARATUS: could not shorten Carol's retention after the refill claim: {error}")
+    });
+    let (ok, out, err) = vox(carol, &["room", "retention", room, "--steps", "7d"], None);
+    assert!(
+        ok,
+        "PRODUCT: Carol's post-refill retention reload was refused: {out}{err}"
+    );
+    while [alice, bob, carol]
+        .iter()
+        .any(|holder| reads(holder, room, pruned))
+    {
+        std::thread::yield_now();
+    }
 
     // A transport reconnect does not change the peer, author, authorization or room lifetime.
     // Its first completed exact lane cycle must therefore be empty and must not decide again.

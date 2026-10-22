@@ -667,6 +667,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::PresentationAsk { .. } => "signing node presentation",
         NetEvent::PresentationDone { .. } => "receiving node presentation",
         NetEvent::Connected { .. } => "filing a new connection",
+        NetEvent::ConnectionClosed { .. } => "retiring work for a closed connection",
         NetEvent::BetterPath { .. } => "adopting a connection",
         NetEvent::ReachFailed { .. } => "filing a failed dial",
         NetEvent::UpgradeFailed { .. } => "filing a path upgrade that failed",
@@ -1338,6 +1339,12 @@ enum NetEvent {
         /// The authenticated peer.
         peer: Digest32,
     },
+    /// The exact filed connection's stream loop observed its QUIC close. A replaced older path
+    /// is ignored; losing the current path immediately retires its actor-owned pool admissions.
+    ConnectionClosed {
+        peer: Digest32,
+        serial: u64,
+    },
     /// A sync session finished and is handing the channel back.
     ///
     /// A session **cannot** be awaited inside the actor loop: two nodes that each
@@ -1848,6 +1855,7 @@ fn spawn_stream_loop(
     // the loop out of the count, what remains is what the count is meant to measure — the
     // manager, and whatever is serving a stream or splicing a tunnel on it.
     let quic = conn.quinn().clone();
+    let serial = conn.serial();
     let conn = Arc::downgrade(&conn);
     tokio::spawn(async move {
         // One stream failing is **not** the connection failing. A refused kind, a
@@ -1922,6 +1930,7 @@ fn spawn_stream_loop(
         }
         // This peer's report of our address dies with its connection.
         net.forget_observed(&peer);
+        let _ = tx.send(NetEvent::ConnectionClosed { peer, serial }).await;
     })
 }
 
@@ -9964,6 +9973,29 @@ impl Node {
                     }
                 }
             }
+            NetEvent::ConnectionClosed { peer, serial } => {
+                let replacement_is_live = self
+                    .net
+                    .as_ref()
+                    .and_then(|net| net.manager().existing(&peer))
+                    .is_some_and(|conn| {
+                        conn.serial() != serial && conn.quinn().close_reason().is_none()
+                    });
+                if replacement_is_live {
+                    return;
+                }
+                self.connected.remove(&peer);
+                self.discover_peers.remove(&peer);
+                #[cfg(feature = "test-knobs")]
+                let cancel_admissions =
+                    std::env::var_os("VOX_TEST_FX35_KEEP_CLOSED_POOL_ADMISSION").is_none();
+                #[cfg(not(feature = "test-knobs"))]
+                let cancel_admissions = true;
+                if cancel_admissions {
+                    self.sched_rooms
+                        .extend(self.bounded_sync.cancel_peer_pool_admissions(peer));
+                }
+            }
             NetEvent::SkdmRefused {
                 channel_id,
                 peer,
@@ -14801,7 +14833,12 @@ impl Node {
             // connection or any other eligibility gate disappears it cannot keep a release-edge
             // promise: dropping the ticket returns an already-granted promise to the next actor
             // immediately, while the parked Flow remains the port's work for a later reconnect.
-            if !eligible {
+            #[cfg(feature = "test-knobs")]
+            let cancel_ineligible =
+                std::env::var_os("VOX_TEST_FX35_KEEP_CLOSED_POOL_ADMISSION").is_none();
+            #[cfg(not(feature = "test-knobs"))]
+            let cancel_ineligible = true;
+            if !eligible && cancel_ineligible {
                 self.bounded_sync.cancel_pool_admission(room, peer);
             }
             if let Some(p) = self.ports.get(&key) {
@@ -21296,6 +21333,13 @@ impl Node {
     /// this node's own (ADR-023 decision 2). `true` when anything was pruned, so the view is
     /// republished and `vox room read` stops showing it.
     async fn sweep_retention(&mut self) -> bool {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os("VOX_TEST_HOLD_RETENTION_SWEEP_FILE")
+            .filter(|path| !path.is_empty())
+            .is_some_and(|path| std::path::Path::new(&path).is_file())
+        {
+            return false;
+        }
         let now_ms = self.now_ms();
         self.refresh_node_retention(now_ms);
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
