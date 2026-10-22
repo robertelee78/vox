@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::log::history::MAX_CONTEXT_AUTHORS;
-use crate::node::history_budget::{BufferCharge, Job};
+use crate::node::history_budget::Job;
 
 use super::HeadHint;
 
@@ -23,7 +23,6 @@ struct State {
     /// unrelated worker that happened to read inventory concurrently.
     generations: BTreeMap<(Digest32, Digest32), u64>,
     pending: Vec<Pending>,
-    charge: Option<BufferCharge>,
 }
 #[derive(Default)]
 pub(crate) struct HintInbox(Mutex<State>);
@@ -46,7 +45,7 @@ impl HintInbox {
     /// so a late, otherwise valid read cannot repopulate the newly empty inventory.
     pub(crate) fn offer(
         &self,
-        job: &Job,
+        _job: &Job,
         generation: u64,
         room: Digest32,
         peer: Digest32,
@@ -93,19 +92,20 @@ impl HintInbox {
                     || pending.in_flight
                     || pending.hint.size >= hint.size
             });
-            if state.pending.len() == MAX_CONTEXT_AUTHORS {
+            // The inventory bound belongs to this exact port. A busy or hostile room must not
+            // consume a node-wide scalar-hint quota and refuse unrelated rooms. Pending scalar
+            // values are parked scheduler input, not an admitted lane buffer: retaining the
+            // Job (through BufferCharge) here kept its worker, byte reservation and lane slot
+            // until every port's hint was gone, contrary to ADR-038 FX-35.
+            if state
+                .pending
+                .iter()
+                .filter(|pending| pending.room == room && pending.peer == peer)
+                .count()
+                == MAX_CONTEXT_AUTHORS
+            {
                 outcome.full = true;
                 break;
-            }
-            if state.charge.is_none() {
-                let Some(charge) =
-                    job.reserve(MAX_CONTEXT_AUTHORS * std::mem::size_of::<Pending>())
-                else {
-                    outcome.full = true;
-                    break;
-                };
-                state.pending = Vec::with_capacity(MAX_CONTEXT_AUTHORS);
-                state.charge = Some(charge);
             }
             state.pending.push(Pending {
                 room,
@@ -242,12 +242,10 @@ impl HintInbox {
             *generation = generation.saturating_add(1);
         }
         state.pending = Vec::new();
-        state.charge = None;
     }
     fn release_empty(state: &mut State) {
         if state.pending.is_empty() {
             state.pending = Vec::new();
-            state.charge = None;
         }
     }
 }

@@ -1533,6 +1533,7 @@ fn select(
 impl Controller {
     /// The history request as it stands, for `vox status --json` (`lanes.history`).
     pub(super) fn lanes_json(&self) -> String {
+        use crate::node::link::b32_encode;
         fn js(s: &str) -> String {
             let mut o = String::from("\"");
             for c in s.chars() {
@@ -1551,8 +1552,46 @@ impl Controller {
             || ("null".to_owned(), "null".to_owned()),
             |s| (js(&format!("{:?}", s.phase)), js(&s.detail)),
         );
+        let active_stage = if self.preparing.is_some() {
+            Some("preparing")
+        } else if self.private_work.is_some() {
+            Some("private_work")
+        } else if self.running.is_some() {
+            Some("running")
+        } else if self.ready.is_some() {
+            Some("ready")
+        } else {
+            None
+        };
+        let owner = self
+            .status
+            .as_ref()
+            .zip(active_stage)
+            .map_or_else(|| "null".to_owned(), |(status, stage)| {
+            let peer = self
+                .ready
+                .as_ref()
+                .map(|dispatch| dispatch.peer)
+                .or(status.private_peer)
+                .map_or_else(|| "null".to_owned(), |peer| format!("\"{}\"", b32_encode(&peer)));
+            let request = status.request.map_or_else(|| "null".to_owned(), |request| {
+                format!(
+                    "\"{}\"",
+                    request.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                )
+            });
+            let instance = status
+                .instance
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                "{{\"stage\":\"{stage}\",\"room\":\"{}\",\"peer\":{peer},\"request\":{request},\"instance\":\"{instance}\"}}",
+                b32_encode(&status.room)
+            )
+            });
         format!(
-            "{{\"phase\":{phase},\"detail\":{detail},\"preparing\":{},\"ready\":{},\"running\":{},\"private_work\":{}}}",
+            "{{\"phase\":{phase},\"detail\":{detail},\"owner\":{owner},\"preparing\":{},\"ready\":{},\"running\":{},\"private_work\":{}}}",
             self.preparing.is_some(),
             self.ready.is_some(),
             self.running.is_some(),

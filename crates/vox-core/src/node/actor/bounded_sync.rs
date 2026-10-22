@@ -311,12 +311,22 @@ struct PoolAdmission {
     gate: &'static str,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
+    ticket: crate::node::history_budget::FlowWaitTicket,
     task: tokio::task::JoinHandle<()>,
 }
 #[derive(Clone, Copy)]
 struct PoolWait {
     gate: &'static str,
     work: AdmissionWork,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RequiredOwner {
+    room: Digest32,
+    peer: Digest32,
+    head: Digest32,
+    seq: u64,
+    request: stream::RequestId,
+    instance: [u8; 16],
 }
 enum ArchiveTurn {
     Ready(crate::node::history_budget::Job),
@@ -354,7 +364,7 @@ pub(super) struct Controller {
     pool_admission: BTreeMap<(Digest32, Digest32), PoolAdmission>,
     deferred: VecDeque<Flow>,
     body_slots: Arc<stream::runtime::BodySlots>,
-    required: VecDeque<(Digest32, Digest32, Digest32, u64)>,
+    required: VecDeque<RequiredOwner>,
     retiring: VecDeque<Flow>,
     cleanup: Option<Cleanup>,
     cleanup_due: Option<std::time::Instant>,
@@ -458,9 +468,7 @@ impl Controller {
             || self
                 .required
                 .iter()
-                .any(|(needed_room, needed_peer, _, _)| {
-                    *needed_room == room && *needed_peer == peer
-                })
+                .any(|required| required.room == room && required.peer == peer)
             || self
                 .foreground_admission
                 .iter()
@@ -685,22 +693,10 @@ impl Controller {
         }
     }
 
-    pub(super) fn release_pool_admission(
-        &mut self,
-        token: u64,
-        room: Digest32,
-        peer: Digest32,
-    ) -> bool {
-        if self
-            .pool_admission
+    pub(super) fn pool_admission_ready(&self, token: u64, room: Digest32, peer: Digest32) -> bool {
+        self.pool_admission
             .get(&(room, peer))
             .is_some_and(|admission| admission.token == token)
-        {
-            self.cancel_pool_admission(room, peer);
-            true
-        } else {
-            false
-        }
     }
 
     fn wait_for_pool(
@@ -710,7 +706,7 @@ impl Controller {
         room: Digest32,
         peer: Digest32,
         waiting: PoolWait,
-        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        ticket: crate::node::history_budget::FlowWaitTicket,
     ) {
         if self.pool_admission.contains_key(&(room, peer)) {
             return;
@@ -718,6 +714,7 @@ impl Controller {
         let token = *next_token;
         *next_token += 1;
         let tx = net_tx.clone();
+        let wake = ticket.wake();
         let task = tokio::spawn(async move {
             wake.await;
             let _ = tx
@@ -731,6 +728,7 @@ impl Controller {
                 gate: waiting.gate,
                 root: waiting.work.root,
                 lane: waiting.work.lane,
+                ticket,
                 task,
             },
         );
@@ -968,7 +966,7 @@ impl Controller {
                 }
             }
         }
-        self.required.retain(|(r, _, _, _)| *r != room);
+        self.required.retain(|required| required.room != room);
         self.join_cleanup().await?;
         while let Some(at) = self.retiring.iter().position(|flow| flow.room == room) {
             let Some(mut flow) = self.retiring.remove(at) else {
@@ -1061,7 +1059,7 @@ impl Controller {
         }
         self.deferred = keep;
         self.required
-            .retain(|(r, p, _, _)| *r != room || *p != peer);
+            .retain(|required| required.room != room || required.peer != peer);
         self.poll_cleanup();
     }
     pub(super) fn fence(&mut self) {
@@ -1391,7 +1389,7 @@ impl Node {
             .bounded_sync
             .required
             .iter()
-            .any(|(needed_room, needed_peer, _, _)| *needed_room == room && *needed_peer == peer)
+            .any(|required| required.room == room && required.peer == peer)
         {
             return AdmissionWork {
                 root: "required",
@@ -1596,7 +1594,14 @@ impl Node {
                 }
             }
             if let Some((head, seq)) = flow.external.take() {
-                let need = (work.room, work.peer, head, seq);
+                let need = RequiredOwner {
+                    room: work.room,
+                    peer: work.peer,
+                    head,
+                    seq,
+                    request: flow.retirement_request(),
+                    instance: flow.instance,
+                };
                 if !self.bounded_sync.required.contains(&need)
                     && self.bounded_sync.required.len() < 128
                 {
@@ -1607,27 +1612,25 @@ impl Node {
                 // EvidenceUnavailable named the author of the exact missing signed dependency.
                 // Keep this flow, its in-flight hint owner and its exact query/continuation
                 // intact; only the next wire turn moves to the authoritative port.
-                let more_for_peer = self
-                    .bounded_sync
-                    .ready
-                    .iter()
-                    .flatten()
-                    .any(|flow| flow.room == work.room && flow.peer == work.peer)
-                    || self
-                        .bounded_sync
-                        .deferred
+                let more_for_peer =
+                    self.bounded_sync
+                        .ready
                         .iter()
+                        .flatten()
                         .any(|flow| flow.room == work.room && flow.peer == work.peer)
-                    || self.history_hints.pending(work.room, work.peer)
-                    || self
-                        .leave_waiters
-                        .iter()
-                        .any(|(room, _, _, _)| *room == work.room)
-                    || self
-                        .bounded_sync
-                        .required
-                        .iter()
-                        .any(|(room, peer, _, _)| *room == work.room && *peer == work.peer);
+                        || self
+                            .bounded_sync
+                            .deferred
+                            .iter()
+                            .any(|flow| flow.room == work.room && flow.peer == work.peer)
+                        || self.history_hints.pending(work.room, work.peer)
+                        || self
+                            .leave_waiters
+                            .iter()
+                            .any(|(room, _, _, _)| *room == work.room)
+                        || self.bounded_sync.required.iter().any(|required| {
+                            required.room == work.room && required.peer == work.peer
+                        });
                 flow.peer = target;
                 flow.route_origin = Some(work.peer);
                 flow.route_complete = false;
@@ -1750,12 +1753,11 @@ impl Node {
                     continue;
                 };
                 flow.route_complete = false;
-                let more_for_target = self.history_hints.pending(work.room, work.peer)
-                    || self
-                        .bounded_sync
-                        .required
-                        .iter()
-                        .any(|(room, peer, _, _)| *room == work.room && *peer == work.peer);
+                let more_for_target =
+                    self.history_hints.pending(work.room, work.peer)
+                        || self.bounded_sync.required.iter().any(|required| {
+                            required.room == work.room && required.peer == work.peer
+                        });
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                     port.req_done = port.req_done.max(work.request);
                     if more_for_target {
@@ -1920,11 +1922,9 @@ impl Node {
                             .leave_waiters
                             .iter()
                             .any(|(r, _, _, _)| *r == work.room)
-                        || self
-                            .bounded_sync
-                            .required
-                            .iter()
-                            .any(|(r, p, _, _)| *r == work.room && *p == work.peer)
+                        || self.bounded_sync.required.iter().any(|required| {
+                            required.room == work.room && required.peer == work.peer
+                        })
                     {
                         port.raise();
                         raised = true;
@@ -2108,7 +2108,10 @@ impl Node {
                 flow
             } else {
                 if self.bounded_sync.flow_count() >= RETAINED_FLOW_LIMIT {
-                    self.note_start(room, peer, "retained_flow_limit");
+                    // This is controller retention preflight, before a Flow/start attempt owns
+                    // the port. Its release is driven by the exact retiring/completion owner;
+                    // do not overwrite the last ended attempt with a start_reason ADR-038 does
+                    // not define.
                     return false;
                 }
                 if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
@@ -2143,7 +2146,8 @@ impl Node {
                         pending_work,
                         self.secret_work.clone(),
                     );
-                    self.note_start(room, peer, "identity_busy");
+                    // Secret-work admission is preflight, before the documented start gates.
+                    // Its exact waiter wakes this port; the latest ended attempt stays intact.
                     return false;
                 };
                 let lease = Arc::new(lease);
@@ -2265,15 +2269,14 @@ impl Node {
                         };
                         let required_at = (!announce_first)
                             .then(|| {
-                                self.bounded_sync
-                                    .required
-                                    .iter()
-                                    .position(|(r, p, _, _)| *r == room && *p == peer)
+                                self.bounded_sync.required.iter().position(|required| {
+                                    required.room == room && required.peer == peer
+                                })
                             })
                             .flatten();
                         let required = required_at
                             .and_then(|at| self.bounded_sync.required.get(at))
-                            .map(|(_, _, head, seq)| (*head, *seq));
+                            .map(|required| (required.head, required.seq));
                         let hint = if announce_first || required.is_some() {
                             None
                         } else {
@@ -2338,12 +2341,12 @@ impl Node {
                             self.bounded_sync
                                 .required
                                 .iter()
-                                .position(|(r, p, _, _)| *r == room && *p == peer)
+                                .position(|required| required.room == room && required.peer == peer)
                         })
                         .flatten();
                     let required = required_at
                         .and_then(|at| self.bounded_sync.required.get(at))
-                        .map(|(_, _, head, seq)| (*head, *seq));
+                        .map(|required| (required.head, required.seq));
                     let hint = if announce_first || required.is_some() {
                         None
                     } else {
@@ -2523,41 +2526,56 @@ impl Node {
         // round runs, and takes it here, in the step that makes the round run. A full fixed pool
         // parks the exact flow, gives back the lane job and slot, and wakes only from a running
         // charge's release; the port keeps its need.
-        let flow_state_wake = Flow::flow_state_wake(&state_job);
-        match flow.resume(&state_job, state_bytes) {
-            crate::node::history_stream::runtime::Resumed::Held => {}
+        let resumed = {
+            let waiter = self
+                .bounded_sync
+                .pool_admission
+                .get_mut(&(room, peer))
+                .map(|admission| &mut admission.ticket);
+            flow.resume(&state_job, state_bytes, waiter)
+        };
+        match resumed {
+            crate::node::history_stream::runtime::Resumed::Held => {
+                self.bounded_sync.cancel_pool_admission(room, peer);
+            }
             refused @ (crate::node::history_stream::runtime::Resumed::PoolFull
             | crate::node::history_stream::runtime::Resumed::NodeBusy) => {
-                let (reason, gate) = match refused {
-                    crate::node::history_stream::runtime::Resumed::PoolFull => {
-                        ("flow_state_pool_full", "pool")
-                    }
-                    crate::node::history_stream::runtime::Resumed::NodeBusy => {
-                        ("flow_state_node_busy", "node_slots")
-                    }
+                let gate = match refused {
+                    crate::node::history_stream::runtime::Resumed::PoolFull => "pool",
+                    crate::node::history_stream::runtime::Resumed::NodeBusy => "node_slots",
                     crate::node::history_stream::runtime::Resumed::Held => unreachable!(),
                 };
-                self.note_start(room, peer, reason);
+                // Both refusals are impossible under the legal running-work bound. The only
+                // public start gate ADR-038 defines for this retained release-edge path is the
+                // flow-state pool; keep the more specific source-slot cause on its exact
+                // admission owner, not as an undocumented start_reason value.
+                self.note_start(room, peer, "flow_state_pool_full");
                 // This ordinary admission wait still owns all work consumed while constructing
                 // the Flow: archive dispatch, exact required dependency, or scalar hint. Retain
                 // it in its lane until a running completion releases capacity and wakes the
                 // actor; never reconstruct only the hint and strand the other two forms.
                 let mut flow = flow;
                 let root = flow.root_name();
+                let retirement_request = flow.retirement_request();
+                let instance = flow.instance;
                 flow.park();
                 debug_assert!(self.bounded_sync.ready[index].is_none());
                 self.bounded_sync.ready[index] = Some(flow);
-                self.bounded_sync.wait_for_pool(
-                    &self.net_tx,
-                    &mut self.next_token,
-                    room,
-                    peer,
-                    PoolWait {
-                        gate,
-                        work: AdmissionWork { root, lane },
-                    },
-                    flow_state_wake,
-                );
+                if let Some(ticket) =
+                    state_job.flow_wait_ticket(room, peer, retirement_request, instance)
+                {
+                    self.bounded_sync.wait_for_pool(
+                        &self.net_tx,
+                        &mut self.next_token,
+                        room,
+                        peer,
+                        PoolWait {
+                            gate,
+                            work: AdmissionWork { root, lane },
+                        },
+                        ticket,
+                    );
+                }
                 return false;
             }
         }
@@ -2700,6 +2718,12 @@ impl Controller {
     /// must be able to see it.
     pub(super) fn lanes_json(&self) -> String {
         use crate::node::link::b32_encode;
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
         let retirement_errors = self
             .retirement_ledger
             .errors
@@ -2710,12 +2734,11 @@ impl Controller {
             .iter()
             .map(|(key, error)| {
                 format!(
-                    "{{\"actor\":{},\"request\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{},\"error\":{}}}",
+                    "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{},\"error\":{}}}",
                     key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
-                    key.request
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>(),
+                    hex(&key.request),
+                    hex(&key.instance),
+                    b32_encode(&key.generation),
                     b32_encode(&key.room),
                     b32_encode(&key.peer),
                     key.archive,
@@ -2725,8 +2748,13 @@ impl Controller {
             .collect::<Vec<_>>();
         let cleanup_error = retirement_errors.values().next().cloned();
         let flow = |f: &Flow| {
+            let key = retirement_key(f);
             format!(
-                "{{\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
+                "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
+                key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
+                hex(&key.request),
+                hex(&key.instance),
+                b32_encode(&key.generation),
                 b32_encode(&f.room),
                 b32_encode(&f.peer),
                 f.root_name(),
@@ -2749,7 +2777,11 @@ impl Controller {
                     || "null".to_owned(),
                     |r| {
                         format!(
-                            "{{\"room\":\"{}\",\"peer\":\"{}\",\"token\":{},\"archive\":{},\"lane\":\"{}\",\"age_ms\":{},\"finished\":{}}}",
+                            "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"token\":{},\"archive\":{},\"lane\":\"{}\",\"age_ms\":{},\"finished\":{}}}",
+                            r.retirement_key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
+                            hex(&r.retirement_key.request),
+                            hex(&r.retirement_key.instance),
+                            b32_encode(&r.retirement_key.generation),
                             b32_encode(&r.room),
                             b32_encode(&r.peer),
                             r.token,
@@ -2762,13 +2794,40 @@ impl Controller {
                 )
             })
             .collect();
+        let deferred = self.deferred.iter().map(flow).collect::<Vec<_>>();
+        let retiring = self.retiring.iter().map(flow).collect::<Vec<_>>();
+        let required = self.required.iter().map(|required| {
+            format!(
+                "{{\"request\":\"{}\",\"instance\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"head\":\"{}\",\"seq\":{}}}",
+                hex(&required.request),
+                hex(&required.instance),
+                b32_encode(&required.room),
+                b32_encode(&required.peer),
+                b32_encode(&required.head),
+                required.seq
+            )
+        }).collect::<Vec<_>>();
+        let cleanup = self.cleanup.as_ref().map_or_else(|| "null".to_owned(), |cleanup| {
+            let key = cleanup.key;
+            format!(
+                "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"archive\":{}}}",
+                key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
+                hex(&key.request),
+                hex(&key.instance),
+                b32_encode(&key.generation),
+                b32_encode(&key.room),
+                b32_encode(&key.peer),
+                key.archive
+            )
+        });
         let admission = |gate: &str,
                          token: u64,
                          room: Digest32,
                          peer: Digest32,
                          root: &str,
                          lane: crate::node::history_budget::Lane,
-                         request: Option<stream::RequestId>| {
+                         request: Option<stream::RequestId>,
+                         wait_order: Option<u64>| {
             let request = request.map_or_else(
                 || "null".to_owned(),
                 |request| {
@@ -2782,14 +2841,15 @@ impl Controller {
                 },
             );
             format!(
-                "{{\"admission\":{},\"gate\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"request\":{}}}",
+                "{{\"admission\":{},\"gate\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"request\":{},\"wait_order\":{}}}",
                 token,
                 gate,
                 b32_encode(&room),
                 b32_encode(&peer),
                 root,
                 lane_name(lane),
-                request
+                request,
+                wait_order.map_or_else(|| "null".to_owned(), |order| order.to_string())
             )
         };
         let mut admissions = Vec::new();
@@ -2802,6 +2862,7 @@ impl Controller {
                 "archive",
                 crate::node::history_budget::Lane::Archive,
                 Some(waiting.request),
+                None,
             ));
         }
         admissions.extend(self.foreground_admission.iter().flatten().map(|waiting| {
@@ -2812,6 +2873,7 @@ impl Controller {
                 waiting.peer,
                 waiting.root,
                 waiting.lane,
+                None,
                 None,
             )
         }));
@@ -2824,6 +2886,7 @@ impl Controller {
                 waiting.root,
                 waiting.lane,
                 None,
+                None,
             )
         }));
         admissions.extend(self.secret_admission.iter().map(|((room, peer), waiting)| {
@@ -2834,6 +2897,7 @@ impl Controller {
                 *peer,
                 waiting.root,
                 waiting.lane,
+                None,
                 None,
             )
         }));
@@ -2846,6 +2910,7 @@ impl Controller {
                 waiting.root,
                 waiting.lane,
                 None,
+                None,
             )
         }));
         admissions.extend(self.pool_admission.iter().map(|((room, peer), waiting)| {
@@ -2857,15 +2922,16 @@ impl Controller {
                 waiting.root,
                 waiting.lane,
                 None,
+                Some(waiting.ticket.sequence()),
             )
         }));
         format!(
-            "{{\"ready\":[{}],\"running\":[{}],\"deferred\":{},\"retiring\":{},\"required\":{},\"admissions\":[{}],\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"pool_admissions\":{},\"cleanup\":{},\"cleanup_error\":{},\"cleanup_errors\":[{}]}}",
+            "{{\"ready\":[{}],\"running\":[{}],\"deferred\":[{}],\"retiring\":[{}],\"required\":[{}],\"admissions\":[{}],\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"pool_admissions\":{},\"cleanup\":{},\"cleanup_error\":{},\"cleanup_errors\":[{}]}}",
             ready.join(","),
             running.join(","),
-            self.deferred.len(),
-            self.retiring.len(),
-            self.required.len(),
+            deferred.join(","),
+            retiring.join(","),
+            required.join(","),
             admissions.join(","),
             self.archive_admission.is_some(),
             self.foreground_admission.iter().flatten().count(),
@@ -2873,7 +2939,7 @@ impl Controller {
             self.secret_admission.len(),
             self.byte_admission.len(),
             self.pool_admission.len(),
-            self.cleanup.is_some(),
+            cleanup,
             serde_json::to_string(&cleanup_error).unwrap_or_else(|_| "null".to_owned()),
             cleanup_errors.join(",")
         )

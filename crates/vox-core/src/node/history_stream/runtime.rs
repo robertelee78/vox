@@ -494,12 +494,6 @@ impl Flow {
         job.bytes_wake()
     }
 
-    pub(crate) fn flow_state_wake(
-        job: &Job,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        job.flow_state_wake()
-    }
-
     /// Reserve the flow state as the round begins, its bytes already held: the last gate before
     /// running, so a held charge always belongs to a running round. [`Resumed::NodeBusy`] when
     /// this fingerprint's current and retiring generations already hold its source-owned slots;
@@ -509,11 +503,19 @@ impl Flow {
         &mut self,
         job: &Job,
         bytes: crate::node::history_budget::BufferCharge,
+        waiter: Option<&mut crate::node::history_budget::FlowWaitTicket>,
     ) -> Resumed {
         if self.state_charge.is_some() {
             return Resumed::Held;
         }
-        match job.reserve_flow_state(self.room, self.peer, bytes) {
+        match job.reserve_flow_state(
+            self.room,
+            self.peer,
+            self.retirement_request,
+            self.instance,
+            bytes,
+            waiter,
+        ) {
             crate::node::history_budget::FlowStateTry::Reserved(charge) => {
                 self.state_charge = Some(charge);
                 Resumed::Held

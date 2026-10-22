@@ -10362,7 +10362,7 @@ impl Node {
                 }
             }
             NetEvent::BoundedFlowStateReady { token, room, peer } => {
-                if self.bounded_sync.release_pool_admission(token, room, peer)
+                if self.bounded_sync.pool_admission_ready(token, room, peer)
                     && self.port_eligible(&(room, peer), std::time::Instant::now())
                 {
                     self.sched_rooms.insert(room);
@@ -14966,10 +14966,6 @@ impl Node {
             u64::try_from(now.saturating_duration_since(t).as_millis()).unwrap_or(u64::MAX)
         };
         let (in_use, per_peer) = crate::node::ports::Slots::snapshot(&self.slots);
-        let actor_incarnation = self
-            .flow_pool_registration
-            .as_ref()
-            .map(crate::node::history_budget::FlowPoolRegistration::actor_incarnation);
         let per_peer: Vec<String> = per_peer
             .iter()
             .map(|(p, n)| format!("\"{}\":{n}", b32_encode(p)))
@@ -15003,8 +14999,22 @@ impl Node {
                         }
                     },
                 );
+                let round_owners = me.map_or_else(Vec::new, |me| {
+                    b.flow_state_running
+                        .iter()
+                        .filter(|owner| {
+                            owner.node == me && owner.room == *room && owner.peer == *peer
+                        })
+                        .map(|owner| format!(
+                            "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\"}}",
+                            owner.actor,
+                            owner.request.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                            owner.instance.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                        ))
+                        .collect::<Vec<_>>()
+                });
                 format!(
-                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},{}}}",
+                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],{}}}",
                     b32_encode(room),
                     b32_encode(peer),
                     port.needs(),
@@ -15016,16 +15026,14 @@ impl Node {
                     port.backing_off(now),
                     self.publishing.contains(&(*room, *peer)),
                     connected,
-                    actor_incarnation.zip(me).is_some_and(|(actor, me)| {
-                        b.flow_state_running
-                            .contains(&(actor, me, *room, *peer))
-                    }),
+                    !round_owners.is_empty(),
+                    round_owners.join(","),
                     last
                 )
             })
             .collect();
         format!(
-            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"actors\":[{}],\"running\":[{}],\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
+            "{{\"slots\":{{\"in_use\":{in_use},\"limit\":{},\"per_peer\":{{{}}}}},\"budget\":{{\"archive_nodes\":[{}],\"archive_jobs\":{},\"control\":{},\"foreground\":{},\"foreground_jobs\":{},\"queued\":[{},{},{},{}],\"flow_state\":{{\"in_use\":{},\"limit\":{},\"by_node\":{{{}}},\"actors\":[{}],\"running\":[{}],\"waiting\":[{}],\"retiring_nodes\":[{}]}}}},\"bounded\":{},\"history\":{},\"next_request_in_ms\":{},\"ports\":[{}]}}",
             crate::node::ports::OUTBOUND_SLOTS,
             per_peer.join(","),
             archive_nodes.join(","),
@@ -15054,11 +15062,26 @@ impl Node {
                 .join(","),
             b.flow_state_running
                 .iter()
-                .map(|(actor, node, room, peer)| format!(
-                    "{{\"actor\":{actor},\"node\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\"}}",
+                .map(|owner| format!(
+                    "{{\"actor\":{},\"node\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"request\":\"{}\",\"instance\":\"{}\"}}",
+                    owner.actor,
+                    b32_encode(&owner.node),
+                    b32_encode(&owner.room),
+                    b32_encode(&owner.peer),
+                    owner.request.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                    owner.instance.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+                .join(","),
+            b.flow_state_waiting
+                .iter()
+                .map(|(order, actor, node, room, peer, request, instance, granted)| format!(
+                    "{{\"order\":{order},\"actor\":{actor},\"node\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"request\":\"{}\",\"instance\":\"{}\",\"granted\":{granted}}}",
                     b32_encode(node),
                     b32_encode(room),
-                    b32_encode(peer)
+                    b32_encode(peer),
+                    request.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                    instance.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
                 ))
                 .collect::<Vec<_>>()
                 .join(","),

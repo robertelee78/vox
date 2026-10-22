@@ -244,9 +244,6 @@ pub struct Budget {
     control_bytes: AtomicUsize,
     /// The daemon's flow-state pool, one record under one lock (ADR-038 FX-35).
     pool: Mutex<Pool>,
-    /// Exact running-charge releases. A pool waiter subscribes before attempting its
-    /// reservation, so replacement/retirement cannot lose the wake.
-    flow_changed: Arc<Notify>,
     /// Owed retirement ownership belongs to the daemon, not one actor incarnation. An actor
     /// panic therefore cannot lose a Flow or its visible failure, and a replacement resumes the
     /// same exact request.
@@ -448,12 +445,39 @@ impl Job {
         self.0.flow_owner
     }
 
-    pub(crate) fn flow_state_wake(
+    /// Record one exact retained Flow after the impossible pool/source-slot refusal. Enrollment
+    /// and an immediately available grant happen under the pool lock, so a release between the
+    /// failed reservation and this call cannot be lost.
+    pub(crate) fn flow_wait_ticket(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let mut wake = Box::pin(Arc::clone(&self.0.budget.flow_changed).notified_owned());
-        wake.as_mut().enable();
-        wake
+        room: Digest32,
+        peer: Digest32,
+        request: [u8; 16],
+        instance: [u8; 16],
+    ) -> Option<FlowWaitTicket> {
+        let owner = self.0.flow_owner?;
+        let budget = Arc::clone(&self.0.budget);
+        let mut pool = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        let node = pool.owners.get(&owner)?.node;
+        let mut id = pool.next_waiter.wrapping_add(1);
+        while pool.waiters.iter().any(|waiting| waiting.id == id) {
+            id = id.wrapping_add(1);
+        }
+        pool.next_waiter = id;
+        pool.waiters.push_back(FlowWaiter {
+            id,
+            owner,
+            node,
+            room,
+            peer,
+            request,
+            instance,
+            granted: false,
+            wake: Arc::new(Notify::new()),
+        });
+        pool.grant_waiters();
+        drop(pool);
+        Some(FlowWaitTicket { budget, id })
     }
 
     /// Subscribe before a shared byte reservation attempt so its exact release cannot be lost.
@@ -521,17 +545,30 @@ impl Job {
         &self,
         room: Digest32,
         peer: Digest32,
+        request: [u8; 16],
+        instance: [u8; 16],
         bytes: BufferCharge,
+        waiter: Option<&mut FlowWaitTicket>,
     ) -> FlowStateTry {
         let budget = Arc::clone(&self.0.budget);
         let mut p = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(owner) = self.0.flow_owner else {
             return FlowStateTry::PoolFull;
         };
-        let key = (owner, self.0.node, room, peer);
+        let key = FlowStateOwner {
+            actor: owner,
+            node: self.0.node,
+            room,
+            peer,
+            request,
+            instance,
+        };
         let Some(node) = p.owners.get(&owner).map(|owner| owner.node) else {
             return FlowStateTry::PoolFull;
         };
+        let granted = waiter.as_ref().is_some_and(|waiter| {
+            waiter.take_grant_locked(&mut p, owner, room, peer, request, instance)
+        });
         // Actor replacement does not create a second pair of bounded slots for one hosted
         // fingerprint. Retiring and current generations share the same source-owned slot count;
         // the old charge's exact Drop wakes the replacement without a tick or elapsed escape.
@@ -541,10 +578,16 @@ impl Job {
             .filter(|pool_owner| pool_owner.node == node)
             .map(|pool_owner| pool_owner.charges)
             .sum();
-        if node_in_use >= BOUNDED_SYNC_RUNNING_SLOTS {
+        let promised_for_node = p
+            .waiters
+            .iter()
+            .filter(|waiting| waiting.granted && waiting.node == node)
+            .count();
+        if !granted && node_in_use + promised_for_node >= BOUNDED_SYNC_RUNNING_SLOTS {
             return FlowStateTry::NodeBusy;
         }
-        if p.in_use >= p.limit {
+        let promised = p.waiters.iter().filter(|waiting| waiting.granted).count();
+        if !granted && p.in_use + promised >= p.limit {
             return FlowStateTry::PoolFull;
         }
         let Some(pool_owner) = p.owners.get_mut(&owner) else {
@@ -805,19 +848,47 @@ struct Pool {
     in_use: usize,
     /// A port can run its live and archive slots together, so retain multiplicity here while
     /// status needs only the key to say that the port has a running round.
-    running: BTreeMap<(u64, Digest32, Digest32, Digest32), usize>,
+    running: BTreeMap<FlowStateOwner, usize>,
     next_owner: u64,
     /// The current actor generation for each hosted fingerprint.
     active: BTreeMap<Digest32, u64>,
     /// Active and retiring actor generations. A replacement with the same fingerprint gets its
     /// own owner for exact attribution, but both generations count as one hosted node.
     owners: BTreeMap<u64, PoolOwner>,
+    /// Impossible-path continuations, ordered by the admission failure that retained their exact
+    /// Flow. A granted row is not a charge: it is a release-edge claim which prevents a later
+    /// contender taking that capacity before the selected continuation resumes.
+    waiters: VecDeque<FlowWaiter>,
+    next_waiter: u64,
+}
+
+struct FlowWaiter {
+    id: u64,
+    owner: u64,
+    node: Digest32,
+    room: Digest32,
+    peer: Digest32,
+    request: [u8; 16],
+    instance: [u8; 16],
+    granted: bool,
+    wake: Arc<Notify>,
 }
 
 struct PoolOwner {
     node: Digest32,
     registered: bool,
     charges: usize,
+}
+
+/// Exact running-round ownership published in the same pool snapshot as its charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FlowStateOwner {
+    pub(crate) actor: u64,
+    pub(crate) node: Digest32,
+    pub(crate) room: Digest32,
+    pub(crate) peer: Digest32,
+    pub(crate) request: [u8; 16],
+    pub(crate) instance: [u8; 16],
 }
 
 impl Default for Pool {
@@ -829,6 +900,8 @@ impl Default for Pool {
             next_owner: 0,
             active: BTreeMap::new(),
             owners: BTreeMap::new(),
+            waiters: VecDeque::new(),
+            next_waiter: 0,
         }
     }
 }
@@ -845,6 +918,120 @@ impl Pool {
             .collect::<BTreeSet<_>>()
             .len();
         self.limit = FLOW_STATE_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * hosted);
+        self.grant_waiters();
+    }
+
+    /// Select the earliest continuation which can use a daemon charge and one of its node's two
+    /// source-owned running slots. Grants are counted ahead of new contenders until consumed or
+    /// cancelled, making release ownership monotonic rather than a Notify race.
+    fn grant_waiters(&mut self) {
+        loop {
+            let promised = self
+                .waiters
+                .iter()
+                .filter(|waiting| waiting.granted)
+                .count();
+            if self.in_use + promised >= self.limit {
+                return;
+            }
+            let at = self.waiters.iter().position(|waiting| {
+                if waiting.granted || !self.owners.contains_key(&waiting.owner) {
+                    return false;
+                }
+                let in_use: usize = self
+                    .owners
+                    .values()
+                    .filter(|owner| owner.node == waiting.node)
+                    .map(|owner| owner.charges)
+                    .sum();
+                let promised = self
+                    .waiters
+                    .iter()
+                    .filter(|candidate| candidate.granted && candidate.node == waiting.node)
+                    .count();
+                in_use + promised < BOUNDED_SYNC_RUNNING_SLOTS
+            });
+            let Some(at) = at else { return };
+            let waiting = &mut self.waiters[at];
+            waiting.granted = true;
+            waiting.wake.notify_one();
+        }
+    }
+}
+
+/// Exact ownership of an impossible flow-state admission wait. It retains no worker, bytes,
+/// outbound slot or flow-state charge. Dropping it removes ineligible work immediately and, when
+/// it owned a release-edge grant, passes that grant to the next earliest eligible continuation.
+pub(crate) struct FlowWaitTicket {
+    budget: Arc<Budget>,
+    id: u64,
+}
+
+impl FlowWaitTicket {
+    pub(crate) fn wake(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let wake = self
+            .budget
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiters
+            .iter()
+            .find(|waiting| waiting.id == self.id)
+            .map(|waiting| Arc::clone(&waiting.wake));
+        let Some(wake) = wake else {
+            // Actor replacement/cancellation may retire the exact owner between enrollment and
+            // spawning its waiter. Do not leave that actor task asleep on an unrelated, private
+            // Notify; let it report the now-stale token and retire normally.
+            return Box::pin(std::future::ready(()));
+        };
+        let mut future = Box::pin(wake.notified_owned());
+        future.as_mut().enable();
+        future
+    }
+
+    fn take_grant_locked(
+        &self,
+        pool: &mut Pool,
+        owner: u64,
+        room: Digest32,
+        peer: Digest32,
+        request: [u8; 16],
+        instance: [u8; 16],
+    ) -> bool {
+        let Some(at) = pool
+            .waiters
+            .iter()
+            .position(|waiting| waiting.id == self.id)
+        else {
+            return false;
+        };
+        if !pool.waiters[at].granted
+            || pool.waiters[at].owner != owner
+            || pool.waiters[at].room != room
+            || pool.waiters[at].peer != peer
+            || pool.waiters[at].request != request
+            || pool.waiters[at].instance != instance
+        {
+            return false;
+        }
+        pool.waiters.remove(at);
+        true
+    }
+
+    pub(crate) fn sequence(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for FlowWaitTicket {
+    fn drop(&mut self) {
+        let mut pool = self
+            .budget
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        pool.waiters.retain(|waiting| waiting.id != self.id);
+        pool.grant_waiters();
     }
 }
 
@@ -855,12 +1042,6 @@ pub(crate) struct FlowPoolRegistration {
     budget: Arc<Budget>,
     node: Digest32,
     owner: u64,
-}
-
-impl FlowPoolRegistration {
-    pub(crate) fn actor_incarnation(&self) -> u64 {
-        self.owner
-    }
 }
 
 impl Drop for FlowPoolRegistration {
@@ -876,6 +1057,7 @@ impl Drop for FlowPoolRegistration {
         if let Some(owner) = p.owners.get_mut(&self.owner) {
             owner.registered = false;
         }
+        p.waiters.retain(|waiting| waiting.owner != self.owner);
         if p.owners
             .get(&self.owner)
             .is_some_and(|owner| owner.charges == 0)
@@ -904,7 +1086,7 @@ pub(crate) enum FlowStateTry {
 /// go back first, then the pool is told.
 pub(crate) struct FlowStateCharge {
     budget: Arc<Budget>,
-    key: (u64, Digest32, Digest32, Digest32),
+    key: FlowStateOwner,
     owner: u64,
     charge: Option<BufferCharge>,
 }
@@ -933,8 +1115,6 @@ impl Drop for FlowStateCharge {
             p.owners.remove(&self.owner);
         }
         p.resize();
-        drop(p);
-        self.budget.flow_changed.notify_waiters();
     }
 }
 
@@ -965,7 +1145,18 @@ pub struct BudgetSnapshot {
     /// Nodes whose actor registration ended while a running charge was still returning.
     pub flow_state_retiring_nodes: Vec<Digest32>,
     /// The running rounds holding a flow state (node, room, peer), from the same view.
-    pub flow_state_running: Vec<(u64, Digest32, Digest32, Digest32)>,
+    pub flow_state_running: Vec<FlowStateOwner>,
+    /// Exact retained impossible-path continuations in monotonic enrollment order.
+    pub flow_state_waiting: Vec<(
+        u64,
+        u64,
+        Digest32,
+        Digest32,
+        Digest32,
+        [u8; 16],
+        [u8; 16],
+        bool,
+    )>,
 }
 
 impl Budget {
@@ -978,10 +1169,14 @@ impl Budget {
             owner = owner.wrapping_add(1);
         }
         p.next_owner = owner;
-        if let Some(replaced) = p.active.insert(node, owner) {
-            if let Some(replaced) = p.owners.get_mut(&replaced) {
+        if let Some(replaced_owner) = p.active.insert(node, owner) {
+            if let Some(replaced) = p.owners.get_mut(&replaced_owner) {
                 replaced.registered = false;
             }
+            // The replacement owns new work for this fingerprint. An old generation may keep
+            // an already-running charge until its task returns, but its parked continuations
+            // ceased to be eligible at replacement and must not consume a later release grant.
+            p.waiters.retain(|waiting| waiting.owner != replaced_owner);
         }
         p.owners.insert(
             owner,
@@ -1045,7 +1240,27 @@ impl Budget {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
-            flow_state_running: p.running.keys().copied().collect(),
+            flow_state_running: p
+                .running
+                .iter()
+                .flat_map(|(owner, count)| std::iter::repeat(*owner).take(*count))
+                .collect(),
+            flow_state_waiting: p
+                .waiters
+                .iter()
+                .map(|waiting| {
+                    (
+                        waiting.id,
+                        waiting.owner,
+                        waiting.node,
+                        waiting.room,
+                        waiting.peer,
+                        waiting.request,
+                        waiting.instance,
+                        waiting.granted,
+                    )
+                })
+                .collect(),
         }
     }
 }
