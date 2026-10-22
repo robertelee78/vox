@@ -3148,26 +3148,60 @@ impl Management {
         else {
             return;
         };
-        let ready = lock(&self.retry_ready).clone();
-        if ready.is_empty() {
+        if !std::path::Path::new(arm).is_file() {
             return;
         }
-        let inflight = lock(&self.inflight).len();
-        let sole = (ready.len() == 1)
-            .then(|| ready.iter().next().map(|(peer, mark)| (*peer, *mark)))
-            .flatten();
-        let exact = (inflight == 0)
-            .then_some(sole)
-            .flatten()
-            .filter(|(peer, _)| {
-                lock(&self.exchanged)
-                    .get(peer)
-                    .is_none_or(|record| record.failures == 0 && record.deadline.is_none())
-            });
-        let Some((peer, _)) = exact else {
+        let peer = loop {
+            // Register before inspecting the reservation: `Attempt::drop` removes the exact
+            // superseded flight and then notifies. Enabling first preserves that release edge if
+            // it races this inspection, without a sleep or a second deadline.
+            let released = self.retry_wake.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            let ready = lock(&self.retry_ready).clone();
+            if ready.is_empty() {
+                return;
+            }
+            let sole = (ready.len() == 1)
+                .then(|| ready.iter().next().map(|(peer, mark)| (*peer, *mark)))
+                .flatten();
+            let (inflight, pending_supersession, retiring_source) = {
+                let flights = lock(&self.inflight);
+                let pending = sole.is_some_and(|(peer, mark)| {
+                    flights.len() == 1
+                        && flights.get(&peer).is_some_and(|flight| {
+                            !flight.superseded && flight.revision < mark.revision
+                        })
+                });
+                let retiring = sole.is_some_and(|(peer, _)| {
+                    flights.len() == 1 && flights.get(&peer).is_some_and(|flight| flight.superseded)
+                });
+                (flights.len(), pending, retiring)
+            };
+            if pending_supersession {
+                // This invocation is what will transfer the old flight's deadline and abort it
+                // in the production stale-flight pass below. Leave the arm intact and let that
+                // source-owned transition run; the release notification invokes this hook again.
+                return;
+            }
+            if retiring_source {
+                released.await;
+                continue;
+            }
+            let exact = (inflight == 0)
+                .then_some(sole)
+                .flatten()
+                .filter(|(peer, _)| {
+                    lock(&self.exchanged)
+                        .get(peer)
+                        .is_none_or(|record| record.failures == 0 && record.deadline.is_none())
+                });
+            if let Some((peer, _)) = exact {
+                break peer;
+            }
             if std::fs::remove_file(arm).is_ok() {
                 let detail = if inflight != 0 {
-                    format!("retry-ready still had {inflight} in-flight deadline source(s)")
+                    format!("retry-ready still had {inflight} non-retiring in-flight source(s)")
                 } else {
                     match sole {
                         None => format!(
