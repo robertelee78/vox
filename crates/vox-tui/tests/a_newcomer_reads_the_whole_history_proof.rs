@@ -478,7 +478,7 @@ const IDLE: Duration = Duration::from_secs(60);
 const HOSTED: [&str; 4] = ["robert", "claude", "codex", "opencode"];
 /// One live round per hosted node plus every daemon archive job exceeds the pool floor by one.
 /// This derives the required population from the product's two source-owned capacities.
-const FX35_HOSTED_COUNT: usize = vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY
+const FX35_HOSTED_COUNT: usize = vox_core::node::history_budget::FLOW_STATE_CAPACITY
     - vox_core::node::history_budget::ARCHIVE_JOBS
     + 1;
 const FX35_HOSTED: [&str; FX35_HOSTED_COUNT] = [
@@ -506,8 +506,6 @@ const ASK_EVERY: Duration = Duration::from_secs(5);
 /// this staging), the host's daemon moved 13.2 MB in and 13.2 MB out in the idle minute, about
 /// 200 KiB per allowed round: the idle re-pull of a sparse author's hint (ADR-038 FX-29).
 const ROUND_BYTES: u64 = 64 * 1024;
-const INVENTORY_REARM_WITHIN: Duration =
-    Duration::from_secs(2 * vox_core::node::syncstream::SYNC_INTERVAL_SECS);
 /// A fifth node hosted by the same daemon. It is trusted before anyone posts, but joins only
 /// after every holder has pruned those post bodies, leaving a real sparse history window.
 const SPARSE: &str = "late";
@@ -1589,7 +1587,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         let by_node = pool["by_node"]
             .as_object()
             .expect("PRODUCT: generation-accounting status omitted by_node");
-        let expected_limit = vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY
+        let expected_limit = vox_core::node::history_budget::FLOW_STATE_CAPACITY
             .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * staged.hosted)
             as u64;
         let actor_sum: u64 = pool["actors"]
@@ -1854,7 +1852,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     shown.status
                 );
                 pressure_staged = in_use
-                    > vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY as u64
+                    > vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64
                     || !full_ports.is_empty();
             }
             let bounded = &v["lanes"]["bounded"];
@@ -1889,7 +1887,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             }
             most_pressure = most_pressure.max(in_use);
         }
-        if most_pressure > vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY as u64 {
+        if most_pressure > vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64 {
             break most_pressure;
         }
         if Instant::now() >= pressure_snapshot_deadman {
@@ -2135,7 +2133,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                          ports have a round running"
                     ));
                 }
-                let expected_limit = vox_core::node::history_budget::FLOW_STATE_MIN_CAPACITY
+                let expected_limit = vox_core::node::history_budget::FLOW_STATE_CAPACITY
                     .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * keys.len())
                     as u64;
                 if l != expected_limit || in_use > l {
@@ -5238,5 +5236,3 @@ fn newcomer_reads_the_whole_history(
     drop(alice_daemon);
     (to_alice, to_bob)
 }
-
-

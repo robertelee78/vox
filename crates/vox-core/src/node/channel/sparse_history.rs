@@ -832,8 +832,7 @@ impl ChannelState {
             // Feed restoration is local accepted-header maintenance. Advance at most one
             // successor in this bounded turn, including while the exact staged body continues
             // through refill below.
-            let contiguous_pending =
-                self.advance_history_contiguous(store, committed, &author)?;
+            let contiguous_pending = self.advance_history_contiguous(store, committed, &author)?;
             if refill_pending {
                 return Ok(HistoryEffectProgress::RefillPending { governance: false });
             }

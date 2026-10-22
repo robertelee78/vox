@@ -509,7 +509,6 @@ impl Source {
         let peer = self.peer;
         let slice = hints.to_vec();
         let committed = Arc::clone(&self.work_committed);
-        let peer = self.peer;
         let output_envelope = 64
             * (std::mem::size_of::<super::HeadHint>()
                 + std::mem::size_of::<(Digest32, Digest32)>()
@@ -531,8 +530,6 @@ impl Source {
                 let read = room.history_read(store)?;
                 let mut missing = Vec::with_capacity(slice.len());
                 let mut changed = Vec::new();
-                let mut mine: Option<u64> = None;
-                let own_contiguous = room.own_verified_head();
                 for hint in slice {
                     if let Some((declined, authorization, peer_incarnation, author_incarnation)) =
                         read.history_declined_head(&peer, &hint.author)?
@@ -553,27 +550,16 @@ impl Source {
                         }
                     }
                     if hint.author == room.me() {
-                        // The peer names a head of this node's own feed that this node holds
-                        // and accepted: its word that it holds the feed through there.
-                        if let Some(adv) = read.history_head(&hint.head)? {
-                            if adv.binding.author == hint.author
-                                && adv.binding.scope == crate::log::history::LogScope::Public
-                                && adv.root.leaves == hint.size
-                                && read.history_head_accepted(&hint.head, adv.binding)?
-                            {
-                                mine = Some(mine.map_or(hint.size, |m| m.max(hint.size)));
-                                // The own feed is this node's durable fact (ADR-037 R5), and
-                                // R10 never visits the own live window, so the window test
-                                // below would keep every own-head echo as a probe forever:
-                                // a hinted round per peer per inventory that fetched
-                                // nothing. A known, accepted own head within the contiguous
-                                // own feed is held; only a longer own feed elsewhere stays a
-                                // probe, for the own-history conflict detector (R5).
-                                if hint.size <= own_contiguous {
-                                    continue;
-                                }
-                            }
+                        // Inventory is only an unauthoritative scalar hint. Even when its
+                        // signed head is already accepted locally, it does not prove the peer
+                        // completed every effect it owes through that position. Keep the hint
+                        // until Query::Head asks the peer for the authenticated role-complete
+                        // receipt. A previously recorded later receipt makes an older echo
+                        // redundant; no scalar echo itself may advance held_through.
+                        if room.held_through(&peer).is_none_or(|held| held < hint.size) {
+                            missing.push(hint);
                         }
+                        continue;
                     }
                     let state =
                         read.sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
@@ -641,14 +627,14 @@ impl Source {
                 for author in changed {
                     room.forget_history_decline(store, peer, author, &committed)?;
                 }
-                Ok(Some((missing, mine, rearmed)))
+                Ok(Some((missing, rearmed)))
             })
             .await?;
         match filtered {
             Lookup::Found(filtered) => {
-                let (missing, mine, rearmed) = filtered.value;
+                self.current()?;
+                let (missing, rearmed) = filtered.value;
                 let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
-                offer.mine_held = mine;
                 offer.rearmed = rearmed;
                 Ok(offer)
             }
@@ -660,4 +646,3 @@ impl Source {
         }
     }
 }
-
