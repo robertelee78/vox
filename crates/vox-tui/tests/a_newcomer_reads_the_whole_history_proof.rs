@@ -651,15 +651,36 @@ fn first_sparse_arrivals(
     alice: &Path,
     bob: &Path,
     room: &str,
+    outcome: &Path,
+    alice_hash: &str,
     limit: Duration,
 ) -> (Option<Duration>, Option<Duration>) {
-    let (mut to_alice, mut to_bob) = (None, None);
-    while (to_alice.is_none() || to_bob.is_none()) && since.elapsed() < limit {
+    let recorded = loop {
+        match std::fs::read_to_string(outcome) {
+            Ok(recorded) => break recorded,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!(
+                "APPARATUS: could not read Bob's exact sparse-Content outcome marker {}: {error}",
+                outcome.display()
+            ),
+        }
+    };
+    let accepted = format!("accepted:{alice_hash}");
+    let refused = format!("refused:{alice_hash}");
+    assert!(
+        recorded == accepted || recorded == refused,
+        "APPARATUS: Bob's first sparse-Content outcome marker did not bind Alice's exact accepted entry {alice_hash}: {recorded:?}"
+    );
+    eprintln!(
+        "[proof] FX-29 sparse Content publication apparatus staged: Bob processed Alice's exact accepted entry {alice_hash} with outcome {recorded}"
+    );
+    let to_bob = reads_first_sparse_content(bob, room, "post 1").then(|| since.elapsed());
+    let mut to_alice = None;
+    while to_alice.is_none() && since.elapsed() < limit {
         if to_alice.is_none() && reads(alice, room, "bob is here") {
             to_alice = Some(since.elapsed());
-        }
-        if to_bob.is_none() && reads_first_sparse_content(bob, room, "post 1") {
-            to_bob = Some(since.elapsed());
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -2890,6 +2911,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
         "VOX_TEST_FOREGROUND_JOBS",
         "VOX_TEST_FX29_MUTANT",
+        "VOX_TEST_FX29_CONTENT_OUTCOME_FILE",
     ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -2949,6 +2971,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         .to_str()
         .expect("APPARATUS: a UTF-8 durable-body marker path")
         .to_owned();
+    let sparse_content_outcome = root.join("fx29-sparse-content-outcome");
+    let sparse_content_outcome_path = sparse_content_outcome
+        .to_str()
+        .expect("APPARATUS: a UTF-8 sparse-Content outcome marker path")
+        .to_owned();
     let alice_daemon = daemon_env(&alice, "alice", &alice_knob);
     attached(&alice, "alice");
     let (ok, _, err) = vox(
@@ -2973,7 +3000,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
     assert!(ok, "PRODUCT: `vox room link` failed: {err}");
     let link = link.trim().to_owned();
-    let bob_daemon = daemon(&bob, "bob");
+    let bob_knob = [(
+        "VOX_TEST_FX29_CONTENT_OUTCOME_FILE",
+        sparse_content_outcome_path.as_str(),
+    )];
+    let bob_daemon = daemon_env(&bob, "bob", &bob_knob);
     attached(&bob, "bob");
     let (ok, _, err) = vox(
         &bob,
@@ -2981,21 +3012,35 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let joined = Instant::now();
+    let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
+    assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
     eprintln!(
         "[proof] FX-29 sparse control publication apparatus staged: Bob joined room {room} before Alice's next shipped post"
     );
-    let joined = Instant::now();
-    let (ok, out, err) = vox(&alice, &["room", "post", &room, "post 1"], None);
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, "--json", "post 1"], None);
     assert!(
         ok,
         "PRODUCT [FX29 sparse-control-publication]: Alice's post after Bob joined was refused: {out}{err}"
     );
-    let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
-    assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
-    eprintln!(
-        "[proof] FX-29 sparse Content publication apparatus staged: Alice's exact post 1 and Bob's own first post were accepted after Bob joined room {room}"
+    let posted: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|error| {
+        panic!("PRODUCT: Alice's `vox room post --json` response was not JSON: {error}: {out}")
+    });
+    let alice_post_hash = posted["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: Alice's `vox room post --json` named no exact entry hash: {out}")
+        })
+        .to_owned();
+    let (to_alice, to_bob) = first_sparse_arrivals(
+        joined,
+        &alice,
+        &bob,
+        &room,
+        &sparse_content_outcome,
+        &alice_post_hash,
+        BOUND,
     );
-    let (to_alice, to_bob) = first_sparse_arrivals(joined, &alice, &bob, &room, BOUND);
     assert!(
         to_alice.is_some() && to_bob.is_some(),
         "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \

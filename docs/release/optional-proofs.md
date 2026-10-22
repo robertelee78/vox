@@ -182,6 +182,13 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 `VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE=<path>`: while that marker exists, the first authenticated key-package request by a non-recipient is answered with one hostile body frame, then the marker is renamed with `.engaged` appended. The quiet-room proof uses this only on the source daemon to prove a real receiving `vox` refuses the unexpected ciphertext before persistence. Same `test-knobs` rule.
 
+`VOX_TEST_FX29_CONTENT_OUTCOME_FILE=<path>`: the first sparse Content effect on that daemon
+creates the marker once with `accepted:<entry-hash>` after its transaction and visible projection
+complete, or `refused:<entry-hash>` after the room records the effect failure. The quiet-room proof
+matches Alice's hash, then performs exactly one shipped Bob read for the Content publication
+verdict. The marker is causal apparatus only and the exact read is the PRODUCT verdict. Same
+`test-knobs` rule.
+
 The isolated FX-29 mutants are
 `VOX_TEST_WATCHDOG_SECS=<operator-deadman> scripts/run-fx29-mutant.sh drop-resume-owed` and the
 same command with `finish-control-after-effect` or `track-content-through-settled-index`. The first
@@ -189,9 +196,9 @@ removes only the `ResumeOwed` installation after the causally staged stale archi
 second restores the merge bug that tries to apply a sparse Presence before its position is
 semantically published; the third makes sparse Content retention rediscover the entry only through
 the still-unsettled public index instead of using the transaction's exact authenticated entry. The
-Content verdict is attached only to Bob's first read of Alice's exact accepted post after Bob's
-own first post is accepted; later reads retain their own claims. The runner accepts only each exact
-named PRODUCT verdict after its exact staging line. Its
+Content verdict is attached only to one Bob read after the outcome marker binds Alice's exact
+accepted entry hash; later reads retain their own claims. The runner accepts only each exact named
+PRODUCT verdict after its exact staging line. Its
 transcript is written under `target/fx29-mutants/`. The required positive deadman is chosen by the
 operator for that machine and only turns a whole-proof wedge into APPARATUS; elapsed time never
 decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a release gate.

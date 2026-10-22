@@ -322,7 +322,9 @@ The decider then answered twelve questions, one at a time. His answers are the d
   pretending it was settled. They preserve the source publication's sealed earliest first-seen
   fact across every deferred retry and restart. A deferred or unavailable body therefore commits
   neither a false receipt nor a public effect marker, and cannot extend its retention lifetime by
-  retrying.
+  retrying. The shipped proof binds its Content verdict to one exact accepted entry hash observed
+  at Bob's effect outcome and then performs one `vox room read`; a polling read may not relabel a
+  later unrelated refusal as this defect.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
   power loss: a node's own entries, consent, trust, keys, Session records and the format marker
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person

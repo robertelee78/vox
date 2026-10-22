@@ -781,6 +781,9 @@ impl FinishedHistoryEffect {
     }
 }
 
+#[cfg(feature = "test-knobs")]
+const TEST_FX29_CONTENT_OUTCOME_ENV: &str = "VOX_TEST_FX29_CONTENT_OUTCOME_FILE";
+
 #[derive(Clone, Copy)]
 pub(crate) struct HistoryEffectCursor {
     hash: Digest32,
@@ -809,6 +812,45 @@ pub(crate) enum HistoryEffectProgress {
 }
 
 impl ChannelState {
+    #[cfg(feature = "test-knobs")]
+    fn record_fx29_content_outcome(&self, hash: &Digest32, accepted: bool) -> Result<()> {
+        use std::io::Write as _;
+
+        let Some(path) = std::env::var_os(TEST_FX29_CONTENT_OUTCOME_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            return Ok(());
+        };
+        if path.exists() {
+            return Ok(());
+        }
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(".writing");
+        let temporary: std::path::PathBuf = temporary.into();
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(_) => {
+                return Err(Error::Profile(
+                    "test sparse-Content outcome marker could not be created",
+                ))
+            }
+        };
+        let outcome = if accepted { "accepted" } else { "refused" };
+        write!(file, "{outcome}:{}", crate::node::link::b32_encode(hash)).map_err(|_| {
+            Error::Profile("test sparse-Content outcome marker could not be written")
+        })?;
+        drop(file);
+        std::fs::rename(&temporary, &path).map_err(|_| {
+            Error::Profile("test sparse-Content outcome marker could not be published")
+        })
+    }
+
     /// One signed-context coordinate per call. The caller retains only (hash,next), never
     /// a full context/map, and holds the shared read/verification envelope for this turn.
     #[allow(clippy::too_many_arguments)]
@@ -1112,6 +1154,10 @@ impl ChannelState {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     self.poison(&error);
+                    #[cfg(feature = "test-knobs")]
+                    if kind == SignedEntryKind::Content && entry.payload.is_some() {
+                        self.record_fx29_content_outcome(hash, false)?;
+                    }
                     return Err(error);
                 }
             };
@@ -1119,6 +1165,10 @@ impl ChannelState {
         if let Err(error) = self.note_contiguous_advance(entry.skeleton.author_id, contiguous) {
             self.poison(&error);
             return Err(error);
+        }
+        #[cfg(feature = "test-knobs")]
+        if kind == SignedEntryKind::Content && entry.payload.is_some() {
+            self.record_fx29_content_outcome(hash, true)?;
         }
         cursor.rendered |= rendered;
         if body_unavailable {
