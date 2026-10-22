@@ -9830,11 +9830,17 @@ impl Node {
                     // the pair's long-lived session from now, as it expects them, and that is said
                     // beside it. Its kept deliveries in sessions of their own are no use to it.
                     if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
-                        self.older.insert((channel_id, peer), false);
+                        if !crate::node::computer::fx28_mutant(
+                            "legacy-ended-unanswered-not-selected",
+                        ) {
+                            self.older.insert((channel_id, peer), false);
+                        }
                         self.deliveries
                             .retain(|(room, member, _), _| *room != channel_id || *member != peer);
                         self.delivery_reserved
                             .retain(|(room, member, _), _| *room != channel_id || *member != peer);
+                        #[cfg(feature = "test-knobs")]
+                        self.mark_ended_unanswered_for_proof(channel_id, peer);
                     }
                     if session.is_none()
                         && self
@@ -13479,18 +13485,23 @@ impl Node {
             .get(room)
             .map(Arc::clone)
             .ok_or(Error::Profile("room is not open"))?;
-        let result = shared
-            .lock()
-            .await
-            .withdraw_consent(profile, target, self.now_ms());
+        let mut channel = shared.lock().await;
+        let result = self
+            .with_current_computer_authority(|| {
+                channel.withdraw_consent(profile, target, self.now_ms())
+            })
+            .ok_or(Error::Profile(
+                "computer policy changed before the room mutation",
+            ))?;
         let generation = match result {
             Ok(Some(revocation)) => revocation.body.new_chain_id,
             Ok(None) => return Ok(()),
             Err(error) => {
-                shared.lock().await.poison(&error);
+                channel.poison(&error);
                 return Err(error);
             }
         };
+        drop(channel);
         self.deliveries
             .retain(|(r, peer, _), _| r != room || *peer != target);
         self.delivery_reserved
@@ -13803,6 +13814,26 @@ impl Node {
             else {
                 continue; // the entire batch remains owed; no key or ratchet was consumed
             };
+            let pair = (*channel_id, target);
+            let legacy_route = matches!(self.older.get(&pair), Some(false));
+            // The older-peer route seals into the pair's long-lived mutable ratchet before final
+            // queue admission. Snapshot every piece of that session registration before the
+            // await which may create it. If durable Computer authority rejects the batch, these
+            // exact pre-seal values are restored together, so retry neither burns another message
+            // index nor opens a second session/hello. Modern deliveries instead retain their
+            // exact sealed bytes in `deliveries`.
+            let legacy_before = legacy_route.then(|| {
+                (
+                    self.sessions
+                        .get(&pair)
+                        .map(crate::pairwise::session::Session::snapshot_for_unpublished_rollback),
+                    self.initiated.get(&pair).cloned(),
+                    self.accepted_hello.get(&pair).copied(),
+                    self.reopen.contains(&pair),
+                    self.session_serial.get(&pair).copied(),
+                    self.last_session_serial,
+                )
+            });
             let mut older = self.older_route(channel_id, target).await;
             let mut all_sent = true;
             let mut jobs = Vec::with_capacity(keys.len());
@@ -13867,8 +13898,51 @@ impl Node {
             };
             if !published {
                 // Preparation counted these exact frames as in flight. Since none reached its
-                // writer, unwind only those volatile counters; the durable obligation and sealed
-                // retry frame remain, ready for the reconciled actor to send under current policy.
+                // writer, unwind only those volatile counters. A modern delivery's exact sealed
+                // retry frame remains. The legacy route has no frame cache, so restore the exact
+                // pre-seal session registration atomically before any retry can run.
+                if let Some((session, initiated, accepted, reopened, serial, last_serial)) =
+                    legacy_before
+                {
+                    match session {
+                        Some(session) => {
+                            self.sessions.insert(pair, session);
+                        }
+                        None => {
+                            self.sessions.remove(&pair);
+                        }
+                    }
+                    match initiated {
+                        Some(initiated) => {
+                            self.initiated.insert(pair, initiated);
+                        }
+                        None => {
+                            self.initiated.remove(&pair);
+                        }
+                    }
+                    match accepted {
+                        Some(accepted) => {
+                            self.accepted_hello.insert(pair, accepted);
+                        }
+                        None => {
+                            self.accepted_hello.remove(&pair);
+                        }
+                    }
+                    if reopened {
+                        self.reopen.insert(pair);
+                    } else {
+                        self.reopen.remove(&pair);
+                    }
+                    match serial {
+                        Some(serial) => {
+                            self.session_serial.insert(pair, serial);
+                        }
+                        None => {
+                            self.session_serial.remove(&pair);
+                        }
+                    }
+                    self.last_session_serial = last_serial;
+                }
                 for _ in 0..watched {
                     self.key_landed(*channel_id, target);
                 }
@@ -17396,6 +17470,22 @@ impl Node {
             mut send,
             recv,
         } = stream;
+        #[cfg(feature = "test-knobs")]
+        if self.end_key_unanswered_for_proof(
+            peer,
+            match &first {
+                crate::node::pairwise_stream::PairwiseFrame::RotationHello {
+                    channel_id, ..
+                } => Some(*channel_id),
+                _ => None,
+            },
+        ) {
+            // Finish without reading/admitting or answering the key. The real sender's watcher
+            // owns classification of this structural EOF as `ENDED_UNANSWERED`.
+            let _recv = recv;
+            let _ = send.finish();
+            return;
+        }
         // **Taken, or said not to be.** A sender cannot learn from the transport whether its key
         // was taken: QUIC acknowledges the bytes before this node decides anything. So a stream
         // that carried a key is answered, one byte once the key is taken, and reset with a wire
@@ -18175,10 +18265,15 @@ impl Node {
         let now_ms = self.now_ms();
         // Offered and said to the room (V030-25) together: a share its members cannot list is
         // half a share.
-        if let Err(e) = channel
-            .add_service(profile.store(), profile, tag, endpoint, kind, true)
-            .and_then(|_| channel.say_share(profile, tag, true, now_ms))
-        {
+        let offered = self.with_current_computer_authority(|| {
+            channel
+                .add_service(profile.store(), profile, tag, endpoint, kind, true)
+                .and_then(|_| channel.say_share(profile, tag, true, now_ms))
+        });
+        let Some(offered) = offered else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        if let Err(e) = offered {
             // Drop the room rather than keep a half-made one. Nothing outside this
             // function has seen it: it is not in `self.channels` and has not been
             // published, so forgetting it here is the whole of the rollback.
@@ -19111,12 +19206,19 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
-            let written = ch.say_presence(profile, false, now_ms).map(|_| {
-                (
-                    ch.generation().load(std::sync::atomic::Ordering::Relaxed),
-                    ch.members().into_iter().all(|m| m == ch.me()),
-                )
-            });
+            let written = self
+                .with_current_computer_authority(|| {
+                    ch.say_presence(profile, false, now_ms).map(|_| {
+                        (
+                            ch.generation().load(std::sync::atomic::Ordering::Relaxed),
+                            ch.members().into_iter().all(|m| m == ch.me()),
+                        )
+                    })
+                })
+                .ok_or(Error::Profile(
+                    "computer policy changed before the room mutation",
+                ))
+                .and_then(|written| written);
             if written.is_ok() {
                 match detail_of(
                     &ch,
@@ -19415,7 +19517,11 @@ impl Node {
             if ch.ended((self.millis_clock)()).is_some() {
                 return Outcome::Failed(Fault::RoomEnded);
             }
-            if let Err(e) = ch.end(profile, now_ms) {
+            let ended = self.with_current_computer_authority(|| ch.end(profile, now_ms));
+            let Some(ended) = ended else {
+                return Outcome::Failed(Fault::ComputerPolicy);
+            };
+            if let Err(e) = ended {
                 // The faulty peer a board must not obey (V030-14's proof): it takes the room off
                 // boards though it may not end it.
                 #[cfg(feature = "mutant-sender")]
@@ -19462,10 +19568,15 @@ impl Node {
         {
             let mut ch = shared.lock().await;
             let done = if admin {
-                ch.add_admin(profile, member, now_ms).map(|_| ())
+                self.with_current_computer_authority(|| {
+                    ch.add_admin(profile, member, now_ms).map(|_| ())
+                })
             } else {
                 // The public command is held by begin_admin_removal across bounded turns.
                 return Outcome::Failed(Fault::Internal);
+            };
+            let Some(done) = done else {
+                return Outcome::Failed(Fault::ComputerPolicy);
             };
             if let Err(e) = done {
                 return Outcome::Failed(fault_of(&e));
@@ -19488,7 +19599,12 @@ impl Node {
         };
         {
             let mut ch = shared.lock().await;
-            if let Err(e) = ch.choose_idle_end(profile, idle_secs, now_ms) {
+            let chosen = self
+                .with_current_computer_authority(|| ch.choose_idle_end(profile, idle_secs, now_ms));
+            let Some(chosen) = chosen else {
+                return Outcome::Failed(Fault::ComputerPolicy);
+            };
+            if let Err(e) = chosen {
                 return Outcome::Failed(fault_of(&e));
             }
         }
@@ -19844,21 +19960,33 @@ impl Node {
                 self.offer_own_head(channel_id, own_hint, own_targets);
                 return;
             }
-            let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {
-                ch.settle_sparse(profile, now_ms)
-            } else {
-                if !matches!(ch.settle(profile.store()), Ok(true)) {
-                    return;
-                }
-                ch.catch_up_generation(profile, now_ms)
-                    .and_then(|_| ch.say_presence(profile, true, now_ms))
-            };
-            let back = settlement.map(|back| {
-                // Shares made while the room was unsettled are said now (V030-25). A share
-                // left unsaid is offered but unlisted, which is not worth failing the room.
-                let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
-                back || said
+            let settlement = self.with_current_computer_authority(|| {
+                let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {
+                    Some(ch.settle_sparse(profile, now_ms))
+                } else if matches!(ch.settle(profile.store()), Ok(true)) {
+                    Some(
+                        ch.catch_up_generation(profile, now_ms)
+                            .and_then(|_| ch.say_presence(profile, true, now_ms)),
+                    )
+                } else {
+                    None
+                };
+                settlement.map(|settlement| {
+                    settlement.map(|back| {
+                        // Shares made while the room was unsettled are said now (V030-25). A
+                        // share left unsaid is offered but unlisted, which is not worth failing
+                        // the room. It is part of the same authority-bearing write transaction.
+                        let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
+                        back || said
+                    })
+                })
             });
+            let Some(settlement) = settlement else {
+                return;
+            };
+            let Some(back) = settlement else {
+                return;
+            };
             (back, own_hint, own_targets)
         };
         match back {
@@ -19946,26 +20074,33 @@ impl Node {
         let now_ms = self.now_ms();
         let outcome = {
             let mut channel = shared.lock().await;
-            let outcome = channel
-                .add_service(profile.store(), profile, service_tag, local, kind, persist)
-                .and_then(|_| {
-                    // A share is said to the room so its members can list it (V030-25); a
-                    // transient offer — a file being handed over — is not a share. If it cannot
-                    // be said, the service is not offered either.
-                    if !persist {
-                        return Ok(());
-                    }
-                    // A room joined and not yet synced cannot be written to (V210-164): the share
-                    // is offered now and said when the room settles (`say_unsaid_shares`).
-                    match channel.say_share(profile, service_tag, true, now_ms) {
-                        Err(crate::error::Error::RoomNotSynced) => Ok(()),
-                        Err(e) => {
-                            let _ = channel.remove_service(profile.store(), service_tag);
-                            Err(e)
-                        }
-                        Ok(()) => Ok(()),
-                    }
-                });
+            let outcome = self
+                .with_current_computer_authority(|| {
+                    channel
+                        .add_service(profile.store(), profile, service_tag, local, kind, persist)
+                        .and_then(|_| {
+                            // A share is said to the room so its members can list it (V030-25); a
+                            // transient offer — a file being handed over — is not a share. If it
+                            // cannot be said, the service is not offered either.
+                            if !persist {
+                                return Ok(());
+                            }
+                            // A room joined and not yet synced cannot be written to (V210-164):
+                            // the share is offered now and said when the room settles.
+                            match channel.say_share(profile, service_tag, true, now_ms) {
+                                Err(crate::error::Error::RoomNotSynced) => Ok(()),
+                                Err(e) => {
+                                    let _ = channel.remove_service(profile.store(), service_tag);
+                                    Err(e)
+                                }
+                                Ok(()) => Ok(()),
+                            }
+                        })
+                })
+                .ok_or(Error::Profile(
+                    "computer policy changed before the room mutation",
+                ))
+                .and_then(|outcome| outcome);
             if outcome.is_ok() {
                 self.publish_service_offers(&channel);
             }
@@ -20001,13 +20136,21 @@ impl Node {
         let outcome = {
             let mut channel = shared.lock().await;
             let was_shared = channel.is_shared(service_tag);
-            let removed = channel.remove_service(profile.store(), service_tag);
-            // The room is told it is no longer shared (V030-25). Not saying so leaves it listed
-            // where nothing answers — a wrong listing, not a failed removal: the service is gone
-            // either way.
-            if matches!(removed, Ok(true)) && was_shared {
-                let _ = channel.say_share(profile, service_tag, false, now_ms);
-            }
+            let removed = self
+                .with_current_computer_authority(|| {
+                    let removed = channel.remove_service(profile.store(), service_tag);
+                    // The room is told it is no longer shared (V030-25). Not saying so leaves it
+                    // listed where nothing answers — a wrong listing, not a failed removal: the
+                    // service is gone either way.
+                    if matches!(removed, Ok(true)) && was_shared {
+                        let _ = channel.say_share(profile, service_tag, false, now_ms);
+                    }
+                    removed
+                })
+                .ok_or(Error::Profile(
+                    "computer policy changed before the room mutation",
+                ))
+                .and_then(|removed| removed);
             if matches!(removed, Ok(true)) {
                 self.publish_service_offers(&channel);
             }
@@ -20707,8 +20850,15 @@ impl Node {
                     }
                 }
             }
-            next.merge_endpoints(add)
-                .and_then(|()| ch.set_anchors(profile, &next, now))
+            match next.merge_endpoints(add) {
+                Ok(()) => self
+                    .with_current_computer_authority(|| ch.set_anchors(profile, &next, now))
+                    .ok_or(Error::Profile(
+                        "computer policy changed before the room mutation",
+                    )),
+                Err(error) => Err(error),
+            }
+            .and_then(|changed| changed)
         };
         if let Err(error) = changed {
             return Outcome::Failed(fault_of(&error));
@@ -20731,7 +20881,12 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        if let Err(e) = shared.lock().await.set_name(profile, name, now_ms) {
+        let mut ch = shared.lock().await;
+        let renamed = self.with_current_computer_authority(|| ch.set_name(profile, name, now_ms));
+        let Some(renamed) = renamed else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        if let Err(e) = renamed {
             return Outcome::Failed(fault_of(&e));
         }
         self.note_local_append(channel_id);
@@ -20786,7 +20941,13 @@ impl Node {
             self.sweep_retention().await;
             return Outcome::OwnRetention { own: ttl, room };
         }
-        if let Err(e) = shared.lock().await.set_retention(profile, ttl, now_ms) {
+        let mut ch = shared.lock().await;
+        let retained =
+            self.with_current_computer_authority(|| ch.set_retention(profile, ttl, now_ms));
+        let Some(retained) = retained else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        if let Err(e) = retained {
             return Outcome::Failed(fault_of(&e));
         }
         self.note_local_append(channel_id);
@@ -20842,7 +21003,13 @@ impl Node {
             self.sweep_retention().await;
             return Outcome::OwnRetention { own: ttl, room };
         }
-        if let Err(e) = shared.lock().await.set_step_retention(profile, ttl, now_ms) {
+        let mut ch = shared.lock().await;
+        let retained =
+            self.with_current_computer_authority(|| ch.set_step_retention(profile, ttl, now_ms));
+        let Some(retained) = retained else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        if let Err(e) = retained {
             return Outcome::Failed(fault_of(&e));
         }
         self.note_local_append(channel_id);
@@ -20955,7 +21122,10 @@ impl Node {
             let _ = here;
             ch.set_checkpoint_idle(self.checkpoint_idle_secs);
             if let Some(profile) = self.profile.as_ref() {
-                if ch.checkpoint_if_due(profile, now_ms).unwrap_or(false) {
+                if self
+                    .with_current_computer_authority(|| ch.checkpoint_if_due(profile, now_ms))
+                    .is_some_and(|checkpointed| checkpointed.unwrap_or(false))
+                {
                     checkpointed.push(*cid);
                 }
             }
@@ -21010,17 +21180,7 @@ impl Node {
             }
         }
         let write = || channel.attention(profile.store(), owner, operation, (self.millis_clock)());
-        if by == owner {
-            return write();
-        }
-        let Some(computer) = self.computer.as_ref().map(Arc::clone) else {
-            return write();
-        };
-        let applied = self
-            .computer_revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        computer
-            .publish_with_current_authority(applied, owner, write)
+        self.with_current_computer_authority(write)
             .ok_or_else(|| "attention waits for current computer trust".to_owned())?
     }
 
@@ -21072,16 +21232,13 @@ impl Node {
         if let Some(paused) = paused {
             #[cfg(feature = "test-knobs")]
             self.hold_room_pause_publication_for_proof().await;
-            let mut write =
-                || ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)());
-            let written = if by == profile.fingerprint() {
-                Some(write())
-            } else {
-                // The room lock is already held and every await is complete. Computer policy
-                // never takes a room lock while holding its state lock, so this room -> policy
-                // order is safe and the exact durable pause write cannot outlive its authority.
-                self.with_current_computer_authority(write)
-            };
+            let write = || ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)());
+            // The room lock is already held and every await is complete. Computer policy never
+            // takes a room lock while holding its state lock, so this room -> policy order is
+            // safe and the exact durable pause write cannot outlive its authority. The local
+            // owner is fenced too: Computer policy authorizes the node identity, not just remote
+            // agents acting through it.
+            let written = self.with_current_computer_authority(write);
             match written {
                 None => return Err(Fault::Refused),
                 Some(Ok(())) => {}
@@ -21145,7 +21302,13 @@ impl Node {
                 }
             }
         }
-        match ch.admit_read_marks(profile, &entries, (self.millis_clock)()) {
+        let admitted = self.with_current_computer_authority(|| {
+            ch.admit_read_marks(profile, &entries, (self.millis_clock)())
+        });
+        let Some(admitted) = admitted else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        match admitted {
             Ok(()) => Outcome::Done,
             Err(error) => {
                 if !matches!(
@@ -23505,6 +23668,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
+        Error::Profile("computer policy changed before the room mutation") => Fault::ComputerPolicy,
         Error::Profile(
             "Legacy history required; resume explicit recovery before posting in this room",
         ) => Fault::LegacyHistoryRequired,

@@ -47,9 +47,89 @@ const TEST_HOLD_ROOM_PAUSE_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_ROOM_PAUSE_PUB
 const TEST_HOLD_TEXT_APPEND_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION";
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_REKEY_ENQUEUE_ENV: &str = "VOX_TEST_HOLD_REKEY_ENQUEUE";
+#[cfg(feature = "test-knobs")]
+const TEST_END_KEY_UNANSWERED_ENV: &str = "VOX_TEST_FX28_END_KEY_UNANSWERED_FILE";
+#[cfg(feature = "test-knobs")]
+const TEST_MARK_ENDED_UNANSWERED_ENV: &str = "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE";
 
 #[cfg(feature = "test-knobs")]
 impl Node {
+    /// Test apparatus: make one exact modern key-delivery stream look like a pre-v0.4.3 peer.
+    /// `<node>\t<arm>\t<marker>`; `arm` contains the expected authenticated sender fingerprint
+    /// and room fingerprint, separated by a tab.
+    /// Consuming the arm before closing the answer half causally selects the real
+    /// `ENDED_UNANSWERED` classification, and the marker names that exact pair. No shipped build
+    /// names this knob.
+    pub(super) fn end_key_unanswered_for_proof(
+        &self,
+        peer: Digest32,
+        room: Option<Digest32>,
+    ) -> bool {
+        let Some(room) = room else { return false };
+        let Ok(spec) = std::env::var(TEST_END_KEY_UNANSWERED_ENV) else {
+            return false;
+        };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(node), Some(arm), Some(marker)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        let mine = self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str());
+        let peer = crate::node::link::b32_encode(&peer);
+        let room = crate::node::link::b32_encode(&room);
+        let expected = format!("{peer}\t{room}");
+        if mine != Some(node)
+            || std::fs::read_to_string(arm).ok().as_deref().map(str::trim)
+                != Some(expected.as_str())
+            || std::fs::remove_file(arm).is_err()
+        {
+            return false;
+        }
+        crate::node::computer::publish_proof_marker(
+            std::path::Path::new(marker),
+            format!("{node}\t{peer}\t{room}\n").as_bytes(),
+        )
+        .is_ok()
+    }
+
+    /// Test apparatus: mark when the sender has admitted the exact authenticated peer's
+    /// `ENDED_UNANSWERED` result. `<node>\t<arm>\t<marker>`; `arm` contains that peer and room,
+    /// separated by a tab. A command submitted after the marker is necessarily handled after
+    /// route selection on this actor.
+    pub(super) fn mark_ended_unanswered_for_proof(&self, room: Digest32, peer: Digest32) {
+        let Ok(spec) = std::env::var(TEST_MARK_ENDED_UNANSWERED_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(node), Some(arm), Some(marker)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        let mine = self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str());
+        let peer = crate::node::link::b32_encode(&peer);
+        let room = crate::node::link::b32_encode(&room);
+        let expected = format!("{peer}\t{room}");
+        if mine != Some(node)
+            || std::fs::read_to_string(arm).ok().as_deref().map(str::trim)
+                != Some(expected.as_str())
+            || std::fs::remove_file(arm).is_err()
+        {
+            return;
+        }
+        let _ = crate::node::computer::publish_proof_marker(
+            std::path::Path::new(marker),
+            format!("{node}\t{peer}\t{room}\n").as_bytes(),
+        );
+    }
+
     async fn hold_authority_use_for_proof(&self, variable: &str, action: &str) {
         let Ok(spec) = std::env::var(variable) else {
             return;

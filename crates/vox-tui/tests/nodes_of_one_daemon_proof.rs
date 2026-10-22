@@ -4249,6 +4249,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION",
         "VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION",
         "VOX_TEST_HOLD_REKEY_ENQUEUE",
+        "VOX_TEST_FX28_END_KEY_UNANSWERED_FILE",
+        "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
         "VOX_TEST_FX28_ROTATE_AFTER_POST",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
         "VOX_TEST_FX28_MUTANT",
@@ -4312,6 +4314,20 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         stale_rekey_release.display(),
         stale_rekey_decision.display()
     );
+    let older_arm = a.data.join("fx28-end-key-unanswered-arm");
+    let older_marker = a.data.join("fx28-end-key-unanswered-marker");
+    let older_spec = format!(
+        "epsilon\t{}\t{}",
+        older_arm.display(),
+        older_marker.display()
+    );
+    let older_selected_arm = b.data.join("fx28-mark-ended-unanswered-arm");
+    let older_selected_marker = b.data.join("fx28-mark-ended-unanswered-marker");
+    let older_selected_spec = format!(
+        "delta\t{}\t{}",
+        older_selected_arm.display(),
+        older_selected_marker.display()
+    );
     let status_arm = a.data.join("mark-computer-status");
     let status_accepted = a.data.join("accepted-computer-status");
     let status_returned = a.data.join("returned-computer-status");
@@ -4341,6 +4357,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &[
             ("VOX_LISTEN", &listen_a),
             ("VOX_TEST_ADVERTISE", &advertised),
+            ("VOX_TEST_FX28_END_KEY_UNANSWERED_FILE", &older_spec),
             ("VOX_TEST_MARK_COMPUTER_STATUS_FILE", &status_spec),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ARM_FILE",
@@ -4358,6 +4375,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", &stale_pause_spec),
             ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", &stale_post_spec),
             ("VOX_TEST_HOLD_REKEY_ENQUEUE", &stale_rekey_spec),
+            (
+                "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
+                &older_selected_spec,
+            ),
             ("VOX_TEST_FX28_ROTATE_AFTER_POST", "1"),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
@@ -4462,6 +4483,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             stale_pause_spec: &stale_pause_spec,
             stale_post_spec: &stale_post_spec,
             stale_rekey_spec: &stale_rekey_spec,
+            older_selected_spec: &older_selected_spec,
             stopped_reader_answered: &stopped_reader_answered_spec,
         },
     );
@@ -4718,6 +4740,11 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         &stale_rekey_engaged,
         &stale_rekey_release,
         &stale_rekey_decision,
+        &older_arm,
+        &older_marker,
+        &older_selected_arm,
+        &older_selected_marker,
+        &delta,
     );
 }
 
@@ -5095,6 +5122,7 @@ struct RestartComputerSide<'a> {
     stale_pause_spec: &'a str,
     stale_post_spec: &'a str,
     stale_rekey_spec: &'a str,
+    older_selected_spec: &'a str,
     stopped_reader_answered: &'a str,
 }
 
@@ -5112,6 +5140,7 @@ fn a_restart_derives_nothing(
         stale_pause_spec,
         stale_post_spec,
         stale_rekey_spec,
+        older_selected_spec,
         stopped_reader_answered,
     } = side;
     let names_b: Vec<&str> = nodes_b.iter().map(|(n, _)| *n).collect();
@@ -5133,6 +5162,10 @@ fn a_restart_derives_nothing(
             ("VOX_TEST_HOLD_ROOM_PAUSE_PUBLICATION", stale_pause_spec),
             ("VOX_TEST_HOLD_TEXT_APPEND_PUBLICATION", stale_post_spec),
             ("VOX_TEST_HOLD_REKEY_ENQUEUE", stale_rekey_spec),
+            (
+                "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE",
+                older_selected_spec,
+            ),
             ("VOX_TEST_FX28_ROTATE_AFTER_POST", "1"),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
@@ -5708,6 +5741,11 @@ fn stale_rekey_is_not_delivered(
     rekey_engaged: &Path,
     rekey_release: &Path,
     rekey_decision: &Path,
+    older_arm: &Path,
+    older_marker: &Path,
+    older_selected_arm: &Path,
+    older_selected_marker: &Path,
+    delta: &str,
 ) {
     assert!(
         wait_until(RETURN_WITHIN, || {
@@ -5743,6 +5781,60 @@ fn stale_rekey_is_not_delivered(
             .1
             .contains("REKEY-BASELINE")),
         "APPARATUS: epsilon did not read the baseline through the staged sender-key path"
+    );
+    // Select the compatibility route through the real protocol result which owns it. Epsilon's
+    // test-only peer apparatus closes exactly one modern delivery without an answer; delta's
+    // shipped roster must then say it runs an older Vox. The stale-authority rejection below is
+    // consequently after `key_frames` sealed into the long-lived session, not the modern cached
+    // delivery path.
+    let _ = std::fs::remove_file(older_marker);
+    let _ = std::fs::remove_file(older_selected_marker);
+    std::fs::write(older_arm, format!("{delta}\t{room}\n"))
+        .expect("APPARATUS: arm epsilon's exact unanswered modern key delivery");
+    std::fs::write(older_selected_arm, format!("{epsilon}\t{room}\n"))
+        .expect("APPARATUS: arm delta's exact ENDED_UNANSWERED route selection");
+    let (ok, out, err) = b.run(
+        &[
+            "room",
+            "post",
+            room,
+            "LEGACY-ROUTE-BASELINE",
+            "--node",
+            "delta",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: post the key rotation which selects the older route: {out}{err}"
+    );
+    let exact_older = read_daemon_marker(
+        older_marker,
+        _da.child.id(),
+        "epsilon's exact modern delivery ended unanswered",
+    );
+    assert_eq!(
+        exact_older.trim(),
+        format!("epsilon\t{delta}\t{room}"),
+        "APPARATUS: unanswered key-delivery marker named another node, sender, or room"
+    );
+    let exact_selection = read_daemon_marker(
+        older_selected_marker,
+        db.child.id(),
+        "delta's exact ENDED_UNANSWERED route selection",
+    );
+    assert_eq!(
+        exact_selection.trim(),
+        format!("delta\t{epsilon}\t{room}"),
+        "APPARATUS: ENDED_UNANSWERED route marker named another node, peer, or room"
+    );
+    println!(
+        "[proof] FX-28 legacy rekey route apparatus staged: epsilon ended delta's exact modern delivery unanswered"
+    );
+    let (ok, roster, roster_error) = b.run(&["room", "roster", room, "--node", "delta"], "");
+    assert!(
+        ok && roster.contains(epsilon) && roster.contains("runs an older Vox"),
+        "PRODUCT [FX28 legacy-rekey-route]: after delta admitted epsilon's exact unanswered modern delivery, its shipped roster did not expose the selected legacy sender-key route: {roster}{roster_error}"
     );
     let rekey_fault = rekey_decision.with_extension("fault");
     for stale in [rekey_engaged, rekey_decision, &rekey_fault] {
