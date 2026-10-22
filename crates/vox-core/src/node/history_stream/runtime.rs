@@ -794,20 +794,44 @@ impl Flow {
             // Lock erases keys immediately. Reopen owns the bounded crash cleanup;
             // no retired worker may keep/recreate an unlocked room to finish work.
             match channel.history_instance(&store) {
-                Err(Error::AtRestLocked) => return Ok((true, None)),
+                Err(Error::AtRestLocked) => return Ok((true, None, None)),
                 Err(error) => return Err(error),
-                Ok(current) if current != instance => return Ok((true, None)),
+                Ok(current) if current != instance => return Ok((true, None, None)),
                 Ok(_) => {}
             }
-            if !channel.cleanup_history_source_owned(&store, &committed, request)? {
-                return Ok((false, after));
+            let publication_owner = channel.history_publication_request(&store)?;
+            if publication_owner.is_some() && publication_owner != Some(request) {
+                return Ok((false, after, publication_owner));
             }
-            channel.cleanup_history_verifiers(&store, &committed, request, after)
+            if !channel.cleanup_history_source_owned(&store, &committed, request)? {
+                return Ok((false, after, None));
+            }
+            channel
+                .cleanup_history_verifiers(&store, &committed, request, after)
+                .map(|(done, next)| (done, next, None))
         })
         .await
         .map_err(|_| Error::Profile("history retirement worker stopped"))??;
         self.cleanup_after = step.1;
         if !step.0 {
+            // A foreground flow may suspend publication A while a freshly derived request B is
+            // its current scalar. Verifier cleanup for B correctly waits while A is publishing,
+            // but retirement must first select A when this same Flow still owns it. Otherwise
+            // B waits for A forever and the actor retains a room-busy Flow with no running
+            // worker. The task/replay stack is the exact ownership set; an unrelated owner's
+            // publication remains untouched and is retried after its own causal completion.
+            if let Some(owner) = step.2.filter(|owner| *owner != request) {
+                let owned = self.retirement_request == owner
+                    || self.tasks.iter().any(|task| task.request == owner)
+                    || self
+                        .replay
+                        .as_ref()
+                        .is_some_and(|task| task.request == owner);
+                if owned {
+                    self.request = owner;
+                    self.cleanup_after = None;
+                }
+            }
             return Ok(false);
         }
 

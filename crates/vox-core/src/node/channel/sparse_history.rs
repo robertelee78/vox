@@ -731,6 +731,11 @@ impl ChannelState {
         Ok(done)
     }
 
+    /// The exact request that owns an unfinished sparse-history publication, if any.
+    pub(crate) fn history_publication_request(&self, store: &Store) -> Result<Option<[u8; 16]>> {
+        Ok(self.history_read(store)?.sparse_publication_request())
+    }
+
     /// A retired request may roll back only its own unpublished roots, or finish only its
     /// own post-switch cleanup. The room lock covers this ownership check and transaction.
     pub(crate) fn cleanup_history_source_owned(
