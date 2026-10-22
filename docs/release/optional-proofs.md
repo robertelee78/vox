@@ -182,11 +182,13 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 `VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE=<path>`: while that marker exists, the first authenticated key-package request by a non-recipient is answered with one hostile body frame, then the marker is renamed with `.engaged` appended. The quiet-room proof uses this only on the source daemon to prove a real receiving `vox` refuses the unexpected ciphertext before persistence. Same `test-knobs` rule.
 
-The isolated FX-29 owner mutant is `scripts/run-fx29-mutant.sh drop-resume-owed`. It removes only
+The isolated FX-29 owner mutant is
+`VOX_TEST_WATCHDOG_SECS=<operator-deadman> scripts/run-fx29-mutant.sh drop-resume-owed`. It removes only
 the `ResumeOwed` installation after the causally staged stale archive return; the runner accepts
 only `PRODUCT [FX29 archive-resume-owner]:` after the exact Control-busy staging line. Its
-transcript is written under `target/fx29-mutants/`. This is an on-demand diagnostic, not CI or a
-release gate.
+transcript is written under `target/fx29-mutants/`. The required positive deadman is chosen by the
+operator for that machine and only turns a whole-proof wedge into APPARATUS; elapsed time never
+decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a release gate.
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|

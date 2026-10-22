@@ -4,6 +4,14 @@
 # apparatus failure, not mutant evidence.
 set -eu
 
+case "${VOX_TEST_WATCHDOG_SECS-}" in
+  ''|*[!0-9]*|0)
+    printf '%s\n' \
+      'APPARATUS: set VOX_TEST_WATCHDOG_SECS to an operator-chosen positive whole-proof deadman; it never decides a PRODUCT verdict' >&2
+    exit 2
+    ;;
+esac
+
 case "${1-}" in
   drop-resume-owed)
     mutant=$1

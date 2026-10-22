@@ -337,7 +337,9 @@ fn wait_room_open(dir: &Path, room: &str, who: &str) {
         {
             return;
         }
-        std::thread::yield_now();
+        // This is apparatus pacing, not a product deadline. Avoid turning an unavailable room
+        // into a hot loop; the operator-selected whole-proof watchdog owns wedge detection.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
