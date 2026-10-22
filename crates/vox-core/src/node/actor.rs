@@ -647,6 +647,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BoundedHeadCompleted { .. } => "finishing an authenticated current head",
         NetEvent::BoundedRoomAdvanced { .. } => "publishing accepted current room work",
         NetEvent::BoundedSyncProgress { .. } => "advancing bounded current/history work",
+        NetEvent::BoardRecordsOwed { .. } => "publishing authorized board records",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
@@ -1332,6 +1333,13 @@ enum NetEvent {
     },
     BoundedSyncProgress {
         token: u64,
+    },
+    /// Missing board records admitted under the exact Computer authority captured by the
+    /// off-actor exchange. Queue admission is the irreversible authorization boundary; this
+    /// actor-owned event performs only the already-authorized transport write.
+    BoardRecordsOwed {
+        conn: Arc<crate::transport::quic::VoxConnection>,
+        records: Vec<Vec<u8>>,
     },
     BoundedSyncDone {
         channel_id: Digest32,
@@ -4910,6 +4918,8 @@ struct RoomPublication {
     reopening: bool,
     /// Settings need current local policy/configuration, not history or an anchor round.
     kind: RoomPublicationKind,
+    /// The exact Computer projection which authorized creating/joining/opening this incarnation.
+    authority: Option<(computer::ComputerAuthority, bool)>,
 }
 
 /// The node actor's state (owned by its task).
@@ -5197,6 +5207,9 @@ pub struct Node {
     /// One completion per room, after current detail is published and any required
     /// initial anchor round ends. Neither room keys nor a snapshot survive a wait.
     publish_waiters: BTreeMap<Digest32, RoomPublication>,
+    /// Carried from the first durable room write to the publication waiter. The boolean selects
+    /// the room-create mutant boundary; ordinary joins/reopens use the normal authority fence.
+    room_publication_authority: BTreeMap<Digest32, (computer::ComputerAuthority, bool)>,
     publication_after: Option<Digest32>,
     publication_pending: bool,
     publication_again: bool,
@@ -5800,6 +5813,7 @@ impl Node {
             publish_failures: std::collections::BTreeMap::new(),
             publish_retry_pending: BTreeSet::new(),
             publish_waiters: BTreeMap::new(),
+            room_publication_authority: BTreeMap::new(),
             publication_after: None,
             publication_pending: false,
             publication_again: false,
@@ -6677,7 +6691,16 @@ impl Node {
             NodeCommand::SetCapability {
                 fingerprint,
                 capability,
-            } => self.set_capability(fingerprint, capability).await,
+            } => {
+                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
+                    if c.grouped() {
+                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
+                            return Outcome::Failed(fault_of(&e));
+                        }
+                    }
+                }
+                self.set_capability(fingerprint, capability).await
+            }
             NodeCommand::Rename {
                 fingerprint,
                 petname,
@@ -6705,6 +6728,13 @@ impl Node {
                 }
             }
             NodeCommand::Untrust { fingerprint } => {
+                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
+                    if c.grouped() {
+                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
+                            return Outcome::Failed(fault_of(&e));
+                        }
+                    }
+                }
                 let alias = self.trust.petname(&fingerprint).map(str::to_owned);
                 let out = self.untrust_identity(&fingerprint).await;
                 // **A member just removed is not offered back at once** (ADR-028 K-18): its offers
@@ -7614,6 +7644,9 @@ impl Node {
                     outcome,
                     reopening,
                     kind,
+                    authority: (kind == RoomPublicationKind::Open)
+                        .then(|| self.room_publication_authority.remove(&room))
+                        .flatten(),
                 },
             );
         }
@@ -7822,6 +7855,21 @@ impl Node {
         if waiting.reopening {
             self.reopening.remove(&room);
             waiting.reopening = false;
+        }
+        if let Some((authority, room_creation)) = &waiting.authority {
+            let current = if *room_creation {
+                authority.publish_room_creation(|| ()).is_some()
+            } else {
+                authority.current()
+            };
+            if !current {
+                let outcome = self.reject_unpublished_live_channel(&room, Fault::ComputerPolicy);
+                self.publish().await;
+                if let Some(reply) = waiting.reply {
+                    let _ = reply.send(outcome);
+                }
+                return;
+            }
         }
         // Node Ready is independent of room preparation. Explicit create/join/open
         // replies keep their original routing condition.
@@ -9437,7 +9485,9 @@ impl Node {
                         match created {
                             None => Outcome::Failed(Fault::ComputerPolicy),
                             Some(Err(error)) => Outcome::Failed(fault_of(&error)),
-                            Some(Ok(channel)) => self.finish_create_channel(channel).await,
+                            Some(Ok(channel)) => {
+                                self.finish_create_channel(channel, authority).await
+                            }
                         }
                     }
                 };
@@ -9779,7 +9829,7 @@ impl Node {
                     if !self.anchor_serves_room(&room, &peer) {
                         continue;
                     }
-                    if let Some(r) = self.admin_roster(&room).await {
+                    if let Ok(Some(r)) = self.admin_roster(&room).await {
                         puts.push(r);
                     }
                 }
@@ -10548,6 +10598,22 @@ impl Node {
             NetEvent::BoundedSyncProgress { token } => {
                 let _ = token;
                 self.accept_bounded_sync();
+            }
+            NetEvent::BoardRecordsOwed { conn, records } => {
+                tokio::spawn(async move {
+                    let Ok(mut client) = crate::nat::service::RendezvousClient::open(&conn).await
+                    else {
+                        return;
+                    };
+                    for wire in records {
+                        if let Err(error) = client.put(&wire).await {
+                            if !matches!(error, Error::RendezvousRejected(_)) {
+                                break;
+                            }
+                        }
+                    }
+                    client.finish();
+                });
             }
             NetEvent::BoundedSyncDone {
                 channel_id,
@@ -12797,12 +12863,12 @@ impl Node {
             });
             return Outcome::Failed(Fault::RoomNameTaken);
         }
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
         let channel = {
             let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::NoIdentity);
-            };
-            let Some(authority) = self.computer_authority() else {
-                return Outcome::Failed(Fault::ComputerPolicy);
             };
             let joined = authority.publish(|| {
                 ChannelState::join_channel_from_sealed(
@@ -12833,12 +12899,6 @@ impl Node {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        let Some(authority) = self.computer_authority() else {
-            return match Self::purge_unpublished_channel(profile, &parsed.channel_id) {
-                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
-                Err(error) => Outcome::Failed(fault_of(&error)),
-            };
-        };
         let step_retention = self.node_step_retention.for_room(&parsed.channel_id);
         let retained = authority.publish(|| {
             channel
@@ -12857,6 +12917,20 @@ impl Node {
             }
             return Outcome::Failed(fault_of(&error));
         }
+        // A joined room is remembered before it becomes live, just like a created room. Use the
+        // same captured authority as the durable join so a replaced Computer policy can leave
+        // neither a live nor a restart-visible partial join.
+        if authority
+            .publish(|| {
+                self.remember_or_say(&channel);
+            })
+            .is_none()
+        {
+            return match Self::purge_unpublished_channel(profile, &parsed.channel_id) {
+                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            };
+        }
         // A room joined again is published again (V030-14): its withdraw is kept no longer.
         self.withdrawn.remove(&parsed.channel_id);
         self.channels.insert(
@@ -12871,9 +12945,6 @@ impl Node {
             self.profile.as_ref(),
             self.channels.get(&parsed.channel_id).map(Arc::clone),
         ) {
-            let Some(authority) = self.computer_authority() else {
-                return Outcome::Failed(Fault::ComputerPolicy);
-            };
             // Same rule as `learn_members`: evidence, not relay (M17.6). The
             // responder's own board is no more trustworthy than any other — it is
             // where a joiner first looks, which makes it the *first* place a
@@ -12901,18 +12972,20 @@ impl Node {
             self.channels.get(&parsed.channel_id).map(Arc::clone),
         ) {
             let mut channel = shared.lock().await;
-            let Some(noted) = self.with_current_computer_authority(|| {
+            let noted = authority.publish(|| {
                 channel.note_member(profile.store(), responder)?;
                 // And every member the link marks one (`m=`).
                 for member in parsed.members.iter().filter(|m| **m != me) {
                     channel.note_member(profile.store(), *member)?;
                 }
                 Ok(())
-            }) else {
-                return Outcome::Failed(Fault::ComputerPolicy);
+            });
+            let Some(noted) = noted else {
+                return self
+                    .reject_unpublished_live_channel(&parsed.channel_id, Fault::ComputerPolicy);
             };
             if let Err(error) = noted {
-                return Outcome::Failed(fault_of(&error));
+                return self.reject_unpublished_live_channel(&parsed.channel_id, fault_of(&error));
             }
         }
         // The join's link routes served only that operation. The room's signed history,
@@ -12927,6 +13000,12 @@ impl Node {
         if !self.anchor_ids.contains(&conn.peer_id()) {
             self.publish_channel_to_anchor(&parsed.channel_id, &conn, PublishCause::Join)
                 .await;
+        }
+        if !authority.current() {
+            let outcome =
+                self.reject_unpublished_live_channel(&parsed.channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
         }
         // **Joining releases no sender key** (M17.6). This is the correction to
         // ADR-007 step 2, which read "the newcomer announces its own sender key … it
@@ -12958,10 +13037,22 @@ impl Node {
         // and only luck decided whether it did.
         // Nothing else replaces the release. A joiner becomes readable when it trusts
         // someone, which is a human act, and `deliver_owed_consents` issues the grant.
-        let _ = self.event_tx.send(NodeEvent::Joined {
-            channel_id: parsed.channel_id,
-            responder,
-        });
+        if authority
+            .publish(|| {
+                let _ = self.event_tx.send(NodeEvent::Joined {
+                    channel_id: parsed.channel_id,
+                    responder,
+                });
+                self.room_publication_authority
+                    .insert(parsed.channel_id, (authority.clone(), false));
+            })
+            .is_none()
+        {
+            let outcome =
+                self.reject_unpublished_live_channel(&parsed.channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
         Outcome::Done
     }
 
@@ -13518,44 +13609,45 @@ impl Node {
         // it came from, in every room, open or not: a later re-trust takes a key of its own
         // moment, never this one's (V210-30).
         let mut pending = self.consent_keys.clone();
-        if pending.forget(fingerprint) {
-            if let Err(e) = pending.save(profile.store(), signer) {
-                return Outcome::Failed(fault_of(&e));
-            }
-            self.consent_keys = pending;
-        }
-        // The decision goes with the trust (V210-45). Not load-bearing: a re-trust always draws
-        // a new place in the consent order, and a decision is only read for a trusted identity,
-        // so a failure here leaves nothing that could widen a later release.
-        let _ = crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint);
         // Record every room before the ring changes. Closed rooms act when reopened; an open
         // room whose narrowing write fails retains the same durable retry across restart.
         let rooms = match profile.store().channels() {
             Ok(rooms) => rooms,
             Err(error) => return Outcome::Failed(fault_of(&error)),
         };
-        if !rooms.is_empty() {
-            let mut locks =
-                match crate::node::pending_lock::PendingLocks::load(profile.store(), signer) {
-                    Ok(l) => l,
-                    Err(e) => return Outcome::Failed(fault_of(&e)),
-                };
-            for room in rooms {
-                if !locks.insert(room, *fingerprint) {
-                    return Outcome::Failed(Fault::Internal);
-                }
-            }
-            if let Err(e) = locks.save(profile.store(), signer) {
-                return Outcome::Failed(fault_of(&e));
+        let mut locks = match crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
+        {
+            Ok(l) => l,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        for room in rooms {
+            if !locks.insert(room, *fingerprint) {
+                return Outcome::Failed(Fault::Internal);
             }
         }
         // The ring is written FIRST and unconditionally, exactly as a revocation's
         // log fact lands before its re-keys: if the rotations below cannot all be
         // delivered, the decision must still have been taken. A removal that were
         // undone by an unreachable peer would be a removal in name only.
-        if let Err(e) = next.save(profile.store(), signer) {
-            return Outcome::Failed(fault_of(&e));
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        let durable = authority.publish(|| -> crate::error::Result<()> {
+            if pending.forget(fingerprint) {
+                pending.save(profile.store(), signer)?;
+            }
+            // The order entry, durable narrowing debt and keyring are one policy decision. No
+            // stale actor projection may commit any of them after its Computer revision moved.
+            crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint)?;
+            locks.save(profile.store(), signer)?;
+            next.save(profile.store(), signer)
+        });
+        match durable {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
+            None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        self.consent_keys = pending;
         self.trust = next;
         self.deliveries
             .retain(|(_, peer, _), _| peer != fingerprint);
@@ -15091,11 +15183,12 @@ impl Node {
                     Arc::clone(shared),
                     *cid,
                 );
+                let tx = self.net_tx.clone();
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(
                         SETUP_PATIENCE,
                         exchange_boards(
-                            &net, &conn, &shared, &store, &authority, cid, known, now_ms,
+                            &net, &conn, &shared, &store, &authority, &tx, cid, known, now_ms,
                         ),
                     )
                     .await;
@@ -15265,7 +15358,7 @@ impl Node {
                     let setup = async {
                         if let (Some(pstore), Some(authority)) = (admit_store, authority.as_ref()) {
                             admitted_authors = exchange_boards(
-                                &net, &conn, shared, &pstore, authority, cid, known, now_ms,
+                                &net, &conn, shared, &pstore, authority, &tx, cid, known, now_ms,
                             )
                             .await;
                         }
@@ -16369,8 +16462,14 @@ impl Node {
                 (None, None) => continue,
             };
             let mut all_posted = true;
+            let Some(authority) = self.computer_authority() else {
+                continue;
+            };
             for key in &keys {
-                if !self.post_key_package(&channel_id, peer, key).await {
+                if !self
+                    .post_key_package_authorized(&channel_id, peer, key, Some(authority.clone()))
+                    .await
+                {
                     all_posted = false;
                     break;
                 }
@@ -16383,29 +16482,16 @@ impl Node {
                 return;
             };
             let mut channel = shared.lock().await;
-            let history_noted = if owed_history {
-                channel.note_history_delivered(profile.store(), &peer)
-            } else {
-                Ok(())
-            };
-            let _ = history_noted
-                .and_then(|()| channel.note_delivered(profile.store(), peer, generation));
+            let _ = authority.publish(|| {
+                let history_noted = if owed_history {
+                    channel.note_history_delivered(profile.store(), &peer)
+                } else {
+                    Ok(())
+                };
+                history_noted
+                    .and_then(|()| channel.note_delivered(profile.store(), peer, generation))
+            });
         }
-    }
-
-    /// Seal `skdm` to `target` and post it to the room's log as a key-package (ADR-023
-    /// decision 4, M23.3). Returns whether it was posted.
-    ///
-    /// Needs the target's published prekey bundle, which this node holds once it has read a
-    /// board that carries it. Without one there is nothing to seal to, and the key stays owed.
-    async fn post_key_package(
-        &mut self,
-        channel_id: &Digest32,
-        target: Digest32,
-        skdm: &crate::group::skdm::Skdm,
-    ) -> bool {
-        self.post_key_package_authorized(channel_id, target, skdm, None)
-            .await
     }
 
     /// Prepare a key package asynchronously, then put only its final synchronous room-log append
@@ -16416,7 +16502,7 @@ impl Node {
         channel_id: &Digest32,
         target: Digest32,
         skdm: &crate::group::skdm::Skdm,
-        authority: Option<(Arc<crate::node::computer::Computer>, u64, Digest32)>,
+        authority: Option<crate::node::actor::computer::ComputerAuthority>,
     ) -> bool {
         // Posted already: on the log, and taken from there (a batch retried whole).
         let posted_as = (
@@ -16444,9 +16530,7 @@ impl Node {
                     .is_ok()
             };
             match authority {
-                Some((computer, applied, node)) => computer
-                    .publish_with_current_authority(applied, node, append)
-                    .unwrap_or(false),
+                Some(authority) => authority.publish(append).unwrap_or(false),
                 None => append(),
             }
         };
@@ -18110,6 +18194,7 @@ impl Node {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
             }
         }
+        self.room_publication_authority.clear();
         self.publication_after = None;
         self.publication_pending = false;
         self.publication_again = false;
@@ -18266,12 +18351,20 @@ impl Node {
     }
 
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
-    fn finish_create_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
-        Box::pin(self.finish_create_channel_unboxed(ch))
+    fn finish_create_channel(
+        &mut self,
+        ch: ChannelState,
+        authority: computer::ComputerAuthority,
+    ) -> Boxed<'_, Outcome> {
+        Box::pin(self.finish_create_channel_unboxed(ch, authority))
     }
 
     /// [`Self::finish_create_channel`], unboxed: see [`Boxed`].
-    async fn finish_create_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
+    async fn finish_create_channel_unboxed(
+        &mut self,
+        mut ch: ChannelState,
+        authority: computer::ComputerAuthority,
+    ) -> Outcome {
         // The node's own retention before the room is visible to anything that can start a
         // session on it (the retention fix, e2a74b9): every creation path comes through here.
         let id = ch.channel_id();
@@ -18279,14 +18372,8 @@ impl Node {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        let Some(authority) = self.computer_authority() else {
-            return match Self::purge_unpublished_channel(profile, &id) {
-                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
-                Err(error) => Outcome::Failed(fault_of(&error)),
-            };
-        };
         let step_retention = self.node_step_retention.for_room(&id);
-        let retained = authority.publish(|| {
+        let retained = authority.publish_room_creation(|| {
             ch.set_node_retention(profile.store(), retention)
                 .and_then(|()| ch.set_node_step_retention(profile.store(), step_retention))
         });
@@ -18306,7 +18393,7 @@ impl Node {
         // task between the room commit and this actor turn, so it gets the same exact token and
         // the room is narrowed away if that token is no longer current.
         if authority
-            .publish(|| {
+            .publish_room_creation(|| {
                 self.remember_or_say(&ch);
             })
             .is_none()
@@ -18319,16 +18406,43 @@ impl Node {
                 Err(error) => Outcome::Failed(fault_of(&error)),
             };
         }
-        self.channels
-            .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+        let inserted = authority.publish_room_creation(|| {
+            self.channels
+                .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+        });
+        if inserted.is_none() {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::NoIdentity);
+            };
+            return match Self::purge_unpublished_channel(profile, &id) {
+                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            };
+        }
         self.adopt_channel_anchors(&id).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
         self.publish_channel_to_anchors(&id, PublishCause::Opened)
             .await;
-        let _ = self
-            .event_tx
-            .send(NodeEvent::ChannelOpened { channel_id: id });
+        if authority.publish_room_creation(|| ()).is_none() {
+            let outcome = self.reject_unpublished_live_channel(&id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
+        if authority
+            .publish_room_creation(|| {
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::ChannelOpened { channel_id: id });
+                self.room_publication_authority
+                    .insert(id, (authority.clone(), true));
+            })
+            .is_none()
+        {
+            let outcome = self.reject_unpublished_live_channel(&id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
         Outcome::Done
     }
 
@@ -18504,6 +18618,27 @@ impl Node {
         }
         batch.purge_channel(channel_id)?;
         batch.commit()
+    }
+
+    /// Retract a room which was inserted only to finish an asynchronous create/join publication.
+    /// The durable room and reopen entry are removed in the same store batch before failure is
+    /// reported, so a rejected authority can leave no live or restart-visible partial room.
+    fn reject_unpublished_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
+        self.channels.remove(channel_id);
+        self.room_publication_authority.remove(channel_id);
+        self.fresh_details.remove(channel_id);
+        self.withdrawn.remove(channel_id);
+        if let Some(net) = self.net.as_ref() {
+            net.membership().clear_channel(channel_id);
+            net.forget_room_on_board(channel_id);
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        match Self::purge_unpublished_channel(profile, channel_id) {
+            Ok(()) => Outcome::Failed(fault),
+            Err(error) => Outcome::Failed(fault_of(&error)),
+        }
     }
 
     /// Take `channel_id` out of the rooms this node reopens by itself.
@@ -18853,6 +18988,7 @@ impl Node {
 
     fn cancel_room_preparation(&mut self, id: &Digest32, fault: Fault) -> bool {
         let opening = self.opening_rooms.remove(id).is_some();
+        self.room_publication_authority.remove(id);
         let publishing = if let Some(waiting) = self.publish_waiters.remove(id) {
             if let Some(reply) = waiting.reply {
                 let _ = reply.send(Outcome::Failed(fault));
@@ -19331,15 +19467,29 @@ impl Node {
     /// Publish a room only after both shared and local retention have been applied durably.
     async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
         if ch.legacy_startup_cleanup_pending() {
             self.legacy_cleanup_rooms.entry(channel_id).or_insert(None);
             self.legacy_cleanup_due = std::time::Instant::now();
         }
         // What the open set aside is reported (V210-74), as a reopen reports it.
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
-        self.remember_or_say(&ch);
-        self.channels
-            .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        let published = authority.publish(|| {
+            self.remember_or_say(&ch);
+            self.channels
+                .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        });
+        if published.is_none() {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::NoIdentity);
+            };
+            return match Self::purge_unpublished_channel(profile, &channel_id) {
+                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            };
+        }
         // Preparation established current decisions and completed all pending narrowing.
         self.resume_leave(&channel_id).await;
         self.adopt_channel_anchors(&channel_id).await;
@@ -19351,7 +19501,23 @@ impl Node {
             .await;
         self.install_key_packages(&channel_id).await;
         self.reach_members_of(&channel_id).await;
-        let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+        if !authority.current() {
+            let outcome = self.reject_unpublished_live_channel(&channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
+        if authority
+            .publish(|| {
+                let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+                self.room_publication_authority
+                    .insert(channel_id, (authority.clone(), false));
+            })
+            .is_none()
+        {
+            let outcome = self.reject_unpublished_live_channel(&channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
         Outcome::Done
     }
 
@@ -19446,6 +19612,10 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
             return;
         }
+        let Some(authority) = self.computer_authority() else {
+            let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+            return;
+        };
         let now_ms = self.now_ms();
         let written = {
             let Some(profile) = self.profile.as_ref() else {
@@ -19453,8 +19623,8 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
-            let written = self
-                .with_current_computer_authority(|| {
+            let written = authority
+                .publish(|| {
                     ch.say_presence(profile, false, now_ms).map(|_| {
                         (
                             ch.generation().load(std::sync::atomic::Ordering::Relaxed),
@@ -19491,8 +19661,17 @@ impl Node {
                 return;
             }
         };
-        self.withdraw_from_boards(&channel_id, crate::nat::withdraw::WithdrawScope::Member)
-            .await;
+        if let Err(fault) = self
+            .withdraw_from_boards(
+                &channel_id,
+                crate::nat::withdraw::WithdrawScope::Member,
+                &authority,
+            )
+            .await
+        {
+            let _ = reply.send(Outcome::Failed(fault));
+            return;
+        }
         // Nobody else is in the room: there is nobody to tell.
         if alone {
             let _ = reply.send(self.purge_room(&channel_id).await);
@@ -19586,84 +19765,82 @@ impl Node {
         &mut self,
         channel_id: &Digest32,
         scope: crate::nat::withdraw::WithdrawScope,
-    ) -> usize {
+        _authority: &computer::ComputerAuthority,
+    ) -> Result<usize, Fault> {
         let now_ms = self.now_ms().get();
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return 0;
-        };
+        let net = self.net.as_ref().map(Arc::clone);
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return 0;
+            return Err(Fault::ChannelNotOpen);
         };
         let epoch = shared.lock().await.epoch();
-        let Some(authority) = self.computer_authority() else {
-            return 0;
+        let Some(profile) = self.profile.as_ref() else {
+            return Err(Fault::NoIdentity);
         };
-        authority
-            .publish(|| {
-                let Some(profile) = self.profile.as_ref() else {
-                    return 0;
-                };
-                let Ok(signer) = profile.signer() else {
-                    return 0;
-                };
-                let Ok(w) = crate::nat::withdraw::BoardWithdraw::build(
-                    signer, channel_id, epoch, scope, now_ms,
-                ) else {
-                    return 0;
-                };
-                let wire = w.to_wire();
-                let _ = net.publish_local(&wire);
-                let mut assigned = BTreeMap::new();
-                for anchor in self.anchors.nodes().iter().chain(
-                    self.room_anchors
-                        .get(channel_id)
-                        .into_iter()
-                        .flat_map(|anchors| anchors.nodes().iter()),
-                ) {
-                    assigned
-                        .entry(anchor.id)
-                        .or_insert_with(|| anchor.endpoints.direct_candidates());
-                }
-                self.withdrawn.insert(
-                    *channel_id,
-                    PendingWithdrawal {
-                        wire: wire.clone(),
-                        routes: assigned,
-                    },
-                );
-                let anchors: Vec<Arc<VoxConnection>> = self
-                    .anchor_ids
-                    .iter()
-                    .filter(|id| self.anchor_serves_room(channel_id, id))
-                    .filter_map(|id| net.manager().existing(id))
-                    .collect();
-                for conn in &anchors {
-                    Self::put_withdraws(conn, vec![wire.clone()]);
-                }
-                anchors.len()
-            })
-            .unwrap_or(0)
+        let signer = profile.signer().map_err(|error| fault_of(&error))?;
+        let w =
+            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now_ms)
+                .map_err(|error| fault_of(&error))?;
+        let wire = w.to_wire();
+        if let Some(net) = net.as_ref() {
+            let _ = net.publish_local(&wire);
+        }
+        let mut assigned = BTreeMap::new();
+        for anchor in self.anchors.nodes().iter().chain(
+            self.room_anchors
+                .get(channel_id)
+                .into_iter()
+                .flat_map(|anchors| anchors.nodes().iter()),
+        ) {
+            assigned
+                .entry(anchor.id)
+                .or_insert_with(|| anchor.endpoints.direct_candidates());
+        }
+        self.withdrawn.insert(
+            *channel_id,
+            PendingWithdrawal {
+                wire: wire.clone(),
+                routes: assigned,
+            },
+        );
+        let anchors: Vec<Arc<VoxConnection>> = net.as_ref().map_or_else(Vec::new, |net| {
+            self.anchor_ids
+                .iter()
+                .filter(|id| self.anchor_serves_room(channel_id, id))
+                .filter_map(|id| net.manager().existing(id))
+                .collect()
+        });
+        for conn in &anchors {
+            Self::put_withdraws(conn, vec![wire.clone()]);
+        }
+        Ok(anchors.len())
     }
 
     /// The room's admin roster, signed (V030-14), when this node is its creator: who besides it a
     /// board takes the room off from. Stamped with the newest admin change on the log, so putting
     /// it again changes nothing on a board that holds it.
-    async fn admin_roster(&self, channel_id: &Digest32) -> Option<Vec<u8>> {
-        let profile = self.profile.as_ref()?;
-        let signer = profile.signer().ok()?;
-        let shared = self.channels.get(channel_id).map(Arc::clone)?;
+    async fn admin_roster(&self, channel_id: &Digest32) -> Result<Option<Vec<u8>>, Fault> {
+        let profile = self.profile.as_ref().ok_or(Fault::NoIdentity)?;
+        let signer = profile.signer().map_err(|error| fault_of(&error))?;
+        let shared = self
+            .channels
+            .get(channel_id)
+            .map(Arc::clone)
+            .ok_or(Fault::ChannelNotOpen)?;
         let mut ch = shared.lock().await;
         let me = ch.me();
         if me != ch.genesis().creator_pubkey().fingerprint() {
-            return None;
+            return Ok(None);
         }
         let stamp = match ch.admin_change_clock(profile.store()) {
-            Ok(stamp) => stamp?,
+            Ok(stamp) => match stamp {
+                Some(stamp) => stamp,
+                None => return Ok(None),
+            },
             Err(error) => {
                 if !ChannelState::governance_refreshing(&error) {
                     ch.poison(&error);
                 }
-                return None;
+                return Err(fault_of(&error));
             }
         };
         // This is one protocol-bounded signed message, not a historical admin projection.
@@ -19677,11 +19854,11 @@ impl Node {
                     if !ChannelState::governance_refreshing(&error) {
                         ch.poison(&error);
                     }
-                    return None;
+                    return Err(fault_of(&error));
                 }
             };
             if admins.len().saturating_add(page.targets.len()) > crate::nat::withdraw::MAX_ROSTER {
-                return None;
+                return Err(Fault::Internal);
             }
             admins.extend(page.targets);
             match page.next {
@@ -19689,38 +19866,42 @@ impl Node {
                 None => break,
             }
         }
-        let authority = self.computer_authority()?;
+        let authority = self.computer_authority().ok_or(Fault::ComputerPolicy)?;
         authority
             .publish(|| {
                 crate::nat::withdraw::AdminRoster::build(signer, channel_id, stamp, admins)
-                    .ok()
                     .map(|r| r.to_wire())
             })
-            .flatten()
+            .ok_or(Fault::ComputerPolicy)?
+            .map(Some)
+            .map_err(|error| fault_of(&error))
     }
 
     /// Put the room's admin roster on this node's board and every anchor connected now (V030-14).
-    async fn publish_admin_roster(&mut self, channel_id: &Digest32) {
-        let Some(wire) = self.admin_roster(channel_id).await else {
-            return;
+    async fn publish_admin_roster(&mut self, channel_id: &Digest32) -> Result<(), Fault> {
+        let Some(wire) = self.admin_roster(channel_id).await? else {
+            return Ok(());
         };
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return;
+            return Ok(());
         };
         let Some(authority) = self.computer_authority() else {
-            return;
+            return Err(Fault::ComputerPolicy);
         };
-        let _ = authority.publish(|| {
-            let _ = net.publish_local(&wire);
-            for conn in self
-                .anchor_ids
-                .iter()
-                .filter(|id| self.anchor_serves_room(channel_id, id))
-                .filter_map(|id| net.manager().existing(id))
-            {
-                Self::put_withdraws(&conn, vec![wire.clone()]);
-            }
-        });
+        authority
+            .publish(|| {
+                let _ = net.publish_local(&wire);
+                for conn in self
+                    .anchor_ids
+                    .iter()
+                    .filter(|id| self.anchor_serves_room(channel_id, id))
+                    .filter_map(|id| net.manager().existing(id))
+                {
+                    Self::put_withdraws(&conn, vec![wire.clone()]);
+                }
+            })
+            .ok_or(Fault::ComputerPolicy)?;
+        Ok(())
     }
 
     /// Put `withdraws` on the board at `conn`, off the actor. A put the board never answered —
@@ -19778,12 +19959,15 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
         {
             let mut ch = shared.lock().await;
             if ch.ended((self.millis_clock)()).is_some() {
                 return Outcome::Failed(Fault::RoomEnded);
             }
-            let ended = self.with_current_computer_authority(|| ch.end(profile, now_ms));
+            let ended = authority.publish(|| ch.end(profile, now_ms));
             let Some(ended) = ended else {
                 return Outcome::Failed(Fault::ComputerPolicy);
             };
@@ -19794,8 +19978,13 @@ impl Node {
                 if crate::log::sync::mutant::withdraws_unentitled() {
                     drop(ch);
                     let anchors = self
-                        .withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
-                        .await;
+                        .withdraw_from_boards(
+                            channel_id,
+                            crate::nat::withdraw::WithdrawScope::Room,
+                            &authority,
+                        )
+                        .await
+                        .unwrap_or(0);
                     eprintln!(
                         "{}: put a room withdraw for {} to {anchors} anchor(s) though this node \
                          may not end it",
@@ -19807,8 +19996,16 @@ impl Node {
             }
         }
         self.note_local_append(channel_id);
-        self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
-            .await;
+        if let Err(fault) = self
+            .withdraw_from_boards(
+                channel_id,
+                crate::nat::withdraw::WithdrawScope::Room,
+                &authority,
+            )
+            .await
+        {
+            return Outcome::Failed(fault);
+        }
         // The checked local publication completes first; the regular lifecycle turn
         // then winds the room down without overtaking this command's reply.
         Outcome::Done
@@ -19849,8 +20046,13 @@ impl Node {
             }
         }
         self.note_local_append(channel_id);
-        // Bounded governance maintenance publishes the checked roster (V030-14)
-        // before the local completion is eligible to answer.
+        // The roster is part of the user-visible admin change. A rejected final publication is
+        // not `Done`; governance retains the durable append and retries its board projection.
+        if let Err(fault) = self.publish_admin_roster(channel_id).await {
+            self.governance_work.pending = true;
+            self.governance_work.again = true;
+            return Outcome::Failed(fault);
+        }
         Outcome::Done
     }
 
@@ -20115,8 +20317,15 @@ impl Node {
                 }
             }
             if idle_ended_here && !self.withdrawn.contains_key(&cid) {
-                self.withdraw_from_boards(&cid, crate::nat::withdraw::WithdrawScope::Room)
-                    .await;
+                if let Some(authority) = self.computer_authority() {
+                    let _ = self
+                        .withdraw_from_boards(
+                            &cid,
+                            crate::nat::withdraw::WithdrawScope::Room,
+                            &authority,
+                        )
+                        .await;
+                }
             }
             if !over {
                 continue;
@@ -22231,16 +22440,10 @@ impl Node {
         };
         for (member, skdm, generation) in releases {
             self.computer_drive_guard(guard)?;
-            let authority = match (&self.computer, &self.profile) {
-                (Some(computer), Some(profile)) => Some((
-                    Arc::clone(computer),
-                    self.computer_revision
-                        .load(std::sync::atomic::Ordering::Acquire),
-                    profile.fingerprint(),
-                )),
-                (Some(_), None) => return Ok(()),
-                (None, _) => None,
-            };
+            let authority = self.computer_authority();
+            if self.computer.is_some() && authority.is_none() {
+                return Ok(());
+            }
             let posted = if let Some((deadline, _cancelled)) = guard {
                 match tokio::time::timeout_at(
                     deadline.into(),
@@ -23021,8 +23224,13 @@ impl Node {
         if !next.set_capability(&fingerprint, capability) {
             return Outcome::Failed(Fault::NotConsented);
         }
-        if let Err(e) = next.save(profile.store(), signer) {
-            return Outcome::Failed(fault_of(&e));
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        match authority.publish(|| next.save(profile.store(), signer)) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
+            None => return Outcome::Failed(Fault::ComputerPolicy),
         }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
@@ -23169,10 +23377,11 @@ impl crate::node::up::Names for NodeNames {
 #[allow(clippy::too_many_arguments)]
 async fn exchange_boards(
     net: &NodeNet,
-    conn: &crate::transport::quic::VoxConnection,
+    conn: &Arc<crate::transport::quic::VoxConnection>,
     shared: &tokio::sync::Mutex<ChannelState>,
     pstore: &crate::node::store::Store,
     authority: &crate::node::actor::computer::ComputerAuthority,
+    tx: &mpsc::Sender<NetEvent>,
     cid: Digest32,
     known: u64,
     now: crate::time::Ms,
@@ -23235,16 +23444,16 @@ async fn exchange_boards(
     // holds newer) costs nothing, and the peer's own sync still reads this board.
     let missing = net.board_records_missing_from(&cid, known, &set);
     if !missing.is_empty() {
-        if let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await {
-            for wire in &missing {
-                if let Err(e) = client.put(wire).await {
-                    if !matches!(e, Error::RendezvousRejected(_)) {
-                        break;
-                    }
-                }
-            }
-            client.finish();
-        }
+        // The off-actor worker does not retain authority past this synchronous queue admission.
+        // A replaced Computer projection therefore cannot enqueue any transport publication;
+        // once admitted, the actor event owns completing that already-authorized operation.
+        let _ = authority.publish(|| {
+            tx.try_send(NetEvent::BoardRecordsOwed {
+                conn: Arc::clone(conn),
+                records: missing,
+            })
+            .is_ok()
+        });
     }
     admitted_authors
 }

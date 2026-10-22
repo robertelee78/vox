@@ -6,7 +6,7 @@ use super::*;
 pub(super) struct Maintenance {
     pub pending: bool,
     after: Option<Digest32>,
-    again: bool,
+    pub(super) again: bool,
     consent_after: BTreeMap<Digest32, Digest32>,
     pub(super) removal: Option<Removal>,
 }
@@ -99,7 +99,18 @@ impl Node {
                 Ok(false) => {}
             }
             drop(channel);
-            self.publish_admin_roster(&work.room).await;
+            if let Err(fault) = self.publish_admin_roster(&work.room).await {
+                if matches!(fault, Fault::ComputerPolicy) {
+                    // The durable removal remains the exact owner of this publication. A fresh
+                    // Computer reconciliation retries it; never answer Done while boards still
+                    // carry the roster which the removal replaced.
+                    self.governance_work.removal = Some(work);
+                    self.governance_work.again = true;
+                } else {
+                    let _ = work.reply.send(Outcome::Failed(fault));
+                }
+                return;
+            }
             self.publish().await;
             let _ = work.reply.send(Outcome::Done);
             return;
@@ -323,7 +334,9 @@ impl Node {
         if progress.ready && progress.changed {
             self.adopt_channel_anchors(&room).await;
             self.refresh_network_view().await;
-            self.publish_admin_roster(&room).await;
+            if self.publish_admin_roster(&room).await.is_err() {
+                self.governance_work.again = true;
+            }
         }
         if progress.changed || backfilled > 0 || legacy_finished || views_finished {
             self.publish().await;

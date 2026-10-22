@@ -1450,7 +1450,7 @@ impl Node {
                     flow.admitted_authors = tokio::select! {
                         biased;
                         ()=worker_fence.retired()=>0,
-                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,authority,room,epoch,crate::time::Ms(now)))=>result.unwrap_or(0),
+                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,authority,&tx,room,epoch,crate::time::Ms(now)))=>result.unwrap_or(0),
                     };
                 }
             }

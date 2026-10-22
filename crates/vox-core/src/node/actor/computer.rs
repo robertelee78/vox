@@ -67,6 +67,13 @@ impl ComputerAuthority {
         }
         self.publish(publish)
     }
+
+    /// Revalidate this exact captured projection without publishing anything. This is used at
+    /// asynchronous hand-offs whose irreversible operation belongs to another component; the
+    /// operation is not even constructed unless the same authority still exists.
+    pub(super) fn current(&self) -> bool {
+        self.publish(|| ()).is_some()
+    }
 }
 
 /// **Test-only** (`test-knobs`): `<node>\t<arm>\t<engaged>\t<release socket>`. The actor consumes
