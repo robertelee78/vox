@@ -4855,6 +4855,13 @@ impl ChannelState {
                 .is_none_or(|held| *held < self.sender.chain_id()))
     }
 
+    /// Whether `target` is still owed this identity's current generation or any entitled
+    /// historical generation. This is the durable half of the shipped delivery status; the node
+    /// adds work currently admitted or in flight before reporting it.
+    pub(crate) fn key_delivery_pending(&self, store: &Store, target: &Digest32) -> Result<bool> {
+        Ok(self.owed_rekey(store, target)? || self.owed_history_for(store, target)?.is_some())
+    }
+
     /// Revoke `target`'s consent to read this identity's messages (ADR-007
     /// §Revocation): rotate this identity's sender key and append the signed
     /// revocation naming the generation that excludes `target`.

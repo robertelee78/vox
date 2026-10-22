@@ -420,6 +420,12 @@ fn detail_of(
         Some(p) => p.drive_from.clone(),
         None => ch.drive_from_known(store)?.0,
     };
+    let mut key_delivery_pending = Vec::new();
+    for target in &member_consent {
+        if ch.key_delivery_pending(store, target)? {
+            key_delivery_pending.push(*target);
+        }
+    }
     Ok(ChannelDetail {
         pause: ch.room_pause(),
         pause_resume_after: ch.pause_resume_after(),
@@ -443,6 +449,7 @@ fn detail_of(
         member_consent,
         governance_revision,
         render_backfill_pending: ch.governance_backfill_pending(store)?,
+        key_delivery_pending,
         consenting,
         offer_bases,
         trusted_by,
@@ -5267,6 +5274,10 @@ pub struct Node {
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Deliveries begun by this actor that have not reached either a durable direct
+    /// acknowledgement or a completed store-and-forward append. Kept through refusal so a stale
+    /// published room view cannot briefly report completion before the fallback updates it.
+    key_delivery_settling: BTreeSet<(Digest32, Digest32)>,
     /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
     /// member takes it, a later key supersedes it, or the member says its opening cannot work.
     deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
@@ -5816,6 +5827,7 @@ impl Node {
             redeliver_now: false,
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
+            key_delivery_settling: BTreeSet::new(),
             deliveries: BTreeMap::new(),
             delivery_reserved: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
@@ -10243,6 +10255,16 @@ impl Node {
                 if whole_history {
                     let _ = channel.note_history_delivered(profile.store(), &peer);
                 }
+                let still_owed = channel
+                    .key_delivery_pending(profile.store(), &peer)
+                    .unwrap_or(true);
+                drop(channel);
+                if !still_owed
+                    && !self.keys_in_flight.contains_key(&(channel_id, peer))
+                    && !self.history_in_flight.contains_key(&(channel_id, peer))
+                {
+                    self.key_delivery_settling.remove(&(channel_id, peer));
+                }
             }
             NetEvent::RoomStored { channel_id } => {
                 // A worker persisted entries: the room's generation moved, and its ports are
@@ -13363,6 +13385,8 @@ impl Node {
         self.delivery_reserved
             .retain(|(_, peer, _), _| peer != fingerprint);
         self.key_waiting.retain(|(_, peer), _| peer != fingerprint);
+        self.key_delivery_settling
+            .retain(|(_, peer)| peer != fingerprint);
         self.note_capability(*fingerprint, had_drive);
         // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
         // nothing it posts from now opens on this node. A closed room drops them, and changes its
@@ -15897,6 +15921,7 @@ impl Node {
                 }
             };
             if owes_consent {
+                self.key_delivery_settling.insert((channel_id, peer));
                 // **The same release the pairwise stream would have carried** (`consent_release`):
                 // what this member may read depends on when it was trusted, never on the path its
                 // key took (V210-45, #226). A key taken now, when the dial failed, would start
@@ -15997,6 +16022,7 @@ impl Node {
                 (None, Some(k)) => vec![k],
                 (None, None) => continue,
             };
+            self.key_delivery_settling.insert((channel_id, peer));
             let mut all_posted = true;
             for key in &keys {
                 if !self.post_key_package(&channel_id, peer, key).await {
@@ -16017,8 +16043,19 @@ impl Node {
             } else {
                 Ok(())
             };
-            let _ = history_noted
+            let completed = history_noted
                 .and_then(|()| channel.note_delivered(profile.store(), peer, generation));
+            let still_owed = completed.is_err()
+                || channel
+                    .key_delivery_pending(profile.store(), &peer)
+                    .unwrap_or(true);
+            drop(channel);
+            if !still_owed
+                && !self.keys_in_flight.contains_key(&(channel_id, peer))
+                && !self.history_in_flight.contains_key(&(channel_id, peer))
+            {
+                self.key_delivery_settling.remove(&(channel_id, peer));
+            }
         }
     }
 
@@ -16751,6 +16788,7 @@ impl Node {
     /// again. Taken is when it is delivered; a `history` key counts towards the batch it belongs
     /// to, whose history is recorded once all of it was taken.
     fn key_in_flight(&mut self, channel_id: Digest32, target: Digest32) -> u64 {
+        self.key_delivery_settling.insert((channel_id, target));
         *self.keys_in_flight.entry((channel_id, target)).or_default() += 1;
         self.delivery_epoch
     }
@@ -17739,6 +17777,7 @@ impl Node {
         }
         // Keys still in flight stay owed, and are sent again after the next unlock (V210-88).
         self.keys_in_flight.clear();
+        self.key_delivery_settling.clear();
         // Sealed bytes, no key material; but the ring that opens the next ones is this identity's.
         self.deliveries.clear();
         self.delivery_reserved.clear();
@@ -19532,6 +19571,8 @@ impl Node {
         self.delivery_reserved
             .retain(|(room, _, _), _| room != channel_id);
         self.key_waiting.retain(|(room, _), _| room != channel_id);
+        self.key_delivery_settling
+            .retain(|(room, _)| room != channel_id);
         self.refresh_network_view().await;
         // Published before it is said: whoever is told the room is deleted and then looks
         // (`vox room list`) must not still see it.
@@ -20362,6 +20403,8 @@ impl Node {
                     last_seen: self.status.last_seen.get(m).copied(),
                     last_sync: self.status.member_synced.get(m).copied(),
                     key_waits: self.said_of(&room.channel_id, m),
+                    key_delivery_pending: room.key_delivery_pending.contains(m)
+                        || self.key_delivery_active(room.channel_id, *m),
                 })
                 .collect();
             // From the room as last published, never its lock: a sync session holds that lock
@@ -20468,6 +20511,16 @@ impl Node {
                 &self.sync_book,
             ));
         report
+    }
+
+    /// Whether a sender-key delivery is in flight and has not reached its terminal
+    /// acknowledgement yet. Combined with the room view's durable obligations, this keeps status
+    /// true across direct delivery and store-and-forward completion.
+    fn key_delivery_active(&self, room: Digest32, member: Digest32) -> bool {
+        let pair = (room, member);
+        self.key_delivery_settling.contains(&pair)
+            || self.keys_in_flight.contains_key(&pair)
+            || self.history_in_flight.contains_key(&pair)
     }
 
     /// Recompute every channel's live reacher set in place.

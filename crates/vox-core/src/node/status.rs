@@ -102,6 +102,9 @@ pub struct MemberStatus {
     /// What is said of it about this identity's key in this room, after its name, if anything
     /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox.
     pub key_waits: Option<String>,
+    /// Whether this member is still owed, or is actively being sent, any generation of this
+    /// node's sender key in this room.
+    pub key_delivery_pending: bool,
 }
 
 /// One room that is still preparing: not open, not closed, and saying what it waits for.
@@ -463,14 +466,15 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"key_delivery_pending\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
                     m.connected,
                     opt(m.last_seen),
                     opt(m.last_sync),
-                    m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q)
+                    m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q),
+                    m.key_delivery_pending
                 )
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));

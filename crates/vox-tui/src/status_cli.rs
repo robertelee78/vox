@@ -90,6 +90,18 @@ fn validate_governance_status(v: &Value) -> Result<(), AppError> {
                 "the node's report room {index} has no numeric governance_revision"
             )));
         }
+        for (member_index, member) in room["members"].as_array().into_iter().flatten().enumerate() {
+            if member
+                .get("key_delivery_pending")
+                .and_then(Value::as_bool)
+                .is_none()
+            {
+                return Err(AppError::Usage(format!(
+                    "the node's report room {index} member {member_index} has no boolean \
+                     key_delivery_pending"
+                )));
+            }
+        }
         if room
             .get("render_backfill_pending")
             .and_then(Value::as_bool)
@@ -324,6 +336,12 @@ fn render(v: &Value) -> Result<String, AppError> {
             );
             if let Some(said) = m.get("key_waits").and_then(Value::as_str) {
                 let _ = writeln!(o, "      {said}");
+            }
+            if flag("key_delivery_pending") {
+                let _ = writeln!(
+                    o,
+                    "      is still owed one or more of your sender keys here"
+                );
             }
         }
     }

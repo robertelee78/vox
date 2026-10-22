@@ -654,6 +654,9 @@ pub struct ChannelDetail {
     /// Whether retained ciphertext still has bounded rendering work queued. This is published
     /// with the room view so status can distinguish parked missing-fact state from active work.
     pub render_backfill_pending: bool,
+    /// Members still owed any generation of this node's sender key, from the durable delivery
+    /// ledger. The live actor may additionally have an admitted delivery in flight.
+    pub key_delivery_pending: Vec<Digest32>,
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `member_consent`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,

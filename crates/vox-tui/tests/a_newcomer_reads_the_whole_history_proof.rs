@@ -508,13 +508,14 @@ fn assert_exact_read_rows(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RoomStatus {
     log_entries: u64,
     received_key_generations: u64,
     governance_revision: u64,
     governance_pending: bool,
     render_backfill_pending: bool,
+    key_delivery_pending: Vec<String>,
 }
 
 /// What the shipped status command says about one room. Refused or malformed output is a product
@@ -566,6 +567,30 @@ fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
                 "PRODUCT: {reader}'s room status has no boolean `render_backfill_pending`: {row}"
             )
         }),
+        key_delivery_pending: row["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("PRODUCT: {reader}'s room status has no members: {row}"))
+            .iter()
+            .filter_map(|member| {
+                let pending = member["key_delivery_pending"].as_bool().unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT: {reader}'s room member has no boolean \
+                         `key_delivery_pending`: {member}"
+                    )
+                });
+                pending.then(|| {
+                    member["id"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "PRODUCT: {reader}'s pending key-delivery member has no id: \
+                                 {member}"
+                            )
+                        })
+                        .to_owned()
+                })
+            })
+            .collect(),
     }
 }
 
@@ -693,7 +718,7 @@ fn wait_room_status(
     room: &str,
     key_must_stay_held: bool,
     claim: &str,
-    ready: impl Fn(RoomStatus) -> bool,
+    ready: impl Fn(&RoomStatus) -> bool,
 ) -> RoomStatus {
     loop {
         let status = room_status(dir, reader, room);
@@ -702,7 +727,7 @@ fn wait_room_status(
             "APPARATUS: {reader} accepted a sender key in room {room} while the package hold \
              marker still existed during `{claim}`: {status:?}"
         );
-        if ready(status) {
+        if ready(&status) {
             return status;
         }
         std::thread::yield_now();
@@ -1738,8 +1763,15 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         "alice",
         &rooms[0],
         false,
-        "Carol's removal did not publish its reset and the one Bob-only regrant",
-        |status| status.governance_revision >= isolation_revision,
+        "Carol's removal did not publish its reset and the one Bob-only regrant, or Alice did \
+         not finish Bob's resulting key delivery",
+        |status| {
+            status.governance_revision >= isolation_revision
+                && !status
+                    .key_delivery_pending
+                    .iter()
+                    .any(|member| member == &fps[1])
+        },
     );
     assert_eq!(
         isolation_settled.governance_revision, isolation_revision,
@@ -1783,6 +1815,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         rooms[0]
     );
 
+    // Alice's shipped status above is the source-owned terminal observation for the prior re-key:
+    // its durable ledger and live delivery machinery both say Bob is owed nothing. Thus no delayed
+    // package from Carol's removal can enter the interval below and masquerade as reset or grant2.
     // The original Alice→Bob grant is already user-visible and its sender key is held. Take Bob
     // offline, then drive one source-owned sender-generation bound through the shipped post
     // command. The rotation appends an authenticated Presence reset between the original grant
