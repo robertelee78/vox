@@ -815,6 +815,9 @@ impl ChannelState {
     #[cfg(feature = "test-knobs")]
     fn record_fx29_content_outcome(&self, hash: &Digest32, accepted: bool) -> Result<()> {
         use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
         let Some(path) = std::env::var_os(TEST_FX29_CONTENT_OUTCOME_ENV)
             .filter(|path| !path.is_empty())
@@ -822,33 +825,41 @@ impl ChannelState {
         else {
             return Ok(());
         };
-        if path.exists() {
-            return Ok(());
-        }
         let mut temporary = path.as_os_str().to_os_string();
-        temporary.push(".writing");
+        temporary.push(format!(
+            ".writing.{}.{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
         let temporary: std::path::PathBuf = temporary.into();
-        let mut file = match std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-            Err(_) => {
-                return Err(Error::Profile(
-                    "test sparse-Content outcome marker could not be created",
-                ))
-            }
-        };
+            .map_err(|_| {
+                Error::Profile("test sparse-Content outcome marker could not be created")
+            })?;
         let outcome = if accepted { "accepted" } else { "refused" };
-        write!(file, "{outcome}:{}", crate::node::link::b32_encode(hash)).map_err(|_| {
-            Error::Profile("test sparse-Content outcome marker could not be written")
-        })?;
+        if write!(file, "{outcome}:{}", crate::node::link::b32_encode(hash)).is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(Error::Profile(
+                "test sparse-Content outcome marker could not be written",
+            ));
+        }
         drop(file);
-        std::fs::rename(&temporary, &path).map_err(|_| {
-            Error::Profile("test sparse-Content outcome marker could not be published")
-        })
+        // A hard link is the no-replace publication primitive here: all callers have a unique,
+        // complete temporary inode, and exactly one can attach it at `path`. Unlike a
+        // check-then-rename, a later Content outcome can never replace the first marker.
+        let published = match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) => Err(Error::Profile(
+                "test sparse-Content outcome marker could not be published",
+            )),
+        };
+        let _ = std::fs::remove_file(&temporary);
+        published
     }
 
     /// One signed-context coordinate per call. The caller retains only (hash,next), never
@@ -1063,6 +1074,8 @@ impl ChannelState {
                     #[cfg(feature = "test-knobs")]
                     if std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
                         == Ok("track-content-through-settled-index")
+                        && std::env::var_os(TEST_FX29_CONTENT_OUTCOME_ENV).is_some()
+                        && entry.skeleton.author_id != self.me()
                     {
                         self.track_body_into(&mut batch, *hash, log, now.get())?;
                     } else {
@@ -1155,7 +1168,10 @@ impl ChannelState {
                 Err(error) => {
                     self.poison(&error);
                     #[cfg(feature = "test-knobs")]
-                    if kind == SignedEntryKind::Content && entry.payload.is_some() {
+                    if kind == SignedEntryKind::Content
+                        && entry.payload.is_some()
+                        && entry.skeleton.author_id != self.me()
+                    {
                         self.record_fx29_content_outcome(hash, false)?;
                     }
                     return Err(error);
@@ -1167,7 +1183,10 @@ impl ChannelState {
             return Err(error);
         }
         #[cfg(feature = "test-knobs")]
-        if kind == SignedEntryKind::Content && entry.payload.is_some() {
+        if kind == SignedEntryKind::Content
+            && entry.payload.is_some()
+            && entry.skeleton.author_id != self.me()
+        {
             self.record_fx29_content_outcome(hash, true)?;
         }
         cursor.rendered |= rendered;
