@@ -14797,6 +14797,13 @@ impl Node {
                 Some(_) => {}
             }
             let eligible = self.port_eligible(&key, now);
+            // A retained flow-state continuation belongs to this exact startable port. Once the
+            // connection or any other eligibility gate disappears it cannot keep a release-edge
+            // promise: dropping the ticket returns an already-granted promise to the next actor
+            // immediately, while the parked Flow remains the port's work for a later reconnect.
+            if !eligible {
+                self.bounded_sync.cancel_pool_admission(room, peer);
+            }
             if let Some(p) = self.ports.get(&key) {
                 let wants = p.needs()
                     || self.bounded_sync.needs_port(key.0, key.1)

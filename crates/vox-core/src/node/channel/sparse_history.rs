@@ -1366,7 +1366,9 @@ impl ChannelState {
             let mut deferred = false;
             let mut unavailable = false;
             if settled && kind == SignedEntryKind::Content {
-                self.track_body_into(&mut batch, hash, log, now.get())?;
+                // Settlement can precede a selected Content body. Its sealed source time is the
+                // retention origin; a later refill must not make an old body young again.
+                self.track_known_body_into(&mut batch, entry, log)?;
                 match self.render_content_into(
                     &mut batch,
                     entry.skeleton.author_id,

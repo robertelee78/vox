@@ -689,7 +689,7 @@ impl Controller {
         );
     }
 
-    fn cancel_pool_admission(&mut self, room: Digest32, peer: Digest32) {
+    pub(super) fn cancel_pool_admission(&mut self, room: Digest32, peer: Digest32) {
         self.pool_admission.remove(&(room, peer));
     }
 
