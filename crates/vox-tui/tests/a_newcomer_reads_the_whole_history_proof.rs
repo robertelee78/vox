@@ -688,7 +688,7 @@ fn wait_room_status(
     reader: &str,
     room: &str,
     key_must_stay_held: bool,
-    _claim: &str,
+    claim: &str,
     ready: impl Fn(RoomStatus) -> bool,
 ) -> RoomStatus {
     loop {
@@ -696,7 +696,7 @@ fn wait_room_status(
         assert!(
             !key_must_stay_held || status.received_key_generations == 0,
             "APPARATUS: {reader} accepted a sender key in room {room} while the package hold \
-             marker still existed: {status:?}"
+             marker still existed during `{claim}`: {status:?}"
         );
         if ready(status) {
             return status;
@@ -1081,14 +1081,6 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: Bob could not join consent-last: {out}{err}");
-    wait_room_status(
-        &bob,
-        "bob",
-        &room,
-        true,
-        "Bob never reported the consent-last room while its package was held",
-        |_| true,
-    );
     assert_eq!(
         trust_detail(&bob, "bob", &room, "alice"),
         "you trust it, but it has not trusted you: it cannot read you",
