@@ -311,24 +311,108 @@ impl ChannelState {
         read.history_head(&id)
     }
 
-    /// Durability debt for the exact live flow which created this author's current applied tip.
-    /// A head from another lane, an unapplied/source-only head, or a superseded tip has no claim
-    /// on that owner's debt.
-    pub(crate) fn received_debt_for_current(
-        &self,
+    /// Durability debts for every exact live flow which contributed a semantic effect for this
+    /// author's current history. Source-only work never enters this set. Each returned token
+    /// retains its creating Arc identity; no same-room lane can substitute for it.
+    pub(crate) fn received_debts_for_current(
+        &mut self,
         store: &Store,
         author: &Digest32,
-    ) -> Result<Option<crate::node::store::ReceivedDebt>> {
-        let Some((owned_tip, owner)) = self.received_tip_owners.get(author) else {
-            return Ok(None);
+    ) -> Result<Vec<crate::node::store::ReceivedDebt>> {
+        let Some(owners) = self.received_tip_owners.remove(author) else {
+            return Ok(Vec::new());
         };
-        let Some(current) = self.history_read(store)?.history_settled_tip(author)? else {
-            return Ok(None);
-        };
-        if current.entry_hash() != *owned_tip {
-            return Ok(None);
+        let mut owners = owners.into_iter();
+        let mut pending = Vec::new();
+        let mut debts = Vec::new();
+        while let Some(owner) = owners.next() {
+            match owner.debt(store) {
+                Ok(Some(debt)) => {
+                    pending.push(owner);
+                    debts.push(debt);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    pending.push(owner);
+                    pending.extend(owners);
+                    self.received_tip_owners.insert(*author, pending);
+                    return Err(error);
+                }
+            }
         }
-        store.received_debt(owner)
+        if !pending.is_empty() {
+            self.received_tip_owners.insert(*author, pending);
+        }
+        Ok(debts)
+    }
+
+    /// Record one semantic receive under the exact flow which committed it. Repeated effects in
+    /// one bounded flow share one Store debt, so retain one Arc capability per author/flow.
+    pub(super) fn record_received_semantic_owner(
+        &mut self,
+        store: &Store,
+        author: Digest32,
+        owner: &crate::node::store::ReceivedFlow,
+    ) -> Result<()> {
+        // Terminal flow settlement often covers an earlier owner before this author is served.
+        // Prune those stale Arcs at the next semantic commit so a never-served author retains only
+        // concurrently live debts, not one handle per historical sync.
+        drop(self.received_debts_for_current(store, &author)?);
+        if owner.debt(store)?.is_none() {
+            return Ok(());
+        }
+        let owners = self.received_tip_owners.entry(author).or_default();
+        if !owners.iter().any(|known| known.same_owner(owner)) {
+            owners.push(owner.clone());
+        }
+        Ok(())
+    }
+
+    /// Sparse publication's semantic boundary. The proof marker identifies this exact source
+    /// entry and creating transaction; the isolated mutant removes only the owner publication.
+    pub(super) fn record_sparse_received_semantic_owner(
+        &mut self,
+        _store: &Store,
+        author: Digest32,
+        _hash: Digest32,
+        owner: &crate::node::store::ReceivedFlow,
+    ) -> Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if let Some(gate) = std::env::var_os("VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE") {
+            let gate = std::path::PathBuf::from(gate);
+            let armed = std::fs::read_to_string(&gate).unwrap_or_default();
+            let mut fields = armed.split_whitespace();
+            let room = fields.next().unwrap_or_default();
+            let _peer = fields.next();
+            let expected = fields.next().unwrap_or_default();
+            if fields.next().is_none()
+                && room == crate::node::link::b32_encode(&self.channel_id)
+                && expected == crate::node::link::b32_encode(&_hash)
+            {
+                let transaction = owner
+                    .debt(_store)?
+                    .ok_or(Error::MalformedAtRest("sparse semantic owner has no debt"))?
+                    .transaction();
+                std::fs::write(
+                    gate.with_extension("sparse-owner-reached"),
+                    format!(
+                        "{} {} {} {transaction}\n",
+                        room,
+                        crate::node::link::b32_encode(&author),
+                        expected
+                    ),
+                )
+                .map_err(|error| Error::Storage {
+                    op: "mark sparse received owner boundary",
+                    detail: error.to_string(),
+                })?;
+            }
+        }
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("sparse-owner-not-recorded") {
+            return Ok(());
+        }
+        self.record_received_semantic_owner(_store, author, owner)
     }
 
     pub(crate) fn history_context(
@@ -894,7 +978,15 @@ impl ChannelState {
             Ok((rendered, refill_pending, staged_deferred, body_unavailable))
         })();
         let (rendered, refill_pending, projection_deferred, body_unavailable) = match applied {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                self.record_sparse_received_semantic_owner(
+                    store,
+                    entry.skeleton.author_id,
+                    *hash,
+                    received,
+                )?;
+                outcome
+            }
             Err(error) => {
                 self.poison(&error);
                 return Err(error);
@@ -1092,7 +1184,17 @@ impl ChannelState {
             })
         })();
         match applied {
-            Ok(progress) => Ok(progress),
+            Ok(progress) => {
+                if settled {
+                    self.record_sparse_received_semantic_owner(
+                        store,
+                        entry.skeleton.author_id,
+                        hash,
+                        received,
+                    )?;
+                }
+                Ok(progress)
+            }
             Err(error) => {
                 self.poison(&error);
                 Err(error)

@@ -422,15 +422,82 @@ impl Source {
 }
 
 impl Source {
-    /// Flush the exact received transaction fenced by the room snapshot which is about to be
-    /// acknowledged. The debt and advertised head are captured under the same room lock; neither
-    /// a stale source nor a later flow in this room can substitute its bytes for that snapshot.
+    /// Flush every exact received transaction fenced by the room snapshot which is about to be
+    /// acknowledged. The debts and advertised head are captured under the same room lock;
+    /// neither a stale source nor a later flow in this room can substitute its bytes for that
+    /// snapshot.
     pub(super) async fn flush_received_before_ack(
         &self,
         debts: Vec<ReceivedDebt>,
         _boundary: Option<Digest32>,
     ) -> Result<()> {
         if debts.is_empty() {
+            #[cfg(feature = "test-knobs")]
+            if std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("sparse-owner-not-recorded") {
+                if let (Some((gate, expected)), Some(boundary)) =
+                    (self.received_ack_probe(), _boundary)
+                {
+                    if crate::node::link::b32_encode(&boundary) == expected {
+                        let staged = std::fs::read_to_string(gate.with_extension("reached"))
+                            .map_err(|error| Error::Storage {
+                                op: "read sparse owner mutant boundary",
+                                detail: error.to_string(),
+                            })?;
+                        let mut fields = staged.split_whitespace();
+                        let room = crate::node::link::b32_encode(&self.room_id);
+                        let peer = crate::node::link::b32_encode(&self.peer);
+                        let staged_room = fields.next().unwrap_or_default();
+                        let staged_peer = fields.next().unwrap_or_default();
+                        let transaction = fields
+                            .next()
+                            .and_then(|field| field.parse::<u64>().ok())
+                            .filter(|transaction| *transaction > 0);
+                        if staged_room != room
+                            || staged_peer != peer
+                            || transaction.is_none()
+                            || fields.next().is_some()
+                        {
+                            return Err(Error::MalformedAtRest(
+                                "sparse owner mutant boundary differs from exact flow",
+                            ));
+                        }
+                        let Some(transaction) = transaction else {
+                            return Err(Error::MalformedAtRest(
+                                "sparse owner mutant transaction missing",
+                            ));
+                        };
+                        let store = Arc::clone(&self.store);
+                        let room_id = self.room_id;
+                        let peer_id = self.peer;
+                        tokio::task::spawn_blocking(move || {
+                            store.hold_unowned_received_ack(
+                                transaction,
+                                || {
+                                    std::fs::write(
+                                        gate.with_extension("ack-reached"),
+                                        format!("{room} {peer} {transaction} {expected}\n"),
+                                    )
+                                    .map_err(|error| {
+                                        Error::Storage {
+                                            op: "mark omitted sparse-owner acknowledgement",
+                                            detail: error.to_string(),
+                                        }
+                                    })
+                                },
+                                || {
+                                    crate::node::store::hold_after_received_flow_transaction(
+                                        transaction,
+                                        room_id,
+                                        peer_id,
+                                    )
+                                },
+                            )
+                        })
+                        .await
+                        .map_err(|_| Error::Unreachable("history flush worker stopped"))??;
+                    }
+                }
+            }
             return Ok(());
         }
         let store = Arc::clone(&self.store);
@@ -508,7 +575,7 @@ impl Source {
                     let page_debts = if !exact_head_probe {
                         page.heads
                             .iter()
-                            .map(|hint| room.received_debt_for_current(store, &hint.author))
+                            .map(|hint| room.received_debts_for_current(store, &hint.author))
                             .collect::<Result<Vec<_>>>()?
                             .into_iter()
                             .flatten()

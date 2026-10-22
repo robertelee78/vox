@@ -1009,6 +1009,63 @@ struct ReadMarkScan {
     started: ReadMarkEligibility,
 }
 
+/// Memory-only exact capabilities for receive flows whose terminal durability settlement failed.
+/// The Store retains the corresponding pending owner, but deliberately offers no room-only way
+/// to recover it: this registry is what keeps the creating Arc available for a later exact retry.
+#[derive(Default)]
+struct ReceivedRetries(std::sync::Mutex<Vec<ReceivedFlow>>);
+
+impl ReceivedRetries {
+    fn retain(&self, owner: ReceivedFlow) {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("legacy-retry-owner-dropped") {
+            // Isolated mutant: omit only the exact capability retained after terminal
+            // settlement failure. The Store's pending Arc remains inaccessible by room id.
+            return;
+        }
+        let mut owners = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !owners.iter().any(|known| known.same_owner(&owner)) {
+            owners.push(owner);
+        }
+    }
+
+    fn remove(&self, owner: &ReceivedFlow) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|known| !known.same_owner(owner));
+    }
+
+    fn retry(&self, store: &Store) -> Result<()> {
+        let owners = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut owners = owners.into_iter();
+        while let Some(owner) = owners.next() {
+            let settled = owner.debt(store).and_then(|debt| {
+                debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
+            });
+            match settled {
+                Ok(()) => self.remove(&owner),
+                Err(error) => {
+                    self.retain(owner);
+                    for owner in owners {
+                        self.retain(owner);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
     channel_id: Digest32,
@@ -1061,10 +1118,15 @@ pub struct ChannelState {
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
     held: BTreeMap<Digest32, u64>,
-    /// Latest semantically applied tip created by each live receive flow. This is memory-only:
-    /// its Arc capability lets an acknowledgement capture only the exact flow which committed
-    /// the advertised tip, never another lane selected merely by room id.
-    received_tip_owners: BTreeMap<Digest32, (Digest32, ReceivedFlow)>,
+    /// Every live receive flow which committed a semantic effect for an author. This is
+    /// memory-only: each Arc capability lets an acknowledgement capture that exact flow's
+    /// still-pending debt, never another lane selected merely by room id. A later durable
+    /// frontier removes covered owners when the acknowledgement next snapshots this set.
+    received_tip_owners: BTreeMap<Digest32, Vec<ReceivedFlow>>,
+    /// Exact owners whose terminal settlement failed. This registry is separate from the room
+    /// mutex so a session can retain its capability after releasing the room, even when another
+    /// lane presently owns that mutex. The next room session retries them before doing work.
+    received_retries: Arc<ReceivedRetries>,
     /// Last missing-body position examined by `owed_wants`, including ineligible positions.
     /// The next session resumes after it and wraps, so unavailable bodies cannot starve others.
     owed_asked_to: Option<(Digest32, u64)>,
@@ -1954,6 +2016,7 @@ impl ChannelState {
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
             received_tip_owners: BTreeMap::new(),
+            received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
@@ -2647,6 +2710,7 @@ impl ChannelState {
             private_sessions: private_session::PrivateSessions::default(),
             held,
             received_tip_owners: BTreeMap::new(),
+            received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: match restart
@@ -2911,6 +2975,7 @@ impl ChannelState {
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
             received_tip_owners: BTreeMap::new(),
+            received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
@@ -6271,9 +6336,13 @@ impl ChannelState {
         now: crate::time::Ms,
     ) -> Result<SyncOutcome> {
         let now_ms = now.get();
+        let retry = self.received_retries.retry(store);
         if self.poisoned {
+            // The first persist/absorption failure remains the room's diagnosis. A later retry
+            // failure cannot relabel it, and the exact owner remains in `received_retries`.
             return Err(self.save_failure());
         }
+        retry?;
         // Per-author heads before the session, so the new entries can be found after.
         let before: BTreeMap<Digest32, u64> = self
             .authors
@@ -6306,8 +6375,24 @@ impl ChannelState {
         let settled = received.debt(store).and_then(|debt| {
             debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
         });
-        settled?;
-        let mut out = absorbed?;
+        if settled.is_err() {
+            self.received_retries.retain(received.clone());
+            // One immediate retry handles a transient terminal flush refusal. If it also fails,
+            // `ReceivedRetries::retry` puts the exact owner back for the next session.
+            let _ = self.received_retries.retry(store);
+        } else {
+            self.received_retries.remove(&received);
+        }
+        let mut out = match absorbed {
+            Ok(out) => {
+                settled?;
+                out
+            }
+            // If both operations failed, return the original absorption error. The settlement
+            // error has retained its exact retry capability above and must not replace the cause
+            // which poisoned the room.
+            Err(error) => return Err(error),
+        };
         if let Ok(n) = session {
             out.applied = n;
         }
@@ -6782,7 +6867,54 @@ impl ChannelState {
         // An entry that arrived may be a parent others named before it: rows move.
         self.settle_display_order(store)?;
         if let Some(tips) = received_tips {
-            self.received_tip_owners.extend(tips);
+            #[cfg(feature = "test-knobs")]
+            let retry_failure = if let Some(gate) =
+                std::env::var_os("VOX_TEST_FX30_LEGACY_RETRY_FILE").map(std::path::PathBuf::from)
+            {
+                let armed = std::fs::read_to_string(&gate).unwrap_or_default();
+                let mut fields = armed.split_whitespace();
+                let expected_room = fields.next().unwrap_or_default();
+                let expected_entry = fields.next().unwrap_or_default();
+                let exact = fields.next().is_none()
+                    && expected_room == crate::node::link::b32_encode(&self.channel_id);
+                if exact && !gate.with_extension("absorption-failed").exists() {
+                    tips.values()
+                        .find(|(hash, _)| crate::node::link::b32_encode(hash) == expected_entry)
+                        .map(|(hash, owner)| (gate, *hash, owner.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            for (author, (_, owner)) in &tips {
+                self.record_received_semantic_owner(store, *author, owner)?;
+            }
+            #[cfg(feature = "test-knobs")]
+            if let Some((gate, hash, owner)) = retry_failure {
+                let transaction = owner
+                    .debt(store)?
+                    .ok_or(Error::MalformedAtRest(
+                        "legacy retry stage has no received debt",
+                    ))?
+                    .transaction();
+                std::fs::write(
+                    gate.with_extension("absorption-failed"),
+                    format!(
+                        "{} {} {transaction}\n",
+                        crate::node::link::b32_encode(&self.channel_id),
+                        crate::node::link::b32_encode(&hash)
+                    ),
+                )
+                .map_err(|error| Error::Storage {
+                    op: "mark legacy absorption failure boundary",
+                    detail: error.to_string(),
+                })?;
+                return Err(Error::Storage {
+                    op: "stage legacy post-commit absorption failure",
+                    detail: "test-knobs exact post-commit boundary".into(),
+                });
+            }
         }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
@@ -6821,29 +6953,35 @@ impl ChannelState {
     ) -> SessionReport {
         let now_ms = now.get();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let (epoch, channel_id) = loop {
+        let (epoch, channel_id, received_retries, poisoned, keys_open) = loop {
             if fence.is_retired() || std::time::Instant::now() >= deadline {
                 return SessionReport::failed(SyncFailure::Session(
                     crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
                 ));
             }
             if let Ok(ch) = shared.try_lock() {
-                if ch.poisoned {
-                    return SessionReport::failed(SyncFailure::Poisoned(
-                        ch.save_failure().to_string(),
-                    ));
-                }
-                if ch.sek.key_bytes().is_err() {
-                    return SessionReport::failed(SyncFailure::Session(
-                        crate::log::sync::SessionError::Local(
-                            crate::wire::WireError::TransportFailed,
-                        ),
-                    ));
-                }
-                break (ch.epoch, ch.channel_id);
+                break (
+                    ch.epoch,
+                    ch.channel_id,
+                    Arc::clone(&ch.received_retries),
+                    ch.poisoned.then(|| ch.save_failure().to_string()),
+                    ch.sek.key_bytes().is_ok(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
+        let retry = received_retries.retry(store);
+        if let Some(error) = poisoned {
+            return SessionReport::failed(SyncFailure::Poisoned(error));
+        }
+        if let Err(error) = retry {
+            return SessionReport::failed(SyncFailure::Poisoned(error.to_string()));
+        }
+        if !keys_open {
+            return SessionReport::failed(SyncFailure::Session(
+                crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
+            ));
+        }
         let room = ChannelSessionRoom {
             shared,
             store,
@@ -6854,6 +6992,7 @@ impl ChannelState {
             on_stored,
             legacy,
             received: ReceivedFlow::new(channel_id),
+            received_retries,
             observe_tip: std::cell::Cell::new(None),
             deadline,
             out: std::cell::RefCell::new(SyncOutcome::default()),
@@ -6905,9 +7044,8 @@ impl ChannelState {
                 match cleanup {
                     Ok(_) => {}
                     Err(error) => {
-                        ch.poisoned = true;
-                        ch.save_error = Some(error.to_string());
-                        *room.fatal.borrow_mut() = Some(error);
+                        ch.poison(&error);
+                        room.remember_fatal(error);
                     }
                 }
             }
@@ -6915,14 +7053,29 @@ impl ChannelState {
         let debt = match room.received.debt(store) {
             Ok(debt) => debt,
             Err(error) => {
-                *room.fatal.borrow_mut() = Some(error);
+                room.received_retries.retain(room.received.clone());
+                room.remember_fatal(error);
                 None
             }
         };
         if let Some(debt) = debt {
+            let observed = debt.clone();
             if let Err(error) = store.flush_received_through(debt) {
-                *room.fatal.borrow_mut() = Some(error);
+                room.received_retries.retain(room.received.clone());
+                room.remember_fatal(error);
+                // Retry through the retained registry, not the still-in-scope local handle. The
+                // isolated mutant removes that retention and therefore cannot be rescued here.
+                let _ = room.received_retries.retry(store);
+                if let Err(error) =
+                    crate::node::store::mark_received_retry_observed(&observed, channel_id, peer)
+                {
+                    room.remember_fatal(error);
+                }
+            } else {
+                room.received_retries.remove(&room.received);
             }
+        } else if room.fatal.borrow().is_none() {
+            room.received_retries.remove(&room.received);
         }
         let fatal = room.fatal.take();
         SessionReport::from_room(room.out.into_inner(), session, fatal)
@@ -9827,6 +9980,7 @@ struct ChannelSessionRoom<'a> {
     on_stored: &'a dyn Fn(),
     legacy: Option<LegacySync>,
     received: ReceivedFlow,
+    received_retries: Arc<ReceivedRetries>,
     observe_tip: std::cell::Cell<Option<crate::log::sync::LegacyGap>>,
     deadline: std::time::Instant,
     out: std::cell::RefCell<SyncOutcome>,
@@ -9835,6 +9989,16 @@ struct ChannelSessionRoom<'a> {
 }
 
 impl ChannelSessionRoom<'_> {
+    /// Keep the first local error: it is the operation which stopped semantic absorption. A
+    /// later cleanup or durability-settlement failure retains its retry owner separately and
+    /// cannot overwrite that causal diagnosis.
+    fn remember_fatal(&self, error: Error) {
+        let mut fatal = self.fatal.borrow_mut();
+        if fatal.is_none() {
+            *fatal = Some(error);
+        }
+    }
+
     fn room(
         &self,
     ) -> std::result::Result<tokio::sync::MutexGuard<'_, ChannelState>, crate::wire::WireError>
@@ -10012,7 +10176,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             }
             Err(error) => {
                 room.poison(&error);
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 return Err(crate::wire::WireError::TransportFailed);
             }
         };
@@ -10038,13 +10202,12 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         ) {
             Ok(entries) => Ok(entries),
             Err(error) if session_projection::floor_index::refreshing(&error) => {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 Err(crate::wire::WireError::TransportFailed)
             }
             Err(error) => {
-                room.poisoned = true;
-                room.save_error = Some(error.to_string());
-                *self.fatal.borrow_mut() = Some(error);
+                room.poison(&error);
+                self.remember_fatal(error);
                 Err(crate::wire::WireError::TransportFailed)
             }
         }
@@ -10098,7 +10261,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                         }
                         Err(error) => {
                             ch.poison(&error);
-                            *self.fatal.borrow_mut() = Some(error);
+                            self.remember_fatal(error);
                             return crate::log::sync::ApplyReport {
                                 fail: Some(crate::wire::WireError::TransportFailed),
                                 ..crate::log::sync::ApplyReport::default()
@@ -10111,7 +10274,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         let legacy_state = match ch.legacy_provisional_state(self.store) {
             Ok(state) => state,
             Err(error) => {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 return crate::log::sync::ApplyReport {
                     fail: Some(crate::wire::WireError::TransportFailed),
                     ..crate::log::sync::ApplyReport::default()
@@ -10130,7 +10293,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             let accepted = match accepted {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    *self.fatal.borrow_mut() = Some(error);
+                    self.remember_fatal(error);
                     return crate::log::sync::ApplyReport {
                         fail: Some(crate::wire::WireError::TransportFailed),
                         ..Default::default()
@@ -10202,7 +10365,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             Ok(batch) => batch,
             Err(error) => {
                 ch.poison(&error);
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 return crate::log::sync::ApplyReport {
                     fail: Some(crate::wire::WireError::TransportFailed),
                     ..crate::log::sync::ApplyReport::default()
@@ -10277,20 +10440,19 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             Err(error) => (crate::log::sync::ApplyReport::default(), Some(error)),
         };
         if let Some(error) = local {
-            ch.poisoned = true;
-            ch.save_error = Some(error.to_string());
-            *self.fatal.borrow_mut() = Some(error);
+            ch.poison(&error);
+            self.remember_fatal(error);
             report.stored = 0;
             report.fail = Some(crate::wire::WireError::TransportFailed);
             // Fork evidence remains independently durable even when unpublished log work fails.
             if let Err(error) = ch.keep_forks(self.store) {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
             }
             return report;
         }
         if self.legacy.is_some() {
             if let Err(error) = ch.keep_forks(self.store) {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 report.fail = Some(crate::wire::WireError::TransportFailed);
             }
             // Exact staging and any witness cursor are durable. Publication/effects are
@@ -10303,7 +10465,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 // Current overlap may discover a fork, but cannot refill or maintain the
                 // mutable roots owned by an explicit legacy publication.
                 if let Err(error) = ch.keep_forks(self.store) {
-                    *self.fatal.borrow_mut() = Some(error);
+                    self.remember_fatal(error);
                     report.fail = Some(crate::wire::WireError::TransportFailed);
                 }
                 report.stored = 0;
@@ -10312,7 +10474,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             Ok(false) => {}
             Err(error) => {
                 ch.poison(&error);
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 report.fail = Some(crate::wire::WireError::TransportFailed);
                 return report;
             }
@@ -10336,9 +10498,8 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             }
         }
         if let Err(error) = ch.filter_received_session_bodies(self.store, &staged, self.now_ms) {
-            ch.poisoned = true;
-            ch.save_error = Some(error.to_string());
-            *self.fatal.borrow_mut() = Some(error);
+            ch.poison(&error);
+            self.remember_fatal(error);
             report.stored = 0;
             report.fail = Some(crate::wire::WireError::TransportFailed);
             return report;
@@ -10351,7 +10512,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 out.refused += got.refused;
             }
             Err(e) => {
-                *self.fatal.borrow_mut() = Some(e);
+                self.remember_fatal(e);
                 report.fail = Some(crate::wire::WireError::TransportFailed);
             }
         }

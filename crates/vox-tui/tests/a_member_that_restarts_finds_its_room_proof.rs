@@ -85,8 +85,10 @@
 //!   mutations make the trust, Session, received key, own-entry and acknowledged-received-entry
 //!   durability promises red at (1), (2), (3), (4) and (5), respectively; each mutation changes
 //!   only the persistence path for the promise whose product assertion it must trip. The two
-//!   receive-specific executable mutants are `VOX_FX30_MUTANT=received-key-not-durable` and
-//!   `VOX_FX30_MUTANT=received-ack-not-flushed`; each reaches its own labelled PRODUCT verdict.
+//!   receive-specific executable mutants are `VOX_FX30_MUTANT=received-key-not-durable`,
+//!   `VOX_FX30_MUTANT=received-ack-not-flushed` and
+//!   `VOX_FX30_MUTANT=sparse-owner-not-recorded`, and
+//!   `VOX_FX30_MUTANT=legacy-retry-owner-dropped`; each reaches its own labelled PRODUCT verdict.
 
 #![cfg(unix)]
 
@@ -632,6 +634,7 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
         "VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE",
         "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+        "VOX_TEST_FX30_LEGACY_RETRY_FILE",
         "VOX_TEST_FX30_MUTANT",
     ]);
     let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
@@ -641,8 +644,13 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     let received_flush_hold = t.path().join("hold-received-flow-flush");
     let received_flush_reached = received_flush_hold.with_extension("reached");
     let received_ack_reached = received_flush_hold.with_extension("ack-reached");
+    let sparse_owner_reached = received_flush_hold.with_extension("sparse-owner-reached");
     let ack_decision_hold = t.path().join("hold-after-ack-flush-decision");
     let ack_decision_reached = ack_decision_hold.with_extension("reached");
+    let legacy_retry = t.path().join("legacy-retry");
+    let legacy_absorption_failed = legacy_retry.with_extension("absorption-failed");
+    let legacy_settlement_failed = legacy_retry.with_extension("settlement-failed");
+    let legacy_retry_observed = legacy_retry.with_extension("retry-observed");
     let durable_flow_hold = t.path().join("hold-after-received-flow-flush");
     let durable_flow_reached = durable_flow_hold.with_extension("reached");
     let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
@@ -650,7 +658,10 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
     assert!(
         mutant.as_deref().is_none_or(|mode| matches!(
             mode,
-            "received-key-not-durable" | "received-ack-not-flushed"
+            "received-key-not-durable"
+                | "received-ack-not-flushed"
+                | "sparse-owner-not-recorded"
+                | "legacy-retry-owner-dropped"
         )),
         "APPARATUS: VOX_FX30_MUTANT names no exact FX-30 mutant: {mutant:?}"
     );
@@ -678,8 +689,17 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
             "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
             ack_decision_hold.to_string_lossy().into_owned(),
         ),
+        (
+            "VOX_TEST_FX30_LEGACY_RETRY_FILE",
+            legacy_retry.to_string_lossy().into_owned(),
+        ),
     ];
-    if mutant.as_deref() == Some("received-ack-not-flushed") {
+    if matches!(
+        mutant.as_deref(),
+        Some(
+            "received-ack-not-flushed" | "sparse-owner-not-recorded" | "legacy-retry-owner-dropped"
+        )
+    ) {
         bob_env.push(("VOX_TEST_FX30_MUTANT", mutant.clone().unwrap()));
     }
     let (alice, alice_fp) = identity(t.path(), "alice");
@@ -932,6 +952,95 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "(4) own posts were the last write",
     );
 
+    // ---- terminal absorption+settlement failure retains its exact retry owner ----------------
+    // Stop Bob before the post so the gate can name the exact shipped entry. The apparatus then
+    // fails after semantic absorption committed and fails that flow's first terminal settlement.
+    // Production retries solely through the retained Arc registry; the mutant drops that Arc.
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let retry_text = "received through a failed terminal settlement";
+    post(&alice, &room, retry_text);
+    let retry_local_at = Instant::now();
+    let retry_entry = loop {
+        if let Some((_, _, entry)) = held_on(&alice, &room, retry_text) {
+            break entry;
+        }
+        assert!(
+            retry_local_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: alice's accepted retry-stage post did not appear in her shipped read"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::write(&legacy_retry, format!("{room} {retry_entry}\n"))
+        .expect("APPARATUS: cannot arm the exact absorption/settlement failure boundary");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    let retry_stage_at = Instant::now();
+    while !legacy_absorption_failed.exists()
+        || !legacy_settlement_failed.exists()
+        || !legacy_retry_observed.exists()
+    {
+        assert!(
+            retry_stage_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, bob did not cross the exact post-commit \
+             absorption failure, pre-flush settlement failure, and retained-owner retry boundary"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let absorbed_marker = std::fs::read_to_string(&legacy_absorption_failed)
+        .expect("APPARATUS: cannot read the absorption-failure marker");
+    let settled_marker = std::fs::read_to_string(&legacy_settlement_failed)
+        .expect("APPARATUS: cannot read the settlement-failure marker");
+    let retried_marker = std::fs::read_to_string(&legacy_retry_observed)
+        .expect("APPARATUS: cannot read the retained-owner retry marker");
+    let marker_transaction = |marker: &str, expected_middle: &str| {
+        let fields = marker.split_whitespace().collect::<Vec<_>>();
+        assert!(
+            fields.len() == 3 && fields[0] == room && fields[1] == expected_middle,
+            "APPARATUS: malformed exact retry marker: {marker:?}"
+        );
+        fields[2]
+            .parse::<u64>()
+            .expect("APPARATUS: retry marker transaction is not an integer")
+    };
+    let absorption_transaction = marker_transaction(&absorbed_marker, &retry_entry);
+    let settlement_transaction = marker_transaction(&settled_marker, &retry_entry);
+    let retry_transaction = marker_transaction(&retried_marker, &alice_fp);
+    assert!(
+        absorption_transaction == settlement_transaction
+            && settlement_transaction == retry_transaction,
+        "APPARATUS: absorption, settlement and retry did not name the same exact flow transaction: \
+         {absorbed_marker:?}, {settled_marker:?}, {retried_marker:?}"
+    );
+    // Alice cannot re-offer the row to the restarted image and rescue the omitted-owner mutant.
+    let alice_pid = alice_d.0.id();
+    signal(alice_pid, rustix::process::Signal::STOP, true);
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let bob_retry_crash = t.path().join("bob-retry-crash");
+    copy_dir(&bob, &bob_retry_crash);
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    drop(bob_d);
+    std::fs::remove_file(&legacy_retry)
+        .expect("APPARATUS: cannot clear the absorption/settlement failure gate");
+    let bob_d = daemon(
+        &bob_retry_crash,
+        "bob-after-retry",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &bob_at,
+        &bob_env,
+    );
+    let bob = bob_retry_crash;
+    assert!(
+        room_answers(&bob, &room, APPARATUS_WATCHDOG),
+        "APPARATUS: bob's room did not answer from the exact terminal-retry crash image"
+    );
+    assert!(
+        read(&bob, &room).iter().any(|row| row == retry_text),
+        "PRODUCT [FX30 legacy-retry]: a semantically received post was lost after absorption and \
+         settlement both failed, so the exact creating owner was not retained for retry \
+         (ADR-038 FX-30, #1022)"
+    );
+    signal(alice_pid, rustix::process::Signal::CONT, false);
+
     // ---- (5) a post bob's node said it holds, last before bob's SIGKILL ------------------------
     let exact_received_flow = format!("{room} {alice_fp}");
     // Stop Bob before Alice commits the post, so no inventory or head response can acknowledge
@@ -983,6 +1092,33 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
             && flow_fields.next().is_none(),
         "APPARATUS: the parked received-flow flush was not alice's exact nonzero transaction in \
          this room: expected `{exact_received_flow} <transaction>`, got {marked_flow:?}"
+    );
+    let sparse_at = Instant::now();
+    while !sparse_owner_reached.exists() {
+        assert!(
+            sparse_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, bob did not publish alice's exact sparse \
+             semantic owner, so the sparse ACK-ownership boundary was not staged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sparse_marker = std::fs::read_to_string(&sparse_owner_reached)
+        .expect("APPARATUS: cannot read bob's sparse semantic-owner marker");
+    let mut sparse_fields = sparse_marker.split_whitespace();
+    let sparse_room = sparse_fields.next().unwrap_or_default();
+    let sparse_author = sparse_fields.next().unwrap_or_default();
+    let sparse_entry = sparse_fields.next().unwrap_or_default();
+    let sparse_transaction = sparse_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        sparse_room == room
+            && sparse_author == alice_fp
+            && sparse_entry == acked_entry
+            && sparse_transaction == flow_transaction
+            && sparse_fields.next().is_none(),
+        "APPARATUS: bob's sparse semantic owner was not alice's exact parked entry/transaction: \
+         flow {marked_flow:?}, sparse owner {sparse_marker:?}"
     );
     let decision_at = Instant::now();
     while !ack_decision_reached.exists() {
@@ -1098,9 +1234,14 @@ fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
         "(5) an acknowledged received post was the last write",
     );
     let his = read(&bob, &room);
+    let received_claim = if mutant.as_deref() == Some("sparse-owner-not-recorded") {
+        "FX30 sparse-owner"
+    } else {
+        "FX30 received-ack"
+    };
     assert!(
         his.iter().any(|t| t == "acked"),
-        "PRODUCT [FX30 received-ack]: a post bob's node had acknowledged holding (alice's row showed held on 1 \
+        "PRODUCT [{received_claim}]: a post bob's node had acknowledged holding (alice's row showed held on 1 \
          node) was lost by a crash of his daemon (ADR-038 FX-30, #1022): bob reads {his:?}"
     );
     println!("[proof] (5) after the crash bob reads the acknowledged post");

@@ -196,8 +196,8 @@ async fn respond(
                     }) {
                         return Ok(None);
                     }
-                    let debt = room.received_debt_for_current(store, &author)?;
-                    Ok(Some((head, debt, boundary)))
+                    let debts = room.received_debts_for_current(store, &author)?;
+                    Ok(Some((head, debts, boundary)))
                 })
                 .await?;
             let held = match found {
@@ -207,10 +207,8 @@ async fn respond(
             };
             // The head was read; what it covers is on disk before the peer hears of it
             // (ADR-038 FX-30).
-            let (head, debt, boundary) = held.value;
-            source
-                .flush_received_before_ack(debt.into_iter().collect(), boundary)
-                .await?;
+            let (head, debts, boundary) = held.value;
+            source.flush_received_before_ack(debts, boundary).await?;
             let wire = head.to_wire();
             let status = match send(
                 source,

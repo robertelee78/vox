@@ -254,6 +254,15 @@ pub(crate) fn hold_after_received_flow_flush(
     room: Digest32,
     peer: Digest32,
 ) -> Result<()> {
+    hold_after_received_flow_transaction(debt.transaction(), room, peer)
+}
+
+#[cfg(feature = "test-knobs")]
+pub(crate) fn hold_after_received_flow_transaction(
+    transaction: u64,
+    room: Digest32,
+    peer: Digest32,
+) -> Result<()> {
     let Some(gate) = std::env::var_os("VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE") else {
         return Ok(());
     };
@@ -267,7 +276,7 @@ pub(crate) fn hold_after_received_flow_flush(
         return Ok(());
     }
     let reached = gate.with_extension("reached");
-    std::fs::write(&reached, format!("{exact} {}\n", debt.transaction())).map_err(|error| {
+    std::fs::write(&reached, format!("{exact} {transaction}\n")).map_err(|error| {
         Error::Storage {
             op: "mark durable received-flow boundary",
             detail: error.to_string(),
@@ -276,6 +285,55 @@ pub(crate) fn hold_after_received_flow_flush(
     while gate.exists() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    Ok(())
+}
+
+/// Mark the common terminal retry boundary after a settlement failure. The marker says only that
+/// retry processing for the exact transaction completed; the shipped read after a crash supplies
+/// the verdict about whether the retained owner actually made the entry durable.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn mark_received_retry_observed(
+    debt: &ReceivedDebt,
+    room: Digest32,
+    peer: Digest32,
+) -> Result<()> {
+    let Some(gate) = std::env::var_os("VOX_TEST_FX30_LEGACY_RETRY_FILE") else {
+        return Ok(());
+    };
+    let gate = PathBuf::from(gate);
+    let failed =
+        std::fs::read_to_string(gate.with_extension("settlement-failed")).unwrap_or_default();
+    let mut fields = failed.split_whitespace();
+    let failed_room = fields.next().unwrap_or_default();
+    let _entry = fields.next();
+    let transaction = fields.next().and_then(|field| field.parse::<u64>().ok());
+    if failed_room != crate::node::link::b32_encode(&room)
+        || transaction != Some(debt.transaction())
+        || fields.next().is_some()
+    {
+        return Ok(());
+    }
+    std::fs::write(
+        gate.with_extension("retry-observed"),
+        format!(
+            "{} {} {}\n",
+            crate::node::link::b32_encode(&room),
+            crate::node::link::b32_encode(&peer),
+            debt.transaction()
+        ),
+    )
+    .map_err(|error| Error::Storage {
+        op: "mark received retry boundary",
+        detail: error.to_string(),
+    })
+}
+
+#[cfg(not(feature = "test-knobs"))]
+pub(crate) fn mark_received_retry_observed(
+    _debt: &ReceivedDebt,
+    _room: Digest32,
+    _peer: Digest32,
+) -> Result<()> {
     Ok(())
 }
 
@@ -326,6 +384,12 @@ impl ReceivedFlow {
 
     pub(crate) fn debt(&self, store: &Store) -> Result<Option<ReceivedDebt>> {
         store.received_debt(self)
+    }
+
+    /// Whether both handles name the same creating flow. Room equality is deliberately not
+    /// enough: concurrent lanes in one room own independent durability debts.
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
     }
 }
 
@@ -411,6 +475,32 @@ fn open_error(e: redb::DatabaseError) -> Error {
 }
 
 impl Store {
+    /// Test apparatus for the exact omitted-owner mutant. It observes one already-staged pending
+    /// transaction under the Store writer and holds that structural ACK boundary without
+    /// flushing it. Packaged code has no caller or equivalent room-only debt lookup.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn hold_unowned_received_ack(
+        &self,
+        transaction: u64,
+        before: impl FnOnce() -> Result<()>,
+        after: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
+        if epochs.durable_through >= transaction
+            || !epochs
+                .pending
+                .iter()
+                .any(|pending| pending.through == transaction)
+        {
+            return Err(Error::MalformedAtRest(
+                "sparse owner mutant did not retain its exact pending transaction",
+            ));
+        }
+        before()?;
+        after()
+    }
+
     /// Open (creating if absent) the store at `path` **writable**, set the file to `0600`, and
     /// initialize or verify the schema version. A file this build cannot read
     /// (garbage, or a newer schema) is a [`Error::Storage`], never a panic.
@@ -1122,6 +1212,35 @@ impl Store {
         });
         if !owned {
             return Ok(false);
+        }
+        #[cfg(feature = "test-knobs")]
+        if let Some(gate) = std::env::var_os("VOX_TEST_FX30_LEGACY_RETRY_FILE").map(PathBuf::from) {
+            let absorption = std::fs::read_to_string(gate.with_extension("absorption-failed"))
+                .unwrap_or_default();
+            let mut fields = absorption.split_whitespace();
+            let room = fields.next().unwrap_or_default();
+            let entry = fields.next().unwrap_or_default();
+            let transaction = fields.next().and_then(|field| field.parse::<u64>().ok());
+            let settlement = gate.with_extension("settlement-failed");
+            if transaction == Some(debt.transaction())
+                && fields.next().is_none()
+                && !room.is_empty()
+                && !entry.is_empty()
+                && !settlement.exists()
+            {
+                std::fs::write(
+                    &settlement,
+                    format!("{room} {entry} {}\n", debt.transaction()),
+                )
+                .map_err(|error| Error::Storage {
+                    op: "mark received settlement failure boundary",
+                    detail: error.to_string(),
+                })?;
+                return Err(Error::Storage {
+                    op: "stage received settlement failure",
+                    detail: "test-knobs exact pre-flush boundary".into(),
+                });
+            }
         }
         let immediate = before(&debt)?;
         let mut txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
