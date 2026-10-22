@@ -442,9 +442,13 @@ The decider then answered twelve questions, one at a time. His answers are the d
   be taken without waiting), `archive_budget_busy` (an archive port only: the archive-lane job
   could not be reserved), `control_budget_busy` (the control-lane job could not be reserved),
   `live_lane_busy` (the node's live flow slot holds another flow), `no_outbound_slot` (the
-  outbound slot could not be taken) and `flow_state_pool_full` (every charge of the pool is held
-  by a running round); and the boolean `round_running`, true while a bounded-sync round of that
-  port runs. It MUST report the pool under `lanes.budget.flow_state` as the integers `in_use`
+  outbound slot could not be taken), `flow_state_node_busy` (the fingerprint's two source-owned
+  running slots are held across its current and retiring actor generations) and
+  `flow_state_pool_full` (every charge of the daemon pool is held by a running round); and the
+  boolean `round_running`, true while a bounded-sync round of that port runs. A node-busy
+  refusal MUST NOT be reported as pool-full: `flow_state_node_busy` is possible while
+  `in_use < limit`, whereas `flow_state_pool_full` requires `in_use == limit`. It MUST report
+  the pool under `lanes.budget.flow_state` as the integers `in_use`
   and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by
   that node's node ID, whose value is that node's integer in-use count; the member values MUST
   sum to `in_use`; a node's `round_running` values and its own `by_node` member MUST be taken
@@ -453,7 +457,9 @@ The decider then answered twelve questions, one at a time. His answers are the d
   continuation waiting for the exact release edge, any "no completed sync" text shown for that
   room in `vox status` or in the app MUST contain the literal text `flow-state pool`; when no port
   in the room has such a continuation, that text MUST NOT identify the flow-state pool as the
-  cause. Measured cause,
+  cause. Before the stale threshold, that exact retained ownership is already an unhealthy
+  `room-flow-state-pool:<room>` condition: diagnosis MUST name it immediately rather than wait on
+  elapsed time, and MUST NOT attach it to another room. Measured cause,
   2026-10-21 (UTC, as every date in this record): on the decider's daemon (four hosted nodes,
   three rooms, restarted 02:32Z) every port of every node had started no round, `queued` froze,
   every room said "no completed sync in 10 minutes", and posts moved neither between the two

@@ -20904,7 +20904,9 @@ impl Node {
                 unreached_since: self.anchor_unreached_since.get(&id).copied(),
             })
             .collect();
-        report.diagnose();
+        // Reconcile user-visible health with the same actor-owned continuations rendered under
+        // `lanes.bounded.admissions`. A daemon-wide count cannot identify which room is waiting.
+        report.diagnose(&self.bounded_sync.retained_pool_rooms());
         self.storage_health(&mut report);
         if let Some(message) = self
             .session_retirement_error

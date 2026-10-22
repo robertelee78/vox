@@ -716,6 +716,13 @@ impl Controller {
             .is_some_and(|admission| !admission.handed_off)
     }
 
+    /// Rooms whose exact parked Flow is retained until its source-owned release edge. This is
+    /// the actor-owned half of the flow-state snapshot rendered under `lanes`; health diagnosis
+    /// consumes the same ownership rather than inferring a cause from a pool count.
+    pub(super) fn retained_pool_rooms(&self) -> std::collections::BTreeSet<Digest32> {
+        self.pool_admission.keys().map(|(room, _)| *room).collect()
+    }
+
     fn wait_for_pool(
         &mut self,
         next_token: &mut u64,
@@ -2556,16 +2563,19 @@ impl Node {
             }
             refused @ (crate::node::history_stream::runtime::Resumed::PoolFull
             | crate::node::history_stream::runtime::Resumed::NodeBusy) => {
-                let gate = match refused {
-                    crate::node::history_stream::runtime::Resumed::PoolFull => "pool",
-                    crate::node::history_stream::runtime::Resumed::NodeBusy => "node_slots",
+                let (gate, reason) = match refused {
+                    crate::node::history_stream::runtime::Resumed::PoolFull => {
+                        ("pool", "flow_state_pool_full")
+                    }
+                    crate::node::history_stream::runtime::Resumed::NodeBusy => {
+                        ("node_slots", "flow_state_node_busy")
+                    }
                     crate::node::history_stream::runtime::Resumed::Held => unreachable!(),
                 };
-                // Both refusals are impossible under the legal running-work bound. The only
-                // public start gate ADR-038 defines for this retained release-edge path is the
-                // flow-state pool; keep the more specific source-slot cause on its exact
-                // admission owner, not as an undocumented start_reason value.
-                self.note_start(room, peer, "flow_state_pool_full");
+                // Both refusals are impossible under the legal running-work bound, but they are
+                // different first gates. Do not call two occupied source-owned slots a full
+                // daemon pool: operators need the same cause here and on the retained admission.
+                self.note_start(room, peer, reason);
                 // This ordinary admission wait still owns all work consumed while constructing
                 // the Flow: archive dispatch, exact required dependency, or scalar hint. Retain
                 // it in its lane until a running completion releases capacity and wakes the

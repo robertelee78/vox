@@ -44,7 +44,7 @@
 //! `"tunnels"` lists every live tunnel (V210-81): the member, the service, which way it was
 //! opened, and when it was opened and last moved a byte.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -351,9 +351,14 @@ fn short(d: &Digest32) -> String {
     b32_encode(d).chars().take(12).collect()
 }
 
+const RETAINED_POOL_HEALTH: &str = "retained continuation is waiting for the flow-state pool";
+
 impl StatusReport {
-    /// Work out the unhealthy lines from the rest of the report.
-    pub fn diagnose(&mut self) {
+    /// Work out the unhealthy lines from the rest of the report. `retained_pool_rooms` comes
+    /// from the actor's exact retained Flow ownership, not from elapsed time or a full-pool
+    /// guess: a room is attributed to the flow-state pool if and only if it owns one of those
+    /// continuations.
+    pub fn diagnose(&mut self, retained_pool_rooms: &BTreeSet<Digest32>) {
         let mut out = Vec::new();
         for room in &self.rooms {
             let others = room.members.iter().filter(|m| !m.me).count();
@@ -365,15 +370,26 @@ impl StatusReport {
             // having synced in its first seconds, and would otherwise alarm on every start.
             let since = room.last_sync.unwrap_or(self.started);
             let stale = self.now.saturating_sub(since) > STALE_SYNC_MS;
+            let retained_by_pool = retained_pool_rooms.contains(&room.id);
+            let retained_cause = retained_by_pool.then_some(RETAINED_POOL_HEALTH);
             if stale {
                 out.push(Unhealthy {
                     key: format!("room-stale:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): no completed sync in {}",
+                        "room {} ({}): no completed sync in {}{}",
                         short(&room.id),
                         room.name,
-                        stale_words(STALE_SYNC_MS)
+                        stale_words(STALE_SYNC_MS),
+                        retained_cause.map_or_else(String::new, |cause| format!("; {cause}"))
                     ),
+                });
+            } else if let Some(cause) = retained_cause {
+                // A retained continuation is an invariant-pressure condition worth showing now;
+                // waiting ten minutes would hide the product-owned cause that can already be
+                // named exactly. The stale form above uses the same per-room ownership predicate.
+                out.push(Unhealthy {
+                    key: format!("room-flow-state-pool:{}", b32_encode(&room.id)),
+                    message: format!("room {} ({}): {cause}", short(&room.id), room.name),
                 });
             }
             for m in &room.members {

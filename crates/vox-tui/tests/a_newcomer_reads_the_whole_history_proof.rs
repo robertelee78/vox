@@ -1225,14 +1225,33 @@ fn parked_flow_charge_discriminator(staged: &Staged) {
 }
 
 /// The gates a start attempt can end at, in the order the daemon tests them (ADR-038 FX-35).
-const START_REASONS: [&str; 6] = [
+const START_REASONS: [&str; 7] = [
     "room_busy",
     "archive_budget_busy",
     "control_budget_busy",
     "live_lane_busy",
     "no_outbound_slot",
+    "flow_state_node_busy",
     "flow_state_pool_full",
 ];
+
+/// User-visible health messages for this exact room, from one shipped status snapshot.
+#[cfg(feature = "optional-proofs")]
+fn room_health_messages<'a>(status: &'a serde_json::Value, room: &str) -> Vec<&'a str> {
+    let stale = format!("room-stale:{room}");
+    let retained = format!("room-flow-state-pool:{room}");
+    status["unhealthy"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|health| {
+            health["key"]
+                .as_str()
+                .is_some_and(|key| key == stale || key == retained)
+        })
+        .filter_map(|health| health["message"].as_str())
+        .collect()
+}
 
 /// What `vox status --json` must say of every port's last start attempt (ADR-038 FX-35), judged
 /// on one status document of `name`: `start_outcome` is `never_attempted`, `started` or
@@ -1711,7 +1730,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
                     .find(|port| {
                         port["room"] == *room
                             && port["peer"] == *peer
-                            && port["start_reason"] == "flow_state_pool_full"
+                            && port["start_reason"] == "flow_state_node_busy"
                     })?;
                 let _ = port;
                 let admission = bounded["admissions"].as_array()?.iter().find(|admission| {
@@ -1773,6 +1792,25 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
                 "PRODUCT: `vox status --json` did not aggregate the retired and replacement \
                  actor into the same two node slots, or did not account its exact waiter: {}",
                 pool
+            );
+            let retained_room = successors[exact_refusal.0].0;
+            let unrelated_room = successors[1 - exact_refusal.0].0;
+            let retained_health = room_health_messages(&replacement, retained_room);
+            assert!(
+                retained_health
+                    .iter()
+                    .any(|message| message.contains("flow-state pool")),
+                "PRODUCT: {running_name}'s exact retained continuation for {retained_room} is \
+                 absent from the room's shipped health diagnosis: {}",
+                replacement["unhealthy"]
+            );
+            assert!(
+                room_health_messages(&replacement, unrelated_room)
+                    .iter()
+                    .all(|message| !message.contains("flow-state pool")),
+                "PRODUCT: {running_name}'s shipped health diagnosis blamed the flow-state pool \
+                 for unrelated room {unrelated_room}, which has no retained continuation: {}",
+                replacement["unhealthy"]
             );
             break exact_refusal;
         }
@@ -1858,7 +1896,11 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// another terminating PRODUCT state without a scheduling command or tick;
 /// giving a replacement generation two new node slots instead of sharing the retired actor's
 /// source-owned pair prevents the exact NodeBusy verdict and makes the generation assertion
-/// PRODUCT-red (and returning PoolFull names that separate PRODUCT defect); removing the
+/// PRODUCT-red; reporting NodeBusy as PoolFull makes the first-gate/in-use assertion PRODUCT-red;
+/// removing the retained-room health attribution makes that exact room's shipped diagnosis
+/// PRODUCT-red; attributing every open room to the flow-state pool makes the simultaneous
+/// unrelated-room negative diagnosis PRODUCT-red; removing the PoolFull port reason makes the
+/// full-pool admission's first-gate assertion PRODUCT-red; removing the
 /// post-quiet need re-arm leaves the waiting node short of the named `re-armed` posts.
 #[cfg(feature = "optional-proofs")]
 #[test]
@@ -1982,6 +2024,22 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                      shipped status reported unused capacity: {}",
                     shown.status
                 );
+                for (room, peer) in &full_ports {
+                    assert!(
+                        v["lanes"]["ports"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|port| {
+                                port["room"] == *room
+                                    && port["peer"] == *peer
+                                    && port["start_reason"] == "flow_state_pool_full"
+                            }),
+                        "PRODUCT: {name}'s exact pool admission {room}/{peer} did not name the \
+                         first failed gate as flow_state_pool_full: {}",
+                        shown.status
+                    );
+                }
                 pool_full_seen = true;
             }
             if !pressure_staged {
