@@ -1,4 +1,4 @@
-//! One charged, node-owned inventory of pending scalar head hints. Hints carry no authority.
+//! One node-owned inventory of pending scalar head hints. Hints carry no authority or charge.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};

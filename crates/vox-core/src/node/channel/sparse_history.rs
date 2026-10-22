@@ -116,8 +116,8 @@ impl ChannelState {
     }
 
     /// A relevant advertised successor or changed membership incarnation removes the durable
-    /// refusal. The inbox holds only charged pending work; this indexed record is the sole
-    /// refusal state.
+    /// refusal. The inbox holds only charge-free pending scalar hints; this indexed record is the
+    /// sole refusal state.
     pub(crate) fn forget_history_decline(
         &self,
         store: &Store,
