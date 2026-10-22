@@ -420,9 +420,15 @@ impl Node {
                 });
             }
         }
-        if progress.ready {
-            // Discover stale consent from disk a page at a time. A quiet room must finish
-            // this work too; it cannot depend on another join or trust command arriving.
+        if progress.ready
+            && (progress.changed || self.governance_work.consent_after.contains_key(&room))
+        {
+            // A changed governance projection starts one bounded scan for stale consent; its
+            // retained cursor finishes that scan even after the causal change has settled. Do
+            // not restart a completed disk scan merely because unrelated room maintenance still
+            // has work: that made every continuation decrypt the same consent entries again and
+            // could monopolize the actor indefinitely. Reopen performs this scan during room
+            // preparation, and an explicit trust removal narrows the affected member directly.
             match self.revoke_untrusted_consents(&room).await {
                 Ok(more) => self.governance_work.again |= more,
                 Err(error) => {
