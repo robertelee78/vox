@@ -28,6 +28,14 @@ pub(crate) enum HistoryPayload {
     Held { payload_len: u64, bytes: Vec<u8> },
 }
 
+/// Atomic result of persisting one advertised-head refusal. Authorization mismatch is not a
+/// storage error: it carries the fresh generation read by the same batch that fenced the flow's
+/// captured generation.
+pub(crate) enum HistoryDeclineResult {
+    Stored { remembered: bool, current: Digest32 },
+    AuthorizationChanged { current: Digest32 },
+}
+
 impl ChannelState {
     /// The current membership incarnation whose inventory a refusal describes. A leave makes
     /// this absent; a readmission uses the leave position until the member's signed `back`
@@ -80,7 +88,7 @@ impl ChannelState {
         head: Digest32,
         authorization: (Digest32, Digest32),
         committed: &std::sync::atomic::AtomicBool,
-    ) -> Result<bool> {
+    ) -> Result<HistoryDeclineResult> {
         let (node, expected_authorization) = authorization;
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
@@ -107,9 +115,7 @@ impl ChannelState {
             &batch, node, room, instance, epoch,
         )?;
         if current != expected_authorization {
-            return Err(Error::Profile(
-                "history authorization changed before refusal",
-            ));
+            return Ok(HistoryDeclineResult::AuthorizationChanged { current });
         }
         let mut index = self.entries.write(&mut batch, &self.sek, &room)?;
         if index.history_declined_head(&peer, &author)?
@@ -120,7 +126,10 @@ impl ChannelState {
                 author_incarnation,
             ))
         {
-            return Ok(false);
+            return Ok(HistoryDeclineResult::Stored {
+                remembered: false,
+                current,
+            });
         }
         index.keep_history_declined_head(
             peer,
@@ -134,7 +143,10 @@ impl ChannelState {
         batch.commit()?;
         self.entries.committed();
         committed.store(true, std::sync::atomic::Ordering::Release);
-        Ok(true)
+        Ok(HistoryDeclineResult::Stored {
+            remembered: true,
+            current,
+        })
     }
 
     /// A relevant advertised successor or changed membership incarnation removes the durable

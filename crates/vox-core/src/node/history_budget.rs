@@ -24,6 +24,9 @@ pub const TEST_FOREGROUND_JOBS_ENV: &str = "VOX_TEST_FOREGROUND_JOBS";
 /// Proof-only file whose presence holds an admitted Live job; absent from production.
 pub const TEST_HOLD_LIVE_JOB_ENV: &str = "VOX_TEST_HOLD_LIVE_JOB_FILE";
 #[cfg(feature = "test-knobs")]
+/// Proof-only file whose presence holds an admitted Control job; absent from production.
+pub const TEST_HOLD_CONTROL_JOB_ENV: &str = "VOX_TEST_HOLD_CONTROL_JOB_FILE";
+#[cfg(feature = "test-knobs")]
 /// Proof-only file whose presence holds an admitted Archive job; absent from production.
 pub const TEST_HOLD_ARCHIVE_JOB_ENV: &str = "VOX_TEST_HOLD_ARCHIVE_JOB_FILE";
 #[cfg(feature = "test-knobs")]
@@ -520,7 +523,7 @@ impl Job {
         wake
     }
 
-    /// Proof-only: keep one admitted Live or Archive job until apparatus removes its lane's
+    /// Proof-only: keep one admitted Control, Live or Archive job until apparatus removes its lane's
     /// named file. The caller invokes this only after it exclusively owns the charged Flow.
     /// A `<hold>.entered.<actor>.<job>` file containing the node, room and peer is the apparatus
     /// edge which proves that exact ownership; observing admission/status before this edge is
@@ -530,8 +533,9 @@ impl Job {
     pub(crate) async fn hold_for_proof(&self, room: Digest32, peer: Digest32) {
         let variable = match self.0.lane {
             Lane::Archive => TEST_HOLD_ARCHIVE_JOB_ENV,
+            Lane::Control => TEST_HOLD_CONTROL_JOB_ENV,
             Lane::Live => TEST_HOLD_LIVE_JOB_ENV,
-            Lane::Control | Lane::LargeControl => return,
+            Lane::LargeControl => return,
         };
         let Some(path) = std::env::var_os(variable) else {
             return;

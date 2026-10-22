@@ -21,7 +21,29 @@ use crate::node::history_budget::{BufferCharge, Job};
 use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
 
-use super::{Proof, ProofKind};
+use super::{Proof, ProofKind, RequestId};
+
+pub(super) enum DeclineResult {
+    Stored {
+        remembered: bool,
+        captured: Digest32,
+        current: Digest32,
+    },
+    AuthorizationChanged {
+        captured: Digest32,
+        current: Digest32,
+    },
+}
+
+#[cfg(feature = "test-knobs")]
+fn request_text(request: &RequestId) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(request.len() * 2);
+    for byte in request {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
 
 // Directory plaintext is capped at 1 MiB before copy/decrypt. This also covers its sealed
 // bytes and bounded decoded author/presence maps. It is temporary, not part of Held's output.
@@ -59,7 +81,7 @@ pub(super) struct Source {
 
 impl Source {
     #[cfg(feature = "test-knobs")]
-    async fn hold_decline_for_proof(&self, author: Digest32, head: Digest32) {
+    async fn hold_decline_for_proof(&self, author: Digest32, head: Digest32, request: RequestId) {
         const VARIABLE: &str = "VOX_TEST_HOLD_HISTORY_DECLINE_FILE";
         let Some(path) = std::env::var_os(VARIABLE) else {
             return;
@@ -69,11 +91,16 @@ impl Source {
         }
         let entered =
             std::path::PathBuf::from(format!("{}.entered", std::path::Path::new(&path).display()));
+        let Some((_, captured)) = self.authorization else {
+            return;
+        };
         let identity = format!(
-            "peer={} author={} head={}\n",
+            "peer={} author={} head={} request={} captured={}\n",
             crate::node::link::b32_encode(&self.peer),
             crate::node::link::b32_encode(&author),
             crate::node::link::b32_encode(&head),
+            request_text(&request),
+            crate::node::link::b32_encode(&captured),
         );
         if std::fs::write(&entered, identity).is_err() {
             return;
@@ -85,7 +112,13 @@ impl Source {
     }
 
     #[cfg(not(feature = "test-knobs"))]
-    async fn hold_decline_for_proof(&self, _author: Digest32, _head: Digest32) {}
+    async fn hold_decline_for_proof(
+        &self,
+        _author: Digest32,
+        _head: Digest32,
+        _request: RequestId,
+    ) {
+    }
 
     /// Durably remember that this exact source refused this author's advertised head before the
     /// live flow treats the refusal as complete. A restart reconstructs the inbox from it.
@@ -94,10 +127,11 @@ impl Source {
         job: &Job,
         author: Digest32,
         head: Digest32,
-    ) -> Result<bool> {
+        request: RequestId,
+    ) -> Result<DeclineResult> {
         // The marker is apparatus only: it proves that a real shipped flow carrying its captured
         // authorization has reached the durability edge before a proof changes trust.
-        self.hold_decline_for_proof(author, head).await;
+        self.hold_decline_for_proof(author, head, request).await;
         let peer = self.peer;
         let authorization = self.authorization.ok_or(Error::Unreachable(
             "history refusal has no captured authorization",
@@ -116,7 +150,22 @@ impl Source {
             })
             .await?
         {
-            Lookup::Found(saved) => Ok(saved.value),
+            Lookup::Found(saved) => match saved.value {
+                crate::node::channel::HistoryDeclineResult::Stored {
+                    remembered,
+                    current,
+                } => Ok(DeclineResult::Stored {
+                    remembered,
+                    captured: authorization.1,
+                    current,
+                }),
+                crate::node::channel::HistoryDeclineResult::AuthorizationChanged { current } => {
+                    Ok(DeclineResult::AuthorizationChanged {
+                        captured: authorization.1,
+                        current,
+                    })
+                }
+            },
             Lookup::Busy | Lookup::Missing => {
                 Err(Error::Unreachable("history refusal was not persisted"))
             }

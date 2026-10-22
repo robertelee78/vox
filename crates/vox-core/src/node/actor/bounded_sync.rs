@@ -1576,7 +1576,15 @@ impl Node {
             let declined = std::mem::take(&mut flow.declined);
             let offered = std::mem::take(&mut flow.offered);
             let rearmed = std::mem::take(&mut flow.rearmed);
-            if fetched != 0 || declined != 0 || offered != 0 || rearmed != 0 {
+            let refusal_stale = flow.refusal_stale.take();
+            let refusal_saved = flow.refusal_saved.take();
+            if fetched != 0
+                || declined != 0
+                || offered != 0
+                || rearmed != 0
+                || refusal_stale.is_some()
+                || refusal_saved.is_some()
+            {
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
@@ -1586,6 +1594,12 @@ impl Node {
                         counts.history_declined = counts.history_declined.saturating_add(declined);
                         counts.history_offered = counts.history_offered.saturating_add(offered);
                         counts.history_rearmed = counts.history_rearmed.saturating_add(rearmed);
+                        if refusal_stale.is_some() {
+                            counts.history_refusal_stale = refusal_stale;
+                        }
+                        if refusal_saved.is_some() {
+                            counts.history_refusal_saved = refusal_saved;
+                        }
                     },
                 );
             }
@@ -1683,11 +1697,10 @@ impl Node {
                     port.clear_backoff();
                 }
                 if let Some((request, instance)) = archive {
-                    let _ = self.begin_history_demand(
-                        work.room,
-                        instance,
-                        crate::node::api::HistoryDemandAction::Resume { request },
-                    );
+                    // `failed` retired the stale running generation. Retain the exact Resume as
+                    // its replacement owner before any fallible profile/room/admission preflight;
+                    // `schedule` either installs preparation or keeps its fair Control ticket.
+                    self.history_demand.owe_resume(work.room, instance, request);
                 }
                 self.sched_rooms.insert(work.room);
                 continue;

@@ -732,6 +732,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Names(_) | NetEvent::Resolve { .. } => "resolving a .vox name",
         NetEvent::SessionActivity { .. } => "reading a page of a room's Session entries",
         NetEvent::HistoryDemandPrepared { .. } => "preparing explicit room history",
+        NetEvent::HistoryResumeReady { .. } => "resuming retained explicit room history",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
@@ -1161,6 +1162,11 @@ enum NetEvent {
     },
     HistoryDemandPrepared {
         token: u64,
+    },
+    /// The exact fair Control ticket retained for a stale archive Resume observed capacity.
+    HistoryResumeReady {
+        room: Digest32,
+        request: crate::node::history_stream::RequestId,
     },
     RoomHistory {
         channel_id: Digest32,
@@ -10954,6 +10960,12 @@ impl Node {
                     self.queue_cancelled_legacy_cleanup();
                 }
             }
+            NetEvent::HistoryResumeReady { room, request } => {
+                if self.history_demand.resume_wake_matches(room, request) {
+                    self.history_demand.clear_resume_wake();
+                    self.retry_owed_history_resume();
+                }
+            }
             NetEvent::RoomHistory {
                 channel_id,
                 query,
@@ -14745,6 +14757,7 @@ impl Node {
         self.accept_history_demand();
         self.queue_cancelled_legacy_cleanup();
         self.accept_bounded_sync();
+        self.retry_owed_history_resume();
         self.apply_held_notes().await;
         if self.net.is_none() {
             self.sched_rooms.clear();

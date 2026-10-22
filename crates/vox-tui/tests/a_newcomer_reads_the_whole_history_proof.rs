@@ -2844,7 +2844,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
         "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
         "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
-        "VOX_TEST_HOLD_LIVE_JOB_FILE",
+        "VOX_TEST_HOLD_CONTROL_JOB_FILE",
         "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
     ]);
     watchdog::arm();
@@ -3832,7 +3832,7 @@ fn prove_declined_refusal_lifecycle(
     // Reconstruct the requester from disk. The first exact lane completion after restart is the
     // durable observation: an in-memory suppression cannot survive this edge.
     late_daemon.stop();
-    let restart_hold = late.join("hold-refusal-restart-live");
+    let restart_hold = late.join("hold-refusal-restart-control");
     let decline_hold = late.join("hold-refusal-generation-write");
     std::fs::File::create(&restart_hold).unwrap_or_else(|error| {
         panic!("APPARATUS: could not arm the requester-restart flow barrier: {error}")
@@ -3843,7 +3843,7 @@ fn prove_declined_refusal_lifecycle(
         late,
         "late-refusal-restarted",
         &[
-            ("VOX_TEST_HOLD_LIVE_JOB_FILE", restart_hold_text.as_str()),
+            ("VOX_TEST_HOLD_CONTROL_JOB_FILE", restart_hold_text.as_str()),
             (
                 "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
                 decline_hold_text.as_str(),
@@ -3905,10 +3905,25 @@ fn prove_declined_refusal_lifecycle(
     let staged = std::fs::read_to_string(&decline_entered).unwrap_or_else(|error| {
         panic!("APPARATUS: could not read the stale-refusal marker: {error}")
     });
+    let staged_fields: std::collections::BTreeMap<_, _> = staged
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
     assert!(
-        staged.contains(&format!("peer={}", fps[1])),
-        "APPARATUS: the held refusal belonged to a different peer: {staged}"
+        staged_fields.get("peer").copied() == Some(fps[1].as_str())
+            && staged_fields.get("author").copied() == Some(fps[1].as_str())
+            && staged_fields.get("head").is_some_and(|head| !head.is_empty())
+            && staged_fields
+                .get("request")
+                .is_some_and(|request| request.len() == 32)
+            && staged_fields
+                .get("captured")
+                .is_some_and(|generation| !generation.is_empty()),
+        "APPARATUS: the held refusal did not identify Bob's exact author/head/request/captured-generation transaction: {staged}"
     );
+    let staged_head = staged_fields["head"].to_owned();
+    let staged_request = staged_fields["request"].to_owned();
+    let staged_generation = staged_fields["captured"].to_owned();
     let grant_before = exact_lane(late, room, &fps[1], "with Bob's old-grant flow in flight");
     let (ok, out, err) = vox(late, &["trust", "remove", &fps[1]], None);
     assert!(
@@ -3923,13 +3938,21 @@ fn prove_declined_refusal_lifecycle(
     std::fs::remove_file(&decline_hold).unwrap_or_else(|error| {
         panic!("APPARATUS: could not release the stale-refusal durability barrier: {error}")
     });
-    let regranted = await_lane_claim(
+    let regranted = await_exact_refusal_transition(
         late,
         room,
         &fps[1],
         grant_before,
-        "Bob's fresh authorization generation",
-        |grown| grown.stale > 0 && grown.history_rearmed > 0 && grown.history_declined > 0,
+        &fps[1],
+        &staged_head,
+        &staged_request,
+        &staged_generation,
+    );
+    assert!(
+        regranted.stale.request == staged_request
+            && regranted.saved.request != staged_request
+            && regranted.lane.stale > 0,
+        "PRODUCT: the fresh authorization lifecycle did not expose distinct exact stale and successor transactions: {regranted:?}"
     );
     assert!(
         !reads(late, room, stale_body),
@@ -4045,6 +4068,137 @@ fn wait_exact_bounded_running(dir: &Path, room: &str, peer: &str, hold: &Path, c
         if marker && exact {
             return;
         }
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactRefusal {
+    peer: String,
+    author: String,
+    head: String,
+    request: String,
+    captured_generation: String,
+    current_generation: String,
+    remembered: bool,
+}
+
+#[cfg(feature = "optional-proofs")]
+#[derive(Debug)]
+struct RefusalTransition {
+    stale: ExactRefusal,
+    saved: ExactRefusal,
+    lane: QuietLane,
+}
+
+#[cfg(feature = "optional-proofs")]
+fn parse_exact_refusal(row: &serde_json::Value, field: &str, claim: &str) -> Option<ExactRefusal> {
+    let refusal = &row[field];
+    if refusal.is_null() {
+        return None;
+    }
+    let text = |name: &str| {
+        refusal[name]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: shipped {field} omitted {name} at {claim}: {refusal}")
+            })
+            .to_owned()
+    };
+    Some(ExactRefusal {
+        peer: text("peer"),
+        author: text("author"),
+        head: text("head"),
+        request: text("request"),
+        captured_generation: text("captured_generation"),
+        current_generation: text("current_generation"),
+        remembered: refusal["remembered"].as_bool().unwrap_or_else(|| {
+            panic!("PRODUCT: shipped {field} omitted remembered at {claim}: {refusal}")
+        }),
+    })
+}
+
+/// Observe the transaction held by the apparatus through the product's exact status facts. Lane
+/// counters are only a causal terminal fence: they cannot satisfy any identity assertion.
+#[cfg(feature = "optional-proofs")]
+#[allow(clippy::too_many_arguments)]
+fn await_exact_refusal_transition(
+    dir: &Path,
+    room: &str,
+    peer: &str,
+    before: QuietLane,
+    author: &str,
+    head: &str,
+    request: &str,
+    captured_generation: &str,
+) -> RefusalTransition {
+    loop {
+        let (_, _, status) = synced(dir);
+        let value: serde_json::Value = serde_json::from_str(&status).unwrap_or_else(|error| {
+            panic!(
+                "PRODUCT: `vox status --json` was not JSON while observing the exact refusal transaction: {error}: {status}"
+            )
+        });
+        let row = value["sync"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["room"].as_str() == Some(room) && row["peer"].as_str() == Some(peer))
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: shipped status omitted the exact {room}/{peer} refusal lane: {status}"
+                )
+            });
+        let stale = parse_exact_refusal(row, "history_refusal_stale", "authorization change");
+        let saved = parse_exact_refusal(row, "history_refusal_saved", "authorization change");
+        let now = quiet_lanes(&status)[&(room.to_owned(), peer.to_owned())];
+        let grown = now.since(before);
+
+        if let Some(saved) = &saved {
+            assert!(
+                !(saved.author == author && saved.head == head && saved.request == request),
+                "PRODUCT: the held old-generation refusal transaction was saved under the fresh grant instead of being fenced: {saved:?}"
+            );
+        }
+        let Some(stale) = stale.filter(|stale| stale.request == request) else {
+            std::thread::yield_now();
+            continue;
+        };
+        assert!(
+            stale.peer == peer
+                && stale.author == author
+                && stale.head == head
+                && stale.captured_generation == captured_generation
+                && stale.current_generation != stale.captured_generation,
+            "PRODUCT: shipped status did not bind the fenced refusal to the held peer/author/head/request and old-to-fresh authorization generations: {stale:?}"
+        );
+        if let Some(saved) = saved.filter(|saved| {
+            saved.peer == peer
+                && saved.author == author
+                && saved.head == head
+                && saved.request != request
+        }) {
+            assert!(
+                saved.captured_generation == stale.current_generation
+                    && saved.current_generation == stale.current_generation
+                    && saved.remembered,
+                "PRODUCT: the successor refusal was not durably saved under the exact fresh generation fenced by the stale transaction: stale={stale:?}, saved={saved:?}"
+            );
+            assert!(
+                grown.stale > 0 && grown.history_rearmed > 0 && grown.history_declined > 0,
+                "PRODUCT: exact stale and successor refusal outcomes were visible, but the shipped lane did not account for fencing, re-arm and durable decline: {grown:?}"
+            );
+            return RefusalTransition {
+                stale,
+                saved,
+                lane: grown,
+            };
+        }
+        assert!(
+            grown.completed == 0,
+            "PRODUCT: the exact lane completed a successor cycle after fencing {stale:?} without durably saving the exact fresh-generation refusal; lane delta: {grown:?}"
+        );
         std::thread::yield_now();
     }
 }

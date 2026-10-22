@@ -154,6 +154,9 @@ pub(crate) struct Flow {
     /// The actor publishes them even if the enclosing attempt is later retired or stale.
     pub(crate) offered: u64,
     pub(crate) rearmed: u64,
+    /// Exact refusal transaction outcomes are published even when the enclosing flow is retired.
+    pub(crate) refusal_stale: Option<crate::node::status::HistoryRefusalStatus>,
+    pub(crate) refusal_saved: Option<crate::node::status::HistoryRefusalStatus>,
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
@@ -312,6 +315,8 @@ impl Flow {
             declined: 0,
             offered: 0,
             rearmed: 0,
+            refusal_stale: None,
+            refusal_saved: None,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -434,6 +439,8 @@ impl Flow {
             declined: 0,
             offered: 0,
             rearmed: 0,
+            refusal_stale: None,
+            refusal_saved: None,
             admitted_authors: 0,
             external: None,
             archive_status: None,
@@ -613,25 +620,52 @@ impl Flow {
         inbox: &super::hints::HintInbox,
         author: Digest32,
         head: Digest32,
-    ) -> Result<()> {
-        let remembered = match source.remember_decline(job, author, head).await {
-            Ok(remembered) => remembered,
-            Err(Error::Profile(message)) if message.contains("history authorization changed") => {
+    ) -> Result<bool> {
+        let remembered = match source
+            .remember_decline(job, author, head, self.request)
+            .await
+        {
+            Ok(super::source::DeclineResult::Stored {
+                remembered,
+                captured,
+                current,
+            }) => {
+                self.refusal_saved = Some(crate::node::status::HistoryRefusalStatus {
+                    peer: source.peer,
+                    author,
+                    head,
+                    request: self.request,
+                    captured_generation: captured,
+                    current_generation: current,
+                    remembered,
+                });
+                remembered
+            }
+            Ok(super::source::DeclineResult::AuthorizationChanged { captured, current }) => {
+                self.refusal_stale = Some(crate::node::status::HistoryRefusalStatus {
+                    peer: source.peer,
+                    author,
+                    head,
+                    request: self.request,
+                    captured_generation: captured,
+                    current_generation: current,
+                    remembered: false,
+                });
                 self.authorization_changed = true;
                 self.waiting = true;
-                return Ok(());
+                return Ok(false);
             }
             Err(error) => {
                 self.local_retry = Some(format!(
                     "local history refusal was not durably recorded: {error}"
                 ));
                 self.waiting = true;
-                return Ok(());
+                return Ok(false);
             }
         };
         inbox.finish(self.room, source.peer, author, head);
         self.declined = self.declined.saturating_add(u64::from(remembered));
-        Ok(())
+        Ok(true)
     }
     pub(crate) fn done(&self) -> bool {
         self.tasks.is_empty() && self.replay.is_none()
@@ -1511,11 +1545,17 @@ impl Flow {
                             _ => None,
                         });
                     if let Some(author) = author {
-                        self.decline(&source, job, inbox, author, head).await?;
+                        if !self.decline(&source, job, inbox, author, head).await? {
+                            return Ok(());
+                        }
                     }
                     if let Some(hint) = self.hint {
-                        self.decline(&source, job, inbox, hint.author, hint.head)
-                            .await?;
+                        if !self
+                            .decline(&source, job, inbox, hint.author, hint.head)
+                            .await?
+                        {
+                            return Ok(());
+                        }
                     }
                     if !self.tasks.iter().any(|pending| matches!(pending.operation,
                         Operation::LiveAdvance { window, .. } if window.head == head && window.next == seq)) {
@@ -1563,7 +1603,9 @@ impl Flow {
                         if let Query::Entry { head, .. } | Query::Page { head, .. } = &query {
                             let head = *head;
                             if let Some(author) = self.head_author(&source, job, head).await? {
-                                self.decline(&source, job, inbox, author, head).await?;
+                                if !self.decline(&source, job, inbox, author, head).await? {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -1587,11 +1629,16 @@ impl Flow {
                         // this node's own (the echo settlement asks for), is not asked for that
                         // hint again until its inventory names another head of the author
                         // (ADR-038 FX-29): the asking side stops, whatever the serving side does.
-                        if let (Query::Head(author), Some(hint)) = (&query, self.hint) {
-                            if hint.author == *author {
-                                self.decline(&source, job, inbox, *author, hint.head)
-                                    .await?;
+                        match (&query, self.hint) {
+                            (Query::Head(author), Some(hint)) if hint.author == *author => {
+                                if !self
+                                    .decline(&source, job, inbox, *author, hint.head)
+                                    .await?
+                                {
+                                    return Ok(());
+                                }
                             }
+                            _ => {}
                         }
                         self.tasks.clear();
                         return Ok(());
@@ -1638,8 +1685,12 @@ impl Flow {
                         // was hinted or required. The route to the author's port below still
                         // runs once for this exact query.
                         if let Some(dependency) = dependency {
-                            self.decline(&source, job, inbox, dependency.author, dependency.head)
-                                .await?;
+                            if !self
+                                .decline(&source, job, inbox, dependency.author, dependency.head)
+                                .await?
+                            {
+                                return Ok(());
+                            }
                         }
                         if dependency.is_some_and(|head| {
                             head.author != self.peer && head.author != self.node

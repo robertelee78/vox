@@ -1185,6 +1185,44 @@ impl RoundReasons {
 }
 
 /// One `(room, peer)`'s counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryRefusalStatus {
+    pub(crate) peer: Digest32,
+    pub(crate) author: Digest32,
+    pub(crate) head: Digest32,
+    pub(crate) request: [u8; 16],
+    pub(crate) captured_generation: Digest32,
+    pub(crate) current_generation: Digest32,
+    pub(crate) remembered: bool,
+}
+
+fn request_text(request: &[u8; 16]) -> String {
+    let mut text = String::with_capacity(request.len() * 2);
+    for byte in request {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn history_refusal_json(refusal: Option<&HistoryRefusalStatus>) -> String {
+    refusal.map_or_else(
+        || "null".to_owned(),
+        |refusal| {
+            format!(
+                "{{\"peer\":\"{}\",\"author\":\"{}\",\"head\":\"{}\",\"request\":\"{}\",\"captured_generation\":\"{}\",\"current_generation\":\"{}\",\"remembered\":{}}}",
+                b32_encode(&refusal.peer),
+                b32_encode(&refusal.author),
+                b32_encode(&refusal.head),
+                request_text(&refusal.request),
+                b32_encode(&refusal.captured_generation),
+                b32_encode(&refusal.current_generation),
+                refusal.remembered,
+            )
+        },
+    )
+}
+
+/// One `(room, peer)`'s counters and exact current diagnostic facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortCounters {
     /// Outbound sessions this node opened.
@@ -1226,6 +1264,10 @@ pub struct PortCounters {
     pub history_offered: u64,
     /// Exact durable refusal relationships invalidated by changed relevant inventory.
     pub history_rearmed: u64,
+    /// Exact last transaction fenced because its flow carried an older authorization.
+    pub(crate) history_refusal_stale: Option<HistoryRefusalStatus>,
+    /// Exact last refusal transaction accepted under its captured authorization.
+    pub(crate) history_refusal_saved: Option<HistoryRefusalStatus>,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,
     /// Sessions that failed.
@@ -1673,6 +1715,7 @@ impl SyncBook {
                  \"completed\":{},\"reasons\":{},\"empty\":{},\"fetched_completed\":{},\"fetched_empty\":{},\
                  \"served_completed\":{},\"served_empty\":{},\"history_fetched\":{},\"history_served\":{},\
                  \"history_declined\":{},\"history_offered\":{},\"history_rearmed\":{},\
+                 \"history_refusal_stale\":{},\"history_refusal_saved\":{},\
                  \"partial\":{},\"failed\":{},\"last_failure\":{},\
                  \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
                  \"running\":[{}]}}",
@@ -1693,6 +1736,8 @@ impl SyncBook {
                 c.history_declined,
                 c.history_offered,
                 c.history_rearmed,
+                history_refusal_json(c.history_refusal_stale.as_ref()),
+                history_refusal_json(c.history_refusal_saved.as_ref()),
                 c.partial,
                 c.failed,
                 c.last_failure

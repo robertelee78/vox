@@ -8,7 +8,7 @@ use crate::node::api::{
 };
 use crate::node::channel::legacy_provisional::LegacyProvisionalOwner;
 use crate::node::channel::{entry_store::sparse::ObjectKind, ChannelState};
-use crate::node::history_budget::{Job, Lane};
+use crate::node::history_budget::{Job, Lane, Ticket};
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
 use crate::node::history_stream::{self as stream, Query, RequestId, Staging};
 use crate::node::store::Store;
@@ -75,6 +75,19 @@ struct Running {
     page: Option<(Digest32, u64, u64)>,
 }
 
+/// One exact durable archive request whose stale running generation has been retired but whose
+/// replacement preparation has not yet been installed. The fair Control ticket and its wake
+/// task are retained here, so a busy admission edge cannot turn a saved Resume into an
+/// unowned paused status. Once `preparing`, `running` or `ready` owns the request, this owner is
+/// removed.
+struct ResumeOwed {
+    room: Digest32,
+    instance: [u8; 16],
+    request: RequestId,
+    ticket: Option<Ticket>,
+    wake_task: Option<tokio::task::JoinHandle<()>>,
+}
+
 fn page_of(query: &Query) -> Option<(Digest32, u64, u64)> {
     match query {
         Query::Page { head, lo, hi, .. } => Some((*head, *lo, *hi)),
@@ -91,8 +104,51 @@ pub(super) struct Controller {
     cancelled_legacy: Option<(Digest32, LegacyProvisionalOwner)>,
     status: Option<Status>,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
+    resume_owed: Option<ResumeOwed>,
 }
 impl Controller {
+    fn clear_resume_owed(&mut self) {
+        if let Some(mut owed) = self.resume_owed.take() {
+            if let Some(task) = owed.wake_task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    pub(super) fn owe_resume(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) {
+        if self.resume_owed.as_ref().is_some_and(|owed| {
+            owed.room == room && owed.instance == instance && owed.request == request
+        }) {
+            return;
+        }
+        self.clear_resume_owed();
+        self.resume_owed = Some(ResumeOwed {
+            room,
+            instance,
+            request,
+            ticket: None,
+            wake_task: None,
+        });
+    }
+
+    pub(super) fn resume_wake_matches(&self, room: Digest32, request: RequestId) -> bool {
+        self.resume_owed
+            .as_ref()
+            .is_some_and(|owed| owed.room == room && owed.request == request)
+    }
+
+    fn resume_owed_matches(&self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
+        self.resume_owed.as_ref().is_some_and(|owed| {
+            owed.room == room && owed.instance == instance && owed.request == request
+        })
+    }
+
+    pub(super) fn clear_resume_wake(&mut self) {
+        if let Some(owed) = self.resume_owed.as_mut() {
+            owed.wake_task = None;
+        }
+    }
+
     pub(super) fn ready_binding(
         &self,
         room: Digest32,
@@ -170,6 +226,13 @@ impl Controller {
         true
     }
     pub(super) fn retire_room(&mut self, room: Digest32) {
+        if self
+            .resume_owed
+            .as_ref()
+            .is_some_and(|owed| owed.room == room)
+        {
+            self.clear_resume_owed();
+        }
         if self.status.as_ref().is_none_or(|s| s.room != room) {
             return;
         }
@@ -196,6 +259,7 @@ impl Controller {
 
     /// Called before lock/shutdown reports completion. No queued event owns a secret context.
     pub(super) async fn retire(&mut self) {
+        self.clear_resume_owed();
         if let Some(running) = self.running.take() {
             running.fence.retire();
             running.cancellation.cancel();
@@ -320,6 +384,40 @@ impl Node {
         instance: [u8; 16],
         action: Action,
     ) -> Result<Status, String> {
+        let retained_resume = match &action {
+            Action::Resume { request } => self
+                .history_demand
+                .resume_owed_matches(room, instance, *request),
+            _ => false,
+        };
+        if retained_resume {
+            // The command names the already-retained exact owner. Advance that owner rather
+            // than canceling its fair ticket and creating a second admission attempt.
+            self.retry_owed_history_resume();
+            return Ok(self.history_demand.status.clone().unwrap_or_else(|| {
+                status(
+                    room,
+                    instance,
+                    Phase::Busy,
+                    "The exact saved history resume is retained locally.",
+                )
+            }));
+        }
+        if !matches!(&action, Action::Status) {
+            // A person's newer explicit action owns its own result. It cancels an internal
+            // re-arm of the older stale generation rather than leaving two Resume owners.
+            self.history_demand.clear_resume_owed();
+        }
+        self.begin_history_demand_with_job(room, instance, action, None)
+    }
+
+    fn begin_history_demand_with_job(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        action: Action,
+        admitted: Option<Job>,
+    ) -> Result<Status, String> {
         let completed = self.accept_history_demand();
         if let Some(current) = &self.history_demand.status {
             if current.room == room
@@ -439,13 +537,19 @@ impl Node {
         );
         let context = Arc::new(Context::unlocked(profile, secret_work).map_err(|e| e.to_string())?);
         let store = profile.store_handle();
-        let Some(job) = self.history_budget.try_start(node, Lane::Control) else {
-            return Ok(status(
-                room,
-                instance,
-                Phase::Busy,
-                "History preparation is busy; cached messages remain available.",
-            ));
+        let job = match admitted {
+            Some(job) => job,
+            None => {
+                let Some(job) = self.history_budget.try_start(node, Lane::Control) else {
+                    return Ok(status(
+                        room,
+                        instance,
+                        Phase::Busy,
+                        "History preparation is busy; cached messages remain available.",
+                    ));
+                };
+                job
+            }
         };
         let peers: Vec<_> = self
             .ports
@@ -514,6 +618,82 @@ impl Node {
             task,
         });
         Ok(pending)
+    }
+
+    /// Attempt the one retained archive Resume owner once. A busy Control lane keeps its fair
+    /// ticket and receives the exact capacity-release wake; local/profile preflight failures keep
+    /// the durable owner but do not self-wake or spin. Any later actor event may try that owner
+    /// again, while a successful preparation atomically replaces it as the request's owner.
+    pub(super) fn retry_owed_history_resume(&mut self) {
+        let Some(mut owed) = self.history_demand.resume_owed.take() else {
+            return;
+        };
+        if self.history_demand.preparing.is_some()
+            || self.history_demand.running.is_some()
+            || self.history_demand.ready.is_some()
+            || self.history_demand.private_work.is_some()
+        {
+            self.history_demand.resume_owed = Some(owed);
+            return;
+        }
+        let Some(node) = self.profile.as_ref().map(|profile| profile.fingerprint()) else {
+            self.history_demand.resume_owed = Some(owed);
+            return;
+        };
+        if owed.ticket.is_none() {
+            owed.ticket = Some(self.history_budget.enqueue(node, Lane::Control));
+        }
+        let Some(ticket) = owed.ticket.as_mut() else {
+            self.history_demand.resume_owed = Some(owed);
+            return;
+        };
+        // Subscribe before the attempt so a release between the failed admission and task spawn
+        // cannot be lost. Keeping the Ticket in `ResumeOwed` preserves FIFO position.
+        let wake = ticket.wake();
+        if let Some(job) = ticket.try_admit() {
+            owed.ticket = None;
+            if let Some(task) = owed.wake_task.take() {
+                task.abort();
+            }
+            let result = self.begin_history_demand_with_job(
+                owed.room,
+                owed.instance,
+                Action::Resume {
+                    request: owed.request,
+                },
+                Some(job),
+            );
+            if self.history_demand.preparing.is_none() {
+                if let Err(error) = result {
+                    if let Some(status) = self
+                        .history_demand
+                        .status
+                        .as_mut()
+                        .filter(|status| status.request == Some(owed.request))
+                    {
+                        status.phase = Phase::Paused;
+                        status.detail = format!(
+                            "Authorization changed; exact history resume is retained locally: {}",
+                            error.chars().take(96).collect::<String>()
+                        );
+                    }
+                }
+                self.history_demand.resume_owed = Some(owed);
+            }
+            return;
+        }
+        if owed.wake_task.is_none() {
+            let tx = self.net_tx.clone();
+            let room = owed.room;
+            let request = owed.request;
+            owed.wake_task = Some(tokio::spawn(async move {
+                wake.await;
+                let _ = tx
+                    .send(NetEvent::HistoryResumeReady { room, request })
+                    .await;
+            }));
+        }
+        self.history_demand.resume_owed = Some(owed);
     }
 
     fn start_private_history(&mut self, dispatch: PrivateDispatch) {
