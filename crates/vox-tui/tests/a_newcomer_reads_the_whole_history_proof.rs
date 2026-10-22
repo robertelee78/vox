@@ -250,37 +250,33 @@ fn said(dir: &Path, tag: &str) -> String {
         .unwrap_or_else(|e| format!("(its stderr could not be read: {e})"))
 }
 
-/// Stop or continue a proof daemon and observe that exact OS event before the journey uses it.
-/// This has no product time quota: the proof watchdog owns apparatus failure if the machine
-/// never delivers the signal.
-fn signal_daemon(pid: u32, signal: &str, stopped: bool) {
-    let sent = Command::new("kill")
-        .args([signal, &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success());
+/// Stop or continue a proof daemon and consume that exact child-state transition before the
+/// journey uses it. `waitpid` is the structural acknowledgement from the kernel; this neither
+/// polls nor invents a product time quota. An operator-set proof deadman still owns a broken
+/// machine that never reports a signal it accepted.
+fn signal_daemon(pid: u32, signal: rustix::process::Signal, stopped: bool) {
+    let pid = rustix::process::Pid::from_raw(pid as _)
+        .unwrap_or_else(|| panic!("APPARATUS: daemon has invalid pid {pid}"));
+    rustix::process::kill_process(pid, signal)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not send {signal:?} to daemon {pid}: {e}"));
+    let options = if stopped {
+        rustix::process::WaitOptions::UNTRACED
+    } else {
+        rustix::process::WaitOptions::CONTINUED
+    };
+    let (_, state) = rustix::process::waitpid(Some(pid), options)
+        .unwrap_or_else(|e| {
+            panic!("APPARATUS: could not observe daemon {pid} after {signal:?}: {e}")
+        })
+        .unwrap_or_else(|| panic!("APPARATUS: daemon {pid} had no state after {signal:?}"));
     assert!(
-        sent,
-        "APPARATUS: `kill {signal} {pid}` did not accept the daemon signal"
+        if stopped {
+            state.stopped()
+        } else {
+            state.continued()
+        },
+        "APPARATUS: daemon {pid} reported {state:?}, not the requested {signal:?} transition"
     );
-    loop {
-        let state = Command::new("ps")
-            .args(["-o", "state=", "-p", &pid.to_string()])
-            .output()
-            .unwrap_or_else(|e| panic!("APPARATUS: could not observe daemon {pid}: {e}"));
-        assert!(
-            state.status.success(),
-            "APPARATUS: `ps` could not observe daemon {pid} after {signal}"
-        );
-        let state = String::from_utf8_lossy(&state.stdout);
-        assert!(
-            !state.trim().is_empty(),
-            "APPARATUS: daemon {pid} exited while applying {signal}"
-        );
-        if state.trim_start().starts_with('T') == stopped {
-            return;
-        }
-        std::thread::yield_now();
-    }
 }
 
 /// `vox room list` once the daemon's socket answers.
@@ -2161,7 +2157,7 @@ fn newcomer_reads_the_whole_history(
         // requester still accepts and records its exact bounded request. Resume the donor
         // immediately after reading the coherent public counters.
         let derived_before = if demands == 0 {
-            signal_daemon(alice_daemon.0.id(), "-STOP", true);
+            signal_daemon(alice_daemon.0.id(), rustix::process::Signal::STOP, true);
             Some(store_counts(&bob))
         } else {
             None
@@ -2182,7 +2178,7 @@ fn newcomer_reads_the_whole_history(
         );
         let derived_after = derived_before.map(|_| store_counts(&bob));
         if derived_before.is_some() {
-            signal_daemon(alice_daemon.0.id(), "-CONT", false);
+            signal_daemon(alice_daemon.0.id(), rustix::process::Signal::CONT, false);
         }
         assert!(
             ok,
