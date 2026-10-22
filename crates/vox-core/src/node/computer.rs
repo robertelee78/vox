@@ -3021,6 +3021,21 @@ impl Computer {
         self.save_before(s, None)
     }
     fn save_before(&self, s: &State, deadline: Option<std::time::Instant>) -> Result<()> {
+        #[cfg(feature = "test-knobs")]
+        let mutant_snapshot = if fx28_mutant("preview-approval-not-durable") {
+            let mut snapshot = s.clone();
+            // Save every surrounding transaction but never the authenticated preview or
+            // approval-bearing enrollment. Even a later background bookkeeping save cannot
+            // accidentally make the deliberately ephemeral fields durable before the crash.
+            snapshot.pending = None;
+            snapshot.pending_expires = 0;
+            snapshot.pair_link = None;
+            Some(snapshot)
+        } else {
+            None
+        };
+        #[cfg(feature = "test-knobs")]
+        let s = mutant_snapshot.as_ref().unwrap_or(s);
         secure(self.path.parent().ok_or_else(bad)?, true)?;
         if self.path.symlink_metadata().is_ok() {
             secure(&self.path, false)?;

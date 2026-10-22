@@ -872,7 +872,7 @@ impl Management {
                     // longer public contract or mint a fresh ordinary-exchange clock.
                     let mut response_deadline = std::time::Instant::now() + PATIENCE;
                     #[cfg(feature = "test-knobs")]
-                    let mut stopped_reader_generation = false;
+                    let mut stopped_reader_generation = None;
                     let result = me
                         .answer(
                             &c,
@@ -895,16 +895,18 @@ impl Management {
                         #[cfg(feature = "test-knobs")]
                         let problem = {
                             let mut problem = problem;
-                            if stopped_reader_generation
-                                && problem.contains("causal convergence deadline")
-                                && Self::mark_stopped_reader_answer_for_proof()
+                            if let Some(generation) = stopped_reader_generation
+                                .filter(|_| problem.contains("causal convergence deadline"))
                             {
-                                // Each response exceeds one eighth of the transaction cap. Eight
-                                // unread streams therefore exceed the connection's whole bounded
-                                // transaction allowance without inventing another size constant.
-                                // This is invariant apparatus for both product and mutant runs;
-                                // the mutant changes only the response deadline's ownership.
-                                problem.push_str(&"x".repeat(MAX_FRAME / MANAGEMENT_SLOTS));
+                                if Self::mark_stopped_reader_answer_for_proof(generation) {
+                                    // Each response exceeds one eighth of the transaction cap.
+                                    // Eight unread streams therefore exceed the connection's
+                                    // whole bounded transaction allowance without inventing
+                                    // another size constant. This is invariant apparatus for
+                                    // both product and mutant runs; the mutant changes only the
+                                    // response deadline's ownership.
+                                    problem.push_str(&"x".repeat(MAX_FRAME / MANAGEMENT_SLOTS));
+                                }
                             }
                             problem
                         };
@@ -1321,8 +1323,7 @@ impl Management {
                 )?);
             }
             activate(s, self.computer.signer.as_ref())?;
-            if !crate::node::computer::fx28_mutant("preview-approval-not-durable")
-                && s.pending.as_ref().map(Enrollment::body) != before_pending
+            if s.pending.as_ref().map(Enrollment::body) != before_pending
                 && s.revision == before_revision
             {
                 s.advance_journal()?;
@@ -2138,10 +2139,7 @@ impl Management {
             s.pending_expires = link.expires;
             s.pair_link = Some(Zeroizing::new(url.to_owned()));
             merge(s, &exchange, link.target, self.computer.signer.as_ref())?;
-            if !crate::node::computer::fx28_mutant("preview-approval-not-durable")
-                && s.pending.as_ref().map(Enrollment::body) != before_pending
-                && s.revision == before
-            {
+            if s.pending.as_ref().map(Enrollment::body) != before_pending && s.revision == before {
                 s.advance_journal()?;
             }
             Ok((before, s.revision))
@@ -2155,14 +2153,16 @@ impl Management {
         send: &mut SendStream,
         recv: &mut RecvStream,
         response_deadline: &mut std::time::Instant,
-        #[cfg(feature = "test-knobs")] stopped_reader_generation: &mut bool,
+        #[cfg(feature = "test-knobs")] stopped_reader_generation: &mut Option<Digest32>,
     ) -> Result<()> {
         let (op, peer, id, remaining_ms) = read_hello_until(recv, conn, *response_deadline).await?;
         #[cfg(feature = "test-knobs")]
         {
-            // Only the exact attack requests advertise this deliberately tiny budget. Ordinary
-            // exchange deadline failures in the same process never enter its generation count.
-            *stopped_reader_generation = op == 2 && remaining_ms == 1;
+            // Bind the exact arm generation when this authenticated request is admitted. A
+            // pre-arm request, an earlier generation, or an ordinary one-millisecond exchange
+            // cannot acquire whichever generation happens to exist when its later error is sent.
+            *stopped_reader_generation =
+                Self::admit_stopped_reader_generation_for_proof(op, &id, remaining_ms);
         }
         let deadline = match op {
             REACHABILITY_WAKE_OP => std::time::Instant::now() + PATIENCE,
@@ -2272,8 +2272,7 @@ impl Management {
             }
             s.pending = Some(g);
             s.pending_expires = invite.expires;
-            if !crate::node::computer::fx28_mutant("preview-approval-not-durable")
-                && s.pending.as_ref().map(Enrollment::body) != before_pending
+            if s.pending.as_ref().map(Enrollment::body) != before_pending
                 && s.revision == before_revision
             {
                 s.advance_journal()?;
@@ -3002,12 +3001,8 @@ impl Management {
         // generation unique to this armed connection before any attack stream can be answered.
         let _ = std::fs::remove_file(generation);
         let _ = std::fs::remove_file(answered);
-        if std::fs::write(
-            generation,
-            format!("{}:{}:{}\n", std::process::id(), conn.serial(), now()),
-        )
-        .is_err()
-        {
+        let generation_id = random_array::<32>()?;
+        if std::fs::write(generation, generation_id).is_err() {
             return Ok(());
         }
         let mut held = Vec::with_capacity(MANAGEMENT_SLOTS);
@@ -3015,7 +3010,7 @@ impl Management {
             let (mut send, recv) = streams::open_typed(conn, StreamKind::Computer).await?;
             write_frame(
                 &mut send,
-                &hello(2, &self.computer.description(), &[0; 32], 1),
+                &hello(2, &self.computer.description(), &generation_id, 1),
             )
             .await?;
             held.push((send, recv));
@@ -3034,22 +3029,44 @@ impl Management {
     }
 
     #[cfg(feature = "test-knobs")]
-    fn mark_stopped_reader_answer_for_proof() -> bool {
+    fn admit_stopped_reader_generation_for_proof(
+        op: u64,
+        request_id: &Digest32,
+        remaining_ms: u64,
+    ) -> Option<Digest32> {
+        if op != 2 || remaining_ms != 1 {
+            return None;
+        }
+        let spec = std::env::var(TEST_STOPPED_READER_ANSWERED_ENV).ok()?;
+        let mut fields = spec.split('\t');
+        let (Some(generation), Some(_marker), None) = (fields.next(), fields.next(), fields.next())
+        else {
+            return None;
+        };
+        let generation: Digest32 = std::fs::read(generation).ok()?.try_into().ok()?;
+        (generation == *request_id).then_some(generation)
+    }
+
+    #[cfg(feature = "test-knobs")]
+    fn mark_stopped_reader_answer_for_proof(generation: Digest32) -> bool {
         use std::sync::{Mutex, OnceLock};
-        static ANSWERS: OnceLock<Mutex<(String, usize)>> = OnceLock::new();
+        static ANSWERS: OnceLock<Mutex<(Digest32, usize)>> = OnceLock::new();
         let Ok(spec) = std::env::var(TEST_STOPPED_READER_ANSWERED_ENV) else {
             return false;
         };
         let mut fields = spec.split('\t');
-        let (Some(generation), Some(marker), None) = (fields.next(), fields.next(), fields.next())
+        let (Some(generation_file), Some(marker), None) =
+            (fields.next(), fields.next(), fields.next())
         else {
             return false;
         };
-        let Ok(generation) = std::fs::read_to_string(generation) else {
+        // Admission already bound the request to `generation`; this check only proves that the
+        // same arm is still current. It never assigns a later file's generation to the request.
+        if std::fs::read(generation_file).ok().as_deref() != Some(generation.as_slice()) {
             return false;
-        };
+        }
         let mut answers = ANSWERS
-            .get_or_init(|| Mutex::new((String::new(), 0)))
+            .get_or_init(|| Mutex::new(([0; 32], 0)))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if answers.0 != generation {
@@ -3060,6 +3077,9 @@ impl Management {
             answers.1 += 1;
         }
         if completed {
+            if std::fs::read(generation_file).ok().as_deref() != Some(generation.as_slice()) {
+                return false;
+            }
             let _ = std::fs::write(
                 marker,
                 b"all bounded management slots reached unread replies\n",

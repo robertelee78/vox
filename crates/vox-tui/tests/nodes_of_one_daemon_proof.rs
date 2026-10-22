@@ -1445,7 +1445,8 @@ fn close_expired_pairing() {
 /// #1020). Two real shipped daemons reach an authenticated preview, beta approves the displayed
 /// operation, and beta is terminated before the other operator approves. After restart, shipped
 /// status must show that same peer, operation and local approval. The mutant which omits the
-/// preview/approval journal advance loses this user-visible intent at the crash boundary.
+/// preview and approval-bearing enrollment from the saved snapshot loses this user-visible
+/// intent at the crash boundary.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "optional two real vox daemons with production Argon2id; run in release with optional-proofs"]
