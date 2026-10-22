@@ -454,6 +454,14 @@ fn first_out_of_turn(order: &[usize]) -> Option<(usize, usize)> {
 /// Whether `vox room read` on `dir` shows `text` now. A read that fails is a red, never silence.
 fn reads(dir: &Path, room: &str, text: &str) -> bool {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
+    if !ok
+        && std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
+            == Ok("track-content-through-settled-index")
+    {
+        panic!(
+            "PRODUCT [FX29 sparse-content-publication]: `vox room read` refused after the exact sparse Content arrived: {out}{err}"
+        );
+    }
     assert!(ok, "PRODUCT: `vox room read` refused: {out}{err}");
     out.contains(text)
 }

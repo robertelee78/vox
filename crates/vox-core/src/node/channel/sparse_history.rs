@@ -1015,12 +1015,22 @@ impl ChannelState {
             let mut body_unavailable = false;
             if kind == SignedEntryKind::Content {
                 if let Some(payload) = &entry.payload {
-                    self.track_body_into(&mut batch, *hash, log, now.get())?;
+                    #[cfg(feature = "test-knobs")]
+                    if std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
+                        == Ok("track-content-through-settled-index")
+                    {
+                        self.track_body_into(&mut batch, *hash, log, now.get())?;
+                    } else {
+                        self.track_known_body_into(&mut batch, &entry, log, now.get())?;
+                    }
+                    #[cfg(not(feature = "test-knobs"))]
+                    self.track_known_body_into(&mut batch, &entry, log, now.get())?;
                     match self.render_content_into(
                         &mut batch,
                         entry.skeleton.author_id,
                         *hash,
                         payload,
+                        Some(&entry),
                         now.get(),
                         historical,
                         &mut expired,
@@ -1293,6 +1303,7 @@ impl ChannelState {
                         .payload
                         .as_deref()
                         .ok_or(Error::MalformedBundle("refill body vanished"))?,
+                    Some(entry),
                     now.get(),
                     historical,
                     &mut expired,

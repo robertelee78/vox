@@ -23,8 +23,13 @@ case "${1-}" in
     verdict='PRODUCT [FX29 sparse-control-publication]:'
     staging='[proof] FX-29 sparse control publication apparatus staged:'
     ;;
+  track-content-through-settled-index)
+    mutant=$1
+    verdict='PRODUCT [FX29 sparse-content-publication]:'
+    staging='[proof] FX-29 sparse control publication apparatus staged:'
+    ;;
   *)
-    printf '%s\n' "usage: $0 {drop-resume-owed|finish-control-after-effect}" >&2
+    printf '%s\n' "usage: $0 {drop-resume-owed|finish-control-after-effect|track-content-through-settled-index}" >&2
     exit 2
     ;;
 esac

@@ -5857,12 +5857,26 @@ impl ChannelState {
         let entry = self
             .entry_at(transaction, entry_hash)?
             .ok_or(Error::MalformedAtRest("rendered entry missing"))?;
-        let ttl = self.entry_retention(transaction, &entry)?;
+        self.already_expired_entry(transaction, &entry, claimed_ms, now_ms)
+    }
+
+    fn already_expired_entry(
+        &self,
+        transaction: Transaction<'_, '_>,
+        entry: &Entry,
+        claimed_ms: u64,
+        now_ms: u64,
+    ) -> Result<bool> {
+        if !self.governance_display_current(now_ms) {
+            return Ok(false);
+        }
+        let ttl = self.entry_retention(transaction, entry)?;
         if ttl == 0 {
             return Ok(false);
         }
+        let entry_hash = entry.entry_hash();
         let first_seen = self
-            .retention_get_in(transaction, entry_hash)?
+            .retention_get_in(transaction, &entry_hash)?
             .map_or(now_ms, |t| t.first_seen_ms);
         Ok(claimed_ms.min(first_seen) <= now_ms.saturating_sub(ttl.saturating_mul(1_000)))
     }
@@ -6089,6 +6103,22 @@ impl ChannelState {
         let entry = self
             .entry_at(Transaction::Batch(batch), &entry_hash)?
             .ok_or(Error::MalformedAtRest("tracked entry missing"))?;
+        self.track_known_body_into(batch, &entry, log_id, now_ms)
+    }
+
+    /// Queue the age of an exact, already-authenticated body while its sparse effect is still
+    /// being published. Sparse Content cannot be marked settled merely to make the ordinary
+    /// index lookup see it: settlement means its semantic projection completed. The caller's
+    /// typed effect owns this entry and the same Batch owns both its source and this retention
+    /// record, so the entry itself is the authoritative input until settlement is sealed.
+    fn track_known_body_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        entry: &Entry,
+        log_id: u64,
+        now_ms: u64,
+    ) -> Result<()> {
+        let entry_hash = entry.entry_hash();
         if entry.payload.as_deref().is_some_and(retained_control) {
             return Ok(());
         }
@@ -6681,6 +6711,7 @@ impl ChannelState {
                         author,
                         entry_hash,
                         payload,
+                        None,
                         now_ms,
                         false,
                         &mut expired,
@@ -7714,7 +7745,7 @@ impl ChannelState {
                 continue;
             }
             if let Some(row) = self
-                .render_content_into(batch, author, hash, &payload, now_ms, true, expired)?
+                .render_content_into(batch, author, hash, &payload, None, now_ms, true, expired)?
                 .into_row()
             {
                 rows.push(row);
@@ -7779,6 +7810,7 @@ impl ChannelState {
                 author,
                 entry_hash,
                 payload,
+                None,
                 now_ms,
                 false,
                 &mut expired,
@@ -7837,6 +7869,7 @@ impl ChannelState {
         author: Digest32,
         entry_hash: Digest32,
         payload: &[u8],
+        pending_sparse_entry: Option<&Entry>,
         now_ms: u64,
         historical: bool,
         expired: &mut Vec<(Digest32, Tracked)>,
@@ -7938,12 +7971,21 @@ impl ChannelState {
             // survives a restart (its key is used up), and ages like one (RR-2), and is indexed
             // for `read by` once the batch has committed.
             Ok(Decoded::Read(record)) => {
-                if self.already_expired(
-                    Transaction::Batch(batch),
-                    &entry_hash,
-                    record.created_millis,
-                    now_ms,
-                )? {
+                let expired_now = match pending_sparse_entry {
+                    Some(entry) => self.already_expired_entry(
+                        Transaction::Batch(batch),
+                        entry,
+                        record.created_millis,
+                        now_ms,
+                    ),
+                    None => self.already_expired(
+                        Transaction::Batch(batch),
+                        &entry_hash,
+                        record.created_millis,
+                        now_ms,
+                    ),
+                }?;
+                if expired_now {
                     self.queue_retention_rendered(batch, &entry_hash, record.created_millis, None)?;
                     expired.extend(
                         self.retention_get_in(Transaction::Batch(batch), &entry_hash)?
@@ -7987,12 +8029,21 @@ impl ChannelState {
             }
             Ok(Decoded::Session(_)) | Err(_) => return Ok(ContentProjection::Applied),
         };
-        if self.already_expired(
-            Transaction::Batch(batch),
-            &entry_hash,
-            content.created_millis,
-            now_ms,
-        )? {
+        let expired_now = match pending_sparse_entry {
+            Some(entry) => self.already_expired_entry(
+                Transaction::Batch(batch),
+                entry,
+                content.created_millis,
+                now_ms,
+            ),
+            None => self.already_expired(
+                Transaction::Batch(batch),
+                &entry_hash,
+                content.created_millis,
+                now_ms,
+            ),
+        }?;
+        if expired_now {
             self.queue_retention_rendered(batch, &entry_hash, content.created_millis, None)?;
             expired.extend(
                 self.retention_get_in(Transaction::Batch(batch), &entry_hash)?

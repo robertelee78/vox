@@ -184,10 +184,12 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 The isolated FX-29 mutants are
 `VOX_TEST_WATCHDOG_SECS=<operator-deadman> scripts/run-fx29-mutant.sh drop-resume-owed` and the
-same command with `finish-control-after-effect`. The first removes only the `ResumeOwed`
-installation after the causally staged stale archive return; the second restores the merge bug
-that tries to apply a sparse Presence before its position is semantically published. The runner
-accepts only each exact named PRODUCT verdict after its exact staging line. Its
+same command with `finish-control-after-effect` or `track-content-through-settled-index`. The first
+removes only the `ResumeOwed` installation after the causally staged stale archive return; the
+second restores the merge bug that tries to apply a sparse Presence before its position is
+semantically published; the third makes sparse Content retention rediscover the entry only through
+the still-unsettled public index instead of using the transaction's exact authenticated entry. The
+runner accepts only each exact named PRODUCT verdict after its exact staging line. Its
 transcript is written under `target/fx29-mutants/`. The required positive deadman is chosen by the
 operator for that machine and only turns a whole-proof wedge into APPARATUS; elapsed time never
 decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a release gate.

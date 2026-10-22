@@ -310,6 +310,17 @@ The decider then answered twelve questions, one at a time. His answers are the d
   peer holds any more (his rooms are sparse: 200, 188 and 76 of one room's entries on three
   nodes) is pulled again from every peer every period: 3.67 syncs per second over 39 peer-room
   pairs, a median 11 s between two syncs of one pair, about 370 commits per sync.
+  Merge RCA (2026-10-22): role-complete receipts required moving sparse effect completion after
+  semantic projection. The old operation had also made the sparse entry discoverable, so moving
+  it exposed two circular dependencies: Presence demanded its own exact published position before
+  it could publish that position, while Content retention/render tried to look the entry up only
+  through the still-unsettled public index. Both parents worked only because they completed every
+  effect early. The composed rule is exact: non-Content may stage its completed marker before its
+  semantic handler only in the same atomic Batch, so a handler failure rolls the marker back;
+  Content remains incomplete until the selected body is semantically admitted, and its retention
+  and expiry decisions consume the transaction's already-authenticated exact entry rather than
+  pretending it was settled. A deferred or unavailable body therefore commits neither a false
+  receipt nor a public effect marker.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
   power loss: a node's own entries, consent, trust, keys, Session records and the format marker
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person
