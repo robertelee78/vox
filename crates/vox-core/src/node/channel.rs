@@ -2585,6 +2585,9 @@ impl ChannelState {
                 sparse: false,
             };
             let mut batch = store.batch()?;
+            // Bootstrap reconstructs a restart index from authenticated room state. A later
+            // person-loss commit carries it; this derived-only rebuild does not force a flush.
+            batch.derived();
             let mut writer = entries.write(&mut batch, &sek, channel_id)?;
             writer.bootstrap_restart(state)?;
             writer.seal()?;

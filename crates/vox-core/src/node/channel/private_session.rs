@@ -362,9 +362,8 @@ impl ChannelState {
     pub(super) fn queue_private_generations(
         &self,
         batch: &mut crate::node::store::Batch<'_>,
-    ) -> Result<()> {
-        // Drive generations are keys: flushed (ADR-038 FX-30).
-        batch.ruled();
+    ) -> Result<bool> {
+        let mut queued = false;
         for (hash, (author, generation)) in &self.private_sessions.observed_generations {
             if self
                 .entries
@@ -372,6 +371,9 @@ impl ChannelState {
                 .log_id(hash)?
                 .is_some()
             {
+                // Drive generations are keys: flush only a transaction that actually queues one
+                // (ADR-038 FX-30). Marking an empty migration Ruled caused a needless full sync.
+                batch.ruled();
                 private_index::observe_control(
                     batch,
                     &self.sek,
@@ -382,9 +384,10 @@ impl ChannelState {
                         ..Default::default()
                     },
                 )?;
+                queued = true;
             }
         }
-        Ok(())
+        Ok(queued)
     }
 
     pub(super) fn private_controls_committed(&mut self, store: &Store) -> Result<()> {
@@ -794,8 +797,9 @@ impl ChannelState {
             let Some((id, entry)) = self.legacy_after(store, work.after, work.through)? else {
                 if !work.migrating {
                     let mut batch = store.batch()?;
-                    self.queue_private_generations(&mut batch)?;
-                    batch.commit()?;
+                    if self.queue_private_generations(&mut batch)? {
+                        batch.commit()?;
+                    }
                     self.private_controls_committed(store)?;
                     work.migrating = true;
                     work.after = None;

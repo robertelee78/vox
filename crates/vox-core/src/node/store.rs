@@ -992,11 +992,12 @@ impl Store {
     /// As [`Self::flush`].
     pub fn flush_if_received_pending(&self) -> Result<bool> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        // An installed replacement's directory entry is durability debt even when no newer
+        // Received epoch exists. Finish it before the fast return so a head/inventory ACK can
+        // never claim bytes whose rename was not made durable.
+        let replacement_flushed = self.finish_replacement(&mut epochs)?;
         if epochs.received <= epochs.flushed {
-            return Ok(false);
-        }
-        if self.finish_replacement(&mut epochs)? {
-            return Ok(true);
+            return Ok(replacement_flushed);
         }
         let txn = match &*self.db.read().unwrap_or_else(PoisonError::into_inner) {
             Backing::Writable(db) => db.begin_write().map_err(storage("begin flush"))?,
@@ -1018,11 +1019,11 @@ impl Store {
     #[must_use]
     pub fn received_pending(&self) -> bool {
         match self.writer.try_lock() {
-            Ok(epochs) => epochs.received > epochs.flushed,
+            Ok(epochs) => epochs.replacement.is_some() || epochs.received > epochs.flushed,
             Err(std::sync::TryLockError::WouldBlock) => true,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 let epochs = poisoned.into_inner();
-                epochs.received > epochs.flushed
+                epochs.replacement.is_some() || epochs.received > epochs.flushed
             }
         }
     }
