@@ -264,62 +264,104 @@ gone() {
 }
 moved=0
 put_back() {
-  if [ "$moved" = 1 ] && [ ! -e "$APPS/Vox.app" ] && [ -e "$APPS/.Vox.app.previous" ]; then
-    mv "$APPS/.Vox.app.previous" "$APPS/Vox.app" \
-      && printf 'vox install: the swap was cut short; the Vox.app that was installed is back\n' >&2
+  if [ "$moved" = 1 ] && [ ! -e "$APPS/Vox.app" ]; then
+    OLD="$APPS/.Vox.install.rollback.partial"
+    [ -e "$OLD" ] || OLD="$APPS/.Vox.app.previous"
+    if [ -e "$OLD" ]; then
+      restore "$OLD" && mv "$OLD" "$APPS/Vox.app" \
+        && printf 'vox install: the swap was cut short; the Vox.app that was installed is back\n' >&2
+    fi
   fi
 }
 trap put_back EXIT
 trap 'exit 130' INT TERM
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+set_aside() { # <bundle>: make structurally non-launchable, then unregister
+  LIVE="$1/Contents/Info.plist" KEPT="$1/Contents/Info.plist.kept"
+  if [ -f "$LIVE" ] && [ ! -L "$LIVE" ] && [ ! -e "$KEPT" ] && [ ! -L "$KEPT" ]; then
+    mv "$LIVE" "$KEPT" || fail "could not make retained bundle $1 non-launchable"
+  elif [ -f "$KEPT" ] && [ ! -L "$KEPT" ] && [ ! -e "$LIVE" ] && [ ! -L "$LIVE" ]; then
+    :
+  else
+    fail "$1 has ambiguous or missing Info.plist metadata"
+  fi
+  # The plist move is the structural guarantee. If unregistering a stale record fails, retain the
+  # non-application bundle and stop loudly; a later install/update retries without ever exposing
+  # a second launchable Vox.
+  "$LSREGISTER" -u "$1" >/dev/null 2>&1 \
+    || fail "LaunchServices could not release $1; it remains non-launchable and was retained"
+}
+restore() { # <bundle>: make a deliberately retained bundle launchable again
+  LIVE="$1/Contents/Info.plist" KEPT="$1/Contents/Info.plist.kept"
+  if [ ! -e "$LIVE" ] && [ ! -L "$LIVE" ] && [ -f "$KEPT" ] && [ ! -L "$KEPT" ]; then
+    mv "$KEPT" "$LIVE" || fail "could not restore $1 as an application bundle"
+  elif [ -f "$LIVE" ] && [ ! -L "$LIVE" ] && [ ! -e "$KEPT" ] && [ ! -L "$KEPT" ]; then
+    : # interrupted after the non-.app rename but before the plist was set aside
+  else
+    fail "$1 is not a single restorable application bundle"
+  fi
+}
 # A bundle is never removed while code from it runs: a daemon not yet restarted after an earlier
 # update runs from the bundle that update replaced. It is retired (renamed aside), and removed by
 # a later transition once nothing runs from it.
 in_use() { # <bundle>: whether any process runs one of its executables
-  files=$(find "$1/Contents" -type f -perm -u+x 2>/dev/null)
-  [ -n "$files" ] || return 1
+  files=$(find "$1/Contents" -type f -perm -u+x) \
+    || fail "could not enumerate executables in retained bundle $1"
+  [ -n "$files" ] || fail "retained bundle $1 has no executable whose use can be checked"
+  OUT="$APPS/.vox-lsof.$$.out" ERR="$APPS/.vox-lsof.$$.err"; gone "$OUT"; gone "$ERR"
+  rc=0
   # shellcheck disable=SC2086 # one argument per file
-  # Read the pids, not the status: lsof exits 1 when any one file named is not open.
-  [ -n "$(/usr/sbin/lsof -t $files 2>/dev/null)" ]
+  /usr/sbin/lsof -t $files >"$OUT" 2>"$ERR" || rc=$?
+  if [ "$rc" = 0 ] && [ -s "$OUT" ] && [ ! -s "$ERR" ]; then
+    gone "$OUT"; gone "$ERR"; return 0
+  fi
+  if [ "$rc" = 1 ] && [ ! -s "$OUT" ] && [ ! -s "$ERR" ]; then
+    gone "$OUT"; gone "$ERR"; return 1
+  fi
+  detail=$(cat "$ERR" 2>/dev/null || printf unreadable-diagnostic)
+  gone "$OUT"; gone "$ERR"
+  fail "could not determine whether retained bundle $1 is in use (lsof $rc: $detail)"
 }
 retire() { # <bundle>
   mv "$1" "$APPS/.Vox.app.retired.$(date +%s).$$" || fail "could not move $1 aside"
 }
 for r in "$APPS"/.Vox.app.retired.*; do
   [ -e "$r" ] || continue
+  set_aside "$r"
   in_use "$r" || gone "$r"
 done
-# A `vox update` cut short between its swap and naming the replaced bundle .Vox.app.previous
-# left a journal (.Vox.app.publishing, as vox update's recover() reads it): finished here the
-# same way, so the replaced bundle under the partial name is kept rather than cleared.
+# The journal belongs to the shipped updater and authenticates exact bundle objects. The shell
+# installer cannot safely reproduce that recovery protocol, so it preserves every byte and asks
+# that updater to finish before a reinstall proceeds.
 J="$APPS/.Vox.app.publishing"
-if [ -d "$J" ]; then
-  published=$(cat "$J/version" 2>/dev/null || true)
-  if [ ! -e "$APPS/.Vox.app.previous" ] && [ -f "$APPS/.Vox.app.partial/Contents/Helpers/vox" ]; then
-    active=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-      "$APPS/Vox.app/Contents/Info.plist" 2>/dev/null || true)
-    if [ -n "$published" ] && [ "$active" = "$published" ]; then
-      mv "$APPS/.Vox.app.partial" "$APPS/.Vox.app.previous" \
-        || fail "could not keep the Vox.app a cut-short update replaced"
-      printf 'vox install: an update was cut short after Vox %s was put in place; the Vox.app it replaced is kept at %s\n' \
-        "$published" "$APPS/.Vox.app.previous" >&2
-    fi
-  fi
-  if [ ! -e "$APPS/.Vox.app.previous" ] && [ -e "$J/Vox.app" ]; then
-    mv "$J/Vox.app" "$APPS/.Vox.app.previous" || fail "could not put back $APPS/.Vox.app.previous"
-  fi
-  gone "$J"
-fi
+[ ! -e "$J" ] \
+  || fail "$J records an unfinished app transition; run the installed 'vox update' to recover it before reinstalling"
 gone "$APPS/.Vox.app.partial"
 gone "$APPS/.Vox.app.previous.partial"
+if [ -e "$APPS/.Vox.install.rollback.partial" ] || [ -L "$APPS/.Vox.install.rollback.partial" ]; then
+  [ ! -e "$APPS/Vox.app" ] && [ ! -L "$APPS/Vox.app" ] \
+    || fail "$APPS/.Vox.install.rollback.partial exists beside Vox.app; neither was changed"
+  restore "$APPS/.Vox.install.rollback.partial"
+  mv "$APPS/.Vox.install.rollback.partial" "$APPS/Vox.app" \
+    || fail "could not restore the Vox.app from an interrupted install"
+  "$LSREGISTER" -f "$APPS/Vox.app" >/dev/null 2>&1 \
+    || fail "restored Vox.app after an interrupted install, but LaunchServices could not register it"
+  printf 'vox install: restored the Vox.app left by an interrupted install before continuing\n' >&2
+fi
 /usr/bin/ditto "$NEW" "$APPS/.Vox.app.partial" || fail "could not copy Vox.app into $APPS"
 printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
   "$CHANNEL" >"$APPS/.marker.partial" || fail "could not write $APPS/$MARKER"
 if [ -e "$APPS/Vox.app" ]; then
   if [ -e "$APPS/.Vox.app.previous" ]; then
+    set_aside "$APPS/.Vox.app.previous"
     if in_use "$APPS/.Vox.app.previous"; then retire "$APPS/.Vox.app.previous"; else gone "$APPS/.Vox.app.previous"; fi
   fi
-  mv "$APPS/Vox.app" "$APPS/.Vox.app.previous" || fail "could not move the installed Vox.app aside"
+  mv "$APPS/Vox.app" "$APPS/.Vox.install.rollback.partial" \
+    || fail "could not move the installed Vox.app to its non-application staging name"
   moved=1
+  set_aside "$APPS/.Vox.install.rollback.partial"
+  mv "$APPS/.Vox.install.rollback.partial" "$APPS/.Vox.app.previous" \
+    || fail "could not retain the installed Vox.app for rollback"
 fi
 mv "$APPS/.Vox.app.partial" "$APPS/Vox.app" || fail "could not put the new Vox.app in place"
 moved=0
@@ -336,9 +378,20 @@ SWAP
   restore_app() {
     if [ "${linked_ok:-0}" != 1 ] && [ -e "$APPS/.Vox.app.previous" ]; then
       gone "$APPS/.Vox.app.failed"
-      mv "$APPS/Vox.app" "$APPS/.Vox.app.failed" 2>/dev/null \
-        && mv "$APPS/.Vox.app.previous" "$APPS/Vox.app" \
-        && printf 'vox install: the install failed after Vox.app was replaced; the Vox.app that was installed is back\n' >&2
+      if mv "$APPS/Vox.app" "$APPS/.Vox.app.failed" \
+        && mv "$APPS/.Vox.app.failed/Contents/Info.plist" \
+          "$APPS/.Vox.app.failed/Contents/Info.plist.kept" \
+        && mv "$APPS/.Vox.app.previous/Contents/Info.plist.kept" \
+          "$APPS/.Vox.app.previous/Contents/Info.plist" \
+        && mv "$APPS/.Vox.app.previous" "$APPS/Vox.app"; then
+        LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+        "$LSREGISTER" -f "$APPS/Vox.app" >/dev/null 2>&1 \
+          || printf 'vox install: restored Vox.app, but LaunchServices registration failed\n' >&2
+        gone "$APPS/.Vox.app.failed"
+        printf 'vox install: the install failed after Vox.app was replaced; the Vox.app that was installed is back\n' >&2
+      else
+        printf 'vox install: failed to restore the prior Vox.app after the install failed; inspect %s\n' "$APPS" >&2
+      fi
     fi
   }
   say "installed: $APPS/Vox.app (Vox $version)"

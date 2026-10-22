@@ -41,10 +41,14 @@ const PARTIAL: &str = ".Vox.app.partial";
 /// A rollback candidate while its kept plist is live. This deliberately does not end in `.app`,
 /// so restoring it never creates a second application before the atomic exchange.
 const ROLLBACK_PARTIAL: &str = ".Vox.rollback.partial";
-/// Where the download is unpacked before its one `Vox.app` is moved to [`PARTIAL`].
-const UNPACK_PARTIAL: &str = ".Vox.app.unpack.partial";
 /// The CLI inside the bundle.
 const HELPER: &str = "Contents/Helpers/vox";
+/// The app executable and sealed resource ledger whose bytes, together with [`HELPER`], identify
+/// each exact bundle across a transition. Moving `Info.plist` aside changes none of them.
+const APP_EXECUTABLE: &str = "Contents/MacOS/Vox";
+const CODE_RESOURCES: &str = "Contents/_CodeSignature/CodeResources";
+const APP_IDENTIFIER: &str = "us.vox.app";
+const HELPER_IDENTIFIER: &str = "us.vox.cli";
 /// The durable journal of a publish or rollback under way. It holds the exact filesystem objects
 /// on each side of the exchange, so recovery never guesses from a version string.
 const PUBLISHING: &str = ".Vox.app.publishing";
@@ -61,6 +65,8 @@ struct Transition {
     kind: TransitionKind,
     active_id: u64,
     target_id: u64,
+    active_digest: [u8; 32],
+    target_digest: [u8; 32],
     version: String,
 }
 
@@ -77,20 +83,52 @@ const TEST_ABORT_AFTER_SWAP_ENV: &str = "VOX_TEST_ABORT_AFTER_SWAP";
 #[cfg(feature = "test-knobs")]
 const TEST_TRANSITION_STOP_ENV: &str = "VOX_TEST_APP_TRANSITION_STOP";
 
-fn transition_boundary(_point: &str) -> Result<(), AppError> {
-    #[cfg(feature = "test-knobs")]
+/// Inject a returned operation failure before the named operation mutates anything. An abort is
+/// delivered separately after the real operation and its durability fence have succeeded. The
+/// macros put the entire reader *and the boundary name* behind `test-knobs`; a packaged binary
+/// does not retain dormant knob strings and does not depend on the optimizer to remove them.
+#[cfg(feature = "test-knobs")]
+fn transition_failure_at(point: &str) -> Result<(), AppError> {
     if let Some(stop) = std::env::var_os(TEST_TRANSITION_STOP_ENV) {
         let stop = stop.to_string_lossy();
-        if stop == format!("abort:{_point}") {
-            std::process::abort();
-        }
-        if stop == format!("fail:{_point}") {
+        if stop == format!("fail:{point}") {
             return Err(usage(format!(
-                "test apparatus stopped the app transition at {_point}"
+                "test apparatus refused the app transition operation at {point}"
             )));
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "test-knobs")]
+fn transition_succeeded_at(point: &str) {
+    if let Some(stop) = std::env::var_os(TEST_TRANSITION_STOP_ENV) {
+        if stop.to_string_lossy() == format!("abort:{point}") {
+            std::process::abort();
+        }
+    }
+}
+
+macro_rules! transition_failure {
+    ($point:literal) => {{
+        #[cfg(feature = "test-knobs")]
+        {
+            transition_failure_at($point)
+        }
+        #[cfg(not(feature = "test-knobs"))]
+        {
+            Ok::<(), AppError>(())
+        }
+    }};
+}
+
+macro_rules! transition_succeeded {
+    ($point:literal) => {{
+        #[cfg(feature = "test-knobs")]
+        {
+            transition_succeeded_at($point);
+        }
+    }};
 }
 
 /// `vox update [--check]` for the Vox.app in `apps`.
@@ -146,12 +184,7 @@ pub(super) fn update(
         )));
     }
     let (vox, app) = fetch_pair(channel, target)?;
-    let installed_text = active_app_version(&active).ok_or_else(|| {
-        usage(format!(
-            "the active {} has no readable Contents/Info.plist version",
-            active.display()
-        ))
-    })?;
+    let installed_text = require_active_app_version(&active)?;
     let installed = semver::Version::parse(&installed_text).map_err(|_| {
         usage(format!(
             "the active {} says its version is {installed_text:?}, not SemVer",
@@ -254,23 +287,29 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
             apps.display()
         )));
     }
-    let was = active_app_version(&active).unwrap_or_else(|| "unknown".to_owned());
-    let now = bundle_version(&previous).unwrap_or_else(|| "unknown".to_owned());
+    let was = require_active_app_version(&active)?;
+    let now = require_bundle_version(&previous)?;
     let transition = Transition {
         kind: TransitionKind::Rollback,
         active_id: file_id(&active)?,
         target_id: file_id(&previous)?,
+        active_digest: bundle_digest(&active)?,
+        target_digest: bundle_digest(&previous)?,
         version: now.clone(),
     };
     begin_transition(apps, &transition)?;
     // Move the rollback bundle to a name which is not an application before restoring its plist.
     // Thus the only `.app` with a live plist is `Vox.app` on every crash boundary. The journal's
     // inode identities let recovery advance any of these durable phases without guessing.
+    transition_failure!("rollback-target-staged")?;
     fs::rename(&previous, &staged).map_err(AppError::Io)?;
     sync_dir(apps)?;
-    transition_boundary("rollback-target-staged")?;
+    transition_succeeded!("rollback-target-staged");
+    transition_failure!("rollback-plist-restored")?;
     restore(&staged)?;
-    transition_boundary("rollback-plist-restored")?;
+    transition_succeeded!("rollback-plist-restored");
+    verify_rollback_bundle(&active, &staged)?;
+    transition_failure!("rollback-exchanged")?;
     if let Err(failed) = swap(&staged, &active) {
         // Nothing was swapped. The journal-backed recovery retries the exact rollback; if the
         // exchange failure was transient it completes the user's command, otherwise the journal
@@ -287,6 +326,7 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         };
     }
     sync_dir(apps)?;
+    transition_succeeded!("rollback-exchanged");
     #[cfg(feature = "test-knobs")]
     if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
         std::process::abort();
@@ -296,20 +336,27 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     // A failure is reported last, after the
     // active bundle is registered and the daemon restarted, so a failed step never leaves the
     // rest of the transition undone or invites a second --rollback that would reverse it.
-    let aside = transition_boundary("rollback-exchanged")
+    let aside = transition_failure!("rollback-displaced-set-aside")
         .and_then(|()| set_aside(&staged))
         .and_then(|changed| {
-            transition_boundary("rollback-displaced-set-aside")?;
+            transition_succeeded!("rollback-displaced-set-aside");
+            transition_failure!("rollback-previous-retained")?;
             fs::rename(&staged, &previous).map_err(AppError::Io)?;
             sync_dir(apps)?;
-            transition_boundary("rollback-previous-retained")?;
+            transition_succeeded!("rollback-previous-retained");
             Ok(changed)
         });
-    let registration = launch_services(true, &active)
-        .map_err(usage)
-        .and_then(|()| transition_boundary("rollback-active-registered"));
+    let registration = transition_failure!("rollback-active-registered").and_then(|()| {
+        launch_services(true, &active).map_err(usage)?;
+        transition_succeeded!("rollback-active-registered");
+        Ok(())
+    });
     let finalization = if aside.is_ok() && registration.is_ok() {
-        finish_transition(apps).and_then(|()| transition_boundary("rollback-journal-cleared"))
+        transition_failure!("rollback-journal-cleared").and_then(|()| {
+            finish_transition(apps)?;
+            transition_succeeded!("rollback-journal-cleared");
+            Ok(())
+        })
     } else {
         Ok(())
     };
@@ -319,14 +366,15 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     } else {
         &staged
     };
-    let now = active_app_version(&active).unwrap_or(now);
-    println!("rolled back: {} -> Vox {now}", active.display());
+    let active_version = require_active_app_version(&active);
+    let reported_now = active_version.as_ref().unwrap_or(&now);
+    println!("rolled back: {} -> Vox {reported_now}", active.display());
     println!(
         "         Vox {was} is kept at {} for --rollback",
         retained.display()
     );
-    ask_to_restart(&was, &now);
-    let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
+    ask_to_restart(&was, reported_now);
+    let detached = super::restart::restart_daemon(&active.join(HELPER), reported_now);
     shell_setup_from(apps, exe);
     super::restart::say_next(&detached);
     // The rollback is committed, so say that first. A later finalization error must still leave a
@@ -373,6 +421,13 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         );
         later_errors.push(format!("inspecting the retained path: {e}"));
     }
+    if let Err(e) = &active_version {
+        println!(
+            "vox: the rollback is done, but its active app metadata could not be read: {e}; run \
+             `vox update` to verify the recorded transition"
+        );
+        later_errors.push(format!("reading the active app metadata: {e}"));
+    }
     if !later_errors.is_empty() {
         return Err(usage(format!(
             "the rollback completed, but later finalization failed: {}",
@@ -389,8 +444,8 @@ fn finish_recovered_rollback(
     repaired: Recovery,
 ) -> Result<(), AppError> {
     require_bundle(active, BUNDLE)?;
-    let now = active_app_version(active).unwrap_or_else(|| "unknown".to_owned());
-    let was = bundle_version(&apps.join(PREVIOUS)).unwrap_or_else(|| "unknown".to_owned());
+    let now = require_active_app_version(active)?;
+    let was = require_bundle_version(&apps.join(PREVIOUS))?;
     println!(
         "finished the interrupted rollback: {} is Vox {now}",
         active.display()
@@ -427,13 +482,15 @@ fn begin_transition(apps: &Path, transition: &Transition) -> Result<(), AppError
             journal.display()
         )));
     }
+    transition_failure!("journal-directory-synced")?;
     fs::create_dir(&journal).map_err(AppError::Io)?;
     sync_dir(apps)?;
-    transition_boundary("journal-directory-synced")?;
+    transition_succeeded!("journal-directory-synced");
     let kind = match transition.kind {
         TransitionKind::Publish => "publish",
         TransitionKind::Rollback => "rollback",
     };
+    transition_failure!("journal-state-synced")?;
     let state = journal.join(TRANSITION_STATE);
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -442,14 +499,19 @@ fn begin_transition(apps: &Path, transition: &Transition) -> Result<(), AppError
         .map_err(AppError::Io)?;
     write!(
         file,
-        "vox-app-transition-v1\nkind={kind}\nactive_id={}\ntarget_id={}\nversion={}\n",
-        transition.active_id, transition.target_id, transition.version
+        "vox-app-transition-v2\nkind={kind}\nactive_id={}\ntarget_id={}\nactive_digest={}\ntarget_digest={}\nversion={}\n",
+        transition.active_id,
+        transition.target_id,
+        hex_digest(&transition.active_digest),
+        hex_digest(&transition.target_digest),
+        transition.version
     )
     .map_err(AppError::Io)?;
     file.sync_all().map_err(AppError::Io)?;
     sync_dir(&journal)?;
     sync_dir(apps)?;
-    transition_boundary("journal-state-synced")
+    transition_succeeded!("journal-state-synced");
+    Ok(())
 }
 
 fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
@@ -470,7 +532,7 @@ fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
         Err(e) => return Err(AppError::Io(e)),
     };
     let mut lines = text.lines();
-    if lines.next() != Some("vox-app-transition-v1") {
+    if lines.next() != Some("vox-app-transition-v2") {
         return Err(usage(format!(
             "{} has an unreadable app-transition record; leave it in place and report this",
             state.display()
@@ -508,6 +570,8 @@ fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
             state.display()
         ))
     })?;
+    let active_digest = parse_digest(&field(lines.next(), "active_digest")?, &state)?;
+    let target_digest = parse_digest(&field(lines.next(), "target_digest")?, &state)?;
     let version = field(lines.next(), "version")?;
     if lines.next().is_some() {
         return Err(usage(format!(
@@ -519,6 +583,8 @@ fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
         kind,
         active_id,
         target_id,
+        active_digest,
+        target_digest,
         version,
     }))
 }
@@ -545,15 +611,19 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
         kind: TransitionKind::Publish,
         active_id: file_id(&active)?,
         target_id: file_id(&staged)?,
+        active_digest: bundle_digest(&active)?,
+        target_digest: bundle_digest(&staged)?,
         version: version.to_owned(),
     };
     begin_transition(apps, &transition)?;
     if path_exists(&previous)? {
+        transition_failure!("publish-older-moved")?;
         fs::rename(&previous, journal.join(BUNDLE)).map_err(AppError::Io)?;
         sync_dir(&journal)?;
         sync_dir(apps)?;
-        transition_boundary("publish-older-moved")?;
+        transition_succeeded!("publish-older-moved");
     }
+    transition_failure!("publish-exchanged")?;
     if let Err(failed) = swap(&staged, &active) {
         // Nothing was swapped: the previous bundle goes back where it was.
         return match recover(apps) {
@@ -565,7 +635,7 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
         };
     }
     sync_dir(apps)?;
-    let exchanged = transition_boundary("publish-exchanged");
+    transition_succeeded!("publish-exchanged");
     #[cfg(feature = "test-knobs")]
     if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
         std::process::abort();
@@ -575,28 +645,33 @@ fn publish(apps: &Path, version: &str) -> Result<Option<AppError>, AppError> {
     // From this point publication is committed: every later failure is returned as a warning so
     // `update` first tells the person that the new app is in place.
     let finish = || -> Result<(), AppError> {
-        exchanged?;
+        transition_failure!("publish-displaced-set-aside")?;
         set_aside(&staged)?;
-        transition_boundary("publish-displaced-set-aside")?;
+        transition_succeeded!("publish-displaced-set-aside");
+        transition_failure!("publish-previous-retained")?;
         fs::rename(&staged, &previous).map_err(AppError::Io)?;
         sync_dir(apps)?;
-        transition_boundary("publish-previous-retained")?;
+        transition_succeeded!("publish-previous-retained");
+        transition_failure!("publish-active-registered")?;
         launch_services(true, &active).map_err(usage)?;
-        transition_boundary("publish-active-registered")?;
+        transition_succeeded!("publish-active-registered");
         // The bundle that was previous before this publish goes, unless something still runs from
         // it: then it is retired, and a later transition removes it (see [`sweep`]).
         let older = journal.join(BUNDLE);
         if path_exists(&older)? {
+            transition_failure!("publish-older-cleaned")?;
             require_bundle(&older, "the journal's retained bundle")?;
-            if in_use(&older) {
+            if in_use(&older)? {
                 retire(apps, &older)?;
             } else {
                 clear(&older)?;
             }
-            transition_boundary("publish-older-cleaned")?;
+            transition_succeeded!("publish-older-cleaned");
         }
+        transition_failure!("publish-journal-cleared")?;
         finish_transition(apps)?;
-        transition_boundary("publish-journal-cleared")
+        transition_succeeded!("publish-journal-cleared");
+        Ok(())
     };
     match finish() {
         Ok(()) => Ok(None),
@@ -678,14 +753,12 @@ const INFO_PLIST: &str = "Contents/Info.plist";
 /// `recover`, the next publish), until it succeeds.
 fn set_aside(bundle: &Path) -> Result<bool, AppError> {
     require_bundle(bundle, "the bundle being set aside")?;
-    if let Err(said) = launch_services(false, bundle) {
-        println!("note: {said}; tried again at the next update or rollback");
-    }
+    let release = launch_services(false, bundle).map_err(usage);
     let plist = bundle.join(INFO_PLIST);
     let kept = bundle.join(KEPT_INFO_PLIST);
     if !plist.is_file() {
         return if kept.is_file() {
-            Ok(false)
+            release.map(|()| false)
         } else {
             Err(usage(format!(
                 "{} has neither a live nor kept Info.plist; it was not removed",
@@ -706,7 +779,7 @@ fn set_aside(bundle: &Path) -> Result<bool, AppError> {
         ))
     })?;
     sync_dir(&bundle.join("Contents"))?;
-    Ok(true)
+    release.map(|()| true)
 }
 
 /// Make a set-aside bundle an application again, for the swap that brings it back.
@@ -743,7 +816,7 @@ fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
             if set_aside(&entry.path())? {
                 repaired.retired_set_aside += 1;
             }
-            if !in_use(&entry.path()) {
+            if !in_use(&entry.path())? {
                 clear(&entry.path())?;
                 repaired.retired_removed += 1;
             }
@@ -754,23 +827,38 @@ fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
 
 /// Whether any process runs one of `bundle`'s executables, as `lsof` reports it. When `lsof`
 /// cannot say, the bundle is taken to be in use: kept is the safe side.
-fn in_use(bundle: &Path) -> bool {
+fn in_use(bundle: &Path) -> Result<bool, AppError> {
     use std::os::unix::fs::PermissionsExt as _;
     let mut files = Vec::new();
     let mut dirs = vec![bundle.join("Contents")];
     while let Some(dir) = dirs.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(_) => return true,
+            Err(e) => {
+                return Err(usage(format!(
+                    "could not inspect retired bundle {} for running code: {e}",
+                    bundle.display()
+                )))
+            }
         };
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(_) => return true,
+                Err(e) => {
+                    return Err(usage(format!(
+                        "could not enumerate retired bundle {} for running code: {e}",
+                        bundle.display()
+                    )))
+                }
             };
             let meta = match fs::symlink_metadata(entry.path()) {
                 Ok(meta) => meta,
-                Err(_) => return true,
+                Err(e) => {
+                    return Err(usage(format!(
+                        "could not inspect {} while checking retired bundle use: {e}",
+                        entry.path().display()
+                    )))
+                }
             };
             if meta.file_type().is_symlink() {
                 continue;
@@ -782,7 +870,10 @@ fn in_use(bundle: &Path) -> bool {
         }
     }
     if files.is_empty() {
-        return true;
+        return Err(usage(format!(
+            "retired bundle {} has no executable to check for use; it was retained",
+            bundle.display()
+        )));
     }
     // `lsof` exits 1 with no output when none of the exact files is open. Any output, diagnostic,
     // other status, or inability to ask is uncertainty and keeps the bundle.
@@ -792,13 +883,24 @@ fn in_use(bundle: &Path) -> bool {
         .env_clear()
         .output()
     {
-        Ok(out) if !out.stdout.is_empty() => true,
+        Ok(out) if out.status.success() && !out.stdout.is_empty() && out.stderr.is_empty() => {
+            Ok(true)
+        }
         Ok(out)
             if out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty() =>
         {
-            false
+            Ok(false)
         }
-        _ => true,
+        Ok(out) => Err(usage(format!(
+            "could not determine whether retired bundle {} is in use: lsof exited {}: {}",
+            bundle.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+        Err(e) => Err(usage(format!(
+            "could not run lsof for retired bundle {}: {e}",
+            bundle.display()
+        ))),
     }
 }
 
@@ -809,26 +911,28 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
     sweep(apps, &mut repaired)?;
     let active = apps.join(BUNDLE);
-    let unpacked = apps.join(UNPACK_PARTIAL);
     let staged = apps.join(PARTIAL);
     let rollback_staged = apps.join(ROLLBACK_PARTIAL);
     let previous = apps.join(PREVIOUS);
     let journal = apps.join(PUBLISHING);
     require_bundle(&active, BUNDLE)?;
-    require_optional_dir(&unpacked, UNPACK_PARTIAL)?;
-    require_optional_bundle(&staged, PARTIAL)?;
+    // Before a durable journal exists, the publish path is only extraction scratch. It may be
+    // structurally incomplete because power stopped `bsdtar`; validate only that its reserved
+    // top-level name is a direct directory, then remove it without following nested symlinks.
+    require_optional_dir(&staged, PARTIAL)?;
     require_optional_bundle(&rollback_staged, ROLLBACK_PARTIAL)?;
     require_optional_bundle(&previous, PREVIOUS)?;
     require_optional_dir(&journal, PUBLISHING)?;
-    // Extraction never publishes state. Any directory left by an interrupted `ditto` is scratch,
-    // and is cleared before transition recovery can report completion.
-    clear(&unpacked)?;
     if !path_exists(&journal)? {
         if path_exists(&rollback_staged)? {
             return Err(usage(format!(
                 "reserved rollback staging path {} exists without its transition journal; no path was changed",
                 rollback_staged.display()
             )));
+        }
+        if path_exists(&staged)? {
+            clear(&staged)?;
+            repaired.unpublished_candidate_cleared = true;
         }
         // No publish was cut short. A previous bundle is set aside again under the lock: one an
         // earlier release left as an application (before M-29a), or one whose record removal
@@ -838,6 +942,7 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
         }
         return Ok(repaired);
     }
+    require_optional_bundle(&staged, PARTIAL)?;
     let kept = journal.join(BUNDLE);
     require_optional_bundle(&kept, "the journal's retained bundle")?;
     let Some(transition) = read_transition(&journal)? else {
@@ -851,31 +956,62 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
         return Ok(repaired);
     };
     let active_id = file_id(&active)?;
+    if active_id == transition.active_id {
+        require_transition_identity(
+            &active,
+            transition.active_id,
+            &transition.active_digest,
+            &journal,
+            "the recorded active app changed",
+        )?;
+    } else if active_id == transition.target_id {
+        require_transition_identity(
+            &active,
+            transition.target_id,
+            &transition.target_digest,
+            &journal,
+            "the recorded replacement app changed",
+        )?;
+    }
     match transition.kind {
         TransitionKind::Publish if active_id == transition.target_id => {
             repaired.interrupted_transition =
                 Some(InterruptedTransition::Published(transition.version.clone()));
             if path_exists(&previous)? {
-                if file_id(&previous)? != transition.active_id {
+                if path_exists(&staged)? {
                     return Err(transition_conflict(
                         &journal,
-                        "the retained previous app changed",
+                        "both the replaced-app staging path and previous-bundle path are occupied",
                     ));
                 }
+                require_transition_identity(
+                    &previous,
+                    transition.active_id,
+                    &transition.active_digest,
+                    &journal,
+                    "the retained previous app changed",
+                )?;
                 repaired.previous_set_aside |= set_aside(&previous)?;
             } else {
-                if !path_exists(&staged)? || file_id(&staged)? != transition.active_id {
+                if !path_exists(&staged)? {
                     return Err(transition_conflict(
                         &journal,
                         "the replaced app is under neither recorded name",
                     ));
                 }
+                require_transition_identity(
+                    &staged,
+                    transition.active_id,
+                    &transition.active_digest,
+                    &journal,
+                    "the replaced app under its staging name changed",
+                )?;
                 repaired.previous_set_aside |= set_aside(&staged)?;
                 fs::rename(&staged, &previous).map_err(AppError::Io)?;
                 sync_dir(apps)?;
             }
             if path_exists(&kept)? {
-                if in_use(&kept) {
+                if in_use(&kept)? {
                     retire(apps, &kept)?;
                 } else {
                     clear(&kept)?;
@@ -887,12 +1023,13 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                 transition.version.clone(),
             ));
             if path_exists(&staged)? {
-                if file_id(&staged)? != transition.target_id {
-                    return Err(transition_conflict(
-                        &journal,
-                        "the unpublished candidate changed",
-                    ));
-                }
+                require_transition_identity(
+                    &staged,
+                    transition.target_id,
+                    &transition.target_digest,
+                    &journal,
+                    "the unpublished candidate changed",
+                )?;
                 clear(&staged)?;
             }
             if path_exists(&kept)? {
@@ -915,12 +1052,13 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                 transition.version.clone(),
             ));
             if path_exists(&rollback_staged)? {
-                if file_id(&rollback_staged)? != transition.active_id {
-                    return Err(transition_conflict(
-                        &journal,
-                        "the displaced app under the rollback staging name changed",
-                    ));
-                }
+                require_transition_identity(
+                    &rollback_staged,
+                    transition.active_id,
+                    &transition.active_digest,
+                    &journal,
+                    "the displaced app under the rollback staging name changed",
+                )?;
                 if path_exists(&previous)? {
                     return Err(transition_conflict(
                         &journal,
@@ -930,12 +1068,19 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                 repaired.previous_set_aside |= set_aside(&rollback_staged)?;
                 fs::rename(&rollback_staged, &previous).map_err(AppError::Io)?;
                 sync_dir(apps)?;
-            } else if !path_exists(&previous)? || file_id(&previous)? != transition.active_id {
+            } else if !path_exists(&previous)? {
                 return Err(transition_conflict(
                     &journal,
                     "the displaced app is under neither recorded rollback name",
                 ));
             } else {
+                require_transition_identity(
+                    &previous,
+                    transition.active_id,
+                    &transition.active_digest,
+                    &journal,
+                    "the retained displaced app changed",
+                )?;
                 repaired.previous_set_aside |= set_aside(&previous)?;
             }
         }
@@ -944,23 +1089,37 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
                 transition.version.clone(),
             ));
             if path_exists(&previous)? {
-                if path_exists(&rollback_staged)? || file_id(&previous)? != transition.target_id {
+                if path_exists(&rollback_staged)? {
                     return Err(transition_conflict(
                         &journal,
                         "the rollback target is not under its recorded name",
                     ));
                 }
+                require_transition_identity(
+                    &previous,
+                    transition.target_id,
+                    &transition.target_digest,
+                    &journal,
+                    "the rollback target changed",
+                )?;
                 fs::rename(&previous, &rollback_staged).map_err(AppError::Io)?;
                 sync_dir(apps)?;
-            } else if !path_exists(&rollback_staged)?
-                || file_id(&rollback_staged)? != transition.target_id
-            {
+            } else if !path_exists(&rollback_staged)? {
                 return Err(transition_conflict(
                     &journal,
                     "the rollback target is under neither recorded name",
                 ));
+            } else {
+                require_transition_identity(
+                    &rollback_staged,
+                    transition.target_id,
+                    &transition.target_digest,
+                    &journal,
+                    "the staged rollback target changed",
+                )?;
             }
             restore(&rollback_staged)?;
+            verify_rollback_bundle(&active, &rollback_staged)?;
             swap(&rollback_staged, &active)?;
             sync_dir(apps)?;
             repaired.previous_set_aside |= set_aside(&rollback_staged)?;
@@ -1003,6 +1162,7 @@ fn transition_conflict(journal: &Path, detail: &str) -> AppError {
 #[derive(Default)]
 struct Recovery {
     interrupted_transition: Option<InterruptedTransition>,
+    unpublished_candidate_cleared: bool,
     previous_set_aside: bool,
     retired_set_aside: usize,
     retired_removed: usize,
@@ -1032,6 +1192,7 @@ impl Recovery {
 
     fn is_empty(&self) -> bool {
         self.interrupted_transition.is_none()
+            && !self.unpublished_candidate_cleared
             && !self.previous_set_aside
             && self.retired_set_aside == 0
             && self.retired_removed == 0
@@ -1060,6 +1221,12 @@ impl Recovery {
                     "finished the rollback cut short after Vox {version} was put in place and kept the replaced app for rollback"
                 ),
             });
+        }
+        if self.unpublished_candidate_cleared {
+            parts.push(
+                "cleared an unpublished candidate left before its durable transition record"
+                    .to_owned(),
+            );
         }
         if self.previous_set_aside {
             parts.push("made the kept previous bundle non-launchable again".to_owned());
@@ -1111,75 +1278,78 @@ impl Recovery {
     }
 }
 
-/// Unpack the downloaded zip beside the bundle, on its filesystem, and return the one Vox.app
-/// it held, moved to `.Vox.app.partial`.
+/// Extract the downloaded bundle directly under a name which is not an application bundle.
+/// `bsdtar --strip-components 1` removes the archive's sole `Vox.app/` component while writing;
+/// unlike extracting into a directory and renaming afterward, no crash boundary ever creates a
+/// second path ending in `.app` with a live plist.
 fn unpack(apps: &Path, zip: &Path) -> Result<PathBuf, AppError> {
-    let unpacked = apps.join(UNPACK_PARTIAL);
     let staged = apps.join(PARTIAL);
-    require_optional_dir(&unpacked, UNPACK_PARTIAL)?;
     require_optional_bundle(&staged, PARTIAL)?;
-    clear(&unpacked)?;
     clear(&staged)?;
-    fs::create_dir(&unpacked).map_err(AppError::Io)?;
-    sync_dir(apps)?;
-    let out = Command::new("/usr/bin/ditto")
-        .args(["-x", "-k"])
+    let listed = Command::new("/usr/bin/bsdtar")
+        .args(["-t", "-f"])
         .arg(zip)
-        .arg(&unpacked)
         .output()
         .map_err(AppError::Io)?;
-    if !out.status.success() {
-        return Err(with_cleanup(
-            &unpacked,
-            usage("the downloaded Vox.app did not unpack"),
-        ));
+    if !listed.status.success() {
+        return Err(usage(format!(
+            "the downloaded Vox.app archive could not be listed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        )));
     }
-    let entries: Vec<String> = fs::read_dir(&unpacked)
-        .map_err(AppError::Io)?
-        .map(|entry| {
-            entry
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .map_err(AppError::Io)
-        })
-        .collect::<Result<_, _>>()?;
-    let bundle = unpacked.join(BUNDLE);
-    let is_dir = match fs::symlink_metadata(&bundle) {
-        Ok(meta) => meta.is_dir() && !meta.file_type().is_symlink(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(with_cleanup(&unpacked, AppError::Io(e))),
-    };
-    if entries != [BUNDLE] || !is_dir {
-        return Err(with_cleanup(
-            &unpacked,
-            usage(format!(
-                "the downloaded zip holds {entries:?}, not exactly {BUNDLE}"
-            )),
-        ));
+    let listing = String::from_utf8(listed.stdout)
+        .map_err(|_| usage("the downloaded Vox.app archive has non-UTF-8 entry names"))?;
+    let mut entries = 0_usize;
+    for entry in listing.lines().filter(|line| !line.is_empty()) {
+        use std::path::Component;
+        let mut components = Path::new(entry).components();
+        if components.next() != Some(Component::Normal(std::ffi::OsStr::new(BUNDLE)))
+            || components.any(|part| !matches!(part, Component::Normal(_)))
+        {
+            return Err(usage(format!(
+                "the downloaded archive entry {entry:?} is not confined beneath {BUNDLE}"
+            )));
+        }
+        entries += 1;
+    }
+    if entries == 0 {
+        return Err(usage(format!(
+            "the downloaded archive holds no {BUNDLE} entries"
+        )));
+    }
+    transition_failure!("publish-candidate-extracted")?;
+    fs::create_dir(&staged).map_err(AppError::Io)?;
+    let extracted = Command::new("/usr/bin/bsdtar")
+        .args(["-x", "-f"])
+        .arg(zip)
+        .args(["-C"])
+        .arg(&staged)
+        .args(["--strip-components", "1"])
+        .output()
+        .map_err(AppError::Io);
+    match extracted {
+        Ok(out) if out.status.success() => transition_succeeded!("publish-candidate-extracted"),
+        Ok(out) => {
+            return Err(with_cleanup(
+                &staged,
+                usage(format!(
+                    "the downloaded Vox.app did not unpack: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+            ))
+        }
+        Err(error) => return Err(with_cleanup(&staged, error)),
     }
     let prepare = || -> Result<(), AppError> {
-        require_bundle(&bundle, "the unpacked candidate bundle")?;
-        // The archive necessarily names `Vox.app`. Disarm that nested name before flushing the
-        // tree, so no durable copied boundary contains a second application. Its bytes are
-        // untouched and its plist is restored only after the whole bundle has a non-application
-        // staging name.
-        set_aside(&bundle)?;
-        sync_tree(&bundle)?;
-        sync_dir(&unpacked)?;
-        transition_boundary("publish-candidate-tree-synced")
+        require_bundle(&staged, "the unpacked candidate bundle")?;
+        transition_failure!("publish-candidate-tree-synced")?;
+        sync_tree(&staged)?;
+        sync_dir(apps)?;
+        transition_succeeded!("publish-candidate-tree-synced");
+        Ok(())
     };
     if let Err(error) = prepare() {
-        return Err(with_cleanup(&unpacked, error));
-    }
-    let stage = || -> Result<(), AppError> {
-        fs::rename(&bundle, &staged).map_err(AppError::Io)?;
-        sync_dir(&unpacked)?;
-        sync_dir(apps)?;
-        restore(&staged)?;
-        transition_boundary("publish-candidate-staged")?;
-        clear(&unpacked)
-    };
-    if let Err(error) = stage() {
-        return Err(with_cleanup(&unpacked, with_cleanup(&staged, error)));
+        return Err(with_cleanup(&staged, error));
     }
     Ok(staged)
 }
@@ -1196,7 +1366,7 @@ fn verify(active: &Path, staged: &Path, vox: &Validated) -> Result<(), AppError>
             vox.version_text
         )));
     }
-    let says = active_app_version(staged).unwrap_or_default();
+    let says = require_active_app_version(staged)?;
     if says != vox.version_text {
         return Err(usage(format!(
             "the new Vox.app says it is version {says:?}, not {}",
@@ -1233,14 +1403,16 @@ fn verify_apple(active: &Path, staged: &Path) -> Result<(), AppError> {
         )),
         other => other,
     };
-    for (what, installed, candidate) in [
+    for (what, required_identifier, installed, candidate) in [
         (
             "the new Vox.app",
+            APP_IDENTIFIER,
             active.to_path_buf(),
             staged.to_path_buf(),
         ),
         (
             "the new Vox.app's vox",
+            HELPER_IDENTIFIER,
             active.join(HELPER),
             staged.join(HELPER),
         ),
@@ -1256,6 +1428,11 @@ fn verify_apple(active: &Path, staged: &Path) -> Result<(), AppError> {
         )
         .map_err(|e| named(what, e))?;
         let ours = signing_identity(&installed).map_err(|e| named(what, e))?;
+        if theirs.identifier != required_identifier || ours.identifier != required_identifier {
+            return Err(usage(format!(
+                "release trust check failed for {what}: its signed product identifier is not {required_identifier}"
+            )));
+        }
         if ours != theirs {
             return Err(usage(format!(
                 "release trust check failed for {what}: its Developer ID is not the one that \
@@ -1279,32 +1456,75 @@ fn verify_apple(active: &Path, staged: &Path) -> Result<(), AppError> {
     .map_err(|e| named("the new Vox.app", e))
 }
 
-/// An active bundle's `CFBundleShortVersionString`. Evidence about [`BUNDLE`] comes only from
-/// its real Info.plist; a kept plist is never evidence that a swap happened.
-fn active_app_version(bundle: &Path) -> Option<String> {
-    plist_version(&bundle.join(INFO_PLIST))
+/// A rollback makes retained code executable again, so it receives the same fixed product,
+/// signature, and signer-continuity checks as a downloaded candidate before the exchange.
+fn verify_rollback_bundle(active: &Path, staged: &Path) -> Result<(), AppError> {
+    require_active_app_version(staged)?;
+    if apple_required() {
+        verify_apple(active, staged)?;
+    }
+    Ok(())
 }
 
-/// A bundle's version while it is deliberately set aside, or while it is active.
-fn bundle_version(bundle: &Path) -> Option<String> {
-    active_app_version(bundle).or_else(|| plist_version(&bundle.join(KEPT_INFO_PLIST)))
+fn require_active_app_version(bundle: &Path) -> Result<String, AppError> {
+    require_plist_version(bundle, &bundle.join(INFO_PLIST))
 }
 
-fn plist_version(plist: &Path) -> Option<String> {
-    if !plist.is_file() {
-        return None;
+fn require_bundle_version(bundle: &Path) -> Result<String, AppError> {
+    let live = bundle.join(INFO_PLIST);
+    let kept = bundle.join(KEPT_INFO_PLIST);
+    match (path_exists(&live)?, path_exists(&kept)?) {
+        (true, false) => require_plist_version(bundle, &live),
+        (false, true) => require_plist_version(bundle, &kept),
+        (true, true) => Err(usage(format!(
+            "{} has both a live and kept Info.plist; its version is ambiguous",
+            bundle.display()
+        ))),
+        (false, false) => Err(usage(format!(
+            "{} has neither a live nor kept Info.plist; its version is unavailable",
+            bundle.display()
+        ))),
+    }
+}
+
+fn require_plist_version(bundle: &Path, plist: &Path) -> Result<String, AppError> {
+    let meta = fs::symlink_metadata(plist).map_err(|e| {
+        usage(format!(
+            "the app metadata {} is unreadable ({e})",
+            plist.display()
+        ))
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_file() || meta.nlink() != 1 {
+        return Err(usage(format!(
+            "the app metadata {} is not a direct, unaliased regular file",
+            plist.display()
+        )));
     }
     let out = Command::new("/usr/libexec/PlistBuddy")
         .args(["-c", "Print :CFBundleShortVersionString"])
         .arg(plist)
         .env_clear()
         .output()
-        .ok()?;
-    if !out.status.success() || out.stdout.len() > MAX_VERSION_OUTPUT_BYTES {
-        return None;
+        .map_err(|e| usage(format!("could not read {} metadata: {e}", bundle.display())))?;
+    if !out.status.success()
+        || out.stdout.len() > MAX_VERSION_OUTPUT_BYTES
+        || !out.stderr.is_empty()
+    {
+        return Err(usage(format!(
+            "the app metadata {} has no readable CFBundleShortVersionString",
+            plist.display()
+        )));
     }
-    let text = String::from_utf8(out.stdout).ok()?;
-    Some(text.trim().to_owned()).filter(|v| !v.is_empty())
+    let text = String::from_utf8(out.stdout)
+        .map_err(|_| usage(format!("the app metadata {} is not UTF-8", plist.display())))?;
+    let version = text.trim();
+    if version.is_empty() {
+        return Err(usage(format!(
+            "the app metadata {} has an empty CFBundleShortVersionString",
+            plist.display()
+        )));
+    }
+    Ok(version.to_owned())
 }
 
 fn path_exists(path: &Path) -> Result<bool, AppError> {
@@ -1379,6 +1599,89 @@ fn file_id(path: &Path) -> Result<u64, AppError> {
     fs::symlink_metadata(path)
         .map(|meta| meta.ino())
         .map_err(AppError::Io)
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut text, byte| {
+            use core::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+}
+
+fn parse_digest(text: &str, state: &Path) -> Result<[u8; 32], AppError> {
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(usage(format!(
+            "{} has an invalid bundle identity digest; leave it in place and report this",
+            state.display()
+        )));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let pair = core::str::from_utf8(pair).map_err(|_| {
+            usage(format!(
+                "{} has an invalid bundle identity digest; leave it in place and report this",
+                state.display()
+            ))
+        })?;
+        digest[index] = u8::from_str_radix(pair, 16).map_err(|_| {
+            usage(format!(
+                "{} has an invalid bundle identity digest; leave it in place and report this",
+                state.display()
+            ))
+        })?;
+    }
+    Ok(digest)
+}
+
+/// Stable identity for the executable, bundled CLI, and retained code-signing ledger. These
+/// files are invariant when Info.plist is moved between its live and kept names, so the journal
+/// can authenticate either side at every recovery phase without weakening the signature check.
+fn bundle_digest(bundle: &Path) -> Result<[u8; 32], AppError> {
+    let mut hasher = Sha256::new();
+    for relative in [APP_EXECUTABLE, HELPER, CODE_RESOURCES] {
+        let path = bundle.join(relative);
+        let meta = fs::symlink_metadata(&path).map_err(|e| {
+            usage(format!(
+                "cannot identify {}: {relative} is unreadable ({e})",
+                bundle.display()
+            ))
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.nlink() != 1 {
+            return Err(usage(format!(
+                "cannot identify {}: {relative} is not a direct, unaliased regular file",
+                bundle.display()
+            )));
+        }
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update(meta.len().to_le_bytes());
+        let mut file = fs::File::open(&path).map_err(AppError::Io)?;
+        let mut buffer = vec![0_u8; IO_BUFFER_BYTES];
+        loop {
+            let read = file.read(&mut buffer).map_err(AppError::Io)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn require_transition_identity(
+    bundle: &Path,
+    expected_id: u64,
+    expected_digest: &[u8; 32],
+    journal: &Path,
+    detail: &str,
+) -> Result<(), AppError> {
+    if file_id(bundle)? != expected_id || bundle_digest(bundle)? != *expected_digest {
+        return Err(transition_conflict(journal, detail));
+    }
+    Ok(())
 }
 
 /// Flush every regular file and directory in a verified candidate before its name can be

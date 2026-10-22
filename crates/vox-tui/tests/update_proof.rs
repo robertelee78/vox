@@ -1587,10 +1587,12 @@ struct OpenedBundle {
     error: String,
 }
 
-/// Ask LaunchServices to open one identifier, wait causally for either its application record or
-/// the completed `open -W`, then read the exact path and terminate that scratch app. There is no
-/// elapsed verdict and no retry count: a deadman may call a wedged observation APPARATUS, but a
-/// slow launch remains allowed to make progress for as long as it needs.
+/// Ask LaunchServices to open one identifier and observe the exact application from
+/// `NSWorkspace.didLaunchApplicationNotification`. The observer is subscribed before `open`,
+/// announces that subscription before the request is submitted, and terminates only the exact
+/// launched process after recording its bundle path. `open -W` and that notification are the two
+/// structural outcomes: a refused request is PRODUCT evidence, while an observer/setup failure is
+/// APPARATUS. There is no polling, repeated process spawn, silence threshold, or elapsed verdict.
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 fn opened_bundle(
     identifier: &str,
@@ -1598,36 +1600,108 @@ fn opened_bundle(
     config: &Path,
     home: &Path,
 ) -> Result<OpenedBundle, String> {
+    use std::io::BufRead as _;
+
     std::fs::create_dir_all(home)
         .map_err(|e| format!("could not make scratch HOME {}: {e}", home.display()))?;
-    // Subscribe before asking `open`, so progress is driven by LaunchServices' own causal
-    // notifications rather than a zero-delay polling loop or a wall-clock guess.
-    let mut listener = Command::new("/usr/bin/lsappinfo")
-        .args([
-            "listen",
-            "+launch",
-            "+launchFailure",
-            "+appCreation",
-            "+creation",
-            "forever",
-        ])
+
+    // This process is proof apparatus, not the product oracle. It reports the exact launch event
+    // that `open -b` caused and then asks that scratch process to terminate so `open -W` can join.
+    const OBSERVER: &str = r#"
+import AppKit
+import Darwin
+
+let wanted = CommandLine.arguments.last!
+let center = NSWorkspace.shared.notificationCenter
+var token: NSObjectProtocol?
+token = center.addObserver(
+    forName: NSWorkspace.didLaunchApplicationNotification,
+    object: nil,
+    queue: nil
+) { note in
+    guard
+        let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+        app.bundleIdentifier == wanted
+    else { return }
+    print("LAUNCHED")
+    print(app.bundleIdentifier ?? "")
+    print(app.processIdentifier)
+    print(app.bundleURL?.path ?? "")
+    print(app.forceTerminate() ? "TERMINATED" : "TERMINATE_FAILED")
+    fflush(stdout)
+    exit(0)
+}
+print("READY")
+fflush(stdout)
+withExtendedLifetime(token) { RunLoop.main.run() }
+"#;
+    let mut observer = Command::new("/usr/bin/swift")
+        .args(["-e", OBSERVER, "--", identifier])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not subscribe to LaunchServices events: {e}"))?;
-    let listener_stdout = listener
+        .map_err(|e| format!("could not start the LaunchServices observer: {e}"))?;
+    let observer_stdout = observer
         .stdout
         .take()
-        .ok_or_else(|| "LaunchServices event subscription had no stdout".to_owned())?;
-    let (event_tx, event_rx) = std::sync::mpsc::channel();
-    let event_reader = std::thread::spawn(move || {
-        use std::io::BufRead as _;
-        for line in std::io::BufReader::new(listener_stdout).lines() {
-            if event_tx.send(line.map(|_| ())).is_err() {
-                return;
-            }
+        .ok_or_else(|| "LaunchServices observer had no stdout".to_owned())?;
+    let mut observer_lines = std::io::BufReader::new(observer_stdout).lines();
+    let ready = observer_lines
+        .next()
+        .transpose()
+        .map_err(|e| format!("could not read LaunchServices observer readiness: {e}"))?;
+    if ready.as_deref() != Some("READY") {
+        let _ = observer.kill();
+        let status = observer.wait();
+        let mut error = String::new();
+        if let Some(mut stderr) = observer.stderr.take() {
+            use std::io::Read as _;
+            let _ = stderr.read_to_string(&mut error);
         }
+        return Err(format!(
+            "LaunchServices observer did not become ready: line={ready:?}, status={status:?}, stderr={:?}",
+            error.trim()
+        ));
+    }
+
+    enum Observation {
+        Launch(Result<(String, u32, PathBuf, bool), String>),
+        Open(std::io::Result<std::process::Output>),
+    }
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let launch_tx = observed_tx.clone();
+    let observer_reader = std::thread::spawn(move || {
+        let mut read = || -> Result<(String, u32, PathBuf, bool), String> {
+            let mut next = |what: &str| {
+                observer_lines
+                    .next()
+                    .transpose()
+                    .map_err(|e| format!("could not read observer {what}: {e}"))?
+                    .ok_or_else(|| format!("observer ended before reporting {what}"))
+            };
+            if next("event")? != "LAUNCHED" {
+                return Err("observer reported an unknown launch event".to_owned());
+            }
+            let launched_identifier = next("bundle identifier")?;
+            let pid = next("process identifier")?
+                .parse::<u32>()
+                .map_err(|e| format!("observer reported an invalid process identifier: {e}"))?;
+            let path = PathBuf::from(next("bundle path")?);
+            let terminated = match next("termination result")?.as_str() {
+                "TERMINATED" => true,
+                "TERMINATE_FAILED" => false,
+                other => {
+                    return Err(format!(
+                        "observer reported unknown termination result {other:?}"
+                    ))
+                }
+            };
+            Ok((launched_identifier, pid, path, terminated))
+        };
+        let _ = launch_tx.send(Observation::Launch(read()));
     });
+
     let mut opened = Command::new("/usr/bin/open");
     opened
         .args(["-n", "-W", "-b", identifier, "--env"])
@@ -1655,104 +1729,112 @@ fn opened_bundle(
         ))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = match opened.spawn() {
+    let child = match opened.spawn() {
         Ok(child) => child,
-        Err(open_error) => {
-            let stop = listener.kill().and_then(|()| listener.wait().map(|_| ()));
-            let joined = event_reader.join();
+        Err(e) => {
+            let _ = observer.kill();
+            let _ = observer.wait();
+            let _ = observer_reader.join();
             return Err(format!(
-                "could not open {identifier}: {open_error}; event-listener cleanup: stop={stop:?}, join={joined:?}"
+                "could not submit the open request for {identifier}: {e}"
             ));
         }
     };
-    let observation = (|| -> Result<Option<String>, String> {
-        loop {
-            let found = Command::new("/usr/bin/lsappinfo")
-                .args(["find", &format!("bundleid={identifier}")])
-                .output()
-                .map_err(|e| format!("could not ask for the opened app: {e}"))?;
-            if let Some(asn) = String::from_utf8_lossy(&found.stdout)
-                .lines()
-                .next()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-            {
-                return Ok(Some(asn.to_owned()));
+    let open_pid = child.id();
+    let open_tx = observed_tx;
+    let open_waiter = std::thread::spawn(move || {
+        let _ = open_tx.send(Observation::Open(child.wait_with_output()));
+    });
+
+    let mut open_output = None;
+    let launch = loop {
+        match observed_rx
+            .recv()
+            .map_err(|_| "launch observers ended without an outcome".to_owned())?
+        {
+            Observation::Open(Ok(out)) if !out.status.success() => {
+                let _ = observer.kill();
+                let _ = observer.wait();
+                let _ = observer_reader.join();
+                let _ = open_waiter.join();
+                return Ok(OpenedBundle {
+                    ok: false,
+                    path: None,
+                    error: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                });
             }
-            if child
-                .try_wait()
-                .map_err(|e| format!("could not observe open -W: {e}"))?
-                .is_some()
-            {
-                return Ok(None);
+            Observation::Open(Ok(out)) => open_output = Some(out),
+            Observation::Open(Err(e)) => {
+                let _ = observer.kill();
+                let _ = observer.wait();
+                let _ = observer_reader.join();
+                let _ = open_waiter.join();
+                return Err(format!("could not collect open -W for {identifier}: {e}"));
             }
-            event_rx
-                .recv()
-                .map_err(|_| {
-                    "LaunchServices event subscription ended before open resolved".to_owned()
-                })?
-                .map_err(|e| format!("could not read a LaunchServices event: {e}"))?;
-        }
-    })();
-    let stopped = listener.kill().and_then(|()| listener.wait().map(|_| ()));
-    let joined = event_reader.join();
-    let asn = match (observation, stopped, joined) {
-        (Ok(asn), Ok(()), Ok(())) => asn,
-        (observation, stopped, joined) => {
-            return Err(format!(
-                "LaunchServices observation/cleanup failed: observation={observation:?}, stop={stopped:?}, reader_joined={}",
-                joined.is_ok()
-            ));
+            Observation::Launch(Ok(result)) => break result,
+            Observation::Launch(Err(why)) => {
+                let stop_open = Command::new("/bin/kill")
+                    .args(["-TERM", &open_pid.to_string()])
+                    .output();
+                let stop_observer = observer.kill();
+                let observer_status = observer.wait();
+                let reader_joined = observer_reader.join().is_ok();
+                let open_joined = open_waiter.join().is_ok();
+                return Err(format!(
+                    "LaunchServices observation failed ({why}); cleanup: open={stop_open:?}, observer_stop={stop_observer:?}, observer_status={observer_status:?}, reader_joined={reader_joined}, open_joined={open_joined}"
+                ));
+            }
         }
     };
-    let mut path = None;
-    let mut observation_error = String::new();
-    if let Some(asn) = &asn {
-        let info = Command::new("/usr/bin/lsappinfo")
-            .args(["info", "-only", "bundlepath", asn])
+    let (launched_identifier, pid, path, terminated) = launch;
+    if !terminated {
+        let killed = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
             .output()
-            .map_err(|e| format!("could not read the opened app's path: {e}"))?;
-        if !info.status.success() {
-            return Err(format!(
-                "lsappinfo could not read {asn}: {}",
-                String::from_utf8_lossy(&info.stderr).trim()
-            ));
-        }
-        let words = String::from_utf8_lossy(&info.stdout);
-        path = words.lines().find_map(|line| {
-            line.trim()
-                .strip_prefix("bundle path=\"")
-                .and_then(|value| value.strip_suffix('"'))
-                .map(PathBuf::from)
-        });
-        let killed = Command::new("/usr/bin/lsappinfo")
-            .args(["kill", "-hard", asn])
-            .output()
-            .map_err(|e| format!("could not terminate the scratch app: {e}"))?;
+            .map_err(|e| format!("could not terminate launched scratch app {pid}: {e}"))?;
         if !killed.status.success() {
-            observation_error = format!(
-                "lsappinfo could not terminate {asn}: {}",
-                String::from_utf8_lossy(&killed.stderr).trim()
-            );
+            let stop_open = Command::new("/bin/kill")
+                .args(["-TERM", &open_pid.to_string()])
+                .output();
+            let observer_status = observer.wait();
+            let reader_joined = observer_reader.join().is_ok();
+            let open_joined = open_waiter.join().is_ok();
+            return Err(format!(
+                "could not terminate launched scratch app {pid}: {}; cleanup: open={stop_open:?}, observer_status={observer_status:?}, reader_joined={reader_joined}, open_joined={open_joined}",
+                String::from_utf8_lossy(&killed.stderr).trim(),
+            ));
         }
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("could not collect open -W: {e}"))?;
-    let mut error = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-    if !observation_error.is_empty() {
-        if !error.is_empty() {
-            error.push_str("; ");
-        }
-        error.push_str(&observation_error);
-    }
-    if asn.is_none() && out.status.success() {
-        error.push_str("; LaunchServices made no application record for the opened identifier");
+    let out = match open_output {
+        Some(out) => out,
+        None => match observed_rx
+            .recv()
+            .map_err(|_| "open -W ended without an outcome".to_owned())?
+        {
+            Observation::Open(result) => result.map_err(|e| e.to_string())?,
+            Observation::Launch(_) => {
+                return Err("LaunchServices observer reported the same launch twice".to_owned())
+            }
+        },
+    };
+    let observer_status = observer
+        .wait()
+        .map_err(|e| format!("could not join LaunchServices observer: {e}"))?;
+    observer_reader
+        .join()
+        .map_err(|_| "LaunchServices observer reader panicked".to_owned())?;
+    open_waiter
+        .join()
+        .map_err(|_| "open -W waiter panicked".to_owned())?;
+    if !observer_status.success() {
+        return Err(format!(
+            "LaunchServices observer exited {observer_status} after reporting a launch"
+        ));
     }
     Ok(OpenedBundle {
-        ok: out.status.success(),
-        path,
-        error,
+        ok: launched_identifier == identifier,
+        path: Some(path),
+        error: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
     })
 }
 
@@ -1891,10 +1973,28 @@ fn stage_transition(journal: &Path, kind: &str, active: &Path, target: &Path, ve
     let target_id = std::fs::symlink_metadata(target)
         .unwrap_or_else(|e| panic!("APPARATUS: read {} identity: {e}", target.display()))
         .ino();
+    let digest = |bundle: &Path| {
+        let mut bytes = Vec::new();
+        for relative in [
+            "Contents/MacOS/Vox",
+            "Contents/Helpers/vox",
+            "Contents/_CodeSignature/CodeResources",
+        ] {
+            let contents = std::fs::read(bundle.join(relative))
+                .unwrap_or_else(|e| panic!("APPARATUS: read {} {relative}: {e}", bundle.display()));
+            bytes.extend_from_slice(&(relative.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(relative.as_bytes());
+            bytes.extend_from_slice(&(contents.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(&contents);
+        }
+        sha256_hex(&bytes)
+    };
+    let active_digest = digest(active);
+    let target_digest = digest(target);
     write(
         &journal.join("state"),
         &format!(
-            "vox-app-transition-v1\nkind={kind}\nactive_id={active_id}\ntarget_id={target_id}\nversion={version}\n"
+            "vox-app-transition-v2\nkind={kind}\nactive_id={active_id}\ntarget_id={target_id}\nactive_digest={active_digest}\ntarget_digest={target_digest}\nversion={version}\n"
         ),
     );
 }
@@ -1912,6 +2012,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         "VOX_TEST_APPLE_VERIFY",
         "VOX_TEST_BUNDLE_APPS_DIR",
         "VOX_TEST_ABORT_AFTER_SWAP",
+        "VOX_TEST_APP_TRANSITION_STOP",
     ]);
     let mut claims = Vec::new();
     let mut receipts = BTreeMap::new();
@@ -1939,6 +2040,26 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 "APPARATUS: VOX_PROOF_PREVIOUS_SHIPPED_APP must name the extracted Developer ID signed, notarized prior Vox.app release"
             )
         });
+    let candidate_version = plist_value(&shipped_app, "CFBundleShortVersionString")
+        .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let previous_version = plist_value(&previous_shipped_app, "CFBundleShortVersionString")
+        .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let exact_identifier = plist_value(&shipped_app, "CFBundleIdentifier")
+        .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let prior_identifier = plist_value(&previous_shipped_app, "CFBundleIdentifier")
+        .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+    let candidate_semver = semver::Version::parse(&candidate_version)
+        .unwrap_or_else(|e| panic!("APPARATUS: shipped candidate version: {e}"));
+    let previous_semver = semver::Version::parse(&previous_version)
+        .unwrap_or_else(|e| panic!("APPARATUS: prior shipped version: {e}"));
+    assert!(
+        exact_identifier == "us.vox.app"
+            && prior_identifier == exact_identifier
+            && candidate_semver > previous_semver
+            && shipped_notarized(&shipped_app).is_ok()
+            && shipped_notarized(&previous_shipped_app).is_ok(),
+        "APPARATUS: supplied apps must be exact signed/notarized us.vox.app releases with candidate {candidate_version} newer than prior {previous_version}; identifiers {exact_identifier:?}/{prior_identifier:?}"
+    );
     let tree = tmpdir();
     let newer = tmpdir();
     let newer_vox = newer.path().join("vox");
@@ -1964,24 +2085,29 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         ),
     ];
 
+    let exact_tree = tmpdir();
+    bundle_release_app(
+        exact_tree.path(),
+        &candidate_version,
+        &shipped_app,
+        &[("stable", None)],
+    );
+    let exact_server = release_server::serve(exact_tree.path())
+        .unwrap_or_else(|why| panic!("APPARATUS: exact release server: {why}"));
+    let prior_tree = tmpdir();
+    bundle_release_app(
+        prior_tree.path(),
+        &previous_version,
+        &previous_shipped_app,
+        &[("stable", None)],
+    );
+    let prior_server = release_server::serve(prior_tree.path())
+        .unwrap_or_else(|why| panic!("APPARATUS: exact prior release server: {why}"));
+
     // ---- exact shipped artifacts: update, open, rollback, open ---------------------------
     // Neither app is rewritten or re-signed. The proof-only apps-dir selector lets this built
     // `vox` drive the scratch installation without replacing either artifact's shipped helper.
     {
-        let candidate_version = plist_value(&shipped_app, "CFBundleShortVersionString")
-            .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
-        let previous_version = plist_value(&previous_shipped_app, "CFBundleShortVersionString")
-            .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
-        let exact_identifier = plist_value(&shipped_app, "CFBundleIdentifier")
-            .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
-        let candidate_semver = semver::Version::parse(&candidate_version)
-            .unwrap_or_else(|e| panic!("APPARATUS: shipped candidate version: {e}"));
-        let previous_semver = semver::Version::parse(&previous_version)
-            .unwrap_or_else(|e| panic!("APPARATUS: prior shipped version: {e}"));
-        assert!(
-            candidate_semver > previous_semver,
-            "APPARATUS: candidate {candidate_version} is not newer than prior {previous_version}"
-        );
         let preexisting = launch_services_paths(&exact_identifier)
             .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
         assert!(
@@ -1989,15 +2115,6 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             "APPARATUS: exact shipped identifier {exact_identifier} already has records; use the isolated macOS proof guest, do not unregister a person's app: {preexisting:?}"
         );
 
-        let exact_tree = tmpdir();
-        bundle_release_app(
-            exact_tree.path(),
-            &candidate_version,
-            &shipped_app,
-            &[("stable", None)],
-        );
-        let exact_server = release_server::serve(exact_tree.path())
-            .unwrap_or_else(|why| panic!("APPARATUS: exact release server: {why}"));
         let tmp = tmpdir();
         let home = tmp.path();
         let exact_helper = bundle_install_exact_product(home, "stable", &previous_shipped_app);
@@ -2037,54 +2154,30 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let active_version = active_app_says(&active);
         let kept_version = kept_app_says(&previous);
         let rollback_signature = shipped_notarized(&active);
-        // Mutant: omit the publish exchange; this update claim alone turns PRODUCT red.
+        // This is one exact-artifact claim, not a chain of purportedly independent assertions:
+        // remove any update/rollback exchange, signature retention, or registration handoff and
+        // this one claim turns PRODUCT red without cascading into sibling exact-artifact claims.
         claims.push(claim(
-            "bundle.exact_shipped_candidate_updates_into_place",
-            updated.status.success() && updated_version == candidate_version,
+            "bundle.exact_shipped_artifacts_update_open_rollback_and_open",
+            updated.status.success()
+                && updated_version == candidate_version
+                && updated_signature.is_ok()
+                && updated_open.ok
+                && updated_open.path.as_deref() == Some(active.as_path())
+                && rollback.status.success()
+                && active_version == previous_version
+                && kept_version == candidate_version
+                && rollback_signature.is_ok()
+                && rollback_open.ok
+                && rollback_open.path.as_deref() == Some(active.as_path()),
             format!(
-                "candidate={candidate_version}, prior={previous_version}; update exit_ok={}, active={updated_version:?}, signature={updated_signature:?}; exact helper {}",
-                updated.status.success(),
+                "candidate={candidate_version}, prior={previous_version}; update={} active={updated_version:?} signature={updated_signature:?} open={:?}; rollback={} active={active_version:?} kept={kept_version:?} signature={rollback_signature:?} open={:?}; exact helper {}",
+                updated.status,
+                updated_open.path,
+                rollback.status,
+                rollback_open.path,
                 exact_helper.display()
             ),
-        ));
-        // Mutant: change a published app byte after verification.
-        claims.push(claim(
-            "bundle.exact_published_candidate_keeps_its_release_signature",
-            updated_signature.is_ok(),
-            format!("published candidate signature={updated_signature:?}"),
-        ));
-        // Mutant: omit active registration; this open-selection claim alone turns PRODUCT red.
-        claims.push(claim(
-            "bundle.exact_shipped_candidate_opens_from_active_path",
-            updated_open.ok && updated_open.path.as_deref() == Some(active.as_path()),
-            format!("updated open selected {:?}", updated_open.path),
-        ));
-        // Mutant: omit the rollback exchange; this rollback claim alone turns PRODUCT red.
-        claims.push(claim(
-            "bundle.exact_shipped_prior_rolls_back_into_place",
-            rollback.status.success() && active_version == previous_version,
-            format!(
-                "rollback exit_ok={}; active={active_version:?}, kept={kept_version:?}, signature={rollback_signature:?}",
-                rollback.status.success()
-            ),
-        ));
-        // Mutant: discard or overwrite the displaced candidate instead of retaining it.
-        claims.push(claim(
-            "bundle.exact_rollback_retains_the_candidate_release",
-            kept_version == candidate_version,
-            format!("retained candidate={kept_version:?}, wanted={candidate_version:?}"),
-        ));
-        // Mutant: restore a plist from a different app during rollback.
-        claims.push(claim(
-            "bundle.exact_rollback_keeps_the_prior_release_signature",
-            rollback_signature.is_ok(),
-            format!("rolled-back prior signature={rollback_signature:?}"),
-        ));
-        // Mutant: register the displaced path after rollback; this open claim alone turns red.
-        claims.push(claim(
-            "bundle.exact_shipped_rollback_opens_from_active_path",
-            rollback_open.ok && rollback_open.path.as_deref() == Some(active.as_path()),
-            format!("rollback open selected {:?}", rollback_open.path),
         ));
         receipts.insert("m29a.exact-update".into(), said(&updated));
         receipts.insert("m29a.exact-rollback".into(), said(&rollback));
@@ -2224,8 +2317,8 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     // Every row has its own claim and mutant seam: remove that named boundary call and the
     // command will complete instead of producing this row's interrupted PRODUCT observation.
     for point in [
+        "publish-candidate-extracted",
         "publish-candidate-tree-synced",
-        "publish-candidate-staged",
         "journal-directory-synced",
         "journal-state-synced",
         "publish-older-moved",
@@ -2236,38 +2329,38 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         "publish-older-cleaned",
         "publish-journal-cleared",
     ] {
+        let mut boundary_ok = true;
+        let mut boundary_evidence = Vec::new();
         for mode in ["abort", "fail"] {
             let tmp = tmpdir();
             let home = tmp.path();
-            let _link = bundle_install_product(
-                home,
-                "stable",
-                &shipped_app,
-                VERSION,
-                &identifier,
-                Path::new(VOX),
-            );
+            let _link = bundle_install_exact_product(home, "stable", &previous_shipped_app);
             let apps = home.join("Apps");
             let active = apps.join("Vox.app");
             let previous = apps.join(".Vox.app.previous");
             let apps_text = apps.to_str().expect("APPARATUS: UTF-8 scratch apps path");
-            let product_base: Vec<(&str, &str)> = base
-                .iter()
-                .copied()
-                .chain([("VOX_TEST_BUNDLE_APPS_DIR", apps_text)])
-                .collect();
-            let product_current_base: Vec<(&str, &str)> = current_base
-                .iter()
-                .copied()
-                .chain([("VOX_TEST_BUNDLE_APPS_DIR", apps_text)])
-                .collect();
+            let product_base = [
+                ("VOX_TEST_RELEASE_BASE", exact_server.base.as_str()),
+                ("VOX_TEST_APPLE_VERIFY", "1"),
+                ("VOX_TEST_BUNDLE_APPS_DIR", apps_text),
+                ("VOX_NO_SHELL_SETUP", "1"),
+                base[2],
+                base[3],
+            ];
+            let product_current_base = [
+                ("VOX_TEST_RELEASE_BASE", prior_server.base.as_str()),
+                ("VOX_TEST_APPLE_VERIFY", "1"),
+                ("VOX_TEST_BUNDLE_APPS_DIR", apps_text),
+                ("VOX_NO_SHELL_SETUP", "1"),
+                base[2],
+                base[3],
+            ];
             let mut registrations = LaunchServicesCleanup::new();
             for path in [
                 active.clone(),
                 previous.clone(),
                 apps.join(".Vox.app.partial"),
                 apps.join(".Vox.rollback.partial"),
-                apps.join(".Vox.app.unpack.partial/Vox.app"),
                 apps.join(".Vox.app.publishing/Vox.app"),
             ] {
                 registrations.remember(&path);
@@ -2291,7 +2384,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             let cut_text = said(&cut);
             let interrupted_version = active_app_says(&active);
             let opened = opened_bundle(
-                &identifier,
+                &exact_identifier,
                 &no_data,
                 &no_config,
                 &home.join(format!("publish-{mode}-{point}-launch-home")),
@@ -2299,8 +2392,8 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
             let repaired = vox(Path::new(VOX), home, &["update"], &product_base);
             let after_version = active_app_says(&active);
-            let after_records =
-                launch_services_paths(&identifier).unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+            let after_records = launch_services_paths(&exact_identifier)
+                .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
             let after_exchange = matches!(
                 point,
                 "publish-exchanged"
@@ -2310,7 +2403,11 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                     | "publish-older-cleaned"
                     | "publish-journal-cleared"
             );
-            let expected_interrupted = if after_exchange { NEWER } else { VERSION };
+            let expected_interrupted = if after_exchange {
+                candidate_version.as_str()
+            } else {
+                previous_version.as_str()
+            };
             let verdict_truthful = if mode == "abort" {
                 !cut.status.success()
             } else if after_exchange {
@@ -2320,29 +2417,34 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             } else {
                 !cut.status.success() && !cut_text.contains("updated:")
             };
-            claims.push(claim(
-                &format!("bundle.publish_boundary.{mode}.{point}"),
-                primed.status.success()
-                    && rewound.status.success()
-                    && verdict_truthful
-                    && interrupted_version == expected_interrupted
-                    && active.join("Contents/Info.plist").is_file()
-                    && !previous.join("Contents/Info.plist").exists()
-                    && opened.ok
-                    && opened.path.as_deref() == Some(active.as_path())
-                    && repaired.status.success()
-                    && after_version == NEWER
-                    && after_records.contains(&active),
-                format!(
-                    "prime={}, rewind={}, cut={} said {cut_text:?}; interrupted={interrupted_version:?}, open={:?}; repair={}, after={after_version:?}, records={after_records:?}",
+            let ok = primed.status.success()
+                && rewound.status.success()
+                && verdict_truthful
+                && interrupted_version == expected_interrupted
+                && active.join("Contents/Info.plist").is_file()
+                && !previous.join("Contents/Info.plist").exists()
+                && opened.ok
+                && opened.path.as_deref() == Some(active.as_path())
+                && repaired.status.success()
+                && after_version == candidate_version
+                && after_records == [active.clone()];
+            boundary_ok &= ok;
+            boundary_evidence.push(format!(
+                    "{mode}: prime={}, rewind={}, cut={} said {cut_text:?}; interrupted={interrupted_version:?}, open={:?}; repair={}, after={after_version:?}, records={after_records:?}",
                     primed.status,
                     rewound.status,
                     cut.status,
                     opened.path,
                     repaired.status
-                ),
-            ));
+                ));
         }
+        // Abort observes the durable success side and returned failure observes the pre-operation
+        // side, but both are one boundary claim. Removing this boundary therefore reds one claim.
+        claims.push(claim(
+            &format!("bundle.publish_boundary.{point}"),
+            boundary_ok,
+            boundary_evidence.join("; "),
+        ));
     }
 
     // ---- real command interruptions at every durable rollback boundary ------------------
@@ -2357,32 +2459,33 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         "rollback-active-registered",
         "rollback-journal-cleared",
     ] {
+        let mut boundary_ok = true;
+        let mut boundary_evidence = Vec::new();
         for mode in ["abort", "fail"] {
             let tmp = tmpdir();
             let home = tmp.path();
-            let _link = bundle_install_product(
-                home,
-                "stable",
-                &shipped_app,
-                VERSION,
-                &identifier,
-                Path::new(VOX),
-            );
+            let _link = bundle_install_exact_product(home, "stable", &previous_shipped_app);
             let apps = home.join("Apps");
             let active = apps.join("Vox.app");
             let previous = apps.join(".Vox.app.previous");
             let rollback_staged = apps.join(".Vox.rollback.partial");
             let apps_text = apps.to_str().expect("APPARATUS: UTF-8 scratch apps path");
-            let product_base: Vec<(&str, &str)> = base
-                .iter()
-                .copied()
-                .chain([("VOX_TEST_BUNDLE_APPS_DIR", apps_text)])
-                .collect();
-            let product_current_base: Vec<(&str, &str)> = current_base
-                .iter()
-                .copied()
-                .chain([("VOX_TEST_BUNDLE_APPS_DIR", apps_text)])
-                .collect();
+            let product_base = [
+                ("VOX_TEST_RELEASE_BASE", exact_server.base.as_str()),
+                ("VOX_TEST_APPLE_VERIFY", "1"),
+                ("VOX_TEST_BUNDLE_APPS_DIR", apps_text),
+                ("VOX_NO_SHELL_SETUP", "1"),
+                base[2],
+                base[3],
+            ];
+            let product_current_base = [
+                ("VOX_TEST_RELEASE_BASE", prior_server.base.as_str()),
+                ("VOX_TEST_APPLE_VERIFY", "1"),
+                ("VOX_TEST_BUNDLE_APPS_DIR", apps_text),
+                ("VOX_NO_SHELL_SETUP", "1"),
+                base[2],
+                base[3],
+            ];
             let mut registrations = LaunchServicesCleanup::new();
             for path in [active.clone(), previous.clone(), rollback_staged.clone()] {
                 registrations.remember(&path);
@@ -2398,7 +2501,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             let cut_text = said(&cut);
             let interrupted_version = active_app_says(&active);
             let opened = opened_bundle(
-                &identifier,
+                &exact_identifier,
                 &no_data,
                 &no_config,
                 &home.join(format!("rollback-{mode}-{point}-launch-home")),
@@ -2414,9 +2517,18 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                     | "rollback-active-registered"
                     | "rollback-journal-cleared"
             );
-            let expected_interrupted = if after_exchange { VERSION } else { NEWER };
-            let recorded = point != "journal-directory-synced";
-            let expected_after = if recorded { VERSION } else { NEWER };
+            let expected_interrupted = if after_exchange {
+                previous_version.as_str()
+            } else {
+                candidate_version.as_str()
+            };
+            let recorded = point != "journal-directory-synced"
+                && !(point == "journal-state-synced" && mode == "fail");
+            let expected_after = if recorded {
+                previous_version.as_str()
+            } else {
+                candidate_version.as_str()
+            };
             let verdict_truthful = if mode == "abort" {
                 !cut.status.success()
             } else if after_exchange {
@@ -2426,27 +2538,37 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             } else {
                 !cut.status.success() && !cut_text.contains("rolled back:")
             };
-            claims.push(claim(
-                &format!("bundle.rollback_boundary.{mode}.{point}"),
-                primed.status.success()
-                    && verdict_truthful
-                    && interrupted_version == expected_interrupted
-                    && active.join("Contents/Info.plist").is_file()
-                    && !previous.join("Contents/Info.plist").exists()
-                    && (!rollback_staged.exists()
-                        || !rollback_staged
-                            .file_name()
-                            .is_some_and(|name| name.to_string_lossy().ends_with(".app")))
-                    && opened.ok
-                    && opened.path.as_deref() == Some(active.as_path())
-                    && repaired.status.success()
-                    && after_version == expected_after,
-                format!(
-                    "prime={}, cut={} said {cut_text:?}; interrupted={interrupted_version:?}, open={:?}; repair={}, after={after_version:?}",
-                    primed.status, cut.status, opened.path, repaired.status
-                ),
+            let after_records = launch_services_paths(&exact_identifier)
+                .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
+            let after_signature = shipped_notarized(&active);
+            let ok = primed.status.success()
+                && verdict_truthful
+                && interrupted_version == expected_interrupted
+                && active.join("Contents/Info.plist").is_file()
+                && !previous.join("Contents/Info.plist").exists()
+                && (!rollback_staged.exists()
+                    || !rollback_staged
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().ends_with(".app")))
+                && opened.ok
+                && opened.path.as_deref() == Some(active.as_path())
+                && repaired.status.success()
+                && after_version == expected_after
+                && after_signature.is_ok()
+                && after_records == [active.clone()];
+            boundary_ok &= ok;
+            boundary_evidence.push(format!(
+                "{mode}: prime={}, cut={} said {cut_text:?}; interrupted={interrupted_version:?}, open={:?}; repair={}, after={after_version:?}, signature={after_signature:?}, records={after_records:?}",
+                primed.status, cut.status, opened.path, repaired.status
             ));
         }
+        // The fail and abort sides are one operation boundary. Removing only this boundary hook
+        // therefore turns exactly this boundary's shipped-artifact claim red.
+        claims.push(claim(
+            &format!("bundle.rollback_boundary.{point}"),
+            boundary_ok,
+            boundary_evidence.join("; "),
+        ));
     }
 
     // ---- reserved transition names never follow a symlink or accept a non-directory -------
