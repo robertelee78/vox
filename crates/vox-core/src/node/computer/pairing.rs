@@ -4320,6 +4320,14 @@ fn exchange(s: &State, peer: &Digest32) -> Result<Vec<u8>> {
     Ok(e.finish())
 }
 fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -> Result<()> {
+    let local = s.description.fingerprint()?;
+    // A fresh preview can target an already-enrolled installation. Capture its exact current
+    // positive grant before applying any incoming candidate/history: historical enrollment,
+    // retained group_genesis, and a removed or quarantined grant confer no authority here.
+    let existing_local_membership = s
+        .genesis
+        .as_ref()
+        .and_then(|genesis| s.grant(&local).map(|grant| (genesis.incarnation(), grant)));
     let mut d = Decoder::new(bytes);
     arity(&mut d, 5)?;
     let read = |bytes: &[u8]| -> Result<Option<Enrollment>> {
@@ -4352,7 +4360,6 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
             "this enrollment attempt was closed locally; its retained intent cannot activate",
         ));
     }
-    let local = s.description.fingerprint()?;
     let candidate = s.pending.as_ref().is_some_and(|p| side(p, &peer).is_ok());
     // Former managers may carry retained negative/fork evidence and receive their removal.
     // This grants no positive authority: every event is independently checked at its prefix.
@@ -4468,11 +4475,22 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
             s.receipts.insert(author, receipt);
         }
     }
-    // Receiving the retained genesis is not enrollment: require the local operator's exact ADD.
+    // Receiving the retained genesis cannot grant new local membership without the local
+    // operator's exact ADD approval. An unapproved preview may preserve only the same positive
+    // grant in the same already-established group; it cannot restore or replace authority.
     if let Some(p) = &s.pending {
-        if p.group.is_some() && p.approvals[side(p, &local)?].is_none() && s.grant(&local).is_some()
+        let local_grant = s.grant(&local);
+        let preserves_local_membership = existing_local_membership.is_some_and(|(group, grant)| {
+            p.group == Some(group) && s.group() == Some(group) && local_grant == Some(grant)
+        });
+        if p.group.is_some()
+            && p.approvals[side(p, &local)?].is_none()
+            && local_grant.is_some()
+            && !preserves_local_membership
         {
-            return Err(Error::SignatureInvalid);
+            return Err(Error::Profile(
+                "this computer has not approved this enrollment; no new trust was established",
+            ));
         }
     }
     Ok(())
