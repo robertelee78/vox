@@ -414,6 +414,28 @@ fn charge(job: &Job, bytes: usize) -> Result<BufferCharge> {
     job.reserve(bytes)
         .ok_or_else(|| invalid("history demand buffer budget is busy"))
 }
+
+/// The exact demand-state working envelope prepaid with a staged record. Semantic application
+/// borrows this proof after it has begun; it never performs another fallible byte reservation.
+pub(crate) struct AdmissionCharge {
+    _charge: BufferCharge,
+}
+
+impl AdmissionCharge {
+    pub(crate) fn total(record: usize) -> Result<usize> {
+        record
+            .checked_add(STATE_WORK)
+            .ok_or(Error::SizeLimitExceeded("history completion envelope"))
+    }
+
+    pub(crate) fn split_from(combined: &mut BufferCharge) -> Result<Self> {
+        let charge = combined
+            .split_off(STATE_WORK)
+            .ok_or(Error::SizeLimitExceeded("history completion envelope"))?;
+        Ok(Self { _charge: charge })
+    }
+}
+
 fn key(context: &Context) -> Result<&Sek> {
     context.check()?;
     Ok(&context.key)
@@ -939,14 +961,13 @@ fn schedule_cleanup(state: &mut State) {
 /// Call only after complete hash/signature/governance admission, in that SAME accepted-entry Batch.
 /// This adds one row, so the caller must reserve one row in its <=64-row publication slice.
 /// Commit failure must poison the enclosing admission; no ACK/progress is claimed on that failure.
-pub fn entry_admitted(
+pub(crate) fn entry_admitted(
     batch: &mut Batch<'_>,
     context: &Context,
     active: &Active,
     entry: Digest32,
-    job: &Job,
+    _admission: &AdmissionCharge,
 ) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
     let key = key(context)?;
     let scope = scope(context);
     let mut state = live(batch, key, &scope, context, active)?;
@@ -965,14 +986,13 @@ pub fn entry_admitted(
 /// The caller invokes this only from the exact entry's semantic-effect transaction, after its
 /// inclusion proof and typed dispatch have succeeded. Unlike body staging, this both advances
 /// the archive count and moves the cursor below the role-only header atomically.
-pub fn role_header_admitted(
+pub(crate) fn role_header_admitted(
     batch: &mut Batch<'_>,
     context: &Context,
     active: &Active,
     seq: u64,
-    job: &Job,
+    _admission: &AdmissionCharge,
 ) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
     let key = key(context)?;
     let scope = scope(context);
     let mut state = load(batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;

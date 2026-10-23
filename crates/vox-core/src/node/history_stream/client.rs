@@ -733,6 +733,7 @@ pub(crate) struct Record {
     pub(crate) entry: crate::log::entry::Entry,
     job: crate::node::history_budget::Job,
     _charge: crate::node::history_budget::BufferCharge,
+    admission: Option<demand::AdmissionCharge>,
     staged: Option<(RequestId, Digest32, StagedAdmission)>,
 }
 
@@ -753,6 +754,7 @@ impl Receiver {
     pub(crate) async fn assemble(
         &self,
         job: &crate::node::history_budget::Job,
+        completion: bool,
     ) -> Result<Assembly> {
         let Some(staging) = &self.staging else {
             return Ok(Assembly::Pending);
@@ -780,16 +782,25 @@ impl Receiver {
             if body.offset != body.length {
                 return Ok(Assembly::Pending);
             }
-            let envelope = 5 * (body.length as usize + crate::log::history::MAX_HEADER_BYTES + 9)
+            let record_envelope = 5
+                * (body.length as usize + crate::log::history::MAX_HEADER_BYTES + 9)
                 + VERIFY_ENVELOPE;
+            let envelope = if completion {
+                demand::AdmissionCharge::total(record_envelope)?
+            } else {
+                record_envelope
+            };
             let Some(record_job) =
                 tokio::runtime::Handle::current().block_on(job.record_job(envelope))
             else {
                 return Ok(Assembly::Busy);
             };
-            let Some(charge) = record_job.reserve(envelope) else {
+            let Some(mut charge) = record_job.reserve(envelope) else {
                 return Ok(Assembly::Busy);
             };
+            let admission = completion
+                .then(|| demand::AdmissionCharge::split_from(&mut charge))
+                .transpose()?;
             let mut entry = crate::log::entry::Entry::from_wire(&body.header)?;
             let mut payload = Vec::with_capacity(body.length as usize);
             for page in 1..=body
@@ -810,6 +821,7 @@ impl Receiver {
                 entry,
                 job: record_job,
                 _charge: charge,
+                admission,
                 staged: Some((active.request(), generation, StagedAdmission::Body)),
             })))
         })
@@ -985,6 +997,7 @@ impl Receiver {
         job: &crate::node::history_budget::Job,
         head: Digest32,
         seq: u64,
+        completion: bool,
     ) -> Result<Assembly> {
         let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Assembly::Busy);
@@ -1001,24 +1014,33 @@ impl Receiver {
                 _ => Assembly::Pending,
             });
         };
-        let envelope = 5
+        let record_envelope = 5
             * (header.value.skeleton.payload_len as usize
                 + crate::log::history::MAX_HEADER_BYTES
                 + 9)
             + VERIFY_ENVELOPE;
+        let envelope = if completion {
+            demand::AdmissionCharge::total(record_envelope)?
+        } else {
+            record_envelope
+        };
         // Release the metadata job before attempting a large body job. The small header itself
         // stays charged until its replacement reservation has been acquired.
         let Some(record_job) = job.record_job(envelope).await else {
             return Ok(Assembly::Busy);
         };
-        let Some(charge) = record_job.reserve(envelope) else {
+        let Some(mut charge) = record_job.reserve(envelope) else {
             return Ok(Assembly::Busy);
         };
+        let admission = completion
+            .then(|| demand::AdmissionCharge::split_from(&mut charge))
+            .transpose()?;
         let entry = header.value;
         Ok(Assembly::Ready(Arc::new(Record {
             entry,
             job: record_job,
             _charge: charge,
+            admission,
             staged: None,
         })))
     }
@@ -1204,6 +1226,10 @@ fn complete_staged(
     let Some((request, generation, admission)) = record.staged else {
         return Ok(());
     };
+    let admission_charge = record
+        .admission
+        .as_ref()
+        .ok_or(Error::Profile("history completion admission missing"))?;
     if hash != record.entry.entry_hash() {
         return Err(Error::MalformedAtRest("history completion entry changed"));
     }
@@ -1217,14 +1243,14 @@ fn complete_staged(
     }
     match admission {
         StagedAdmission::Body => {
-            demand::entry_admitted(batch, &staging.context, &active, hash, &record.job)
+            demand::entry_admitted(batch, &staging.context, &active, hash, admission_charge)
         }
         StagedAdmission::RoleHeader => demand::role_header_admitted(
             batch,
             &staging.context,
             &active,
             record.entry.skeleton.seq,
-            &record.job,
+            admission_charge,
         ),
     }
 }
@@ -1381,10 +1407,12 @@ impl Receiver {
                     | EntryPhase::Refill
                     | EntryPhase::Effect(_)
             );
+        let completion =
+            matches!(phase, EntryPhase::Refill | EntryPhase::Effect(_)) && (body || role_header);
         let assembly = if full {
-            self.assemble(job).await?
+            self.assemble(job, completion).await?
         } else {
-            self.header_record(job, head, seq).await?
+            self.header_record(job, head, seq, completion).await?
         };
         let mut record = match assembly {
             Assembly::Ready(record) => record,
