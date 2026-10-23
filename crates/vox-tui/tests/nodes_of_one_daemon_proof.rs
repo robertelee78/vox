@@ -278,8 +278,12 @@ impl Daemon {
             c.env(k, v);
         }
         if !env.iter().any(|(key, _)| *key == "VOX_TEST_FX28_MUTANT") {
-            if let Ok(mutant) = std::env::var("VOX_TEST_FX28_MUTANT") {
-                c.env("VOX_TEST_FX28_MUTANT", mutant);
+            // The shared pre-main isolation removes every inherited product knob. Keep the
+            // operator's selector under the existing proof-run VOX_MUTANT_ prefix, then map it
+            // explicitly onto each isolated daemon; the product never reads the run setting.
+            if let Ok(mutant) = std::env::var("VOX_MUTANT_FX28") {
+                c.env("VOX_TEST_FX28_MUTANT", &mutant);
+                eprintln!("[proof] FX-28 mutant {mutant} selected for this scratch daemon");
             }
         }
         let started = Instant::now();
@@ -6840,14 +6844,15 @@ fn stale_rekey_is_not_delivered(
         "APPARATUS: baseline-drain marker named another node, peer, or room"
     );
     // Select the compatibility route through the real protocol result which owns it. Epsilon's
-    // test-only peer apparatus closes exactly one modern delivery without an answer. Delta
+    // test-only peer apparatus closes every exact modern delivery without an answer while armed,
+    // faithfully emulating an older peer even if modern jobs overlap. Delta
     // atomically pauses that exact pair's automatic re-key and publishes the selected route; its
     // shipped roster must then say epsilon runs an older Vox. The target post below releases that
     // same still-owed key into the real long-lived-session preparation and durable-policy fence.
     let _ = std::fs::remove_file(older_marker);
     let _ = std::fs::remove_file(older_selected_marker);
     std::fs::write(older_arm, format!("{delta}\t{full_room}\n"))
-        .expect("APPARATUS: arm epsilon's exact unanswered modern key delivery");
+        .expect("APPARATUS: arm epsilon's exact legacy-peer modern-delivery behavior");
     std::fs::write(older_selected_arm, format!("{epsilon}\t{full_room}\n"))
         .expect("APPARATUS: arm delta's exact ENDED_UNANSWERED route selection");
     std::fs::write(&rotate_after_post_arm, format!("delta\t{full_room}\n"))

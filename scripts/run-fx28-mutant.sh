@@ -85,7 +85,9 @@ esac
 artifact_dir=${VOX_FX28_MUTANT_ARTIFACTS:-target/fx28-mutants}
 mkdir -p "$artifact_dir"
 artifact="$artifact_dir/$mutant.log"
-export VOX_TEST_FX28_MUTANT="$mutant"
+# The proof's pre-main isolation scrubs inherited product knobs. This is a proof-run setting;
+# its daemon helper explicitly maps it to VOX_TEST_FX28_MUTANT only on scratch product children.
+export VOX_MUTANT_FX28="$mutant"
 
 set +e
 cargo test --release -p vox-tui \

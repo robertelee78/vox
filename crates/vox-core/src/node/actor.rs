@@ -10578,7 +10578,7 @@ impl Node {
                     return;
                 };
                 // A failed write leaves the key owed, and it is sent again: never the other way.
-                let durably_recorded = {
+                let _durably_recorded = {
                     let mut channel = shared.lock().await;
                     let delivered = channel
                         .note_delivered(profile.store(), peer, chain_id)
@@ -10595,7 +10595,7 @@ impl Node {
                     peer,
                     history,
                     whole_history,
-                    durably_recorded,
+                    _durably_recorded,
                 );
             }
             NetEvent::RoomStored { channel_id } => {
@@ -23138,7 +23138,7 @@ impl Node {
         } else {
             rotated
         };
-        let delivered = if drive_rekey {
+        let _delivered = if drive_rekey {
             self.deliver_rekeys_for(&channel_id, false).await
         } else {
             0
@@ -23155,7 +23155,7 @@ impl Node {
             let _ = crate::node::computer::publish_proof_marker(
                 &marker,
                 format!(
-                    "{node}\t{room}\trotated={rotated}\trelease_requested={}\treleased_paused={released_paused}\tcomplete_target_batches={delivered}\n",
+                    "{node}\t{room}\trotated={rotated}\trelease_requested={}\treleased_paused={released_paused}\tcomplete_target_batches={_delivered}\n",
                     release_peer.is_some()
                 )
                 .as_bytes(),

@@ -105,11 +105,13 @@ const TEST_MARK_DELIVERY_DRAINED_ENV: &str = "VOX_TEST_FX28_MARK_DELIVERY_DRAINE
 
 #[cfg(feature = "test-knobs")]
 impl Node {
-    /// Test apparatus: make one exact modern key-delivery stream look like a pre-v0.4.3 peer.
+    /// Test apparatus: emulate a pre-v0.4.3 peer for one exact sender and room while armed.
     /// `<node>\t<arm>\t<marker>`; `arm` contains the expected authenticated sender fingerprint
     /// and room fingerprint, separated by a tab.
-    /// Consuming the arm before closing the answer half causally selects the real
-    /// `ENDED_UNANSWERED` classification, and the marker names that exact pair. No shipped build
+    /// Every matching modern delivery closes without an answer throughout the staged phase;
+    /// legacy Hello/Skdm traffic is unaffected. The first marker names the exact pair. A one-shot
+    /// EOF would let overlapping modern deliveries succeed and truthfully supersede the older
+    /// inference, so the arm remains present until the proof's daemon teardown. No shipped build
     /// names this knob.
     pub(super) fn end_key_unanswered_for_proof(
         &self,
@@ -136,15 +138,29 @@ impl Node {
         if mine != Some(node)
             || std::fs::read_to_string(arm).ok().as_deref().map(str::trim)
                 != Some(expected.as_str())
-            || std::fs::remove_file(arm).is_err()
         {
             return false;
         }
-        crate::node::computer::publish_proof_marker(
-            std::path::Path::new(marker),
-            format!("{node}\t{peer}\t{room}\n").as_bytes(),
-        )
-        .is_ok()
+        let marker = std::path::Path::new(marker);
+        let contents = format!("{node}\t{peer}\t{room}\n");
+        if marker.is_file() {
+            if std::fs::read_to_string(marker).ok().as_deref() != Some(contents.as_str()) {
+                crate::node::computer::publish_proof_fault(
+                    &marker.with_extension("fault"),
+                    "legacy-peer apparatus marker did not name the armed sender and room",
+                );
+                std::process::exit(70);
+            }
+        } else if let Err(error) =
+            crate::node::computer::publish_proof_marker(marker, contents.as_bytes())
+        {
+            crate::node::computer::publish_proof_fault(
+                &marker.with_extension("fault"),
+                &format!("could not publish the exact legacy-peer apparatus marker: {error}"),
+            );
+            std::process::exit(70);
+        }
+        true
     }
 
     /// Test apparatus: arm a marker after the sender has admitted the exact authenticated peer's
