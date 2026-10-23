@@ -1201,11 +1201,12 @@ impl Management {
                 ));
             }
         }
-        // The pairing handshake with the link's computer is this computer's exchange with it
-        // for now: the retry leaves it alone meanwhile, and the reservation ends with the
+        // Pairing reserves the peer while it authenticates the invitation: retry leaves it
+        // alone meanwhile, and the reservation ends with the
         // handshake however it ends (a drop guard), so the computer never stays in flight.
         let target = link.target;
-        // The state this handshake carries, read before the reservation: the state lock is
+        // The state which owns this handshake's supersession check, read before reservation:
+        // pairing sends identity proof, not this node's ordinary policy snapshot. The state lock is
         // never taken under the in-flight lock (the retry takes them the other way round).
         let (revision, policy_revision) = {
             let state = lock(&self.computer.state);
@@ -1260,9 +1261,6 @@ impl Management {
                                 superseded: false,
                             },
                         );
-                        let mut exchanged = lock(&self.exchanged);
-                        let record = exchanged.entry(target).or_default();
-                        record.attempts = record.attempts.saturating_add(1);
                         break;
                     }
                     Some(flight) if flight.origin == Origin::Operator && !flight.superseded => {
@@ -1274,6 +1272,18 @@ impl Management {
                     Some(flight) => {
                         causal_deadline = causal_deadline.min(flight.deadline);
                         if !flight.superseded {
+                            if flight.origin == Origin::Retry && flight.causal {
+                                // The command takes the transport slot, not the ordinary
+                                // snapshot's obligation. Restore its consumed causal mark before
+                                // cutting the task, so release can resume that exact unfinished
+                                // work even when no failed-attempt record exists yet.
+                                self.mark_retry(
+                                    target,
+                                    flight.revision,
+                                    flight.policy_revision,
+                                    flight.deadline,
+                                );
+                            }
                             flight.superseded = true;
                             if let Some(abort) = &flight.abort {
                                 abort.abort();
@@ -1331,52 +1341,23 @@ impl Management {
                 }
             }
         }
-        let (paired, superseded) = match task.await {
-            Ok(Ok(paired)) => (paired, false),
-            Ok(Err(_)) => (
-                Err(Error::Profile(
+        let paired = match task.await {
+            Ok(Ok(paired)) => paired,
+            Ok(Err(_)) => Err(Error::Profile(
                     "the computer pairing did not finish before its causal convergence deadline; try again",
                 )),
-                false,
-            ),
             // Cut by the retry because this node changed: no failure of anyone's.
-            Err(e) if e.is_cancelled() => (
-                Err(Error::Profile(
+            Err(e) if e.is_cancelled() => Err(Error::Profile(
                     "this computer changed while the pairing ran, so the pairing was \
                      superseded; try again",
                 )),
-                true,
-            ),
-            Err(_) => (
-                Err(Error::Profile(
+            Err(_) => Err(Error::Profile(
                     "the computer pairing task failed; try again",
                 )),
-                false,
-            ),
         };
-        // Recorded while still reserved, with the state it carried, so the record never
-        // touches a reservation the retry may have taken meanwhile; the guard releases this
-        // one after. A superseded handshake is recorded as nothing.
-        if !superseded {
-            let outcome = match &paired {
-                // The handshake exchanged state: counted and dated like any exchange, with
-                // the revisions it carried, and the status's problem follows from every
-                // computer's record.
-                Ok(revisions) => Ok(*revisions),
-                Err(e) => Err(e.to_string()),
-            };
-            self.record_exchange(
-                target,
-                serial,
-                revision,
-                policy_revision,
-                true,
-                true,
-                causal_deadline.min(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN),
-                outcome,
-                None,
-            );
-        }
+        // This ceremony received the peer's state but sent no ordinary policy snapshot.
+        // Its result belongs to this command and the durable pairing status; it cannot
+        // acknowledge, pace, repair or replace an ordinary outbound exchange obligation.
         drop(reserved);
         paired?;
         self.status()
@@ -2160,14 +2141,14 @@ impl Management {
         self.serve(Arc::clone(&conn));
         Ok(conn)
     }
-    /// The operator's pairing handshake with the inviting computer: this node's revision as it
-    /// stood when the handshake began, and after the computer's state was merged.
+    /// Authenticate the inviting computer and durably retain its preview. The initiator sends
+    /// identity proof, not an ordinary policy snapshot, and therefore returns no sent revision.
     async fn pair(
         self: &Arc<Self>,
         link: &Link,
         url: &str,
         deadline: std::time::Instant,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<()> {
         let conn = self
             .connect(link.target, &link.endpoints, Some(link))
             .await?;
@@ -2228,9 +2209,7 @@ impl Management {
         pop::verify(&proof, &ci, &transcript, &link.target)?;
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
-        let revisions = self.computer.change_until(deadline, |s| {
-            // The revision this node stood at when it accepted the pairing, read in the
-            // transaction that merges the computer's state, and the revision after.
+        self.computer.change_until(deadline, |s| {
             let before = s.revision;
             let before_pending = s.pending.as_ref().map(Enrollment::encode);
             if s.pending
@@ -2254,10 +2233,10 @@ impl Management {
             {
                 s.advance_journal()?;
             }
-            Ok((before, s.revision))
+            Ok(())
         })?;
         let _ = send.finish();
-        Ok(revisions)
+        Ok(())
     }
     async fn answer(
         &self,
@@ -3098,9 +3077,8 @@ impl Management {
         // enqueue a retry while the exchange is still in flight. A successful payload has already
         // discharged every such cause through both revisions it actually carried. Consume only a
         // mark covered on both axes: `retry_peer_now` can otherwise combine an older journal
-        // revision with a policy revision which committed while this flight was away. Operator
-        // pairing has no coverage tuple because its reported pre-merge revision is not a sent
-        // ordinary-sync snapshot.
+        // revision with a policy revision which committed while this flight was away. A torn
+        // or failed attempt has no successfully sent ordinary-sync snapshot to cover a mark.
         let covered_retry = outcome.as_ref().ok().and(covered_payload);
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
