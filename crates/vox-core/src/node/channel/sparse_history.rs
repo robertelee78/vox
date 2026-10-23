@@ -722,6 +722,7 @@ impl ChannelState {
             .cleanup_publication(store, &self.sek, &self.channel_id)?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         if done {
+            self.history_publication_changed.notify_waiters();
             let read = self.history_read(store)?;
             self.dag.set_order_revision(
                 read.order_revision(),
@@ -734,6 +735,20 @@ impl ChannelState {
     /// The exact request that owns an unfinished sparse-history publication, if any.
     pub(crate) fn history_publication_request(&self, store: &Store) -> Result<Option<[u8; 16]>> {
         Ok(self.history_read(store)?.sparse_publication_request())
+    }
+
+    /// Subscribe under the room mutex before testing its actual publication owner. Only a
+    /// committed completion or key erasure publishes this edge; no room guard is retained.
+    pub(crate) fn history_publication_wake(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
+        let mut wake =
+            Box::pin(std::sync::Arc::clone(&self.history_publication_changed).notified_owned());
+        wake.as_mut().enable();
+        wake
+    }
+    pub(crate) fn history_retirement_locked(&self) -> bool {
+        self.sek.key_bytes().is_err()
     }
 
     /// A retired request may roll back only its own unpublished roots, or finish only its

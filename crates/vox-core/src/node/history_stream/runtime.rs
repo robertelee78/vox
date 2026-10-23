@@ -61,6 +61,26 @@ const GOVERNANCE_STEPS_PER_TURN: u8 = 4;
 /// The body bytes one explicit history quantum fetches at most; past it the request pauses and
 /// `vox room read --history resume` asks for the rest.
 const ARCHIVE_QUANTUM_BYTES: u64 = 1024 * 1024;
+
+pub(crate) enum RetirementStep {
+    Done,
+    Progress,
+    Wait(RetirementWait),
+}
+pub(crate) enum RetirementWait {
+    Bytes(crate::node::history_budget::BytePressure),
+    Publication {
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+    },
+}
+impl RetirementWait {
+    pub(crate) async fn released(self) {
+        match self {
+            Self::Bytes(pressure) => pressure.released().await,
+            Self::Publication { wake } => wake.await,
+        }
+    }
+}
 #[derive(Clone)]
 struct Task {
     request: RequestId,
@@ -934,11 +954,11 @@ impl Flow {
     }
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
-    pub(crate) async fn retire_slice(&mut self) -> Result<bool> {
+    pub(crate) async fn retire_slice(&mut self) -> Result<RetirementStep> {
         self.publication_owner_wait = None;
-        if !self.initialized {
+        if !self.initialized || self.shared.lock().await.history_retirement_locked() {
             self.cancel();
-            return Ok(true);
+            return Ok(RetirementStep::Done);
         }
         // A published current body queues only local exact-request reclamation. If its peer
         // departs before the next network turn, finish that bounded cleanup here; membership is
@@ -953,36 +973,45 @@ impl Flow {
             .tasks
             .iter()
             .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
+        let staging = if reclaim_live && self.live.is_some() {
+            self.live.clone().map(|stage| (Purpose::Live, stage))
+        } else if reclaim_control && self.control.is_some() {
+            self.control.clone().map(|stage| (Purpose::Control, stage))
+        } else {
+            None
+        };
         // A parked flow owns no worker. Retirement admits one independent large-control job for
         // this bounded local slice and gives it back before the flow is retained again.
         let cleanup_job = self
             .cleanup_budget
             .admit_job(self.node, crate::node::history_budget::Lane::LargeControl)
             .await;
-        if reclaim_live
-            && !self
-                .reclaim_stage(Purpose::Live, &cleanup_job, true)
-                .await?
-        {
-            return Ok(false);
-        }
-        if reclaim_control
-            && !self
-                .reclaim_stage(Purpose::Control, &cleanup_job, true)
-                .await?
-        {
-            return Ok(false);
-        }
         // No worker owns this Flow while it is retiring. Retain its already-fenced local
         // capability only through the exact queued reclamation above, then cancel it before
         // any general publication/verifier cleanup. Nothing here opens a stream or schedules
         // another turn.
-        self.cancel();
+        if staging.is_none() {
+            self.cancel();
+        }
         // Cleanup uses the independently admitted foreground-control envelope above; no parked
         // flow retains a Control worker merely so it can eventually retire.
         const CLEANUP_ENVELOPE: usize = 6 * 1024 * 1024;
-        let Some(charge) = cleanup_job.reserve(CLEANUP_ENVELOPE) else {
-            return Ok(false);
+        let envelope = if staging.is_some() {
+            demand::AdmissionCharge::total(CLEANUP_ENVELOPE)?
+        } else {
+            CLEANUP_ENVELOPE
+        };
+        let mut charge = match cleanup_job.reserve_or_pressure(envelope) {
+            Ok(charge) => charge,
+            Err(Error::HistoryCapacity(pressure)) => {
+                return Ok(RetirementStep::Wait(RetirementWait::Bytes(*pressure)))
+            }
+            Err(error) => return Err(error),
+        };
+        let admission = if staging.is_some() {
+            Some(demand::AdmissionCharge::split_from(&mut charge)?)
+        } else {
+            None
         };
         let room = self.shared.clone();
         let store = self.cleanup_store.clone();
@@ -990,56 +1019,109 @@ impl Flow {
         let instance = self.instance;
         let after = self.cleanup_after;
         let committed = Arc::clone(&self.work_committed);
+        enum Slice {
+            Gone,
+            Staging(Purpose, bool),
+            Source(bool, Option<[u8; 64]>),
+            Publication(
+                Option<RequestId>,
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+            ),
+        }
         let step = tokio::task::spawn_blocking(move || {
             let _charge = charge;
             let mut channel = room.blocking_lock();
+            if channel.history_retirement_locked() {
+                return Ok(Slice::Gone);
+            }
             // Lock erases keys immediately. Reopen owns the bounded crash cleanup;
             // no retired worker may keep/recreate an unlocked room to finish work.
             match channel.history_instance(&store) {
-                Err(Error::AtRestLocked) => return Ok((true, None, None)),
+                Err(Error::AtRestLocked) => return Ok(Slice::Gone),
                 Err(error) => return Err(error),
-                Ok(current) if current != instance => return Ok((true, None, None)),
+                Ok(current) if current != instance => return Ok(Slice::Gone),
                 Ok(_) => {}
             }
+            if let Some((purpose, staging)) = staging {
+                // Same room->Active lock order as semantic completion. Observer cancellation
+                // remains set: this route can only delete the captured abandoned staging.
+                let mut active = staging
+                    .active
+                    .lock()
+                    .map_err(|_| Error::Profile("history activation lock failed"))?;
+                let admission = admission
+                    .as_ref()
+                    .ok_or(Error::Profile("history retirement admission missing"))?;
+                let done =
+                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?;
+                return Ok(Slice::Staging(purpose, done));
+            }
+            let wake = channel.history_publication_wake();
             let publication_owner = channel.history_publication_request(&store)?;
-            if publication_owner.is_some() && publication_owner != Some(request) {
-                return Ok((false, after, publication_owner));
+            if channel.history_publication_busy(&store)? && publication_owner != Some(request) {
+                return Ok(Slice::Publication(publication_owner, wake));
             }
             if !channel.cleanup_history_source_owned(&store, &committed, request)? {
-                return Ok((false, after, None));
+                return Ok(Slice::Source(false, after));
             }
             channel
                 .cleanup_history_verifiers(&store, &committed, request, after)
-                .map(|(done, next)| (done, next, None))
+                .map(|(done, next)| Slice::Source(done, next))
         })
         .await
         .map_err(|_| Error::Profile("history retirement worker stopped"))??;
-        self.cleanup_after = step.1;
-        if !step.0 {
-            // A foreground flow may suspend publication A while a freshly derived request B is
-            // its current scalar. Verifier cleanup for B correctly waits while A is publishing,
-            // but retirement must first select A when this same Flow still owns it. Otherwise
-            // B waits for A forever and the actor retains a room-busy Flow with no running
-            // worker. The task/replay stack is the exact ownership set; an unrelated owner's
-            // publication remains untouched and is retried after its own causal completion.
-            if let Some(owner) = step.2.filter(|owner| *owner != request) {
-                let owned = self.retirement_request == owner
-                    || self.tasks.iter().any(|task| task.request == owner)
-                    || self
-                        .replay
-                        .as_ref()
-                        .is_some_and(|task| task.request == owner);
-                if owned {
-                    self.request = owner;
-                    self.cleanup_after = None;
-                } else {
-                    // This retirement is causally blocked by one exact publication owner. The
-                    // controller runs that owner first and retries this flow from the owner's
-                    // completion, never from a wall-clock backoff.
-                    self.publication_owner_wait = Some(owner);
-                }
+        let (done, next) = match step {
+            Slice::Gone => {
+                self.cancel();
+                return Ok(RetirementStep::Done);
             }
-            return Ok(false);
+            Slice::Staging(purpose, done) => {
+                if done {
+                    if let Some(index) = body_slot(purpose) {
+                        if let Some(request) = self.owners[index].take() {
+                            self.slots.release(purpose, request);
+                        }
+                    }
+                    match purpose {
+                        Purpose::Live => self.live = None,
+                        Purpose::Control => self.control = None,
+                        Purpose::History => unreachable!(),
+                    }
+                }
+                return Ok(RetirementStep::Progress);
+            }
+            Slice::Source(done, next) => (done, next),
+            Slice::Publication(owner, wake) => {
+                // A foreground flow may suspend publication A while a freshly derived request B is
+                // its current scalar. Verifier cleanup for B correctly waits while A is publishing,
+                // but retirement must first select A when this same Flow still owns it. Otherwise
+                // B waits for A forever and the actor retains a room-busy Flow with no running
+                // worker. The task/replay stack is the exact ownership set; an unrelated owner's
+                // publication remains untouched and is retried after its own causal completion.
+                if let Some(owner) = owner.filter(|owner| *owner != request) {
+                    let owned = self.retirement_request == owner
+                        || self.tasks.iter().any(|task| task.request == owner)
+                        || self
+                            .replay
+                            .as_ref()
+                            .is_some_and(|task| task.request == owner);
+                    if owned {
+                        self.request = owner;
+                        self.cleanup_after = None;
+                        return Ok(RetirementStep::Progress);
+                    } else {
+                        // This retirement is causally blocked by one exact publication owner. The
+                        // controller runs that owner first and retries this flow from the owner's
+                        // completion, never from a wall-clock backoff.
+                        self.publication_owner_wait = Some(owner);
+                    }
+                }
+                return Ok(RetirementStep::Wait(RetirementWait::Publication { wake }));
+            }
+        };
+        self.cleanup_after = next;
+        if !done {
+            return Ok(RetirementStep::Progress);
         }
 
         // A foreground flow may suspend an older root while a freshly identified entry uses
@@ -1063,10 +1145,31 @@ impl Flow {
             .or_else(|| self.replay.as_ref().map(|task| task.request));
         if let Some(next) = next {
             self.request = next;
-            Ok(false)
+            Ok(RetirementStep::Progress)
         } else {
-            Ok(true)
+            Ok(RetirementStep::Done)
         }
+    }
+
+    /// Permanent cleanup faults wait only for actual key erasure (or explicit controller
+    /// recovery). Publication notifications while unlocked never retry a broken store.
+    pub(crate) fn retirement_erasure(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
+        let shared = Arc::clone(&self.shared);
+        Box::pin(async move {
+            loop {
+                let wake = {
+                    let room = shared.lock().await;
+                    let wake = room.history_publication_wake();
+                    if room.history_retirement_locked() {
+                        return;
+                    }
+                    wake
+                };
+                wake.await;
+            }
+        })
     }
 
     fn stage(&self, purpose: Purpose) -> Option<Staging> {

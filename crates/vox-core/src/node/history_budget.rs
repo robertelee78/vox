@@ -42,8 +42,6 @@ pub const BOUNDED_SYNC_RUNNING_SLOTS: usize = 2;
 /// One running bounded-sync quantum's product contract; proofs wait on this source-owned edge,
 /// never a copied timeout.
 pub const BOUNDED_ROUND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
-/// A failed bounded retirement slice remains owned and retries from its exact timer event.
-pub const RETIRE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) const FLOW_STATE_BYTES: usize = 128 * 1024;
 const CONTROL_TURNS_BEFORE_LIVE: usize = 3;
 const LIVE_GRANTS: usize = 64;
@@ -243,6 +241,8 @@ pub(crate) struct RetirementKey {
 pub(crate) struct RetirementEntry {
     pub(crate) flow: Arc<tokio::sync::Mutex<Option<crate::node::history_stream::runtime::Flow>>>,
     pub(crate) running: AtomicBool,
+    pub(crate) failed: AtomicBool,
+    pub(crate) recovery_changed: Arc<Notify>,
     pub(crate) task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 

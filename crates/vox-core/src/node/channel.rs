@@ -1282,6 +1282,8 @@ pub struct ChannelState {
     local_append_budget: Option<crate::log::history::LocalAppendBudget>,
     local_content_header: Option<(crate::log::history::EntryV2, Vec<Digest32>)>,
     local_history: Option<local_history::Prepared>,
+    /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
+    history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
     /// profile is new — and its earlier entries are with the other members. Writing before they
@@ -2098,6 +2100,7 @@ impl ChannelState {
             local_append_budget: None,
             local_content_header: None,
             local_history: None,
+            history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2807,6 +2810,7 @@ impl ChannelState {
             local_append_budget: None,
             local_content_header: None,
             local_history: None,
+            history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3072,6 +3076,7 @@ impl ChannelState {
             local_append_budget: None,
             local_content_header: None,
             local_history: None,
+            history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3961,6 +3966,7 @@ impl ChannelState {
                 batch.commit()?;
                 self.entries.committed();
                 if done {
+                    self.history_publication_changed.notify_waiters();
                     let read = self.entries.read(store, &self.sek, &self.channel_id)?;
                     self.dag.set_order_revision(
                         read.order_revision(),
@@ -10376,6 +10382,7 @@ impl ChannelState {
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {
         self.sek.lock_now();
+        self.history_publication_changed.notify_waiters();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel
         // can neither unseal nor answer a join until it is reopened (ADR-010/015).
         // `Zeroizing` wipes it as it drops.

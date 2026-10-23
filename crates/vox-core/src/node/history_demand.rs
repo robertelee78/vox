@@ -1295,3 +1295,53 @@ pub fn reclaim(context: &Context, request: RequestId, job: &Job) -> Result<bool>
     commit_context(batch, context)?;
     Ok(state.cleanup.is_none())
 }
+
+/// Retirement deletion only. The room owner first holds the room mutex and verifies its
+/// unlocked incarnation. Observer cancellation cannot revoke permission to delete this exact
+/// abandoned staging, but a replacement request/binding is always left untouched. This route
+/// cannot start/resume demand, admit entries, append bodies, acknowledge bytes or grant access.
+pub(crate) fn retire_staging(
+    context: &Context,
+    active: &mut Active,
+    _admission: &AdmissionCharge,
+    committed: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    let key = &context.key;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, key, &scope)? else {
+        return Ok(true);
+    };
+    if active.node != context.node
+        || active.scope != scope
+        || state.request != active.request
+        || state.binding != active.binding
+        || state.serial != active.serial
+    {
+        return Ok(true);
+    }
+    if state.progress.terminal() && state.cleanup.is_none() {
+        return Ok(true);
+    }
+    if !state.progress.terminal() {
+        state.serial = next_serial(state.serial)?;
+        state.progress = Progress::Cancelled;
+        schedule_cleanup(&mut state);
+    }
+    if let Some(mut cleanup) = state.cleanup {
+        let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+        for page in cleanup.next..=end {
+            batch.delete_segment(&scope, KIND, page)?;
+        }
+        cleanup.next = end + 1;
+        state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    }
+    put(&mut batch, key, &scope, &state)?;
+    batch.commit()?;
+    committed.store(true, std::sync::atomic::Ordering::Release);
+    // Keep only this retired deletion owner's serial current across bounded page slices.
+    // It remains invalid for all ordinary body/admission/ACK operations.
+    active.serial = state.serial;
+    active.valid = false;
+    Ok(state.cleanup.is_none())
+}
