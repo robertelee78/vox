@@ -22,6 +22,12 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stale-tick-authority]:'
     staging='[proof] FX-28 stale-tick-authority apparatus staged:'
     ;;
+  stale-join-authority)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 stale-join-authority]:'
+    staging='[proof] FX-28 stale-join-authority apparatus staged:'
+    ;;
   ready-fence-accepts-unsettled)
     mutant=$1
     journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
@@ -59,14 +65,15 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac
 
 artifact_dir=${VOX_FX28_MUTANT_ARTIFACTS:-target/fx28-mutants}
 mkdir -p "$artifact_dir"
-artifact="$artifact_dir/$mutant.log"
+run_dir=$(mktemp -d "$artifact_dir/$mutant.XXXXXXXX")
+artifact="$run_dir/proof.log"
 # The proof's pre-main isolation scrubs inherited product knobs. This is a proof-run setting;
 # its daemon helper explicitly maps it to VOX_TEST_FX28_MUTANT only on scratch product children.
 export VOX_MUTANT_FX28="$mutant"

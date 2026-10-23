@@ -33,6 +33,10 @@ pub(super) enum ComputerAuthority {
 
 impl ComputerAuthority {
     pub(super) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("stale-join-authority") {
+            return Some(publish());
+        }
         match self {
             Self::Unmanaged => Some(publish()),
             Self::Managed {

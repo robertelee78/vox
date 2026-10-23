@@ -5539,6 +5539,7 @@ fn rejected_join_records_leave_remote_board(
         join_engaged.is_file(),
         "APPARATUS: delta's join was not still held after durable policy moved"
     );
+    println!("[proof] FX-28 stale-join-authority apparatus staged: the responder serves both exact join records while delta's completed join remains held across durable Computer policy movement");
     board_forward.close();
     std::os::unix::net::UnixStream::connect(join_release).unwrap_or_else(|error| {
         panic!(
