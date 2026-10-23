@@ -4859,8 +4859,8 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             nodes.len()
         );
     }
-    // ---- one queued node applies or becomes non-attached without a late apparent pass -------
-    delayed_node_does_not_make_a_late_pass(
+    // ---- a late accepted actor completes without another user action -----------------------
+    delayed_node_completes_without_another_policy_action(
         (&a, &da, &nodes_a),
         (&b, &db, &nodes_b),
         &hold_arm,
@@ -6161,14 +6161,21 @@ fn stale_remote_pause_is_refused(
     let paused = pause
         .wait_with_output()
         .expect("APPARATUS: collect the causally released room-pause command");
+    let pause_stdout = String::from_utf8_lossy(&paused.stdout);
+    let acknowledged_saved_pause = pause_stdout.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|report| {
+            report["admitted"] == true && report["report"]["selection"]["state"]["paused"] == true
+        })
+    });
     assert!(
-        !paused.status.success(),
+        !paused.status.success() && !acknowledged_saved_pause,
         "PRODUCT [FX28 stale-tick-authority]: after durable Computer policy moved while its exact admitted remote pause was held, shipped `vox room pause` still published and acknowledged the stale drive mutation: stdout {}; stderr {}",
         String::from_utf8_lossy(&paused.stdout),
         String::from_utf8_lossy(&paused.stderr)
     );
     println!(
-        "[proof] after durable policy moved, releasing the exact admitted stale-authority publication made shipped `vox room pause` refuse it: {}",
+        "[proof] after durable policy moved, releasing the exact admitted stale-authority publication made shipped `vox room pause` refuse it: stdout {}; stderr {}",
+        pause_stdout.trim(),
         String::from_utf8_lossy(&paused.stderr).trim()
     );
     assert!(
@@ -6797,7 +6804,7 @@ fn stale_rekey_is_not_delivered(
 /// One node whose actor queue is held remains attached but must not claim the new trust projection;
 /// its healthy sibling applies the same revision inside the bound. The elapsed time is sampled
 /// after both computer statuses and both nodes' shipped trust views and `vox node list`.
-fn delayed_node_does_not_make_a_late_pass(
+fn delayed_node_completes_without_another_policy_action(
     (a, da, nodes_a): (&Account, &Daemon, &[(&str, &str)]),
     (b, db, _nodes_b): (&Account, &Daemon, &[(&str, &str)]),
     hold_arm: &Path,
@@ -6807,6 +6814,13 @@ fn delayed_node_does_not_make_a_late_pass(
 ) {
     let eta = a.make_node("eta");
     let b_id = computer_id(b);
+    let before_status_b = computer(b, &["status"]);
+    let prior_miss = before_status_b["application_misses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|record| record["node"] == "delta")
+        .cloned();
     let before_revision = computer(a, &["status"])["revision"].as_u64().unwrap_or(0);
     std::fs::write(hold_arm, b"hold delta's next policy message")
         .unwrap_or_else(|e| panic!("APPARATUS: could not stage the held delta marker: {e}"));
@@ -6943,21 +6957,47 @@ fn delayed_node_does_not_make_a_late_pass(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+    // Wait for the shipped status to acknowledge this local observation miss. The apparatus
+    // deliberately withholds the event; its release must not create a replacement policy action.
+    // Keep the original path-restoration return boundary throughout this claim.
+    let late_record = loop {
+        let status = computer(b, &["status"]);
+        let record = status["application_misses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|record| {
+                record["node"] == "delta"
+                    && record["revision"] == status["revision"]
+                    && prior_miss.as_ref() != Some(*record)
+            })
+            .cloned();
+        if let Some(record) = record {
+            assert!(
+                !roster_current(&status, &["delta"])
+                    && grant_words(b, "delta", &eta).is_none(),
+                "PRODUCT [FX28 late-application]: while its exact accepted event remained held, delta claimed the unapplied grant or current authority: {status}"
+            );
+            break record;
+        }
+        assert!(
+            Instant::now() < return_deadline,
+            "APPARATUS: the deliberately held local application exhausted the retained return boundary before shipped status exposed its local miss; status {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    println!(
+        "[proof] FX-28 late-application apparatus staged: delta remains attached and fail-closed while shipped status records its local observation miss {late_record}; releasing the accepted event causes no policy action"
+    );
     std::os::unix::net::UnixStream::connect(hold_release).unwrap_or_else(|e| {
         panic!(
             "APPARATUS: could not release delta's held computer-policy actor at {}: {e}",
             hold_release.display()
         )
     });
-    // Releasing a test-side hold is apparatus cleanup, not a new product cause or clock. Prefer
-    // the retained local deadline; if the green observation consumed it, a bounded cleanup
-    // watchdog remains APPARATUS and can never turn product green or red.
-    let cleanup_now = Instant::now();
-    let cleanup_deadline = if held_deadline > cleanup_now {
-        held_deadline
-    } else {
-        cleanup_now + CHANGE_SHOWN_WITHIN
-    };
+    // This watchdog diagnoses only the apparatus release acknowledgement. Product recovery below
+    // keeps the original return deadline, never a fresh five-second application clock.
+    let cleanup_deadline = held_deadline.max(Instant::now()) + CHANGE_SHOWN_WITHIN;
     while hold_engaged.is_file() {
         assert!(
             Instant::now() < cleanup_deadline,
@@ -6966,112 +7006,40 @@ fn delayed_node_does_not_make_a_late_pass(
         std::thread::yield_now();
     }
     forward.set_delay(Duration::ZERO);
-
-    // The held message owned the original local application deadline, and releasing it after
-    // that deadline must not invent a fresh clock. Exercise the actual recovery contract instead:
-    // a later shipped policy event reconciles the same still-attached actor. This is a PRODUCT
-    // claim, not stale-rekey apparatus staging.
-    let status_b = computer(b, &["status"]);
-    let local_computer = status_b["this_computer"]["fingerprint"]
-        .as_str()
-        .unwrap_or_default();
-    let personal = status_b["nodes"]
-        .as_array()
-        .and_then(|nodes| {
-            nodes.iter().find_map(|node| {
-                (node["computer"] == local_computer && node["personal"] == true)
-                    .then(|| node["name"].as_str())
-                    .flatten()
-            })
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: beta's shipped computer status names no current personal node: {status_b}"
-            )
+    loop {
+        let status = computer(b, &["status"]);
+        let ready = b.run(&["node", "list"], "").1.lines().any(|line| {
+            line.split_whitespace().next() == Some("delta") && line.starts_with("delta Ready")
         });
-    assert!(
-        personal == "beta" || personal == "delta",
-        "PRODUCT: beta's personal node is outside its attached beta/delta roster: {personal}; {status_b}"
-    );
-    let next_personal = if personal == "beta" { "delta" } else { "beta" };
-    let mut local_names: Vec<&str> = nodes_a.iter().map(|(name, _)| *name).collect();
-    local_names.push("eta");
-    let reconcile = |from: &str, to: &str| {
-        let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
-        let changed_at = Instant::now();
-        let local_deadline = changed_at + CHANGE_SHOWN_WITHIN;
-        let remote_deadline = changed_at + RETURN_WITHIN;
-        let changed = computer(b, &["personal", to]);
-        let revision = changed["revision"].as_u64().unwrap_or(0);
+        let grant = grant_words(b, "delta", &eta);
+        let current = roster_current(&status, &["beta", "delta"]);
+        if ready && current && grant.is_some() {
+            assert!(
+                status["application_misses"]
+                    .as_array()
+                    .is_some_and(|records| records.contains(&late_record)),
+                "PRODUCT [FX28 late-application]: completing the accepted late application erased its recorded miss: before {late_record}, after {status}"
+            );
+            assert!(
+                !status["pending_nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|pending| pending.starts_with("delta:")),
+                "PRODUCT [FX28 late-application]: delta became current and usable but remained reported pending: {status}"
+            );
+            break;
+        }
         assert!(
-            revision > before,
-            "PRODUCT: changing beta's personal node from {from} to {to} did not create the later policy event needed to reconcile its attached actor: before {before}, after {changed}"
+            Instant::now() < return_deadline,
+            "PRODUCT [FX28 late-application]: after releasing its accepted local application, delta did not become Ready/current with eta's grant inside the retained {RETURN_WITHIN:?} return boundary; no policy toggle, detach, unlock or restart was performed: ready {ready}, grant {grant:?}, status {status}\n{}",
+            db.said()
         );
-        loop {
-            let status = computer(b, &["status"]);
-            let delta_ready = b.run(&["node", "list"], "").1.lines().any(|line| {
-                line.split_whitespace().next() == Some("delta") && line.starts_with("delta Ready")
-            });
-            let delta_grant = grant_words(b, "delta", &eta);
-            let observed_at = Instant::now();
-            if status["revision"].as_u64() == Some(revision)
-                && roster_current(&status, &["beta", "delta"])
-                && delta_ready
-                && delta_grant.is_some()
-            {
-                assert!(
-                    observed_at <= local_deadline,
-                    "PRODUCT: beta first returned its attached delta actor Ready/current with eta's grant only after policy revision {revision}'s {CHANGE_SHOWN_WITHIN:?} local application boundary: status {status}"
-                );
-                break;
-            }
-            assert!(
-                observed_at < local_deadline,
-                "PRODUCT: {CHANGE_SHOWN_WITHIN:?} after beta's policy revision {revision}, the still-attached delta actor had not become Ready/current with eta's grant (ADR-038 FX-28): ready {delta_ready}, grant {delta_grant:?}, status {status}\n{}",
-                db.said()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        loop {
-            let status = computer(a, &["status"]);
-            let remote_personal: Vec<_> = status["nodes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|node| node["computer"] == b_id && node["personal"] == true)
-                .filter_map(|node| node["name"].as_str())
-                .collect();
-            let confirmed = status["applications"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|application| application["computer"]["fingerprint"] == b_id)
-                .is_some_and(|application| application["confirmed"] == true);
-            let observed_at = Instant::now();
-            if status["state"] == "confirmed"
-                && roster_current(&status, &local_names)
-                && confirmed
-                && remote_personal.as_slice() == [to]
-            {
-                assert!(
-                    observed_at <= remote_deadline,
-                    "PRODUCT: alpha first returned beta policy revision {revision}'s exact personal-node change only after its retained {RETURN_WITHIN:?} remote-return boundary: confirmed {confirmed}, remote personal {remote_personal:?}, status {status}"
-                );
-                break;
-            }
-            assert!(
-                observed_at < remote_deadline,
-                "PRODUCT: inside beta policy revision {revision}'s retained {RETURN_WITHIN:?} remote-return contract, alpha had not applied the change with every own binding current, beta confirmed, and beta's unique personal node changed to {to}: confirmed {confirmed}, remote personal {remote_personal:?}, status {status}\n{}",
-                da.said()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        revision
-    };
-    let healing_revision = reconcile(personal, next_personal);
-    let restored_revision = reconcile(next_personal, personal);
+        std::thread::sleep(Duration::from_millis(50));
+    }
     println!(
-        "[proof] beta's later shipped policy event reconciled the same still-attached delta actor at revision {healing_revision}; revision {restored_revision} restored its original personal-node authority before the next claim, and releasing the expired held message created no replacement clock"
+        "[proof] delta's accepted late application completed automatically: the same actor is Ready/current with eta's grant, pending cleared, and its historical miss retained; no policy toggle, detach, unlock or restart"
     );
 }
 
