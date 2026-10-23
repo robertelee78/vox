@@ -14,7 +14,8 @@
   2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict);
   amended 2026-10-23 (FX-28: atomic node application, durable room-admission rollback, fresh
   pairing requests, observation deadlines that do not discard valid work, and the rendezvous
-  registration handoff)
+  registration handoff); amended 2026-10-23 (FX-35: approved exact capacity per active-or-retiring
+  hosted identity, with no fixed floor)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -595,9 +596,11 @@ The decider then answered twelve questions, one at a time. His answers are the d
   newer than it served), a connection to its peer and no bounded-sync round running for that
   port; a flow is parked while it sits in `ready`, `deferred`, `retiring` or `cleanup` and no
   task runs it. The flow-state pool is shared by every hosted node, each charge is 128 KiB, and
-  its limit MUST be `max(16, 2 × currently hosted node identities)`. That limit meets or exceeds
-  the maximum legal running work because each hosted node MUST run at most two bounded-sync
-  rounds at once. Each running bounded-sync round MUST hold exactly one flow-state charge, and
+  its limit MUST be exactly `2 × active-or-retiring hosted node identities`, with no fixed or
+  minimum floor. Current and retiring generations of the same identity count once. Across those
+  generations each identity MUST run at most two bounded-sync rounds at once, so the pool exactly
+  covers the maximum legal running work. Each running round MUST hold exactly one flow-state
+  charge, and
   each held flow-state charge MUST be held by exactly one running bounded-sync round.
   Acquisition of the charge and the round's transition to running MUST be one atomic state
   transition for accounting and status; every transition out of running, by completion, failure
@@ -608,9 +611,12 @@ The decider then answered twelve questions, one at a time. His answers are the d
   MUST retain at most twelve flows in all across `ready`, `running`, `deferred`, `retiring` and
   `cleanup`.
 
-  There is no daemon-wide flow-state wait queue. A failure to reserve flow state is an impossible
-  invariant violation under the legal running-work limit above. If it nevertheless occurs, the
-  daemon MUST retain that exact `Flow` as an event-owned continuation, release every worker,
+  The node actor retains parked `Flow` work; the daemon-wide pool retains only its admission-order
+  metadata. Exhausting one identity's two running positions is the legitimate
+  `flow_state_node_busy` refusal. A global `flow_state_pool_full` refusal is an impossible invariant
+  violation under the legal running-work limit above, and MUST NOT replace node-busy. If it
+  nevertheless occurs, the daemon MUST retain that exact `Flow` as an event-owned continuation,
+  release every worker,
   byte, room, lane-job, live-flow, outbound-slot and flow-state reservation the failed attempt
   acquired, and record its eligibility in monotonically increasing order. The exact transition
   of a running round out of `running` that releases a charge MUST select and wake the earliest
@@ -635,8 +641,9 @@ The decider then answered twelve questions, one at a time. His answers are the d
   be taken without waiting), `archive_budget_busy` (an archive port only: the archive-lane job
   could not be reserved), `control_budget_busy` (the control-lane job could not be reserved),
   `live_lane_busy` (the node's live flow slot holds another flow), `no_outbound_slot` (the
-  outbound slot could not be taken) and `flow_state_pool_full` (every charge of the pool is held
-  by a running round); and the boolean `round_running`, true while a bounded-sync round of that
+  outbound slot could not be taken), `flow_state_node_busy` (the identity's two running positions
+  are occupied across its current and retiring generations), and `flow_state_pool_full` (every
+  daemon-pool position is occupied by a running charge or an earlier release-edge grant); and the boolean `round_running`, true while a bounded-sync round of that
   port runs. It MUST report the pool under `lanes.budget.flow_state` as the integers `in_use`
   and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by
   that node's node ID, whose value is that node's integer in-use count; the member values MUST
@@ -656,6 +663,12 @@ The decider then answered twelve questions, one at a time. His answers are the d
   pool full (16 of 16) by the first fifth of the run with 1,951 flows started before and none
   after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The product
   said only the symptom. "please make vox work"; "be methodical" (the decider, 2026-10-21).
+  > **Decision amendment (the decider, 2026-10-23).** The pool limit is exactly
+  > `2 × active-or-retiring hosted node identities`, with no fixed or minimum floor; generations
+  > of one identity share its two running positions. Parked work retains its exact actor-owned
+  > `Flow` but no worker, byte charge, outbound slot or flow-state charge. This replaces the
+  > earlier `max(16, 2 × hosted identities)` formula; the causal release and retention requirements
+  > above remain. Historical 16-of-16 measurements describe the defect, not the capacity policy.
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
