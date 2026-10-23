@@ -13561,15 +13561,21 @@ impl Node {
     }
 
     /// Mark where every open room's sender key stands at `fingerprint`'s trust decision, drawn by
-    /// [`Self::draw_trust_stamp`] (V210-45).
+    /// [`Self::draw_trust_stamp`] (V210-45). Returns `Ok(false)` when the captured Computer policy
+    /// moved before the all-room commit; nothing was written or installed, and the current policy
+    /// pass must retry.
     async fn mark_trust_decision(
         &mut self,
         fingerprint: Digest32,
         decision: crate::node::consent_order::Stamp,
-    ) {
-        let Some(profile) = self.profile.as_ref() else {
-            return;
+    ) -> crate::error::Result<bool> {
+        // Capture the exact projection before any await. The final synchronous commit revalidates
+        // this same token; a policy which moves while rooms are being sealed cannot authorize its
+        // predecessor's marks.
+        let Some(authority) = self.computer_authority() else {
+            return Ok(false);
         };
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
         let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
         // **One commit for every room** (#189): each room marks and seals under its own lock,
         // and the write happens once, after, with no room's lock held. A commit per room made
@@ -13577,44 +13583,55 @@ impl Node {
         // 1,600 rooms. The write transaction is never held while awaiting a room's lock: a sync
         // holds a room's lock while it waits for a write transaction, so that order would
         // deadlock. Nothing else on the actor runs between the seals and the commit, and nothing
-        // off it writes a room's marks, so no newer marks can be overwritten by these.
-        let mut sealed: Vec<(SharedChannel, Digest32, crate::atrest::store::SealedSegment)> =
-            Vec::new();
+        // off it writes a room's marks, so no newer marks can be overwritten by these. Sealing is
+        // non-mutating: live marks remain exactly aligned with the store until the batch commits.
+        let mut sealed = Vec::new();
         for ch in shared {
-            let (seg, id) = {
-                let mut room = ch.lock().await;
-                (
-                    room.mark_trust_sealed(fingerprint, decision),
-                    room.channel_id(),
-                )
+            let (prepared, id) = {
+                let room = ch.lock().await;
+                let id = room.channel_id();
+                let prepared = match room.mark_trust_sealed(fingerprint, decision) {
+                    Ok(prepared) => prepared,
+                    // Preparation has not changed memory or storage. Match the single-room path:
+                    // only a failed durable write poisons a room.
+                    Err(error) => return Err(error),
+                };
+                (prepared, id)
             };
-            if let Ok(Some(seg)) = seg {
-                sealed.push((ch, id, seg));
+            if let Some(prepared) = prepared {
+                sealed.push((ch, id, prepared));
             }
         }
         if sealed.is_empty() {
-            return;
+            // This no-op is still the caller's final Computer-policy fence. A policy move while
+            // the rooms were inspected must restart the causal pass just like a refused write.
+            return Ok(authority.current());
         }
-        let written = self
-            .computer_authority()
-            .and_then(|authority| {
-                authority.publish(|| -> crate::error::Result<()> {
-                    let mut batch = profile.store().batch()?;
-                    for (_, id, seg) in &sealed {
-                        ChannelState::queue_marks(&mut batch, id, seg)?;
-                    }
-                    batch.commit()
-                })
-            })
-            .unwrap_or(Err(Error::Profile(
-                "computer policy changed before the room mutation",
-            )));
-        if let Err(e) = written {
-            // As a failed per-room write always did: memory is ahead of the store.
-            for (ch, _, _) in sealed {
-                ch.lock().await.poison(&e);
+        let Some(written) = authority.publish(|| -> crate::error::Result<()> {
+            let mut batch = profile.store().batch()?;
+            for (_, id, prepared) in &sealed {
+                ChannelState::queue_marks(&mut batch, id, prepared)?;
             }
+            batch.commit()
+        }) else {
+            // An expected policy supersession is not a room/storage failure. Preparation changed
+            // no live state, so the current causal policy pass can retry without rollback.
+            return Ok(false);
+        };
+        if let Err(error) = written {
+            // A real storage failure has the same fail-closed result as the former per-room write.
+            for (ch, _, _) in sealed {
+                ch.lock().await.poison(&error);
+            }
+            return Err(error);
         }
+        // The durable batch now owns these exact positions. Install them even if Computer policy
+        // moves after the commit: skipping installation would put memory behind its committed
+        // segment. No other actor work can prepare a newer mark while this method is running.
+        for (ch, _, prepared) in sealed {
+            ch.lock().await.install_trust_mark(prepared);
+        }
+        Ok(true)
     }
 
     /// Drop, in a room just opened, every sender key held from a member this owner does not trust
@@ -13776,7 +13793,11 @@ impl Node {
             // the same decision and keeps its place. Nothing else runs on the actor in between,
             // so no post is sealed between the place and the marks. A failure here narrows what
             // the member will read and never widens it, so it does not undo the trust.
-            self.mark_trust_decision(fingerprint, decision).await;
+            match self.mark_trust_decision(fingerprint, decision).await {
+                Ok(true) => {}
+                Ok(false) => return Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => return Outcome::Failed(fault_of(&error)),
+            }
         }
         // A member may have been admitted while it was not trusted and missed the earlier live
         // capability record. Publish a fresh signed record when local trust starts or widens the

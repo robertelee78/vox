@@ -901,7 +901,9 @@ impl Node {
             self.owe_private_support_in_open_rooms().await;
             Self::computer_policy_active(deadline, cancelled)?;
             for (id, stamp) in application.changes {
-                self.mark_trust_decision(id, stamp).await;
+                if !self.mark_trust_decision(id, stamp).await? {
+                    continue 'policy;
+                }
                 Self::computer_policy_active(deadline, cancelled)?;
             }
             // The existing room machinery performs pending removals, sender-key rotation, and

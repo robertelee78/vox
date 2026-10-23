@@ -464,6 +464,15 @@ const MARKS_VERSION: u64 = 2;
 /// A trust mark: the decision's stamp, and where this identity's sender key stood at it.
 type TrustMark = (Stamp, u64, u64);
 
+/// One trust-mark segment prepared without changing the room's live projection. The caller writes
+/// the sealed segment first, then installs the corresponding in-memory mark with
+/// [`ChannelState::install_trust_mark`].
+pub struct PreparedTrustMark {
+    target: Digest32,
+    position: TrustMark,
+    sealed: SealedSegment,
+}
+
 /// How long a superseded generation of this identity's sender key is kept for a trusted
 /// identity that has not joined, in a room kept forever (PRD-001 R14): 30 days. A room with a
 /// retention keeps it for that instead ([`ChannelState::unjoined_hold_secs`]).
@@ -4740,38 +4749,41 @@ impl ChannelState {
     pub fn mark_trust(&mut self, store: &Store, target: Digest32, decision: Stamp) -> Result<()> {
         match self.mark_trust_sealed(target, decision)? {
             None => Ok(()),
-            Some(seg) => {
+            Some(prepared) => {
                 if let Err(e) = store.put_segment(
                     &self.channel_id,
                     SegmentKind::KeyMaterial,
                     SEG_TRUST_MARKS,
-                    &seg,
+                    &prepared.sealed,
                 ) {
                     self.poisoned = true;
                     self.save_error = Some(e.to_string());
                     return Err(e);
                 }
+                self.install_trust_mark(prepared);
                 Ok(())
             }
         }
     }
 
-    /// [`Self::mark_trust`] without writing: the marks, sealed under this room's SEK, for the
-    /// caller to write with every other room's in **one** commit ([`Self::queue_marks`]), or
-    /// `None` when this room already holds the mark.
+    /// [`Self::mark_trust`] without writing or changing this room's live marks: the next marks,
+    /// sealed under this room's SEK, for the caller to write with every other room's in **one**
+    /// commit ([`Self::queue_marks`]), or `None` when this room already holds the mark. The caller
+    /// installs the prepared mark only after that commit succeeds.
     ///
     /// A trust decision marks every open room, and one commit per room made `vox trust add` cost
-    /// a durable commit for each: about 7 s on the node's actor at 1,600 rooms (#189). If the
-    /// caller's commit fails, it must [`Self::poison`] each room it sealed for, as a failed
-    /// write here always has.
+    /// a durable commit for each: about 7 s on the node's actor at 1,600 rooms (#189). A caller
+    /// whose real storage commit fails must [`Self::poison`] each room it sealed for, as a failed
+    /// write here always has. Refusal by an external policy fence writes nothing and is not room
+    /// corruption.
     ///
     /// # Errors
     /// The room holds [`AUTHORS_HARD_LIMIT`] marks already, or the marks cannot be sealed.
     pub fn mark_trust_sealed(
-        &mut self,
+        &self,
         target: Digest32,
         decision: Stamp,
-    ) -> Result<Option<SealedSegment>> {
+    ) -> Result<Option<PreparedTrustMark>> {
         if self
             .trust_marks
             .get(&target)
@@ -4787,9 +4799,22 @@ impl ChannelState {
             self.sender.chain_id(),
             self.sender.current_position().0,
         );
-        self.trust_marks.insert(target, position);
-        let bytes = marks_bytes(&self.trust_marks);
-        seal_segment(&self.sek, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, &bytes).map(Some)
+        let mut next = self.trust_marks.clone();
+        next.insert(target, position);
+        let bytes = marks_bytes(&next);
+        let sealed = seal_segment(&self.sek, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, &bytes)?;
+        Ok(Some(PreparedTrustMark {
+            target,
+            position,
+            sealed,
+        }))
+    }
+
+    /// Install exactly the mark whose sealed segment committed successfully. No other task writes
+    /// trust marks: the node actor serializes their preparation and installation, while room work
+    /// may hold the room lock without changing this projection.
+    pub fn install_trust_mark(&mut self, prepared: PreparedTrustMark) {
+        self.trust_marks.insert(prepared.target, prepared.position);
     }
 
     /// Queue `channel_id`'s sealed marks ([`Self::mark_trust_sealed`]) into `batch`.
@@ -4799,9 +4824,14 @@ impl ChannelState {
     pub fn queue_marks(
         batch: &mut crate::node::store::Batch<'_>,
         channel_id: &Digest32,
-        seg: &SealedSegment,
+        prepared: &PreparedTrustMark,
     ) -> Result<()> {
-        batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, seg)
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_TRUST_MARKS,
+            &prepared.sealed,
+        )
     }
 
     /// Mark this room poisoned after a real storage or consistency failure.
