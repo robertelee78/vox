@@ -28,6 +28,12 @@ case "${1-}" in
     verdict='PRODUCT [FX28 fresh-preview-boundary]:'
     staging='[proof] FX-28 fresh-preview-boundary apparatus staged:'
     ;;
+  detach-keeps-reconciliation)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 detach-reconciliation]:'
+    staging='[proof] FX-28 detach-reconciliation apparatus staged:'
+    ;;
   late-application-abandons-work)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
@@ -77,7 +83,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|fresh-preview-inherits-old-deadline|late-application-abandons-work|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac

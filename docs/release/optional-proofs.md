@@ -161,10 +161,10 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's twelve executable mutants are run one at a time with
+FX-28's thirteen executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `stale-tick-authority`, `stale-join-authority`,
-`fresh-preview-inherits-old-deadline`, `late-application-abandons-work`,
+`fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
 `ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
 `stale-trust-projection`, `stale-rekey-authority`, or
 `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
@@ -205,6 +205,11 @@ not acknowledge ordinary delivery. `late-application-abandons-work` drops only t
 causally held past its observation boundary. The journey requires that same revision to become
 current and usable after release without a role toggle, detach, unlock or restart, while its
 historical miss remains visible. Its return boundary stays fixed throughout the observation.
+`detach-keeps-reconciliation` retains the departing actor's owned flight and live pending row.
+The existing replacement journey first observes that exact public pending result and miss, then
+requires same-policy reattachment to clear live pending status and confirm its actual grant while
+retaining history. Its existing delayed-reply interval stages the race; failure to stage it is
+APPARATUS and cannot count as a product or mutant verdict.
 
 Startup derives the actual current binding and settles its exact application before the
 state-locked Ready publication. Genuine policy movement continues the same accepted operation;
