@@ -16,6 +16,24 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stopped-reader-write]:'
     staging='[proof] FX-28 stopped-reader apparatus staged:'
     ;;
+  lock-through-computer-write)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 status-during-write]:'
+    staging='[proof] FX-28 status-during-write apparatus staged:'
+    ;;
+  deadline-as-storage-failure)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 deadline-as-storage-failure]:'
+    staging='[proof] FX-28 deadline-as-storage-failure apparatus staged:'
+    ;;
+  withdrawal-not-durable)
+    mutant=$1
+    journey=two_paired_computers_that_are_idle_exchange_nothing
+    verdict='PRODUCT [FX28 withdrawal-not-durable]:'
+    staging='[proof] FX-28 withdrawal-not-durable apparatus staged:'
+    ;;
   stale-tick-authority)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
@@ -101,7 +119,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|lock-through-computer-write|deadline-as-storage-failure|withdrawal-not-durable|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|due-backoff-drops-causal-cause|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac

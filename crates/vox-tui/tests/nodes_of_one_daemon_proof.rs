@@ -5256,14 +5256,14 @@ fn computer_write_expiry_keeps_status_live(
     engaged: &Path,
     release: &Path,
 ) {
-    for stale in [engaged, release] {
+    let finished = engaged.with_extension("finished");
+    for stale in [engaged, release, &finished] {
         let _ = std::fs::remove_file(stale);
     }
-    std::fs::write(arm, b"hold the next remote Computer state commit\n")
-        .expect("APPARATUS: arm the durable Computer-state commit hold");
     let a_id = computer_id(a);
     let before_b = computer(b, &["status"]);
-    let changed = Instant::now();
+    std::fs::write(arm, b"hold the next remote Computer state commit\n")
+        .expect("APPARATUS: arm the durable Computer-state commit hold");
     computer(a, &["personal", "gamma"]);
     let marker = read_daemon_marker(
         engaged,
@@ -5274,10 +5274,83 @@ fn computer_write_expiry_keeps_status_live(
         marker.contains("computer state commit held"),
         "APPARATUS: durable-write marker did not name its boundary: {marker}"
     );
+    let remaining_ns = marker
+        .trim()
+        .strip_prefix("computer state commit held\tremaining_ns=")
+        .and_then(|remaining| remaining.parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            panic!("APPARATUS: durable-write marker did not name its exact remaining deadline: {marker}")
+        });
+    // The source captured its owned deadline before publishing the marker. Reading that marker and
+    // then retaining its full remaining duration is a conservative upper end: publication/read
+    // latency can only make this proof release later, never before the actual deadline.
+    let write_deadline_upper = Instant::now() + Duration::from_nanos(remaining_ns);
 
-    // This command is the product observation. Under the lock-through-write mutant it wedges on
-    // the parked filesystem work and Account::run names that exact PRODUCT liveness failure.
-    let during = computer(b, &["status"]);
+    println!(
+        "[proof] FX-28 status-during-write apparatus staged: the exact durable Computer write is parked before filesystem work while status must read the last committed revision"
+    );
+    // This shipped command is the product observation. The deliberately faulty build holds the
+    // Computer state lock across this exact parked write. Use the product's existing actor-liveness
+    // contract, then release the apparatus before reporting the red so no proof process is leaked.
+    let status_started = Instant::now();
+    let status_deadline = status_started + ACTOR_WITHIN;
+    let mut status = b
+        .cmd(&["computer", "status", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start shipped status during held Computer write");
+    loop {
+        let observation_started = Instant::now();
+        if status
+            .try_wait()
+            .expect("APPARATUS: inspect shipped status during held Computer write")
+            .is_some()
+        {
+            if Instant::now() > status_deadline {
+                let _ = std::os::unix::net::UnixStream::connect(release);
+                let output = status
+                    .wait_with_output()
+                    .expect("APPARATUS: collect boundary-crossing shipped status");
+                panic!(
+                    "APPARATUS: shipped status completion was first observed across its actor-liveness boundary, so this polling sample cannot attribute a PRODUCT timing verdict; stdout {}; stderr {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            break;
+        }
+        if observation_started >= status_deadline {
+            let _ = std::os::unix::net::UnixStream::connect(release);
+            let _ = status.kill();
+            let output = status
+                .wait_with_output()
+                .expect("APPARATUS: collect wedged shipped status");
+            panic!(
+                "PRODUCT [FX28 status-during-write]: shipped `vox computer status` remained blocked for its source-owned {ACTOR_WITHIN:?} actor-liveness contract while the exact durable Computer write was parked; stdout {}; stderr {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = status
+        .wait_with_output()
+        .expect("APPARATUS: collect shipped status during held Computer write");
+    assert!(
+        output.status.success(),
+        "PRODUCT [FX28 status-during-write]: shipped `vox computer status` failed while the exact durable Computer write was parked: stdout {}; stderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let during: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "PRODUCT [FX28 status-during-write]: shipped `vox computer status` returned unreadable JSON while the exact durable Computer write was parked: {error}; stdout {}; stderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
     assert_eq!(
         during["revision"], before_b["revision"],
         "PRODUCT [FX28 status-during-write]: shipped status exposed an uncommitted Computer revision while its durable write was parked: before {before_b}; during {during}"
@@ -5288,13 +5361,26 @@ fn computer_write_expiry_keeps_status_live(
 
     // The clock belongs to the change made above. Waiting to that exported boundary stages a
     // causal refusal; it is not the verdict and does not give a wedged command permission to pass.
-    std::thread::sleep(RETURN_WITHIN.saturating_sub(changed.elapsed()));
+    std::thread::sleep(write_deadline_upper.saturating_duration_since(Instant::now()));
+    println!(
+        "[proof] FX-28 deadline-as-storage-failure apparatus staged: the exact Computer replacement remained parked through its original causal boundary before pre-rename release"
+    );
     std::os::unix::net::UnixStream::connect(release).unwrap_or_else(|error| {
         panic!(
             "APPARATUS: release the held Computer-state commit at {}: {error}",
             release.display()
         )
     });
+    let commit_outcome = read_daemon_marker(
+        &finished,
+        db.child.id(),
+        "the exact released Computer-state commit outcome",
+    );
+    assert!(
+        commit_outcome.contains("computer state commit refused:")
+            && commit_outcome.contains("causal convergence deadline"),
+        "APPARATUS: the released Computer-state write did not report the staged pre-rename causal refusal: {commit_outcome}"
+    );
     let after = computer(b, &["status"]);
     assert!(
         after["state"] != "quarantined"
@@ -5738,6 +5824,9 @@ fn rejected_join_records_leave_remote_board(
         "APPARATUS: after the answering board's exact path reopened while beta was stopped, it did not still expose both accepted stale join records, so durable withdrawal recovery cannot be measured; member {}, bundle {}",
         still_exposed.0,
         still_exposed.1
+    );
+    println!(
+        "[proof] FX-28 withdrawal-not-durable apparatus staged: after the refused join and with beta stopped, the reopened responder board still exposes both exact accepted records"
     );
 
     let rotate_after_post_spec = b

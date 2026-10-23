@@ -161,9 +161,10 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's sixteen executable mutants are run one at a time with
+FX-28's nineteen executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
-`preview-approval-not-durable`, `stopped-reader-fresh-write`, `stale-tick-authority`, `stale-join-authority`,
+`preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
+`deadline-as-storage-failure`, `withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
 `fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
 `redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
 `due-backoff-drops-causal-cause`,
@@ -173,7 +174,13 @@ FX-28's sixteen executable mutants are run one at a time with
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
 not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
 authenticated peer which fills the other daemon's bounded management slots and leaves every
-response unread. `ready-fence-accepts-unsettled` bypasses only the daemon's final state-locked
+response unread. `lock-through-computer-write` restores the former state lock across an exact held
+durable Computer write; shipped status must still answer with the last committed revision inside
+its existing actor-liveness contract. `deadline-as-storage-failure` turns an exact pre-rename
+causal refusal into permanent storage quarantine again. `withdrawal-not-durable` omits the refused
+join's prepared and pending board-withdrawal journals; after the responder path reopens with the
+joining daemon stopped, restart must still remove both exact accepted records from that real board.
+`ready-fence-accepts-unsettled` bypasses only the daemon's final state-locked
 publication fence after a successful receipt. A later real operator change supersedes that
 receipt while startup is held; the mutant exposes the stale or held-back projection instead of
 the current personal role and exact managed/manual grants. `stale-post-authority` bypasses the durable-policy fence around an

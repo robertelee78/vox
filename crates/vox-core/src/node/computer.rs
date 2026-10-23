@@ -54,36 +54,62 @@ pub(crate) fn fx28_mutant(named: &str) -> bool {
 
 /// Test apparatus: park one exact Computer-state commit after its replacement snapshot is ready
 /// and before any filesystem work. `<arm>\t<engaged>\t<release socket>`; removing `arm` selects
-/// one write, `engaged` proves it reached the boundary, and one local connection releases it.
-/// The release binary contains none of these names or behavior.
+/// one write, `engaged` names the exact remaining source-owned deadline, and one local connection
+/// releases it. The derived `finished` marker publishes only after save classification. The release
+/// binary contains none of these names or behavior.
 #[cfg(feature = "test-knobs")]
-fn hold_state_commit_for_proof() {
+fn hold_state_commit_for_proof(deadline: Option<std::time::Instant>) -> Option<std::path::PathBuf> {
     let Ok(spec) = std::env::var("VOX_TEST_HOLD_COMPUTER_STATE_COMMIT") else {
-        return;
+        return None;
     };
     let mut fields = spec.splitn(3, '\t');
     let (Some(arm), Some(engaged), Some(release)) = (fields.next(), fields.next(), fields.next())
     else {
-        return;
+        return None;
     };
     if std::fs::remove_file(arm).is_err() {
-        return;
+        return None;
     }
+    let finished = std::path::Path::new(engaged).with_extension("finished");
+    let _ = std::fs::remove_file(&finished);
     let _ = std::fs::remove_file(release);
     let Ok(listener) = std::os::unix::net::UnixListener::bind(release) else {
-        return;
+        return None;
     };
+    let remaining_ns = deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_nanos()
+        })
+        .unwrap_or(0);
     if publish_proof_marker(
         std::path::Path::new(engaged),
-        b"computer state commit held\n",
+        format!("computer state commit held\tremaining_ns={remaining_ns}\n").as_bytes(),
     )
     .is_err()
     {
-        return;
+        return None;
     }
     let _ = listener.accept();
     let _ = std::fs::remove_file(engaged);
     let _ = std::fs::remove_file(release);
+    Some(finished)
+}
+
+#[cfg(feature = "test-knobs")]
+fn finish_state_commit_for_proof(
+    marker: Option<&std::path::Path>,
+    outcome: &str,
+    storage_failed: bool,
+) {
+    let Some(marker) = marker else {
+        return;
+    };
+    let _ = publish_proof_marker(
+        marker,
+        format!("computer state commit {outcome}; storage_failed={storage_failed}\n").as_bytes(),
+    );
 }
 
 /// Publish a populated proof marker in one namespace operation, without replacing an existing
@@ -3922,14 +3948,14 @@ impl Computer {
                     .store(true, std::sync::atomic::Ordering::Release);
             }
             #[cfg(feature = "test-knobs")]
-            hold_state_commit_for_proof();
-            #[cfg(feature = "test-knobs")]
             let mutant_state_guard =
                 fx28_mutant("lock-through-computer-write").then(|| lock(&self.state));
             let deadline = match boundary {
                 ComputerChangeBoundary::Deadline(deadline) => Some(deadline),
                 ComputerChangeBoundary::Current(_) => None,
             };
+            #[cfg(feature = "test-knobs")]
+            let state_commit_marker = hold_state_commit_for_proof(deadline);
             let saved = self.save_before(&next, deadline);
             #[cfg(feature = "test-knobs")]
             drop(mutant_state_guard);
@@ -3948,6 +3974,13 @@ impl Computer {
                 }
                 self.authority_blocked
                     .store(false, std::sync::atomic::Ordering::Release);
+                #[cfg(feature = "test-knobs")]
+                finish_state_commit_for_proof(
+                    state_commit_marker.as_deref(),
+                    &format!("refused: {error}"),
+                    self.storage_failed
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
                 return Err(error);
             }
             let committed_late =
@@ -3959,6 +3992,13 @@ impl Computer {
             *published = next;
             self.authority_blocked
                 .store(false, std::sync::atomic::Ordering::Release);
+            #[cfg(feature = "test-knobs")]
+            finish_state_commit_for_proof(
+                state_commit_marker.as_deref(),
+                "saved",
+                self.storage_failed
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
             let _ = self.journal_changed.send(());
             if committed_late {
                 self.invalidate_reachers();
