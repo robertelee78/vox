@@ -1162,11 +1162,16 @@ impl RendezvousService {
                 use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
                 let w =
                     BoardWithdraw::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                // A withdrawal is permanent negative state, so a rejected future-dated pre-join
+                // must not return after a crash as a future tombstone which blocks a corrected
+                // join. Check before both the authenticated and pending-withdraw paths mutate.
+                crate::nat::store::check_clock_sanity(w.timestamp_ms, now)
+                    .map_err(|e| RejectReason::for_error(&e))?;
                 let mut store = lock(&self.store);
                 let key = match w.scope {
-                    WithdrawScope::Member => {
-                        self.known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
-                    }
+                    WithdrawScope::Member => self
+                        .known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
+                        .or_else(|| store.prejoin_key(&w.channel_id, &w.author_id, now).cloned()),
                     // The creator, or a member its current roster names: an admin whose admin
                     // was taken back is refused.
                     WithdrawScope::Room => {
