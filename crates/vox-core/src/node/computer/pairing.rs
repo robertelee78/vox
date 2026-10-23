@@ -3535,19 +3535,25 @@ impl Management {
                 return;
             }
             let marker = std::path::Path::new(engaged);
+            if let Err(error) = std::fs::remove_file(arm) {
+                super::publish_proof_fault(
+                    &marker.with_extension("fault"),
+                    &format!("claim exact first flight arm: {error}"),
+                );
+                return;
+            }
+            if flight.deadline <= std::time::Instant::now() {
+                super::publish_proof_fault(
+                    &marker.with_extension("fault"),
+                    "first flight reached its owned deadline while claiming the apparatus arm",
+                );
+                return;
+            }
             let body = format!("{}\t{serial}\t{}", text_id(&peer), flight.policy_revision);
             if let Err(error) = super::publish_proof_marker(marker, body.as_bytes()) {
                 super::publish_proof_fault(
                     &marker.with_extension("fault"),
                     &format!("mark exact first flight: {error}"),
-                );
-                return;
-            }
-            if let Err(error) = std::fs::remove_file(arm) {
-                let _ = std::fs::remove_file(marker);
-                super::publish_proof_fault(
-                    &marker.with_extension("fault"),
-                    &format!("claim exact first flight arm: {error}"),
                 );
                 return;
             }

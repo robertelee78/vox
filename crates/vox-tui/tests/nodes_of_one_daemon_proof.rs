@@ -444,6 +444,10 @@ fn wait_for_daemon_marker(marker: &Path, daemon: &mut Daemon, deadline: Instant,
             panic!("APPARATUS: {what}: {fault}");
         }
         if marker.is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: {what} was observed only after its retained staging boundary"
+            );
             return;
         }
         if let Some(status) = daemon
