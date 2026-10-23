@@ -2778,15 +2778,23 @@ impl NodeNet {
     ///
     /// `passphrase` is collected out of band by the client — never from the invite
     /// link (ADR-016).
-    pub async fn start_join(
+    /// The preparation callback must durably retain rollback covering the exact verified
+    /// proposal's epoch and timestamp before it returns: admission cannot commit until that handoff.
+    #[allow(clippy::too_many_arguments)] // authenticated exchange plus durable preparation
+    pub async fn start_join<F, Fut>(
         &self,
         conn: &VoxConnection,
         ctx: JoinContext,
         passphrase: &[u8],
         signer: &(dyn RootSigner + Send + Sync),
         ik: &X25519IdentityKey,
-    ) -> Result<JoinOutcome> {
-        run_initiator(conn, ctx, passphrase, signer, ik).await
+        prepare_before_admission: F,
+    ) -> Result<JoinOutcome>
+    where
+        F: FnOnce(crate::node::joinstream::AdmissionProposal) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        run_initiator(conn, ctx, passphrase, signer, ik, prepare_before_admission).await
     }
 
     /// Read everything the board holds for `(channel_id, epoch)`: the genesis, the

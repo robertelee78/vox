@@ -3254,14 +3254,27 @@ impl Joiner {
     /// identity remotely visible. The actor serializes the public recovery journal; a crash,
     /// failed seal or policy refusal can then withdraw without needing a stored room key.
     async fn retain_board_cleanup(&self, board: &Arc<VoxConnection>) -> Result<(), JoinerLost> {
+        self.retain_board_cleanup_at(board, 0, self.now)
+            .await
+            .map_err(|error| JoinerLost::of(fault_of(&error)))
+    }
+
+    /// Complete the durable actor handoff before the join protocol acknowledges a proposed
+    /// admission. The signed Member withdrawal covers the actual witness epoch and timestamp,
+    /// even if the responder's clock is later than this joiner's starting clock.
+    async fn retain_board_cleanup_at(
+        &self,
+        board: &Arc<VoxConnection>,
+        epoch: u64,
+        timestamp_ms: u64,
+    ) -> crate::error::Result<()> {
         let withdrawal = crate::nat::withdraw::BoardWithdraw::build(
             self.signer.as_ref(),
             &self.parsed.channel_id,
-            0,
+            epoch,
             crate::nat::withdraw::WithdrawScope::Member,
-            self.now,
-        )
-        .map_err(|error| JoinerLost::of(fault_of(&error)))?
+            timestamp_ms.max(self.now),
+        )?
         .to_wire();
         let (ack, received) = oneshot::channel();
         self.tx
@@ -3273,11 +3286,8 @@ impl Joiner {
                 ack,
             })
             .await
-            .map_err(|_| JoinerLost::of(Fault::Locked))?;
-        received
-            .await
-            .map_err(|_| JoinerLost::of(Fault::Locked))?
-            .map_err(|error| JoinerLost::of(fault_of(&error)))
+            .map_err(|_| Error::AtRestLocked)?;
+        received.await.map_err(|_| Error::AtRestLocked)?
     }
 
     /// An answered refusal proves this exact announcement published nothing. Remove its route
@@ -4013,7 +4023,9 @@ impl Joiner {
                  the member's answer)"
             ));
             let exchanged = net
-                .start_join(&conn, ctx, &self.passphrase, signer, &ik)
+                .start_join(&conn, ctx, &self.passphrase, signer, &ik, |proposal| {
+                    self.retain_board_cleanup_at(&conn, proposal.epoch, proposal.timestamp_ms)
+                })
                 .await;
             // **The solve apart from the rest** (V210-62): the proof of work is this machine's
             // own CPU and random in length by design, the rest is waiting on the responder. One
@@ -19043,7 +19055,7 @@ impl Node {
             routes: BTreeMap::new(),
         });
         let prior = crate::nat::withdraw::BoardWithdraw::from_wire(&pending.wire)?;
-        if withdrawal.timestamp_ms > prior.timestamp_ms {
+        if withdrawal.timestamp_ms >= prior.timestamp_ms {
             pending.wire = wire;
         }
         let route = board.quinn().remote_address();
