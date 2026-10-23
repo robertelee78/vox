@@ -306,8 +306,17 @@ fn begin_detach(
             // Drop the exact owned flight now so its guard cannot keep publishing while detach
             // waits for other work. This same slot lock fences every pending-result writer and
             // prevents a replacement attachment from acquiring status that we could erase.
-            drop(a.computer_reconciliation.take());
-            management.node_detached(node.as_str());
+            #[cfg(feature = "test-knobs")]
+            let keep_reconciliation = a.computer_reconciliation.as_ref().is_some_and(|flight| {
+                management.keep_detach_reconciliation_for_proof(node.as_str(), flight.target)
+                    && a.handle.computer_current()
+            });
+            #[cfg(not(feature = "test-knobs"))]
+            let keep_reconciliation = false;
+            if !keep_reconciliation {
+                drop(a.computer_reconciliation.take());
+                management.node_detached(node.as_str());
+            }
             Some((a, tx))
         }
         Some(other) => {

@@ -1845,6 +1845,22 @@ impl Management {
     pub fn node_detached(&self, node: &str) {
         lock(&self.pending_nodes).remove(node);
     }
+
+    /// Isolate the detach mutant to delta's exact public pending result. The daemon also
+    /// requires the actor to be current, selecting the held-reply race rather than unapplied work.
+    #[cfg(feature = "test-knobs")]
+    pub fn keep_detach_reconciliation_for_proof(
+        &self,
+        node: &str,
+        target: ComputerPolicyTarget,
+    ) -> bool {
+        super::fx28_mutant("detach-keeps-reconciliation")
+            && node == "delta"
+            && self.computer.policy_target() == target
+            && lock(&self.pending_nodes)
+                .get(node)
+                .is_some_and(|pending| pending.target == target)
+    }
     fn transport_leases(&self, supplied: Option<&Link>) -> Result<Vec<TransportLease>> {
         let s = lock(&self.computer.state);
         let local = s.description.fingerprint()?;

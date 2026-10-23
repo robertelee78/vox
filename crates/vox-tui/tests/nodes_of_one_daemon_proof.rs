@@ -4255,7 +4255,12 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         hold_release.display()
     );
     let reply_marker = b.data.join("hold-delta-computer-policy-reply");
-    let reply_spec = format!("delta\t15000\t{}", reply_marker.display());
+    let reply_hold = Duration::from_secs(15);
+    let reply_spec = format!(
+        "delta\t{}\t{}",
+        reply_hold.as_millis(),
+        reply_marker.display()
+    );
     let state_commit_arm = b.data.join("hold-computer-state-commit-arm");
     let state_commit_engaged = b.data.join("hold-computer-state-commit-engaged");
     let state_commit_release = b.data.join("hold-computer-state-commit-release.sock");
@@ -4594,7 +4599,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
     ];
 
     // ---- stale reconciliation cannot detach a replacement generation or revision ----------
-    replacement_generation_survives((&a, &da), (&b, &db), &reply_marker);
+    replacement_generation_survives((&a, &da), (&b, &db), (&reply_marker, reply_hold, &delta));
 
     // ---- both live daemons converge when their userspace path is restored -----------------
     change_reaches_a_live_computer((&a, &da, &nodes_a), (&b, &db, &nodes_b), &forward);
@@ -5842,13 +5847,14 @@ fn a_restart_derives_nothing(
 /// A reconciliation result belongs to one attachment generation and one exact policy revision.
 /// First, an old delta actor applies a change but its reply is held while a person detaches and
 /// re-attaches delta. Then, on that replacement attachment, R1's reply is held while R2 starts and
-/// applies. Neither old five-second waiter may detach the attachment that superseded its work.
+/// applies. Detach retires the old pending result; neither old result may change its successor.
 fn replacement_generation_survives(
     (a, da): (&Account, &Daemon),
     (b, db): (&Account, &Daemon),
-    reply_marker: &Path,
+    (reply_marker, reply_hold, delta): (&Path, Duration, &str),
 ) {
     let zeta = a.make_node("zeta");
+    let reply_armed_at = Instant::now();
     std::fs::write(reply_marker, b"hold the old generation's reply")
         .unwrap_or_else(|e| panic!("APPARATUS: could not stage delayed old-generation reply: {e}"));
     let changed = Instant::now();
@@ -5867,18 +5873,76 @@ fn replacement_generation_survives(
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let old_reply_held = Instant::now();
+    let return_deadline = changed + RETURN_WITHIN;
+    // The reply delay starts only after this event computes its result, hence no earlier than
+    // its arm. Its existing fixture interval is staging only: obtain the actual public miss
+    // and pending row before the earliest possible reply release, or this race is not staged.
+    let reply_cannot_have_returned_before = reply_armed_at + reply_hold;
+    let (held_revision, old_miss) = loop {
+        let status = computer(b, &["status"]);
+        let revision = status["revision"]
+            .as_u64()
+            .expect("APPARATUS: held delta status omitted its policy revision");
+        let pending = status["pending_nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .any(|words| {
+                words.starts_with("delta:")
+                    && words.contains("missed its local application boundary")
+            });
+        let miss = status["application_misses"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|miss| miss["node"] == delta && miss["revision"].as_u64() == Some(revision))
+            .cloned();
+        let applied = roster_current(&status, &["beta", "delta"])
+            && grant_words(b, "delta", &zeta).as_deref() == Some("read");
+        assert!(
+            Instant::now() < reply_cannot_have_returned_before.min(return_deadline),
+            "APPARATUS: the exact public pending miss was not observed before the old reply could return; no detach-ownership verdict is possible: {status}"
+        );
+        if pending && applied {
+            if let Some(miss) = miss {
+                break (revision, miss);
+            }
+        }
+        assert!(
+            daemon_alive(da.child.id()) && daemon_alive(db.child.id()),
+            "APPARATUS: a daemon exited while staging delta's exact pending result before detach"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    println!("[proof] FX-28 detach-reconciliation apparatus staged: delta's exact applied target {held_revision} has public pending status and historical miss {old_miss} before its held old-generation reply can return");
     let (ok, out, err) = b.run(&["node", "detach", "delta"], "");
     assert!(ok, "APPARATUS: detach old delta generation: {out}{err}");
+    assert!(
+        Instant::now() < reply_cannot_have_returned_before,
+        "APPARATUS: detach did not complete before the old reply could return; the pending-result retirement race was not staged"
+    );
     let (ok, out, err) = b.run(&["node", "attach", "delta", "--passphrase-file", "-"], PASS);
     assert!(
         ok,
         "APPARATUS: attach replacement delta generation: {out}{err}"
     );
-    std::thread::sleep(
-        CHANGE_SHOWN_WITHIN
-            .saturating_add(Duration::from_secs(1))
-            .saturating_sub(old_reply_held.elapsed()),
+    assert!(
+        wait_until(return_deadline.saturating_duration_since(Instant::now()), || {
+            let status = computer(b, &["status"]);
+            let grant = grant_words(b, "delta", &zeta);
+            let observed_at = Instant::now();
+            let complete = status["revision"].as_u64() == Some(held_revision)
+                && !status["pending_nodes"].as_array().into_iter().flatten()
+                    .filter_map(serde_json::Value::as_str).any(|words| words.starts_with("delta:"))
+                && status["application_misses"].as_array().is_some_and(|misses| misses.contains(&old_miss))
+                && status["state"] == "confirmed"
+                && roster_current(&status, &["beta", "delta"])
+                && grant.as_deref() == Some("read");
+            complete && observed_at <= return_deadline
+        }),
+        "PRODUCT [FX28 detach-reconciliation]: reattaching the same-policy delta did not clear the departing attachment's pending result and confirm its actual grant while preserving the historical miss within the original return boundary: {}",
+        computer(b, &["status"])
     );
     let status = computer(b, &["status"]);
     let (listed_ok, listed, listed_err) = b.run(&["node", "list"], "");
