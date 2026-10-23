@@ -663,6 +663,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AddressWaitOver { .. } => "withholding an address no board holds the room for",
         NetEvent::AnchorNoteDue { .. } => "saying which anchors never took a room",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
+        NetEvent::JoinBoardPublication { .. } => "retaining a join publication's rollback",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::LeaveWaitOver { .. } => "answering a leave nobody took",
@@ -1642,6 +1643,14 @@ enum NetEvent {
         result: Box<crate::error::Result<()>>,
         /// The `Forward` command's reply.
         reply: oneshot::Sender<Outcome>,
+    },
+    /// A joiner's task finished: make the room, or say why not, and answer the command.
+    JoinBoardPublication {
+        channel_id: Digest32,
+        attachment: u64,
+        board: Arc<VoxConnection>,
+        withdrawal: Option<Vec<u8>>,
+        ack: oneshot::Sender<crate::error::Result<()>>,
     },
     /// A joiner's task finished: make the room, or say why not, and answer the command.
     JoinerDone {
@@ -3098,6 +3107,7 @@ struct Joiner {
     net: Arc<NodeNet>,
     tx: mpsc::Sender<NetEvent>,
     me: Digest32,
+    attachment: u64,
     parsed: crate::node::link::InviteLink,
     routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
     signer: Arc<crate::atrest::vault::VaultRootSigner>,
@@ -3240,6 +3250,60 @@ impl JoinSteps {
 }
 
 impl Joiner {
+    /// Retain the signed narrowing action before an announcement can make this joining
+    /// identity remotely visible. The actor serializes the public recovery journal; a crash,
+    /// failed seal or policy refusal can then withdraw without needing a stored room key.
+    async fn retain_board_cleanup(&self, board: &Arc<VoxConnection>) -> Result<(), JoinerLost> {
+        let withdrawal = crate::nat::withdraw::BoardWithdraw::build(
+            self.signer.as_ref(),
+            &self.parsed.channel_id,
+            0,
+            crate::nat::withdraw::WithdrawScope::Member,
+            self.now,
+        )
+        .map_err(|error| JoinerLost::of(fault_of(&error)))?
+        .to_wire();
+        let (ack, received) = oneshot::channel();
+        self.tx
+            .send(NetEvent::JoinBoardPublication {
+                channel_id: self.parsed.channel_id,
+                attachment: self.attachment,
+                board: Arc::clone(board),
+                withdrawal: Some(withdrawal),
+                ack,
+            })
+            .await
+            .map_err(|_| JoinerLost::of(Fault::Locked))?;
+        received
+            .await
+            .map_err(|_| JoinerLost::of(Fault::Locked))?
+            .map_err(|error| JoinerLost::of(fault_of(&error)))
+    }
+
+    /// An answered refusal proves this exact announcement published nothing. Remove its route
+    /// before reporting the failure, so a rejected future-dated pre-join cannot manufacture a
+    /// future tombstone and block the same person's corrected-clock retry.
+    async fn forget_refused_board_cleanup(
+        &self,
+        board: &Arc<VoxConnection>,
+    ) -> Result<(), JoinerLost> {
+        let (ack, received) = oneshot::channel();
+        self.tx
+            .send(NetEvent::JoinBoardPublication {
+                channel_id: self.parsed.channel_id,
+                attachment: self.attachment,
+                board: Arc::clone(board),
+                withdrawal: None,
+                ack,
+            })
+            .await
+            .map_err(|_| JoinerLost::of(Fault::Locked))?;
+        received
+            .await
+            .map_err(|_| JoinerLost::of(Fault::Locked))?
+            .map_err(|error| JoinerLost::of(fault_of(&error)))
+    }
+
     fn helper_context(&self) -> crate::node::network::HelperContext {
         crate::node::network::HelperContext {
             room: Some(self.parsed.channel_id),
@@ -3746,9 +3810,13 @@ impl Joiner {
                 "announcing this joiner to board {}",
                 short(board.peer_id())
             ));
+            self.retain_board_cleanup(&board).await?;
             let Err(e) = announce(&board, &prejoin_wire).await else {
                 break;
             };
+            if matches!(e, Error::RendezvousRejected(_)) {
+                self.forget_refused_board_cleanup(&board).await?;
+            }
             steps.took("announce to the board (failed)", t);
             refused.push(format!(
                 "board {} took no pre-join record: {e}",
@@ -3883,7 +3951,11 @@ impl Joiner {
                 };
                 match dialled {
                     Ok(c) => {
+                        self.retain_board_cleanup(&c).await?;
                         if let Err(e) = announce(&c, &prejoin_wire).await {
+                            if matches!(e, Error::RendezvousRejected(_)) {
+                                self.forget_refused_board_cleanup(&c).await?;
+                            }
                             last_fault = fault_of(&e);
                             // Said, as a failed dial is: a join that failed here reported no
                             // reason at all (V210-83).
@@ -4830,6 +4902,7 @@ impl EventStream {
 }
 
 const PENDING_WITHDRAWALS_META_KEY: &str = "pending-board-withdrawals";
+const PENDING_JOIN_CLEANUP_META_KEY: &str = "pending-join-board-cleanup";
 const PENDING_WITHDRAWALS_VERSION: u64 = 1;
 const MAX_PENDING_WITHDRAWALS: usize = 4096;
 const MAX_WITHDRAWAL_TARGETS: usize = 4096;
@@ -5405,6 +5478,9 @@ pub struct Node {
     // Wire and the room's effective anchor identities at withdrawal. The room may be
     // purged before an offline anchor returns, so its scope must survive that purge.
     withdrawn: BTreeMap<Digest32, PendingWithdrawal>,
+    /// Signed rollback retained before a joining task publishes to a board. It is not sent
+    /// during a successful join; failure or startup recovery promotes it before partial purge.
+    join_cleanup: BTreeMap<Digest32, PendingWithdrawal>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Per `(room, member)`: consecutive keys not taken, and the unix millisecond before which the
@@ -5974,6 +6050,7 @@ impl Node {
             winding: BTreeMap::new(),
             departed_seen: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
+            join_cleanup: BTreeMap::new(),
             governance_work: governance::Maintenance::default(),
             key_backoff: BTreeMap::new(),
             rekey_after: BTreeMap::new(),
@@ -7524,6 +7601,17 @@ impl Node {
                 let Ok(signer) = profile.signer() else { return };
                 let stamp =
                     spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
+                if let Err(error) = Self::refresh_join_cleanup(
+                    profile,
+                    &mut self.join_cleanup,
+                    *channel_id,
+                    epoch,
+                    stamp,
+                    Some(conn),
+                ) {
+                    eprintln!("vox node: join publication could not retain its rollback: {error}");
+                    return;
+                }
                 net.own_records(signer, channel_id, epoch, &ring, seq, stamp, admission)
             };
             let Ok((address, bundle)) = records else {
@@ -9017,6 +9105,19 @@ impl Node {
             };
             let Ok(signer) = profile.signer() else { return };
             let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
+            if let Err(error) = Self::refresh_join_cleanup(
+                profile,
+                &mut self.join_cleanup,
+                *channel_id,
+                channel.epoch(),
+                stamp,
+                None,
+            ) {
+                eprintln!(
+                    "vox node: local join publication could not retain its rollback: {error}"
+                );
+                return;
+            }
             let _ = net.publish_local(&channel.genesis().to_wire());
             let admission = channel.own_admission().clone();
             if let Ok((address, bundle)) = net.own_records(
@@ -9514,6 +9615,24 @@ impl Node {
                 });
                 let _ = ack.send(());
             }
+            NetEvent::JoinBoardPublication {
+                channel_id,
+                attachment,
+                board,
+                withdrawal,
+                ack,
+            } => {
+                let result =
+                    if attachment != self.delivery_epoch || !self.joining.contains(&channel_id) {
+                        Err(Error::Profile("the join no longer owns this attachment"))
+                    } else {
+                        match withdrawal {
+                            Some(wire) => self.retain_join_cleanup(channel_id, &board, wire),
+                            None => self.forget_refused_join_board(channel_id, &board),
+                        }
+                    };
+                let _ = ack.send(result);
+            }
             NetEvent::JoinerDone {
                 reply,
                 parsed,
@@ -9544,7 +9663,10 @@ impl Node {
                         if !lost.why.is_empty() {
                             self.say_why_the_join_failed(&lost.why);
                         }
-                        Outcome::Failed(lost.fault)
+                        match self.abort_join_cleanup(&room, lost.fault) {
+                            Ok(outcome) => outcome,
+                            Err(error) => Outcome::Failed(fault_of(&error)),
+                        }
                     }
                 };
                 // Whatever arrived for this room while it was being joined, in arrival order — into
@@ -12768,6 +12890,10 @@ impl Node {
                 return;
             }
         };
+        if self.joining.contains(&parsed.channel_id) {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
         let (Some(net), Some(ring)) = (
             self.net.as_ref().map(Arc::clone),
             self.prekeys.as_ref().map(Arc::clone),
@@ -12883,6 +13009,7 @@ impl Node {
             net,
             tx: self.net_tx.clone(),
             me,
+            attachment: self.delivery_epoch,
             parsed: parsed.clone(),
             routes,
             signer,
@@ -13061,14 +13188,14 @@ impl Node {
                         .collect::<String>()
                 ),
             });
-            return Outcome::Failed(Fault::RoomNameTaken);
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::RoomNameTaken);
         }
         let Some(authority) = self.computer_authority() else {
-            return Outcome::Failed(Fault::ComputerPolicy);
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
         };
         let channel = {
             let Some(profile) = self.profile.as_ref() else {
-                return Outcome::Failed(Fault::NoIdentity);
+                return self.reject_join_cleanup(&parsed.channel_id, Fault::NoIdentity);
             };
             let joined = authority.publish(|| {
                 ChannelState::join_channel_from_sealed(
@@ -13089,15 +13216,17 @@ impl Node {
                 )
             });
             match joined {
-                None => return Outcome::Failed(Fault::ComputerPolicy),
+                None => return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy),
                 Some(Ok(channel)) => channel,
-                Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
+                Some(Err(error)) => {
+                    return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
+                }
             }
         };
         let mut channel = channel;
         let retention = self.node_retention_for(&parsed.channel_id);
         let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::NoIdentity);
         };
         let step_retention = self.node_step_retention.for_room(&parsed.channel_id);
         let retained = authority.publish(|| {
@@ -13106,16 +13235,10 @@ impl Node {
                 .and_then(|()| channel.set_node_step_retention(profile.store(), step_retention))
         });
         let Some(retained) = retained else {
-            return match Self::purge_unpublished_channel(profile, &parsed.channel_id) {
-                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
-                Err(error) => Outcome::Failed(fault_of(&error)),
-            };
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
         };
         if let Err(error) = retained {
-            if let Err(cleanup) = Self::purge_unpublished_channel(profile, &parsed.channel_id) {
-                return Outcome::Failed(fault_of(&cleanup));
-            }
-            return Outcome::Failed(fault_of(&error));
+            return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
         }
         // A joined room is remembered before it becomes live, just like a created room. Use the
         // same captured authority as the durable join so a replaced Computer policy can leave
@@ -13126,20 +13249,14 @@ impl Node {
             })
             .is_none()
         {
-            return match Self::purge_unpublished_channel(profile, &parsed.channel_id) {
-                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
-                Err(error) => Outcome::Failed(fault_of(&error)),
-            };
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
         }
         // A room joined again is published again (V030-14): its withdraw is kept no longer.
         if self.withdrawn.contains_key(&parsed.channel_id) {
             let mut next = self.withdrawn.clone();
             next.remove(&parsed.channel_id);
             if let Err(error) = Self::save_pending_withdrawals(profile, &next) {
-                return match Self::purge_unpublished_channel(profile, &parsed.channel_id) {
-                    Ok(()) => Outcome::Failed(fault_of(&error)),
-                    Err(cleanup) => Outcome::Failed(fault_of(&cleanup)),
-                };
+                return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
             }
             self.withdrawn = next;
         }
@@ -13147,25 +13264,9 @@ impl Node {
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
         );
-        // The successful join exchange has already put this newcomer's pre-join records on the
-        // answering member's board. That is the causal publication boundary: the responder may
-        // also appear in `anchor_ids` as a generic board connection, which makes the later direct
-        // publication pass skip it. Record both the holder and the authenticated route now, so a
-        // later Computer-policy refusal can durably withdraw those already-visible records even
-        // after the connection and local room are gone.
-        let join_board = conn.peer_id();
-        self.on_board.insert((parsed.channel_id, join_board));
-        let join_route = conn.quinn().remote_address();
-        let routes = self
-            .board_routes
-            .entry((parsed.channel_id, join_board))
-            .or_default();
-        if !routes.contains(&join_route) {
-            if routes.len() == MAX_WITHDRAWAL_ROUTES {
-                routes.remove(0);
-            }
-            routes.push(join_route);
-        }
+        // Every board route was retained before its pre-join announcement, before the successful
+        // exchange and off-actor seal. Every exit above can therefore withdraw without first
+        // installing the room or relying on a live connection surviving until cleanup.
         // Every member whose bundle is on the board is an admitted author **on the
         // M17.6 evidence its record carries** — a self-signed record proves possession
         // of a key and nothing else. Sync hard-fails on an entry from an author we
@@ -13209,12 +13310,12 @@ impl Node {
                 }
                 Ok(())
             });
+            drop(channel);
             let Some(noted) = noted else {
-                return self
-                    .reject_unpublished_live_channel(&parsed.channel_id, Fault::ComputerPolicy);
+                return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
             };
             if let Err(error) = noted {
-                return self.reject_unpublished_live_channel(&parsed.channel_id, fault_of(&error));
+                return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
             }
         }
         // The join's link routes served only that operation. The room's signed history,
@@ -13271,28 +13372,23 @@ impl Node {
         // and only luck decided whether it did.
         // Nothing else replaces the release. A joiner becomes readable when it trusts
         // someone, which is a human act, and `deliver_owed_consents` issues the grant.
-        if authority
-            .publish(|| {
-                let _ = self.event_tx.send(NodeEvent::Joined {
-                    channel_id: parsed.channel_id,
-                    responder,
-                });
-                self.room_publication_authority.insert(
-                    parsed.channel_id,
-                    (authority.clone(), RoomPublicationOwnership::Joined),
-                );
-            })
-            .is_none()
-        {
-            return self
-                .withdraw_and_reject_unpublished_live_channel(
-                    &parsed.channel_id,
-                    RoomPublicationOwnership::Joined,
-                    &authority,
-                )
-                .await;
+        let completed = authority.publish(|| -> crate::error::Result<()> {
+            self.complete_join_cleanup(&parsed.channel_id)?;
+            let _ = self.event_tx.send(NodeEvent::Joined {
+                channel_id: parsed.channel_id,
+                responder,
+            });
+            self.room_publication_authority.insert(
+                parsed.channel_id,
+                (authority.clone(), RoomPublicationOwnership::Joined),
+            );
+            Ok(())
+        });
+        match completed {
+            Some(Ok(())) => Outcome::Done,
+            Some(Err(error)) => self.reject_join_cleanup(&parsed.channel_id, fault_of(&error)),
+            None => self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy),
         }
-        Outcome::Done
     }
 
     /// Release this identity's sender key to `target` and record the grant: deliver
@@ -18887,7 +18983,245 @@ impl Node {
             Some(bytes) => read_pending_withdrawals(&bytes)?,
             None => BTreeMap::new(),
         };
+        self.join_cleanup = match profile.store().get_meta(PENDING_JOIN_CLEANUP_META_KEY)? {
+            Some(bytes) => read_pending_withdrawals(&bytes)?,
+            None => BTreeMap::new(),
+        };
+        // A successful join removed its preparation inside its final authority fence. Anything
+        // left here belongs to a join interrupted before that boundary, never an existing room
+        // opened by its passphrase. Promote its narrowing action and purge its partial room in
+        // one transaction before any remembered room is reopened or the network starts.
+        for room in self.join_cleanup.keys().copied().collect::<Vec<_>>() {
+            self.abort_join_cleanup(&room, Fault::Locked)?;
+        }
         Ok(())
+    }
+
+    fn save_join_cleanup(
+        profile: &Profile,
+        pending: &BTreeMap<Digest32, PendingWithdrawal>,
+    ) -> crate::error::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("withdrawal-not-durable") {
+            return Ok(());
+        }
+        profile.store().put_meta(
+            PENDING_JOIN_CLEANUP_META_KEY,
+            &pending_withdrawals_bytes(pending)?,
+        )
+    }
+
+    /// This journal is prepared recovery, not an active withdrawal: successful joining continues
+    /// publishing normally. The actor acknowledges it before the task can announce to a board.
+    fn retain_join_cleanup(
+        &mut self,
+        room: Digest32,
+        board: &Arc<VoxConnection>,
+        wire: Vec<u8>,
+    ) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        if self.channels.contains_key(&room) || profile.store().get_sek_wrap(&room)?.is_some() {
+            return Err(Error::Profile(
+                "an existing room cannot become join rollback state",
+            ));
+        }
+        let withdrawal = crate::nat::withdraw::BoardWithdraw::from_wire(&wire)?;
+        if withdrawal.channel_id != room
+            || withdrawal.scope != crate::nat::withdraw::WithdrawScope::Member
+            || withdrawal.author_id != profile.fingerprint()
+        {
+            return Err(Error::Profile(
+                "join rollback does not name this member and room",
+            ));
+        }
+        withdrawal.verify(&crate::identity::composite::RootSigner::public_key(
+            profile.signer()?,
+        ))?;
+        let mut next = self.join_cleanup.clone();
+        let pending = next.entry(room).or_insert_with(|| PendingWithdrawal {
+            wire: wire.clone(),
+            routes: BTreeMap::new(),
+        });
+        let prior = crate::nat::withdraw::BoardWithdraw::from_wire(&pending.wire)?;
+        if withdrawal.timestamp_ms > prior.timestamp_ms {
+            pending.wire = wire;
+        }
+        let route = board.quinn().remote_address();
+        let routes = pending.routes.entry(board.peer_id()).or_default();
+        if !routes.contains(&route) {
+            if routes.len() == MAX_WITHDRAWAL_ROUTES {
+                routes.remove(0);
+            }
+            routes.push(route);
+        }
+        Self::save_join_cleanup(profile, &next)?;
+        self.join_cleanup = next;
+        self.on_board.insert((room, board.peer_id()));
+        if let Some(routes) = self
+            .join_cleanup
+            .get(&room)
+            .and_then(|pending| pending.routes.get(&board.peer_id()))
+        {
+            self.board_routes
+                .insert((room, board.peer_id()), routes.clone());
+        }
+        Ok(())
+    }
+
+    fn forget_refused_join_board(
+        &mut self,
+        room: Digest32,
+        board: &Arc<VoxConnection>,
+    ) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let mut next = self.join_cleanup.clone();
+        if let Some(pending) = next.get_mut(&room) {
+            let peer = board.peer_id();
+            if let Some(routes) = pending.routes.get_mut(&peer) {
+                routes.retain(|route| *route != board.quinn().remote_address());
+                if routes.is_empty() {
+                    pending.routes.remove(&peer);
+                }
+            }
+            if pending.routes.is_empty() {
+                next.remove(&room);
+            }
+        }
+        Self::save_join_cleanup(profile, &next)?;
+        self.join_cleanup = next;
+        self.board_routes.remove(&(room, board.peer_id()));
+        self.on_board.remove(&(room, board.peer_id()));
+        Ok(())
+    }
+
+    /// Every record published while a join is incomplete is covered by its prepared withdrawal.
+    /// A pre-key refresh may stamp records ahead of the clock, so persist that exact stamp before
+    /// publishing, rather than reconstructing it after a crash from the wall clock.
+    fn refresh_join_cleanup(
+        profile: &Profile,
+        pending: &mut BTreeMap<Digest32, PendingWithdrawal>,
+        room: Digest32,
+        epoch: u64,
+        stamp: u64,
+        board: Option<&Arc<VoxConnection>>,
+    ) -> crate::error::Result<()> {
+        let Some(existing) = pending.get(&room) else {
+            return Ok(());
+        };
+        let prior = crate::nat::withdraw::BoardWithdraw::from_wire(&existing.wire)?;
+        let stamp = stamp.max(prior.timestamp_ms);
+        let mut next = pending.clone();
+        let entry = next
+            .get_mut(&room)
+            .ok_or(Error::Profile("join rollback disappeared"))?;
+        entry.wire = crate::nat::withdraw::BoardWithdraw::build(
+            profile.signer()?,
+            &room,
+            epoch,
+            crate::nat::withdraw::WithdrawScope::Member,
+            stamp,
+        )?
+        .to_wire();
+        if let Some(board) = board {
+            let route = board.quinn().remote_address();
+            let routes = entry.routes.entry(board.peer_id()).or_default();
+            if !routes.contains(&route) {
+                if routes.len() == MAX_WITHDRAWAL_ROUTES {
+                    routes.remove(0);
+                }
+                routes.push(route);
+            }
+        }
+        Self::save_join_cleanup(profile, &next)?;
+        *pending = next;
+        Ok(())
+    }
+
+    fn complete_join_cleanup(&mut self, room: &Digest32) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let mut next = self.join_cleanup.clone();
+        next.remove(room);
+        Self::save_join_cleanup(profile, &next)?;
+        self.join_cleanup = next;
+        Ok(())
+    }
+
+    fn reject_join_cleanup(&mut self, room: &Digest32, fault: Fault) -> Outcome {
+        match self.abort_join_cleanup(room, fault) {
+            Ok(outcome) => outcome,
+            Err(error) => Outcome::Failed(fault_of(&error)),
+        }
+    }
+
+    /// Promote the prepared rollback and purge only the partial room owned by this join in one
+    /// durable transaction. Neither a crash nor a failure can lose the signed board action, and
+    /// an existing room with no preparation is never deleted by this path.
+    fn abort_join_cleanup(
+        &mut self,
+        room: &Digest32,
+        fault: Fault,
+    ) -> crate::error::Result<Outcome> {
+        let Some(cleanup) = self.join_cleanup.get(room).cloned() else {
+            return Ok(Outcome::Failed(fault));
+        };
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let signer = profile.signer()?;
+        let mut withdrawn = self.withdrawn.clone();
+        let pending = withdrawn.entry(*room).or_insert_with(|| cleanup.clone());
+        for (board, routes) in cleanup.routes {
+            let kept = pending.routes.entry(board).or_default();
+            for route in routes {
+                if !kept.contains(&route) && kept.len() < MAX_WITHDRAWAL_ROUTES {
+                    kept.push(route);
+                }
+            }
+        }
+        let old = crate::nat::withdraw::BoardWithdraw::from_wire(&pending.wire)?;
+        let prepared = crate::nat::withdraw::BoardWithdraw::from_wire(&cleanup.wire)?;
+        if old.scope != crate::nat::withdraw::WithdrawScope::Room
+            && old.timestamp_ms < prepared.timestamp_ms
+        {
+            pending.wire = cleanup.wire;
+        }
+        let mut unfinished = self.join_cleanup.clone();
+        unfinished.remove(room);
+        let mut open = OpenRooms::load(profile.store(), signer)?;
+        let changed = open.forget(room);
+        let mut batch = profile.store().batch()?;
+        #[cfg(feature = "test-knobs")]
+        let persist = !crate::node::computer::fx28_mutant("withdrawal-not-durable");
+        #[cfg(not(feature = "test-knobs"))]
+        let persist = true;
+        if persist {
+            batch.put_meta(
+                PENDING_WITHDRAWALS_META_KEY,
+                &pending_withdrawals_bytes(&withdrawn)?,
+            )?;
+        }
+        batch.put_meta(
+            PENDING_JOIN_CLEANUP_META_KEY,
+            &pending_withdrawals_bytes(&unfinished)?,
+        )?;
+        if changed {
+            batch.put_meta(
+                crate::node::open_rooms::OPEN_ROOMS_META_KEY,
+                &open.sealed(signer)?,
+            )?;
+        }
+        batch.purge_channel(room)?;
+        batch.commit()?;
+        self.withdrawn = withdrawn;
+        self.join_cleanup = unfinished;
+        self.retract_live_channel(room);
+        if let (Some(net), Some(pending)) = (self.net.as_ref(), self.withdrawn.get(room)) {
+            let _ = net.publish_local(&pending.wire);
+            for board in pending.routes.keys() {
+                if let Some(conn) = net.manager().existing(board) {
+                    Self::put_withdraws(&conn, vec![pending.wire.clone()]);
+                }
+            }
+        }
+        Ok(Outcome::Failed(fault))
     }
 
     fn replace_pending_withdrawals(
@@ -18973,6 +19307,13 @@ impl Node {
         ownership: RoomPublicationOwnership,
         authority: &computer::ComputerAuthority,
     ) -> Outcome {
+        if ownership == RoomPublicationOwnership::Joined
+            && self.join_cleanup.contains_key(channel_id)
+        {
+            let outcome = self.reject_join_cleanup(channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
         let scope = if ownership == RoomPublicationOwnership::Created {
             crate::nat::withdraw::WithdrawScope::Room
         } else {
