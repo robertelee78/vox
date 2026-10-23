@@ -1237,6 +1237,22 @@ impl Management {
         // alone meanwhile, and the reservation ends with the
         // handshake however it ends (a drop guard), so the computer never stays in flight.
         let target = link.target;
+        #[cfg(feature = "test-knobs")]
+        let command_deadline = if super::fx28_mutant("fresh-preview-inherits-old-deadline") {
+            // Mutant: make this fresh invocation inherit unrelated ordinary work's clock.
+            let failed = lock(&self.exchanged)
+                .get(&target)
+                .and_then(|record| record.deadline);
+            let ready = lock(&self.retry_ready)
+                .get(&target)
+                .map(|mark| mark.deadline);
+            failed
+                .into_iter()
+                .chain(ready)
+                .fold(command_deadline, std::time::Instant::min)
+        } else {
+            command_deadline
+        };
         // The state which owns this handshake's supersession check, read before reservation:
         // pairing sends identity proof, not this node's ordinary policy snapshot. The state lock is
         // never taken under the in-flight lock (the retry takes them the other way round).

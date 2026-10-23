@@ -1594,9 +1594,9 @@ fn computer_preview_and_approval_survive_a_crash() {
 /// Independent mutants: omitting the post-reservation supersession check lets a stale operator
 /// pairing survive the newer policy revision; requiring a retained peer connection strands the
 /// repair; discarding failed transport work means the remote anchor's return never causes
-/// registration; ignoring a marker-only authorization change leaves the causally staged grant in
-/// the shipped effective keyring; clearing a late success hides the missed contract before
-/// preview/restart; bypassing only the final state-locked Ready fence exposes an old projection after a real
+/// registration; clearing a late success hides the missed contract before preview/restart;
+/// making a fresh preview inherit an older missed deadline refuses its authenticated code;
+/// bypassing only the final state-locked Ready fence exposes an old projection after a real
 /// later operator policy changed the personal-node role. Historical transport lateness does not
 /// revoke the receiver's authenticated current policy.
 /// Each reaches a PRODUCT deadline/roster assertion, while inability to stage an exact race is
@@ -1613,6 +1613,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
         "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_FILE",
         "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE",
+        "VOX_TEST_FX28_MUTANT",
     ]);
     let anchor = Account::new();
     let a = Account::new();
@@ -2267,8 +2268,8 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&b, &["status"])
     );
 
-    // Establish an older computer-managed capability upgrade. The next expired revision must
-    // revoke this too, not merely the grant introduced by that next revision.
+    // Establish an older computer-managed capability upgrade. Later sender transport lateness
+    // must preserve this and the new grants on a receiver which applied authenticated policy.
     computer(&a, &["personal", "anchor-return-first"]);
     let expected_bob_grants_with_drive = [
         (first.as_str(), "read + drive"),
@@ -2289,16 +2290,14 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         computer(&b, &["status"])
     );
 
-    // Principal FX-28 race: the answerer durably merges and applies this grant before its reply
-    // is allowed to leave. Shipped trust output must first show that effective grant. The
-    // initiator then names the missed causal revision; after releasing the exact parked answer,
-    // its later marker must revoke the already-published grant on the answerer. Mutant: ignore a
-    // marker-only change in `change_until`; the final effective-keyring assertion stays granted
-    // and turns PRODUCT red.
+    // The answerer applies authenticated policy before its reply leaves. Observe the actual
+    // effective grant while that reply is held, then complete the same cause. A separate reverse
+    // exchange can legitimately cover it too; delaying one reply is not evidence of a miss.
     std::fs::write(&answer_after_merge_arm, b"armed")
         .expect("APPARATUS: arm post-merge answer hold");
     let applied_then_late = a.make_node("applied-before-late-marker");
     let revision_before_applied_late = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let held_reply_started = Instant::now();
     let (ok, out, err) = a.run(
         &[
             "node",
@@ -2332,56 +2331,33 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "PRODUCT: the answerer merged revision {applied_late_revision} but its shipped effective keyring never showed the grant before the held reply: {}",
         computer(&b, &["status"])
     );
-    loop {
-        let left_status = computer(&a, &["status"]);
-        let application = application_toward(&a, &b_id);
-        if application["missed_revision"] == applied_late_revision
-            && application["convergence_state"] == "expired"
-        {
-            break;
-        }
-        assert!(
-            daemon_alive(left.child.id()) && daemon_alive(right.child.id()),
-            "APPARATUS: a daemon exited before shipped status named the post-merge held reply's missed revision: {left_status}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let held_reply_deadline = held_reply_started + RETURN_WITHIN;
+    assert!(
+        Instant::now() < held_reply_deadline,
+        "APPARATUS: the held-reply observation consumed the attach's original return interval before release"
+    );
     std::os::unix::net::UnixStream::connect(&answer_after_merge_release)
         .unwrap_or_else(|error| panic!("APPARATUS: release post-merge answer hold: {error}"));
-    loop {
-        let remote = application_toward(&b, &a_id);
-        if matches!(
-            remote["convergence_state"].as_str(),
-            Some("expired" | "repaired-late")
-        ) {
-            let (_, grants, grant_error) =
-                b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
-            assert!(
-                exact_grants(&b, "after-remote-anchor-b", &[]),
-                "PRODUCT: after shipped status named the received operator-policy revision expired, the managed node retained computer authority in its effective keyring: status {}; shipped trust output {grants}; error {grant_error}",
-                computer(&b, &["status"]),
-            );
-            break;
-        }
-        assert!(
-            anchor_currently_has(&relay, &[&a_id, &b_id]),
-            "APPARATUS: exact anchor registrations disappeared before the later marker's shipped effective-keyring verdict"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    assert!(
+        wait_until(held_reply_deadline.saturating_duration_since(Instant::now()), || {
+            exact_grants(&b, "after-remote-anchor-b", &applied_grants)
+                && computer(&a, &["status"])["state"] == "confirmed"
+                && computer(&b, &["status"])["state"] == "confirmed"
+        }),
+        "PRODUCT: after the exact post-merge reply was released, authenticated policy revision {applied_late_revision} did not finish its original return contract with current receiver grants: left {}; right {}",
+        computer(&a, &["status"]), computer(&b, &["status"])
+    );
 
     // Exercise the late-repair branch itself. The anchor goes away, a real policy revision is
     // made, and shipped status—not a sleep—causally says that revision missed its retained
     // convergence deadline. After the exact anchor identities return, the late exchange repairs
     // the roster but MUST keep the missed contract visible. Mutant: clear the late-success branch
-    // in `record_exchange`; the failure count/problem assertions below turn PRODUCT red.
+    // in `record_exchange`; the durable missed-revision/repair assertions turn PRODUCT red.
     stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
     relay
         .child
         .wait()
         .expect("APPARATUS: stopped anchor did not exit");
-    let before_late_right = full_roster(&computer(&b, &["status"]))
-        .expect("APPARATUS: right status did not expose its pre-expiry binding evidence");
     let late = a.make_node("anchor-return-late");
     let revision_before_late = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
     let (ok, out, err) = a.run(
@@ -2404,51 +2380,156 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     loop {
         let status = computer(&a, &["status"]);
         let application = application_toward(&a, &b_id);
-        if application["exchange_failures"].as_u64().unwrap_or(0) > 0
-            && status["problem"]
-                .as_str()
-                .is_some_and(|problem| problem.contains("causal convergence deadline"))
+        if application["missed_revision"] == late_revision
+            && application["convergence_state"] == "expired"
         {
             break;
         }
         assert!(
             daemon_alive(left.child.id()),
-            "APPARATUS: left daemon exited before shipped status named the deliberately staged missed causal deadline"
+            "APPARATUS: left daemon exited before shipped status named the deliberately staged missed causal deadline: {status}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    // This old miss is not this next explicit request's clock. Admit a fresh invocation while
+    // its only bridge is still down, park its exact reservation, and restore the path before
+    // allowing that same process to authenticate. No command retry or replacement clock is used.
+    let fresh_invitation = computer(&b, &["invite"]);
+    let fresh_link = fresh_invitation["invite_link"]
+        .as_str()
+        .expect("PRODUCT: fresh-boundary invitation named no link")
+        .to_owned();
+    let fresh_invite_id = fresh_invitation["invite_id"]
+        .as_str()
+        .expect("PRODUCT: fresh-boundary invitation named no id")
+        .to_owned();
+    let fresh_local = computer(&a, &["status"])["this_computer"].clone();
+    let fresh_peer = fresh_invitation["this_computer"].clone();
+    for previous in [&operator_reserved_engaged, &operator_superseded] {
+        let _ = std::fs::remove_file(previous);
+    }
+    std::fs::write(&operator_reserved_arm, b"fresh-boundary\n")
+        .expect("APPARATUS: arm the fresh command's existing reservation hold");
+    let fresh_started = Instant::now();
+    let mut fresh_preview = a
+        .cmd(&["computer", "pair", &fresh_link, "--preview", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the fresh-boundary shipped preview");
+    wait_for_command_marker(
+        &operator_reserved_engaged,
+        &mut fresh_preview,
+        left.child.id(),
+        fresh_started + PAIR_WITHIN,
+        "the fresh command reserved its exact peer after the old ordinary deadline missed",
+    );
+    let fresh_admitted_by = Instant::now();
+    let old_miss = application_toward(&a, &b_id);
+    assert!(
+        std::fs::read_to_string(&operator_reserved_engaged).ok().as_deref()
+            == Some(b_id.as_str())
+            && old_miss["missed_revision"] == late_revision
+            && old_miss["convergence_state"] == "expired"
+            && fresh_preview.try_wait().expect("APPARATUS: inspect the held fresh preview").is_none(),
+        "APPARATUS: the exact fresh command was not live and reserved while its peer's earlier revision {late_revision} already showed the old miss: {old_miss}"
+    );
+    println!(
+        "[proof] FX-28 fresh-preview-boundary apparatus staged: the same fresh command holds its exact peer reservation while shipped status already names old revision {late_revision} expired"
+    );
     relay = start_anchor(&anchor_listen);
     wait_for_current_anchor_peers(&mut relay, &[&a_id, &b_id]);
+    assert!(
+        fresh_started.elapsed() < PAIR_WITHIN,
+        "APPARATUS: restoring and verifying the path consumed the fresh invocation's entire pairing interval before its release"
+    );
+    std::os::unix::net::UnixStream::connect(&operator_reserved_release).unwrap_or_else(|error| {
+        panic!("APPARATUS: release the fresh command's exact reservation: {error}")
+    });
+    let fresh_output = fresh_preview
+        .wait_with_output()
+        .expect("APPARATUS: collect the same fresh-boundary command");
+    let fresh_completed = Instant::now();
+    let fresh_stdout = String::from_utf8_lossy(&fresh_output.stdout);
+    let fresh_stderr = String::from_utf8_lossy(&fresh_output.stderr);
+    assert!(
+        anchor_currently_has(&relay, &[&a_id, &b_id]),
+        "APPARATUS: verified anchor registrations disappeared before the fresh-boundary verdict"
+    );
+    assert!(
+        fresh_output.status.success(),
+        "PRODUCT [FX28 fresh-preview-boundary]: after its exact peer path was restored inside this fresh invocation's original pairing interval, the same shipped preview did not authenticate its code independently of old revision {late_revision}'s already-missed deadline: stdout {fresh_stdout}; stderr {fresh_stderr}"
+    );
+    assert!(
+        fresh_completed <= fresh_admitted_by + PAIR_WITHIN,
+        "PRODUCT [FX28 fresh-preview-boundary]: the fresh command succeeded only after even the conservative upper bracket of its original admission-owned pairing interval"
+    );
+    assert!(
+        fresh_completed <= fresh_started + PAIR_WITHIN,
+        "APPARATUS: fresh command completion landed inside admission-clock observation ambiguity; no timing verdict is possible"
+    );
+    let fresh: serde_json::Value = serde_json::from_str(&fresh_stdout).unwrap_or_else(|error| {
+        panic!("PRODUCT: fresh preview returned unreadable JSON: {error}: {fresh_stdout}")
+    });
+    let fresh_operation = fresh["pairing"]["operation_id"]
+        .as_str()
+        .filter(|operation| !operation.is_empty())
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: fresh preview omitted its authenticated operation: {fresh}")
+        });
+    assert!(
+        fresh["this_computer"] == fresh_local
+            && fresh["pairing"]["peer"] == fresh_peer
+            && fresh["pairing"]["approved_here"] == false
+            && fresh["pairing"]["approved_there"] == false
+            && fresh["pairing"]["expires_ms"] == fresh_invitation["invite_expires_ms"],
+        "PRODUCT: the fresh command did not show its exact authenticated, still-unapproved invitation: {fresh}"
+    );
+    let retained_miss = application_toward(&a, &b_id);
+    assert!(
+        retained_miss["missed_revision"] == late_revision
+            && matches!(retained_miss["convergence_state"].as_str(), Some("expired" | "repaired-late")),
+        "PRODUCT: fresh pairing erased or renewed the old ordinary miss instead of retaining its history (a real ordinary exchange may repair it): before {old_miss}; after {retained_miss}"
+    );
+    computer(&a, &["cancel", fresh_operation]);
+    computer(&b, &["cancel", &fresh_invite_id]);
+    let mut late_grants = applied_grants.clone();
+    late_grants.push((late.as_str(), "read"));
+    let late_roster = [
+        ("anchor-return-first", first.as_str()),
+        ("anchor-return-second", second.as_str()),
+        ("anchor-return-third", third.as_str()),
+        ("applied-before-late-marker", applied_then_late.as_str()),
+        ("anchor-return-late", late.as_str()),
+        ("after-remote-anchor-b", bob.as_str()),
+    ];
     loop {
         let left_status = computer(&a, &["status"]);
         let right_status = computer(&b, &["status"]);
         let application = application_toward(&a, &b_id);
-        let remote_application = application_toward(&b, &a_id);
-        let repaired = application["last_started_exchange"]["sent_revision"]
-            .as_u64()
-            .is_some_and(|revision| revision >= late_revision)
-            && application["missed_revision"] == late_revision
-            && application["repaired_late"] == true
-            && application["convergence_state"] == "repaired-late"
-            && remote_application["missed_revision"] == right_status["revision"]
-            && remote_application["convergence_state"] == "expired"
-            && right_status["state"] == "expired";
+        let completed_snapshot = ["last_started_exchange", "last_answered_exchange"]
+            .iter()
+            .any(|field| {
+                application[*field]["sent_revision"]
+                    .as_u64()
+                    .is_some_and(|revision| revision >= late_revision)
+            });
+        let repaired = completed_snapshot
+            && exact_roster(&left_status, &late_roster)
+            && exact_roster(&right_status, &late_roster)
+            && roster_current(&right_status, &["after-remote-anchor-b"])
+            && exact_grants(&b, "after-remote-anchor-b", &late_grants);
         if repaired {
             assert!(
-                application["exchange_failures"].as_u64().unwrap_or(0) > 0
-                    && left_status["problem"]
-                        .as_str()
-                        .is_some_and(|problem| problem.contains("repaired state only after")),
-                "PRODUCT: the late exchange repaired revision {late_revision} but cleared its missed causal contract: status {left_status}; application {application}"
+                application["missed_revision"] == late_revision
+                    && application["repaired_late"] == true
+                    && application["convergence_state"] == "repaired-late"
+                    && application["exchange_failures"] == 0
+                    && left_status["problem"].is_null(),
+                "PRODUCT: actual late ordinary coverage restored the roster and receiver grants but failed to retain revision {late_revision}'s repaired historical miss or clear its operational failure: status {left_status}; application {application}"
             );
-            let after_late_right = full_roster(&right_status).unwrap_or_else(|| {
-                panic!("PRODUCT: the expired remote status lost its structural binding evidence: {right_status}")
-            });
-            assert_eq!(
-                after_late_right.get("after-remote-anchor-b"),
-                before_late_right.get("after-remote-anchor-b"),
-                "PRODUCT: the remote actor derived or saved ordinary trust from expired revision {late_revision}: before {before_late_right:?}; after {after_late_right:?}"
-            );
+            println!("[proof] late ordinary coverage repaired revision {late_revision}, cleared operational failure, retained its historical miss, and left the receiver current with every authenticated grant");
             break;
         }
         assert!(
@@ -2464,15 +2545,15 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "PRODUCT: the cancelled same-state preview unexpectedly succeeded after a missed contract: {preview_out}{preview_err}"
     );
     let after_preview = computer(&a, &["status"]);
+    let after_failed_preview = application_toward(&a, &b_id);
     assert!(
-        after_preview["problem"]
-            .as_str()
-            .is_some_and(|problem| problem.contains("repaired state only after"))
-            && application_toward(&a, &b_id)["exchange_failures"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0,
-        "PRODUCT: a same-state failed preview cleared or re-enabled the durable missed contract: {after_preview}"
+        after_preview["problem"].is_null()
+            && after_failed_preview["exchange_failures"] == 0
+            && after_failed_preview["missed_revision"] == late_revision
+            && after_failed_preview["repaired_late"] == true
+            && after_failed_preview["convergence_state"] == "repaired-late"
+            && exact_grants(&b, "after-remote-anchor-b", &late_grants),
+        "PRODUCT: a same-state failed preview changed repaired operational state, erased the historical miss, or revoked receiver trust: {after_preview}; application {after_failed_preview}"
     );
     let before_restart = (
         full_roster(&computer(&a, &["status"])).unwrap_or_else(|| {
@@ -2521,10 +2602,20 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         ],
     );
     right = start(&b, "[::1]:0", &v6, &[]);
+    wait_for_current_anchor_peers(&mut relay, &[&a_id, &b_id]);
     loop {
-        if full_roster(&computer(&a, &["status"])) == Some(before_restart.0.clone())
+        let restarted_application = application_toward(&a, &b_id);
+        let completed_after_restart = ["last_started_exchange", "last_answered_exchange"]
+            .iter()
+            .any(|field| {
+                restarted_application[*field]["sent_revision"]
+                    .as_u64()
+                    .is_some()
+            });
+        if completed_after_restart
+            && full_roster(&computer(&a, &["status"])) == Some(before_restart.0.clone())
             && full_roster(&computer(&b, &["status"])) == Some(before_restart.1.clone())
-            && exact_grants(&b, "after-remote-anchor-b", &[])
+            && exact_grants(&b, "after-remote-anchor-b", &late_grants)
         {
             break;
         }
@@ -2544,27 +2635,21 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let restarted_late = computer(&a, &["status"]);
     let restarted_remote = computer(&b, &["status"]);
     assert!(
-        restarted_late["problem"]
-            .as_str()
-            .is_some_and(|problem| problem.contains("repaired state only after"))
+        restarted_late["problem"].is_null()
             && application_toward(&a, &b_id)["exchange_failures"]
                 .as_u64()
-                .unwrap_or(0)
-                > 0
+                == Some(0)
             && application_toward(&a, &b_id)["missed_revision"] == late_revision
             && application_toward(&a, &b_id)["convergence_state"] == "repaired-late"
-            && application_toward(&b, &a_id)["missed_revision"]
-                == restarted_remote["revision"]
-            && matches!(
-                application_toward(&b, &a_id)["convergence_state"].as_str(),
-                Some("expired" | "repaired-late")
-            ),
-        "PRODUCT: restarting the daemons cleared the exact durable missed causal contract without a newer policy revision: left {restarted_late}; right {restarted_remote}"
+            && application_toward(&a, &b_id)["repaired_late"] == true
+            && roster_current(&restarted_remote, &["after-remote-anchor-b"])
+            && exact_grants(&b, "after-remote-anchor-b", &late_grants),
+        "PRODUCT: restart lost the exact repaired miss or current receiver grants, or resurrected an operational failure: left {restarted_late}; right {restarted_remote}"
     );
 
     // A newer operator change is the only replacement cause. Before its exchange, status names
-    // the old miss as replaced; after its own timely exchange both computers name convergence
-    // and only then may the remote actor derive the formerly-late grant.
+    // the old miss as replaced; after its own timely exchange both computers name convergence.
+    // The receiver already keeps the earlier authenticated grants throughout this transition.
     stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
     relay
         .child
