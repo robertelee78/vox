@@ -239,9 +239,30 @@ impl Router {
                         }
                     }
                     Err(why) => {
-                        if router.finish_computer_reconciliation(
-                            &name, generation, target, pass, Some(&why),
+                        // The actor can durably settle its exact keyring before later room
+                        // maintenance reports a fault. That fault belongs in the daemon log, but
+                        // must not leave the already-current Computer application pending forever:
+                        // later follower passes deliberately skip a current actor. The finish
+                        // fence below still requires this exact target, attachment and pass, so a
+                        // node already current only for a newer target cannot complete this one.
+                        let applied = handle.computer_current();
+                        if !router.finish_computer_reconciliation(
+                            &name,
+                            generation,
+                            target,
+                            pass,
+                            (!applied).then_some(why.as_str()),
                         ) {
+                            return;
+                        }
+                        if applied {
+                            eprintln!(
+                                "vox daemon: node {name} applied computer trust revision {revision}; its ancillary room reconciliation reported: {why}"
+                            );
+                            if let Err(e) = management.record_application() {
+                                eprintln!("vox daemon: computer trust application pending: {e}");
+                            }
+                        } else {
                             eprintln!(
                                 "vox daemon: node {name} computer trust reconciliation at revision {revision} failed: {why}"
                             );
