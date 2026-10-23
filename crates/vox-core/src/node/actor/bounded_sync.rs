@@ -3,7 +3,7 @@
 use super::*;
 use crate::node::history_stream::{
     self as stream,
-    runtime::{Flow, RetirementStep, RetirementWait},
+    runtime::{Flow, RetirementStep},
     Purpose, RequestId,
 };
 use crate::node::store::Store;
