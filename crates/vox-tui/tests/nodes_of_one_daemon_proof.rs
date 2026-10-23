@@ -440,6 +440,9 @@ fn read_daemon_marker(marker: &Path, daemon_pid: u32, what: &str) -> String {
 /// elapsed wall time is deliberately not the verdict.
 fn wait_for_daemon_marker(marker: &Path, daemon: &mut Daemon, deadline: Instant, what: &str) {
     loop {
+        if let Ok(fault) = std::fs::read_to_string(marker.with_extension("fault")) {
+            panic!("APPARATUS: {what}: {fault}");
+        }
         if marker.is_file() {
             return;
         }
@@ -1843,7 +1846,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let first = a.make_node("anchor-return-first");
     let second = a.make_node("anchor-return-second");
     let third = a.make_node("anchor-return-third");
-    std::fs::write(&first_flight_arm, format!("{revision_before}\n"))
+    std::fs::write(&first_flight_arm, format!("{b_id}\t{revision_before}\n"))
         .expect("APPARATUS: arm the first causal exchange hold");
     let first_changed = Instant::now();
     let first_deadline = first_changed + RETURN_WITHIN;
@@ -1863,6 +1866,16 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         &mut left,
         first_deadline,
         "the first revision's exchange entered its exact held flight",
+    );
+    let entered = std::fs::read_to_string(&first_flight_engaged)
+        .expect("APPARATUS: read exact first flight ownership");
+    let entered: Vec<_> = entered.trim().split('\t').collect();
+    assert!(
+        entered.len() == 3
+            && entered[0] == b_id
+            && entered[1].parse::<u64>().is_ok_and(|serial| serial > 0)
+            && entered[2].parse::<u64>().is_ok_and(|policy| policy > revision_before),
+        "APPARATUS: first flight did not name the exact peer, owned serial and later policy: {entered:?}"
     );
     let staged = application_toward(&a, &b_id);
     assert!(

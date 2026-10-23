@@ -2950,6 +2950,9 @@ impl Management {
                 recorded: false,
             };
             let task = tokio::spawn(async move {
+                #[cfg(feature = "test-knobs")]
+                me.hold_first_computer_exchange_for_proof(peer, serial)
+                    .await;
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
                 // attempt. Exchange and reconciliation share the causal return deadline; this
@@ -3271,9 +3274,6 @@ impl Management {
         _revision: u64,
         deadline: std::time::Instant,
     ) -> Result<(u64, u64, u64)> {
-        #[cfg(feature = "test-knobs")]
-        self.hold_first_computer_exchange_for_proof(_revision, deadline)
-            .await;
         let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
         let conn = self.connect(peer, endpoints, link.as_ref()).await?;
@@ -3501,43 +3501,56 @@ impl Management {
     /// A marker is apparatus evidence only; every verdict still comes from shipped status and
     /// trust commands.
     #[cfg(feature = "test-knobs")]
-    async fn hold_first_computer_exchange_for_proof(
-        &self,
-        revision: u64,
-        deadline: std::time::Instant,
-    ) {
+    async fn hold_first_computer_exchange_for_proof(&self, peer: Digest32, serial: u64) {
         let Ok(spec) = std::env::var(TEST_HOLD_FIRST_COMPUTER_EXCHANGE_ENV) else {
             return;
         };
         let Some((arm, engaged)) = spec.split_once('\t') else {
             return;
         };
-        // The arm names the revision observed before the journey's change. An idle/fallback
-        // exchange that races the command cannot consume it; only a flight carrying later policy
-        // can. Removing it is then the one-shot claim.
-        let Some(after) = std::fs::read_to_string(arm)
-            .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok())
-        else {
+        // The arm names the exact peer and policy revision observed before the change. Claim
+        // only this still-owned causal retry flight, without a cancellable gap before marking
+        // its entry. Journal movement may supersede it normally and retains its original clock.
+        let Ok(armed) = std::fs::read_to_string(arm) else {
             return;
         };
-        if revision <= after {
+        let Some((expected_peer, after)) = armed.trim().split_once('\t') else {
             return;
-        }
-        if std::fs::remove_file(arm).is_err() {
+        };
+        let Ok(after) = after.parse::<u64>() else {
             return;
-        }
-        let stage_at = deadline
-            .checked_sub(COMPUTER_RETURN_SHOWN_WITHIN.saturating_sub(COMPUTER_CHANGE_SHOWN_WITHIN))
-            .unwrap_or(deadline);
-        tokio::time::sleep_until(stage_at.into()).await;
-        if std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(engaged)
-            .is_err()
+        };
         {
-            return;
+            let inflight = lock(&self.inflight);
+            let Some(flight) = inflight.get(&peer) else {
+                return;
+            };
+            if expected_peer != text_id(&peer)
+                || flight.serial != serial
+                || flight.origin != Origin::Retry
+                || flight.superseded
+                || !flight.causal
+                || flight.policy_revision <= after
+            {
+                return;
+            }
+            let marker = std::path::Path::new(engaged);
+            let body = format!("{}\t{serial}\t{}", text_id(&peer), flight.policy_revision);
+            if let Err(error) = super::publish_proof_marker(marker, body.as_bytes()) {
+                super::publish_proof_fault(
+                    &marker.with_extension("fault"),
+                    &format!("mark exact first flight: {error}"),
+                );
+                return;
+            }
+            if let Err(error) = std::fs::remove_file(arm) {
+                let _ = std::fs::remove_file(marker);
+                super::publish_proof_fault(
+                    &marker.with_extension("fault"),
+                    &format!("claim exact first flight arm: {error}"),
+                );
+                return;
+            }
         }
         std::future::pending::<()>().await;
     }
