@@ -3275,6 +3275,117 @@ impl ChannelState {
         self.admit_within(store, key, now, max_authors())
     }
 
+    /// Admit a joiner this node just authenticated and retain its witnessed admission in the
+    /// same transaction. The caller verifies the witness and the live join authority first.
+    /// A successful join must remain discoverable after this responder restarts while the
+    /// joiner is offline; neither author membership nor its notice may be committed alone.
+    /// Re-admitting the same key still succeeds at the room cap and returns `false`.
+    pub(crate) fn admit_author_with_notice(
+        &mut self,
+        store: &Store,
+        notice: &crate::nat::notice::AdmissionNotice,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if self.is_poisoned() {
+            return Err(self.save_failure());
+        }
+        let fingerprint = notice.key.fingerprint();
+        if notice.channel_id() != self.channel_id
+            || notice.witness.epoch != self.epoch
+            || notice.joiner() != fingerprint
+        {
+            return Err(Error::MalformedGovernance(
+                "admission notice does not name this room, epoch and joiner",
+            ));
+        }
+        let added = match self.authors.get(&fingerprint) {
+            Some(existing) if existing.to_bytes() == notice.key.to_bytes() => false,
+            Some(_) => {
+                return Err(Error::MalformedGovernance(
+                    "another key is already admitted for this fingerprint",
+                ));
+            }
+            None if self.authors.len() >= max_authors() => {
+                return Err(Error::RoomFull {
+                    members: self.authors.len() as u64,
+                });
+            }
+            None => true,
+        };
+        let at = notice.witness.timestamp_ms;
+        if self.withdrawn_since(&fingerprint, at) {
+            return Err(Error::MalformedGovernance(
+                "admission withdrawn: the member left the room",
+            ));
+        }
+        let keep = self
+            .board_kept
+            .notices
+            .get(&fingerprint)
+            .is_none_or(|(held, _)| *held < at);
+        if !self.board_kept.notices.contains_key(&fingerprint)
+            && self.board_kept.notices.len() >= AUTHORS_HARD_LIMIT
+        {
+            return Err(Error::SizeLimitExceeded("kept notices"));
+        }
+        if !added && !keep {
+            self.now_hint = self.now_hint.max(now.get());
+            return Ok(false);
+        }
+
+        let mut authors = self.authors.clone();
+        authors.insert(fingerprint, notice.key.clone());
+        let mut board_kept = self.board_kept.clone();
+        if keep {
+            board_kept
+                .notices
+                .insert(fingerprint, (at, notice.to_wire()));
+        }
+        let authors_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &authors_bytes(&authors),
+        )?;
+        let board_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_BOARD_KEPT,
+            &board_kept_bytes(&board_kept),
+        )?;
+        let committed = (|| {
+            let mut batch = store.batch()?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_AUTHORS,
+                &authors_seg,
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_BOARD_KEPT,
+                &board_seg,
+            )?;
+            batch.commit()
+        })();
+        if let Err(error) = committed {
+            self.poisoned = true;
+            self.save_error = Some(error.to_string());
+            return Err(error);
+        }
+        self.authors = authors;
+        self.board_kept = board_kept;
+        self.now_hint = self.now_hint.max(now.get());
+        if added {
+            self.admission
+                .admit(self.channel_id, self.epoch, fingerprint);
+            self.owe_private_support();
+            self.governance_ready = false;
+        }
+        Ok(added)
+    }
+
     /// [`ChannelState::admit_author`], refused at `limit` authors. Keep the room's
     /// maintenance time in milliseconds, including after an admission (#562).
     fn admit_within(

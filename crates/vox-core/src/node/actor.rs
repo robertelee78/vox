@@ -9474,27 +9474,21 @@ impl Node {
                                     ch.epoch(),
                                     &peer,
                                 )?;
-                                let admitted = ch
-                                    .admit_author(profile.store(), &identity, now_ms)
-                                    .map(|_| ch.name().map(str::to_owned));
+                                let notice = crate::nat::notice::AdmissionNotice::new(
+                                    (*identity).clone(),
+                                    (*witness).clone(),
+                                )?;
+                                ch.admit_author_with_notice(profile.store(), &notice, now_ms)?;
                                 // A member that left and proved the passphrase again is in again
                                 // here, until its own return reaches the others through this node.
-                                if admitted.is_ok() {
-                                    ch.readmit(identity.fingerprint());
-                                    // Keep and publish the exact witnessed admission before the
-                                    // authority lock is released; success cannot acknowledge a
-                                    // seat after durable Computer policy has moved.
-                                    if let Ok(notice) = crate::nat::notice::AdmissionNotice::new(
-                                        (*identity).clone(),
-                                        (*witness).clone(),
-                                    ) {
-                                        let _ = ch.keep_notice(profile.store(), &notice);
-                                        if let Some(net) = &net {
-                                            let _ = net.publish_local(&notice.to_wire());
-                                        }
-                                    }
+                                ch.readmit(identity.fingerprint());
+                                // Membership and its notice are durable together before live
+                                // publication. Success cannot acknowledge a seat after durable
+                                // Computer policy has moved, or one a restart cannot announce.
+                                if let Some(net) = &net {
+                                    let _ = net.publish_local(&notice.to_wire());
                                 }
-                                admitted
+                                Ok(ch.name().map(str::to_owned))
                             })
                             .unwrap_or(Err(Error::Profile(
                                 "computer policy changed before the room mutation",
