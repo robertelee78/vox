@@ -3108,10 +3108,12 @@ impl Management {
                         {
                             return;
                         }
-                        if let Err(error) =
-                            me.computer
-                                .record_missed_exchange(peer, attempt_revision, false)
-                        {
+                        if let Err(error) = me.computer.record_missed_exchange(
+                            peer,
+                            attempt_revision,
+                            policy_revision,
+                            false,
+                        ) {
                             drop(_recording);
                             guard.done(Err(format!(
                                 "the missed exchange could not be recorded durably: {error}"
@@ -3204,9 +3206,12 @@ impl Management {
         if deadline > std::time::Instant::now() {
             return Ok(());
         }
-        let cause = self
+        let Some(cause) = self
             .computer
-            .record_missed_exchange(peer, revision, false)?;
+            .record_missed_exchange(peer, revision, owner, false)?
+        else {
+            return Ok(());
+        };
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
         if record.missed_revision.is_none_or(|held| cause >= held) {
@@ -3262,18 +3267,18 @@ impl Management {
                         record.repaired_late == Some(policy_revision),
                     )
                 });
-        let missed = retained_miss || (causal && completed >= deadline);
+        let deadline_missed = retained_miss || (causal && completed >= deadline);
         // Only the snapshot this flight actually sent can acknowledge a local obligation. The
         // merged revision may include a newer local cause which arose while this flight was away.
         let durable_revision = outcome.as_ref().map_or(revision, |(sent, _merged)| *sent);
-        let mut missed_cause = None;
+        let mut missed_cause = retained_miss.then_some(policy_revision);
         let durable = if covered {
             Ok(())
-        } else if missed {
+        } else if deadline_missed {
             self.computer
-                .record_missed_exchange(peer, durable_revision, outcome.is_ok() || was_repaired)
+                .record_missed_exchange(peer, durable_revision, policy_revision, outcome.is_ok())
                 .map(|cause| {
-                    missed_cause = Some(cause);
+                    missed_cause = cause;
                 })
         } else if outcome.is_ok() {
             self.computer.record_timely_exchange(peer, durable_revision)
@@ -3285,6 +3290,9 @@ impl Management {
                 "the exchange result could not be recorded durably: {error}"
             ));
         }
+        // A timed-out journal-only attempt has an operational failure, not an invented policy
+        // miss. Only the durable API's exact owner (or already-retained covered history) names it.
+        let missed = missed_cause.is_some();
         // Authenticated traffic from this very sync can complete the reachability waiter and
         // enqueue a retry while the exchange is still in flight. A successful payload has already
         // discharged every such cause through both revisions it actually carried. Consume only a
@@ -3298,14 +3306,13 @@ impl Management {
         record.last = Some(completed);
         record.revision = revision;
         record.involved = involved;
-        let failed = outcome.is_err() && !was_repaired;
+        let failed = outcome.is_err();
         match outcome {
             Ok((sent_revision, merged_revision)) => {
                 let at_ms = now();
                 record.last_ms = Some(at_ms);
                 record.count = record.count.saturating_add(1);
-                if missed {
-                    let missed_revision = missed_cause.unwrap_or(policy_revision);
+                if let Some(missed_revision) = missed_cause {
                     // The original cause remains durably late, but this exchange succeeded now.
                     // Current consecutive failures and their backoff are operational state, not
                     // historical verdicts: clear them and resume the ordinary quiet fallback.
@@ -3338,19 +3345,19 @@ impl Management {
                         .map_or(deadline, |held| held.min(deadline)),
                 );
                 record.deadline_policy_revision = Some(policy_revision);
-                record.problem = Some(if was_repaired {
-                    "the exchange repaired state only after its causal convergence deadline".into()
-                } else if missed {
+                // Historical repair does not turn this new failure into successful delivery,
+                // hide its actual cause, or suppress the existing reachability recovery handoff.
+                record.problem = Some(if missed && !was_repaired {
                     "the exchange did not finish before its causal convergence deadline".into()
                 } else {
                     text
                 });
                 if missed {
-                    record.missed_revision = Some(missed_cause.unwrap_or(policy_revision));
+                    record.missed_revision = missed_cause;
                 }
                 if record
                     .repaired_late
-                    .is_none_or(|held| held != missed_cause.unwrap_or(policy_revision))
+                    .is_none_or(|held| Some(held) != missed_cause)
                 {
                     record.repaired_late = None;
                 }
@@ -4028,7 +4035,8 @@ impl Management {
         // If this daemon's own causal clock already expired, retain that historical miss while
         // recording the inbound full exchange as its eventual repair.
         let missed_cause = if retained_miss {
-            Some(self.computer.record_missed_exchange(peer, revision, true)?)
+            self.computer
+                .record_missed_exchange(peer, revision, policy_revision, true)?
         } else {
             self.computer.record_timely_exchange(peer, revision)?;
             None

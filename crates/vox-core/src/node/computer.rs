@@ -1118,8 +1118,9 @@ pub(crate) struct State {
     /// (ADR-038 FX-28): a binding is derived once per revision, across restarts too, and a node
     /// whose record names the current revision is left alone.
     pub derived: BTreeMap<Digest32, DerivedBinding>,
-    /// Peers for which this exact local revision was repaired only after its causal deadline.
-    /// This operational truth is durable so restart cannot turn a missed contract into success.
+    /// Peers for which this exact local operator-policy revision missed its causal deadline,
+    /// and whether a real ordinary exchange later repaired it. Journal delivery positions are
+    /// not policy owners. This history is durable across later payload movement and restart.
     pub missed_exchanges: BTreeMap<Digest32, (u64, bool)>,
     /// Pre-candidate received expiry markers, retained only so a state written by an earlier
     /// FX-28 development build can heal on its next authenticated matching-frontier exchange.
@@ -1129,9 +1130,10 @@ pub(crate) struct State {
     /// Latest local application boundary missed by each managed node. Completion clears the
     /// node's live pending state but not this historical fact; one record per node bounds growth.
     application_misses: BTreeMap<Digest32, u64>,
-    /// A causal exchange obligation is recorded before any network work begins. A timely merge
-    /// removes it in the same durable transaction; after a crash an unresolved obligation is a
-    /// miss, never permission to manufacture a fresh convergence clock.
+    /// Oldest unresolved ordinary-delivery watermark for each peer. A policy change records
+    /// its policy revision; later preview/receipt/reach payloads may instead own a journal-only
+    /// watermark. A complete sent snapshot may clear only covered values. Only an exact policy
+    /// watermark can become policy-miss history; journal-only work remains queued on restart.
     pub pending_exchanges: BTreeMap<Digest32, u64>,
     intervals: BTreeMap<Digest32, Vec<MembershipInterval>>,
     retired_nodes: BTreeMap<Digest32, u64>,
@@ -4050,43 +4052,55 @@ impl Computer {
         (state.policy_revision, state.missed_exchanges.clone())
     }
 
+    /// Record a missed policy owner separately from the ordinary snapshot's journal coverage.
+    /// `sent_revision` is the completed snapshot on success, or the owned source position when
+    /// expiring a failed/blocked cause; that source position alone proves no delivery. `repaired`
+    /// means this real exchange completed, not that an older exchange once repaired the policy.
+    /// Without an exact pending/retained policy owner there is only
+    /// an operational transport outcome, so no policy history is created.
     pub(crate) fn record_missed_exchange(
         &self,
         peer: Digest32,
-        revision: u64,
+        sent_revision: u64,
+        policy_revision: u64,
         repaired: bool,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         self.change_durable(|state| {
-            // A superseded older flight cannot consume or expire the newer operator cause which
-            // replaced its obligation before the scheduler cut it.
-            let pending = state
+            // A superseded older flight cannot consume or repair the newer operator cause.
+            if state.policy_revision != policy_revision {
+                return Ok(None);
+            }
+            let covered_pending = state
                 .pending_exchanges
                 .get(&peer)
                 .copied()
-                .filter(|cause| *cause <= revision);
-            let retained = state
+                .filter(|watermark| *watermark <= sent_revision);
+            let pending_policy = covered_pending.filter(|owner| *owner == policy_revision);
+            let retained_policy = state
                 .missed_exchanges
                 .get(&peer)
-                .map(|(cause, _)| *cause)
-                .filter(|cause| *cause == state.policy_revision);
-            let cause = pending.or(retained).unwrap_or(revision);
-            // A failed fallback or reachability-only journal exchange is transport evidence, not
-            // an expired operator policy. Policy causes are always atomically pending; equality
-            // retains the conservative migration behavior for a pre-amendment state.
-            if pending.is_none() && retained.is_none() && revision != state.policy_revision {
-                return Ok(revision);
+                .map(|(owner, _)| *owner)
+                .filter(|owner| *owner == policy_revision);
+            // Expiring an actual policy cause consumes its pending consequence. Only actual
+            // successful delivery may also consume covered journal-only work. Repaired history
+            // alone is never evidence that this attempt sent the later preview/receipt payload.
+            if pending_policy.is_some() || (repaired && covered_pending.is_some()) {
+                state.pending_exchanges.remove(&peer);
             }
+            let Some(owner) = pending_policy.or(retained_policy) else {
+                return Ok(None);
+            };
             let held = state
                 .missed_exchanges
                 .entry(peer)
-                .or_insert((cause, repaired));
-            if cause > held.0 || (cause == held.0 && repaired) {
-                *held = (cause, repaired);
+                .or_insert((owner, repaired));
+            // A value beyond the current policy can only be the old mixed-axis journal bug.
+            // Replace it only with this independently proven current-policy owner; never infer
+            // a miss by merely relabeling an unowned journal watermark.
+            if owner > held.0 || held.0 > state.policy_revision || (owner == held.0 && repaired) {
+                *held = (owner, repaired);
             }
-            if pending.is_some() {
-                state.pending_exchanges.remove(&peer);
-            }
-            Ok(cause)
+            Ok(Some(owner))
         })
     }
 
@@ -4106,24 +4120,26 @@ impl Computer {
                 return Ok(None);
             }
             let revision = state.revision;
-            // An atomically recorded policy obligation is older and stronger than later
-            // reachability/journal movement carried by this exchange.
-            state.pending_exchanges.entry(peer).or_insert(revision);
+            // Policy obligations are already recorded atomically by their policy change. Never
+            // mint one merely because a failed fallback retries at journal == policy. Preserve
+            // any existing policy cause; a vacant later journal watermark is payload work only.
+            if revision > policy_revision {
+                state.pending_exchanges.entry(peer).or_insert(revision);
+            }
             Ok(Some(revision))
         })
     }
 
-    /// Clear a precommitted obligation only after the complete exchange returned within its
-    /// causal boundary. A crash before this durable acknowledgement leaves the conservative
-    /// unresolved record for startup to expire; it can never erase a real miss.
-    pub(crate) fn record_timely_exchange(&self, peer: Digest32, revision: u64) -> Result<()> {
+    /// Clear covered delivery work only after a real complete exchange. Policy miss history
+    /// is separate and never erased here; an unsent later journal watermark stays pending.
+    pub(crate) fn record_timely_exchange(&self, peer: Digest32, sent_revision: u64) -> Result<()> {
         self.change_durable(|state| {
             // The completed flight may acknowledge only the state it actually sent. A newer
             // obligation which appeared while it was in flight remains pending.
             if state
                 .pending_exchanges
                 .get(&peer)
-                .is_some_and(|cause| *cause <= revision)
+                .is_some_and(|watermark| *watermark <= sent_revision)
             {
                 state.pending_exchanges.remove(&peer);
             }
@@ -4131,17 +4147,22 @@ impl Computer {
         })
     }
 
-    /// A process exit cannot reset a causal clock. An exchange that was durably in progress has
-    /// no proof of timely completion after restart, so recovery promotes it to an exact miss.
+    /// A process exit cannot reset an unresolved operator-policy clock. Its exact policy
+    /// watermark becomes a miss; journal-only payload work remains queued for actual delivery
+    /// and cannot overwrite policy history with a transport/preview revision.
     pub(crate) fn recover_pending_exchanges(&self) -> Result<()> {
         self.change_durable(|state| {
-            for (peer, revision) in std::mem::take(&mut state.pending_exchanges) {
+            for (peer, watermark) in std::mem::take(&mut state.pending_exchanges) {
+                if watermark != state.policy_revision {
+                    state.pending_exchanges.insert(peer, watermark);
+                    continue;
+                }
                 let held = state
                     .missed_exchanges
                     .entry(peer)
-                    .or_insert((revision, false));
-                if revision > held.0 {
-                    *held = (revision, false);
+                    .or_insert((watermark, false));
+                if watermark > held.0 || held.0 > state.policy_revision {
+                    *held = (watermark, false);
                 }
             }
             Ok(())
