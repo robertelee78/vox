@@ -1559,10 +1559,16 @@ fn stage_hosted_nodes(
                 &as_node(&["room", "join", "--passphrase-file", "-", &link], *node),
                 Some(&format!("{ROOMPASS}\n")),
             );
-            assert!(
-                ok,
-                "APPARATUS: {who}'s staging join of {name} was refused: {err}"
-            );
+            if !ok {
+                let verdict = if err.contains("your passphrase was accepted")
+                    && (err.contains("did not answer") || err.contains("sent no frame in time"))
+                {
+                    "PRODUCT"
+                } else {
+                    "APPARATUS"
+                };
+                panic!("{verdict}: {who}'s staging join of {name} was refused: {err}");
+            }
         }
         rooms.push(room);
     }

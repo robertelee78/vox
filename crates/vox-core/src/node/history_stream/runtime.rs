@@ -193,6 +193,10 @@ pub(crate) struct Flow {
     /// The last local slice found an unfinished sparse publication. Before retrying that newer
     /// slice, select the exact older request in this Flow that owns the publication.
     publication_wait: bool,
+    /// Exact durable publication owner when it belongs to another retained Flow. The actor uses
+    /// this causal edge to resume that owner, rather than retrying this waiter on an unrelated
+    /// port cadence.
+    publication_owner_wait: Option<RequestId>,
     governance_cycles: u8,
     last_head: Option<super::HeadHint>,
     /// Immutable identity of this cleanup obligation. `request` changes as continuations are
@@ -336,6 +340,7 @@ impl Flow {
             body_progress: false,
             governance_wait: false,
             publication_wait: false,
+            publication_owner_wait: None,
             governance_cycles: 0,
             last_head: None,
             retirement_request: request,
@@ -459,6 +464,7 @@ impl Flow {
             body_progress: false,
             governance_wait: false,
             publication_wait: false,
+            publication_owner_wait: None,
             governance_cycles: 0,
             last_head: None,
             retirement_request: request,
@@ -517,6 +523,20 @@ impl Flow {
             }
         }
         false
+    }
+
+    pub(crate) fn publication_owner_wait(&self) -> Option<RequestId> {
+        self.publication_owner_wait
+    }
+
+    pub(crate) fn owns_request(&self, request: RequestId) -> bool {
+        self.request == request
+            || self.retirement_request == request
+            || self.tasks.iter().any(|task| task.request == request)
+            || self
+                .replay
+                .as_ref()
+                .is_some_and(|task| task.request == request)
     }
     /// Retain exact control closure above any ordinary-body work already on the LIFO stack.
     /// Source proof runs before effect application; a successor gets a distinct pair of tasks.
@@ -712,6 +732,21 @@ impl Flow {
             )
         )
     }
+
+    /// The exact request whose sparse publication is between Begin and Cleanup in the next
+    /// local slice. This is a durable room-wide exclusion, not ordinary retained Flow state: it
+    /// must reach Cleanup (or explicit retirement rollback) before this Flow can be parked.
+    fn active_publication_owner(&self) -> Option<RequestId> {
+        let next = self.tasks.last().or(self.replay.as_ref())?;
+        match &next.operation {
+            Operation::Local(LocalStep::Entry {
+                request,
+                phase: EntryPhase::Prepare(_) | EntryPhase::Commit(_) | EntryPhase::Cleanup(_),
+                ..
+            }) => Some(*request),
+            _ => None,
+        }
+    }
     pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
         use crate::node::history_budget::Lane;
         match self
@@ -759,6 +794,7 @@ impl Flow {
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
     pub(crate) async fn retire_slice(&mut self) -> Result<bool> {
+        self.publication_owner_wait = None;
         if !self.initialized {
             self.cancel();
             return Ok(true);
@@ -855,6 +891,11 @@ impl Flow {
                 if owned {
                     self.request = owner;
                     self.cleanup_after = None;
+                } else {
+                    // This retirement is causally blocked by one exact publication owner. The
+                    // controller runs that owner first and retries this flow from the owner's
+                    // completion, never from a wall-clock backoff.
+                    self.publication_owner_wait = Some(owner);
                 }
             }
             return Ok(false);
@@ -950,7 +991,7 @@ impl Flow {
         // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
         // 128-position live window drained at three positions a second (40 s), and a creator
         // serving three joiners at once read their first posts after 30 s (#934).
-        let started = tokio::time::Instant::now();
+        let mut quantum_started = tokio::time::Instant::now();
         let mut slices = 0u32;
         let result = loop {
             let result = self
@@ -966,15 +1007,28 @@ impl Flow {
                 )
                 .await;
             slices += 1;
+            let publication_active = self.active_publication_owner().is_some();
             if result.is_err()
                 || self.waiting
                 || self.external.is_some()
-                || slices >= LOCAL_SLICES_PER_TURN
-                || started.elapsed() >= LOCAL_TURN_BUDGET
-                || tokio::time::Instant::now() >= deadline
+                || (!publication_active
+                    && (slices >= LOCAL_SLICES_PER_TURN
+                        || quantum_started.elapsed() >= LOCAL_TURN_BUDGET
+                        || tokio::time::Instant::now() >= deadline))
                 || !self.next_slice_is_local()
             {
                 break result;
+            }
+            if publication_active
+                && (slices >= LOCAL_SLICES_PER_TURN
+                    || quantum_started.elapsed() >= LOCAL_TURN_BUDGET)
+            {
+                // The quantum protects executor fairness, not correctness. Yield the worker
+                // without returning its Flow to the actor, then finish the publication under
+                // the same running ownership.
+                tokio::task::yield_now().await;
+                slices = 0;
+                quantum_started = tokio::time::Instant::now();
             }
         };
         if result.as_ref().is_err_and(|error| {
@@ -1049,13 +1103,18 @@ impl Flow {
                 .await?;
             match owner {
                 Lookup::Found(owner) => match owner.value {
-                    None => self.publication_wait = false,
+                    None => {
+                        self.publication_wait = false;
+                        self.publication_owner_wait = None;
+                    }
                     Some(owner) if self.prioritize_publication_owner(owner) => {
                         self.publication_wait = false;
+                        self.publication_owner_wait = None;
                     }
-                    Some(_) => {
+                    Some(owner) => {
                         // Another live Flow owns the room's publication. Keep this exact task
-                        // parked; that owner's completion is the causal wake for this room.
+                        // parked and name that owner so the actor can resume its exact port.
+                        self.publication_owner_wait = Some(owner);
                         self.waiting = true;
                         return Ok(());
                     }
@@ -1173,6 +1232,7 @@ impl Flow {
                     Lookup::Found(found) => found,
                     Lookup::Missing => {
                         self.publication_wait = true;
+                        self.publication_owner_wait = None;
                         self.push(task)?;
                         self.waiting = true;
                         return Ok(());
@@ -1280,6 +1340,7 @@ impl Flow {
                     Lookup::Found(found) => found,
                     Lookup::Missing => {
                         self.publication_wait = true;
+                        self.publication_owner_wait = None;
                         self.push(task)?;
                         self.waiting = true;
                         return Ok(());
@@ -1394,6 +1455,7 @@ impl Flow {
                     Lookup::Found(_) => {}
                     Lookup::Missing => {
                         self.publication_wait = true;
+                        self.publication_owner_wait = None;
                         self.push(task)?;
                         self.waiting = true;
                         return Ok(());
@@ -1974,9 +2036,11 @@ impl Flow {
                     if let Lookup::Found(owner) = owner {
                         if let Some(owner) = owner.value.filter(|owner| *owner != task.request) {
                             if self.prioritize_publication_owner(owner) {
+                                self.publication_owner_wait = None;
                                 return Ok(());
                             }
                             self.publication_wait = true;
+                            self.publication_owner_wait = Some(owner);
                         }
                     }
                     self.waiting = true;

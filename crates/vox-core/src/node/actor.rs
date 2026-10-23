@@ -711,7 +711,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SlotFreed => "starting a queued sync",
         NetEvent::ArchiveAdmissionReady { .. } => "starting admitted archive work",
         NetEvent::ForegroundAdmissionReady { .. } => "starting admitted foreground work",
-        NetEvent::BoundedRoomReady { .. } => "retrying work after its room was released",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
@@ -1429,12 +1428,6 @@ enum NetEvent {
     },
     /// This node's retained Control or Live ticket observed a relevant capacity release.
     ForegroundAdmissionReady {
-        token: u64,
-        room: Digest32,
-        peer: Digest32,
-    },
-    /// The exact room mutex a bounded port met busy was released.
-    BoundedRoomReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
@@ -10540,13 +10533,6 @@ impl Node {
                         .release_foreground_admission(token, room, peer);
                 }
             }
-            NetEvent::BoundedRoomReady { token, room, peer } => {
-                if self.bounded_sync.release_room_admission(token, room, peer)
-                    && self.port_eligible(&(room, peer), std::time::Instant::now())
-                {
-                    self.sched_rooms.insert(room);
-                }
-            }
             NetEvent::BoundedSecretReady { token, room, peer } => {
                 if self
                     .bounded_sync
@@ -14721,18 +14707,26 @@ impl Node {
         self.note_local_append(channel_id);
     }
 
-    /// The room instance `channel_id` names now, and its generation counter.
+    /// The room instance `channel_id` names now and the immutable scheduling facts of that
+    /// instance. Start admission reads these from the port mirror instead of waiting on the room
+    /// mutex in the actor.
     async fn room_ref(
         &self,
         channel_id: &Digest32,
     ) -> Option<(
         crate::node::ports::RoomRef,
         Arc<std::sync::atomic::AtomicU64>,
+        u64,
+        bool,
     )> {
         use crate::node::ports::RoomRef;
+        let store = self.log_store()?;
         if let Some(shared) = self.channels.get(channel_id) {
-            let gen = shared.lock().await.generation();
-            return Some((RoomRef::Channel(Arc::downgrade(shared)), gen));
+            let channel = shared.lock().await;
+            let gen = channel.generation();
+            let epoch = channel.epoch();
+            let sparse = channel.uses_sparse_history(&store).ok()?;
+            return Some((RoomRef::Channel(Arc::downgrade(shared)), gen, epoch, sparse));
         }
         None
     }
@@ -14775,12 +14769,12 @@ impl Node {
         if !self.shares_room(channel_id, peer).await {
             return false;
         }
-        let Some((room, gen)) = self.room_ref(channel_id).await else {
+        let Some((room, gen, epoch, sparse)) = self.room_ref(channel_id).await else {
             return false;
         };
         self.ports.insert(
             (*channel_id, *peer),
-            crate::node::ports::Port::new(room, gen),
+            crate::node::ports::Port::new(room, gen, epoch, sparse),
         );
         self.sched_rooms.insert(*channel_id);
         true
@@ -15441,47 +15435,20 @@ impl Node {
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             return false;
         };
-        // **Not with a member that left** (V210-164): it holds no room to sync, and refused every
-        // session for it. Its port is marked served; a member that joins again syncs from its own
-        // side, and is synced with again once it says it is back.
-        // The first gate takes the room without waiting (ADR-038 FX-35): a start that waited on
-        // a held room would hold the scheduler and the selected waiter with it.
-        let (left, sparse) = match shared.try_lock() {
-            Ok(channel) => (channel.has_left(&peer), channel.uses_sparse_history(&store)),
-            Err(_) => {
-                let work = self.bounded_pending_identity(channel_id, peer);
-                self.bounded_sync.wait_for_room(
-                    &self.net_tx,
-                    &mut self.next_token,
-                    channel_id,
-                    peer,
-                    work,
-                    Arc::clone(&shared),
-                );
-                self.note_start(channel_id, peer, "room_busy");
-                return false;
-            }
-        };
-        if left {
-            if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
-                port.req_done = port.req_gen;
-                port.done_gen = port.gen.load(std::sync::atomic::Ordering::Relaxed);
-            }
+        let Some((epoch, sparse)) = self
+            .ports
+            .get(&(channel_id, peer))
+            .map(|port| (port.epoch, port.sparse))
+        else {
             return false;
-        }
-        match sparse {
-            Ok(true) => {
-                // The bounded starter notes the attempt's own end.
-                return self
-                    .start_bounded_outbound(channel_id, peer, shared, store, conn)
-                    .await;
-            }
-            Err(_) => {
-                // The room's store could not be read at this moment.
-                self.note_start(channel_id, peer, "room_busy");
-                return false;
-            }
-            Ok(false) => {}
+        };
+        if sparse {
+            // The bounded starter notes the attempt's own end. Membership and epoch are checked
+            // again under the room mutex by its first local slice; the actor never waits on that
+            // mutex merely to start a worker.
+            return self
+                .start_bounded_outbound(channel_id, peer, epoch, shared, store, conn)
+                .await;
         }
         let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
             return false;
@@ -16310,10 +16277,10 @@ impl Node {
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
         if departure_receipt {
-            if let Some((room, gen)) = self.room_ref(&channel_id).await {
+            if let Some((room, gen, epoch, sparse)) = self.room_ref(&channel_id).await {
                 self.ports
                     .entry((channel_id, peer))
-                    .or_insert_with(|| crate::node::ports::Port::new(room, gen));
+                    .or_insert_with(|| crate::node::ports::Port::new(room, gen, epoch, sparse));
             }
         }
         if !self.ensure_port(&channel_id, &peer).await {

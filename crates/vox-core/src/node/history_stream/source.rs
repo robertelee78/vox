@@ -301,12 +301,14 @@ impl Source {
         let Some(scratch) = work_job.reserve(temporary) else {
             return Ok(Lookup::Busy);
         };
+        // A round deadline may end wire work, but it cannot make a queued local room step fail.
+        // The mutex release is the causal wake for this bounded operation; wall-clock expiry is
+        // neither evidence that the room is wedged nor permission to abandon a publication that
+        // this request may already own. Cancellation remains exact through the attempt fence.
         let mut room = tokio::select! {
             biased;
             () = self.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-            result = tokio::time::timeout_at(self.deadline, self.room.clone().lock_owned()) => {
-                result.map_err(|_| Error::Unreachable("history room lock deadline elapsed"))?
-            }
+            room = self.room.clone().lock_owned() => room,
         };
         self.current()?;
         let source = self.clone();

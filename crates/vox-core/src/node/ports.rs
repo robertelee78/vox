@@ -235,6 +235,13 @@ pub struct Port {
     pub room: RoomRef,
     /// The room's generation.
     pub gen: Arc<AtomicU64>,
+    /// Immutable epoch of this room instance. A reopen or epoch change replaces the room
+    /// instance and therefore this port; outbound scheduling does not need the room mutex merely
+    /// to rediscover it.
+    pub epoch: u64,
+    /// Wire/history format of this room instance. The sparse marker is immutable after creation;
+    /// keeping it with the port removes room-lock acquisition from the scheduler's start path.
+    pub sparse: bool,
     /// At most one outbound attempt.
     pub out: Option<Attempt>,
     /// Up to [`INBOUND_PER_PORT`] inbound attempts.
@@ -277,10 +284,12 @@ pub struct Port {
 impl Port {
     /// A fresh port for `room`, with a request raised: a new port syncs at once.
     #[must_use]
-    pub fn new(room: RoomRef, gen: Arc<AtomicU64>) -> Self {
+    pub fn new(room: RoomRef, gen: Arc<AtomicU64>, epoch: u64, sparse: bool) -> Self {
         Self {
             room,
             gen,
+            epoch,
+            sparse,
             out: None,
             inbound: BTreeMap::new(),
             queued: false,
