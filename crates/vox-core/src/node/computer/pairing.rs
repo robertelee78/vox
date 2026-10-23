@@ -2263,11 +2263,11 @@ impl Management {
         )
         .await?;
         let (op, peer, _, echoed_remaining_ms) =
-            read_hello_until(&mut recv, &conn, deadline).await?;
+            read_response_hello_until(&mut recv, &conn, deadline).await?;
         if op != 1 || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
-        let f = frame_until(&mut recv, deadline).await?;
+        let f = response_frame_until(&mut recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 3)?;
         let sid = d.bytes()?.to_vec();
@@ -2304,7 +2304,7 @@ impl Management {
             .bytes(&share)
             .bytes(&pop::seal_pop(isk.as_ref(), &proof)?);
         write_frame_until(&mut send, &e.finish(), deadline).await?;
-        let f = frame_until(&mut recv, deadline).await?;
+        let f = response_frame_until(&mut recv, deadline).await?;
         let mut d = Decoder::new(&f);
         arity(&mut d, 2)?;
         let proof = pop::open_pop(isk.as_ref(), d.bytes()?)?;
@@ -3463,12 +3463,13 @@ impl Management {
             deadline,
         )
         .await?;
-        let (op, _, _, echoed_remaining_ms) = read_hello_until(&mut recv, &conn, deadline).await?;
+        let (op, _, _, echoed_remaining_ms) =
+            read_response_hello_until(&mut recv, &conn, deadline).await?;
         if op != 2 || echoed_remaining_ms != remaining_ms {
             return Err(bad());
         }
         write_frame_until(&mut send, &payload, deadline).await?;
-        let f = frame_until(&mut recv, deadline).await?;
+        let f = response_frame_until(&mut recv, deadline).await?;
         #[cfg(feature = "test-knobs")]
         self.partition_computer_peer_for_proof(peer)?;
         // A merge that moves this daemon's revision is a change here: `change` wakes the
@@ -4127,6 +4128,39 @@ async fn read_hello_until(
     let f = frame_until(recv, deadline).await?;
     parse_hello(&f, conn)
 }
+async fn read_response_hello_until(
+    recv: &mut RecvStream,
+    conn: &VoxConnection,
+    deadline: std::time::Instant,
+) -> Result<(u64, Description, Digest32, u64)> {
+    let f = response_frame_until(recv, deadline).await?;
+    parse_hello(&f, conn)
+}
+
+/// Every answer phase can return the tagged `[0, text]` refusal instead of its successful
+/// payload. The final pairing success is also an array of two, but starts with bytes: array
+/// length alone must never classify it as a refusal. The existing frame bound, canonical
+/// decoder, exact tag and end check apply before displaying the peer's words. This only
+/// reports a failure on the authenticated transport; it establishes no pairing-code proof,
+/// enrollment or ordinary-policy delivery.
+async fn response_frame_until(
+    recv: &mut RecvStream,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>> {
+    let f = frame_until(recv, deadline).await?;
+    #[cfg(feature = "test-knobs")]
+    if super::fx28_mutant("owner-refusal-decoded-as-payload") {
+        return Ok(f);
+    }
+    let mut d = Decoder::new(&f);
+    if d.array()? == 2 && d.uint() == Ok(0) {
+        let problem = d.text()?;
+        d.finish()?;
+        return Err(Error::ComputerRefused(problem.to_owned()));
+    }
+    Ok(f)
+}
+
 fn parse_hello(f: &[u8], conn: &VoxConnection) -> Result<(u64, Description, Digest32, u64)> {
     let mut d = Decoder::new(f);
     arity(&mut d, 6)?;

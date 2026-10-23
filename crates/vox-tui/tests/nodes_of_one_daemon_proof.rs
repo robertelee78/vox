@@ -1594,6 +1594,7 @@ fn computer_preview_and_approval_survive_a_crash() {
 /// repair; discarding failed transport work means the remote anchor's return never causes
 /// registration; clearing a late success hides the missed contract before preview/restart;
 /// making a fresh preview inherit an older missed deadline refuses its authenticated code;
+/// decoding a tagged owner refusal as enrollment data hides why a cancelled code was refused;
 /// bypassing only the final state-locked Ready fence exposes an old projection after a real
 /// later operator policy changed the personal-node role. Historical transport lateness does not
 /// revoke the receiver's authenticated current policy.
@@ -2517,6 +2518,8 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
                     .is_some_and(|revision| revision >= late_revision)
             });
         let repaired = completed_snapshot
+            && left_status["state"] == "confirmed"
+            && right_status["state"] == "confirmed"
             && exact_roster(&left_status, &late_roster)
             && exact_roster(&right_status, &late_roster)
             && roster_current(&right_status, &["after-remote-anchor-b"])
@@ -2539,11 +2542,20 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    // Real ordinary coverage has just confirmed both installations and every grant through
+    // their still-running anchor. The cancelled invitation must now receive the owner's real
+    // refusal, rather than interpreting its tagged error as a malformed enrollment payload.
+    println!("[proof] FX-28 owner-refusal apparatus staged: both installations just confirmed actual ordinary coverage on the live anchor path before retrying the cancelled invitation");
     let (preview_ok, preview_out, preview_err) =
         a.run(&["computer", "pair", &race_link, "--preview", "--json"], "");
+    let preview_shown = format!("{preview_out}{preview_err}");
     assert!(
-        !preview_ok,
-        "PRODUCT: the cancelled same-state preview unexpectedly succeeded after a missed contract: {preview_out}{preview_err}"
+        !preview_ok
+            && preview_shown.contains("computer peer refused the request:")
+            && (preview_shown.contains(
+                "computer pairing code expired, cancelled, or unknown; no new trust was established",
+            ) || preview_shown.contains("computer pairing code expired or was cancelled")),
+        "PRODUCT [FX28 owner-refusal]: on the already-confirmed live computer path, the cancelled same-state preview did not return the owner's genuine cancellation refusal: stdout {preview_out}; stderr {preview_err}"
     );
     let after_preview = computer(&a, &["status"]);
     let after_failed_preview = application_toward(&a, &b_id);
