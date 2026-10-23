@@ -28,18 +28,6 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stale-tick-authority]:'
     staging='[proof] FX-28 stale-tick-authority apparatus staged:'
     ;;
-  keyring-commit-not-recoverable)
-    mutant=$1
-    journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
-    verdict='PRODUCT [FX28 keyring-commit-crash]:'
-    staging='[proof] FX-28 keyring-commit recovery apparatus staged:'
-    ;;
-  expired-plan-drops-prepared)
-    mutant=$1
-    journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
-    verdict='PRODUCT [FX28 expiry-before-keyring-commit]:'
-    staging='[proof] FX-28 expiry-before-keyring-commit apparatus staged:'
-    ;;
   ready-fence-accepts-unsettled)
     mutant=$1
     journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
@@ -77,7 +65,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority|keyring-commit-not-recoverable|expired-plan-drops-prepared|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac

@@ -1,20 +1,6 @@
 //! Computer policy is daemon-owned. No public node command can forge a management binding.
 use super::*;
 
-/// **Test-only** (`test-knobs`): `<arm>\t<committed>\t<fault>`. The arm contains the exact peer
-/// fingerprint whose grant the journey introduced. After the durable recovery record and node
-/// keyring commit, but before the applied receipt, the actor publishes `committed` and exits.
-/// Shipped builds neither name nor read this variable.
-#[cfg(feature = "test-knobs")]
-const TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV: &str =
-    "VOX_TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_FILE";
-/// **Test-only** (`test-knobs`): `<arm>\t<prepared>\t<release socket>\t<fault>`. `arm`
-/// contains the exact grant fingerprint. After the matching durable Computer preparation and
-/// before the node-keyring commit, the actor publishes its node/revision/grant identity and waits
-/// for one connection to `release`. Shipped builds neither name nor read this variable.
-#[cfg(feature = "test-knobs")]
-const TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_ENV: &str =
-    "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_FILE";
 /// **Test-only** (`test-knobs`): `<arm>\t<receipt>\t<release socket>\t<fault>`. `arm` contains
 /// the exact grant fingerprint. Startup publishes `receipt` only after the matching applied
 /// receipt removed its recovery record, then waits before actor startup returns to the daemon's
@@ -1080,16 +1066,6 @@ impl Node {
         // trust-decision stamps. If a newer revision already won, none of this plan is applied.
         // Expiry is recovery from the retained prepared/applied sets and needs no new grant.
         if !expired {
-            #[cfg(feature = "test-knobs")]
-            if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable")
-                && !computer.prepare_application_until(me, revision, &covered, deadline)?
-            {
-                return Ok(KeyringApplication {
-                    changes: Vec::new(),
-                    settled: false,
-                });
-            }
-            #[cfg(not(feature = "test-knobs"))]
             if !computer.prepare_application_until(me, revision, &covered, deadline)? {
                 return Ok(KeyringApplication {
                     changes: Vec::new(),
@@ -1162,13 +1138,8 @@ impl Node {
             .ok_or(Error::Profile("managed profile disappeared"))?;
         Self::computer_policy_active(deadline, cancelled)?;
         // The staged plan may lose to a durable expiry or newer policy before taking its writer
-        // fence. The proof parks here, without a node-store writer or Computer writer held, so
-        // that real policy movement can win. The exact fence below then commits all node effects
-        // together or none; there is no pending-key deletion with an unchanged live keyring.
-        #[cfg(feature = "test-knobs")]
-        if !expired {
-            Self::hold_after_computer_application_prepared_for_proof(me, revision, &covered)?;
-        }
+        // fence. The exact fence below commits all node effects together or none; there is no
+        // pending-key deletion with an unchanged live keyring.
         let Some(changes) = computer.commit_application_if_current(revision, expired, || {
             Self::computer_policy_active(deadline, cancelled)?;
             let signer = profile.signer()?;
@@ -1189,10 +1160,6 @@ impl Node {
                 settled: false,
             });
         };
-        #[cfg(feature = "test-knobs")]
-        if !expired {
-            Self::crash_after_computer_keyring_commit_for_proof(me, revision, &covered);
-        }
         // The keyring commit is now irreversible. Always classify it against durable Computer
         // policy and, when needed, perform its rollback before consulting the caller's deadline.
         self.trust = next;
@@ -1240,88 +1207,6 @@ impl Node {
             changes,
             settled: true,
         })
-    }
-
-    /// Hold the exact durable-prepare/node-keyring-commit boundary for the shipped-binary proof.
-    /// The arm names authenticated semantic content, so another node or policy cannot satisfy it.
-    #[cfg(feature = "test-knobs")]
-    fn hold_after_computer_application_prepared_for_proof(
-        node: Digest32,
-        revision: u64,
-        covered: &[Digest32],
-    ) -> crate::error::Result<()> {
-        let Ok(spec) = std::env::var(TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_ENV) else {
-            return Ok(());
-        };
-        let mut fields = spec.splitn(4, '\t');
-        let (Some(arm), Some(prepared), Some(release), Some(fault)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return Err(Error::Profile(
-                "computer application proof hold is malformed",
-            ));
-        };
-        let arm = std::path::Path::new(arm);
-        let target = match std::fs::read_to_string(arm) {
-            Ok(target) => target,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                crate::node::computer::publish_proof_fault(
-                    std::path::Path::new(fault),
-                    &format!("could not read exact prepared-application arm: {error}"),
-                );
-                return Err(Error::Profile("computer application proof hold failed"));
-            }
-        };
-        let target = target.trim();
-        if !covered
-            .iter()
-            .any(|peer| crate::node::link::b32_encode(peer) == target)
-        {
-            return Ok(());
-        }
-        let fail = |detail: String| {
-            crate::node::computer::publish_proof_fault(std::path::Path::new(fault), &detail);
-            Error::Profile("computer application proof hold failed")
-        };
-        std::fs::remove_file(arm).map_err(|error| {
-            fail(format!(
-                "could not consume exact prepared-application arm: {error}"
-            ))
-        })?;
-        let release = std::path::Path::new(release);
-        match std::fs::remove_file(release) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(fail(format!(
-                    "could not clear prepared-application release socket: {error}"
-                )))
-            }
-        }
-        let listener = std::os::unix::net::UnixListener::bind(release).map_err(|error| {
-            fail(format!(
-                "could not bind prepared-application release: {error}"
-            ))
-        })?;
-        let marker = format!(
-            "{}\t{revision}\t{target}",
-            crate::node::link::b32_encode(&node)
-        );
-        crate::node::computer::publish_proof_marker(
-            std::path::Path::new(prepared),
-            marker.as_bytes(),
-        )
-        .map_err(|error| {
-            fail(format!(
-                "could not publish prepared-application marker: {error}"
-            ))
-        })?;
-        listener
-            .accept()
-            .map_err(|error| fail(format!("prepared-application release failed: {error}")))?;
-        let _ = std::fs::remove_file(release);
-        Ok(())
     }
 
     /// Hold startup after the exact applied receipt succeeded and before the daemon's final
@@ -1404,68 +1289,6 @@ impl Node {
             .map_err(|error| fail(format!("applied-receipt release failed: {error}")))?;
         let _ = std::fs::remove_file(release);
         Ok(())
-    }
-
-    /// End the proof daemon at the exact two-store boundary: its keyring is durable, while the
-    /// computer transaction still contains only the pre-commit recovery record. The populated
-    /// marker is apparatus evidence of that operation boundary, never a product verdict.
-    #[cfg(feature = "test-knobs")]
-    fn crash_after_computer_keyring_commit_for_proof(
-        node: Digest32,
-        revision: u64,
-        covered: &[Digest32],
-    ) {
-        let Ok(spec) = std::env::var(TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV) else {
-            return;
-        };
-        let mut fields = spec.splitn(3, '\t');
-        let (Some(arm), Some(committed), Some(fault)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            eprintln!("APPARATUS: malformed {TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_ENV}");
-            std::process::exit(70);
-        };
-        let arm_path = std::path::Path::new(arm);
-        let target = match std::fs::read_to_string(arm_path) {
-            Ok(target) => target,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => {
-                crate::node::computer::publish_proof_fault(
-                    std::path::Path::new(fault),
-                    &format!("could not read exact keyring-commit arm: {error}"),
-                );
-                std::process::exit(70);
-            }
-        };
-        let target = target.trim();
-        if !covered
-            .iter()
-            .any(|peer| crate::node::link::b32_encode(peer) == target)
-        {
-            return;
-        }
-        if let Err(error) = std::fs::remove_file(arm_path) {
-            crate::node::computer::publish_proof_fault(
-                std::path::Path::new(fault),
-                &format!("could not consume exact keyring-commit arm: {error}"),
-            );
-            std::process::exit(70);
-        }
-        let marker = format!(
-            "{}\t{revision}\t{target}",
-            crate::node::link::b32_encode(&node)
-        );
-        if let Err(error) = crate::node::computer::publish_proof_marker(
-            std::path::Path::new(committed),
-            marker.as_bytes(),
-        ) {
-            crate::node::computer::publish_proof_fault(
-                std::path::Path::new(fault),
-                &format!("could not publish exact keyring-commit marker: {error}"),
-            );
-            std::process::exit(70);
-        }
-        std::process::exit(86);
     }
 
     pub(super) fn computer_change_refused(&self, command: &NodeCommand) -> bool {

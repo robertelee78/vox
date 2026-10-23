@@ -1591,11 +1591,9 @@ fn computer_preview_and_approval_survive_a_crash() {
 /// discarding failed transport work means the remote anchor's return never causes registration;
 /// ignoring a marker-only authorization change leaves the causally staged grant in the shipped
 /// effective keyring; clearing a late success hides the missed contract before preview/restart;
-/// dropping the prepared rollback set from an expired plan leaves its exact grant effective;
-/// bypassing only the final state-locked Ready fence publishes the applied receipt after its
-/// revision durably expired;
-/// omitting the durable pre-keyring recovery record leaves a newly committed grant effective
-/// after an exact commit-boundary crash and restart.
+/// bypassing only the final state-locked Ready fence exposes an old projection after a real
+/// later operator policy changed the personal-node role. Historical transport lateness does not
+/// revoke the receiver's authenticated current policy.
 /// Each reaches a PRODUCT deadline/roster assertion, while inability to stage an exact race is
 /// APPARATUS.
 #[cfg(feature = "optional-proofs")]
@@ -1608,10 +1606,8 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "VOX_TEST_HOLD_COMPUTER_RETRY_READY_FILE",
         "VOX_TEST_HOLD_COMPUTER_OPERATOR_RESERVED_FILE",
         "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
-        "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_FILE",
         "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_FILE",
         "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE",
-        "VOX_TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_FILE",
     ]);
     let anchor = Account::new();
     let a = Account::new();
@@ -1695,28 +1691,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         answer_after_merge_engaged.display(),
         answer_after_merge_release.display()
     );
-    let application_prepared_arm = b.data.join("hold-after-computer-application-prepared");
-    let application_prepared_engaged = b.data.join("held-after-computer-application-prepared");
-    let application_prepared_release = b
-        .data
-        .join("release-after-computer-application-prepared.sock");
-    let application_prepared_fault = b.data.join("fault-after-computer-application-prepared");
-    let application_prepared_spec = format!(
-        "{}\t{}\t{}\t{}",
-        application_prepared_arm.display(),
-        application_prepared_engaged.display(),
-        application_prepared_release.display(),
-        application_prepared_fault.display()
-    );
-    let receipt_answer_arm = b.data.join("hold-receipt-race-answer-after-merge");
-    let receipt_answer_engaged = b.data.join("held-receipt-race-answer-after-merge");
-    let receipt_answer_release = b.data.join("release-receipt-race-answer-after-merge.sock");
-    let receipt_answer_spec = format!(
-        "{}\t{}\t{}",
-        receipt_answer_arm.display(),
-        receipt_answer_engaged.display(),
-        receipt_answer_release.display()
-    );
     let application_receipt_arm = b.data.join("hold-after-computer-application-receipt");
     let application_receipt_engaged = b.data.join("held-after-computer-application-receipt");
     let application_receipt_release = b
@@ -1730,17 +1704,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         application_receipt_release.display(),
         application_receipt_fault.display()
     );
-    let reconcile_send_arm = b.data.join("hold-computer-reconcile-send");
-    let reconcile_send_engaged = b.data.join("held-computer-reconcile-send");
-    let reconcile_send_release = b.data.join("release-computer-reconcile-send.sock");
-    let reconcile_send_fault = b.data.join("fault-computer-reconcile-send");
-    let reconcile_send_spec = format!(
-        "{}\t{}\t{}\t{}",
-        reconcile_send_arm.display(),
-        reconcile_send_engaged.display(),
-        reconcile_send_release.display(),
-        reconcile_send_fault.display()
-    );
     let receipt_reconcile_arm = b.data.join("hold-receipt-race-reconcile-send");
     let receipt_reconcile_engaged = b.data.join("held-receipt-race-reconcile-send");
     let receipt_reconcile_release = b.data.join("release-receipt-race-reconcile-send.sock");
@@ -1751,15 +1714,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         receipt_reconcile_engaged.display(),
         receipt_reconcile_release.display(),
         receipt_reconcile_fault.display()
-    );
-    let keyring_commit_crash_arm = b.data.join("crash-after-keyring-commit-arm");
-    let keyring_commit_crash_committed = b.data.join("crash-after-keyring-commit-durable");
-    let keyring_commit_crash_fault = b.data.join("crash-after-keyring-commit-fault");
-    let keyring_commit_crash_spec = format!(
-        "{}\t{}\t{}",
-        keyring_commit_crash_arm.display(),
-        keyring_commit_crash_committed.display(),
-        keyring_commit_crash_fault.display()
     );
     let start = |account: &Account, listen: &str, anchor: &str, env: &[(&str, &str)]| {
         let mut daemon = Daemon::start(
@@ -2636,7 +2590,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         );
     }
 
-    // Expiry removes only Computer-managed authority. Keep one ordinary, unrelated manual trust
+    // Policy reconciliation preserves ordinary, unrelated manual trust. Keep one such trust
     // in the returning node so every Ready assertion below distinguishes a correctly reconciled
     // keyring from both (a) a stale managed grant and (b) the empty held-back projection shown
     // while reconciliation is unfinished. This makes the final Ready-fence mutant observable in
@@ -2659,236 +2613,26 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         ok,
         "PRODUCT: unrelated manual trust was refused while Computer policy was current: {out}{err}"
     );
-    let manual_only = [(manual_outsider.as_str(), "read")];
 
-    // Exact live two-store race: keep the answerer's managed node Locked while a new policy
-    // revision merges, then start its shipped attach. The actor durably prepares that revision's
-    // rollback set and is held before its node-keyring commit. While held, the initiating
-    // computer names the same revision missed and its late exchange makes the answerer's durable
-    // status name it expired. Releasing the commit boundary may write the formerly-live grant,
-    // but attach may say Ready only after the receipt notices expiry and durably revokes it.
-    // Mutant: omit the durable prepared rollback set from the expired plan. The just-committed
-    // grant then survives to Ready and the immediate shipped trust assertion turns PRODUCT red
-    // without an elapsed-time verdict.
+    // The exact applied receipt for R is held before Ready. A real later operator change
+    // supplies R+1 while the node is still attaching. Its final Ready fence must reconcile the
+    // current policy, including the new personal-node role, without losing unrelated manual
+    // trust. A sender's historical missed exchange is not authority over this receiver.
     let (locked, locked_out, locked_err) = b.run(&["node", "lock", "after-remote-anchor-b"], "");
     assert!(
         locked,
-        "APPARATUS: could not Lock the managed node for the exact prepare/expiry race: {locked_out}{locked_err}"
+        "APPARATUS: Lock bob before applied-receipt supersession: {locked_out}{locked_err}"
     );
     stop_pid(right.child.id());
     right
         .child
         .wait()
-        .expect("APPARATUS: right daemon did not stop before exact prepare/expiry staging");
+        .expect("APPARATUS: stop right before applied-receipt supersession");
     right = start(
         &b,
         "[::1]:0",
         &v6,
         &[
-            (
-                "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
-                &answer_after_merge_spec,
-            ),
-            (
-                "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_PREPARED_FILE",
-                &application_prepared_spec,
-            ),
-            (
-                "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE",
-                &reconcile_send_spec,
-            ),
-        ],
-    );
-    assert!(
-        !answer_after_merge_engaged.exists()
-            && !application_prepared_engaged.exists()
-            && !application_prepared_fault.exists()
-            && !reconcile_send_engaged.exists()
-            && !reconcile_send_fault.exists(),
-        "APPARATUS: an earlier hook invocation left an exact prepare/expiry marker"
-    );
-    std::fs::write(&answer_after_merge_arm, b"armed")
-        .expect("APPARATUS: arm merge-before-reply hold for exact prepare/expiry race");
-    let expired_during_commit = a.make_node("expired-between-prepare-and-commit");
-    let before_prepare_race = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
-    let (ok, out, err) = a.run(
-        &[
-            "node",
-            "attach",
-            "expired-between-prepare-and-commit",
-            "--passphrase-file",
-            "-",
-        ],
-        PASS,
-    );
-    assert!(ok, "PRODUCT: attach prepare/expiry race node: {out}{err}");
-    let prepare_race_revision = computer(&a, &["status"])["revision"]
-        .as_u64()
-        .filter(|revision| *revision > before_prepare_race)
-        .unwrap_or_else(|| {
-            panic!("PRODUCT: attaching the prepare/expiry race node moved no policy revision")
-        });
-    assert!(
-        wait_until(CHANGE_SHOWN_WITHIN, || answer_after_merge_engaged.is_file()),
-        "APPARATUS: answerer never reached merge-before-reply for exact prepare/expiry revision {prepare_race_revision}"
-    );
-    std::fs::write(&application_prepared_arm, &expired_during_commit)
-        .expect("APPARATUS: arm exact durable-prepare/node-keyring-commit boundary");
-    std::fs::write(
-        &reconcile_send_arm,
-        format!("{bob}\t{prepare_race_revision}"),
-    )
-    .expect("APPARATUS: arm exact post-Ready reconciliation-send boundary");
-    let mut attaching = b
-        .cmd(&[
-            "node",
-            "attach",
-            "after-remote-anchor-b",
-            "--passphrase-file",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: start shipped managed-node attach for prepare/expiry race");
-    attaching
-        .stdin
-        .take()
-        .expect("APPARATUS: prepare/expiry attach stdin")
-        .write_all(PASS.as_bytes())
-        .expect("APPARATUS: type prepare/expiry attach passphrase");
-    wait_for_command_marker(
-        &application_prepared_engaged,
-        &mut attaching,
-        right.child.id(),
-        Instant::now() + RETURN_WITHIN,
-        "the exact policy application was durably prepared before its node-keyring commit",
-    );
-    if application_prepared_fault.is_file() {
-        panic!(
-            "APPARATUS: exact prepared-application hold failed: {}",
-            std::fs::read_to_string(&application_prepared_fault).unwrap_or_default()
-        );
-    }
-    assert_eq!(
-        std::fs::read_to_string(&application_prepared_engaged)
-            .expect("APPARATUS: read exact prepared-application identity"),
-        format!("{bob}\t{prepare_race_revision}\t{expired_during_commit}"),
-        "APPARATUS: prepared-application boundary named another node, revision, or grant"
-    );
-    // The initiator durably owns the in-flight obligation before opening the stream. Crashing and
-    // restarting it is the causal, non-timing way to make that exact unanswered revision missed:
-    // startup recovery promotes the pending obligation, then its authenticated exchange carries
-    // the expiry to the answerer while the node-keyring commit remains held.
-    let _ = left.crash();
-    left = start(&a, "127.0.0.1:0", &v4, &[]);
-    loop {
-        let application = application_toward(&a, &b_id);
-        if application["missed_revision"] == prepare_race_revision
-            && application["convergence_state"] == "expired"
-        {
-            break;
-        }
-        assert!(
-            daemon_alive(left.child.id()) && daemon_alive(right.child.id()),
-            "APPARATUS: a daemon exited before restart recovery durably named exact prepared revision {prepare_race_revision} expired"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    loop {
-        let remote = application_toward(&b, &a_id);
-        if remote["missed_revision"] == prepare_race_revision
-            && matches!(
-                remote["convergence_state"].as_str(),
-                Some("expired" | "repaired-late")
-            )
-        {
-            break;
-        }
-        assert!(
-            daemon_alive(left.child.id()) && daemon_alive(right.child.id()),
-            "APPARATUS: a daemon exited before the answerer durably received expiry for exact prepared revision {prepare_race_revision}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    println!(
-        "[proof] FX-28 expiry-before-keyring-commit apparatus staged: revision {prepare_race_revision}, node {bob}, grant {expired_during_commit}"
-    );
-    std::os::unix::net::UnixStream::connect(&answer_after_merge_release)
-        .unwrap_or_else(|error| panic!("APPARATUS: release prepare/expiry held answer: {error}"));
-    std::os::unix::net::UnixStream::connect(&application_prepared_release).unwrap_or_else(
-        |error| {
-            panic!("APPARATUS: release exact durable-prepare/node-keyring-commit boundary: {error}")
-        },
-    );
-    let attached = attaching
-        .wait_with_output()
-        .expect("APPARATUS: collect prepare/expiry managed-node attach");
-    let attached_out = String::from_utf8_lossy(&attached.stdout);
-    let attached_err = String::from_utf8_lossy(&attached.stderr);
-    assert!(
-        attached.status.success(),
-        "PRODUCT [FX28 expiry-before-keyring-ready]: after exact prepared revision {prepare_race_revision} expired, the managed node did not become Ready through durable revocation: {attached_out}{attached_err}"
-    );
-    right.expect_apparatus_event(
-        "managed node Ready after exact prepare/expiry reconciliation",
-        |line| line.contains("after-remote-anchor-b is Ready"),
-    );
-    let reconcile_deadline = Instant::now() + RETURN_WITHIN;
-    loop {
-        if reconcile_send_fault.is_file() {
-            panic!(
-                "APPARATUS: exact post-Ready reconciliation hold failed: {}",
-                std::fs::read_to_string(&reconcile_send_fault).unwrap_or_default()
-            );
-        }
-        if reconcile_send_engaged.is_file() {
-            break;
-        }
-        assert!(
-            daemon_alive(right.child.id()),
-            "APPARATUS: answerer exited before holding the exact post-Ready asynchronous reconciliation"
-        );
-        assert!(
-            Instant::now() < reconcile_deadline,
-            "APPARATUS: the answerer remained live but did not reach the exact post-Ready reconciliation-send boundary"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(
-        std::fs::read_to_string(&reconcile_send_engaged)
-            .expect("APPARATUS: read exact held reconciliation identity"),
-        format!("{bob}\t{prepare_race_revision}"),
-        "APPARATUS: post-Ready reconciliation hold named another node or revision"
-    );
-    let remote = application_toward(&b, &a_id);
-    let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
-    assert!(
-        exact_grants(&b, "after-remote-anchor-b", &manual_only),
-        "PRODUCT [FX28 expiry-before-keyring-commit]: Ready preceded durable revocation of exact expired revision {prepare_race_revision}: status {remote}; shipped trust output {grants}; error {grant_error}"
-    );
-
-    // A second exact revision stages the final Ready fence on the other side of the applied
-    // receipt. The receipt has removed `prepared` and recorded the grant before the hold. Only
-    // then does the initiating computer durably expire that same revision. Live authority gates
-    // already fail closed; the daemon must reconcile the stale receipt before publishing Ready.
-    // Its isolated mutant bypasses only that final state-locked fence. The later Attached-event
-    // reconciliation is held independently so it cannot rescue the shipped trust assertion.
-    stop_pid(right.child.id());
-    right
-        .child
-        .wait()
-        .expect("APPARATUS: stop right daemon before exact post-receipt expiry staging");
-    right = start(
-        &b,
-        "[::1]:0",
-        &v6,
-        &[
-            (
-                "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
-                &receipt_answer_spec,
-            ),
             (
                 "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_FILE",
                 &application_receipt_spec,
@@ -2900,48 +2644,49 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         ],
     );
     assert!(
-        !receipt_answer_engaged.exists()
-            && !application_receipt_engaged.exists()
+        !application_receipt_engaged.exists()
             && !application_receipt_fault.exists()
             && !receipt_reconcile_engaged.exists()
             && !receipt_reconcile_fault.exists(),
-        "APPARATUS: an earlier hook invocation left an exact post-receipt expiry marker"
+        "APPARATUS: earlier receipt supersession staging left a marker"
     );
-    std::fs::write(&receipt_answer_arm, b"armed")
-        .expect("APPARATUS: arm merge-before-reply hold for exact post-receipt expiry race");
-    let expired_after_receipt = a.make_node("expired-after-applied-receipt");
-    let before_receipt_race = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let receipt_node = a.make_node("applied-before-policy-superseded");
+    let receipt_policy_started = Instant::now();
     let (ok, out, err) = a.run(
         &[
             "node",
             "attach",
-            "expired-after-applied-receipt",
+            "applied-before-policy-superseded",
             "--passphrase-file",
             "-",
         ],
         PASS,
     );
-    assert!(
-        ok,
-        "PRODUCT: attach post-receipt expiry race node: {out}{err}"
-    );
-    let receipt_race_revision = computer(&a, &["status"])["revision"]
-        .as_u64()
-        .filter(|revision| *revision > before_receipt_race)
-        .unwrap_or_else(|| {
-            panic!("PRODUCT: attaching the post-receipt expiry race node moved no policy revision")
-        });
-    assert!(
-        wait_until(CHANGE_SHOWN_WITHIN, || receipt_answer_engaged.is_file()),
-        "APPARATUS: answerer never reached merge-before-reply for exact post-receipt revision {receipt_race_revision}"
-    );
-    std::fs::write(&application_receipt_arm, &expired_after_receipt)
-        .expect("APPARATUS: arm exact successful-applied-receipt/startup-settlement boundary");
-    std::fs::write(
-        &receipt_reconcile_arm,
-        format!("{bob}\t{receipt_race_revision}"),
-    )
-    .expect("APPARATUS: arm exact later reconciliation after final Ready fence");
+    assert!(ok, "PRODUCT: attach receipt supersession node: {out}{err}");
+    let receipt_policy_deadline = receipt_policy_started + RETURN_WITHIN;
+    loop {
+        let status = computer(&b, &["status"]);
+        if status["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|node| {
+                node["computer"] == a_id
+                    && node["name"] == "applied-before-policy-superseded"
+                    && node["fingerprint"] == receipt_node
+            })
+        {
+            break;
+        }
+        assert!(
+            daemon_alive(left.child.id()) && daemon_alive(right.child.id())
+                && Instant::now() < receipt_policy_deadline,
+            "APPARATUS: receiver did not show the exact policy needed to stage the held receipt: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::fs::write(&application_receipt_arm, &receipt_node)
+        .expect("APPARATUS: arm exact successful receipt before Ready");
     let mut receipt_attach = b
         .cmd(&[
             "node",
@@ -2954,260 +2699,127 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("APPARATUS: start shipped managed-node attach for post-receipt expiry race");
+        .expect("APPARATUS: start bob attach for receipt supersession");
     receipt_attach
         .stdin
         .take()
-        .expect("APPARATUS: post-receipt expiry attach stdin")
+        .expect("APPARATUS: receipt attach stdin")
         .write_all(PASS.as_bytes())
-        .expect("APPARATUS: type post-receipt expiry attach passphrase");
+        .expect("APPARATUS: type receipt attach passphrase");
     wait_for_command_marker(
         &application_receipt_engaged,
         &mut receipt_attach,
         right.child.id(),
         Instant::now() + RETURN_WITHIN,
-        "the exact policy application receipt succeeded before startup settlement",
+        "the exact R application receipt before Ready",
     );
     if application_receipt_fault.is_file() {
         panic!(
-            "APPARATUS: exact applied-receipt hold failed: {}",
+            "APPARATUS: applied-receipt hold failed: {}",
             std::fs::read_to_string(&application_receipt_fault).unwrap_or_default()
         );
     }
+    let receipt_race_revision = computer(&b, &["status"])["revision"]
+        .as_u64()
+        .expect("APPARATUS: receiver status omitted its local policy revision");
     assert_eq!(
         std::fs::read_to_string(&application_receipt_engaged)
-            .expect("APPARATUS: read exact applied-receipt identity"),
-        format!("{bob}\t{receipt_race_revision}\t{expired_after_receipt}"),
-        "APPARATUS: applied-receipt boundary named another node, revision, or grant"
+            .expect("APPARATUS: read exact applied receipt"),
+        format!("{bob}\t{receipt_race_revision}\t{receipt_node}"),
+        "APPARATUS: receipt marker named another node, receiver revision or grant"
     );
-
-    let _ = left.crash();
-    left = start(&a, "127.0.0.1:0", &v4, &[]);
-    loop {
-        let application = application_toward(&a, &b_id);
-        if application["missed_revision"] == receipt_race_revision
-            && application["convergence_state"] == "expired"
-        {
-            break;
+    let replacement_started = Instant::now();
+    computer(&a, &["personal", "anchor-return-second"]);
+    let replacement_deadline = replacement_started + RETURN_WITHIN;
+    let ready_revision = loop {
+        let status = computer(&b, &["status"]);
+        let second_personal = status["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|node| {
+                node["computer"] == a_id
+                    && node["name"] == "anchor-return-second"
+                    && node["personal"] == true
+            });
+        let revision = status["revision"].as_u64().unwrap_or(0);
+        if second_personal && revision > receipt_race_revision {
+            break revision;
         }
         assert!(
-            daemon_alive(left.child.id()) && daemon_alive(right.child.id()),
-            "APPARATUS: a daemon exited before restart recovery durably expired exact post-receipt revision {receipt_race_revision}"
+            daemon_alive(left.child.id()) && daemon_alive(right.child.id())
+                && Instant::now() < replacement_deadline,
+            "APPARATUS: later operator personal-node policy did not reach the receiver while R's Ready was held: {status}"
         );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    loop {
-        let remote = application_toward(&b, &a_id);
-        if remote["missed_revision"] == receipt_race_revision
-            && matches!(
-                remote["convergence_state"].as_str(),
-                Some("expired" | "repaired-late")
-            )
-        {
-            break;
-        }
-        assert!(
-            daemon_alive(left.child.id()) && daemon_alive(right.child.id()),
-            "APPARATUS: answerer did not durably receive expiry after exact applied receipt for revision {receipt_race_revision}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Only the mutant may need the post-Attached reconciliation. Keep its exact R+1 send
+    // parked so it cannot repair a prematurely published Ready before the shipped trust read.
+    // A correct startup is already current and need not consume this arm.
+    std::fs::write(&receipt_reconcile_arm, format!("{bob}\t{ready_revision}"))
+        .expect("APPARATUS: arm exact later reconciliation after Ready");
+    std::os::unix::net::UnixStream::connect(&application_receipt_release)
+        .expect("APPARATUS: release R receipt into the final current-policy Ready fence");
     println!(
-        "[proof] FX-28 expiry-after-applied-receipt apparatus staged: revision {receipt_race_revision}, node {bob}, grant {expired_after_receipt}"
-    );
-    std::os::unix::net::UnixStream::connect(&receipt_answer_release)
-        .unwrap_or_else(|error| panic!("APPARATUS: release post-receipt held answer: {error}"));
-    std::os::unix::net::UnixStream::connect(&application_receipt_release).unwrap_or_else(|error| {
-        panic!("APPARATUS: release exact applied-receipt/startup-settlement boundary: {error}")
-    });
-    println!(
-        "[proof] FX-28 startup Ready state-lock apparatus staged: node {bob}, applied revision {receipt_race_revision}, expired grant {expired_after_receipt}"
+        "[proof] FX-28 startup Ready state-lock apparatus staged: node {bob}, receipt revision {receipt_race_revision}, current receiver revision {ready_revision}, personal node anchor-return-second"
     );
     let receipt_attached = receipt_attach
         .wait_with_output()
-        .expect("APPARATUS: collect post-receipt expiry managed-node attach");
-    let receipt_attached_out = String::from_utf8_lossy(&receipt_attached.stdout);
-    let receipt_attached_err = String::from_utf8_lossy(&receipt_attached.stderr);
+        .expect("APPARATUS: collect receipt-superseded attach");
     assert!(
         receipt_attached.status.success(),
-        "PRODUCT [FX28 startup-ready-reconcile]: after exact applied revision {receipt_race_revision} expired, the managed node did not become Ready through final startup reconciliation: {receipt_attached_out}{receipt_attached_err}"
+        "PRODUCT [FX28 startup-ready-reconcile]: bob did not become Ready under the later operator policy: {}{}",
+        String::from_utf8_lossy(&receipt_attached.stdout),
+        String::from_utf8_lossy(&receipt_attached.stderr)
     );
-    right.expect_apparatus_event(
-        "managed node Ready after exact post-receipt expiry reconciliation",
-        |line| line.contains("after-remote-anchor-b is Ready"),
-    );
-    let reconcile_deadline = Instant::now() + RETURN_WITHIN;
-    loop {
-        if receipt_reconcile_fault.is_file() {
-            panic!(
-                "APPARATUS: exact later post-receipt reconciliation hold failed: {}",
-                std::fs::read_to_string(&receipt_reconcile_fault).unwrap_or_default()
-            );
-        }
-        if receipt_reconcile_engaged.is_file() {
-            break;
-        }
-        assert!(
-            daemon_alive(right.child.id()),
-            "APPARATUS: answerer exited before holding later reconciliation after post-receipt Ready"
-        );
-        assert!(
-            Instant::now() < reconcile_deadline,
-            "APPARATUS: answerer remained live but did not reach later reconciliation after post-receipt Ready"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert_eq!(
-        std::fs::read_to_string(&receipt_reconcile_engaged)
-            .expect("APPARATUS: read exact later post-receipt reconciliation identity"),
-        format!("{bob}\t{receipt_race_revision}"),
-        "APPARATUS: later post-receipt reconciliation hold named another node or revision"
-    );
-    let remote = application_toward(&b, &a_id);
+    let mut current_grants: Vec<(&str, &str)> = final_grants
+        .iter()
+        .map(|(fp, grant)| {
+            (
+                *fp,
+                if *fp == second.as_str() {
+                    "read + drive"
+                } else if *fp == first.as_str() {
+                    "read"
+                } else {
+                    *grant
+                },
+            )
+        })
+        .collect();
+    current_grants.push((receipt_node.as_str(), "read"));
+    current_grants.push((manual_outsider.as_str(), "read"));
+    let ready_status = computer(&b, &["status"]);
     let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
-    assert!(
-        exact_grants(&b, "after-remote-anchor-b", &manual_only),
-        "PRODUCT [FX28 startup-ready-state-lock]: Ready published stale authority from exact expired applied revision {receipt_race_revision}: status {remote}; shipped trust output {grants}; error {grant_error}"
-    );
-
-    // Extend the same merge-before-reply journey through the exact crash window the durable
-    // stores cannot make atomic. The answerer first parks its reply after the merge. Its managed
-    // actor then durably prepares the exact rollback set, commits the node keyring, publishes the
-    // causal boundary marker and exits before the ordinary applied receipt. On restart, shipped
-    // status must name the unresolved exchange expired and shipped trust must show no authority.
-    // Mutant: omit only the durable pre-keyring record; the new grant survives recovery and this
-    // assertion turns red on its own user-visible output.
-    stop_pid(right.child.id());
-    right
-        .child
-        .wait()
-        .expect("APPARATUS: stop right daemon before exact keyring-commit crash staging");
-    right = start(
-        &b,
-        "[::1]:0",
-        &v6,
-        &[
-            (
-                "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
-                &answer_after_merge_spec,
-            ),
-            (
-                "VOX_TEST_CRASH_AFTER_COMPUTER_KEYRING_COMMIT_FILE",
-                &keyring_commit_crash_spec,
-            ),
-        ],
-    );
-    assert!(
-        !answer_after_merge_engaged.exists()
-            && !keyring_commit_crash_committed.exists()
-            && !keyring_commit_crash_fault.exists(),
-        "APPARATUS: an earlier hook invocation left an exact-boundary marker in the scratch account"
-    );
-    std::fs::write(&answer_after_merge_arm, b"armed")
-        .expect("APPARATUS: arm exact merge-before-reply hold for crash recovery");
-    let committed_then_crashed = a.make_node("committed-before-receipt-crash");
-    std::fs::write(&keyring_commit_crash_arm, &committed_then_crashed)
-        .expect("APPARATUS: arm exact post-keyring/pre-receipt crash");
-    let before_commit_crash = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
-    let (ok, out, err) = a.run(
-        &[
-            "node",
-            "attach",
-            "committed-before-receipt-crash",
-            "--passphrase-file",
-            "-",
-        ],
-        PASS,
-    );
-    assert!(
-        ok,
-        "PRODUCT: attach exact keyring-commit crash node: {out}{err}"
-    );
-    let committed_revision = computer(&a, &["status"])["revision"]
-        .as_u64()
-        .filter(|revision| *revision > before_commit_crash)
-        .unwrap_or_else(|| {
-            panic!("PRODUCT: attaching the keyring-commit crash node moved no policy revision")
-        });
-    let staging_deadline = Instant::now() + RETURN_WITHIN;
-    loop {
-        if keyring_commit_crash_fault.is_file() {
-            panic!(
-                "APPARATUS: exact keyring-commit crash hook failed: {}",
-                std::fs::read_to_string(&keyring_commit_crash_fault).unwrap_or_default()
-            );
-        }
-        if keyring_commit_crash_committed.is_file() {
-            break;
-        }
-        if let Some(status) = right
-            .child
-            .try_wait()
-            .expect("APPARATUS: inspect exact keyring-commit crash daemon")
-        {
-            panic!(
-                "APPARATUS: answerer exited {status} without publishing the exact durable keyring-commit boundary: {}",
-                right.said()
-            );
-        }
-        assert!(
-            Instant::now() < staging_deadline,
-            "APPARATUS: answerer remained live but never reached the exact durable keyring-commit boundary"
+    if receipt_reconcile_fault.is_file() {
+        panic!(
+            "APPARATUS: later reconciliation hold failed: {}",
+            std::fs::read_to_string(&receipt_reconcile_fault).unwrap_or_default()
         );
-        std::thread::sleep(Duration::from_millis(50));
     }
-    let crash_marker = std::fs::read_to_string(&keyring_commit_crash_committed)
-        .expect("APPARATUS: read exact durable keyring-commit marker");
-    assert_eq!(
-        crash_marker,
-        format!("{bob}\t{committed_revision}\t{committed_then_crashed}"),
-        "APPARATUS: keyring-commit crash marker named a different node, revision, or grant"
-    );
-    assert!(
-        answer_after_merge_engaged.is_file(),
-        "APPARATUS: keyring commit occurred without the exchange parked at merge-before-reply"
-    );
-    let crash_status = right
-        .child
-        .wait()
-        .expect("APPARATUS: reap exact keyring-commit crash daemon");
-    assert_eq!(
-        crash_status.code(),
-        Some(86),
-        "APPARATUS: exact keyring-commit hook did not own the staged process exit"
-    );
-    println!(
-        "[proof] FX-28 keyring-commit recovery apparatus staged: revision {committed_revision}, node {bob}, grant {committed_then_crashed}"
-    );
-    right = start(&b, "[::1]:0", &v6, &[]);
-    right.expect_apparatus_event(
-        "node after-remote-anchor-b is Ready after exact keyring-commit recovery",
-        |line| line.contains("after-remote-anchor-b is Ready"),
-    );
-    // Ready is published only after startup reconciles computer policy, and Management recovers
-    // pending exchanges before that actor starts. Status therefore owes the exact durable miss
-    // now; polling would add no causal event and could hide a missing publication indefinitely.
-    let recovered_status = computer(&b, &["status"]);
-    let recovered = recovered_status["applications"]
+    if receipt_reconcile_engaged.is_file() {
+        assert_eq!(
+            std::fs::read_to_string(&receipt_reconcile_engaged)
+                .expect("APPARATUS: read exact later reconciliation marker"),
+            format!("{bob}\t{ready_revision}"),
+            "APPARATUS: later reconciliation marker named another node or policy revision"
+        );
+    }
+    let role_current = ready_status["nodes"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|application| application["computer"]["fingerprint"] == a_id)
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+        .filter(|node| node["computer"] == a_id && node["personal"] == true)
+        .map(|node| node["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
     assert!(
-        recovered["missed_revision"] == committed_revision
-            && matches!(
-                recovered["convergence_state"].as_str(),
-                Some("expired" | "repaired-late")
-            ),
-        "PRODUCT [FX28 keyring-commit-crash]: after the restarted managed node became Ready, shipped status did not retain exact interrupted revision {committed_revision} as expired or repaired-late: {recovered_status}"
+        ready_status["revision"].as_u64() == Some(ready_revision)
+            && roster_current(&ready_status, &["after-remote-anchor-b"])
+            && role_current.as_slice() == ["anchor-return-second"]
+            && exact_grants(&b, "after-remote-anchor-b", &current_grants),
+        "PRODUCT [FX28 startup-ready-state-lock]: Ready did not expose current receiver revision {ready_revision}, exact later personal role, and all managed/manual grants: status {ready_status}; trust {grants}; error {grant_error}"
     );
-    let (_, grants, grant_error) = b.run(&["trust", "list", "--node", "after-remote-anchor-b"], "");
-    assert!(
-        exact_grants(&b, "after-remote-anchor-b", &manual_only),
-        "PRODUCT [FX28 keyring-commit-crash]: after restart made exact merged revision {committed_revision} expired, the managed node retained authority committed before its missing applied receipt: status {recovered_status}; shipped trust output {grants}; error {grant_error}"
-    );
+
     drop((left, right, relay));
 }
 

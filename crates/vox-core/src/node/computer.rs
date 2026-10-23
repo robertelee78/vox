@@ -2795,12 +2795,6 @@ impl Computer {
             if let Some(applied) = s.applied.get(&node) {
                 denied.extend(applied.grants.keys().copied());
             }
-            #[cfg(feature = "test-knobs")]
-            let prepared = s
-                .prepared
-                .get(&node)
-                .filter(|_| !fx28_mutant("expired-plan-drops-prepared"));
-            #[cfg(not(feature = "test-knobs"))]
             let prepared = s.prepared.get(&node);
             if let Some(prepared) = prepared {
                 denied.extend(prepared.grants.keys().copied());

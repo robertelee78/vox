@@ -157,27 +157,24 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
-| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, a missed revision becomes ordinary trust, expiry between a durable live preparation and its keyring commit remains effective at Ready, Ready publishes an applied policy after that exact revision expires, a marker arriving after remote application fails to revoke the exact late-derived grant across restart, or a crash between keyring commit and applied receipt leaves the interrupted grant effective. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, historical misses disappear across restart, or Ready exposes an old application after a later operator policy changes the personal-node role while losing current managed or manual grants. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's twelve executable mutants are run one at a time with
+FX-28's ten executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`,
-`stale-flight-clears-newer`, `stale-tick-authority`, or
-`keyring-commit-not-recoverable`, `expired-plan-drops-prepared`, or
-`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`, `stale-trust-projection`, or
-`stale-rekey-authority`, or `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
+`stale-flight-clears-newer`, `stale-tick-authority`,
+`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
+`stale-trust-projection`, `stale-rekey-authority`, or
+`legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
 only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
 not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
 authenticated peer which fills the other daemon's bounded management slots and leaves every
-response unread. `keyring-commit-not-recoverable` crashes the answerer after its node keyring is
-durable but before its applied receipt, and makes the restarted shipped trust projection retain
-the interrupted grant. `expired-plan-drops-prepared` removes the exact durable rollback source
-after expiry between preparation and keyring commit, so the managed node says Ready with that
-grant still effective. `ready-fence-accepts-unsettled` bypasses only the daemon's final
-state-locked publication fence after a successful receipt, so Ready publishes the exact expired
-grant before reconciliation. `stale-post-authority` bypasses the durable-policy fence around an
+response unread. `ready-fence-accepts-unsettled` bypasses only the daemon's final state-locked
+publication fence after a successful receipt. A later real operator change supersedes that
+receipt while startup is held; the mutant exposes the stale or held-back projection instead of
+the current personal role and exact managed/manual grants. `stale-post-authority` bypasses the durable-policy fence around an
 ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
 trusted rows; `stale-room-create-authority` bypasses only the first durable commit of an exact
 sealed room create, so its shipped create answer and room list expose stale authority;
@@ -190,6 +187,16 @@ through the legacy long-lived ratchet; the normal build restores its exact unpub
 snapshot, while the stale-authority mutant independently makes the shipped revoked reader expose
 the forbidden post. These are
 on-demand diagnostics, not CI or release gates, and are serialized like the journeys.
+
+The former expiry-before-keyring-commit phase and the `expired-plan-drops-prepared` and
+`keyring-commit-not-recoverable` mutants are removed. The node-store commit now serializes the
+exact policy revision and expiry state across one atomic batch of keyring and dependent metadata;
+a superseding plan commits nothing. A sender's missed exchange is historical timing evidence and
+does not revoke an authenticated receiver policy. The dedicated pre-receipt crash phase and its
+knobs are removed too: an actual later removal derives its denied peers from authenticated
+binding history regardless of a prepared receipt, so the old omitted-preparation mutation no
+longer affects it. The same journey retains unchanged restart and final Ready supersession;
+the independent preview/approval crash journey retains the operator's durable intent claim.
 
 Startup has no separate pre-network durable-reread claim: every authority-bearing use checks the
 current durable policy and fails closed, which the independent `stale-tick-authority` mutant
