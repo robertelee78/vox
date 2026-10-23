@@ -13,7 +13,8 @@
   normal Tokio worker stack while reconstructing an ML-DSA root key for one signature); amended
   2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict);
   amended 2026-10-23 (FX-28: atomic node application, durable room-admission rollback, fresh
-  pairing requests and observation deadlines that do not discard valid work)
+  pairing requests, observation deadlines that do not discard valid work, and the rendezvous
+  registration handoff)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -320,6 +321,24 @@ The decider then answered twelve questions, one at a time. His answers are the d
   obligations while the new request checks the code under the existing verification and approval
   rules. A preview does not acknowledge background delivery. Reserving the peer for that request
   does not suppress observation of an older background miss or manufacture another sync attempt.
+  Rendezvous RCA, 2026-10-23: the invitation was saved and returned before its background
+  `ComputerRegister` reached the anchor. Redeeming that otherwise-valid code could therefore
+  report a store-policy refusal before any code verification. Missing publication is an
+  availability handoff: the one authenticated redemption waits for that exact owner/registration
+  to appear, with its event registered before the absence check. Registry transitions and their
+  notifications share one serialized order. Actual owner, token, expiry and serving-policy
+  refusals remain terminal; a direct connection independently races this path. The waiting
+  service task retains no history-flow charge or management permit needed by registration, and
+  cancellation of the caller's stream retires its scoped waiter. Known revocation of an existing
+  registration is retained through that registration's recorded expiry; no expiry is invented
+  for an unknown record or after an anchor restart. Active and unexpired revoked records share
+  the anchor's existing global, owner and source retention budgets, so recent withdrawals can
+  produce an ordinary capacity refusal without evicting live evidence. Transport connection,
+  registration, redemption and response reading spend the caller's one original boundary;
+  private 15 s and 30 s wrappers cannot truncate a valid pairing wait. The shipped anchor journey
+  holds the exact inviter registration, observes the redeem request reach that missing record,
+  releases publication and requires the same command to authenticate the code. Reintroducing
+  the former immediate policy rejection makes that user command fail on its own assertion.
   Local application ownership is separate from the transport exchange's bounded attempt. The
   daemon-to-node event names the exact policy revision and expiry plus its attachment/pass owner.
   Its retained observation deadline classifies on-time versus late; true supersession cancels
