@@ -354,7 +354,7 @@ pub struct Management {
     slots: Arc<tokio::sync::Semaphore>,
     problem: Mutex<Option<String>>,
     unavailable_nodes: Mutex<Vec<String>>,
-    pending_nodes: Mutex<Vec<String>>,
+    pending_nodes: Mutex<BTreeMap<String, PendingNodeApplication>>,
     transport_cache: Mutex<BTreeMap<(Digest32, Digest32), RegisteredLease>>,
     revoked_transport: Mutex<std::collections::BTreeSet<(Digest32, Digest32, u64)>>,
     /// Per computer: when this node last exchanged state with it, and how many exchanges in a row
@@ -374,6 +374,15 @@ pub struct Management {
     /// At most one authenticated reachability waiter per failing computer. Its one stream is
     /// retained by QUIC through a transient path outage and wakes retry when the path carries it.
     reachability_waiters: Mutex<BTreeMap<Digest32, (u64, tokio::task::AbortHandle)>>,
+}
+
+/// One user-visible local application result, owned by the exact durable policy target whose
+/// follower pass produced it. Status filters obsolete results instead of letting an old pass
+/// describe a newer revision while its broadcast is still being scheduled.
+#[derive(Clone)]
+struct PendingNodeApplication {
+    target: ComputerPolicyTarget,
+    words: String,
 }
 
 /// One computer's exchange record.
@@ -707,7 +716,11 @@ impl Management {
     /// Sign a receipt only for the exact locally applied policy and authenticated roster frontier.
     /// The remote receipt is a separate statement: offline peers remain pending.
     pub fn record_application(&self) -> Result<()> {
-        if !lock(&self.pending_nodes).is_empty() {
+        let target = self.computer.policy_target();
+        if lock(&self.pending_nodes)
+            .values()
+            .any(|pending| pending.target == target)
+        {
             return Ok(());
         }
         let local = self.computer.signer.fingerprint();
@@ -816,7 +829,7 @@ impl Management {
             slots: Arc::new(tokio::sync::Semaphore::new(MANAGEMENT_SLOTS)),
             problem: Mutex::new(problem),
             unavailable_nodes: Mutex::new(Vec::new()),
-            pending_nodes: Mutex::new(Vec::new()),
+            pending_nodes: Mutex::new(BTreeMap::new()),
             transport_cache: Mutex::new(BTreeMap::new()),
             revoked_transport: Mutex::new(Default::default()),
             exchanged: Mutex::new(exchanged),
@@ -1586,8 +1599,17 @@ impl Management {
                 })
             })
             .transpose()?;
+        let target = ComputerPolicyTarget {
+            revision: s.policy_revision,
+            expired: Computer::revision_expired(&s),
+        };
         let mut pending_nodes = lock(&self.unavailable_nodes).clone();
-        pending_nodes.extend(lock(&self.pending_nodes).iter().cloned());
+        pending_nodes.extend(
+            lock(&self.pending_nodes)
+                .values()
+                .filter(|pending| pending.target == target)
+                .map(|pending| pending.words.clone()),
+        );
         for node in s.binding_approvals.keys() {
             pending_nodes.push(format!(
                 "{}: binding approved here; unlock its local vault to sign and apply it",
@@ -1785,17 +1807,20 @@ impl Management {
     }
     /// One node's application failed or did not finish: said in the status, in place of any
     /// earlier word about that node.
-    pub fn node_pending(&self, node: &str, why: &str) {
+    pub fn node_pending(&self, node: &str, target: ComputerPolicyTarget, why: &str) {
         let mut pending = lock(&self.pending_nodes);
-        let prefix = format!("{node}: ");
-        pending.retain(|entry| !entry.starts_with(&prefix));
-        pending.push(format!("{prefix}{why}"));
+        pending.insert(
+            node.to_owned(),
+            PendingNodeApplication {
+                target,
+                words: format!("{node}: {why}"),
+            },
+        );
     }
     /// The exact current reconciliation pass completed: clear only that node's pending result.
     /// The daemon owns pass ordering and calls this while holding the attachment's ownership lock.
     pub fn node_applied(&self, node: &str) {
-        let prefix = format!("{node}: ");
-        lock(&self.pending_nodes).retain(|entry| !entry.starts_with(&prefix));
+        lock(&self.pending_nodes).remove(node);
     }
     fn transport_leases(&self, supplied: Option<&Link>) -> Result<Vec<TransportLease>> {
         let s = lock(&self.computer.state);

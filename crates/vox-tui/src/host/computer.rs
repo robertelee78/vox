@@ -260,32 +260,45 @@ impl Router {
         change: vox_core::node::computer::ComputerChange,
         pass: u64,
     ) {
-        {
+        let owns_pass = {
             let slots = lock(&self.inner.slots);
-            let owned = matches!(
+            matches!(
                 slots.get(node),
                 Some(Slot::Attached(attached))
                     if attached.generation == generation
                         && attached.computer_reconciliation.as_ref().is_some_and(|flight|
                             flight.target == change.target() && flight.pass == pass)
-            );
-            if !owned {
-                return;
-            }
-            self.inner.defaults.computer.node_pending(
-                node.as_str(),
-                &format!(
-                    "computer trust revision {} missed its local application boundary; the accepted application is still running",
-                    change.revision()
-                ),
-            );
+            )
+        };
+        if !owns_pass {
+            return;
         }
         let management = &self.inner.defaults.computer;
         match management
             .computer
             .record_application_miss(identity, change)
         {
-            Ok(true) => {}
+            Ok(true) => {
+                let slots = lock(&self.inner.slots);
+                if matches!(
+                    slots.get(node),
+                    Some(Slot::Attached(attached))
+                        if attached.generation == generation
+                            && attached.computer_reconciliation.as_ref().is_some_and(|flight|
+                                flight.target == change.target() && flight.pass == pass)
+                ) {
+                    // Keep pass ownership through the synchronous status write. Target-tagging
+                    // independently keeps a later durable policy from displaying these words.
+                    management.node_pending(
+                        node.as_str(),
+                        change.target(),
+                        &format!(
+                            "computer trust revision {} missed its local application boundary; the accepted application is still running",
+                            change.revision()
+                        ),
+                    );
+                }
+            }
             Ok(false) => {}
             Err(error) => {
                 let slots = lock(&self.inner.slots);
@@ -298,6 +311,7 @@ impl Router {
                 ) {
                     management.node_pending(
                         node.as_str(),
+                        change.target(),
                         &format!("computer trust lateness could not be recorded: {error}"),
                     );
                 }
@@ -329,7 +343,7 @@ impl Router {
                 attached.computer_reconciliation = None;
                 let management = &self.inner.defaults.computer;
                 match failure {
-                    Some(why) => management.node_pending(node.as_str(), why),
+                    Some(why) => management.node_pending(node.as_str(), target, why),
                     None => management.node_applied(node.as_str()),
                 }
                 true
