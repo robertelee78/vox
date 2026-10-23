@@ -405,7 +405,15 @@ impl Node {
 
     /// Test apparatus: hold a prepared sender/history-key batch after every await and immediately
     /// before its final durable-policy fence and queue admission.
-    pub(super) async fn hold_rekey_enqueue_for_proof(&self, target: Digest32) -> bool {
+    pub(super) async fn hold_rekey_enqueue_for_proof(
+        &self,
+        room: Digest32,
+        target: Digest32,
+        legacy: bool,
+        all_sent: bool,
+        live_generation: u64,
+        prepared_generations: &[u64],
+    ) -> bool {
         let Ok(spec) = std::env::var(TEST_HOLD_REKEY_ENQUEUE_ENV) else {
             return false;
         };
@@ -426,10 +434,21 @@ impl Node {
             .and_then(|name| name.to_str());
         let armed_target = std::fs::read_to_string(arm).ok();
         let target = crate::node::link::b32_encode(&target);
-        if mine != Some(node)
-            || armed_target.as_deref().map(str::trim) != Some(target.as_str())
-            || std::fs::remove_file(arm).is_err()
-        {
+        let room = crate::node::link::b32_encode(&room);
+        let expected = format!("{target}\t{room}");
+        if mine != Some(node) || armed_target.as_deref().map(str::trim) != Some(expected.as_str()) {
+            return false;
+        }
+        if !legacy || !all_sent || !prepared_generations.contains(&live_generation) {
+            crate::node::computer::publish_proof_fault(
+                &std::path::Path::new(engaged).with_extension("fault"),
+                &format!(
+                    "exact sender-key batch could not stage: node={node} peer={target} room={room} legacy={legacy} complete={all_sent} live_generation={live_generation} prepared_generations={prepared_generations:?}"
+                ),
+            );
+            return false;
+        }
+        if std::fs::remove_file(arm).is_err() {
             return false;
         }
         let _ = std::fs::remove_file(release);

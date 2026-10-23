@@ -14486,10 +14486,24 @@ impl Node {
             // connection, room and session operation awaited, so durable Computer policy is
             // checked once more under its state lock at the irreversible queue admission.
             #[cfg(feature = "test-knobs")]
-            let held_for_proof = legacy_route
-                && all_sent
-                && watched == 1
-                && self.hold_rekey_enqueue_for_proof(target).await;
+            let live_generation = shared.lock().await.sender_generation();
+            #[cfg(feature = "test-knobs")]
+            let prepared_generations: Vec<_> = keys
+                .iter()
+                .take(watched as usize)
+                .map(|key| key.body.chain_id)
+                .collect();
+            #[cfg(feature = "test-knobs")]
+            let held_for_proof = self
+                .hold_rekey_enqueue_for_proof(
+                    *channel_id,
+                    target,
+                    legacy_route,
+                    all_sent,
+                    live_generation,
+                    &prepared_generations,
+                )
+                .await;
             #[cfg(feature = "test-knobs")]
             let published = {
                 if crate::node::computer::fx28_mutant("stale-rekey-authority") {

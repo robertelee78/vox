@@ -45,6 +45,10 @@ const TEST_HOLD_COMPUTER_OPERATOR_RESERVED_ENV: &str =
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_ENV: &str =
     "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE";
+/// Test-only exact management-path partition. Room streams are unaffected. The arm contains the
+/// authenticated peer fingerprint; `<arm>\t<marker>` stays armed through the diagnostic phase.
+#[cfg(feature = "test-knobs")]
+const TEST_PARTITION_COMPUTER_PEER_ENV: &str = "VOX_TEST_PARTITION_COMPUTER_PEER_FILE";
 /// **Test-only** (`test-knobs`): `<arm>\t<generation>\t<release>\t<answered>`. The arm is consumed
 /// by an enrolled real Vox peer, which clears earlier apparatus state and creates a unique
 /// generation. It retains only requests whose authenticated hello was echoed (so admission, not
@@ -2295,6 +2299,8 @@ impl Management {
         }
         if op == 2 {
             let payload = frame_until(recv, deadline).await?;
+            #[cfg(feature = "test-knobs")]
+            self.partition_computer_peer_for_proof(conn.peer_id())?;
             // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
             // reply is the merged state, encoded under the same lock, so the revision the
             // record names is the revision the reply carries.
@@ -3289,6 +3295,8 @@ impl Management {
         }
         write_frame_until(&mut send, &payload, deadline).await?;
         let f = frame_until(&mut recv, deadline).await?;
+        #[cfg(feature = "test-knobs")]
+        self.partition_computer_peer_for_proof(peer)?;
         // A merge that moves this daemon's revision is a change here: `change` wakes the
         // daemon's follower on it (ADR-038 FX-28).
         let merged = self.computer.change_until(deadline, |s| {
@@ -3678,6 +3686,41 @@ impl Management {
         }
         let _ = listener.accept().await;
         let _ = std::fs::remove_file(release);
+    }
+
+    /// Delay one exact peer's management updates while room traffic remains available. The
+    /// existing run's peer/room reads decide behavior; this marker only establishes the selective
+    /// path loss. Every matching ordinary exchange is refused until teardown, including an
+    /// outbound response which was already in flight when the arm was written.
+    #[cfg(feature = "test-knobs")]
+    fn partition_computer_peer_for_proof(&self, peer: Digest32) -> Result<()> {
+        let Ok(spec) = std::env::var(TEST_PARTITION_COMPUTER_PEER_ENV) else {
+            return Ok(());
+        };
+        let mut fields = spec.splitn(2, '\t');
+        let (Some(arm), Some(marker)) = (fields.next(), fields.next()) else {
+            return Ok(());
+        };
+        let expected = text_id(&peer);
+        if std::fs::read_to_string(arm).ok().as_deref().map(str::trim) != Some(expected.as_str()) {
+            return Ok(());
+        }
+        let marker = std::path::Path::new(marker);
+        if std::fs::read_to_string(marker).ok().as_deref() != Some(expected.as_str()) {
+            if let Err(error) = super::publish_proof_marker(marker, expected.as_bytes()) {
+                // Two already-authenticated exchanges may arrive together. Only an identical
+                // successful publication by the other one can satisfy this shared boundary.
+                if std::fs::read_to_string(marker).ok().as_deref() != Some(expected.as_str()) {
+                    super::publish_proof_fault(
+                        &marker.with_extension("fault"),
+                        &format!("could not mark the exact management-path partition: {error}"),
+                    );
+                }
+            }
+        }
+        Err(Error::Profile(
+            "computer peer path is partitioned by proof apparatus",
+        ))
     }
 
     /// Park an answer only after its policy merge is durable. The marker and socket are staging

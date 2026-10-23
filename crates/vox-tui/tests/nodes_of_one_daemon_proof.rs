@@ -61,6 +61,7 @@ const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const PASS: &str = "identity passphrase";
 const ROOM_PASS: &str = "room passphrase for the daemon proof";
 const FX28_ROTATE_AFTER_POST_ARM: &str = "fx28-rotate-after-post-arm";
+const FX28_CONTROL_PARTITION_ARM: &str = "fx28-rekey-control-partition-arm";
 /// Deliberately larger than both the one-minute return contract and ten-minute pairing command.
 /// A receiver that reconstructs a sender deadline from Unix time expires immediately under this
 /// skew; duration-budget transport remains governed by each daemon's monotonic clock.
@@ -380,6 +381,9 @@ fn wait_for_command_marker(
     loop {
         if marker.is_file() {
             return;
+        }
+        if let Ok(fault) = std::fs::read_to_string(marker.with_extension("fault")) {
+            panic!("APPARATUS: could not stage {what}: {fault}");
         }
         if let Some(status) = command
             .try_wait()
@@ -4480,6 +4484,7 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         "VOX_TEST_FX28_ROTATE_AFTER_POST",
         "VOX_TEST_MARK_COMPUTER_STATUS_FILE",
         "VOX_TEST_FX28_MUTANT",
+        "VOX_TEST_PARTITION_COMPUTER_PEER_FILE",
         "VOX_TEST_FX28_STOPPED_READER_ARM_FILE",
         "VOX_TEST_FX28_STOPPED_READER_ANSWERED_FILE",
     ]);
@@ -4574,6 +4579,12 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
         older_arm.display(),
         older_marker.display()
     );
+    let control_partition_arm = a.data.join(FX28_CONTROL_PARTITION_ARM);
+    let control_partition_spec = format!(
+        "{}\t{}",
+        control_partition_arm.display(),
+        control_partition_arm.with_extension("marker").display()
+    );
     let older_selected_arm = b.data.join("fx28-mark-ended-unanswered-arm");
     let older_selected_marker = b.data.join("fx28-mark-ended-unanswered-marker");
     let older_selected_spec = format!(
@@ -4616,6 +4627,10 @@ fn two_paired_computers_that_are_idle_exchange_nothing() {
             ("VOX_LISTEN", &listen_a),
             ("VOX_TEST_ADVERTISE", &advertised),
             ("VOX_TEST_FX28_END_KEY_UNANSWERED_FILE", &older_spec),
+            (
+                "VOX_TEST_PARTITION_COMPUTER_PEER_FILE",
+                &control_partition_spec,
+            ),
             ("VOX_TEST_MARK_COMPUTER_STATUS_FILE", &status_spec),
             (
                 "VOX_TEST_FX28_STOPPED_READER_ARM_FILE",
@@ -6912,11 +6927,50 @@ fn stale_rekey_is_not_delivered(
         ok && roster_shown.contains(epsilon) && roster_shown.contains("runs an older Vox"),
         "PRODUCT [FX28 legacy-rekey-route]: after delta admitted epsilon's exact unanswered modern delivery, its shipped roster did not expose the selected legacy sender-key route: {roster_shown}"
     );
+    // Stage the protected ciphertext before holding this actor at key admission. A post marks
+    // sync as owed, but sync runs on a later actor turn; holding within that same post would
+    // prevent its payload from reaching epsilon at all. The shipped hash view includes sealed
+    // entries even when their sender key is missing, so check this exact post, not a row count.
+    let (ok, posted, err) = b.run(
+        &[
+            "room",
+            "post",
+            room,
+            "STALE-AUTHORITY-REKEY",
+            "--node",
+            "delta",
+            "--json",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: append the protected ciphertext while its key is paused: {posted}{err}"
+    );
+    let posted: serde_json::Value = serde_json::from_str(posted.trim())
+        .expect("APPARATUS: protected post returned no structured receipt");
+    let protected_hash = posted["entry_hash"]
+        .as_str()
+        .expect("APPARATUS: protected post receipt has no entry hash");
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, hashes, _) =
+                a.run(&["room", "read", room, "--node", "epsilon", "--hashes"], "");
+            ok && hashes
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(protected_hash))
+        }),
+        "APPARATUS: epsilon never held the exact protected ciphertext before sender revocation"
+    );
+    let (ok, unreadable, err) = a.run(&["room", "read", room, "--node", "epsilon"], "");
+    assert!(ok && !unreadable.contains("STALE-AUTHORITY-REKEY"),
+        "APPARATUS: the exact ciphertext was not staged unreadable while its key remained paused: {unreadable}{err}");
+    println!("[proof] epsilon holds the exact protected post through shipped read --hashes, while its ordinary room read cannot display it without the paused sender key");
     let rekey_fault = rekey_decision.with_extension("fault");
     for stale in [rekey_engaged, rekey_decision, &rekey_fault] {
         let _ = std::fs::remove_file(stale);
     }
-    std::fs::write(rekey_arm, format!("{epsilon}\n"))
+    std::fs::write(rekey_arm, format!("{epsilon}\t{full_room}\n"))
         .expect("APPARATUS: arm epsilon's exact stale rekey enqueue");
     std::fs::write(hold_arm, b"hold delta's revocation policy message\n")
         .expect("APPARATUS: arm delta's reconciliation behind the rekey decision");
@@ -6931,7 +6985,7 @@ fn stale_rekey_is_not_delivered(
             "room",
             "post",
             room,
-            "STALE-AUTHORITY-REKEY",
+            "RELEASE-STAGED-REKEY",
             "--node",
             "delta",
         ])
@@ -6947,8 +7001,19 @@ fn stale_rekey_is_not_delivered(
         Instant::now() + RETURN_WITHIN,
         "epsilon's prepared sender-key batch at final queue admission",
     );
+    let (read_ok, held_read, held_error) = a.run(&["room", "read", room, "--node", "epsilon"], "");
+    assert!(
+        read_ok && !held_read.contains("STALE-AUTHORITY-REKEY"),
+        "APPARATUS: before revocation epsilon already exposed the protected text while its exact sender-key batch was held, or its room could not be read: {held_read}{held_error}"
+    );
     let before = computer(b, &["status"])["revision"].as_u64().unwrap_or(0);
     let a_id = computer_id(a);
+    let b_id = computer_id(b);
+    let receiver_before = computer(a, &["status"]);
+    let control_partition_arm = a.data.join(FX28_CONTROL_PARTITION_ARM);
+    let control_partition_marker = control_partition_arm.with_extension("marker");
+    std::fs::write(&control_partition_arm, &b_id)
+        .expect("APPARATUS: stage only the recipient's exact computer-management path loss");
     let status = computer(b, &["status"]);
     computer(
         b,
@@ -6971,6 +7036,24 @@ fn stale_rekey_is_not_delivered(
     assert!(
         rekey_engaged.is_file(),
         "APPARATUS: epsilon's exact rekey was not still held after durable revocation"
+    );
+    let partitioned_peer = read_daemon_marker(
+        &control_partition_marker,
+        _da.child.id(),
+        "the recipient refused the exact computer-management update before merging it",
+    );
+    assert_eq!(
+        partitioned_peer, b_id,
+        "APPARATUS: the management-path partition named a different computer peer"
+    );
+    let receiver_current = computer(a, &["status"]);
+    assert!(
+        receiver_before["state"] == "confirmed"
+            && receiver_current["state"] == "confirmed"
+            && receiver_current["revision"] == receiver_before["revision"]
+            && grant_words(a, "epsilon", delta).is_some(),
+        "APPARATUS: epsilon no longer trusts delta before the held sender-key batch is released, so receiver-side revocation would mask the sender-authority mutant; receiver computer status: {}",
+        receiver_current
     );
     println!(
         "[proof] FX-28 stale-rekey-authority apparatus staged: epsilon was durably revoked while its exact prepared sender-key batch remained held at final queue admission"
@@ -7019,7 +7102,16 @@ fn stale_rekey_is_not_delivered(
                 .run(&["room", "read", room, "--node", "epsilon"], "")
                 .1
                 .contains("STALE-AUTHORITY-REKEY")),
-            "APPARATUS: the mutant enqueued epsilon's exact key but the shipped recipient never exposed its delivery"
+            "APPARATUS: the mutant enqueued epsilon's exact key but the shipped recipient never exposed its delivery; receiver grant {:?}; receiver status {}; recipient daemon {}; sender daemon {}",
+            grant_words(a, "epsilon", delta),
+            computer(a, &["status"]),
+            _da.said(),
+            db.said()
+        );
+        assert!(
+            grant_words(a, "epsilon", delta).is_some()
+                && computer(a, &["status"])["revision"] == receiver_before["revision"],
+            "APPARATUS: recipient management state moved during the isolated sender-revocation verdict"
         );
         panic!("PRODUCT [FX28 stale-rekey-authority]: after epsilon's durable revocation, its shipped room read exposed text unlocked by the stale sender-key batch");
     }
