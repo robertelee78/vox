@@ -1024,6 +1024,16 @@ pub(super) struct CurrentPrivateGuard {
     pub(super) nonce: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
     deadline: tokio::time::Instant,
 }
+
+#[derive(Clone, Copy)]
+pub(super) enum CurrentPrivateBoundary {
+    /// A page or request intent has not committed local semantic work. It may leave this worker
+    /// only if the same authority and observation deadline still hold after preparation.
+    Observing,
+    /// The callback performs its own captured-authority check inside each durable transaction.
+    /// Its committed result is not replaced by a later observation of elapsed time.
+    Applying,
+}
 impl Node {
     pub(super) fn current_private_context(&self) -> Option<(Arc<Store>, CurrentPrivateGuard)> {
         let profile = self.profile.as_ref().filter(|p| p.is_unlocked())?;
@@ -1047,21 +1057,17 @@ impl Node {
 pub(super) async fn current_private_room<T: Send + 'static>(
     room: Arc<Mutex<ChannelState>>,
     store: Arc<Store>,
-    job: Job,
+    charge: crate::node::history_budget::BufferCharge,
     guard: CurrentPrivateGuard,
+    boundary: CurrentPrivateBoundary,
     work: impl FnOnce(&mut ChannelState, &Store) -> crate::error::Result<T> + Send + 'static,
-) -> crate::error::Result<T> {
+) -> crate::error::Result<(crate::node::history_budget::BufferCharge, T)> {
     use crate::error::Error;
-    let charge = job
-        .reserve(4 * 1024 * 1024)
-        .ok_or(Error::StreamRefused("private disk buffers are busy"))?;
     let mut room = tokio::time::timeout_at(guard.deadline, room.lock_owned())
         .await
         .map_err(|_| Error::StreamRefused("private room lock deadline elapsed"))?;
     tokio::task::spawn_blocking(move || {
         let _lease = guard.lease;
-        let _job = job;
-        let _charge = charge;
         if tokio::time::Instant::now() >= guard.deadline
             || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
                 crate::node::trust::TRUST_META_KEY,
@@ -1072,16 +1078,20 @@ pub(super) async fn current_private_room<T: Send + 'static>(
             ));
         }
         let result = work(&mut room, &store)?;
-        if tokio::time::Instant::now() >= guard.deadline
-            || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
-                crate::node::trust::TRUST_META_KEY,
-            )? != guard.nonce
+        if matches!(boundary, CurrentPrivateBoundary::Observing)
+            && (tokio::time::Instant::now() >= guard.deadline
+                || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                    crate::node::trust::TRUST_META_KEY,
+                )? != guard.nonce)
         {
             return Err(Error::StreamRefused(
                 "private authority changed or request expired",
             ));
         }
-        Ok(result)
+        // Applying callbacks own their durable result. finish_private_pull checks the captured
+        // trust nonce inside every record/cursor Batch before commit; a later observation cannot
+        // truthfully replace that committed outcome with a refusal.
+        Ok((charge, result))
     })
     .await
     .map_err(|_| Error::StreamRefused("private disk worker stopped"))?

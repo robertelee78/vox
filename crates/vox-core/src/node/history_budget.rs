@@ -474,6 +474,9 @@ pub struct BytePressure {
     budget: Arc<Budget>,
     lane: Lane,
     required: usize,
+    /// The shared-pool ceiling this exact refused operation may use. Most work uses the lane's
+    /// full limit; work which depends on a peer response can retain derived serving headroom.
+    shared_limit: usize,
     wake: ByteWake,
 }
 
@@ -482,6 +485,7 @@ impl std::fmt::Debug for BytePressure {
         f.debug_struct("BytePressure")
             .field("lane", &self.lane)
             .field("required", &self.required)
+            .field("shared_limit", &self.shared_limit)
             .finish_non_exhaustive()
     }
 }
@@ -515,7 +519,7 @@ impl BytePressure {
             };
             if used
                 .checked_add(self.required)
-                .is_some_and(|total| total <= self.lane.buffer_limit())
+                .is_some_and(|total| total <= self.shared_limit)
             {
                 return;
             }
@@ -536,7 +540,15 @@ impl Job {
     /// Subscribe before attempting the record reservation. The dependency is transferred to
     /// the actor only on refusal, and starts waiting after the worker has released its buffers.
     pub(crate) fn byte_pressure(&self, required: usize) -> crate::error::Result<BytePressure> {
-        if required > self.0.lane.buffer_limit() {
+        self.byte_pressure_with_limit(required, self.0.lane.buffer_limit())
+    }
+
+    fn byte_pressure_with_limit(
+        &self,
+        required: usize,
+        shared_limit: usize,
+    ) -> crate::error::Result<BytePressure> {
+        if required > shared_limit || shared_limit > self.0.lane.buffer_limit() {
             return Err(crate::error::Error::SizeLimitExceeded(
                 "history record reconstruction envelope",
             ));
@@ -545,6 +557,7 @@ impl Job {
             budget: Arc::clone(&self.0.budget),
             lane: self.0.lane,
             required,
+            shared_limit,
             wake: byte_wake(&self.0.budget, self.0.lane),
         })
     }
@@ -554,7 +567,30 @@ impl Job {
     /// observed by the second check. Control's running Flow-state charge is included in the
     /// fresh envelope; independent pools are never summed.
     pub(crate) fn reserve_or_pressure(&self, bytes: usize) -> crate::error::Result<BufferCharge> {
-        if let Some(charge) = self.reserve(bytes) {
+        self.reserve_or_pressure_with_limit(bytes, self.0.lane.buffer_limit())
+    }
+
+    /// Reserve a complete operation while retaining exact shared-pool headroom for the response
+    /// which can let that operation finish. The total lane cap is unchanged. Both the atomic
+    /// reservation and a retained byte-pressure dependency use the same derived ceiling, so a
+    /// woken requester cannot steal its own server's response envelope.
+    pub(crate) fn reserve_or_pressure_with_headroom(
+        &self,
+        bytes: usize,
+        headroom: usize,
+    ) -> crate::error::Result<BufferCharge> {
+        let shared_limit = self.0.lane.buffer_limit().checked_sub(headroom).ok_or(
+            crate::error::Error::SizeLimitExceeded("history serving headroom"),
+        )?;
+        self.reserve_or_pressure_with_limit(bytes, shared_limit)
+    }
+
+    fn reserve_or_pressure_with_limit(
+        &self,
+        bytes: usize,
+        shared_limit: usize,
+    ) -> crate::error::Result<BufferCharge> {
+        if let Some(charge) = self.reserve_with_shared_limit(bytes, shared_limit) {
             return Ok(charge);
         }
         let required = self
@@ -565,8 +601,8 @@ impl Job {
             .ok_or(crate::error::Error::SizeLimitExceeded(
                 "history working envelope",
             ))?;
-        let pressure = self.byte_pressure(required)?;
-        self.reserve(bytes)
+        let pressure = self.byte_pressure_with_limit(required, shared_limit)?;
+        self.reserve_with_shared_limit(bytes, shared_limit)
             .ok_or_else(|| crate::error::Error::HistoryCapacity(Box::new(pressure)))
     }
 
@@ -917,6 +953,13 @@ impl Job {
     /// returned charge for that buffer's lifetime, including across worker/actor handoffs.
     /// Exhaustion is an explicit yield/refusal; a valid large record never bypasses the bound.
     pub fn reserve(&self, bytes: usize) -> Option<BufferCharge> {
+        self.reserve_with_shared_limit(bytes, self.0.lane.buffer_limit())
+    }
+
+    fn reserve_with_shared_limit(&self, bytes: usize, shared_limit: usize) -> Option<BufferCharge> {
+        if shared_limit > self.0.lane.buffer_limit() {
+            return None;
+        }
         self.0
             .bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -933,7 +976,7 @@ impl Job {
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                     current
                         .checked_add(bytes)
-                        .filter(|total| *total <= self.0.lane.buffer_limit())
+                        .filter(|total| *total <= shared_limit)
                 })
                 .is_err()
             {

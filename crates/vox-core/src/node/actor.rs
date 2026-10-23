@@ -720,6 +720,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::BoardRecordsOwed { .. } => "publishing authorized board records",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
+        NetEvent::PrivateSessionBytesReady { .. } => {
+            "retrying private Session work after its bytes were released"
+        }
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
@@ -1171,8 +1174,15 @@ enum NetEvent {
     PrivateSessionDone {
         channel_id: Digest32,
         peer: Digest32,
+        token: crate::node::ports::Token,
+        revision: u64,
         room: std::sync::Weak<tokio::sync::Mutex<crate::node::channel::ChannelState>>,
         result: Result<bool, String>,
+    },
+    PrivateSessionBytesReady {
+        channel_id: Digest32,
+        peer: Digest32,
+        token: crate::node::ports::Token,
     },
     /// A program asked, through the app API, to open an app stream to `peer`: reach it
     /// through the ladder and hand the connection back (ADR-022 decision 7).
@@ -5271,6 +5281,19 @@ struct OfflineFallback {
     consent_seq: Option<u64>,
 }
 
+/// One exact current private pull, from cheap selection through a local byte wait and its actual
+/// worker. The weak room, policy revision and token prevent an old completion from clearing a
+/// reopened room's replacement attempt.
+struct PrivatePullOwner {
+    token: crate::node::ports::Token,
+    revision: u64,
+    room: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    /// A capacity/room-release wait owns no room-side `pulling` bit and may be superseded by a
+    /// newer lifecycle. A running attempt retains that bit until its exact completion returns.
+    waiting: bool,
+    task: Option<tokio::task::AbortHandle>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     history_demand: history_demand::Controller,
@@ -5286,6 +5309,7 @@ pub struct Node {
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
     history_budget: Arc<crate::node::history_budget::Budget>,
+    private_pulls: BTreeMap<(Digest32, Digest32), PrivatePullOwner>,
     /// Capacity ownership follows this actor through unwind. Graceful lock moves the guard to
     /// the retirement task; a panic drops it here and the pool defers removal until charges end.
     flow_pool_registration: Option<crate::node::history_budget::FlowPoolRegistration>,
@@ -6116,6 +6140,7 @@ impl Node {
             history_hints: crate::node::history_stream::HintInbox::new(),
             held_notes: Vec::new(),
             history_budget,
+            private_pulls: BTreeMap::new(),
             flow_pool_registration: None,
             flow_release_tx,
             paths,
@@ -7711,6 +7736,7 @@ impl Node {
     /// Tear the network down: close every connection and the endpoint, so a locked
     /// node presents no network identity at all.
     async fn stop_network(&mut self) {
+        self.cancel_private_pulls(None);
         if let Some(task) = self.nearby_task.take() {
             task.abort();
         }
@@ -11166,24 +11192,36 @@ impl Node {
                     crate::transport::streams::refuse(&mut send, &mut recv);
                     return;
                 };
+                // The page allocation and its room/store scratch must both fit before either is
+                // retained. A remote request owns its retry, so local pressure is refused rather
+                // than installed as a local byte waiter.
+                let Some(mut work_charge) =
+                    job.reserve(crate::node::sessionstream::CURRENT_PAGE_ENVELOPE)
+                else {
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
                 let Some((store, guard)) = self.current_private_context() else {
                     crate::transport::streams::refuse(&mut send, &mut recv);
                     return;
                 };
-                let Some(charge) = job.reserve(crate::node::sessionstream::PAGE_ENVELOPE) else {
-                    crate::transport::streams::refuse(&mut send, &mut recv);
-                    return;
-                };
+                let page_charge = work_charge
+                    .split_off(crate::node::sessionstream::PAGE_ENVELOPE)
+                    .expect("current private page reservation has two exact halves");
                 self.join_tasks.spawn(async move {
                     let _connection = conn;
                     let page = history_demand::current_private_room(
                         shared,
                         store,
-                        job,
+                        work_charge,
                         guard,
-                        move |room, store| room.private_page(store, &ask, &peer, &holders, charge),
+                        history_demand::CurrentPrivateBoundary::Observing,
+                        move |room, store| {
+                            room.private_page(store, &ask, &peer, &holders, page_charge)
+                        },
                     )
-                    .await;
+                    .await
+                    .map(|(_, page)| page);
                     match page {
                         Ok(page) => {
                             let _ = tokio::time::timeout(
@@ -11199,14 +11237,33 @@ impl Node {
             NetEvent::PrivateSessionDone {
                 channel_id,
                 peer,
+                token,
+                revision,
                 room,
                 result,
             } => {
-                if !self
-                    .channels
-                    .get(&channel_id)
-                    .zip(room.upgrade().as_ref())
-                    .is_some_and(|(current, old)| Arc::ptr_eq(current, old))
+                let key = (channel_id, peer);
+                let Some(owned_room) = self
+                    .private_pulls
+                    .get(&key)
+                    .filter(|owner| owner.token == token && owner.revision == revision)
+                    .map(|owner| owner.room.clone())
+                else {
+                    return;
+                };
+                // This exact token is done even if its room disappeared. Remove only it before
+                // validating whether the result may affect the current incarnation.
+                self.private_pulls.remove(&key);
+                let completed = room.upgrade();
+                if !owned_room
+                    .upgrade()
+                    .zip(completed.as_ref())
+                    .is_some_and(|(owned, completed)| Arc::ptr_eq(&owned, completed))
+                    || !self
+                        .channels
+                        .get(&channel_id)
+                        .zip(completed.as_ref())
+                        .is_some_and(|(current, completed)| Arc::ptr_eq(current, completed))
                 {
                     return;
                 }
@@ -11229,6 +11286,14 @@ impl Node {
                 if advanced {
                     self.pull_private_sessions(channel_id, peer).await;
                 }
+            }
+            NetEvent::PrivateSessionBytesReady {
+                channel_id,
+                peer,
+                token,
+            } => {
+                self.resume_private_session_bytes(channel_id, peer, token)
+                    .await;
             }
             NetEvent::BoundedRoomAdvanced {
                 channel_id,
@@ -20212,6 +20277,7 @@ impl Node {
     }
 
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
+        self.cancel_private_pulls(Some(*channel_id));
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -21140,6 +21206,7 @@ impl Node {
             }
         }
         self.key_package_rooms.remove(channel_id);
+        self.cancel_private_pulls(Some(*channel_id));
         self.governance_work.set_deadline(*channel_id, None);
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
@@ -21773,6 +21840,7 @@ impl Node {
         }
         let mut name = String::new();
         self.key_package_rooms.remove(channel_id);
+        self.cancel_private_pulls(Some(*channel_id));
         self.governance_work.set_deadline(*channel_id, None);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
@@ -23639,7 +23707,11 @@ impl Node {
             .map(|(id, room)| (*id, Arc::clone(room)))
             .collect();
         for (room, shared) in rooms {
-            let members = shared.lock().await.drive_members();
+            let Ok(held) = shared.try_lock() else {
+                continue;
+            };
+            let members = held.drive_members();
+            drop(held);
             for peer in members {
                 self.pull_private_sessions(room, peer).await;
             }
@@ -23655,54 +23727,277 @@ impl Node {
         }
     }
 
+    /// Cancel byte waits and attempts for a room which is leaving this actor, or for the whole
+    /// network on lock/shutdown. JoinSet still owns an aborted worker until it actually exits, so
+    /// its secret lease and charges are not reported released early.
+    fn cancel_private_pulls(&mut self, room: Option<Digest32>) {
+        let keys: Vec<_> = self
+            .private_pulls
+            .keys()
+            .filter(|(candidate, _)| room.is_none_or(|room| room == *candidate))
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(owner) = self.private_pulls.remove(&key) {
+                if let Some(task) = owner.task {
+                    task.abort();
+                }
+            }
+        }
+    }
+
     /// Pull through the separate typed stream. No network wait holds the actor or room lock.
     /// It shares the ordinary outbound slot budget, and retries only while a connection exists.
     async fn pull_private_sessions(&mut self, channel_id: Digest32, peer: Digest32) {
+        let key = (channel_id, peer);
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return;
+        };
+        // Never await the actor's room here. A running room operation supplies its own completion
+        // event, and the retained tick is the fallback; selection itself takes no slot, worker,
+        // secret lease or disk envelope.
+        let Ok(room) = shared.try_lock() else {
+            return;
+        };
+        let intent = room.private_pull_intent(peer);
+        drop(room);
+        if let Some(owner) = self.private_pulls.get(&key) {
+            if !owner.waiting
+                || (owner
+                    .room
+                    .upgrade()
+                    .is_some_and(|owned| Arc::ptr_eq(&owned, &shared))
+                    && intent == Some(owner.revision))
+            {
+                return;
+            }
+            // A current lifecycle event or the retained discovery tick supersedes a stale byte
+            // wait immediately; it need not wait for unrelated capacity before new policy work
+            // can own the pair. The old token still fences a release event already in flight.
+            if let Some(owner) = self.private_pulls.remove(&key) {
+                if let Some(task) = owner.task {
+                    task.abort();
+                }
+            }
+        }
+        let Some(revision) = intent else {
+            return;
+        };
+        let token = self.next_token;
+        self.next_token += 1;
+        self.private_pulls.insert(
+            key,
+            PrivatePullOwner {
+                token,
+                revision,
+                room: Arc::downgrade(&shared),
+                waiting: true,
+                task: None,
+            },
+        );
+        self.continue_private_session(channel_id, peer, token).await;
+    }
+
+    async fn resume_private_session_bytes(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        token: crate::node::ports::Token,
+    ) {
+        let key = (channel_id, peer);
+        let Some((revision, weak)) = self
+            .private_pulls
+            .get(&key)
+            .filter(|owner| owner.token == token)
+            .map(|owner| (owner.revision, owner.room.clone()))
+        else {
+            return;
+        };
+        if let Some(owner) = self.private_pulls.get_mut(&key) {
+            owner.task = None;
+        }
+        let Some(shared) = weak.upgrade() else {
+            self.private_pulls.remove(&key);
+            return;
+        };
+        if !self
+            .channels
+            .get(&channel_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &shared))
+        {
+            self.private_pulls.remove(&key);
+            return;
+        }
+        enum IntentState {
+            Current,
+            Changed,
+            NotDue,
+            Locked,
+        }
+        let state = match shared.try_lock() {
+            Ok(room) => match room.private_pull_intent(peer) {
+                Some(current) if current == revision => IntentState::Current,
+                Some(_) => IntentState::Changed,
+                None => IntentState::NotDue,
+            },
+            Err(_) => IntentState::Locked,
+        };
+        match state {
+            IntentState::Current => {
+                self.continue_private_session(channel_id, peer, token).await;
+            }
+            IntentState::Changed => {
+                self.private_pulls.remove(&key);
+                self.pull_private_sessions(channel_id, peer).await;
+            }
+            IntentState::NotDue => {
+                // It is no longer due (or another exact pull owns it). Drop only this token.
+                self.private_pulls.remove(&key);
+            }
+            IntentState::Locked => {
+                // Byte capacity is ready but a room worker still owns the mutex. Wait for that
+                // exact release off actor, retaining no worker/slot/lease, then revalidate again.
+                let tx = self.net_tx.clone();
+                let room = Arc::downgrade(&shared);
+                let abort = self.join_tasks.spawn(async move {
+                    let Some(room) = room.upgrade() else {
+                        return;
+                    };
+                    drop(room.lock().await);
+                    let _ = tx
+                        .send(NetEvent::PrivateSessionBytesReady {
+                            channel_id,
+                            peer,
+                            token,
+                        })
+                        .await;
+                });
+                if let Some(owner) = self.private_pulls.get_mut(&key) {
+                    owner.waiting = true;
+                    owner.task = Some(abort);
+                }
+            }
+        }
+    }
+
+    async fn continue_private_session(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        token: crate::node::ports::Token,
+    ) {
+        let key = (channel_id, peer);
+        let Some((revision, weak)) = self
+            .private_pulls
+            .get(&key)
+            .filter(|owner| owner.token == token)
+            .map(|owner| (owner.revision, owner.room.clone()))
+        else {
+            return;
+        };
+        let Some(shared) = weak.upgrade().filter(|room| {
+            self.channels
+                .get(&channel_id)
+                .is_some_and(|current| Arc::ptr_eq(current, room))
+        }) else {
+            self.private_pulls.remove(&key);
+            return;
+        };
         let Some(conn) = self
             .net
             .as_ref()
             .and_then(|net| net.manager().existing(&peer))
         else {
-            return;
-        };
-        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
-            return;
-        };
-        let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
+            self.private_pulls.remove(&key);
             return;
         };
         let Some(profile) = self.profile.as_ref() else {
+            self.private_pulls.remove(&key);
+            return;
+        };
+        let Some(slot) = crate::node::ports::Slots::take(&self.slots, peer, Box::new(|| {})) else {
+            self.private_pulls.remove(&key);
             return;
         };
         let Some(job) = self.history_budget.try_start(
             profile.fingerprint(),
             crate::node::history_budget::Lane::Live,
         ) else {
+            self.private_pulls.remove(&key);
             return;
         };
+        let mut work_charge = match job.reserve_or_pressure_with_headroom(
+            crate::node::sessionstream::CURRENT_PAGE_ENVELOPE,
+            crate::node::sessionstream::CURRENT_PAGE_ENVELOPE,
+        ) {
+            Ok(charge) => charge,
+            Err(crate::error::Error::HistoryCapacity(pressure)) => {
+                // The waiter retains only exact intent. Release the slot and worker before its
+                // first capacity predicate so its own temporary ownership cannot wake itself.
+                drop(job);
+                drop(slot);
+                let tx = self.net_tx.clone();
+                let abort = self.join_tasks.spawn(async move {
+                    pressure.released().await;
+                    let _ = tx
+                        .send(NetEvent::PrivateSessionBytesReady {
+                            channel_id,
+                            peer,
+                            token,
+                        })
+                        .await;
+                });
+                if let Some(owner) = self.private_pulls.get_mut(&key) {
+                    owner.waiting = true;
+                    owner.task = Some(abort);
+                }
+                return;
+            }
+            Err(error) => {
+                drop(job);
+                drop(slot);
+                self.private_pulls.remove(&key);
+                crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
+                    status.last_failure = Some(error.to_string())
+                });
+                return;
+            }
+        };
+        let page_charge = work_charge
+            .split_off(crate::node::sessionstream::PAGE_ENVELOPE)
+            .expect("current private page reservation has two exact halves");
         let Some((store, guard)) = self.current_private_context() else {
+            self.private_pulls.remove(&key);
             return;
         };
         let tx = self.net_tx.clone();
         let clock = self.millis_clock.clone();
-        self.join_tasks.spawn(async move {
+        let abort = self.join_tasks.spawn(async move {
             let _slot = slot;
             let weak = Arc::downgrade(&shared);
             let result = async {
-                let ask = history_demand::current_private_room(
+                let started = history_demand::current_private_room(
                     shared.clone(),
                     store.clone(),
-                    job.clone(),
+                    work_charge,
                     guard.clone(),
-                    move |room, store| room.start_private_pull(store, peer),
+                    history_demand::CurrentPrivateBoundary::Observing,
+                    move |room, store| room.start_private_pull(store, peer, revision),
                 )
-                .await?;
+                .await;
+                let (work_charge, ask) = match started {
+                    Ok(started) => started,
+                    Err(error) => {
+                        shared.lock().await.cancel_private_pull(peer, revision);
+                        return Err(error);
+                    }
+                };
                 let Some(ask) = ask else {
                     return Ok(false);
                 };
                 let page = tokio::time::timeout(
                     Duration::from_secs(10),
-                    crate::node::sessionstream::pull(&conn, ask, job.clone()),
+                    crate::node::sessionstream::pull_precharged(&conn, ask, page_charge),
                 )
                 .await
                 .unwrap_or(Err(crate::error::Error::Unreachable(
@@ -23710,16 +24005,24 @@ impl Node {
                 )));
                 let now = clock();
                 let trust_nonce = guard.nonce;
-                history_demand::current_private_room(
-                    shared,
+                let finished = history_demand::current_private_room(
+                    shared.clone(),
                     store,
-                    job,
+                    work_charge,
                     guard,
+                    history_demand::CurrentPrivateBoundary::Applying,
                     move |room, store| {
-                        room.finish_private_pull(store, peer, page, now, trust_nonce)
+                        room.finish_private_pull(store, peer, revision, page, now, trust_nonce)
                     },
                 )
-                .await
+                .await;
+                match finished {
+                    Ok((_, advanced)) => Ok(advanced),
+                    Err(error) => {
+                        shared.lock().await.cancel_private_pull(peer, revision);
+                        Err(error)
+                    }
+                }
             }
             .await
             .map_err(|e: crate::error::Error| e.to_string());
@@ -23727,11 +24030,17 @@ impl Node {
                 .send(NetEvent::PrivateSessionDone {
                     channel_id,
                     peer,
+                    token,
+                    revision,
                     room: weak,
                     result,
                 })
                 .await;
         });
+        if let Some(owner) = self.private_pulls.get_mut(&key) {
+            owner.waiting = false;
+            owner.task = Some(abort);
+        }
     }
 
     /// Re-send durable room-deletion cleanups after unlock, without accepting old-room work.

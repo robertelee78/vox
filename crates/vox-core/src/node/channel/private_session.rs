@@ -2307,12 +2307,30 @@ impl ChannelState {
         Ok(page)
     }
 
+    /// Cheap actor-side selection before taking a slot, worker or disk envelope. The actor owns
+    /// the corresponding attempt token; this snapshot only says which current policy revision a
+    /// later room/store operation must still match.
+    pub(crate) fn private_pull_intent(&self, peer: Digest32) -> Option<u64> {
+        (!self.poisoned
+            && !self.drive.receivers.is_empty()
+            && !self.private_sessions.pulling.contains(&peer)
+            && !self
+                .private_sessions
+                .attempted
+                .get(&peer)
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(1)))
+        .then_some(self.private_sessions.revision)
+    }
+
     pub(crate) fn start_private_pull(
         &mut self,
         store: &Store,
         peer: Digest32,
+        revision: u64,
     ) -> Result<Option<Ask>> {
-        if !self.private_policy_ready(store, self.now_hint)? {
+        if revision != self.private_sessions.revision
+            || !self.private_policy_ready(store, self.now_hint)?
+        {
             return Ok(None);
         }
         if self.poisoned
@@ -2336,7 +2354,7 @@ impl ChannelState {
         self.private_sessions.pulling.insert(peer);
         self.private_sessions.attempted.insert(peer, Instant::now());
         Ok(Some(Ask {
-            revision: self.private_sessions.revision,
+            revision,
             room: self.channel_id,
             epoch: self.epoch,
             query: PrivateQuery::LiveTail,
@@ -2353,16 +2371,22 @@ impl ChannelState {
         &mut self,
         store: &Store,
         peer: Digest32,
+        revision: u64,
         page: Result<Page>,
         now: u64,
         trust_nonce: TrustNonce,
     ) -> Result<bool> {
+        if revision != self.private_sessions.revision {
+            return Err(Error::StreamRefused(
+                "private live request or authority changed",
+            ));
+        }
         self.private_sessions.pulling.remove(&peer);
         let page = page?;
         self.require_governance_ready(store, crate::time::Ms(now))?;
         if self.poisoned
             || !self.drive_members().contains(&peer)
-            || page.revision != self.private_sessions.revision
+            || page.revision != revision
             || page.query != PrivateQuery::LiveTail
         {
             return Err(Error::StreamRefused(
@@ -2502,6 +2526,13 @@ impl ChannelState {
         // for whatever it waits for, and no failing page is retried in a tight loop. No
         // private archive is scheduled automatically either way, even when a gap remains.
         Ok(advanced)
+    }
+
+    /// Cancel only the selected policy revision. A stale task must not clear a newer pull.
+    pub(crate) fn cancel_private_pull(&mut self, peer: Digest32, revision: u64) {
+        if self.private_sessions.revision == revision {
+            self.private_sessions.pulling.remove(&peer);
+        }
     }
 
     fn preview_private_record(&self, store: &Store, wire: &[u8]) -> Result<Option<SessionRow>> {
@@ -2782,6 +2813,7 @@ impl ChannelState {
         self.private_sessions.revision = self.private_sessions.revision.wrapping_add(1);
         self.private_sessions.cursors.clear();
         self.private_sessions.observed_tips.clear();
+        self.private_sessions.pulling.clear();
         self.private_sessions.attempted.clear();
     }
 
