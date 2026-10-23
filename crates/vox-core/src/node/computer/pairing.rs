@@ -969,11 +969,12 @@ impl Management {
                         continue;
                     };
                     let c = Arc::clone(&conn);
+                    let deadline = std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN;
                     tokio::spawn(async move {
                         let _slot = slot;
-                        let _ = tokio::time::timeout(
-                            COMPUTER_RETURN_SHOWN_WITHIN,
-                            me.transport_incoming(&c, kind, send, recv),
+                        let _ = tokio::time::timeout_at(
+                            deadline.into(),
+                            me.transport_incoming(&c, kind, send, recv, deadline),
                         )
                         .await;
                     });
@@ -1978,12 +1979,14 @@ impl Management {
         anchor: crate::nat::bootstrap::BootstrapNode,
         lease: TransportLease,
         redeem: bool,
+        deadline: std::time::Instant,
     ) -> Result<Arc<VoxConnection>> {
-        let conn = self
-            .net
-            .manager()
-            .connect(anchor.id, &anchor.endpoints)
-            .await?;
+        let conn = tokio::time::timeout_at(
+            deadline.into(),
+            self.net.manager().connect(anchor.id, &anchor.endpoints),
+        )
+        .await
+        .map_err(|_| Error::Unreachable("computer transport reached its owner's deadline"))??;
         self.serve(Arc::clone(&conn));
         let cached = lock(&self.transport_cache)
             .get(&(anchor.id, lease.registration))
@@ -2001,6 +2004,7 @@ impl Management {
                     &lease.token,
                     lease.expires,
                     lease.peer,
+                    deadline,
                 )
                 .await?;
             lock(&self.transport_cache).insert(
@@ -2015,7 +2019,13 @@ impl Management {
         if redeem {
             if let Some(peer) = lease.peer {
                 self.net
-                    .redeem_computer_transport(&conn, peer, lease.registration, &lease.token)
+                    .redeem_computer_transport(
+                        &conn,
+                        peer,
+                        lease.registration,
+                        &lease.token,
+                        deadline,
+                    )
                     .await?;
             }
         }
@@ -2023,6 +2033,10 @@ impl Management {
     }
 
     async fn refresh_transport(self: &Arc<Self>) -> Result<Option<std::time::Instant>> {
+        // One background refresh invocation owns one operational return boundary; registration,
+        // redemption and all configured anchors spend that same clock. Foreground callers pass
+        // their already-created command or ordinary-exchange owner instead.
+        let deadline = std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN;
         let mut work = tokio::task::JoinSet::new();
         let leases = self.transport_leases(None)?;
         for lease in leases.iter().cloned() {
@@ -2031,7 +2045,11 @@ impl Management {
                 let me = Arc::clone(self);
                 let anchor = anchor.clone();
                 let lease = lease.clone();
-                work.spawn(async move { me.transport_at(anchor, lease, true).await.map(|_| ()) });
+                work.spawn(async move {
+                    me.transport_at(anchor, lease, true, deadline)
+                        .await
+                        .map(|_| ())
+                });
             }
         }
         // Cancellation remains retryable after either daemon or anchor restarts. These are
@@ -2063,16 +2081,19 @@ impl Management {
                 let me = Arc::clone(self);
                 let anchor = anchor.clone();
                 work.spawn(async move {
-                    let conn = me
-                        .net
-                        .manager()
-                        .connect(anchor.id, &anchor.endpoints)
-                        .await?;
+                    let conn = tokio::time::timeout_at(
+                        deadline.into(),
+                        me.net.manager().connect(anchor.id, &anchor.endpoints),
+                    )
+                    .await
+                    .map_err(|_| {
+                        Error::Unreachable("computer transport reached its owner's deadline")
+                    })??;
                     me.serve(Arc::clone(&conn));
                     let key = (anchor.id, registration, conn.serial());
                     if !lock(&me.revoked_transport).contains(&key) {
                         me.net
-                            .revoke_computer_transport(&conn, registration)
+                            .revoke_computer_transport(&conn, registration, deadline)
                             .await?;
                         lock(&me.revoked_transport).insert(key);
                     }
@@ -2119,6 +2140,7 @@ impl Management {
         kind: StreamKind,
         send: SendStream,
         recv: RecvStream,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         let mut origins = Vec::new();
         for lease in self.transport_leases(None)? {
@@ -2130,7 +2152,7 @@ impl Management {
             }
             if let Some(peer) = self
                 .net
-                .computer_transport_peer(conn, lease.registration)
+                .computer_transport_peer(conn, lease.registration, deadline)
                 .await?
             {
                 if lease.peer.is_none_or(|expected| expected == peer) {
@@ -2162,6 +2184,7 @@ impl Management {
         target: Digest32,
         endpoints: &EndpointList,
         supplied: Option<&Link>,
+        deadline: std::time::Instant,
     ) -> Result<Arc<VoxConnection>> {
         if let Some(conn) = self.net.manager().existing(&target) {
             return Ok(conn);
@@ -2190,7 +2213,7 @@ impl Management {
                         extra_helpers: [anchor.id].into_iter().collect(),
                         ..crate::node::network::HelperContext::default()
                     };
-                    me.transport_at(anchor, lease, true).await?;
+                    me.transport_at(anchor, lease, true, deadline).await?;
                     me.net
                         .reach(target, &EndpointList::default(), &helpers)
                         .await
@@ -2229,7 +2252,7 @@ impl Management {
         deadline: std::time::Instant,
     ) -> Result<()> {
         let conn = self
-            .connect(link.target, &link.endpoints, Some(link))
+            .connect(link.target, &link.endpoints, Some(link), deadline)
             .await?;
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         let remaining_ms = wire_budget(deadline);
@@ -3422,7 +3445,9 @@ impl Management {
             .await;
         let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
-        let conn = self.connect(peer, endpoints, link.as_ref()).await?;
+        let conn = self
+            .connect(peer, endpoints, link.as_ref(), deadline)
+            .await?;
         self.serve(Arc::clone(&conn));
         #[cfg(feature = "test-knobs")]
         self.stage_stopped_reader_for_proof(&conn, deadline).await?;

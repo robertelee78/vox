@@ -1613,17 +1613,39 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
         "VOX_TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_FILE",
         "VOX_TEST_HOLD_COMPUTER_RECONCILE_SEND_FILE",
+        "VOX_TEST_HOLD_COMPUTER_REGISTRATION_FILE",
         "VOX_TEST_FX28_MUTANT",
     ]);
     let anchor = Account::new();
     let a = Account::new();
     let b = Account::new();
+    let registration_arm = anchor.data.join("registration.arm");
+    let registration_held = anchor.data.join("registration.held");
+    let registration_release = anchor.data.join("registration.release.sock");
+    let registration_waiting = anchor.data.join("registration.waiting");
+    let registration_fault = anchor.data.join("registration.fault");
+    let registration_spec = format!(
+        "{}\t{}\t{}\t{}\t{}",
+        registration_arm.display(),
+        registration_held.display(),
+        registration_release.display(),
+        registration_waiting.display(),
+        registration_fault.display()
+    );
     let start_anchor = |listen: &str| {
         let out = anchor.data.with_extension("anchor.out");
         let f = std::fs::File::create(&out).expect("APPARATUS: anchor transcript");
         let started = Instant::now();
-        let child = anchor
-            .cmd(&["node", "--listen", listen, "--serve", "anyone"])
+        let mut command = anchor.cmd(&["node", "--listen", listen, "--serve", "anyone"]);
+        command.env(
+            "VOX_TEST_HOLD_COMPUTER_REGISTRATION_FILE",
+            &registration_spec,
+        );
+        #[cfg(feature = "test-knobs")]
+        if let Ok(mutant) = std::env::var("VOX_MUTANT_FX28") {
+            command.env("VOX_TEST_FX28_MUTANT", mutant);
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(
                 f.try_clone()
@@ -1755,14 +1777,133 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             &answer_after_merge_spec,
         )],
     );
+    let a_id = computer_id(&a);
+    let b_id = computer_id(&b);
+    let owner_key = vox_core::node::link::b32_decode(&a_id, "apparatus computer owner")
+        .expect("APPARATUS: decode the inviter's shipped identity");
+    std::fs::write(&registration_arm, owner_key)
+        .expect("APPARATUS: arm the exact inviter registration hold");
+    let publication_started = Instant::now();
     let invitation = computer(&a, &["invite"]);
     let link = invitation["invite_link"]
         .as_str()
         .expect("PRODUCT: node-free computer invitation missing");
-    let preview = computer(&b, &["pair", link, "--preview"]);
+    let registration_key = vox_core::node::link::b32_decode(
+        invitation["invite_id"]
+            .as_str()
+            .expect("PRODUCT: invitation omitted its id"),
+        "apparatus invitation id",
+    )
+    .expect("APPARATUS: decode the shipped invitation id");
+    let exact_registration = [owner_key.as_slice(), registration_key.as_slice()].concat();
+    wait_for_daemon_marker(
+        &registration_held,
+        &mut relay,
+        publication_started + RETURN_WITHIN,
+        "the exact inviter publication before anchor insertion",
+    );
+    assert_eq!(
+        std::fs::read(&registration_held).expect("APPARATUS: read held registration"),
+        exact_registration,
+        "APPARATUS: anchor held a different owner/invitation publication"
+    );
+    let pairing_started = Instant::now();
+    let mut initial_preview = b
+        .cmd(&["computer", "pair", link, "--preview", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: start the exact registration-late preview");
+    wait_for_command_marker(
+        &registration_waiting,
+        &mut initial_preview,
+        right.child.id(),
+        pairing_started + PAIR_WITHIN,
+        "the exact missing-inviter redemption branch",
+    );
+    assert!(
+        std::fs::read(&registration_waiting).ok().as_deref() == Some(exact_registration.as_slice())
+            && std::fs::read(&registration_held).ok().as_deref()
+                == Some(exact_registration.as_slice())
+            && !registration_fault.exists(),
+        "APPARATUS: redemption and held publication did not name the same exact owner/invitation"
+    );
+    println!("[proof] FX-28 registration-handoff apparatus staged: the exact missing-inviter redemption arrived while only its owner's real anchor insertion remained held");
+    std::os::unix::net::UnixStream::connect(&registration_release)
+        .expect("APPARATUS: release the exact inviter registration");
+    let initial_output = initial_preview
+        .wait_with_output()
+        .expect("APPARATUS: collect the same registration-late preview command");
+    assert!(initial_output.status.success(),
+        "PRODUCT [FX28 registration-handoff]: the same valid-code pairing command failed instead of waiting for its exact inviter publication: stdout {}; stderr {}",
+        String::from_utf8_lossy(&initial_output.stdout), String::from_utf8_lossy(&initial_output.stderr));
+    let preview: serde_json::Value =
+        serde_json::from_slice(&initial_output.stdout).unwrap_or_else(|error| {
+            panic!("PRODUCT: registration-late preview returned unreadable JSON: {error}")
+        });
+    assert!(preview["this_computer"]["fingerprint"] == b_id
+        && preview["pairing"]["peer"]["fingerprint"] == a_id
+        && preview["pairing"]["approved_here"] == false
+        && preview["pairing"]["approved_there"] == false,
+        "PRODUCT: registration-late preview did not authenticate the exact still-unapproved computers: {preview}");
     let op = preview["pairing"]["operation_id"]
         .as_str()
         .expect("PRODUCT: pairing preview omitted its operation identity");
+    // Cancellation must stay a known refusal, even after the active registration is removed.
+    // The anchor marker is emitted only for this exact already-published owner's revocation;
+    // it supplies no fabricated expiry and consumes no active-registration capacity.
+    computer(&a, &["cancel", op]);
+    computer(&b, &["cancel", op]);
+    let known_revoked = registration_waiting.with_extension("revoked");
+    wait_for_daemon_marker(
+        &known_revoked,
+        &mut relay,
+        Instant::now() + RETURN_WITHIN,
+        "the exact known registration revocation",
+    );
+    assert_eq!(
+        std::fs::read(&known_revoked).expect("APPARATUS: read known revocation"),
+        exact_registration,
+        "APPARATUS: revocation marker named another owner/invitation"
+    );
+    println!("[proof] FX-28 known-revocation apparatus staged: the anchor processed this exact already-published registration's authenticated cancellation");
+    // A circuit already closing after cancellation can still be returned by the old process's
+    // connection cache. Restart this same scratch redeemer so this claim necessarily asks the
+    // still-running anchor about the known registration, rather than racing that teardown.
+    stop_pid(right.child.id());
+    right
+        .child
+        .wait()
+        .expect("APPARATUS: stop the cancelled-code redeemer");
+    right = start(
+        &b,
+        "[::1]:0",
+        &v6,
+        &[(
+            "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
+            &answer_after_merge_spec,
+        )],
+    );
+    assert_eq!(
+        computer_id(&b),
+        b_id,
+        "PRODUCT: restarting the cancelled-code redeemer changed its persistent computer identity"
+    );
+    let (closed_ok, closed_out, closed_err) =
+        b.run(&["computer", "pair", link, "--preview", "--json"], "");
+    assert!(!closed_ok && !closed_err.contains("deadline") && !closed_err.contains("timed out"),
+        "PRODUCT [FX28 cancelled-code]: the cancelled code was accepted or left waiting until a deadline instead of returning a terminal refusal: stdout {closed_out}; stderr {closed_err}");
+    // A new invitation remains usable; revocation history must not consume active capacity or
+    // resurrect the cancelled operation. Establish the computers only from this new operation.
+    let invitation = computer(&a, &["invite"]);
+    let link = invitation["invite_link"]
+        .as_str()
+        .expect("PRODUCT: replacement node-free invitation missing");
+    let preview = computer(&b, &["pair", link, "--preview"]);
+    let op = preview["pairing"]["operation_id"]
+        .as_str()
+        .expect("PRODUCT: replacement pairing preview omitted its operation identity");
     computer(&a, &["approve", op]);
     computer(&b, &["approve", op]);
     loop {
@@ -1840,8 +1981,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .expect("APPARATUS: stopped anchor did not exit");
     right = start(&b, "[::1]:0", &v6, &[]);
 
-    let a_id = computer_id(&a);
-    let b_id = computer_id(&b);
     let before = application_toward(&a, &b_id);
     let attempts_before = before["exchange_attempts"].as_u64().unwrap_or(0);
     let failures_before = before["exchange_failures"].as_u64().unwrap_or(0);

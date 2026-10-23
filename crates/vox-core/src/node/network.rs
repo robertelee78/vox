@@ -693,9 +693,10 @@ impl NodeNet {
         token: &Digest32,
         expires_ms: u64,
         peer: Option<Digest32>,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
                 .register_computer_transport(
@@ -705,6 +706,7 @@ impl NodeNet {
                     token,
                     expires_ms,
                     peer,
+                    deadline,
                 )
                 .await
         })
@@ -719,12 +721,13 @@ impl NodeNet {
         owner: Digest32,
         registration: Digest32,
         token: &Digest32,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
-                .redeem_computer_transport(owner, registration, token)
+                .redeem_computer_transport(owner, registration, token, deadline)
                 .await
         })
         .await
@@ -736,12 +739,13 @@ impl NodeNet {
         &self,
         anchor: &VoxConnection,
         registration: Digest32,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
-                .revoke_computer_transport(registration)
+                .revoke_computer_transport(registration, deadline)
                 .await
         })
         .await
@@ -753,12 +757,13 @@ impl NodeNet {
         &self,
         anchor: &VoxConnection,
         registration: Digest32,
+        deadline: std::time::Instant,
     ) -> Result<Option<Digest32>> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
-                .computer_transport_peer(registration)
+                .computer_transport_peer(registration, deadline)
                 .await
         })
         .await
