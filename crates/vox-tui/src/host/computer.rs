@@ -219,10 +219,6 @@ impl Router {
                         router.mark_computer_reconciliation_late(
                             &name, generation, identity, change, pass,
                         );
-                        #[cfg(feature = "test-knobs")]
-                        if handle.abandon_late_computer_application_for_proof(&superseded) {
-                            return;
-                        }
                         application.await
                     }
                 }

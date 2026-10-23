@@ -84,6 +84,21 @@ impl ComputerPolicyGuard {
             Self::Current { change, .. } => Some(*change),
         }
     }
+
+    /// Proof mutant for the former defect: once the exact causally held live-follower event is
+    /// released after its original observation boundary, discard it instead of completing the
+    /// still-current work. Deadline-owned command/startup work is deliberately unaffected.
+    #[cfg(feature = "test-knobs")]
+    fn abandon_late_application_for_proof(&self) {
+        let Self::Current { change, superseded } = self else {
+            return;
+        };
+        if crate::node::computer::fx28_mutant("late-application-abandons-work")
+            && std::time::Instant::now() >= change.apply_deadline()
+        {
+            superseded.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// A captured actor projection whose final use is checked against durable Computer state. The
@@ -353,7 +368,7 @@ impl Node {
         let _ = std::fs::remove_file(release);
     }
 
-    pub(super) async fn hold_computer_policy_for_proof(&self) {
+    pub(super) async fn hold_computer_policy_for_proof(&self, guard: &ComputerPolicyGuard) {
         let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV) else {
             return;
         };
@@ -379,6 +394,7 @@ impl Node {
             return;
         }
         let _ = listener.accept().await;
+        guard.abandon_late_application_for_proof();
         let _ = std::fs::remove_file(engaged);
         let _ = std::fs::remove_file(release);
     }
@@ -846,41 +862,6 @@ impl NodeHandle {
             .map_err(|_| Error::Unreachable("the node has stopped"))?;
         rx.await
             .map_err(|_| Error::Unreachable("the node has stopped"))?
-    }
-
-    /// Proof mutant for the former defect: after the public miss is recorded, discard the exact
-    /// accepted follower event instead of allowing its same-current application to complete.
-    #[cfg(feature = "test-knobs")]
-    pub fn abandon_late_computer_application_for_proof(
-        &self,
-        superseded: &std::sync::atomic::AtomicBool,
-    ) -> bool {
-        if !crate::node::computer::fx28_mutant("late-application-abandons-work") {
-            return false;
-        }
-        // Isolate this fault to the actor causally held for the late-application claim;
-        // earlier independent deadline scenarios must not mask its assertion.
-        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV) else {
-            return false;
-        };
-        let mut fields = spec.splitn(4, '\t');
-        let (Some(node), Some(_arm), Some(engaged), Some(_release)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return false;
-        };
-        if self
-            .paths
-            .profile_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            != Some(node)
-            || !std::path::Path::new(engaged).is_file()
-        {
-            return false;
-        }
-        superseded.store(true, std::sync::atomic::Ordering::Release);
-        true
     }
 
     /// Run the daemon's synchronous Ready publication only while the exact durable application

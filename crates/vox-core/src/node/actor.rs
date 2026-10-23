@@ -11336,7 +11336,7 @@ impl Node {
             }
             NetEvent::ComputerPolicy { guard, reply } => {
                 #[cfg(feature = "test-knobs")]
-                self.hold_computer_policy_for_proof().await;
+                self.hold_computer_policy_for_proof(&guard).await;
                 #[cfg(feature = "test-knobs")]
                 let reply_delay = self.hold_computer_policy_reply_for_proof();
                 let result = match self.prepare_computer_binding_guarded(&guard) {
