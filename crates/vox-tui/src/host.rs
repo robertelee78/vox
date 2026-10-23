@@ -172,10 +172,10 @@ struct Attached {
     paths: Paths,
     /// Which attach this is: a release or a panic meant for an earlier one changes nothing.
     generation: u64,
-    /// Exact Computer policy revision whose reconciliation result currently owns this attach.
-    /// A later revision replaces that ownership before starting its actor work, so an older
-    /// timeout cannot detach the still-current attachment.
-    computer_reconciliation: Option<u64>,
+    /// Exact `(policy revision, pass generation)` currently reconciling this attach. A later
+    /// pass replaces ownership even at the same revision, so an earlier result cannot overwrite
+    /// the current node's application status.
+    computer_reconciliation: Option<(u64, u64)>,
     /// Attached implicitly: it detaches when its last holder goes (L-3).
     implicit: bool,
     /// The actual credential that opened this identity was empty (or this is a headless node).

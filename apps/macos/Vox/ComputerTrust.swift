@@ -381,10 +381,14 @@ struct ComputerTrustView: View {
     private func applicationState(_ application: ComputerApplication, status: ComputerStatus) -> String {
         if status.state == "quarantined" { return "Trust suspended" }
         if application.convergenceState == "expired" { return "Expired before convergence" }
-        if application.convergenceState == "repaired-late" { return "Repaired late; trust not applied" }
-        if application.convergenceState == "replaced" { return "Expired revision replaced; applying current policy" }
         if !model.reachable {
             return application.confirmed ? "Last known: confirmed" : "Last known: awaiting confirmation"
+        }
+        if application.convergenceState == "repaired-late" {
+            return application.confirmed ? "Confirmed; repaired late" : "Repaired late; awaiting confirmation"
+        }
+        if application.convergenceState == "replaced" {
+            return application.confirmed ? "Confirmed; expired revision replaced" : "Expired revision replaced; applying current policy"
         }
         return application.confirmed ? "Confirmed" : "Awaiting confirmation"
     }

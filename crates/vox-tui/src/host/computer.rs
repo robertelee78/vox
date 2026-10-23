@@ -29,8 +29,8 @@ fn mark_computer_status_returned_for_proof(returned: Option<std::path::PathBuf>)
 impl Router {
     /// Reconcile the daemon's nodes with computer trust on change, and on no timer (ADR-038
     /// FX-28): when the policy revision moves (a change made here, or a merged exchange that
-    /// moved it), when a node attaches or detaches, and when the endpoints this daemon advertises
-    /// move (its reach is then recorded for the other computers). Measured before this
+    /// moved it), and when a node attaches or detaches. Endpoint movement records transport reach
+    /// for the other computers without starting another node-application clock. Measured before this
     /// (2026-10-20, the decider's daemon): a 1 s tick re-derived every node's binding, an ML-DSA
     /// verification of every management event, with nothing changed.
     pub(super) fn follow_computer_trust(&self) {
@@ -79,17 +79,19 @@ impl Router {
                             continue;
                         }
                         advertised = now;
-                        vox_core::node::computer::ComputerChange::now(
-                            management.computer.policy_revision(),
-                        )
+                        if let Err(error) = management.record_reach() {
+                            eprintln!("vox daemon: computer reach update pending: {error}");
+                        }
+                        continue;
                     }
                     event = nodes.recv() => {
                         match event {
                             Ok(DaemonEvent::Attached { .. } | DaemonEvent::Detached { .. })
                             | Err(broadcast::error::RecvError::Lagged(_)) => {
-                                vox_core::node::computer::ComputerChange::now(
-                                    management.computer.policy_revision(),
-                                )
+                                // Unlock owns a new attachment's startup boundary. Updating the
+                                // roster must not renew an older attached node's policy deadline;
+                                // any actual roster policy change arrives through `policy` above.
+                                change
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
                         }
@@ -132,16 +134,16 @@ impl Router {
         }
         let mut pending = Vec::new();
         let mut behind = Vec::new();
+        let pass = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
         let attached: Vec<_> = {
             let mut slots = lock(&self.inner.slots);
             slots
                 .iter_mut()
                 .filter_map(|(name, slot)| match slot {
                     Slot::Attached(attached) => {
-                        // Claim the attachment for this exact revision before any older task can
-                        // report. Attachment generation alone cannot distinguish R1 from R2 on
-                        // the same live actor.
-                        attached.computer_reconciliation = Some(revision);
+                        // Same-revision passes can overlap too. Claim this exact pass before an
+                        // older task can report or erase the current node's pending status.
+                        attached.computer_reconciliation = Some((revision, pass));
                         Some((
                             name.as_str().to_owned(),
                             attached.handle.clone(),
@@ -185,7 +187,9 @@ impl Router {
                     .map_err(|error| error.to_string());
                 match outcome {
                     Ok(()) => {
-                        if !router.computer_reconciliation_current(&name, generation, revision) {
+                        if !router.finish_computer_reconciliation(
+                            &name, generation, revision, pass, None,
+                        ) {
                             return;
                         }
                         if let Err(e) = management.record_application() {
@@ -193,11 +197,12 @@ impl Router {
                         }
                     }
                     Err(why) => {
-                        eprintln!(
-                            "vox daemon: node {name} computer trust reconciliation at revision {revision} failed: {why}"
-                        );
-                        if router.computer_reconciliation_current(&name, generation, revision) {
-                            management.node_pending(name.as_str(), &why);
+                        if router.finish_computer_reconciliation(
+                            &name, generation, revision, pass, Some(&why),
+                        ) {
+                            eprintln!(
+                                "vox daemon: node {name} computer trust reconciliation at revision {revision} failed: {why}"
+                            );
                         }
                     }
                 }
@@ -205,16 +210,30 @@ impl Router {
         }
     }
 
-    fn computer_reconciliation_current(
+    fn finish_computer_reconciliation(
         &self,
         node: &NodeName,
         generation: u64,
         revision: u64,
+        pass: u64,
+        failure: Option<&str>,
     ) -> bool {
-        match lock(&self.inner.slots).get(node) {
+        match lock(&self.inner.slots).get_mut(node) {
             Some(Slot::Attached(attached)) => {
-                attached.generation == generation
-                    && attached.computer_reconciliation == Some(revision)
+                if attached.generation != generation
+                    || attached.computer_reconciliation != Some((revision, pass))
+                {
+                    return false;
+                }
+                // Ownership and its status update share this slot lock. Checking, unlocking and
+                // only then updating allowed an earlier pass to overwrite a newer result.
+                attached.computer_reconciliation = None;
+                let management = &self.inner.defaults.computer;
+                match failure {
+                    Some(why) => management.node_pending(node.as_str(), why),
+                    None => management.node_applied(node.as_str()),
+                }
+                true
             }
             _ => false,
         }

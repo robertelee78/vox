@@ -651,6 +651,42 @@ impl Management {
         })?
     }
 
+    /// Record transport reach without creating a policy-application event or receipt. An
+    /// endpoint change cannot renew an expired node application's causal deadline.
+    pub fn record_reach(&self) -> Result<()> {
+        let local = self.computer.signer.fingerprint();
+        let endpoints = self.net.local_endpoints()?;
+        self.computer
+            .change(|s| self.record_reach_in(s, local, endpoints))
+    }
+
+    fn record_reach_in(
+        &self,
+        s: &mut State,
+        local: Digest32,
+        endpoints: EndpointList,
+    ) -> Result<()> {
+        if s.genesis.is_some() && s.grant(&local).is_some() && s.quarantined.is_empty() {
+            let reach = Reach {
+                endpoints,
+                anchors: self.anchors.clone(),
+                token: s
+                    .reaches
+                    .get(&local)
+                    .map(|r| r.token)
+                    .unwrap_or(random_array()?),
+            };
+            if s.reaches.get(&local) != Some(&reach) {
+                let mut body = Encoder::new();
+                body.array(1).bytes(&reach.encode());
+                let event =
+                    Control::sign(s, "reach", body.finish(), self.computer.signer.as_ref())?;
+                s.retain_roster(event)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Sign a receipt only for the exact locally applied policy and authenticated roster frontier.
     /// The remote receipt is a separate statement: offline peers remain pending.
     pub fn record_application(&self) -> Result<()> {
@@ -660,24 +696,7 @@ impl Management {
         let local = self.computer.signer.fingerprint();
         let endpoints = self.net.local_endpoints()?;
         self.computer.change(|s| {
-            if s.genesis.is_some() && s.grant(&local).is_some() && s.quarantined.is_empty() {
-                let reach = Reach {
-                    endpoints,
-                    anchors: self.anchors.clone(),
-                    token: s
-                        .reaches
-                        .get(&local)
-                        .map(|r| r.token)
-                        .unwrap_or(random_array()?),
-                };
-                if s.reaches.get(&local) != Some(&reach) {
-                    let mut body = Encoder::new();
-                    body.array(1).bytes(&reach.encode());
-                    let event =
-                        Control::sign(s, "reach", body.finish(), self.computer.signer.as_ref())?;
-                    s.retain_roster(event)?;
-                }
-            }
+            self.record_reach_in(s, local, endpoints)?;
             // A reach record is transport state, not a later operator-policy cause. It must not
             // make an expired policy current again or recreate the computer's applied receipt.
             if Computer::revision_expired(s) {
@@ -1773,6 +1792,12 @@ impl Management {
         let prefix = format!("{node}: ");
         pending.retain(|entry| !entry.starts_with(&prefix));
         pending.push(format!("{prefix}{why}"));
+    }
+    /// The exact current reconciliation pass completed: clear only that node's pending result.
+    /// The daemon owns pass ordering and calls this while holding the attachment's ownership lock.
+    pub fn node_applied(&self, node: &str) {
+        let prefix = format!("{node}: ");
+        lock(&self.pending_nodes).retain(|entry| !entry.starts_with(&prefix));
     }
     fn transport_leases(&self, supplied: Option<&Link>) -> Result<Vec<TransportLease>> {
         let s = lock(&self.computer.state);
