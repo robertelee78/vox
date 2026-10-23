@@ -33,8 +33,8 @@ pub const TEST_HOLD_ARCHIVE_JOB_ENV: &str = "VOX_TEST_HOLD_ARCHIVE_JOB_FILE";
 /// Proof-only file whose presence holds the pool at its source-defined floor. This stages the
 /// otherwise impossible retained-continuation path without copying a capacity count.
 pub const TEST_FLOW_STATE_FLOOR_ENV: &str = "VOX_TEST_FLOW_STATE_FLOOR_FILE";
-/// Running bounded-sync flow states shared by the daemon. Parked work owns none of these slots;
-/// a full pool retains the exact continuation and wakes it from a charge release.
+/// Historical fixed capacity used only to stage the old full-pool failure in optional proofs.
+/// Production capacity is exactly the running slots times active-or-retiring identities.
 pub const FLOW_STATE_CAPACITY: usize = 16;
 /// The running bounded-sync slots one hosted node owns. This is the source of truth for both
 /// the controller's array and the daemon pool's per-node capacity (ADR-038 FX-35).
@@ -57,7 +57,7 @@ fn flow_state_limit(hosted: usize) -> usize {
     {
         return FLOW_STATE_CAPACITY;
     }
-    FLOW_STATE_CAPACITY.max(BOUNDED_SYNC_RUNNING_SLOTS * hosted)
+    BOUNDED_SYNC_RUNNING_SLOTS * hosted
 }
 
 #[cfg(feature = "test-knobs")]
@@ -896,8 +896,8 @@ impl Drop for BufferCharge {
 /// `vox status --json` shows of it is one coordinated view: how many flow states it allows;
 /// which running rounds hold one (actor, node, room, peer); and the current actor's count per
 /// hosted node (one member per hosted node, 0 until it holds one). Retiring generations remain
-/// visible separately. The limit is at least [`FLOW_STATE_CAPACITY`] and otherwise two per
-/// hosted identity; it bounds only running rounds. A parked continuation holds no pool slot.
+/// visible separately. The limit is exactly two per active-or-retiring hosted identity;
+/// it bounds only running rounds. A parked continuation holds no pool slot.
 struct Pool {
     limit: usize,
     in_use: usize,
@@ -961,7 +961,7 @@ pub struct FlowStateOwner {
 impl Default for Pool {
     fn default() -> Self {
         Self {
-            limit: FLOW_STATE_CAPACITY,
+            limit: 0,
             in_use: 0,
             running: BTreeMap::new(),
             next_owner: 0,

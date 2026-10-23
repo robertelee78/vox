@@ -2266,9 +2266,8 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
         let by_node = pool["by_node"]
             .as_object()
             .expect("PRODUCT: generation-accounting status omitted by_node");
-        let expected_limit = vox_core::node::history_budget::FLOW_STATE_CAPACITY
-            .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * staged.hosted)
-            as u64;
+        let expected_limit =
+            (vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * staged.hosted) as u64;
         let actor_sum: u64 = pool["actors"]
             .as_array()
             .into_iter()
@@ -2386,7 +2385,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// `by_node` holding one member per node its daemon hosts, the asked node's member equal to its
 /// ports with `round_running` and `in_use` the sum; and every port's last start in the contract's
 /// words ([`start_words`]). Its limit is exactly the shared source constants'
-/// `max(floor, running slots × hosted nodes)`, not a copied count, so it is never full in the
+/// `running slots × active-or-retiring identities`, not a copied count, so it is never full in the
 /// production segment. A feature-gated apparatus file then temporarily selects that same
 /// source-defined floor to reach the otherwise impossible retained path: PoolFull requires
 /// `occupied == limit`; an unrelated hosted-identity registration enlarges the limit but does
@@ -3074,9 +3073,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                          ports have a round running"
                     ));
                 }
-                let expected_limit = vox_core::node::history_budget::FLOW_STATE_CAPACITY
-                    .max(vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * keys.len())
-                    as u64;
+                let expected_limit = (vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS
+                    * keys.len()) as u64;
                 if l != expected_limit || occupied > l {
                     broken.push(format!(
                         "{name}: the pool allows {l}, not exactly {expected_limit}, flow states \
