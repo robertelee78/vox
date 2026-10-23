@@ -33,10 +33,6 @@ pub(super) enum ComputerAuthority {
 
 impl ComputerAuthority {
     pub(super) fn publish<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
-        #[cfg(feature = "test-knobs")]
-        if crate::node::computer::fx28_mutant("stale-tick-authority") {
-            return Some(publish());
-        }
         match self {
             Self::Unmanaged => Some(publish()),
             Self::Managed {
@@ -51,6 +47,15 @@ impl ComputerAuthority {
     pub(super) fn publish_room_creation<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
         #[cfg(feature = "test-knobs")]
         if crate::node::computer::fx28_mutant("stale-room-create-authority") {
+            return Some(publish());
+        }
+        self.publish(publish)
+    }
+
+    /// The pause mutant changes only this publication, so earlier join assertions cannot mask it.
+    pub(super) fn publish_room_pause<T>(&self, publish: impl FnOnce() -> T) -> Option<T> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("stale-tick-authority") {
             return Some(publish());
         }
         self.publish(publish)

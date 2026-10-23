@@ -22563,7 +22563,9 @@ impl Node {
             // safe and the exact durable pause write cannot outlive its authority. The local
             // owner is fenced too: Computer policy authorizes the node identity, not just remote
             // agents acting through it.
-            let written = self.with_current_computer_authority(write);
+            let written = self
+                .computer_authority()
+                .and_then(|authority| authority.publish_room_pause(write));
             match written {
                 None => return Err(Fault::Refused),
                 Some(Ok(())) => {}
