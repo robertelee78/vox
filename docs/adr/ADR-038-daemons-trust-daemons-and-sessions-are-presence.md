@@ -1,15 +1,18 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
 - **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
-  at a time, quoted below) are the requirements; nothing here is built. Each requirement lands
-  with its proof (ADR-018) in a small release (FX-19).
+  at a time, quoted below) are the accepted product requirements; undecided presentation details
+  remain proposed. Execution, acceptance and delivery are recorded on the source-bound GitHub
+  issues, separately from decision status. Each requirement MUST land with its proof (ADR-018)
+  in a small release (FX-19).
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
   that could not be unlocked); amended 2026-10-21 (FX-35: a daemon whose parked flows held
   the flow-state pool synced nothing); amended 2026-10-21 (FX-37: room creation overflowed a
   normal Tokio worker stack while reconstructing an ML-DSA root key for one signature); amended
-  2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict)
+  2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict);
+  amended 2026-10-23 (FX-28: atomic node application and durable room-admission rollback)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -412,6 +415,40 @@ The decider then answered twelve questions, one at a time. His answers are the d
   path and proves the carried policy is applied to every receiving node while the initiator still
   names the original miss as repaired late. Its mutant suppresses the repair application, so the
   effective-keyring assertion—not elapsed sampling—turns PRODUCT red.
+
+  Application handoff, 2026-10-23: preparing an application MUST durably retain the exact
+  rollback obligation before changing the node store. The keyring, pending removal locks,
+  pending consent keys and consent ordering MUST commit together in one node-store batch.
+  The Computer writer fence validates the same policy revision and expiry state before that
+  batch; policy changes cannot interleave with its commit. The short state lock MUST NOT span
+  node-store I/O. Live trust marks likewise install only after their durable batch commits.
+  Once an application receipt is current, the actor MUST publish its committed revision and
+  trust view before an elapsed-time verdict can return; recording a missed boundary cannot
+  strand a completed application behind an older live projection.
+  Every reconciliation pass owns a distinct identity even at the same policy revision; a
+  superseded pass cannot clear or overwrite its successor's pending result. Endpoint observations
+  update reachability without renewing an application deadline. Node attachment uses the
+  policy cause's retained deadline; a later effective policy change owns its own new cause.
+  Clients show current application confirmation, historical lateness and current reachability
+  separately: neither late repair nor an unreachable peer erases a confirmed application.
+
+  A refused or interrupted room join MUST retain cleanup before publishing any prejoin, member
+  or bundle record remotely. Before the responder admits a member, it proposes the exact
+  admission fields under a signature domain distinct from the final join witness. The initiator
+  verifies that proposal and durably covers its epoch and timestamp in its withdrawal journal
+  before acknowledging its hash. Only then may the responder admit and return the final witness;
+  the initiator verifies its signature and equality with the prepared fields. A proposal alone
+  grants no admission authority, and validation-only exchanges admit nobody. Final admission
+  rechecks the exact room instance, attachment, epoch and responder's current membership under
+  the room lock. The author and its admission notice MUST commit in one store batch before
+  success; neither live projection advances if persistence fails. Member withdrawals
+  can authenticate against the exact held prejoin root key, remove covered prejoins as well as
+  member/bundle records, and prevent replay without blocking a genuinely later prejoin. The
+  board rejects future-dated withdrawals before storing either pending or applied state. A
+  current-policy fence closes the successful join's cleanup obligation; failure or restart keeps
+  it until withdrawal is complete. Sender-key authority proofs stage the exact protected entry
+  at the recipient before releasing a held key batch: lack of ciphertext or receiver-side policy
+  revocation cannot substitute for proving the sender's final admission fence.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its
