@@ -278,7 +278,7 @@ pub(super) async fn erase_retired_node(ledger: &Arc<RetirementLedger>, node: Dig
             // Only dependency waiting can remain once we own the actual worker's cell.
             task.abort();
         }
-        if let Some(mut flow) = held.take() {
+        if let Some(flow) = held.take() {
             flow.cancel();
             flow.shared.lock().await.lock_now();
             // Locked-room reopen recovery owns any remaining durable staging cleanup. Drop
