@@ -986,6 +986,14 @@ impl Receiver {
         let fence = self.source.fence.clone();
         let deadline = self.source.deadline;
         let job = job.clone();
+        let requested_zero_entry = match query {
+            Query::Entry {
+                head,
+                seq,
+                offset: 0,
+            } => Some((*head, *seq)),
+            _ => None,
+        };
         tokio::task::spawn_blocking(move || {
             let committed = admission.is_some();
             if !committed {
@@ -1009,10 +1017,18 @@ impl Receiver {
             }
             let normalized = if let Some(body) = &state.body {
                 if hint.as_ref().is_some_and(|cursor| {
+                    // An honest Busy before the header carries no new body hash. A prior
+                    // response may already have persisted this exact header at offset zero;
+                    // preserve that durable knowledge rather than treating absence as conflict.
+                    let busy_before_header = status == Status::Busy
+                        && requested_zero_entry == Some((state.bounds.head, body.seq))
+                        && body.offset == 0
+                        && cursor.entry.is_none()
+                        && cursor.offset == 0;
                     cursor.head != state.bounds.head
-                        || cursor.entry != Some(body.entry)
                         || cursor.next_seq != body.seq
-                        || cursor.offset != body.offset
+                        || (!busy_before_header
+                            && (cursor.entry != Some(body.entry) || cursor.offset != body.offset))
                 }) {
                     return Err(Error::MalformedBundle(
                         "history body hint differs from storage",
