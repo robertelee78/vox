@@ -1572,10 +1572,8 @@ fn stage_hosted_nodes(
         }
         rooms.push(room);
     }
-    // One post each in each room, and every node reads every other's within BOUND. A post the
-    // room turns away because its last change is still being applied ("this request made no
-    // change") is retried for up to [`POST_WAIT`], as the person told so does; the longest such
-    // wait is reported.
+    // One post each in each room. Retry only the explicit no-change refusal while the room
+    // applies its last change; callers assess delivery separately from setup.
     let posted = Instant::now();
     let mut waited = Duration::ZERO;
     for room in &rooms {
@@ -1584,6 +1582,12 @@ fn stage_hosted_nodes(
             waited = waited.max(stage_post(dir, *node, name, room, &text));
         }
     }
+    eprintln!(
+        "[delivery] all {} posts accepted across {} identities and {} rooms; mutual reads follow",
+        everyone.len() * rooms.len(),
+        everyone.len(),
+        rooms.len()
+    );
     Staged {
         _host_daemon: host_daemon,
         peer_daemon: Some(peer_daemon),
@@ -1608,6 +1612,7 @@ fn converged(staged: &Staged) {
         everyone, rooms, ..
     } = staged;
     let mut unread: Vec<String> = Vec::new();
+    let mut previous_unread = None;
     loop {
         unread.clear();
         for room in rooms {
@@ -1623,6 +1628,14 @@ fn converged(staged: &Staged) {
                     }
                 }
             }
+        }
+        if previous_unread.as_ref() != Some(&unread) {
+            eprintln!(
+                "[delivery] ordinary reads still missing {} reader/author/room observations; examples: {:?}",
+                unread.len(),
+                &unread[..unread.len().min(8)]
+            );
+            previous_unread = Some(unread.clone());
         }
         if unread.is_empty() {
             break;
