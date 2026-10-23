@@ -2817,11 +2817,19 @@ impl Management {
                                 // a later retry started a new user-visible clock.
                                 last + wait
                             };
-                            if now >= due {
+                            if now < due {
+                                next = Some(next.map_or(due, |held| held.min(due)));
+                                return false;
+                            }
+                            // A due backoff attempt is still the repair of the retained ordinary
+                            // cause. It must pass through the receipt/causal classification below:
+                            // otherwise the first failure consumes the retry mark and every later
+                            // attempt loses ownership of the original deadline, so no attempt can
+                            // ever record that deadline as missed.
+                            #[cfg(feature = "test-knobs")]
+                            if super::fx28_mutant("due-backoff-drops-causal-cause") {
                                 return true;
                             }
-                            next = Some(next.map_or(due, |held| held.min(due)));
-                            return false;
                         }
                     } else {
                         // A successful exchange delivered this exact payload. A missing applied

@@ -2365,15 +2365,21 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     // Exercise the late-repair branch itself. The anchor goes away, a real policy revision is
     // made, and shipped status—not a sleep—causally says that revision missed its retained
     // convergence deadline. After the exact anchor identities return, the late exchange repairs
-    // the roster but MUST keep the missed contract visible. Mutant: clear the late-success branch
-    // in `record_exchange`; the durable missed-revision/repair assertions turn PRODUCT red.
+    // the roster but MUST keep the missed contract visible. Independent mutants: let a due
+    // backoff retry drop its retained causal owner, or clear the late-success branch in
+    // `record_exchange`; the durable missed-revision/repair assertions turn PRODUCT red.
     stop_pid(anchor.lock_pid().expect("APPARATUS: scratch anchor daemon"));
     relay
         .child
         .wait()
         .expect("APPARATUS: stopped anchor did not exit");
     let late = a.make_node("anchor-return-late");
+    let before_late_application = application_toward(&a, &b_id);
+    let attempts_before_late = before_late_application["exchange_attempts"]
+        .as_u64()
+        .expect("PRODUCT: pre-late application omitted its exchange-attempt count");
     let revision_before_late = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
+    let late_admission_started = Instant::now();
     let (ok, out, err) = a.run(
         &[
             "node",
@@ -2385,24 +2391,72 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         PASS,
     );
     assert!(ok, "PRODUCT: attach the late-repair node: {out}{err}");
+    // The policy event which owns the return contract was admitted during this shipped command.
+    // Its exact instant is inside [late_admission_started, late_admitted_by]; the later endpoint is
+    // the conservative bound, so a still-pending application after it plus RETURN_WITHIN is an
+    // unambiguous product miss rather than a proof watchdog or a replacement clock.
+    let late_admitted_by = Instant::now();
+    let late_miss_shown_by = late_admitted_by + RETURN_WITHIN;
     let late_revision = computer(&a, &["status"])["revision"]
         .as_u64()
         .filter(|revision| *revision > revision_before_late)
         .unwrap_or_else(|| {
             panic!("PRODUCT: attaching the late-repair node moved no policy revision")
         });
+    let mut due_backoff_staged = false;
     loop {
+        let observation_started = Instant::now();
         let status = computer(&a, &["status"]);
-        let application = application_toward(&a, &b_id);
+        let application = status["applications"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|application| application["computer"]["fingerprint"] == b_id)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            status["revision"].as_u64(),
+            Some(late_revision),
+            "APPARATUS: another policy superseded revision {late_revision} before its due-backoff miss could be judged: {status}"
+        );
+        let stage_observed = application["exchange_attempts"]
+            .as_u64()
+            .is_some_and(|attempts| attempts >= attempts_before_late.saturating_add(2))
+            && application["exchange_failures"]
+                .as_u64()
+                .is_some_and(|failures| failures > 0);
+        if stage_observed && !due_backoff_staged {
+            due_backoff_staged = true;
+            println!(
+                "[proof] FX-28 due-backoff-causal-miss apparatus staged: revision {late_revision}'s early failed attempt was followed by its selected due retry under unchanged policy"
+            );
+        }
         if application["missed_revision"] == late_revision
             && application["convergence_state"] == "expired"
         {
+            assert!(
+                due_backoff_staged,
+                "APPARATUS: revision {late_revision}'s miss became visible without a shipped early failure followed by its due retry, so the backoff selector's causal path was not exercised: before {before_late_application}; after {application}"
+            );
+            println!(
+                "[proof] revision {late_revision}'s early failure and due-backoff retry remained one causal obligation; shipped status names the retained cause expired (admission command took {:?}, contract {RETURN_WITHIN:?})",
+                late_admitted_by.duration_since(late_admission_started)
+            );
             break;
         }
         assert!(
             daemon_alive(left.child.id()),
             "APPARATUS: left daemon exited before shipped status named the deliberately staged missed causal deadline: {status}"
         );
+        if observation_started >= late_miss_shown_by {
+            assert!(
+                due_backoff_staged,
+                "APPARATUS: the anchor-outage phase reached revision {late_revision}'s return boundary without a shipped early failure followed by its due retry, so the backoff selector's causal path was not exercised: before {before_late_application}; after {application}"
+            );
+            panic!(
+                "PRODUCT [FX28 due-backoff-causal-miss]: a shipped status read begun after the conservative upper end of revision {late_revision}'s original {RETURN_WITHIN:?} return contract still reported its exact remote application as pending instead of expired: {application}; status {status}"
+            );
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
     // This old miss is not this next explicit request's clock. Admit a fresh invocation while
