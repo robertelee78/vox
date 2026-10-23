@@ -455,18 +455,16 @@ struct Flight {
     /// This flight, as distinct from any later one with the same computer: an abort handle is
     /// installed, and a reservation released, only for the flight that owns them.
     serial: u64,
-    /// Operator-policy revision which owns this flight's causal clock. `revision` still decides
-    /// whether its actual exchange payload was superseded; keeping both prevents a larger
-    /// transport/pairing journal number from making an older policy own a newer policy's clock.
+    /// Operator-policy revision of this flight. For retries it owns the ordinary causal clock;
+    /// for an operator command it identifies supersession, not ownership of ordinary work.
     policy_revision: u64,
     revision: u64,
     involved: bool,
     /// This flight discharges a policy/receipt/failure obligation. A quiet fallback is false: an
     /// overlapping inbound fallback must not cancel it and manufacture a second local attempt.
     causal: bool,
-    /// Earliest causal return deadline among the changes this flight is responsible for. A
-    /// superseding revision inherits it before this task is cut, so coalescing never restarts the
-    /// user's convergence clock.
+    /// A retry's retained causal return deadline, or an operator invocation's own command
+    /// deadline. Only the former is transferred to ordinary work when this flight is cut.
     deadline: std::time::Instant,
     /// Who started it: the retry, or the operator's pairing command.
     origin: Origin,
@@ -1169,6 +1167,10 @@ impl Management {
     }
     /// Authenticate a supplied code before exposing the peer as an approval candidate.
     pub async fn preview(self: &Arc<Self>, url: &str) -> Result<ComputerStatus> {
+        // Admission of this explicit request owns one command clock, including validation,
+        // reservation and authentication. Earlier ordinary-policy work keeps its own clock;
+        // this fresh invocation neither inherits nor renews it.
+        let command_deadline = std::time::Instant::now() + COMPUTER_PAIR_WITHIN;
         let link = Link::parse(url)?;
         if lock(&self.computer.state)
             .pair_link
@@ -1215,7 +1217,6 @@ impl Management {
         // The operator's action comes first: a retry exchange in flight with that computer
         // is cut (as no failure) and its reservation waited for, briefly; another operator
         // pairing in flight is reported.
-        let mut causal_deadline = std::time::Instant::now() + COMPUTER_PAIR_WITHIN;
         let serial = next_flight();
         loop {
             // Register before inspecting the reservation. `notify_waiters` carries no saved
@@ -1227,25 +1228,6 @@ impl Management {
                 let mut inflight = lock(&self.inflight);
                 match inflight.get_mut(&target) {
                     None => {
-                        // A failed retry can record and release between the operator reading the
-                        // link and taking this reservation. Its first causal deadline remains the
-                        // pairing command's deadline too; a later failure may not replace it.
-                        if let Some(deadline) = lock(&self.exchanged)
-                            .get(&target)
-                            .filter(|record| record.failures > 0)
-                            .and_then(|record| record.deadline)
-                        {
-                            causal_deadline = causal_deadline.min(deadline);
-                        }
-                        // Supersession transfers the earliest causal deadline into retry_ready
-                        // before aborting. The old flight can disappear before this operator wins
-                        // the slot, so the retained mark is part of takeover state too.
-                        if let Some(deadline) = lock(&self.retry_ready)
-                            .get(&target)
-                            .map(|mark| mark.deadline)
-                        {
-                            causal_deadline = causal_deadline.min(deadline);
-                        }
                         inflight.insert(
                             target,
                             Flight {
@@ -1253,8 +1235,8 @@ impl Management {
                                 policy_revision,
                                 revision,
                                 involved: true,
-                                causal: true,
-                                deadline: causal_deadline,
+                                causal: false,
+                                deadline: command_deadline,
                                 origin: Origin::Operator,
                                 abort: None,
                                 covered: false,
@@ -1270,7 +1252,6 @@ impl Management {
                         ));
                     }
                     Some(flight) => {
-                        causal_deadline = causal_deadline.min(flight.deadline);
                         if !flight.superseded {
                             if flight.origin == Origin::Retry && flight.causal {
                                 // The command takes the transport slot, not the ordinary
@@ -1292,14 +1273,13 @@ impl Management {
                     }
                 }
             }
-            // The inherited absolute deadline is the only bound. Release normally wakes this
-            // branch; reaching the deadline is a truthful failure of the already-open cause, not
-            // a fresh command-local timeout.
+            // Waiting for the old reservation spends this invocation's same command clock.
+            // The preempted retry's original deadline remains in its separate causal mark.
             tokio::select! {
                 () = &mut released => {}
-                () = tokio::time::sleep_until(causal_deadline.into()) => {
+                () = tokio::time::sleep_until(command_deadline.into()) => {
                     return Err(Error::Profile(
-                        "the existing computer exchange did not yield before its causal convergence deadline; try again",
+                        "computer pairing did not obtain the peer before this command's deadline; try again",
                     ));
                 }
             }
@@ -1320,11 +1300,11 @@ impl Management {
         let me = Arc::clone(self);
         let (link_owned, url_owned) = (link, url.to_owned());
         let task = tokio::spawn(async move {
-            // An explicit pairing owns this one causal deadline. Once it has elapsed the command
-            // fails; it cannot turn a retained, already-missed contract into a later success.
+            // The handshake spends the remainder of this invocation's original command clock.
+            // Its result is not an acknowledgement of any older ordinary-policy obligation.
             tokio::time::timeout_at(
-                causal_deadline.into(),
-                me.pair(&link_owned, &url_owned, causal_deadline),
+                command_deadline.into(),
+                me.pair(&link_owned, &url_owned, command_deadline),
             )
             .await
         });
@@ -1344,16 +1324,16 @@ impl Management {
         let paired = match task.await {
             Ok(Ok(paired)) => paired,
             Ok(Err(_)) => Err(Error::Profile(
-                    "the computer pairing did not finish before its causal convergence deadline; try again",
-                )),
+                "computer pairing did not finish before this command's deadline; try again",
+            )),
             // Cut by the retry because this node changed: no failure of anyone's.
             Err(e) if e.is_cancelled() => Err(Error::Profile(
-                    "this computer changed while the pairing ran, so the pairing was \
+                "this computer changed while the pairing ran, so the pairing was \
                      superseded; try again",
-                )),
+            )),
             Err(_) => Err(Error::Profile(
-                    "the computer pairing task failed; try again",
-                )),
+                "the computer pairing task failed; try again",
+            )),
         };
         // This ceremony received the peer's state but sent no ordinary policy snapshot.
         // Its result belongs to this command and the durable pairing status; it cannot
@@ -2557,7 +2537,7 @@ impl Management {
     async fn retry(self: &Arc<Self>) -> Result<Option<std::time::Instant>> {
         #[cfg(feature = "test-knobs")]
         self.hold_retry_ready_for_proof().await;
-        let (peers, attempted, revision, policy_revision, mut next) = {
+        let (peers, attempted, revision, policy_revision, mut next, blocked_misses) = {
             let s = lock(&self.computer.state);
             let policy_revision = s.policy_revision;
             let local = self.computer.signer.fingerprint();
@@ -2601,6 +2581,8 @@ impl Management {
             let mut selected_deadlines = BTreeMap::new();
             let mut selected_tokens = BTreeMap::new();
             let mut selected_causal = BTreeSet::new();
+            let mut retained_deadlines = BTreeMap::new();
+            let mut blocked_misses = Vec::new();
             // A computer no longer paired (removed, or its pairing cancelled) keeps its
             // counts, which are "since the daemon started" and survive its re-enrollment, but
             // not its failure: that must not stand in the status for good.
@@ -2656,6 +2638,20 @@ impl Management {
                     // queued ComputerChange is the sole owner of P2's original deadline and
                     // `mark_policy_retry` replaces the mark when that event is consumed.
                     return false;
+                }
+                // An operator can own this peer's transport slot while ordinary work remains
+                // unfinished. Retain that work's exact clock independently of pacing filters.
+                if let Some(mark) = causal_mark {
+                    retained_deadlines.insert(*peer, mark.deadline);
+                }
+                if let Some(deadline) = record
+                    .deadline
+                    .filter(|_| record.deadline_policy_revision == Some(policy_revision))
+                {
+                    retained_deadlines
+                        .entry(*peer)
+                        .and_modify(|held| *held = (*held).min(deadline))
+                        .or_insert(deadline);
                 }
                 let reachability_restored = causal_mark.is_some();
                 let causal_deadline = match (causal_mark.map(|mark| mark.deadline), record.deadline)
@@ -2754,15 +2750,16 @@ impl Management {
                         || (flight.origin == Origin::Retry
                             && flight.involved != (involved == Some(*peer)));
                     if stale && !flight.superseded {
-                        // Transfer the first unfinished change's end before cutting the stale
-                        // work. The replacement may carry newer state, but never gets a newer
-                        // convergence clock.
-                        self.mark_retry(
-                            *peer,
-                            flight.revision,
-                            flight.policy_revision,
-                            flight.deadline,
-                        );
+                        // Only ordinary work transfers an ordinary cause. A pairing command's
+                        // deadline belongs to its invocation and cannot create or renew one.
+                        if flight.origin == Origin::Retry && flight.causal {
+                            self.mark_retry(
+                                *peer,
+                                flight.revision,
+                                flight.policy_revision,
+                                flight.deadline,
+                            );
+                        }
                         flight.superseded = true;
                         #[cfg(feature = "test-knobs")]
                         if flight.origin == Origin::Operator && flight.abort.is_none() {
@@ -2770,6 +2767,21 @@ impl Management {
                         }
                         if let Some(abort) = &flight.abort {
                             abort.abort();
+                        }
+                    }
+                    if flight.origin == Origin::Operator && !flight.superseded {
+                        if let Some(deadline) = retained_deadlines.get(peer) {
+                            let observed = s
+                                .missed_exchanges
+                                .get(peer)
+                                .is_some_and(|(cause, _)| *cause >= policy_revision);
+                            if !observed {
+                                if *deadline <= now {
+                                    blocked_misses.push((*peer, policy_revision));
+                                } else {
+                                    next = Some(next.map_or(*deadline, |held| held.min(*deadline)));
+                                }
+                            }
                         }
                     }
                 }
@@ -2851,8 +2863,18 @@ impl Management {
                     (peer, endpoints, url)
                 })
                 .collect::<Vec<_>>();
-            (peers, attempted, revision, policy_revision, next)
+            (
+                peers,
+                attempted,
+                revision,
+                policy_revision,
+                next,
+                blocked_misses,
+            )
         };
+        for (peer, owner) in blocked_misses {
+            self.record_blocked_deadline(peer, owner)?;
+        }
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
             let (involved, serial, deadline, causal) =
@@ -3003,6 +3025,51 @@ impl Management {
         }
         Ok(next)
     }
+    /// Observe an ordinary cause which expired while an operator owns its peer's transport
+    /// slot. This is no attempted exchange: retain the obligation and miss without changing
+    /// attempt counts, failure pacing or the independent command. Outcome recording serializes
+    /// the recheck with a real inbound reply which may already have covered the cause.
+    fn record_blocked_deadline(&self, peer: Digest32, owner: u64) -> Result<()> {
+        let _recording = lock(&self.recording);
+        if !lock(&self.inflight)
+            .get(&peer)
+            .is_some_and(|flight| flight.origin == Origin::Operator && !flight.superseded)
+        {
+            return Ok(());
+        }
+        // Snapshot separately in the established exchanged -> retry_ready order; neither
+        // observation lock crosses the durable Computer transaction.
+        let failed = lock(&self.exchanged).get(&peer).and_then(|record| {
+            record
+                .deadline
+                .filter(|_| record.deadline_policy_revision == Some(owner))
+                .map(|deadline| (record.revision, deadline))
+        });
+        let ready = lock(&self.retry_ready)
+            .get(&peer)
+            .filter(|mark| mark.policy_revision == owner)
+            .map(|mark| (mark.revision, mark.deadline));
+        let (revision, deadline) = match (failed, ready) {
+            (Some((a, a_deadline)), Some((b, b_deadline))) => {
+                (a.max(b), a_deadline.min(b_deadline))
+            }
+            (Some(cause), None) | (None, Some(cause)) => cause,
+            (None, None) => return Ok(()),
+        };
+        if deadline > std::time::Instant::now() {
+            return Ok(());
+        }
+        let cause = self
+            .computer
+            .record_missed_exchange(peer, revision, false)?;
+        let mut exchanged = lock(&self.exchanged);
+        let record = exchanged.entry(peer).or_default();
+        if record.missed_revision.is_none_or(|held| cause >= held) {
+            record.missed_revision = Some(cause);
+        }
+        Ok(())
+    }
+
     /// Record one attempt's outcome for `peer`, now: `last` paces the next attempt whether it
     /// succeeded or not; `last_ms`, what a person reads as the last exchange, is set only by a
     /// completed one. The status's problem is then the words of a computer still failing, or
@@ -3799,6 +3866,13 @@ impl Management {
                     && record
                         .deadline
                         .is_some_and(|deadline| completed >= deadline))
+        }) || lock(&self.retry_ready).get(&peer).is_some_and(|mark| {
+            // The exact covered cause can expire before the scheduler persists its miss,
+            // including while a pairing command owns the outbound slot. A real reply must
+            // retain that timing fact instead of treating the already-late coverage as timely.
+            mark.policy_revision == policy_revision
+                && mark.revision <= revision
+                && completed >= mark.deadline
         });
         // A policy merge records its obligation in the same transaction. Only a complete reply
         // proves the initiating peer received this state and can clear that durable obligation.
