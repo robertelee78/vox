@@ -3854,7 +3854,11 @@ impl Computer {
     ) -> Result<T> {
         blocking_transaction(|| {
             self.change_guarded_blocking(ComputerChangeBoundary::Deadline(deadline), f)
-                .map(|value| value.expect("a deadline boundary cannot be superseded"))
+                .and_then(|value| {
+                    value.ok_or(Error::Profile(
+                        "the deadline-bound computer transaction ended without a committed result",
+                    ))
+                })
         })
     }
 
@@ -3985,8 +3989,7 @@ impl Computer {
                 );
                 return Err(error);
             }
-            let committed_late =
-                deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+            let committed_late = deadline.filter(|deadline| std::time::Instant::now() >= *deadline);
             if authorization_changed {
                 self.invalidate_reachers();
             }
@@ -4002,7 +4005,7 @@ impl Computer {
                     .load(std::sync::atomic::Ordering::Acquire),
             );
             let _ = self.journal_changed.send(());
-            if committed_late {
+            if let Some(deadline) = committed_late {
                 self.invalidate_reachers();
                 // The atomic rename happened. Publish an already-expired reconciliation event so
                 // actors revoke/detach instead of leaving the durable new policy live but unseen.
@@ -4014,7 +4017,7 @@ impl Computer {
                             expired: Self::revision_expired(&published),
                         },
                         now,
-                        deadline.expect("a late commit has a deadline"),
+                        deadline,
                     ));
                 }
                 return Err(Error::Profile(
