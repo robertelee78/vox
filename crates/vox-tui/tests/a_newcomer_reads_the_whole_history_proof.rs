@@ -1360,8 +1360,15 @@ fn stage_two_archive_jobs(staged: &Staged) -> String {
                          {error}: {out}"
                     )
                 });
-            if rows.len() == vox_core::log::history::MAX_PAGE_ENTRIES {
-                break rows[0]["entry_hash"]
+            // The live window counts raw author positions, including hidden controls.
+            // A person's actual readable Content cursor is the page boundary; waiting for
+            // exactly128 visible rows can never establish that boundary reliably.
+            if let Some(oldest) = rows.iter().find(|row| {
+                row["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("archive-pressure-"))
+            }) {
+                break oldest["entry_hash"]
                     .as_str()
                     .unwrap_or_else(|| {
                         panic!("APPARATUS: {name}'s oldest archive-pressure row has no entry_hash")
