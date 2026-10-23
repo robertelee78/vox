@@ -1015,18 +1015,6 @@ impl Node {
         }
         computer.storage_ready()?;
         let revision = computer.policy_revision();
-        if !computer.current_revision_expired()
-            && !self.computer_expired
-            && self
-                .computer_revision
-                .load(std::sync::atomic::Ordering::Acquire)
-                == revision
-        {
-            return Ok(KeyringApplication {
-                changes: Vec::new(),
-                settled: true,
-            });
-        }
         let Some(profile) = &self.profile else {
             if let Some(signer) = &self.headless {
                 let expired = computer.current_revision_expired();
@@ -1091,8 +1079,9 @@ impl Node {
         Self::computer_policy_active(deadline, cancelled)?;
         // Prepare before any node-store effect, including pending key/removal metadata and
         // trust-decision stamps. If a newer revision already won, none of this plan is applied.
-        // Expiry is recovery from the retained prepared/applied sets and needs no new grant.
-        if !expired && !computer.prepare_application_until(me, revision, &covered, deadline)? {
+        // Expiry prepares its retained rollback set too: a crash after revocation must not leave
+        // an older live applied receipt able to certify the changed keyring after repair.
+        if !computer.prepare_application_until(me, revision, expired, &covered, deadline)? {
             return Ok(KeyringApplication {
                 changes: Vec::new(),
                 settled: false,
@@ -1187,6 +1176,11 @@ impl Node {
         };
         // The keyring commit is now irreversible. Always classify it against durable Computer
         // policy and, when needed, perform its rollback before consulting the caller's deadline.
+        // The previous applied marker no longer describes this changed keyring. Invalidate it
+        // until a Current receipt installs the exact new projection; otherwise a same-revision
+        // expiry repair can make the old marker short-circuit the required grant restoration.
+        self.computer_revision
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
         self.trust = next;
         self.consent_keys = pending;
         let receipt = if expired {

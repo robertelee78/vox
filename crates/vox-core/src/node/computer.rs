@@ -2529,9 +2529,10 @@ impl Computer {
                         // with no retained managed grant.
                         Self::application_settled_in(&s, &node, applied)
                     } else {
-                        s.derived
-                            .get(&node)
-                            .is_some_and(|derived| derived.revision == s.policy_revision)
+                        Self::application_settled_in(&s, &node, applied)
+                            && s.derived
+                                .get(&node)
+                                .is_some_and(|derived| derived.revision == s.policy_revision)
                     })
     }
 
@@ -2563,10 +2564,11 @@ impl Computer {
                         // grant from the missed revision to survive or reappear.
                         Self::application_settled_in(&state, &node, applied)
                     } else {
-                        state
-                            .derived
-                            .get(&node)
-                            .is_some_and(|derived| derived.revision == state.policy_revision)
+                        Self::application_settled_in(&state, &node, applied)
+                            && state
+                                .derived
+                                .get(&node)
+                                .is_some_and(|derived| derived.revision == state.policy_revision)
                     }));
         current.then(publish)
     }
@@ -2945,11 +2947,7 @@ impl Computer {
     /// Is this exact local policy revision durably applied to this node's keyring?
     pub fn applied(&self, node: &Digest32, revision: u64) -> bool {
         let state = lock(&self.state);
-        !Self::revision_expired(&state)
-            && state
-                .applied
-                .get(node)
-                .is_some_and(|a| a.revision == revision)
+        !Self::revision_expired(&state) && Self::application_settled_in(&state, node, revision)
     }
 
     /// Record application only after the actor saved the complete keyring under the ordinary
@@ -2965,20 +2963,21 @@ impl Computer {
     }
 
     /// Persist the exact revocation set before committing the node's keyring. This is not an
-    /// applied receipt: the actor must still save the keyring and call `mark_applied_until`.
-    /// If the process ends between those writes, startup expiry can revoke everything that the
-    /// interrupted commit may have made effective.
+    /// applied receipt: the actor must still save the keyring and finish its live or expired
+    /// receipt. If the process ends between those writes, the retained preparation prevents an
+    /// old live receipt from certifying an interrupted application or revocation.
     pub(crate) fn prepare_application_until(
         &self,
         node: Digest32,
         revision: u64,
+        expected_expired: bool,
         covered: &[Digest32],
         deadline: std::time::Instant,
     ) -> Result<bool> {
         self.change_until(deadline, |state| {
             let current = state.policy_revision;
             let expired = Self::revision_expired(state);
-            if current != revision || expired {
+            if current != revision || expired != expected_expired {
                 // This plan lost a race with another authenticated policy revision before the
                 // node keyring commit. Nothing from it became authority, so keep the caller's
                 // original causal deadline and derive the now-current plan instead of making a
@@ -3001,6 +3000,20 @@ impl Computer {
                     grants: covered.iter().map(|peer| (*peer, revision)).collect(),
                 },
             );
+            if expired {
+                // Keep the rollback set above before retiring the live applied receipt. This
+                // preparation precedes the node-store revocation, so a same-revision repair or
+                // a crash on either side of that commit must reapply instead of claiming the
+                // revoked keyring still represents the live policy.
+                if state
+                    .applied
+                    .get(&node)
+                    .is_none_or(|applied| applied.revision <= revision)
+                {
+                    state.applied.remove(&node);
+                    state.receipts.remove(&self.signer.fingerprint());
+                }
+            }
             Ok(true)
         })
     }
@@ -3100,6 +3113,18 @@ impl Computer {
             if revision > state.policy_revision {
                 return Err(bad());
             }
+            // The revoked node keyring already committed. Its old live receipt is obsolete
+            // even if the expiry was repaired before this journal write; keeping it would
+            // certify the revoked keyring as live at the same revision, including on restart.
+            // A strictly newer application belongs to another completed projection and stands.
+            if state
+                .applied
+                .get(&node)
+                .is_none_or(|applied| applied.revision <= revision)
+            {
+                state.applied.remove(&node);
+                state.receipts.remove(&self.signer.fingerprint());
+            }
             // A newer authenticated policy can arrive during the revocation keyring rename.
             // The stale revocation is safe but is not current: retain its recovery records and
             // immediately derive the newer policy instead of failing or claiming convergence.
@@ -3107,14 +3132,8 @@ impl Computer {
                 receipt = ApplicationReceipt::Reconcile;
                 return Ok(());
             }
-            // Revocation settled this expired projection, not the live policy at the same
-            // revision. Absence is settled while expired; if authenticated repair clears that
-            // expiry without moving the revision, no live applied receipt may short-circuit
-            // restoring the policy's grants (including after restart).
-            state.applied.remove(&node);
+            // Only the exact current expiry can discharge its prepared rollback obligation.
             state.prepared.remove(&node);
-            // Receipts are statements by computers, not by their managed nodes.
-            state.receipts.remove(&self.signer.fingerprint());
             Ok(())
         })?;
         Ok(receipt)
@@ -3826,10 +3845,10 @@ impl Computer {
                         {
                             Self::application_settled_in(&state, &node, applied)
                         } else {
-                            state
-                                .derived
-                                .get(&node)
-                                .is_some_and(|derived| derived.revision == state.policy_revision)
+                            Self::application_settled_in(&state, &node, applied)
+                                && state.derived.get(&node).is_some_and(|derived| {
+                                    derived.revision == state.policy_revision
+                                })
                         }))
             {
                 next

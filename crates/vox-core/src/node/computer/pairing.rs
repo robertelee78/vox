@@ -721,10 +721,9 @@ impl Management {
                 return Ok(());
             };
             for b in roster.read(&local, &g.incarnation())?.2 {
-                if !s
-                    .applied
-                    .get(&b.verify(&local, &g.incarnation())?)
-                    .is_some_and(|a| {
+                let node = b.verify(&local, &g.incarnation())?;
+                if !Computer::application_settled_in(s, &node, s.policy_revision)
+                    || !s.applied.get(&node).is_some_and(|a| {
                         a.revision == s.policy_revision && a.interval == g.incarnation()
                     })
                 {
