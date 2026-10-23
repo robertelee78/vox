@@ -2949,9 +2949,6 @@ impl Management {
                 recorded: false,
             };
             let task = tokio::spawn(async move {
-                #[cfg(feature = "test-knobs")]
-                me.hold_first_computer_exchange_for_proof(peer, serial)
-                    .await;
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
                 // attempt. Exchange and reconciliation share the causal return deadline; this
@@ -2984,13 +2981,13 @@ impl Management {
                         peer,
                         endpoints,
                         url,
-                        attempt_revision,
+                        serial,
                         std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
                     )
                     .await
                     .map_err(|e| e.to_string())
                 } else {
-                    let exchange = me.sync_peer(peer, endpoints, url, attempt_revision, deadline);
+                    let exchange = me.sync_peer(peer, endpoints, url, serial, deadline);
                     tokio::pin!(exchange);
                     tokio::select! {
                         // Poll the exchange first at the boundary. This starts the real dial;
@@ -3270,9 +3267,12 @@ impl Management {
         peer: Digest32,
         endpoints: EndpointList,
         url: Option<Zeroizing<String>>,
-        _revision: u64,
+        _serial: u64,
         deadline: std::time::Instant,
     ) -> Result<(u64, u64, u64)> {
+        #[cfg(feature = "test-knobs")]
+        self.hold_first_computer_exchange_for_proof(peer, _serial)
+            .await;
         let link = url.as_ref().map(|l| Link::parse(l)).transpose()?;
         let endpoints = link.as_ref().map(|l| &l.endpoints).unwrap_or(&endpoints);
         let conn = self.connect(peer, endpoints, link.as_ref()).await?;
@@ -3529,6 +3529,7 @@ impl Management {
                 || flight.origin != Origin::Retry
                 || flight.superseded
                 || !flight.causal
+                || flight.deadline <= std::time::Instant::now()
                 || flight.policy_revision <= after
             {
                 return;
