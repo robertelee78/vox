@@ -334,6 +334,21 @@ pub(super) fn advance(
         }
         _ => State::new(writer, now),
     };
+    // A suffix fold retains the published prefix's genuine expiry dependency. Merge it
+    // for resumed cursors too: an interrupted older fold may not yet carry that minimum.
+    // A new authority generation recomputes from scratch instead of inheriting old grants.
+    if writer.authority_folded() == state.generation {
+        let published = writer.authority_deadline();
+        if published != 0 {
+            state.deadline = if state.deadline == 0 {
+                published
+            } else {
+                state.deadline.min(published)
+            };
+        }
+    }
+    // A suffix can make a retained dependency redundant. Its genuine expiry still causes
+    // the full rebuild below to remove it, without a new provenance index or history scan.
     // Expiry changes historical authorization too. No decision at an old wall
     // time may be published after a relevant deadline passed during paged work.
     if state.deadline != 0 && now >= state.deadline {
@@ -481,6 +496,10 @@ fn action_step(
             writer.first(Table::ActionOrder, Some(rank_key(state.after_rank)))?
         else {
             if writer.head_ready() {
+                // Current admins can be unchanged while a late action's strict-past grant
+                // contributes a new expiry. Publish it with the completed projection so the
+                // existing room deadline wake cannot lose that historical authorization edge.
+                writer.authority_published(state.generation, state.deadline)?;
                 writer.projection_published(state.projection)?;
                 writer.evaluation_published(state.ordered)?;
                 state.phase = DONE;

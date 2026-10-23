@@ -1239,6 +1239,9 @@ impl<'a, 'store> Write<'a, 'store> {
     pub(super) fn authority_folded(&self) -> u64 {
         self.header.authority_folded
     }
+    pub(super) fn authority_deadline(&self) -> u64 {
+        self.header.authority_deadline
+    }
     pub(super) fn head_ready(&self) -> bool {
         self.header.head_generation == self.header.authority_generation
     }
