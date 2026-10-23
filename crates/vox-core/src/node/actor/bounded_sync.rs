@@ -1306,7 +1306,8 @@ impl Controller {
     }
     pub(super) fn fence(&mut self) {
         self.retirement_waiting.clear();
-        self.retirement_failed.clear();
+        // Fencing revokes network work; it is not recovery of a failed storage operation.
+        // Keep exact failures until teardown transfers their owners to ledger key erasure.
         self.cancel_archive_admission();
         for index in 0..self.foreground_admission.len() {
             self.cancel_foreground_admission(index);
@@ -1335,6 +1336,21 @@ impl Controller {
             work.fence.retire();
         }
     }
+    fn transfer_failed_retirements(&mut self) {
+        let mut keep = VecDeque::new();
+        while let Some(flow) = self.retiring.pop_front() {
+            let key = retirement_key(&flow);
+            if self.retirement_failed.remove(&key) {
+                self.retirement_waiting.remove(&key);
+                // No slice may run first: this Flow can hold a superseded, still-unlocked
+                // room Arc which the current actor's room map no longer contains.
+                spawn_owed_retirement(flow, Arc::clone(&self.retirement_ledger), true);
+            } else {
+                keep.push_back(flow);
+            }
+        }
+        self.retiring = keep;
+    }
     pub(super) async fn retire(&mut self) {
         self.fence();
         for slot in &mut self.ready {
@@ -1358,6 +1374,9 @@ impl Controller {
         if let Err(error) = self.join_cleanup().await {
             eprintln!("vox: history retirement is pending: {error}");
         }
+        // Joining may itself publish a new exact failure. Transfer both earlier failures and
+        // that result before drain_retiring/poll_cleanup can dispatch another storage slice.
+        self.transfer_failed_retirements();
         if let Err(error) = self.drain_retiring(None).await {
             eprintln!("vox: history retirement is pending: {error}");
             // Join any different bounded cleanup already dispatched before moving its peers
