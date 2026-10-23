@@ -1320,7 +1320,7 @@ impl Management {
             // Its result is not an acknowledgement of any older ordinary-policy obligation.
             tokio::time::timeout_at(
                 command_deadline.into(),
-                me.pair(&link_owned, &url_owned, command_deadline),
+                me.pair(&link_owned, &url_owned, policy_revision, command_deadline),
             )
             .await
         });
@@ -2160,6 +2160,7 @@ impl Management {
         self: &Arc<Self>,
         link: &Link,
         url: &str,
+        expected_policy_revision: u64,
         deadline: std::time::Instant,
     ) -> Result<()> {
         let conn = self
@@ -2223,6 +2224,14 @@ impl Management {
         let exchange = d.bytes()?.to_vec();
         d.finish()?;
         self.computer.change_until(deadline, |s| {
+            // The initiator sent identity proof, not its ordinary journal. Receipt and reach
+            // movement is harmless, but changed operator policy must not install this preview.
+            // Check at the actual commit as well as the scheduler's cancellation boundary.
+            if s.policy_revision != expected_policy_revision {
+                return Err(Error::Profile(
+                    "this computer's policy changed while pairing ran, so the pairing was superseded; try again",
+                ));
+            }
             let before = s.revision;
             let before_pending = s.pending.as_ref().map(Enrollment::encode);
             if s.pending
@@ -2777,11 +2786,18 @@ impl Management {
             {
                 let mut inflight = lock(&self.inflight);
                 for (peer, flight) in inflight.iter_mut() {
-                    // Stale: this node's state moved on, or (a retry flight) whether the
-                    // computer is involved in a pending operation changed.
-                    let stale = flight.revision != revision
-                        || (flight.origin == Origin::Retry
-                            && flight.involved != (involved == Some(*peer)));
+                    // Retry sent an ordinary snapshot, so its journal and operation context
+                    // must still match. Preview sent no ordinary history: a repaired receipt or
+                    // transport fact cannot cancel its immutable invitation proof. Actual policy
+                    // supersession still cancels it; final pair commit checks that same owner and
+                    // the exact Enrollment/cancellation evidence before installing anything.
+                    let stale = match flight.origin {
+                        Origin::Retry => {
+                            flight.revision != revision
+                                || flight.involved != (involved == Some(*peer))
+                        }
+                        Origin::Operator => flight.policy_revision != policy_revision,
+                    };
                     if stale && !flight.superseded {
                         // Only ordinary work transfers an ordinary cause. A pairing command's
                         // deadline belongs to its invocation and cannot create or renew one.
