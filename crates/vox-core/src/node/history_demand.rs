@@ -192,7 +192,7 @@ pub struct Body {
     pub header: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cursor {
     pub query_kind: u8,
@@ -1120,7 +1120,7 @@ pub(crate) fn checkpoint_precharged(
     {
         return Err(invalid("history demand still has unfinished work"));
     }
-    state.cursor = if let Some(cursor) = cursor {
+    let next_cursor = if let Some(cursor) = cursor {
         if cursor.head != state.bounds.head
             || cursor.lo != state.bounds.lo
             || cursor.hi != state.bounds.hi
@@ -1148,6 +1148,16 @@ pub(crate) fn checkpoint_precharged(
     } else {
         None
     };
+    if state.progress == progress && state.cursor == next_cursor {
+        // Exact Active, current authority and all cursor/credit invariants were checked in
+        // this serialized batch. An identical checkpoint has no durable work to commit.
+        let result = context.check();
+        if result.is_err() {
+            active.valid = false;
+        }
+        return result;
+    }
+    state.cursor = next_cursor;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;
     commit(batch, active, context)?;
