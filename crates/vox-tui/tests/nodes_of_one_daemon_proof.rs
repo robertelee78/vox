@@ -1999,7 +1999,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     let revision_before = computer(&a, &["status"])["revision"].as_u64().unwrap_or(0);
     let first = a.make_node("anchor-return-first");
     let second = a.make_node("anchor-return-second");
-    let third = a.make_node("anchor-return-third");
     std::fs::write(&first_flight_arm, format!("{b_id}\t{revision_before}\n"))
         .expect("APPARATUS: arm the first causal exchange hold");
     let first_changed = Instant::now();
@@ -2166,6 +2165,9 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     // no task handle yet; attaching a node is a newer policy revision, and the retry must mark that
     // exact handle-less flight superseded before the apparatus releases it. The user-visible
     // command must then refuse its stale preview rather than installing stale work.
+    // Create the later race identity only in its own phase: an unattached on-disk node
+    // truthfully keeps Computer applying and must not contaminate the earlier exact roster.
+    let third = a.make_node("anchor-return-third");
     let race_invitation = computer(&b, &["invite"]);
     let race_link = race_invitation["invite_link"]
         .as_str()

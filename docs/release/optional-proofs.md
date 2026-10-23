@@ -161,11 +161,11 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's fourteen executable mutants are run one at a time with
+FX-28's fifteen executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `stale-tick-authority`, `stale-join-authority`,
 `fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
-`redeem-rejects-pending-registration`,
+`redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
 `ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
 `stale-trust-projection`, `stale-rekey-authority`, or
 `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
@@ -203,6 +203,11 @@ the independent preview/approval crash journey retains the operator's durable in
 inviter registration is still being published. The anchor journey holds that real registration,
 observes the matching redemption, then releases publication and requires the same shipped pairing
 command to authenticate the valid code. Known refusal and direct reach remain independent.
+
+`owner-refusal-decoded-as-payload` skips recognition of the existing tagged peer refusal.
+The anchor journey retries a cancelled invitation over an established computer connection and
+requires the shipped command to preserve the owner's cancellation reason rather than report
+malformed response data. It does not accept a transport failure as evidence of cancellation.
 
 `fresh-preview-inherits-old-deadline` makes a new pairing request inherit an older ordinary
 exchange's clock. The existing anchor journey holds that fresh reservation while the ordinary

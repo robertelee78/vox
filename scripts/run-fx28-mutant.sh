@@ -28,6 +28,12 @@ case "${1-}" in
     verdict='PRODUCT [FX28 registration-handoff]:'
     staging='[proof] FX-28 registration-handoff apparatus staged:'
     ;;
+  owner-refusal-decoded-as-payload)
+    mutant=$1
+    journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
+    verdict='PRODUCT [FX28 owner-refusal]:'
+    staging='[proof] FX-28 owner-refusal apparatus staged:'
+    ;;
   fresh-preview-inherits-old-deadline)
     mutant=$1
     journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
@@ -89,7 +95,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|redeem-rejects-pending-registration|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|redeem-rejects-pending-registration|owner-refusal-decoded-as-payload|fresh-preview-inherits-old-deadline|detach-keeps-reconciliation|late-application-abandons-work|stale-join-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac
