@@ -234,13 +234,14 @@ fn spawn_owed_retirement(mut flow: Flow, ledger: Arc<RetirementLedger>, failed: 
     );
 }
 
-fn resume_owed_retirements(ledger: &Arc<RetirementLedger>) {
+fn resume_owed_retirements(ledger: &Arc<RetirementLedger>, node: Digest32) {
     let entries = ledger
         .entries
         .lock()
         .map(|entries| {
             entries
                 .iter()
+                .filter(|(key, _)| key.node == node)
                 .map(|(key, entry)| (*key, Arc::clone(entry)))
                 .collect::<Vec<_>>()
         })
@@ -250,6 +251,55 @@ fn resume_owed_retirements(ledger: &Arc<RetirementLedger>) {
         entry.failed.store(false, Ordering::Release);
         entry.recovery_changed.notify_waiters();
         start_retirement(ledger, key, entry);
+    }
+}
+
+/// Explicit node locking also erases rooms retained by an earlier actor incarnation. The
+/// replacement actor's room instances cannot erase those old instances or their Context leases.
+pub(super) async fn erase_retired_node(ledger: &Arc<RetirementLedger>, node: Digest32) {
+    let entries = ledger
+        .entries
+        .lock()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|(key, _)| key.node == node)
+                .map(|(key, entry)| (*key, Arc::clone(entry)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (key, entry) in entries {
+        // Every actual retirement slice holds this cell through its blocking worker's join.
+        // A queued original worker sees None after we take the Flow and cannot borrow its keys.
+        let mut held = entry.flow.lock().await;
+        entry.failed.store(true, Ordering::Release);
+        let task = entry.task.lock().ok().and_then(|mut task| task.take());
+        if let Some(task) = &task {
+            // Only dependency waiting can remain once we own the actual worker's cell.
+            task.abort();
+        }
+        if let Some(mut flow) = held.take() {
+            flow.cancel();
+            flow.shared.lock().await.lock_now();
+            // Locked-room reopen recovery owns any remaining durable staging cleanup. Drop
+            // every Context here; never restore its cancellation or retain copied room keys.
+            drop(flow);
+        }
+        drop(held);
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+        if let Ok(mut entries) = ledger.entries.lock() {
+            if entries
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                // Keep the pointer check and error removal under the same map lock, so a
+                // replacement entry cannot have its error removed by this old owner.
+                clear_retirement_error(ledger, key);
+                entries.remove(&key);
+            }
+        }
     }
 }
 
@@ -517,7 +567,10 @@ impl Controller {
 
     pub(super) fn set_retirement_ledger(&mut self, ledger: Arc<RetirementLedger>) {
         self.retirement_ledger = ledger;
-        resume_owed_retirements(&self.retirement_ledger);
+    }
+
+    pub(super) fn recover_node_retirements(&self, node: Digest32) {
+        resume_owed_retirements(&self.retirement_ledger, node);
     }
 
     pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {

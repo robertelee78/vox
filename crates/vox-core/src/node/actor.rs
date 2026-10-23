@@ -6105,6 +6105,9 @@ impl Node {
         let mut bounded_sync = bounded_sync::Controller::default();
         bounded_sync.set_completion_wake(Arc::clone(&bounded_completion_wake));
         bounded_sync.set_retirement_ledger(Arc::clone(&bounded_retirement_ledger));
+        if let Some(node) = profile.as_ref().map(Profile::fingerprint) {
+            bounded_sync.recover_node_retirements(node);
+        }
         let node = Self {
             history_demand: history_demand::Controller::default(),
             bounded_sync,
@@ -19367,6 +19370,7 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        let retirement_node = self.profile.as_ref().map(Profile::fingerprint);
         let mut bounded_sync = std::mem::take(&mut self.bounded_sync);
         self.bounded_sync
             .set_completion_wake(Arc::clone(&self.bounded_completion_wake));
@@ -19515,10 +19519,14 @@ impl Node {
         let secret_work = Arc::clone(&self.secret_work);
         let tx = self.net_tx.clone();
         let flow_pool_registration = self.flow_pool_registration.take();
+        let retirement_ledger = Arc::clone(&self.bounded_retirement_ledger);
         tokio::spawn(async move {
             let mut aborted = aborted;
             history_demand.retire().await;
             bounded_sync.retire().await;
+            if let Some(node) = retirement_node {
+                bounded_sync::erase_retired_node(&retirement_ledger, node).await;
+            }
             // Every bounded round has ended before this ownership guard drops. Actor panic drops
             // the same guard during unwind; if a charge still lives, the pool truthfully reports
             // the node as retiring and lowers capacity only when that charge returns.
