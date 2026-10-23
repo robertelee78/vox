@@ -7275,8 +7275,17 @@ fn delayed_node_completes_without_another_policy_action(
             "APPARATUS: another policy superseded the exact delayed application before its same-revision recovery could be judged: miss {late_record}, status {status}"
         );
         let current = roster_current(&status, &["beta", "delta"]);
+        let pending = status["pending_nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .any(|pending| pending.starts_with("delta:"));
         let observed_at = Instant::now();
-        if ready && current && grant.is_some() {
+        // The status snapshot precedes the separate node/grant reads. A new grant can become
+        // visible between them while this earlier snapshot still reports accepted work running.
+        // Wait for the complete observed state; a partial observation is not a wedge verdict.
+        if ready && current && grant.is_some() && !pending {
             assert!(
                 observed_at <= return_deadline,
                 "PRODUCT [FX28 late-application]: delta first became Ready/current with eta's grant only after the retained {RETURN_WITHIN:?} return boundary: {status}"
@@ -7286,15 +7295,6 @@ fn delayed_node_completes_without_another_policy_action(
                     .as_array()
                     .is_some_and(|records| records.contains(&late_record)),
                 "PRODUCT [FX28 late-application]: completing the accepted late application erased its recorded miss: before {late_record}, after {status}"
-            );
-            assert!(
-                !status["pending_nodes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .any(|pending| pending.starts_with("delta:")),
-                "PRODUCT [FX28 late-application]: delta became current and usable but remained reported pending: {status}"
             );
             break;
         }

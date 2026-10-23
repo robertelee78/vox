@@ -87,7 +87,8 @@ impl ComputerPolicyGuard {
 
     /// Proof mutant for the former defect: once the exact causally held live-follower event is
     /// released after its original observation boundary, discard it instead of completing the
-    /// still-current work. Deadline-owned command/startup work is deliberately unaffected.
+    /// still-current work. Deadline-owned command work is deliberately unaffected; the proof's
+    /// one-shot arm is created only for this post-startup follower event.
     #[cfg(feature = "test-knobs")]
     fn abandon_late_application_for_proof(&self) {
         let Self::Current { change, superseded } = self else {
