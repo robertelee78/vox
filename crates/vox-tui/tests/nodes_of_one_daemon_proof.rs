@@ -6806,20 +6806,24 @@ fn stale_rekey_is_not_delivered(
 /// after both computer statuses and both nodes' shipped trust views and `vox node list`.
 fn delayed_node_completes_without_another_policy_action(
     (a, da, nodes_a): (&Account, &Daemon, &[(&str, &str)]),
-    (b, db, _nodes_b): (&Account, &Daemon, &[(&str, &str)]),
+    (b, db, nodes_b): (&Account, &Daemon, &[(&str, &str)]),
     hold_arm: &Path,
     hold_engaged: &Path,
     hold_release: &Path,
     forward: &port_forward::PortForward,
 ) {
     let eta = a.make_node("eta");
+    let delta = nodes_b
+        .iter()
+        .find_map(|(name, fingerprint)| (*name == "delta").then_some(*fingerprint))
+        .expect("APPARATUS: delayed application has no delta node identity");
     let b_id = computer_id(b);
     let before_status_b = computer(b, &["status"]);
     let prior_miss = before_status_b["application_misses"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|record| record["node"] == "delta")
+        .find(|record| record["node"] == delta)
         .cloned();
     let before_revision = computer(a, &["status"])["revision"].as_u64().unwrap_or(0);
     std::fs::write(hold_arm, b"hold delta's next policy message")
@@ -6858,7 +6862,7 @@ fn delayed_node_completes_without_another_policy_action(
     let mut last_not_carried_at = restored;
     let mut carried_bracket = None;
 
-    let held_deadline = loop {
+    let (held_deadline, held_policy_revision) = loop {
         let observation_started = Instant::now();
         let status_a = computer(a, &["status"]);
         let record = application_toward(a, &b_id)["last_started_exchange"].clone();
@@ -6915,7 +6919,12 @@ fn delayed_node_completes_without_another_policy_action(
                     println!(
                         "[proof] {elapsed:?} after path restoration began, shipped status names eta carried; within the conservatively bracketed local {CHANGE_SHOWN_WITHIN:?} interval beta applied it on its healthy node, and held delta remains Ready without eta's new grant"
                     );
-                    break green_deadline;
+                    break (
+                        green_deadline,
+                        status_b["revision"]
+                            .as_u64()
+                            .expect("PRODUCT: held actor status has no policy revision"),
+                    );
                 }
                 panic!(
                     "APPARATUS: the held-node state was first observed inside the polling ambiguity \
@@ -6961,18 +6970,48 @@ fn delayed_node_completes_without_another_policy_action(
     // deliberately withholds the event; its release must not create a replacement policy action.
     // Keep the original path-restoration return boundary throughout this claim.
     let late_record = loop {
+        assert!(
+            hold_engaged.is_file() && daemon_alive(db.child.id()),
+            "APPARATUS: delta's exact actor hold or its daemon disappeared before the local miss observation"
+        );
         let status = computer(b, &["status"]);
+        assert_eq!(
+            status["revision"].as_u64(), Some(held_policy_revision),
+            "APPARATUS: another policy superseded the exact held application before its miss could be judged: {status}"
+        );
         let record = status["application_misses"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|record| {
-                record["node"] == "delta"
-                    && record["revision"] == status["revision"]
+                record["node"] == delta
+                    && record["revision"].as_u64() == Some(held_policy_revision)
                     && prior_miss.as_ref() != Some(*record)
             })
             .cloned();
         if let Some(record) = record {
+            assert!(
+                hold_engaged.is_file(),
+                "APPARATUS: delta's exact actor hold disappeared while reading its application miss"
+            );
+            assert!(
+                status["pending_nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|pending| pending.starts_with("delta:") && pending.contains("missed its local application boundary")),
+                "PRODUCT [FX28 late-application]: delta's held late application was not reported as pending: {status}"
+            );
+            assert!(
+                Instant::now() <= return_deadline,
+                "PRODUCT [FX28 late-application]: delta's local application miss first became visible after the retained {RETURN_WITHIN:?} return boundary: {status}"
+            );
+            assert!(
+                roster_current(&status, &["beta"])
+                    && grant_words(b, "beta", &eta).is_some(),
+                "PRODUCT [FX28 late-application]: holding delta prevented its healthy beta sibling from remaining current with eta's grant: {status}"
+            );
             assert!(
                 !roster_current(&status, &["delta"])
                     && grant_words(b, "delta", &eta).is_none(),
@@ -6982,7 +7021,7 @@ fn delayed_node_completes_without_another_policy_action(
         }
         assert!(
             Instant::now() < return_deadline,
-            "APPARATUS: the deliberately held local application exhausted the retained return boundary before shipped status exposed its local miss; status {status}"
+            "PRODUCT [FX28 late-application]: while its exact accepted event remained held, shipped status did not expose delta's local application miss by the retained {RETURN_WITHIN:?} return boundary: {status}"
         );
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -7012,8 +7051,17 @@ fn delayed_node_completes_without_another_policy_action(
             line.split_whitespace().next() == Some("delta") && line.starts_with("delta Ready")
         });
         let grant = grant_words(b, "delta", &eta);
+        assert_eq!(
+            status["revision"], late_record["revision"],
+            "APPARATUS: another policy superseded the exact delayed application before its same-revision recovery could be judged: miss {late_record}, status {status}"
+        );
         let current = roster_current(&status, &["beta", "delta"]);
+        let observed_at = Instant::now();
         if ready && current && grant.is_some() {
+            assert!(
+                observed_at <= return_deadline,
+                "PRODUCT [FX28 late-application]: delta first became Ready/current with eta's grant only after the retained {RETURN_WITHIN:?} return boundary: {status}"
+            );
             assert!(
                 status["application_misses"]
                     .as_array()
@@ -7032,7 +7080,7 @@ fn delayed_node_completes_without_another_policy_action(
             break;
         }
         assert!(
-            Instant::now() < return_deadline,
+            observed_at < return_deadline,
             "PRODUCT [FX28 late-application]: after releasing its accepted local application, delta did not become Ready/current with eta's grant inside the retained {RETURN_WITHIN:?} return boundary; no policy toggle, detach, unlock or restart was performed: ready {ready}, grant {grant:?}, status {status}\n{}",
             db.said()
         );
