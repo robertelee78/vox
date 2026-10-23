@@ -869,7 +869,12 @@ impl NodeHandle {
         else {
             return false;
         };
-        if self.paths.profile_dir.file_name().and_then(|name| name.to_str()) != Some(node)
+        if self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(node)
             || !std::path::Path::new(engaged).is_file()
         {
             return false;
