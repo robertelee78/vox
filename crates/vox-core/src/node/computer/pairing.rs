@@ -3030,6 +3030,9 @@ impl Management {
     /// completed one. The status's problem is then the words of a computer still failing, or
     /// none: it never clears while a failure stands, and never stands once every computer is
     /// exchanged with again.
+    // Every outcome retains the cause captured by its own flight, including teardown after that
+    // flight has left `inflight`; reading those fields from a newer reservation would be wrong.
+    #[allow(clippy::too_many_arguments)]
     fn record_exchange(
         self: &Arc<Self>,
         peer: Digest32,

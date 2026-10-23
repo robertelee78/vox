@@ -514,7 +514,11 @@ fn make_room(a: &Account, node: &str) -> String {
         ],
         ROOM_PASS,
     );
-    assert!(ok, "APPARATUS: room create on {node}: {out}{err}");
+    assert!(
+        ok,
+        "APPARATUS: room create on {node}: {out}{err}; Computer status after refusal: {}",
+        computer(a, &["status"])
+    );
     let (ok, list, err) = a.run(&["room", "list", "--node", node], "");
     assert!(ok, "APPARATUS: room list on {node}: {err}");
     list.lines()
@@ -7392,7 +7396,8 @@ fn delayed_node_does_not_make_a_late_pass(
                 .find(|application| application["computer"]["fingerprint"] == b_id)
                 .is_some_and(|application| application["confirmed"] == true);
             let observed_at = Instant::now();
-            if roster_current(&status, &local_names)
+            if status["state"] == "confirmed"
+                && roster_current(&status, &local_names)
                 && confirmed
                 && remote_personal.as_slice() == [to]
             {
