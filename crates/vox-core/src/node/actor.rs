@@ -723,14 +723,22 @@ type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
 
-/// Put a pre-join record on the board at `conn`. A **refusal is fine**: it means our
-/// previous announcement is still live (the ADR-012 refresh floor declines a faster
-/// replacement), and being announced is all this is for. Only a transport failure is
-/// an error.
+/// Put a pre-join record on the board at `conn`. Only a stale-record refusal is fine: it means
+/// this identity's newer announcement is already live, and being announced is all this is for.
+/// A policy, capacity or malformed-record refusal means the board did not authorize the Join
+/// stream which follows and must remain the join's causal error. Swallowing every refusal made a
+/// future-dated pre-join look accepted; the responder then correctly classed the joiner Unknown
+/// and the person was told the downstream `authenticator invalid` fiction instead of the board
+/// publication failure.
 async fn announce(conn: &VoxConnection, prejoin_wire: &[u8]) -> crate::error::Result<()> {
     let mut client = crate::nat::service::RendezvousClient::open(conn).await?;
     let res = match client.put(prejoin_wire).await {
-        Ok(()) | Err(crate::error::Error::RendezvousRejected(_)) => Ok(()),
+        Ok(()) => Ok(()),
+        Err(crate::error::Error::RendezvousRejected(reason))
+            if reason == crate::nat::service::RejectReason::Stale.as_str() =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e),
     };
     client.finish();
@@ -4821,10 +4829,111 @@ impl EventStream {
     }
 }
 
-/// A signed room withdrawal awaiting anchors, including routes that outlive room purge.
+const PENDING_WITHDRAWALS_META_KEY: &str = "pending-board-withdrawals";
+const PENDING_WITHDRAWALS_VERSION: u64 = 1;
+const MAX_PENDING_WITHDRAWALS: usize = 4096;
+const MAX_WITHDRAWAL_TARGETS: usize = 4096;
+const MAX_WITHDRAWAL_ROUTES: usize = 64;
+
+/// A signed room withdrawal awaiting boards, including routes that outlive room purge.
+#[derive(Clone)]
 struct PendingWithdrawal {
     wire: Vec<u8>,
     routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
+}
+
+fn pending_withdrawals_bytes(
+    pending: &BTreeMap<Digest32, PendingWithdrawal>,
+) -> crate::error::Result<Vec<u8>> {
+    if pending.len() > MAX_PENDING_WITHDRAWALS {
+        return Err(Error::SizeLimitExceeded("pending board withdrawals"));
+    }
+    let mut e = crate::cbor::Encoder::new();
+    e.array(2)
+        .uint(PENDING_WITHDRAWALS_VERSION)
+        .array(pending.len());
+    for (room, withdrawal) in pending {
+        if withdrawal.routes.len() > MAX_WITHDRAWAL_TARGETS {
+            return Err(Error::SizeLimitExceeded("pending withdrawal targets"));
+        }
+        e.array(3)
+            .bytes(room)
+            .bytes(&withdrawal.wire)
+            .array(withdrawal.routes.len());
+        for (target, routes) in &withdrawal.routes {
+            if routes.len() > MAX_WITHDRAWAL_ROUTES {
+                return Err(Error::SizeLimitExceeded("pending withdrawal routes"));
+            }
+            e.array(2).bytes(target).array(routes.len());
+            for route in routes {
+                e.text(&route.to_string());
+            }
+        }
+    }
+    Ok(e.finish())
+}
+
+fn read_pending_withdrawals(
+    bytes: &[u8],
+) -> crate::error::Result<BTreeMap<Digest32, PendingWithdrawal>> {
+    let bad = |why| Error::MalformedAtRest(why);
+    let mut d = crate::cbor::Decoder::new(bytes);
+    if d.array().map_err(|_| bad("pending withdrawals"))? != 2
+        || d.uint().map_err(|_| bad("pending withdrawals version"))? != PENDING_WITHDRAWALS_VERSION
+    {
+        return Err(bad("pending withdrawals version"));
+    }
+    let count = d.array().map_err(|_| bad("pending withdrawals count"))?;
+    if count > MAX_PENDING_WITHDRAWALS {
+        return Err(bad("pending withdrawals count"));
+    }
+    let mut pending = BTreeMap::new();
+    for _ in 0..count {
+        if d.array().map_err(|_| bad("pending withdrawal"))? != 3 {
+            return Err(bad("pending withdrawal arity"));
+        }
+        let room = Digest32::try_from(d.bytes().map_err(|_| bad("pending withdrawal room"))?)
+            .map_err(|_| bad("pending withdrawal room length"))?;
+        let wire = d
+            .bytes()
+            .map_err(|_| bad("pending withdrawal wire"))?
+            .to_vec();
+        let target_count = d
+            .array()
+            .map_err(|_| bad("pending withdrawal target count"))?;
+        if target_count > MAX_WITHDRAWAL_TARGETS {
+            return Err(bad("pending withdrawal target count"));
+        }
+        let mut routes = BTreeMap::new();
+        for _ in 0..target_count {
+            if d.array().map_err(|_| bad("pending withdrawal target"))? != 2 {
+                return Err(bad("pending withdrawal target arity"));
+            }
+            let target =
+                Digest32::try_from(d.bytes().map_err(|_| bad("pending withdrawal target id"))?)
+                    .map_err(|_| bad("pending withdrawal target id length"))?;
+            let route_count = d
+                .array()
+                .map_err(|_| bad("pending withdrawal route count"))?;
+            if route_count > MAX_WITHDRAWAL_ROUTES {
+                return Err(bad("pending withdrawal route count"));
+            }
+            let mut target_routes = Vec::with_capacity(route_count);
+            for _ in 0..route_count {
+                let route = d
+                    .text()
+                    .map_err(|_| bad("pending withdrawal route"))?
+                    .parse()
+                    .map_err(|_| bad("pending withdrawal route address"))?;
+                target_routes.push(route);
+            }
+            routes.insert(target, target_routes);
+        }
+        pending.insert(room, PendingWithdrawal { wire, routes });
+    }
+    d.finish()
+        .map_err(|_| bad("pending withdrawals trailing"))?;
+    Ok(pending)
 }
 
 /// An opened room stays private until one bounded recovery/retention turn completes.
@@ -5198,6 +5307,11 @@ pub struct Node {
     board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Authenticated transport routes actually used to publish each room to each board. A board
+    /// which is a room member need not be an anchor, and its connection may be gone by the time a
+    /// stale publication must be withdrawn. Keep the observed route until the room is retracted,
+    /// so the durable withdrawal can still name where it must go after a restart.
+    board_routes: BTreeMap<(Digest32, Digest32), Vec<std::net::SocketAddr>>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends, and
     /// counted under the cause that asked first (several asks while one round runs are one round).
     publish_again: BTreeMap<(Digest32, Digest32), PublishCause>,
@@ -5309,6 +5423,12 @@ pub struct Node {
     /// Per `(room, member)`: keys written and not yet answered (V210-88). In memory only, so a
     /// key cut off by a crash is owed again after the restart; see [`watch_delivery`].
     keys_in_flight: BTreeMap<(Digest32, Digest32), u32>,
+    /// Test-only exact legacy-route marker, emitted only after the changed user view is published.
+    #[cfg(feature = "test-knobs")]
+    fx28_ended_unanswered_marker: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// Test-only exact re-key pair paused after a staged `ENDED_UNANSWERED` selection.
+    #[cfg(feature = "test-knobs")]
+    fx28_rekey_pause: Option<(Digest32, Digest32)>,
     /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
     /// member takes it, a later key supersedes it, or the member says its opening cannot work.
     deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
@@ -5821,6 +5941,7 @@ impl Node {
             pairwise_epoch: watch::channel(0).0,
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
+            board_routes: BTreeMap::new(),
             publish_again: BTreeMap::new(),
             stale_retries: BTreeMap::new(),
             republish_pending: std::collections::BTreeSet::new(),
@@ -5860,6 +5981,10 @@ impl Node {
             redeliver_now: false,
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
+            #[cfg(feature = "test-knobs")]
+            fx28_ended_unanswered_marker: None,
+            #[cfg(feature = "test-knobs")]
+            fx28_rekey_pause: None,
             deliveries: BTreeMap::new(),
             delivery_reserved: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
@@ -6939,6 +7064,16 @@ impl Node {
                         e => fault_of(&e),
                     });
                 }
+                if let Err(e) = self.load_pending_withdrawals() {
+                    // Forgetting a signed withdrawal can resurrect records for a room whose
+                    // signing material was already purged. Refuse the unlock rather than run
+                    // with a board-cleanup obligation we cannot recover truthfully.
+                    drop(self.lock_all().await);
+                    eprintln!(
+                        "vox node: identity unlock could not recover pending board withdrawals: {e}"
+                    );
+                    return Outcome::Failed(fault_of(&e));
+                }
                 if let Err(e) = self.start_network() {
                     drop(self.lock_all().await);
                     eprintln!("vox node: identity unlock could not start networking: {e}");
@@ -7446,6 +7581,17 @@ impl Node {
                     }
                 }
                 return;
+            }
+            let route = conn.quinn().remote_address();
+            let routes = self
+                .board_routes
+                .entry((*channel_id, board_id))
+                .or_default();
+            if !routes.contains(&route) {
+                if routes.len() == MAX_WITHDRAWAL_ROUTES {
+                    routes.remove(0);
+                }
+                routes.push(route);
             }
             crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
             #[cfg(feature = "test-knobs")]
@@ -10174,6 +10320,24 @@ impl Node {
                 holds_room,
             } => {
                 self.publishing.remove(&(channel_id, board));
+                // A Computer-policy withdrawal can be queued while this older publish is still
+                // on its board stream. Send the retained withdrawal after the round's completion
+                // as well: this ordering makes the withdrawal, never the stale publication, the
+                // last word even when the first cleanup send raced the in-flight round.
+                if let Some(wire) = self
+                    .withdrawn
+                    .get(&channel_id)
+                    .filter(|pending| pending.routes.contains_key(&board))
+                    .map(|pending| pending.wire.clone())
+                {
+                    if let Some(conn) = self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&board))
+                    {
+                        Self::put_withdraws(&conn, vec![wire]);
+                    }
+                }
                 // A port to this board's peer is ineligible while a publish round to it runs (its
                 // records must reach the board before a session reads it). The round ending is the
                 // event that makes the port eligible again, so the room's ports are evaluated now
@@ -10414,11 +10578,25 @@ impl Node {
                     return;
                 };
                 // A failed write leaves the key owed, and it is sent again: never the other way.
-                let mut channel = shared.lock().await;
-                let _ = channel.note_delivered(profile.store(), peer, chain_id);
-                if whole_history {
-                    let _ = channel.note_history_delivered(profile.store(), &peer);
-                }
+                let durably_recorded = {
+                    let mut channel = shared.lock().await;
+                    let delivered = channel
+                        .note_delivered(profile.store(), peer, chain_id)
+                        .is_ok();
+                    let history_delivered = !whole_history
+                        || channel
+                            .note_history_delivered(profile.store(), &peer)
+                            .is_ok();
+                    delivered && history_delivered
+                };
+                #[cfg(feature = "test-knobs")]
+                self.mark_delivery_drained_for_proof(
+                    channel_id,
+                    peer,
+                    history,
+                    whole_history,
+                    durably_recorded,
+                );
             }
             NetEvent::RoomStored { channel_id } => {
                 // A worker persisted entries: the room's generation moved, and its ports are
@@ -12954,11 +13132,40 @@ impl Node {
             };
         }
         // A room joined again is published again (V030-14): its withdraw is kept no longer.
-        self.withdrawn.remove(&parsed.channel_id);
+        if self.withdrawn.contains_key(&parsed.channel_id) {
+            let mut next = self.withdrawn.clone();
+            next.remove(&parsed.channel_id);
+            if let Err(error) = Self::save_pending_withdrawals(profile, &next) {
+                return match Self::purge_unpublished_channel(profile, &parsed.channel_id) {
+                    Ok(()) => Outcome::Failed(fault_of(&error)),
+                    Err(cleanup) => Outcome::Failed(fault_of(&cleanup)),
+                };
+            }
+            self.withdrawn = next;
+        }
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
         );
+        // The successful join exchange has already put this newcomer's pre-join records on the
+        // answering member's board. That is the causal publication boundary: the responder may
+        // also appear in `anchor_ids` as a generic board connection, which makes the later direct
+        // publication pass skip it. Record both the holder and the authenticated route now, so a
+        // later Computer-policy refusal can durably withdraw those already-visible records even
+        // after the connection and local room are gone.
+        let join_board = conn.peer_id();
+        self.on_board.insert((parsed.channel_id, join_board));
+        let join_route = conn.quinn().remote_address();
+        let routes = self
+            .board_routes
+            .entry((parsed.channel_id, join_board))
+            .or_default();
+        if !routes.contains(&join_route) {
+            if routes.len() == MAX_WITHDRAWAL_ROUTES {
+                routes.remove(0);
+            }
+            routes.push(join_route);
+        }
         // Every member whose bundle is on the board is an admitted author **on the
         // M17.6 evidence its record carries** — a self-signed record proves possession
         // of a key and nothing else. Sync hard-fails on an entry from an author we
@@ -13023,6 +13230,8 @@ impl Node {
             self.publish_channel_to_anchor(&parsed.channel_id, &conn, PublishCause::Join)
                 .await;
         }
+        #[cfg(feature = "test-knobs")]
+        self.hold_room_join_after_board_for_proof().await;
         if !authority.current() {
             return self
                 .withdraw_and_reject_unpublished_live_channel(
@@ -13998,6 +14207,10 @@ impl Node {
         let now_ms = self.now_ms().get();
         let targets: BTreeSet<Digest32> = owed.into_iter().chain(history.keys().copied()).collect();
         for target in targets {
+            #[cfg(feature = "test-knobs")]
+            if self.fx28_rekey_pause == Some((*channel_id, target)) {
+                continue;
+            }
             if !self.trust.is_trusted(&target) {
                 continue; // A historical consent never overrides the current keyring.
             }
@@ -14144,7 +14357,10 @@ impl Node {
             // connection, room and session operation awaited, so durable Computer policy is
             // checked once more under its state lock at the irreversible queue admission.
             #[cfg(feature = "test-knobs")]
-            let held_for_proof = self.hold_rekey_enqueue_for_proof(target).await;
+            let held_for_proof = legacy_route
+                && all_sent
+                && watched == 1
+                && self.hold_rekey_enqueue_for_proof(target).await;
             #[cfg(feature = "test-knobs")]
             let published = {
                 if crate::node::computer::fx28_mutant("stale-rekey-authority") {
@@ -18274,6 +18490,7 @@ impl Node {
         // What the boards held was learnt over the network that goes down with the lock; an address
         // asked for meanwhile is not handed out by a locked node (V210-96).
         self.on_board.clear();
+        self.board_routes.clear();
         self.publish_trouble.clear();
         // Retry timers may still deliver their public, key-free pair after this actor is locked.
         // Clear the retry authority now; each timer keeps its pending token until dequeue, then
@@ -18622,6 +18839,59 @@ impl Node {
         Ok(())
     }
 
+    /// Persist the signed public withdrawals and the exact boards still owed them. The room may
+    /// be purged immediately afterwards, so this write is the recovery boundary that preserves
+    /// both the withdrawal and where it must go across a crash.
+    fn save_pending_withdrawals(
+        profile: &Profile,
+        pending: &BTreeMap<Digest32, PendingWithdrawal>,
+    ) -> crate::error::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("withdrawal-not-durable") {
+            return Ok(());
+        }
+        profile.store().put_meta(
+            PENDING_WITHDRAWALS_META_KEY,
+            &pending_withdrawals_bytes(pending)?,
+        )
+    }
+
+    fn load_pending_withdrawals(&mut self) -> crate::error::Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .ok_or(Error::AtRestLocked)?;
+        self.withdrawn = match profile.store().get_meta(PENDING_WITHDRAWALS_META_KEY)? {
+            Some(bytes) => read_pending_withdrawals(&bytes)?,
+            None => BTreeMap::new(),
+        };
+        Ok(())
+    }
+
+    fn replace_pending_withdrawals(
+        &mut self,
+        next: BTreeMap<Digest32, PendingWithdrawal>,
+    ) -> crate::error::Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .ok_or(Error::AtRestLocked)?;
+        Self::save_pending_withdrawals(profile, &next)?;
+        self.withdrawn = next;
+        Ok(())
+    }
+
+    fn forget_pending_withdrawal(&mut self, channel_id: &Digest32) -> crate::error::Result<()> {
+        if !self.withdrawn.contains_key(channel_id) {
+            return Ok(());
+        }
+        let mut next = self.withdrawn.clone();
+        next.remove(channel_id);
+        self.replace_pending_withdrawals(next)
+    }
+
     /// [`Self::remember_open`], and if it cannot, **say so and keep going**.
     ///
     /// Every caller has already made or opened the room — it is in the store, and a created
@@ -18662,7 +18932,7 @@ impl Node {
     /// The durable room and reopen entry are removed in the same store batch before failure is
     /// reported, so a rejected authority can leave no live or restart-visible partial room.
     fn reject_unpublished_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
-        self.retract_live_channel(channel_id, true);
+        self.retract_live_channel(channel_id);
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -18701,7 +18971,7 @@ impl Node {
     /// Remove only the transient projection of a stored room.  An explicit open or startup
     /// reopen never owns the room rows and therefore must not reuse create/join rollback.
     fn reject_existing_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
-        self.retract_live_channel(channel_id, false);
+        self.retract_live_channel(channel_id);
         Outcome::Failed(fault)
     }
 
@@ -18721,13 +18991,11 @@ impl Node {
         }
     }
 
-    fn retract_live_channel(&mut self, channel_id: &Digest32, keep_withdrawal: bool) {
+    fn retract_live_channel(&mut self, channel_id: &Digest32) {
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
-        if !keep_withdrawal {
-            self.withdrawn.remove(channel_id);
-        }
+        self.board_routes.retain(|(room, _), _| room != channel_id);
         if let Some(net) = self.net.as_ref() {
             net.membership().clear_channel(channel_id);
             net.forget_room_on_board(channel_id);
@@ -19647,6 +19915,7 @@ impl Node {
                 }
                 // And no address to it is handed out now (V210-96).
                 self.on_board.retain(|(r, _)| r != channel_id);
+                self.board_routes.retain(|(r, _), _| r != channel_id);
                 self.publish_trouble.retain(|(r, _), _| r != channel_id);
                 self.anchor_owed.retain(|(r, _), _| r != channel_id);
                 let (closed, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.address_waiters)
@@ -19838,8 +20107,10 @@ impl Node {
             self.purge_room(&channel_id).await
         } else {
             // In the room again: its records go on boards again.
-            self.withdrawn.remove(&channel_id);
-            Outcome::Failed(Fault::LeaveUndone)
+            match self.forget_pending_withdrawal(&channel_id) {
+                Ok(()) => Outcome::Failed(Fault::LeaveUndone),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            }
         };
         for reply in heard.into_iter().filter_map(|(_, _, reply, _)| reply) {
             let _ = reply.send(outcome);
@@ -19884,17 +20155,53 @@ impl Node {
                 .entry(anchor.id)
                 .or_insert_with(|| anchor.endpoints.direct_candidates());
         }
-        self.withdrawn.insert(
+        // A board need not be an anchor. In particular, a join publishes to the member that
+        // answered it. Retain every board which already holds this room and every publish still
+        // in flight; `PublishDone` sends the withdrawal again after that older round ends, so a
+        // late publication cannot race past the cleanup.
+        let direct_boards: BTreeSet<Digest32> = self
+            .on_board
+            .iter()
+            .chain(self.publishing.iter())
+            .filter(|(room, _)| room == channel_id)
+            .map(|(_, board)| *board)
+            .collect();
+        for board in direct_boards {
+            let routes = assigned.entry(board).or_default();
+            if let Some(observed) = self.board_routes.get(&(*channel_id, board)) {
+                for route in observed {
+                    if !routes.contains(route) && routes.len() < MAX_WITHDRAWAL_ROUTES {
+                        routes.push(*route);
+                    }
+                }
+            }
+            for route in self.peer_book.endpoints(&board).direct_candidates() {
+                if !routes.contains(&route) && routes.len() < MAX_WITHDRAWAL_ROUTES {
+                    routes.push(route);
+                }
+            }
+            if let Some(conn) = net.as_ref().and_then(|net| net.manager().existing(&board)) {
+                let route = conn.quinn().remote_address();
+                if !routes.contains(&route) && routes.len() < MAX_WITHDRAWAL_ROUTES {
+                    routes.push(route);
+                }
+            }
+        }
+        let mut next = self.withdrawn.clone();
+        next.insert(
             *channel_id,
             PendingWithdrawal {
                 wire: wire.clone(),
                 routes: assigned,
             },
         );
+        self.replace_pending_withdrawals(next)
+            .map_err(|error| fault_of(&error))?;
         let anchors: Vec<Arc<VoxConnection>> = net.as_ref().map_or_else(Vec::new, |net| {
-            self.anchor_ids
-                .iter()
-                .filter(|id| self.anchor_serves_room(channel_id, id))
+            self.withdrawn
+                .get(channel_id)
+                .into_iter()
+                .flat_map(|pending| pending.routes.keys())
                 .filter_map(|id| net.manager().existing(id))
                 .collect()
         });
@@ -22700,8 +23007,61 @@ impl Node {
         // command reports; it does not un-send the message that just went out, so the
         // append is still reported as the success it was.
         #[cfg(feature = "test-knobs")]
-        let proof_rotation = std::env::var_os("VOX_TEST_FX28_ROTATE_AFTER_POST")
-            .is_some_and(|value| !value.is_empty());
+        let proof_post_action =
+            std::env::var_os("VOX_TEST_FX28_ROTATE_AFTER_POST").and_then(|arm| {
+                // The value names a one-shot apparatus arm. `<node>\t<room>` forces a rotation;
+                // `<node>\t<room>\trelease-paused\t<peer>` instead releases the exact re-key pair
+                // paused by the staged `ENDED_UNANSWERED`. Only that exact shipped post consumes
+                // it, so an earlier baseline or concurrent post cannot drive unrelated work.
+                let node = self
+                    .paths
+                    .profile_dir
+                    .file_name()
+                    .and_then(|name| name.to_str());
+                let room = crate::node::link::b32_encode(channel_id);
+                let marker = std::path::PathBuf::from(&arm).with_extension("result");
+                let staged = std::fs::read_to_string(&arm).ok()?;
+                let fields: Vec<_> = staged.trim_end().split('\t').collect();
+                let exact_node_room = node.is_some_and(|node| {
+                    fields.first().copied() == Some(node)
+                        && fields.get(1).copied() == Some(room.as_str())
+                });
+                let action = match fields.as_slice() {
+                    [_, _] if exact_node_room => Some(None),
+                    [_, _, "release-paused", peer] if exact_node_room => {
+                        crate::node::link::b32_decode(peer, "FX-28 paused re-key peer")
+                            .ok()
+                            .map(Some)
+                    }
+                    _ => None,
+                };
+                if action.is_none() {
+                    let _ = crate::node::computer::publish_proof_marker(
+                        &marker.with_extension("fault"),
+                        format!(
+                            "post-side re-key arm named {:?}; this actor post was {:?}",
+                            staged.trim_end(),
+                            node.map(|node| format!("{node}\t{room}"))
+                                .as_deref()
+                                .unwrap_or("<unknown node>")
+                        )
+                        .as_bytes(),
+                    );
+                    return None;
+                }
+                if let Err(error) = std::fs::remove_file(&arm) {
+                    let _ = crate::node::computer::publish_proof_marker(
+                        &marker.with_extension("fault"),
+                        format!("consume forced rotation arm: {error}").as_bytes(),
+                    );
+                    return None;
+                }
+                Some((marker, action.flatten()))
+            });
+        #[cfg(feature = "test-knobs")]
+        let proof_rotation = proof_post_action
+            .as_ref()
+            .is_some_and(|(_, peer)| peer.is_none());
         #[cfg(not(feature = "test-knobs"))]
         let proof_rotation = false;
         let rotated = (ch.should_rotate_sender(now_ms) || proof_rotation)
@@ -22738,8 +23098,68 @@ impl Node {
         // ADR-016: push immediately after a local append. Marking it here and
         // letting the tick do the work keeps authoring off the network path.
         self.note_local_append(&channel_id);
-        if rotated {
-            let _ = self.deliver_rekeys_for(&channel_id, false).await;
+        #[cfg(feature = "test-knobs")]
+        let released_paused = proof_post_action.as_ref().is_some_and(|(marker, peer)| {
+            peer.is_some_and(|peer| {
+                let pair = (channel_id, peer);
+                if self.fx28_rekey_pause == Some(pair)
+                    && self.older.get(&pair) == Some(&false)
+                {
+                    self.fx28_rekey_pause = None;
+                    true
+                } else {
+                    crate::node::computer::publish_proof_fault(
+                        &marker.with_extension("fault"),
+                        &format!(
+                            "paused re-key release for {} in {} found pause {:?} and route {:?}; exact legacy selection did not survive",
+                            crate::node::link::b32_encode(&peer),
+                            crate::node::link::b32_encode(&channel_id),
+                            self.fx28_rekey_pause.map(|(room, peer)| (
+                                crate::node::link::b32_encode(&room),
+                                crate::node::link::b32_encode(&peer)
+                            )),
+                            self.older.get(&pair)
+                        ),
+                    );
+                    false
+                }
+            })
+        });
+        #[cfg(feature = "test-knobs")]
+        let release_requested = proof_post_action
+            .as_ref()
+            .is_some_and(|(_, peer)| peer.is_some());
+        #[cfg(not(feature = "test-knobs"))]
+        let released_paused = false;
+        #[cfg(not(feature = "test-knobs"))]
+        let release_requested = false;
+        let drive_rekey = if release_requested {
+            released_paused
+        } else {
+            rotated
+        };
+        let delivered = if drive_rekey {
+            self.deliver_rekeys_for(&channel_id, false).await
+        } else {
+            0
+        };
+        #[cfg(feature = "test-knobs")]
+        if let Some((marker, release_peer)) = proof_post_action {
+            let node = self
+                .paths
+                .profile_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<unknown>");
+            let room = crate::node::link::b32_encode(&channel_id);
+            let _ = crate::node::computer::publish_proof_marker(
+                &marker,
+                format!(
+                    "{node}\t{room}\trotated={rotated}\trelease_requested={}\treleased_paused={released_paused}\tcomplete_target_batches={delivered}\n",
+                    release_peer.is_some()
+                )
+                .as_bytes(),
+            );
         }
         Outcome::Done
     }
@@ -22874,6 +23294,10 @@ impl Node {
         self.fresh_details
             .retain(|id, _| self.channels.contains_key(id) && !read.contains(id));
         self.view_tx.send_replace(view);
+        #[cfg(feature = "test-knobs")]
+        if let Some((marker, contents)) = self.fx28_ended_unanswered_marker.take() {
+            let _ = crate::node::computer::publish_proof_marker(&marker, &contents);
+        }
     }
 
     /// The node's view, built **without waiting long on any room a session holds.**

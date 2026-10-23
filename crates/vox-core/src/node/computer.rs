@@ -52,6 +52,40 @@ pub(crate) fn fx28_mutant(named: &str) -> bool {
     std::env::var("VOX_TEST_FX28_MUTANT").as_deref() == Ok(named)
 }
 
+/// Test apparatus: park one exact Computer-state commit after its replacement snapshot is ready
+/// and before any filesystem work. `<arm>\t<engaged>\t<release socket>`; removing `arm` selects
+/// one write, `engaged` proves it reached the boundary, and one local connection releases it.
+/// The release binary contains none of these names or behavior.
+#[cfg(feature = "test-knobs")]
+fn hold_state_commit_for_proof() {
+    let Ok(spec) = std::env::var("VOX_TEST_HOLD_COMPUTER_STATE_COMMIT") else {
+        return;
+    };
+    let mut fields = spec.splitn(3, '\t');
+    let (Some(arm), Some(engaged), Some(release)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return;
+    };
+    if std::fs::remove_file(arm).is_err() {
+        return;
+    }
+    let _ = std::fs::remove_file(release);
+    let Ok(listener) = std::os::unix::net::UnixListener::bind(release) else {
+        return;
+    };
+    if publish_proof_marker(
+        std::path::Path::new(engaged),
+        b"computer state commit held\n",
+    )
+    .is_err()
+    {
+        return;
+    }
+    let _ = listener.accept();
+    let _ = std::fs::remove_file(engaged);
+    let _ = std::fs::remove_file(release);
+}
+
 /// Publish a populated proof marker in one namespace operation, without replacing an existing
 /// marker. Test-knob call sites use this only for causal staging; shipped builds compile every
 /// caller out.
@@ -176,12 +210,27 @@ const MAX_RECORDS: usize = 4096;
 const MAX_STATE: u64 = 64 * 1024 * 1024;
 const HISTORY_FULL: &str = "computer control history is full; no authority was discarded";
 const STORAGE_FAILED: &str = "computer policy storage failed; computer trust is suspended until storage is repaired and the daemon restarted";
+const COMPUTER_COMMIT_CAUSAL_EXPIRED: &str =
+    "the computer change reached its causal convergence deadline before its atomic commit";
 
 fn bad() -> Error {
     Error::Profile("computer management state is malformed; it was left unchanged")
 }
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// Computer-state transactions contain synchronous filesystem staging, flush and rename. When
+/// invoked by the daemon's multi-thread Tokio runtime, declare that whole blocking region so a
+/// slow disk or an earlier serialized writer cannot consume a runtime worker and starve read-only
+/// status/network work. Non-runtime and current-thread callers execute it directly.
+fn blocking_transaction<T>(transaction: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(transaction)
+    } else {
+        transaction()
+    }
 }
 fn arity(d: &mut Decoder<'_>, n: usize) -> Result<()> {
     if d.array()? == n {
@@ -1010,6 +1059,11 @@ pub(crate) struct State {
     /// Peers for which this exact local revision was repaired only after its causal deadline.
     /// This operational truth is durable so restart cannot turn a missed contract into success.
     pub missed_exchanges: BTreeMap<Digest32, (u64, bool)>,
+    /// Pre-candidate received expiry markers, retained only so a state written by an earlier
+    /// FX-28 development build can heal on its next authenticated matching-frontier exchange.
+    /// A peer's missed deadline is historical status on that peer, never authority here: the
+    /// exchange carrying the policy is itself its authenticated repair.
+    received_misses: BTreeMap<Digest32, u64>,
     /// A causal exchange obligation is recorded before any network work begins. A timely merge
     /// removes it in the same durable transaction; after a crash an unresolved obligation is a
     /// miss, never permission to manufacture a fresh convergence clock.
@@ -1626,7 +1680,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(30)
+        e.array(31)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1773,14 +1827,18 @@ impl State {
                 e.array(2).bytes(peer).uint(*created);
             }
         }
+        e.array(self.received_misses.len());
+        for (peer, revision) in &self.received_misses {
+            e.array(2).bytes(peer).uint(*revision);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        // 30 elements; older current-version states have no distinct operator-policy revision or
-        // durable pre-keyring application record.
+        // 31 elements; older current-version states have no distinct operator-policy revision,
+        // durable pre-keyring application record, or inbound/outbound miss distinction.
         let fields = count(&mut d)?;
-        if !(25..=30).contains(&fields) {
+        if !(25..=31).contains(&fields) {
             return Err(bad());
         }
         let description = Description::decode(d.bytes()?)?;
@@ -2119,8 +2177,20 @@ impl State {
                 }
             }
         }
+        let mut received_misses = BTreeMap::new();
+        if fields >= 31 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let peer = digest(&mut d)?;
+                let at = d.uint()?;
+                if at > revision || received_misses.insert(peer, at).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            received_misses,
             prepared,
             pending_exchanges,
             missed_exchanges,
@@ -2376,7 +2446,14 @@ pub(crate) enum ApplicationReceipt {
 pub struct Computer {
     path: PathBuf,
     storage_failed: std::sync::atomic::AtomicBool,
+    /// Fail closed across the gap between staging a policy replacement and publishing its new
+    /// in-memory snapshot. Status reads do not consult this flag and therefore never wedge on I/O.
+    authority_blocked: std::sync::atomic::AtomicBool,
     pub(crate) signer: Arc<dyn RootSigner + Send + Sync>,
+    /// Serialize replacement-state transactions without making readers wait for their disk I/O.
+    /// `state` is held only to take and publish a snapshot; `changes` keeps two writers from
+    /// staging from the same snapshot while either one has released `state` to save it.
+    changes: Mutex<()>,
     pub(crate) state: Mutex<State>,
     // Existing live room gates, weakly held: a durable policy change invalidates them before
     // exposing the new revision. Actors republish only after their keyring is reconciled.
@@ -2386,6 +2463,10 @@ pub struct Computer {
     /// The policy revision, sent whenever a change moves it: a local change or a merged
     /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
     changed: tokio::sync::broadcast::Sender<ComputerChange>,
+    /// Every durable journal movement, including application receipts and transport facts which
+    /// do not change operator authority. Management exchange follows this edge so it can remain
+    /// event-driven without making node reconciliation re-run or polling an applying peer.
+    journal_changed: tokio::sync::broadcast::Sender<()>,
     /// Each node's plan at the revision it was derived at: the app's polling and every trust
     /// command answer from it while the revision stands, instead of verifying the history again.
     plans: Mutex<BTreeMap<Digest32, (u64, PolicyPlan)>>,
@@ -2415,6 +2496,10 @@ impl Computer {
         self.changed.subscribe()
     }
 
+    pub(crate) fn journal_changes(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.journal_changed.subscribe()
+    }
+
     /// Whether `node`'s binding was derived at the current policy revision.
     pub fn binding_current(&self, node: &Digest32) -> bool {
         let s = lock(&self.state);
@@ -2428,19 +2513,24 @@ impl Computer {
     /// advance. Restart revalidates the retained state and its ability to be saved before attach.
     pub(crate) fn policy_current(&self, applied: u64, node: Digest32) -> bool {
         let s = lock(&self.state);
-        (s.genesis.is_none() && s.intervals.is_empty())
-            || (self.storage_ready().is_ok() && s.policy_revision == applied)
-                && if Self::revision_expired(&s) || s.grant(&self.signer.fingerprint()).is_none() {
-                    // Expiry revokes the missed revision's managed grants; it does not make the
-                    // node unusable forever. A retired local computer follows the same rule. The
-                    // actor may publish again only after its exact node keyring is durably settled
-                    // with no retained managed grant.
-                    Self::application_settled_in(&s, &node, applied)
-                } else {
-                    s.derived
-                        .get(&node)
-                        .is_some_and(|derived| derived.revision == s.policy_revision)
-                }
+        !self
+            .authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+            && ((s.genesis.is_none() && s.intervals.is_empty())
+                || (self.storage_ready().is_ok() && s.policy_revision == applied)
+                    && if Self::revision_expired(&s)
+                        || s.grant(&self.signer.fingerprint()).is_none()
+                    {
+                        // Expiry revokes the missed revision's managed grants; it does not make the
+                        // node unusable forever. A retired local computer follows the same rule. The
+                        // actor may publish again only after its exact node keyring is durably settled
+                        // with no retained managed grant.
+                        Self::application_settled_in(&s, &node, applied)
+                    } else {
+                        s.derived
+                            .get(&node)
+                            .is_some_and(|derived| derived.revision == s.policy_revision)
+                    })
     }
 
     /// Execute one synchronous irreversible publication only while `node`'s actor projection is
@@ -2455,22 +2545,25 @@ impl Computer {
     ) -> Option<T> {
         let state = lock(&self.state);
         let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
-        let current = unmanaged
-            || (self.storage_ready().is_ok()
-                && state.policy_revision == applied
-                && if Self::revision_expired(&state)
-                    || state.grant(&self.signer.fingerprint()).is_none()
-                {
-                    // The expired policy itself is not authority.  The safe, durably-revoked
-                    // projection is: it lets manual/unmanaged work continue without allowing a
-                    // grant from the missed revision to survive or reappear.
-                    Self::application_settled_in(&state, &node, applied)
-                } else {
-                    state
-                        .derived
-                        .get(&node)
-                        .is_some_and(|derived| derived.revision == state.policy_revision)
-                });
+        let current = !self
+            .authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+            && (unmanaged
+                || (self.storage_ready().is_ok()
+                    && state.policy_revision == applied
+                    && if Self::revision_expired(&state)
+                        || state.grant(&self.signer.fingerprint()).is_none()
+                    {
+                        // The expired policy itself is not authority.  The safe, durably-revoked
+                        // projection is: it lets manual/unmanaged work continue without allowing a
+                        // grant from the missed revision to survive or reappear.
+                        Self::application_settled_in(&state, &node, applied)
+                    } else {
+                        state
+                            .derived
+                            .get(&node)
+                            .is_some_and(|derived| derived.revision == state.policy_revision)
+                    }));
         current.then(publish)
     }
 
@@ -2737,9 +2830,9 @@ impl Computer {
     }
 
     fn revision_expired(s: &State) -> bool {
-        s.missed_exchanges
+        s.received_misses
             .values()
-            .any(|(revision, _)| *revision == s.policy_revision)
+            .any(|revision| *revision == s.policy_revision)
     }
 
     /// The plan for `node` from the verified rosters of `s`, derived.
@@ -3248,10 +3341,13 @@ impl Computer {
             let c = Arc::new(Self {
                 path,
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
+                authority_blocked: std::sync::atomic::AtomicBool::new(false),
                 signer,
+                changes: Mutex::new(()),
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
                 changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
+                journal_changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
                 plans: Mutex::new(BTreeMap::new()),
             });
             // Validate present storage before any endpoint or managed node can resume authority.
@@ -3309,15 +3405,19 @@ impl Computer {
             prepared: BTreeMap::new(),
             derived: BTreeMap::new(),
             missed_exchanges: BTreeMap::new(),
+            received_misses: BTreeMap::new(),
             pending_exchanges: BTreeMap::new(),
         };
         let c = Arc::new(Self {
             path,
             storage_failed: std::sync::atomic::AtomicBool::new(false),
+            authority_blocked: std::sync::atomic::AtomicBool::new(false),
             signer: Arc::new(root),
+            changes: Mutex::new(()),
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
             changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
+            journal_changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
             plans: Mutex::new(BTreeMap::new()),
         });
         c.save(&lock(&c.state))?;
@@ -3361,9 +3461,7 @@ impl Computer {
         if let Some(deadline) = deadline {
             write_private_file_checked(&self.path, &bytes, || {
                 if std::time::Instant::now() >= deadline {
-                    Err(Error::Profile(
-                        "the computer change reached its causal convergence deadline before its atomic commit",
-                    ))
+                    Err(Error::Profile(COMPUTER_COMMIT_CAUSAL_EXPIRED))
                 } else {
                     Ok(())
                 }
@@ -3384,13 +3482,24 @@ impl Computer {
         deadline: std::time::Instant,
         f: impl FnOnce(&mut State) -> Result<T>,
     ) -> Result<T> {
-        let mut held = lock(&self.state);
+        blocking_transaction(|| self.change_until_blocking(deadline, f))
+    }
+
+    fn change_until_blocking<T>(
+        &self,
+        deadline: std::time::Instant,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
+        // A writer owns the transaction order, but readers own no part of its filesystem work:
+        // status and authorization observations remain live while staging or flush is slow.
+        let _change = lock(&self.changes);
         self.storage_ready()?;
         if std::time::Instant::now() >= deadline {
             return Err(Error::Profile(
                 "the computer change reached its causal convergence deadline before its transaction began",
             ));
         }
+        let held = lock(&self.state).clone();
         let mut next = held.clone();
         let value = match f(&mut next) {
             Ok(value) => value,
@@ -3437,44 +3546,71 @@ impl Computer {
                     "the computer change reached its causal convergence deadline before it could be saved",
                 ));
             }
-            if let Err(error) = self.save_before(&next, Some(deadline)) {
-                self.storage_failure();
-                return Err(error);
-            }
-            let committed_late = std::time::Instant::now() >= deadline;
-            let moved = held.revision != next.revision;
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
             if authorization_changed {
+                self.authority_blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            #[cfg(feature = "test-knobs")]
+            hold_state_commit_for_proof();
+            #[cfg(feature = "test-knobs")]
+            let mutant_state_guard =
+                fx28_mutant("lock-through-computer-write").then(|| lock(&self.state));
+            let saved = self.save_before(&next, Some(deadline));
+            #[cfg(feature = "test-knobs")]
+            drop(mutant_state_guard);
+            if let Err(error) = saved {
+                // A refused pre-rename causal check leaves the old named file and in-memory
+                // state intact. It is a missed clock, not evidence that durable storage failed.
+                #[cfg(feature = "test-knobs")]
+                let deadline_is_storage_failure = fx28_mutant("deadline-as-storage-failure");
+                #[cfg(not(feature = "test-knobs"))]
+                let deadline_is_storage_failure = false;
+                if deadline_is_storage_failure
+                    || !matches!(&error, Error::Profile(why) if *why == COMPUTER_COMMIT_CAUSAL_EXPIRED)
+                {
+                    self.storage_failure();
+                }
+                self.authority_blocked
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(error);
+            }
+            let committed_late = std::time::Instant::now() >= deadline;
+            if authorization_changed {
                 self.invalidate_reachers();
             }
-            *held = next;
+            let mut published = lock(&self.state);
+            *published = next;
+            self.authority_blocked
+                .store(false, std::sync::atomic::Ordering::Release);
+            let _ = self.journal_changed.send(());
             if committed_late {
                 self.invalidate_reachers();
                 // The atomic rename happened. Publish an already-expired reconciliation event so
                 // actors revoke/detach instead of leaving the durable new policy live but unseen.
-                if moved || authorization_changed {
+                if authorization_changed {
                     let now = std::time::Instant::now();
-                    let _ = self.changed.send(ComputerChange {
-                        revision: held.policy_revision,
-                        apply_deadline: now,
-                        return_deadline: deadline,
-                    });
+                    let _ = self.changed.send(ComputerChange::at(
+                        published.policy_revision,
+                        now,
+                        deadline,
+                    ));
                 }
                 return Err(Error::Profile(
                     "the computer change committed at its causal boundary and was published as expired",
                 ));
             }
-            if moved || authorization_changed {
-                // A change here, or a merged exchange that moved this daemon's revision: either
-                // is a change here (ADR-038 FX-28), and the daemon reconciles its nodes on it.
+            if authorization_changed {
+                // Only operator authority makes nodes re-derive keyrings. Receipt, reach and
+                // pairing-journal movement is exchange payload and wakes Management through
+                // `journal_changed`; treating it as policy repeatedly reconciled every node.
                 // The local apply contract may shorten an outer return deadline, never extend it.
-                let _ = self.changed.send(ComputerChange {
-                    revision: held.policy_revision,
-                    apply_deadline: deadline
-                        .min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN),
-                    return_deadline: deadline,
-                });
+                let _ = self.changed.send(ComputerChange::at(
+                    published.policy_revision,
+                    deadline.min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN),
+                    deadline,
+                ));
             }
         }
         Ok(value)
@@ -3527,15 +3663,24 @@ impl Computer {
 
     /// Own the consequence of a causal exchange before opening a socket. This write has no
     /// elapsed product verdict: it either commits, or the exchange is not allowed to start.
-    pub(crate) fn record_pending_exchange(&self, peer: Digest32, revision: u64) -> Result<bool> {
+    pub(crate) fn record_pending_exchange(
+        &self,
+        peer: Digest32,
+        policy_revision: u64,
+    ) -> Result<Option<u64>> {
         self.change_durable(|state| {
-            if state.revision != revision {
-                return Ok(false);
+            // Operational journal records may land between scheduler selection and this durable
+            // reservation. They change the payload revision, not the operator policy or its
+            // causal clock, so adopt the current journal position instead of repeatedly cutting
+            // a useful flight. A different policy really does supersede this reservation.
+            if state.policy_revision != policy_revision {
+                return Ok(None);
             }
+            let revision = state.revision;
             // An atomically recorded policy obligation is older and stronger than later
             // reachability/journal movement carried by this exchange.
             state.pending_exchanges.entry(peer).or_insert(revision);
-            Ok(true)
+            Ok(Some(revision))
         })
     }
 
@@ -3577,27 +3722,43 @@ impl Computer {
     /// Persistence used by convergence bookkeeping whose truth must survive a crash and which
     /// has no wall-clock success criterion of its own.
     fn change_durable<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        let mut held = lock(&self.state);
+        blocking_transaction(|| self.change_durable_blocking(f))
+    }
+
+    fn change_durable_blocking<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let _change = lock(&self.changes);
         self.storage_ready()?;
+        let held = lock(&self.state).clone();
         let mut next = held.clone();
         let value = f(&mut next)?;
         if held.body() != next.body() {
-            if let Err(error) = self.save_before(&next, None) {
-                self.storage_failure();
-                return Err(error);
-            }
             let authorization_changed =
                 Self::revision_expired(&held) != Self::revision_expired(&next);
             if authorization_changed {
+                self.authority_blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            if let Err(error) = self.save_before(&next, None) {
+                self.storage_failure();
+                self.authority_blocked
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(error);
+            }
+            if authorization_changed {
                 self.invalidate_reachers();
             }
-            *held = next;
+            let mut published = lock(&self.state);
+            *published = next;
+            self.authority_blocked
+                .store(false, std::sync::atomic::Ordering::Release);
+            let _ = self.journal_changed.send(());
             if authorization_changed {
-                let _ = self.changed.send(ComputerChange {
-                    revision: held.policy_revision,
-                    apply_deadline: std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
-                    return_deadline: std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
-                });
+                let now = std::time::Instant::now();
+                let _ = self.changed.send(ComputerChange::at(
+                    published.policy_revision,
+                    now + COMPUTER_CHANGE_SHOWN_WITHIN,
+                    now + COMPUTER_RETURN_SHOWN_WITHIN,
+                ));
             }
         }
         Ok(value)
@@ -3619,19 +3780,22 @@ impl Computer {
         }
         crate::node::tunnel::publish_reachers(
             gate,
-            if (state.genesis.is_none() && state.intervals.is_empty())
-                || (self.storage_ready().is_ok()
-                    && applied == state.policy_revision
-                    && if Self::revision_expired(&state)
-                        || state.grant(&self.signer.fingerprint()).is_none()
-                    {
-                        Self::application_settled_in(&state, &node, applied)
-                    } else {
-                        state
-                            .derived
-                            .get(&node)
-                            .is_some_and(|derived| derived.revision == state.policy_revision)
-                    })
+            if !self
+                .authority_blocked
+                .load(std::sync::atomic::Ordering::Acquire)
+                && ((state.genesis.is_none() && state.intervals.is_empty())
+                    || (self.storage_ready().is_ok()
+                        && applied == state.policy_revision
+                        && if Self::revision_expired(&state)
+                            || state.grant(&self.signer.fingerprint()).is_none()
+                        {
+                            Self::application_settled_in(&state, &node, applied)
+                        } else {
+                            state
+                                .derived
+                                .get(&node)
+                                .is_some_and(|derived| derived.revision == state.policy_revision)
+                        }))
             {
                 next
             } else {

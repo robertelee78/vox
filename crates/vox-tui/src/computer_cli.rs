@@ -302,18 +302,23 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             Some(at) => {
                 let ago = now_ms.saturating_sub(at) / 1000;
                 format!(
-                    "; exchanged {} time(s) in {} attempt(s) since the daemon started, last {ago} s ago{}",
+                    "; exchanged {} time(s) in {} attempt(s) since the daemon started, last {ago} s ago{}{}",
                     application.exchanges,
                     application.exchange_attempts,
                     if application.exchange_failures > 0 {
                         format!(", {} failed in a row", application.exchange_failures)
                     } else {
                         String::new()
+                    },
+                    if application.exchange_in_flight {
+                        "; exchange in flight"
+                    } else {
+                        ""
                     }
                 )
             }
             None => format!(
-                "; not exchanged since the daemon started{}",
+                "; not exchanged since the daemon started{}{}",
                 if application.exchange_failures > 0 {
                     format!(
                         ", {} attempt(s) failed in a row",
@@ -321,6 +326,11 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
                     )
                 } else {
                     String::new()
+                },
+                if application.exchange_in_flight {
+                    "; exchange in flight"
+                } else {
+                    ""
                 }
             ),
         };

@@ -259,6 +259,15 @@ The decider then answered twelve questions, one at a time. His answers are the d
   complete (the peer unreachable, the stream cut), within 60 s, the fallback exchange's
   period, after the peer becomes reachable again. Two daemons on which nothing changed MUST
   start no pairing exchange except FX-15's named fallback and MUST derive no node binding again.
+  A node actor which has not applied the revision at the local observation boundary remains
+  attached but non-authoritative: status names it pending, its prior projection fails every
+  current-policy fence, and a later policy event can reconcile the same unlocked actor. Detaching
+  it would destroy the only in-memory credential able to recover and turn a bounded miss into a
+  permanent unlock requirement. Releasing held work after its original local deadline does not
+  renew that clock: the shipped journey causes a later policy event and requires that event to
+  reconcile the same Ready actor inside its own causal boundary, then restores the original
+  personal-node role through a second independently bounded event before using it in the next
+  room operation.
   These are the shipped, user-visible work records; a machine-dependent CPU threshold is not a
   verdict. "We need the detection of change logic to be sound. Easy for local daemon to notice,
   but daemon to daemon update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
@@ -289,22 +298,28 @@ The decider then answered twelve questions, one at a time. His answers are the d
   boundary, and publishes the in-memory state only after that commit. There is no second outer timeout: it would truncate the ten-minute
   pairing contract or mint a fresh ordinary-exchange clock. This bounds remote transaction and
   reconciliation work without claiming to reconstruct the initiator's instant. Network transit
-  continues to consume the initiator's original deadline. If repair completes only after that
-  retained deadline, the miss is durably recorded before repair is attempted. The exchange carries
-  that structural marker with the state, so the answerer's merge commits the received policy and
-  its local expired classification atomically. It may retain the state as evidence, but its node
-  actors refuse to derive or save ordinary trust from that revision. A successful late exchange
-  changes the marker to repaired-late; restart and a same-state failed preview preserve it. Only a
-  later operator policy change replaces it, and only that newer cause meeting its deadline may
-  converge and apply trust. Thus a late answer cannot turn the original miss into an on-time
-  result or an ordinary grant. The daemon-to-node event carries the same absolute deadline and a
+  continues to consume the initiator's original deadline. If repair begins only after that
+  retained deadline, the initiator durably records the miss before attempting repair. That record
+  is historical truth about the original cause, not authority over the receiving daemon: the
+  complete authenticated exchange being merged is itself the repair and the receiver applies its
+  signed policy under the causal boundary of that exchange. On return the initiator records
+  `repaired-late`; restart and a same-state failed preview preserve both the miss and repair. No
+  second exchange is required merely to tell the receiver that the first restored exchange was
+  successful. A later operator policy change replaces the old cause in current convergence status,
+  but neither it nor a repair rewrites the original miss as on-time. The daemon-to-node event carries the same absolute deadline and a
   cancellation token through its bounded queue and actor. Every durable actor stage rechecks both;
   caller timeout cancels queued work rather than merely dropping its reply, and continuously moving
   revisions retry until that causal deadline instead of an arbitrary revision count. The shipped
-  journey causally releases an actor message only after visible detachment and proves its binding
-  evidence did not move. The shipped journey also restarts one daemon with its Unix clock one hour ahead and then
-  proves changes in both directions from a causal observation on the proof process's monotonic
-  clock, never by comparing either daemon's Unix timestamp. A recovery proof evaluates no PRODUCT
+  journey causally holds one actor, proves its healthy sibling applies while the held actor stays
+  Ready without claiming the new grant, and then releases that exact message. The shipped journey
+  also restarts one daemon with its Unix clock one hour ahead and then proves changes in both
+  directions from a causal observation on the proof process's monotonic clock, never by comparing
+  either daemon's Unix timestamp. After those clock-independence and quiet-boundary claims, its
+  first fresh-room join also proves the skewed publisher stops at the board's named `Clock`
+  refusal rather than proceeding without a pre-join record and blaming authentication. The daemon
+  is then restarted without the test-only clock step before the independent stale-rekey claim;
+  rendezvous's five-minute future-date security bound is deliberately not a Computer deadline.
+  A recovery proof evaluates no PRODUCT
   timing verdict until it has causal apparatus evidence of reachability (the restored anchor's
   latest event-driven view names both exact management fingerprints, or a round trip has completed
   through the exact userspace forward); failure to establish or retain that precondition is
@@ -312,11 +327,27 @@ The decider then answered twelve questions, one at a time. His answers are the d
   the real restoration event. Absence of idle derivation is compared across the next dated,
   completed fallback exchange named by the same shipped status snapshot as the binding evidence,
   not an arbitrary quiet window: the unchanged revision is a structural cause boundary and every
-  binding's durable derivation record must remain identical across it. CLI JSON, plain CLI, the app
+  binding's durable derivation record must remain identical across it. A complete ordinary
+  exchange is bidirectional: the starter sends its snapshot and the answer returns the peer's
+  snapshot, so that one completion paces both daemons' fallback clocks. The quiet proof therefore
+  requires one such pair exchange, not one independently originated exchange per daemon. It admits
+  a second attempt only when both named fallback instants were already overlapping. Every recorded
+  completion must advance the opposite daemon's `last_answered_exchange`; an overlapped attempt
+  without its own completion is covered only when that same daemon answered the successful peer
+  round and retained no failure. CLI JSON, plain CLI, the app
   FFI and the native Computer Trust screen expose the exact missed revision, whether it repaired
   late, and whether it is expired, replaced, pending or converged, alongside policy revision,
   per-peer exchange records/counters and per-node binding revision/derivation moment. Neither
   client has to infer currentness from elapsed time or free-text failure wording.
+  Each per-peer application also names `exchange_in_flight`, true for the whole reservation from
+  selection through completion. Attempts say that work started and exchanges that it completed;
+  this bit closes the otherwise invisible interval between them, so a person can distinguish a
+  tail still applying receipts from an idle daemon or a wedged attempt. The quiet-boundary proof
+  takes this bit, both counters and binding/currentness from one shipped-status snapshot per
+  daemon. It begins the unchanged-state claim only at `false`; failure to become false while the
+  same policy remains current and confirmed is PRODUCT (either another pre-fallback attempt or one
+  attempt exceeding its existing return contract), not an apparatus sleep and not a renewed
+  timeout.
   Crash and late-marker amendment, 2026-10-21: the transaction which commits an effective
   operator-policy change also durably records every exact peer and that policy revision as
   unresolved; this ordering leaves no crash window between publishing the cause and owning its
@@ -332,20 +363,42 @@ The decider then answered twelve questions, one at a time. His answers are the d
 
   Revision numbers remain local and are never translated by ordinal position. The durable state
   separately names the journal revision of its last effective operator-policy change: endpoint
-  and reachability records may advance the journal but cannot replace an expired policy. A wire miss marker
+  and reachability records may advance the journal but cannot replace an operator-policy cause. A wire miss marker
   therefore carries a digest of the exact canonical policy frontier (genesis, pending enrollment
   and signed policy history; not reachability records, receipts, convergence observations or local revision numbers). The
-  receiver maps it to its current local revision only when that digest exactly matches after
-  merge. A marker for an older frontier cannot expire unrelated newer local policy. When the
-  matching marker arrives after that policy was already applied, its durable transition itself
-  invalidates all live authorization gates and wakes reconciliation even though the journal
-  revision did not move. Reconciliation fails closed by removing every grant managed by the
-  expired computer policy, including an older grant whose capability the expired revision changed;
-  it removes the receipt keyed by the computer identity (not a managed node identity), and never
-  records the expired state as an ordinary applied policy. Restart repeats this safely before
-  networking. A transaction whose atomic rename completes at its deadline publishes an
-  already-expired reconciliation event rather than leaving durable policy invisible to attached
-  actors. A later marker is thus a causal revocation, not status decoration.
+  receiver correlates it with that frontier only after merge. A marker for an older frontier cannot
+  affect unrelated newer local policy, and a matching marker cannot revoke the policy carried by
+  the authenticated exchange that delivered it. The earlier design did exactly that: the receiver
+  merged the policy, classified it expired from the sender's pre-repair marker, and removed every
+  managed grant; the sender marked the exchange repaired only after sending and then correctly
+  suppressed unchanged work, so the receiver could never learn the bit that would unexpire it.
+  Missed and repaired-late remain durable, user-visible convergence evidence on the initiating
+  daemon. A successful repair clears current consecutive failures and their backoff, and resumes
+  the ordinary named fallback; historical lateness must not disable future liveness work. The
+  authenticated traffic of that same repair can also finish its retained reachability waiter while
+  the exchange is in flight. Success consumes that queued wake only when the sent snapshot covers
+  both its journal and operator-policy revisions. This prevents the repair from scheduling a
+  redundant full exchange while preserving a policy or journal cause committed during the flight;
+  wall-clock quietness is neither the state machine nor the evidence of coverage. Every retained
+  failure deadline names the operator-policy revision which owns it. A reachability mark from an
+  older policy is a barrier until the already-queued newer `ComputerChange` installs that newer
+  policy's original deadline; it can neither expire the new policy nor be discarded in favor of a
+  fresh clock. Reachability snapshots and inserts its mark while holding the policy state, so an
+  old mark cannot be inserted after the newer event has already been consumed; without that one
+  boundary the old barrier could suppress every later fallback. A complete inbound ordinary exchange is bidirectional repair: its reply carries this
+  daemon's current snapshot, so it clears operational failure and paces the fallback. Outcome
+  recording serializes that reply with an overlapping outbound flight; when the reply covers both
+  of a causal retry flight's revisions, that flight is superseded and cannot recreate a durable
+  miss after the reply cleared the same obligation. An ordinary quiet fallback has no such
+  obligation: simultaneous fallbacks may both finish once, rather than one canceling the other and
+  manufacturing a second local attempt. The inbound success covers the exact noncausal flight:
+  its later success may still be counted, but its later error cannot overwrite that success. Only
+  a causal flight's expired deadline can create a durable policy miss; a quiet fallback's transport
+  bound is operational, never authority over the current policy. Receiver
+  authorization instead fails closed while its durable node application is behind
+  the merged policy revision, and becomes current only after that exact projection is saved and
+  receipted. An older policy revision's reconciliation result cannot detach or displace that
+  recovery.
 
   The answerer's hello echo and every response frame share the same local absolute deadline as
   its read and transaction, including both the frame length and body; a peer which stops reading
@@ -355,9 +408,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   uses one causal Unlock boundary and continues on actual revision movement, with no eight-pass
   verdict and no per-pass renewed deadline. The optional shipped-binary journey parks an answer
   after its merge, proves the answerer's effective keyring contains the newly applied grant,
-  observes the initiator's structural missed-revision state, then releases that exact answer and
-  proves the later matching marker removes the grant. Its mutant suppresses marker-only
-  invalidation, so the effective-keyring assertion—not elapsed sampling—turns PRODUCT red.
+  observes the initiator's structural missed-revision state, then restores the exact authenticated
+  path and proves the carried policy is applied to every receiving node while the initiator still
+  names the original miss as repaired late. Its mutant suppresses the repair application, so the
+  effective-keyring assertion—not elapsed sampling—turns PRODUCT red.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its

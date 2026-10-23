@@ -132,6 +132,11 @@ pub struct ComputerApplication {
     /// Attempts since the daemon started, completed or not: every round the retry ran toward
     /// it, so a proof can count rounds per computer (ADR-038 FX-15).
     pub exchange_attempts: u64,
+    /// Whether this daemon currently owns the peer's exchange reservation, from reservation
+    /// through completion. Together with attempts and completions this distinguishes active work
+    /// from a wedged attempt without guessing from elapsed wall-clock time.
+    #[serde(default)]
+    pub exchange_in_flight: bool,
     /// Attempts in a row that could not reach it; the retry backs off with each.
     pub exchange_failures: u32,
     /// Exact policy revision whose convergence contract was missed, retained after replacement.
@@ -371,6 +376,9 @@ struct Exchanged {
     /// End of the one return contract that began at the last failed attempt. The next backoff
     /// and exchange share it; neither gets a fresh timeout.
     deadline: Option<std::time::Instant>,
+    /// Operator-policy revision which owns `deadline`. A newer policy owns a fresh causal clock;
+    /// an expired deadline without this matching owner cannot expire that newer policy.
+    deadline_policy_revision: Option<u64>,
     /// This node's state revision at the last attempt, and whether a pairing operation
     /// involving the computer was open then: a change in either is tried at once, backoff or
     /// not; the same state waits the backoff out.
@@ -392,6 +400,9 @@ struct Exchanged {
 #[derive(Clone, Copy, Debug)]
 struct RetryMark {
     token: u64,
+    /// Operator-policy revision which owns this causal clock. Journal movement may update the
+    /// payload revision without turning an older policy clock into the owner of a newer policy.
+    policy_revision: u64,
     revision: u64,
     deadline: std::time::Instant,
 }
@@ -403,21 +414,33 @@ struct Attempt {
     peer: Digest32,
     serial: u64,
     revision: u64,
+    policy_revision: u64,
     involved: bool,
+    causal: bool,
     deadline: std::time::Instant,
     recorded: bool,
 }
 
 impl Attempt {
-    fn done(mut self, outcome: std::result::Result<(u64, u64), String>) {
+    fn done(mut self, outcome: std::result::Result<(u64, u64, u64), String>) {
         self.recorded = true;
+        let (outcome, covered_payload) = match outcome {
+            Ok((sent_revision, sent_policy_revision, merged_revision)) => (
+                Ok((sent_revision, merged_revision)),
+                Some((sent_revision, sent_policy_revision)),
+            ),
+            Err(error) => (Err(error), None),
+        };
         self.me.record_exchange(
             self.peer,
             self.serial,
             self.revision,
+            self.policy_revision,
             self.involved,
+            self.causal,
             self.deadline,
             outcome,
+            covered_payload,
         );
         // Dropped here: the reservation is released by its owner, after the record.
     }
@@ -428,8 +451,15 @@ struct Flight {
     /// This flight, as distinct from any later one with the same computer: an abort handle is
     /// installed, and a reservation released, only for the flight that owns them.
     serial: u64,
+    /// Operator-policy revision which owns this flight's causal clock. `revision` still decides
+    /// whether its actual exchange payload was superseded; keeping both prevents a larger
+    /// transport/pairing journal number from making an older policy own a newer policy's clock.
+    policy_revision: u64,
     revision: u64,
     involved: bool,
+    /// This flight discharges a policy/receipt/failure obligation. A quiet fallback is false: an
+    /// overlapping inbound fallback must not cancel it and manufacture a second local attempt.
+    causal: bool,
     /// Earliest causal return deadline among the changes this flight is responsible for. A
     /// superseding revision inherits it before this task is cut, so coalescing never restarts the
     /// user's convergence clock.
@@ -437,6 +467,9 @@ struct Flight {
     /// Who started it: the retry, or the operator's pairing command.
     origin: Origin,
     abort: Option<tokio::task::AbortHandle>,
+    /// A complete inbound exchange replied with at least this noncausal flight's snapshot. Its
+    /// later success may still count; its later failure cannot overwrite that completed success.
+    covered: bool,
     /// Cut because this node changed meanwhile: its end is no failure, and the next tick
     /// exchanges again. Read and cleared with the flight's removal, under the one lock.
     superseded: bool,
@@ -478,8 +511,10 @@ impl Drop for Reserved {
             inflight.remove(&self.peer);
         }
         // Flight release is useful to both the scheduler and an operator command taking over
-        // this exact peer. Wake every already-registered waiter; neither has to poll the map.
+        // this exact peer. Wake every already-registered waiter, then leave one coalesced permit
+        // for the scheduler if release landed between its retry turn and its next registration.
         self.me.retry_wake.notify_waiters();
+        self.me.retry_wake.notify_one();
     }
 }
 
@@ -496,7 +531,10 @@ impl Drop for Attempt {
             if flight.serial != self.serial {
                 return;
             }
-            let should_record = !self.recorded && !flight.superseded;
+            // A covered quiet flight may still record a normal success through `done`, but if its
+            // task tears down the inbound full exchange has already won. Do not lose the coverage
+            // bit with this removal and then manufacture a failure from the guard path.
+            let should_record = !self.recorded && !flight.superseded && !flight.covered;
             inflight.remove(&self.peer);
             should_record
         };
@@ -505,14 +543,18 @@ impl Drop for Attempt {
                 self.peer,
                 self.serial,
                 self.revision,
+                self.policy_revision,
                 self.involved,
+                self.causal,
                 self.deadline,
                 Err("the exchange task failed".to_owned()),
+                None,
             );
         }
         // See `Reserved::drop`: a takeover and the scheduler can both be waiting for this one
         // causal release.
         self.me.retry_wake.notify_waiters();
+        self.me.retry_wake.notify_one();
     }
 }
 
@@ -678,6 +720,10 @@ impl Management {
                     self.computer.signer.as_ref(),
                 )?,
             );
+            // This receipt is new exchange payload even though it changes no operator policy.
+            // Give it a journal identity so the event-driven scheduler sends it once; do not use
+            // `advance_journal`, whose purpose is a new management cause and clears receipts.
+            s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
             Ok(())
         })
     }
@@ -760,6 +806,7 @@ impl Management {
         tokio::spawn(async move {
             let Some(me) = weak.upgrade() else { return };
             let mut changes = me.computer.changes();
+            let mut journal = me.computer.journal_changes();
             let mut network = me.net.presence().changes();
             let wake = Arc::clone(&me.retry_wake);
             drop(me);
@@ -793,18 +840,41 @@ impl Management {
                         match changed {
                             Ok(event) => {
                                 if let Some(me) = weak.upgrade() {
-                                    me.retry_changed_now(event.return_deadline());
+                                    me.retry_changed_now(event);
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 if let Some(me) = weak.upgrade() {
                                     // Never extend a missed cause: an immediate deadline is the
                                     // conservative failure boundary.
-                                    me.retry_changed_now(std::time::Instant::now());
+                                    let now = std::time::Instant::now();
+                                    me.retry_changed_now(ComputerChange::at(
+                                        me.computer.policy_revision(),
+                                        now,
+                                        now,
+                                    ));
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                         }
+                    }
+                    changed = journal.recv() => {
+                        if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            return;
+                        }
+                        if let Some(me) = weak.upgrade() {
+                            // Node application can finish before the exchange carrying the last
+                            // remote roster fact. It correctly cannot sign a receipt then; this
+                            // exact later journal edge is what makes the receipt eligible. The
+                            // operation is idempotent, and a newly created receipt advances the
+                            // journal once so it is sent rather than polled for.
+                            if let Err(error) = me.record_application() {
+                                *lock(&me.problem) = Some(error.to_string());
+                            }
+                        }
+                        // A durable receipt/reach/pairing payload moved without changing node
+                        // authority. Re-evaluate the exchange need at that exact edge; the
+                        // unchanged-success filter above still prevents sending the same state.
                     }
                     changed = network.recv() => {
                         if matches!(changed, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
@@ -1115,7 +1185,10 @@ impl Management {
         let target = link.target;
         // The state this handshake carries, read before the reservation: the state lock is
         // never taken under the in-flight lock (the retry takes them the other way round).
-        let revision = lock(&self.computer.state).revision;
+        let (revision, policy_revision) = {
+            let state = lock(&self.computer.state);
+            (state.revision, state.policy_revision)
+        };
         // The operator's action comes first: a retry exchange in flight with that computer
         // is cut (as no failure) and its reservation waited for, briefly; another operator
         // pairing in flight is reported.
@@ -1154,11 +1227,14 @@ impl Management {
                             target,
                             Flight {
                                 serial,
+                                policy_revision,
                                 revision,
                                 involved: true,
+                                causal: true,
                                 deadline: causal_deadline,
                                 origin: Origin::Operator,
                                 abort: None,
+                                covered: false,
                                 superseded: false,
                             },
                         );
@@ -1271,9 +1347,12 @@ impl Management {
                 target,
                 serial,
                 revision,
+                policy_revision,
+                true,
                 true,
                 causal_deadline.min(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN),
                 outcome,
+                None,
             );
         }
         drop(reserved);
@@ -1286,7 +1365,7 @@ impl Management {
         let local = self.computer.signer.fingerprint();
         self.computer.change(|s| {
             let before_revision = s.revision;
-            let before_pending = s.pending.as_ref().map(Enrollment::body);
+            let before_pending = s.pending.as_ref().map(Enrollment::encode);
             if s.genesis.as_ref().is_some_and(|g| g.operation() == id)
                 || s.history.values().any(|r| {
                     r.event()
@@ -1327,7 +1406,7 @@ impl Management {
                 )?);
             }
             activate(s, self.computer.signer.as_ref())?;
-            if s.pending.as_ref().map(Enrollment::body) != before_pending
+            if s.pending.as_ref().map(Enrollment::encode) != before_pending
                 && s.revision == before_revision
             {
                 s.advance_journal()?;
@@ -1521,14 +1600,16 @@ impl Management {
             BTreeMap::new()
         };
         let exchanged = lock(&self.exchanged).clone();
+        // Snapshot sequentially, never while holding `exchanged`: operator pairing reserves
+        // under `inflight` and then consults `exchanged`. The state lock held by this status call
+        // prevents a policy snapshot from being paired with reservations for another revision.
+        let inflight: BTreeSet<_> = lock(&self.inflight).keys().copied().collect();
         let applications: Vec<_> = descriptions
             .iter()
             .map(|(id, d)| {
                 let record = exchanged.get(id).cloned().unwrap_or_default();
                 let missed = s.missed_exchanges.get(id).copied();
-                let expired = missed.is_some_and(|(revision, _)| revision == s.policy_revision);
                 let confirmed = !storage_failed
-                    && !expired
                     && s.receipts
                         .get(id)
                         .is_some_and(|r| valid_receipt(&s, id, r).unwrap_or(false));
@@ -1545,6 +1626,7 @@ impl Management {
                     last_exchange_ms: record.last_ms,
                     exchanges: record.count,
                     exchange_attempts: record.attempts,
+                    exchange_in_flight: inflight.contains(id),
                     exchange_failures: record.failures,
                     missed_revision: missed.map(|(revision, _)| revision),
                     repaired_late: missed.is_some_and(|(_, repaired)| repaired),
@@ -1622,12 +1704,9 @@ impl Management {
             }
         }
         former.retain(|id, _| !descriptions.contains_key(id));
-        let expired = applications.iter().any(|application| {
-            matches!(
-                application.convergence_state.as_str(),
-                "expired" | "repaired-late"
-            )
-        });
+        let expired = applications
+            .iter()
+            .any(|application| application.convergence_state == "expired");
         let state = if storage_failed || !s.quarantined.is_empty() {
             "quarantined"
         } else if s.genesis.is_some() && s.grant(&local).is_none() && !busy {
@@ -2125,7 +2204,7 @@ impl Management {
             // The revision this node stood at when it accepted the pairing, read in the
             // transaction that merges the computer's state, and the revision after.
             let before = s.revision;
-            let before_pending = s.pending.as_ref().map(Enrollment::body);
+            let before_pending = s.pending.as_ref().map(Enrollment::encode);
             if s.pending
                 .as_ref()
                 .is_some_and(|p| !enrolled(s, p) && p.body() != g.body())
@@ -2143,7 +2222,8 @@ impl Management {
             s.pending_expires = link.expires;
             s.pair_link = Some(Zeroizing::new(url.to_owned()));
             merge(s, &exchange, link.target, self.computer.signer.as_ref())?;
-            if s.pending.as_ref().map(Enrollment::body) != before_pending && s.revision == before {
+            if s.pending.as_ref().map(Enrollment::encode) != before_pending && s.revision == before
+            {
                 s.advance_journal()?;
             }
             Ok((before, s.revision))
@@ -2193,14 +2273,21 @@ impl Management {
             // A merge that moves this daemon's revision is a change here (ADR-038 FX-28). The
             // reply is the merged state, encoded under the same lock, so the revision the
             // record names is the revision the reply carries.
-            let (merged, reply) = self.computer.change_until(deadline, |s| {
-                merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
-                Ok((s.revision, exchange(s, &conn.peer_id())?))
-            })?;
+            let local = self.computer.signer.fingerprint();
+            let (merged, policy_revision, involved, reply) =
+                self.computer.change_until(deadline, |s| {
+                    merge(s, &payload, conn.peer_id(), self.computer.signer.as_ref())?;
+                    Ok((
+                        s.revision,
+                        s.policy_revision,
+                        pending_involves(s, &local, &conn.peer_id()),
+                        exchange(s, &conn.peer_id())?,
+                    ))
+                })?;
             #[cfg(feature = "test-knobs")]
             self.hold_answer_after_merge_for_proof(conn.peer_id()).await;
             write_frame_until(send, &reply, deadline).await?;
-            self.record_answered(conn.peer_id(), merged)?;
+            self.record_answered(conn.peer_id(), merged, policy_revision, involved)?;
             return Ok(());
         }
         let (invite, mut g) = {
@@ -2261,7 +2348,7 @@ impl Management {
         pop::verify(&proof, &ci, &transcript, &conn.peer_id())?;
         let recorded = self.computer.change_until(deadline, |s| {
             let before_revision = s.revision;
-            let before_pending = s.pending.as_ref().map(Enrollment::body);
+            let before_pending = s.pending.as_ref().map(Enrollment::encode);
             let i = s
                 .invitations
                 .iter_mut()
@@ -2281,15 +2368,20 @@ impl Management {
             }
             s.pending = Some(g);
             s.pending_expires = invite.expires;
-            if s.pending.as_ref().map(Enrollment::body) != before_pending
+            if s.pending.as_ref().map(Enrollment::encode) != before_pending
                 && s.revision == before_revision
             {
                 s.advance_journal()?;
             }
             // The state sent back, encoded with the pairing just recorded, and its revision.
-            Ok((s.revision, exchange(s, &conn.peer_id())?))
+            Ok((
+                s.revision,
+                s.policy_revision,
+                pending_involves(s, &self.computer.signer.fingerprint(), &conn.peer_id()),
+                exchange(s, &conn.peer_id())?,
+            ))
         })?;
-        let (revision, payload) = recorded;
+        let (revision, policy_revision, involved, payload) = recorded;
         let proof = pop::IdentityProof::create(self.computer.signer.as_ref(), &ci, &transcript)?;
         let mut e = Encoder::new();
         e.array(2)
@@ -2297,48 +2389,82 @@ impl Management {
             .bytes(&payload);
         write_frame_until(send, &e.finish(), deadline).await?;
         // The enrollment handshake is an exchange this daemon answered (ADR-038 FX-28).
-        self.record_answered(conn.peer_id(), revision)?;
+        self.record_answered(conn.peer_id(), revision, policy_revision, involved)?;
         Ok(())
     }
     /// Wake one failed peer from authenticated connection/application activity. A peer that has
     /// no failed exchange cannot spend work by sending streams: it is not put on this set.
     fn retry_peer_now(&self, peer: Digest32) {
-        let cause = lock(&self.exchanged).get(&peer).and_then(|record| {
-            (record.failures > 0).then(|| {
-                (
-                    record.revision,
+        // Keep the state snapshot locked through mark insertion. Otherwise P2 can commit and its
+        // ComputerChange can be fully consumed after this function reads P1 but before it inserts
+        // the P1 mark, leaving a stale barrier with no remaining P2 event able to replace it.
+        // This is the scheduler's established state -> exchanged -> retry_ready lock order.
+        let state = lock(&self.computer.state);
+        let revision = state.revision;
+        let policy_revision = state.policy_revision;
+        let deadline = lock(&self.exchanged).get(&peer).and_then(|record| {
+            (record.failures > 0 && record.deadline_policy_revision == Some(policy_revision)).then(
+                || {
                     record
                         .deadline
-                        .unwrap_or(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN),
-                )
-            })
+                        .unwrap_or(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN)
+                },
+            )
         });
-        if let Some((revision, deadline)) = cause {
-            self.mark_retry(peer, revision, deadline);
+        if let Some(deadline) = deadline {
+            self.mark_retry(peer, revision, policy_revision, deadline);
+            drop(state);
             self.retry_wake.notify_one();
+        } else {
+            drop(state);
         }
     }
 
-    fn mark_retry(&self, peer: Digest32, revision: u64, deadline: std::time::Instant) {
+    fn mark_retry(
+        &self,
+        peer: Digest32,
+        revision: u64,
+        policy_revision: u64,
+        deadline: std::time::Instant,
+    ) {
         let mut ready = lock(&self.retry_ready);
         match ready.entry(peer) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(RetryMark {
                     token: next_flight(),
+                    policy_revision,
                     revision,
                     deadline,
                 });
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                // Revision says what the replacement carries; deadline says when the earliest
-                // unfinished cause must finish. Neither is permitted to replace the other.
-                let merged_revision = entry.get().revision.max(revision);
+                // An older torn flight cannot shorten a replacement already registered for a
+                // newer state. At the same/newer journal revision, transport-only supersession
+                // retains the earliest unfinished clock; policy supersession uses
+                // `mark_policy_retry` below and deliberately replaces it.
+                if policy_revision < entry.get().policy_revision
+                    || (policy_revision == entry.get().policy_revision
+                        && revision < entry.get().revision)
+                {
+                    return;
+                }
+                if policy_revision > entry.get().policy_revision {
+                    entry.insert(RetryMark {
+                        token: next_flight(),
+                        policy_revision,
+                        revision,
+                        deadline,
+                    });
+                    return;
+                }
+                let merged_revision = revision;
                 let merged_deadline = entry.get().deadline.min(deadline);
                 if merged_revision != entry.get().revision
                     || merged_deadline != entry.get().deadline
                 {
                     entry.insert(RetryMark {
                         token: next_flight(),
+                        policy_revision,
                         revision: merged_revision,
                         deadline: merged_deadline,
                     });
@@ -2347,9 +2473,57 @@ impl Management {
         }
     }
 
+    /// Register a durable operator-policy event. Unlike a later transport-only journal movement,
+    /// a newer policy revision is a new user cause with its own already-created deadline; it
+    /// replaces every older cause instead of inheriting an expired clock (ADR-038 FX-28).
+    fn mark_policy_retry(
+        &self,
+        peer: Digest32,
+        revision: u64,
+        policy_revision: u64,
+        deadline: std::time::Instant,
+    ) {
+        let mut ready = lock(&self.retry_ready);
+        match ready.entry(peer) {
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if entry.get().policy_revision < policy_revision =>
+            {
+                entry.insert(RetryMark {
+                    token: next_flight(),
+                    policy_revision,
+                    revision,
+                    deadline,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().policy_revision > policy_revision || revision < entry.get().revision
+                {
+                    return;
+                }
+                let merged_deadline = entry.get().deadline.min(deadline);
+                if revision != entry.get().revision || merged_deadline != entry.get().deadline {
+                    entry.insert(RetryMark {
+                        token: next_flight(),
+                        policy_revision,
+                        revision,
+                        deadline: merged_deadline,
+                    });
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(RetryMark {
+                    token: next_flight(),
+                    policy_revision,
+                    revision,
+                    deadline,
+                });
+            }
+        }
+    }
+
     /// A durable state event owns its deadline before scheduling. Every peer selected because
     /// of that revision uses the same absolute end through exchange and local reconciliation.
-    fn retry_changed_now(&self, deadline: std::time::Instant) {
+    fn retry_changed_now(&self, change: ComputerChange) {
         let local = self.computer.signer.fingerprint();
         let (revision, peers): (u64, Vec<_>) = {
             let state = lock(&self.computer.state);
@@ -2365,7 +2539,7 @@ impl Management {
         };
         if !peers.is_empty() {
             for peer in peers {
-                self.mark_retry(peer, revision, deadline);
+                self.mark_policy_retry(peer, revision, change.revision(), change.return_deadline());
             }
             self.retry_wake.notify_one();
         }
@@ -2374,7 +2548,7 @@ impl Management {
     async fn retry(self: &Arc<Self>) -> Result<Option<std::time::Instant>> {
         #[cfg(feature = "test-knobs")]
         self.hold_retry_ready_for_proof().await;
-        let (peers, attempted, revision, mut next) = {
+        let (peers, attempted, revision, policy_revision, mut next) = {
             let s = lock(&self.computer.state);
             let policy_revision = s.policy_revision;
             let local = self.computer.signer.fingerprint();
@@ -2429,6 +2603,8 @@ impl Management {
             for (peer, record) in exchanged.iter_mut() {
                 if !known.contains(peer) && (record.failures > 0 || record.problem.is_some()) {
                     record.failures = 0;
+                    record.deadline = None;
+                    record.deadline_policy_revision = None;
                     record.problem = None;
                     changed = true;
                 }
@@ -2444,22 +2620,34 @@ impl Management {
                 // exact state and needs no periodic retry. A later policy state is a new cause;
                 // it may make one attempt under its own already-created retry mark.
                 if let Some(record) = exchanged.get_mut(peer) {
-                    if record.missed_revision.is_some()
-                        && record.missed_revision != Some(policy_revision)
-                    {
+                    let replaced_miss = record.missed_revision.is_some()
+                        && record.missed_revision != Some(policy_revision);
+                    let replaced_failure = record.failures > 0
+                        && record
+                            .deadline_policy_revision
+                            .is_some_and(|owner| owner != policy_revision);
+                    if replaced_miss || replaced_failure {
                         record.failures = 0;
                         record.deadline = None;
+                        record.deadline_policy_revision = None;
                         record.problem = None;
-                        record.missed_revision = None;
-                        record.repaired_late = None;
+                        if replaced_miss {
+                            record.missed_revision = None;
+                            record.repaired_late = None;
+                        }
                         changed = true;
                     }
                 }
                 let record = exchanged.get(peer).cloned().unwrap_or_default();
-                if record.repaired_late == Some(policy_revision) {
+                let causal_mark = retry_ready.get(peer).copied();
+                if causal_mark.is_some_and(|mark| mark.policy_revision != policy_revision) {
+                    // A reachability wake can snapshot P1 immediately before P2 commits. Never
+                    // lend P1's (possibly expired) clock to P2, and do not invent a default clock
+                    // for P2. Keep this stale mark only as a barrier for this turn; the already
+                    // queued ComputerChange is the sole owner of P2's original deadline and
+                    // `mark_policy_retry` replaces the mark when that event is consumed.
                     return false;
                 }
-                let causal_mark = retry_ready.get(peer).copied();
                 let reachability_restored = causal_mark.is_some();
                 let causal_deadline = match (causal_mark.map(|mark| mark.deadline), record.deadline)
                 {
@@ -2501,12 +2689,16 @@ impl Management {
                             return false;
                         }
                     } else {
-                        let acknowledged = s
-                            .receipts
-                            .get(peer)
-                            .is_some_and(|r| valid_receipt(&s, peer, r).unwrap_or(false));
-                        if acknowledged
-                            && involved != Some(*peer)
+                        // A successful exchange delivered this exact payload. A missing applied
+                        // receipt means the peer is still doing local work, not that sending the
+                        // same signed history again can help it. Its authenticated state change
+                        // wakes us; the quiet fallback covers a lost wake. Retrying immediately
+                        // here completed 585 full exchanges in one minute and starved the peer's
+                        // node reconciliation—the idle CPU/network storm FX-29 measures.
+                        let unchanged = record.revision == revision
+                            && record.involved == (involved == Some(*peer));
+                        if unchanged
+                            && !reachability_restored
                             && now.duration_since(last) < EXCHANGE_FALLBACK
                         {
                             let due = last + EXCHANGE_FALLBACK;
@@ -2556,7 +2748,12 @@ impl Management {
                         // Transfer the first unfinished change's end before cutting the stale
                         // work. The replacement may carry newer state, but never gets a newer
                         // convergence clock.
-                        self.mark_retry(*peer, flight.revision, flight.deadline);
+                        self.mark_retry(
+                            *peer,
+                            flight.revision,
+                            flight.policy_revision,
+                            flight.deadline,
+                        );
                         flight.superseded = true;
                         #[cfg(feature = "test-knobs")]
                         if flight.origin == Origin::Operator && flight.abort.is_none() {
@@ -2575,14 +2772,17 @@ impl Management {
                         *peer,
                         Flight {
                             serial: next_flight(),
+                            policy_revision,
                             revision,
                             involved: involved == Some(*peer),
+                            causal: selected_causal.contains(peer),
                             deadline: selected_deadlines
                                 .get(peer)
                                 .copied()
                                 .unwrap_or(now + COMPUTER_RETURN_SHOWN_WITHIN),
                             origin: Origin::Retry,
                             abort: None,
+                            covered: false,
                             superseded: false,
                         },
                     );
@@ -2642,7 +2842,7 @@ impl Management {
                     (peer, endpoints, url)
                 })
                 .collect::<Vec<_>>();
-            (peers, attempted, revision, next)
+            (peers, attempted, revision, policy_revision, next)
         };
         for (peer, endpoints, url) in peers {
             let me = Arc::clone(self);
@@ -2653,30 +2853,51 @@ impl Management {
                         (*involved, *serial, *deadline, *causal)
                     },
                 );
-            // The guard exists before the task does and travels with it: a task cut before
-            // its first poll drops the guard all the same, so no reservation ever leaks.
-            let guard = Attempt {
-                me: Arc::clone(self),
-                peer,
-                serial,
-                revision,
-                involved,
-                deadline,
-                recorded: false,
-            };
+            let mut attempt_revision = revision;
             if causal {
-                match self.computer.record_pending_exchange(peer, revision) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                match self.computer.record_pending_exchange(peer, policy_revision) {
+                    Ok(Some(current_revision)) => {
+                        attempt_revision = current_revision;
+                        if let Some(flight) = lock(&self.inflight).get_mut(&peer) {
+                            if flight.serial == serial {
+                                flight.revision = current_revision;
+                            }
+                        }
+                    }
+                    Ok(None) => {
                         if let Some(flight) = lock(&self.inflight).get_mut(&peer) {
                             if flight.serial == serial {
                                 flight.superseded = true;
                             }
                         }
-                        drop(guard);
+                        // Release this exact superseded reservation. The ordinary guard is built
+                        // below only after durable reservation succeeds; without a guard here the
+                        // map would retain a flight which owns no task forever.
+                        drop(Attempt {
+                            me: Arc::clone(self),
+                            peer,
+                            serial,
+                            revision: attempt_revision,
+                            policy_revision,
+                            involved,
+                            causal,
+                            deadline,
+                            recorded: false,
+                        });
                         continue;
                     }
                     Err(error) => {
+                        let guard = Attempt {
+                            me: Arc::clone(self),
+                            peer,
+                            serial,
+                            revision: attempt_revision,
+                            policy_revision,
+                            involved,
+                            causal,
+                            deadline,
+                            recorded: false,
+                        };
                         guard.done(Err(format!(
                             "the exchange obligation could not be recorded durably: {error}"
                         )));
@@ -2684,17 +2905,43 @@ impl Management {
                     }
                 }
             }
+            // The guard exists before the task does and travels with it: a task cut before
+            // its first poll drops the guard all the same, so no reservation ever leaks.
+            let guard = Attempt {
+                me: Arc::clone(self),
+                peer,
+                serial,
+                revision: attempt_revision,
+                policy_revision,
+                involved,
+                causal,
+                deadline,
+                recorded: false,
+            };
             let task = tokio::spawn(async move {
                 // Each computer's outcome is recorded by its own task the moment it ends,
                 // dated then: a slow computer never delays another's record, status or next
                 // attempt. Exchange and reconciliation share the causal return deadline; this
                 // stage neither subtracts a private budget nor starts a new one.
                 let outcome = if deadline <= std::time::Instant::now() {
-                    if let Err(error) = me.computer.record_missed_exchange(peer, revision, false) {
-                        guard.done(Err(format!(
-                            "the missed exchange could not be recorded durably: {error}"
-                        )));
-                        return;
+                    if causal {
+                        let _recording = lock(&me.recording);
+                        if lock(&me.inflight)
+                            .get(&peer)
+                            .is_some_and(|flight| flight.serial == serial && flight.superseded)
+                        {
+                            return;
+                        }
+                        if let Err(error) =
+                            me.computer
+                                .record_missed_exchange(peer, attempt_revision, false)
+                        {
+                            drop(_recording);
+                            guard.done(Err(format!(
+                                "the missed exchange could not be recorded durably: {error}"
+                            )));
+                            return;
+                        }
                     }
                     // The product already missed the causal contract, but repair must continue.
                     // A local operational bound prevents the transport from being held forever;
@@ -2704,13 +2951,13 @@ impl Management {
                         peer,
                         endpoints,
                         url,
-                        revision,
+                        attempt_revision,
                         std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN,
                     )
                     .await
                     .map_err(|e| e.to_string())
                 } else {
-                    let exchange = me.sync_peer(peer, endpoints, url, revision, deadline);
+                    let exchange = me.sync_peer(peer, endpoints, url, attempt_revision, deadline);
                     tokio::pin!(exchange);
                     tokio::select! {
                         // Poll the exchange first at the boundary. This starts the real dial;
@@ -2719,12 +2966,11 @@ impl Management {
                         biased;
                         result = &mut exchange => result.map_err(|e| e.to_string()),
                         () = tokio::time::sleep_until(deadline.into()) => {
-                            match me.computer.record_missed_exchange(peer, revision, false) {
-                                Ok(_) => Err("the exchange did not finish before its causal convergence deadline".into()),
-                                Err(error) => Err(format!(
-                                    "the missed exchange could not be recorded durably: {error}"
-                                )),
-                            }
+                            Err(if causal {
+                                "the exchange did not finish before its causal convergence deadline".into()
+                            } else {
+                                "the quiet fallback exchange did not finish before its operational return bound".into()
+                            })
                         },
                     }
                 };
@@ -2758,11 +3004,24 @@ impl Management {
         peer: Digest32,
         serial: u64,
         revision: u64,
+        policy_revision: u64,
         involved: bool,
+        causal: bool,
         deadline: std::time::Instant,
         mut outcome: std::result::Result<(u64, u64), String>,
+        covered_payload: Option<(u64, u64)>,
     ) {
         let _recording = lock(&self.recording);
+        // An inbound full exchange can cover and supersede this exact outbound snapshot while its
+        // task is finishing. It records the successful coverage under `recording`; the older
+        // outbound outcome must not recreate a miss afterward.
+        let (superseded, covered) = lock(&self.inflight)
+            .get(&peer)
+            .filter(|flight| flight.serial == serial)
+            .map_or((false, false), |flight| (flight.superseded, flight.covered));
+        if superseded || (covered && outcome.is_err()) {
+            return;
+        }
         if lock(&self.exchanged)
             .get(&peer)
             .is_some_and(|record| record.last_serial > serial)
@@ -2770,7 +3029,6 @@ impl Management {
             return;
         }
         let completed = std::time::Instant::now();
-        let policy_revision = self.computer.policy_revision();
         let (retained_miss, was_repaired) =
             lock(&self.exchanged)
                 .get(&peer)
@@ -2780,7 +3038,7 @@ impl Management {
                         record.repaired_late == Some(policy_revision),
                     )
                 });
-        let missed = retained_miss || completed >= deadline;
+        let missed = retained_miss || (causal && completed >= deadline);
         // Only the snapshot this flight actually sent can acknowledge a local obligation. The
         // merged revision may include a newer local cause which arose while this flight was away.
         let durable_revision = outcome.as_ref().map_or(revision, |(sent, merged)| {
@@ -2797,7 +3055,9 @@ impl Management {
             }
         });
         let mut missed_cause = None;
-        let durable = if missed {
+        let durable = if covered {
+            Ok(())
+        } else if missed {
             self.computer
                 .record_missed_exchange(peer, durable_revision, outcome.is_ok() || was_repaired)
                 .map(|cause| {
@@ -2813,6 +3073,14 @@ impl Management {
                 "the exchange result could not be recorded durably: {error}"
             ));
         }
+        // Authenticated traffic from this very sync can complete the reachability waiter and
+        // enqueue a retry while the exchange is still in flight. A successful payload has already
+        // discharged every such cause through both revisions it actually carried. Consume only a
+        // mark covered on both axes: `retry_peer_now` can otherwise combine an older journal
+        // revision with a policy revision which committed while this flight was away. Operator
+        // pairing has no coverage tuple because its reported pre-merge revision is not a sent
+        // ordinary-sync snapshot.
+        let covered_retry = outcome.as_ref().ok().and(covered_payload);
         let mut exchanged = lock(&self.exchanged);
         let record = exchanged.entry(peer).or_default();
         record.last_serial = serial;
@@ -2827,18 +3095,19 @@ impl Management {
                 record.count = record.count.saturating_add(1);
                 if missed {
                     let missed_revision = missed_cause.unwrap_or(policy_revision);
-                    record.failures = record.failures.saturating_add(1).max(1);
-                    record.deadline =
-                        Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
-                    record.problem = Some(
-                        "the exchange repaired state only after its causal convergence deadline"
-                            .into(),
-                    );
+                    // The original cause remains durably late, but this exchange succeeded now.
+                    // Current consecutive failures and their backoff are operational state, not
+                    // historical verdicts: clear them and resume the ordinary quiet fallback.
+                    record.failures = 0;
+                    record.deadline = None;
+                    record.deadline_policy_revision = None;
+                    record.problem = None;
                     record.repaired_late = Some(missed_revision);
                     record.missed_revision = Some(missed_revision);
                 } else {
                     record.failures = 0;
                     record.deadline = None;
+                    record.deadline_policy_revision = None;
                     record.problem = None;
                     record.missed_revision = None;
                     record.repaired_late = None;
@@ -2851,7 +3120,13 @@ impl Management {
             }
             Err(text) => {
                 record.failures = record.failures.saturating_add(1);
-                record.deadline = Some(record.deadline.map_or(deadline, |held| held.min(deadline)));
+                record.deadline = Some(
+                    record
+                        .deadline
+                        .filter(|_| record.deadline_policy_revision == Some(policy_revision))
+                        .map_or(deadline, |held| held.min(deadline)),
+                );
+                record.deadline_policy_revision = Some(policy_revision);
                 record.problem = Some(if was_repaired {
                     "the exchange repaired state only after its causal convergence deadline".into()
                 } else if missed {
@@ -2875,6 +3150,14 @@ impl Management {
             .filter(|r| r.failures > 0)
             .find_map(|r| r.problem.clone());
         drop(exchanged);
+        if let Some((covered_revision, covered_policy_revision)) = covered_retry {
+            let mut ready = lock(&self.retry_ready);
+            if ready.get(&peer).is_some_and(|mark| {
+                mark.revision <= covered_revision && mark.policy_revision <= covered_policy_revision
+            }) {
+                ready.remove(&peer);
+            }
+        }
         if failed {
             self.arm_reachability_waiter(peer);
         } else if let Some((_, waiter)) = lock(&self.reachability_waiters).remove(&peer) {
@@ -2953,7 +3236,7 @@ impl Management {
         url: Option<Zeroizing<String>>,
         _revision: u64,
         deadline: std::time::Instant,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64, u64)> {
         #[cfg(feature = "test-knobs")]
         self.hold_first_computer_exchange_for_proof(_revision, deadline)
             .await;
@@ -2963,9 +3246,9 @@ impl Management {
         self.serve(Arc::clone(&conn));
         #[cfg(feature = "test-knobs")]
         self.stage_stopped_reader_for_proof(&conn, deadline).await?;
-        let (payload, sent) = {
+        let (payload, sent, sent_policy) = {
             let s = lock(&self.computer.state);
-            (exchange(&s, &peer)?, s.revision)
+            (exchange(&s, &peer)?, s.revision, s.policy_revision)
         };
         let (mut send, mut recv) = streams::open_typed(&conn, StreamKind::Computer).await?;
         let remaining_ms = wire_budget(deadline);
@@ -2988,7 +3271,7 @@ impl Management {
             Ok(s.revision)
         })?;
         let _ = send.finish();
-        Ok((sent, merged))
+        Ok((sent, sent_policy, merged))
     }
 
     /// Have this real shipped daemon act as the stopped reader. The peer sees ordinary
@@ -3423,18 +3706,102 @@ impl Management {
 
     /// Record an exchange `peer` started and this node answered, now: what a person reads as
     /// the last exchange answered, with this daemon's revision after the merge (what it sent).
-    fn record_answered(&self, peer: Digest32, revision: u64) -> Result<()> {
+    fn record_answered(
+        &self,
+        peer: Digest32,
+        revision: u64,
+        policy_revision: u64,
+        involved: bool,
+    ) -> Result<()> {
+        let _recording = lock(&self.recording);
+        let completed = std::time::Instant::now();
+        {
+            let mut inflight = lock(&self.inflight);
+            if let Some(flight) = inflight.get_mut(&peer) {
+                // This reply sent a snapshot at least as new on both causal axes as the outbound
+                // flight. Cut causal work so it cannot recreate a cleared miss. Let a simultaneous
+                // quiet fallback finish, but mark it covered so only its success can be recorded.
+                if flight.origin == Origin::Retry
+                    && flight.revision <= revision
+                    && flight.policy_revision <= policy_revision
+                    && !flight.superseded
+                {
+                    if flight.causal {
+                        flight.superseded = true;
+                        if let Some(abort) = &flight.abort {
+                            abort.abort();
+                        }
+                    } else {
+                        flight.covered = true;
+                    }
+                }
+            }
+        }
+        let retained_miss = lock(&self.exchanged).get(&peer).is_some_and(|record| {
+            record.missed_revision == Some(policy_revision)
+                || (record.deadline_policy_revision == Some(policy_revision)
+                    && record
+                        .deadline
+                        .is_some_and(|deadline| completed >= deadline))
+        });
         // A policy merge records its obligation in the same transaction. Only a complete reply
         // proves the initiating peer received this state and can clear that durable obligation.
-        self.computer.record_timely_exchange(peer, revision)?;
+        // If this daemon's own causal clock already expired, retain that historical miss while
+        // recording the inbound full exchange as its eventual repair.
+        let missed_cause = if retained_miss {
+            Some(self.computer.record_missed_exchange(peer, revision, true)?)
+        } else {
+            self.computer.record_timely_exchange(peer, revision)?;
+            None
+        };
         let mut exchanged = lock(&self.exchanged);
-        exchanged.entry(peer).or_default().last_answered = Some(ExchangeRecord {
+        let record = exchanged.entry(peer).or_default();
+        record.last = Some(completed);
+        record.revision = revision;
+        record.involved = involved;
+        record.failures = 0;
+        record.deadline = None;
+        record.deadline_policy_revision = None;
+        record.problem = None;
+        record.missed_revision = missed_cause;
+        record.repaired_late = missed_cause;
+        record.last_answered = Some(ExchangeRecord {
             at_ms: now(),
             sent_revision: revision,
             merged_revision: revision,
         });
+        *lock(&self.problem) = exchanged
+            .values()
+            .filter(|record| record.failures > 0)
+            .find_map(|record| record.problem.clone());
+        drop(exchanged);
+        let mut ready = lock(&self.retry_ready);
+        if ready.get(&peer).is_some_and(|mark| {
+            mark.revision <= revision && mark.policy_revision <= policy_revision
+        }) {
+            ready.remove(&peer);
+        }
+        drop(ready);
+        if let Some((_, waiter)) = lock(&self.reachability_waiters).remove(&peer) {
+            waiter.abort();
+        }
         Ok(())
     }
+}
+fn pending_involves(s: &State, local: &Digest32, peer: &Digest32) -> bool {
+    s.pending
+        .as_ref()
+        .filter(|g| {
+            g.approvals.iter().any(Option::is_none)
+                || (g.group.is_none() && s.genesis.is_none())
+                || (g.group.is_some() && !enrolled(s, g))
+        })
+        .and_then(|g| {
+            side(g, local)
+                .ok()
+                .map(|i| g.computers[1 - i].fingerprint())
+        })
+        .is_some_and(|id| id.ok().as_ref() == Some(peer))
 }
 fn side(g: &Enrollment, id: &Digest32) -> Result<usize> {
     g.computers
@@ -3769,20 +4136,19 @@ fn merge(s: &mut State, bytes: &[u8], peer: Digest32, signer: &dyn RootSigner) -
     };
     d.finish()?;
     activate(s, signer)?;
-    if let Some((_sender_revision, repaired, sender_frontier)) = missed {
+    if let Some((_sender_revision, _repaired, sender_frontier)) = missed {
         // Revision numbers are local journal order. Only an identical canonical policy frontier
         // can translate the peer's marker onto this daemon's current local revision. A receiver
         // with independent newer policy therefore cannot have that policy poisoned by an older
         // remote miss.
         if sender_frontier == policy_frontier(s)? {
-            let local_revision = s.policy_revision;
-            let held = s
-                .missed_exchanges
-                .entry(peer)
-                .or_insert((local_revision, repaired));
-            if local_revision > held.0 || (local_revision == held.0 && repaired) {
-                *held = (local_revision, repaired);
-            }
+            // The complete authenticated exchange being merged now is the repair. The marker
+            // says only that the sender did not complete its original cause on time; making its
+            // pre-exchange `repaired` bit an authorization gate required a second exchange which
+            // the repaired sender deliberately suppresses, leaving this receiver revoked for
+            // good. Preserve lateness in the sender's durable status, and clear any expiry an
+            // earlier FX-28 development build persisted for this matching peer/frontier.
+            s.received_misses.remove(&peer);
         }
     }
     for (author, receipt) in receipts {

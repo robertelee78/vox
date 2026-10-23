@@ -104,10 +104,10 @@ impl Router {
     /// own, bounded by the causal event's absolute deadline; each records the application receipt when it is
     /// done. The pass itself waits for none of them, so a revision arriving meanwhile starts its
     /// own pass at once and a stuck node holds nothing but itself. A node at the current
-    /// revision is not asked; one that fails or does not answer is said in the status and
-    /// detached (a failed write must not leave stale grants on the network). The slot moves to
-    /// `Detaching` synchronously before cleanup starts, so queued actor work cannot hide a stale
-    /// attached node past the public five-second contract.
+    /// revision is not asked; one that fails or does not answer is said in the status and remains
+    /// attached but non-authoritative. `Computer::policy_current` and the synchronously invalidated
+    /// reacher gates fail its old projection closed. Keeping the actor is essential: a later valid
+    /// policy event must be able to reconcile it without an unlock or daemon restart.
     async fn reconcile_computer_trust(&self, change: vox_core::node::computer::ComputerChange) {
         let management = Arc::clone(&self.inner.defaults.computer);
         let revision = change.revision();
@@ -196,7 +196,7 @@ impl Router {
                         eprintln!(
                             "vox daemon: node {name} computer trust reconciliation at revision {revision} failed: {why}"
                         );
-                        if router.detach_failed_computer_node(name.clone(), generation, revision) {
+                        if router.computer_reconciliation_current(&name, generation, revision) {
                             management.node_pending(name.as_str(), &why);
                         }
                     }
@@ -205,8 +205,6 @@ impl Router {
         }
     }
 
-    /// Make a failed node non-attached in the same synchronous critical section that decides it,
-    /// then leave its potentially slow actor cleanup to an independent task.
     fn computer_reconciliation_current(
         &self,
         node: &NodeName,
@@ -219,32 +217,6 @@ impl Router {
                     && attached.computer_reconciliation == Some(revision)
             }
             _ => false,
-        }
-    }
-
-    fn detach_failed_computer_node(&self, node: NodeName, generation: u64, revision: u64) -> bool {
-        let going = {
-            let mut slots = lock(&self.inner.slots);
-            match slots.get(&node) {
-                Some(Slot::Attached(attached))
-                    if attached.generation == generation
-                        && attached.computer_reconciliation == Some(revision) =>
-                {
-                    begin_detach(&mut slots, &node)
-                }
-                _ => None,
-            }
-        };
-        if let Some((attached, done)) = going {
-            let router = self.clone();
-            self.inner.rt.spawn(async move {
-                let _ = router
-                    .finish_detach(node, attached, done, DetachCause::Requested)
-                    .await;
-            });
-            true
-        } else {
-            false
         }
     }
 

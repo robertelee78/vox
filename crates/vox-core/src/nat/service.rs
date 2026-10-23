@@ -223,6 +223,10 @@ pub enum RejectReason {
     /// (V030-14, #520). Its own code, so a refused replay of a departed member's admission says
     /// why.
     Withdrawn = 7,
+    /// The signed publication time is outside the board's accepted clock window. Distinct from
+    /// generic policy so a publisher does not proceed as though the record landed and later blame
+    /// the responder's authentication when the board never authorized it.
+    Clock = 8,
 }
 
 impl RejectReason {
@@ -235,6 +239,7 @@ impl RejectReason {
             5 => Some(Self::UnknownKind),
             6 => Some(Self::Stale),
             7 => Some(Self::Withdrawn),
+            8 => Some(Self::Clock),
             _ => None,
         }
     }
@@ -251,6 +256,7 @@ impl RejectReason {
             Self::UnknownKind => "rejected: unknown record kind",
             Self::Stale => "rejected: the board holds a newer record from that author",
             Self::Withdrawn => "rejected: withdrawn, its author left the room",
+            Self::Clock => "rejected: timestamp is outside the board's accepted clock window",
         }
     }
 
@@ -261,6 +267,9 @@ impl RejectReason {
             Error::RendezvousRejected(s) if s.ends_with("at capacity") => Self::Capacity,
             Error::RendezvousRejected(s) if s.starts_with("non-increasing") => Self::Stale,
             Error::RendezvousRejected("withdrawn") => Self::Withdrawn,
+            Error::RendezvousRejected(
+                "timestamp too far in the future" | "record already expired",
+            ) => Self::Clock,
             Error::RendezvousRejected(_) => Self::Policy,
             _ => Self::Malformed,
         }

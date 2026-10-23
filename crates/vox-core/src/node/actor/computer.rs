@@ -93,11 +93,15 @@ const TEST_HOLD_TEXT_APPEND_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_TEXT_APPEND_P
 #[cfg(feature = "test-knobs")]
 const TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV: &str = "VOX_TEST_HOLD_ROOM_CREATE_PUBLICATION";
 #[cfg(feature = "test-knobs")]
+const TEST_HOLD_ROOM_JOIN_AFTER_BOARD_ENV: &str = "VOX_TEST_HOLD_ROOM_JOIN_AFTER_BOARD";
+#[cfg(feature = "test-knobs")]
 const TEST_HOLD_REKEY_ENQUEUE_ENV: &str = "VOX_TEST_HOLD_REKEY_ENQUEUE";
 #[cfg(feature = "test-knobs")]
 const TEST_END_KEY_UNANSWERED_ENV: &str = "VOX_TEST_FX28_END_KEY_UNANSWERED_FILE";
 #[cfg(feature = "test-knobs")]
 const TEST_MARK_ENDED_UNANSWERED_ENV: &str = "VOX_TEST_FX28_MARK_ENDED_UNANSWERED_FILE";
+#[cfg(feature = "test-knobs")]
+const TEST_MARK_DELIVERY_DRAINED_ENV: &str = "VOX_TEST_FX28_MARK_DELIVERY_DRAINED_FILE";
 
 #[cfg(feature = "test-knobs")]
 impl Node {
@@ -143,12 +147,72 @@ impl Node {
         .is_ok()
     }
 
-    /// Test apparatus: mark when the sender has admitted the exact authenticated peer's
+    /// Test apparatus: arm a marker after the sender has admitted the exact authenticated peer's
     /// `ENDED_UNANSWERED` result. `<node>\t<arm>\t<marker>`; `arm` contains that peer and room,
-    /// separated by a tab. A command submitted after the marker is necessarily handled after
-    /// route selection on this actor.
-    pub(super) fn mark_ended_unanswered_for_proof(&self, room: Digest32, peer: Digest32) {
+    /// separated by a tab. The exact pair's automatic re-key is paused at that causal boundary;
+    /// the marker is emitted after the actor publishes the changed user view. A later exact
+    /// post-side apparatus release drives the owed key into the ordinary durable-authority fence.
+    pub(super) fn mark_ended_unanswered_for_proof(&mut self, room: Digest32, peer: Digest32) {
         let Ok(spec) = std::env::var(TEST_MARK_ENDED_UNANSWERED_ENV) else {
+            return;
+        };
+        let mut fields = spec.splitn(3, '\t');
+        let (Some(node), Some(arm), Some(marker)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return;
+        };
+        let mine = self
+            .paths
+            .profile_dir
+            .file_name()
+            .and_then(|name| name.to_str());
+        let peer_id = peer;
+        let room_id = room;
+        let peer = crate::node::link::b32_encode(&peer);
+        let room = crate::node::link::b32_encode(&room);
+        let expected = format!("{peer}\t{room}");
+        if mine != Some(node)
+            || std::fs::read_to_string(arm).ok().as_deref().map(str::trim)
+                != Some(expected.as_str())
+            || std::fs::remove_file(arm).is_err()
+        {
+            return;
+        }
+        self.fx28_rekey_pause = Some((room_id, peer_id));
+        self.fx28_ended_unanswered_marker = Some((
+            std::path::PathBuf::from(marker),
+            format!("{node}\t{peer}\t{room}\n").into_bytes(),
+        ));
+    }
+
+    /// Test apparatus: the exact baseline key was durably recorded and no key/history batch for
+    /// this pair remains in flight. `<node>\t<arm>\t<marker>`; the arm contains `peer\troom`.
+    /// This is a staging precondition only, never a product verdict.
+    pub(super) fn mark_delivery_drained_for_proof(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        history: bool,
+        whole_history: bool,
+        durably_recorded: bool,
+    ) {
+        let pair = (room, peer);
+        if !durably_recorded
+            || (history && !whole_history)
+            || self.keys_in_flight.contains_key(&pair)
+            || self.history_in_flight.contains_key(&pair)
+            || self
+                .deliveries
+                .keys()
+                .any(|(held_room, held_peer, _)| (*held_room, *held_peer) == pair)
+            || self
+                .delivery_reserved
+                .keys()
+                .any(|(held_room, held_peer, _)| (*held_room, *held_peer) == pair)
+        {
+            return;
+        }
+        let Ok(spec) = std::env::var(TEST_MARK_DELIVERY_DRAINED_ENV) else {
             return;
         };
         let mut fields = spec.splitn(3, '\t');
@@ -308,6 +372,17 @@ impl Node {
         self.hold_authority_use_for_proof(
             TEST_HOLD_ROOM_CREATE_PUBLICATION_ENV,
             "room create publication",
+        )
+        .await;
+    }
+
+    /// Test apparatus: hold a completed join after its records were queued to the answering
+    /// member's real board and immediately before the final durable-policy fence. The marker
+    /// stages only; shipped join/list output and the remote board judge the result.
+    pub(super) async fn hold_room_join_after_board_for_proof(&self) {
+        self.hold_authority_use_for_proof(
+            TEST_HOLD_ROOM_JOIN_AFTER_BOARD_ENV,
+            "room join after board publication",
         )
         .await;
     }

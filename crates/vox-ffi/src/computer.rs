@@ -77,6 +77,8 @@ pub struct ComputerApplication {
     pub exchanges: u64,
     /// Started exchanges since this daemon started, including failures.
     pub exchange_attempts: u64,
+    /// Whether this daemon currently has an exchange reserved toward this member.
+    pub exchange_in_flight: bool,
     /// Consecutive exchanges which did not satisfy their causal contract.
     pub exchange_failures: u32,
     /// Exact policy revision whose convergence deadline was missed.
@@ -98,6 +100,7 @@ impl From<core::ComputerApplication> for ComputerApplication {
             last_exchange_ms: v.last_exchange_ms,
             exchanges: v.exchanges,
             exchange_attempts: v.exchange_attempts,
+            exchange_in_flight: v.exchange_in_flight,
             exchange_failures: v.exchange_failures,
             missed_revision: v.missed_revision,
             repaired_late: v.repaired_late,
