@@ -464,6 +464,15 @@ const MARKS_VERSION: u64 = 2;
 /// A trust mark: the decision's stamp, and where this identity's sender key stood at it.
 type TrustMark = (Stamp, u64, u64);
 
+/// One trust-mark segment prepared without changing the room's live projection. The caller writes
+/// the sealed segment first, then installs the corresponding in-memory mark with
+/// [`ChannelState::install_trust_mark`].
+pub struct PreparedTrustMark {
+    target: Digest32,
+    position: TrustMark,
+    sealed: SealedSegment,
+}
+
 /// How long a superseded generation of this identity's sender key is kept for a trusted
 /// identity that has not joined, in a room kept forever (PRD-001 R14): 30 days. A room with a
 /// retention keeps it for that instead ([`ChannelState::unjoined_hold_secs`]).
@@ -3266,6 +3275,117 @@ impl ChannelState {
         self.admit_within(store, key, now, max_authors())
     }
 
+    /// Admit a joiner this node just authenticated and retain its witnessed admission in the
+    /// same transaction. The caller verifies the witness and the live join authority first.
+    /// A successful join must remain discoverable after this responder restarts while the
+    /// joiner is offline; neither author membership nor its notice may be committed alone.
+    /// Re-admitting the same key still succeeds at the room cap and returns `false`.
+    pub(crate) fn admit_author_with_notice(
+        &mut self,
+        store: &Store,
+        notice: &crate::nat::notice::AdmissionNotice,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        if self.is_poisoned() {
+            return Err(self.save_failure());
+        }
+        let fingerprint = notice.key.fingerprint();
+        if notice.channel_id() != self.channel_id
+            || notice.witness.epoch != self.epoch
+            || notice.joiner() != fingerprint
+        {
+            return Err(Error::MalformedGovernance(
+                "admission notice does not name this room, epoch and joiner",
+            ));
+        }
+        let added = match self.authors.get(&fingerprint) {
+            Some(existing) if existing.to_bytes() == notice.key.to_bytes() => false,
+            Some(_) => {
+                return Err(Error::MalformedGovernance(
+                    "another key is already admitted for this fingerprint",
+                ));
+            }
+            None if self.authors.len() >= max_authors() => {
+                return Err(Error::RoomFull {
+                    members: self.authors.len() as u64,
+                });
+            }
+            None => true,
+        };
+        let at = notice.witness.timestamp_ms;
+        if self.withdrawn_since(&fingerprint, at) {
+            return Err(Error::MalformedGovernance(
+                "admission withdrawn: the member left the room",
+            ));
+        }
+        let keep = self
+            .board_kept
+            .notices
+            .get(&fingerprint)
+            .is_none_or(|(held, _)| *held < at);
+        if !self.board_kept.notices.contains_key(&fingerprint)
+            && self.board_kept.notices.len() >= AUTHORS_HARD_LIMIT
+        {
+            return Err(Error::SizeLimitExceeded("kept notices"));
+        }
+        if !added && !keep {
+            self.now_hint = self.now_hint.max(now.get());
+            return Ok(false);
+        }
+
+        let mut authors = self.authors.clone();
+        authors.insert(fingerprint, notice.key.clone());
+        let mut board_kept = self.board_kept.clone();
+        if keep {
+            board_kept
+                .notices
+                .insert(fingerprint, (at, notice.to_wire()));
+        }
+        let authors_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_AUTHORS,
+            &authors_bytes(&authors),
+        )?;
+        let board_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_BOARD_KEPT,
+            &board_kept_bytes(&board_kept),
+        )?;
+        let committed = (|| {
+            let mut batch = store.batch()?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_AUTHORS,
+                &authors_seg,
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_BOARD_KEPT,
+                &board_seg,
+            )?;
+            batch.commit()
+        })();
+        if let Err(error) = committed {
+            self.poisoned = true;
+            self.save_error = Some(error.to_string());
+            return Err(error);
+        }
+        self.authors = authors;
+        self.board_kept = board_kept;
+        self.now_hint = self.now_hint.max(now.get());
+        if added {
+            self.admission
+                .admit(self.channel_id, self.epoch, fingerprint);
+            self.owe_private_support();
+            self.governance_ready = false;
+        }
+        Ok(added)
+    }
+
     /// [`ChannelState::admit_author`], refused at `limit` authors. Keep the room's
     /// maintenance time in milliseconds, including after an admission (#562).
     fn admit_within(
@@ -4740,38 +4860,41 @@ impl ChannelState {
     pub fn mark_trust(&mut self, store: &Store, target: Digest32, decision: Stamp) -> Result<()> {
         match self.mark_trust_sealed(target, decision)? {
             None => Ok(()),
-            Some(seg) => {
+            Some(prepared) => {
                 if let Err(e) = store.put_segment(
                     &self.channel_id,
                     SegmentKind::KeyMaterial,
                     SEG_TRUST_MARKS,
-                    &seg,
+                    &prepared.sealed,
                 ) {
                     self.poisoned = true;
                     self.save_error = Some(e.to_string());
                     return Err(e);
                 }
+                self.install_trust_mark(prepared);
                 Ok(())
             }
         }
     }
 
-    /// [`Self::mark_trust`] without writing: the marks, sealed under this room's SEK, for the
-    /// caller to write with every other room's in **one** commit ([`Self::queue_marks`]), or
-    /// `None` when this room already holds the mark.
+    /// [`Self::mark_trust`] without writing or changing this room's live marks: the next marks,
+    /// sealed under this room's SEK, for the caller to write with every other room's in **one**
+    /// commit ([`Self::queue_marks`]), or `None` when this room already holds the mark. The caller
+    /// installs the prepared mark only after that commit succeeds.
     ///
     /// A trust decision marks every open room, and one commit per room made `vox trust add` cost
-    /// a durable commit for each: about 7 s on the node's actor at 1,600 rooms (#189). If the
-    /// caller's commit fails, it must [`Self::poison`] each room it sealed for, as a failed
-    /// write here always has.
+    /// a durable commit for each: about 7 s on the node's actor at 1,600 rooms (#189). A caller
+    /// whose real storage commit fails must [`Self::poison`] each room it sealed for, as a failed
+    /// write here always has. Refusal by an external policy fence writes nothing and is not room
+    /// corruption.
     ///
     /// # Errors
     /// The room holds [`AUTHORS_HARD_LIMIT`] marks already, or the marks cannot be sealed.
     pub fn mark_trust_sealed(
-        &mut self,
+        &self,
         target: Digest32,
         decision: Stamp,
-    ) -> Result<Option<SealedSegment>> {
+    ) -> Result<Option<PreparedTrustMark>> {
         if self
             .trust_marks
             .get(&target)
@@ -4787,9 +4910,22 @@ impl ChannelState {
             self.sender.chain_id(),
             self.sender.current_position().0,
         );
-        self.trust_marks.insert(target, position);
-        let bytes = marks_bytes(&self.trust_marks);
-        seal_segment(&self.sek, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, &bytes).map(Some)
+        let mut next = self.trust_marks.clone();
+        next.insert(target, position);
+        let bytes = marks_bytes(&next);
+        let sealed = seal_segment(&self.sek, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, &bytes)?;
+        Ok(Some(PreparedTrustMark {
+            target,
+            position,
+            sealed,
+        }))
+    }
+
+    /// Install exactly the mark whose sealed segment committed successfully. No other task writes
+    /// trust marks: the node actor serializes their preparation and installation, while room work
+    /// may hold the room lock without changing this projection.
+    pub fn install_trust_mark(&mut self, prepared: PreparedTrustMark) {
+        self.trust_marks.insert(prepared.target, prepared.position);
     }
 
     /// Queue `channel_id`'s sealed marks ([`Self::mark_trust_sealed`]) into `batch`.
@@ -4799,9 +4935,14 @@ impl ChannelState {
     pub fn queue_marks(
         batch: &mut crate::node::store::Batch<'_>,
         channel_id: &Digest32,
-        seg: &SealedSegment,
+        prepared: &PreparedTrustMark,
     ) -> Result<()> {
-        batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_TRUST_MARKS, seg)
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_TRUST_MARKS,
+            &prepared.sealed,
+        )
     }
 
     /// Mark this room poisoned after a real storage or consistency failure.
@@ -9526,6 +9667,24 @@ impl ChannelState {
         }
         if !self.is_member(member) {
             return Err(Error::Profile("that identity is not a member of the room"));
+        }
+        if self.is_admin(profile.store(), member, now)? {
+            return Err(Error::Profile("that identity is already a room admin"));
+        }
+        let mut after = None;
+        let mut admins = 0_usize;
+        loop {
+            let page = self.admin_page(profile.store(), after, 64, now)?;
+            admins = admins.saturating_add(page.targets.len());
+            if admins >= crate::nat::withdraw::MAX_ROSTER {
+                return Err(Error::Profile(
+                    "this room already has its maximum 512 admins",
+                ));
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
         }
         let key = self
             .authors

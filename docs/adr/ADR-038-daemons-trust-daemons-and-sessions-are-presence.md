@@ -1,14 +1,20 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
 - **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
-  at a time, quoted below) are the requirements; nothing here is built. Each requirement lands
-  with its proof (ADR-018) in a small release (FX-19).
+  at a time, quoted below) are the accepted product requirements; undecided presentation details
+  remain proposed. Execution, acceptance and delivery are recorded on the source-bound GitHub
+  issues, separately from decision status. Each requirement MUST land with its proof (ADR-018)
+  in a small release (FX-19).
 - **Date**: 2026-10-19; amended 2026-10-20 (FX-22–FX-27, the daemon's CPU); amended
   2026-10-20 (FX-28–FX-34: the idle daemon's disk and CPU, measured on v0.4.9, the own-feed
   recovery ruling of 2026-10-19, a retention change that poisoned a room, and a node on Linux
   that could not be unlocked); amended 2026-10-21 (FX-35: a daemon whose parked flows held
   the flow-state pool synced nothing); amended 2026-10-21 (FX-37: room creation overflowed a
-  normal Tokio worker stack while reconstructing an ML-DSA root key for one signature)
+  normal Tokio worker stack while reconstructing an ML-DSA root key for one signature); amended
+  2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict);
+  amended 2026-10-23 (FX-28: atomic node application, durable room-admission rollback, fresh
+  pairing requests, observation deadlines that do not discard valid work, and the rendezvous
+  registration handoff)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -256,11 +262,24 @@ The decider then answered twelve questions, one at a time. His answers are the d
   it was made, whatever the other daemon does; on the other daemon within 5 s of the exchange
   the changing daemon starts for it (#989) completing, and, when that exchange does not
   complete (the peer unreachable, the stream cut), within 60 s, the fallback exchange's
-  period, after the peer becomes reachable again. Two daemons on which nothing changed
-  MUST spend nothing on it:
-  over an idle minute their CPU grows by no more than FX-15's quiet-room bound. "We need the
-  detection of change logic to be sound. Easy for local daemon to notice, but daemon to daemon
-  update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
+  period, after the peer becomes reachable again. Two daemons on which nothing changed MUST
+  start no pairing exchange except FX-15's named fallback and MUST derive no node binding again.
+  A node actor which has not applied the revision at the local observation boundary remains
+  attached but non-authoritative: status names it pending and its prior projection fails every
+  current-policy fence. The accepted application retains ownership and continues when its queue,
+  room lock or storage can progress. Crossing the observation boundary records lateness; it is
+  not an authorization lease and MUST NOT discard still-current work or its unlocked credential.
+  Only an actual policy/expiry change, detach, lock or shutdown supersedes that work. Completion
+  clears the exact owned pending result while preserving the historical miss. A later unrelated
+  policy action, restart or manual retry MUST NOT be required to recover. Startup follows the
+  same distinction: it derives and applies the actual current binding before Ready, repeating
+  only for actual policy supersession within the same accepted startup operation. The shipped
+  journey holds an accepted actor past its observation boundary, observes the miss and fail-closed
+  state, then releases that event and requires usable current authority without another policy
+  action. A late completion never rewrites the original miss as on-time.
+  These are the shipped, user-visible work records; a machine-dependent CPU threshold is not a
+  verdict. "We need the detection of change logic to be sound. Easy for local daemon to notice,
+  but daemon to daemon update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
   once per revision of the computer policy and on no timer; a change made on the other daemon
   arrives in the pairing exchange that daemon starts, and a merged exchange that moves this
   daemon's revision is a change here, so detection on either side is the exchange itself.
@@ -274,6 +293,195 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `record_application()`, which derives again; a further 6–8% was the app's polling re-deriving
   the same state per control answer (`individual_trust_eligibility` → `Computer::capability` →
   `Binding::verify`). Four nodes, nothing changed.
+  Deadline contract and RCA, 2026-10-21: an early FX-28 repair converted its local monotonic
+  deadline to Unix milliseconds and the answering daemon subtracted its own Unix clock. Those
+  clocks need not agree: a receiver ahead could expire valid work immediately, while one behind
+  could extend it. A causal deadline is therefore never transported as an absolute time. The
+  initiating daemon owns and enforces its original monotonic `Instant` through dial, exchange and
+  local reconciliation. Its hello carries only the duration budget remaining when the hello is
+  sent. Immediately when the complete authenticated hello is received—before echoing it or reading
+  its payload—the answerer caps that duration to the operation's public contract and applies it to
+  its own monotonic clock. The complete length-prefixed frame (length and body together) uses that
+  one absolute end; neither half renews the remainder. A state transaction checks it before
+  executing, then stages and flushes its replacement file, checks again at the atomic rename
+  boundary, and publishes the in-memory state only after that commit. There is no second outer timeout: it would truncate the ten-minute
+  pairing contract or mint a fresh ordinary-exchange clock. This bounds remote transaction and
+  reconciliation work without claiming to reconstruct the initiator's instant. Network transit
+  continues to consume the initiator's original deadline. If repair begins only after that
+  retained deadline, the initiator durably records the miss before attempting repair. That record
+  is historical truth about the original cause, not authority over the receiving daemon: the
+  complete authenticated exchange being merged is itself the repair and the receiver applies its
+  signed policy under the causal boundary of that exchange. On return the initiator records
+  `repaired-late`; restart and a same-state failed preview preserve both the miss and repair. No
+  second exchange is required merely to tell the receiver that the first restored exchange was
+  successful. A later operator policy change replaces the old cause in current convergence status,
+  but neither it nor a repair rewrites the original miss as on-time. Decision, 2026-10-23 (the
+  decider): a new explicit pairing request owns its admission boundary; it MUST NOT inherit an
+  older background exchange's elapsed deadline. The old cause keeps its miss and unfinished
+  obligations while the new request checks the code under the existing verification and approval
+  rules. A preview does not acknowledge background delivery. Reserving the peer for that request
+  does not suppress observation of an older background miss or manufacture another sync attempt.
+  Rendezvous RCA, 2026-10-23: the invitation was saved and returned before its background
+  `ComputerRegister` reached the anchor. Redeeming that otherwise-valid code could therefore
+  report a store-policy refusal before any code verification. Missing publication is an
+  availability handoff: the one authenticated redemption waits for that exact owner/registration
+  to appear, with its event registered before the absence check. Registry transitions and their
+  notifications share one serialized order. Actual owner, token, expiry and serving-policy
+  refusals remain terminal; a direct connection independently races this path. The waiting
+  service task retains no history-flow charge or management permit needed by registration, and
+  cancellation of the caller's stream retires its scoped waiter. Known revocation of an existing
+  registration is retained through that registration's recorded expiry; no expiry is invented
+  for an unknown record or after an anchor restart. Active and unexpired revoked records share
+  the anchor's existing global, owner and source retention budgets, so recent withdrawals can
+  produce an ordinary capacity refusal without evicting live evidence. Transport connection,
+  registration, redemption and response reading spend the caller's one original boundary;
+  private 15 s and 30 s wrappers cannot truncate a valid pairing wait. The shipped anchor journey
+  holds the exact inviter registration, observes the redeem request reach that missing record,
+  releases publication and requires the same command to authenticate the code. Reintroducing
+  the former immediate policy rejection makes that user command fail on its own assertion.
+  Local application ownership is separate from the transport exchange's bounded attempt. The
+  daemon-to-node event names the exact policy revision and expiry plus its attachment/pass owner.
+  Its retained observation deadline classifies on-time versus late; true supersession cancels
+  obsolete work. Every durable actor stage and the final writer fence validate that exact current
+  policy. The owner keeps awaiting the same accepted event after reporting lateness, with no fresh
+  clock, timer-driven reconciliation or retry-count cap. The shipped journey causally holds one
+  actor, proves its healthy sibling applies while the held actor stays Ready without claiming
+  the new grant, and then releases that exact message. Its automatic completion clears pending
+  while the latest local miss per node remains durably visible across restart. The shipped journey
+  also restarts one daemon with its Unix clock one hour ahead and then proves changes in both
+  directions from a causal observation on the proof process's monotonic clock, never by comparing
+  either daemon's Unix timestamp. After those clock-independence and quiet-boundary claims, its
+  first fresh-room join also proves the skewed publisher stops at the board's named `Clock`
+  refusal rather than proceeding without a pre-join record and blaming authentication. The daemon
+  is then restarted without the test-only clock step before the independent stale-rekey claim;
+  rendezvous's five-minute future-date security bound is deliberately not a Computer deadline.
+  A recovery proof evaluates no PRODUCT
+  timing verdict until it has causal apparatus evidence of reachability (the restored anchor's
+  latest event-driven view names both exact management fingerprints, or a round trip has completed
+  through the exact userspace forward); failure to establish or retain that precondition is
+  APPARATUS/NO RESULT, never a PRODUCT retry verdict. The retained local deadline still measures
+  the real restoration event. Absence of idle derivation is compared across the next dated,
+  completed fallback exchange named by the same shipped status snapshot as the binding evidence,
+  not an arbitrary quiet window: the unchanged revision is a structural cause boundary and every
+  binding's durable derivation record must remain identical across it. A complete ordinary
+  exchange is bidirectional: the starter sends its snapshot and the answer returns the peer's
+  snapshot, so that one completion paces both daemons' fallback clocks. The quiet proof therefore
+  requires one such pair exchange, not one independently originated exchange per daemon. It admits
+  a second attempt only when both named fallback instants were already overlapping. Every recorded
+  completion must advance the opposite daemon's `last_answered_exchange`; an overlapped attempt
+  without its own completion is covered only when that same daemon answered the successful peer
+  round and retained no failure. CLI JSON, plain CLI, the app
+  FFI and the native Computer Trust screen expose the exact missed revision, whether it repaired
+  late, and whether it is expired, replaced, pending or converged, alongside policy revision,
+  per-peer exchange records/counters and per-node binding revision/derivation moment. Neither
+  client has to infer currentness from elapsed time or free-text failure wording.
+  Each per-peer application also names `exchange_in_flight`, true for the whole reservation from
+  selection through completion. Attempts say that work started and exchanges that it completed;
+  this bit closes the otherwise invisible interval between them, so a person can distinguish a
+  tail still applying receipts from an idle daemon or a wedged attempt. The quiet-boundary proof
+  takes this bit, both counters and binding/currentness from one shipped-status snapshot per
+  daemon. It begins the unchanged-state claim only at `false`; failure to become false while the
+  same policy remains current and confirmed is PRODUCT (either another pre-fallback attempt or one
+  attempt exceeding its existing return contract), not an apparatus sleep and not a renewed
+  timeout.
+  Crash and late-marker amendment, 2026-10-21: the transaction which commits an effective
+  operator-policy change also durably records every exact peer and that policy revision as
+  unresolved; this ordering leaves no crash window between publishing the cause and owning its
+  consequence. A later exchange may carry transport/journal records too, but it retains that
+  operator-policy cause rather than replacing it with the later journal number. Only the
+  complete exchange returning within its boundary durably clears that obligation; a crash after
+  merge but before that acknowledgement therefore fails closed rather than inventing success.
+  Deadline expiry promotes it to missed before any late repair proceeds; after a process crash, an
+  unresolved obligation is likewise recovered as missed, because restart has no evidence that
+  it completed within the lost monotonic interval and MUST NOT create a replacement clock. A
+  newer operator revision owns its own already-created causal deadline; an older unresolved or
+  missed revision is historical `replaced` evidence and cannot shorten that new clock.
+
+  Revision numbers remain local and are never translated by ordinal position. The durable state
+  separately names the journal revision of its last effective operator-policy change: endpoint
+  and reachability records may advance the journal but cannot replace an operator-policy cause. A wire miss marker
+  therefore carries a digest of the exact canonical policy frontier (genesis, pending enrollment
+  and signed policy history; not reachability records, receipts, convergence observations or local revision numbers). The
+  receiver correlates it with that frontier only after merge. A marker for an older frontier cannot
+  affect unrelated newer local policy, and a matching marker cannot revoke the policy carried by
+  the authenticated exchange that delivered it. The earlier design did exactly that: the receiver
+  merged the policy, classified it expired from the sender's pre-repair marker, and removed every
+  managed grant; the sender marked the exchange repaired only after sending and then correctly
+  suppressed unchanged work, so the receiver could never learn the bit that would unexpire it.
+  Missed and repaired-late remain durable, user-visible convergence evidence on the initiating
+  daemon. A successful repair clears current consecutive failures and their backoff, and resumes
+  the ordinary named fallback; historical lateness must not disable future liveness work. The
+  authenticated traffic of that same repair can also finish its retained reachability waiter while
+  the exchange is in flight. Success consumes that queued wake only when the sent snapshot covers
+  both its journal and operator-policy revisions. This prevents the repair from scheduling a
+  redundant full exchange while preserving a policy or journal cause committed during the flight;
+  wall-clock quietness is neither the state machine nor the evidence of coverage. Every retained
+  failure deadline names the operator-policy revision which owns it. A reachability mark from an
+  older policy is a barrier until the already-queued newer `ComputerChange` installs that newer
+  policy's original deadline; it can neither expire the new policy nor be discarded in favor of a
+  fresh clock. Reachability snapshots and inserts its mark while holding the policy state, so an
+  old mark cannot be inserted after the newer event has already been consumed; without that one
+  boundary the old barrier could suppress every later fallback. A complete inbound ordinary exchange is bidirectional repair: its reply carries this
+  daemon's current snapshot, so it clears operational failure and paces the fallback. Outcome
+  recording serializes that reply with an overlapping outbound flight; when the reply covers both
+  of a causal retry flight's revisions, that flight is superseded and cannot recreate a durable
+  miss after the reply cleared the same obligation. An ordinary quiet fallback has no such
+  obligation: simultaneous fallbacks may both finish once, rather than one canceling the other and
+  manufacturing a second local attempt. The inbound success covers the exact noncausal flight:
+  its later success may still be counted, but its later error cannot overwrite that success. Only
+  a causal flight's expired deadline can create a durable policy miss; a quiet fallback's transport
+  bound is operational, never authority over the current policy. Receiver
+  authorization instead fails closed while its durable node application is behind
+  the merged policy revision, and becomes current only after that exact projection is saved and
+  receipted. An older policy revision's reconciliation result cannot detach or displace that
+  recovery.
+
+  The answerer's hello echo and every response frame share the same local absolute deadline as
+  its read and transaction, including both the frame length and body; a peer which stops reading
+  cannot retain one of the bounded answer slots past that deadline. Actor publication checks the
+  same deadline and cancellation after the durable application receipt and after every live
+  publication stage; a late boundary empties registered reacher gates. Startup reconciliation
+  uses one causal Unlock boundary and continues on actual revision movement, with no eight-pass
+  verdict and no per-pass renewed deadline. The optional shipped-binary journey parks an answer
+  after its merge, proves the answerer's effective keyring contains the newly applied grant,
+  observes the initiator's structural missed-revision state, then restores the exact authenticated
+  path and proves the carried policy is applied to every receiving node while the initiator still
+  names the original miss as repaired late. Its mutant suppresses the repair application, so the
+  effective-keyring assertion—not elapsed sampling—turns PRODUCT red.
+
+  Application handoff, 2026-10-23: preparing an application MUST durably retain the exact
+  rollback obligation before changing the node store. The keyring, pending removal locks,
+  pending consent keys and consent ordering MUST commit together in one node-store batch.
+  The Computer writer fence validates the same policy revision and expiry state before that
+  batch; policy changes cannot interleave with its commit. The short state lock MUST NOT span
+  node-store I/O. Live trust marks likewise install only after their durable batch commits.
+  Once an application receipt is current, the actor MUST publish its committed revision and
+  trust view before an elapsed-time verdict can return; recording a missed boundary cannot
+  strand a completed application behind an older live projection.
+  Every reconciliation pass owns a distinct identity even at the same policy revision; a
+  superseded pass cannot clear or overwrite its successor's pending result. Endpoint observations
+  update reachability without renewing an application deadline. Node attachment uses the
+  policy cause's retained deadline; a later effective policy change owns its own new cause.
+  Clients show current application confirmation, historical lateness and current reachability
+  separately: neither late repair nor an unreachable peer erases a confirmed application.
+
+  A refused or interrupted room join MUST retain cleanup before publishing any prejoin, member
+  or bundle record remotely. Before the responder admits a member, it proposes the exact
+  admission fields under a signature domain distinct from the final join witness. The initiator
+  verifies that proposal and durably covers its epoch and timestamp in its withdrawal journal
+  before acknowledging its hash. Only then may the responder admit and return the final witness;
+  the initiator verifies its signature and equality with the prepared fields. A proposal alone
+  grants no admission authority, and validation-only exchanges admit nobody. Final admission
+  rechecks the exact room instance, attachment, epoch and responder's current membership under
+  the room lock. The author and its admission notice MUST commit in one store batch before
+  success; neither live projection advances if persistence fails. Member withdrawals
+  can authenticate against the exact held prejoin root key, remove covered prejoins as well as
+  member/bundle records, and prevent replay without blocking a genuinely later prejoin. The
+  board rejects future-dated withdrawals before storing either pending or applied state. A
+  current-policy fence closes the successful join's cleanup obligation; failure or restart keeps
+  it until withdrawal is complete. Sender-key authority proofs stage the exact protected entry
+  at the recipient before releasing a held key batch: lack of ciphertext or receiver-side policy
+  revocation cannot substitute for proving the sender's final admission fence.
 - **FX-29.** A sync round that brings this node nothing (no entry, header, proof or key it did
   not already hold) MUST write nothing: over a quiet minute a member's store MUST gain no
   commit at all from its rounds. Decision: a hint this node holds (its committed head, its
@@ -496,7 +704,7 @@ Narrow successor amendments. Requirements not named here remain in force.
 | ADR-036 legacy history recovery (Legacy history required, resume, cancel, cached-only reads) | Deleted (FX-18) |
 | ADR-037 R7, R11: event-driven gates; a turn may run several chunks, never a cycle | FX-15 adds: no round without a nameable need; a no-progress, no-wait round retires; a hint for a held head finishes on arrival |
 | ADR-037 R5: a member's higher own head marks the room "own history behind"; every write refuses until resolved | FX-32 says what resolves it: the node recovers its own entries from that member (verified under its own key), keeps reading, and writes again once current |
-| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds the bound: a change made on either daemon shows on every attached node of both within 5 s, or within 60 s after the peer is reachable again when its exchange was lost, and an unchanged pair spends nothing |
+| ADR-035 CT-9, CT-14: computer-trust changes are reconciled, idempotently and recoverably | Preserved; FX-28 adds the bound: a change made on either daemon shows on every attached node of both within 5 s, or within 60 s after the peer is reachable again when its exchange was lost; an unchanged pair starts no exchange except the named fallback and derives no binding again |
 | ADR-037 R7, R11: a port runs a round only on a need; a turn may run several chunks, never a cycle | Preserved; FX-29 adds what a round that brings nothing may write: nothing |
 | No predecessor: no ADR names a durability class for the store or a flush under a room's lock | FX-30 and FX-31 are new rules |
 | PRD-001 R7, R8; ADR-023 M23.1: the admin sets the room's retention; it applies to what is stored at the next sweep | Preserved; FX-33 adds that the sweep never stops the room |

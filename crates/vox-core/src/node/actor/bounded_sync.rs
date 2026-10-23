@@ -1441,15 +1441,16 @@ impl Node {
         let now = self.now_ms().get();
         let net = self.net.as_ref().cloned();
         let pstore = profile.store_handle();
+        let authority = self.computer_authority();
         let task = tokio::spawn(async move {
             let _slot = slot;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             if flow.needs_board() && !worker_fence.is_retired() {
-                if let Some(net) = net {
+                if let (Some(net), Some(authority)) = (net, authority.as_ref()) {
                     flow.admitted_authors = tokio::select! {
                         biased;
                         ()=worker_fence.retired()=>0,
-                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,room,epoch,crate::time::Ms(now)))=>result.unwrap_or(0),
+                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,authority,&tx,room,epoch,crate::time::Ms(now)))=>result.unwrap_or(0),
                     };
                 }
             }

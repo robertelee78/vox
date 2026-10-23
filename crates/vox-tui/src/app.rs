@@ -766,7 +766,8 @@ pub fn run_node(
         // Addresses are discovered on a task after start-up (a route probe and a
         // gateway request); print the anchor specs once they are known, then serve.
         let mut printed: Vec<String> = Vec::new();
-        let mut last_state: (usize, usize, usize) = (usize::MAX, 0, 0);
+        let mut last_state: (Vec<vox_core::hash::Digest32>, usize, usize) =
+            (Vec::new(), usize::MAX, usize::MAX);
         // What the board actually holds per room, reported when it changes. See below.
         let mut last_board: Vec<String> = Vec::new();
         let mut last_holding: Vec<String> = Vec::new();
@@ -851,12 +852,25 @@ pub fn run_node(
                     // anchor stays quiet and a log is not a heartbeat to scroll past —
                     // and every line is something that actually happened.
                     let view = node.view();
-                    let now = (view.connected, view.relaying, view.anchoring.len());
+                    let now = (
+                        view.connected_peers.clone(),
+                        view.relaying,
+                        view.anchoring.len(),
+                    );
                     if now != last_state {
-                        let (peers, circuits, rooms) = now;
+                        let peers = now
+                            .0
+                            .iter()
+                            .map(vox_core::node::link::b32_encode)
+                            .collect::<Vec<_>>()
+                            .join(",");
                         println!(
-                            "vox node: {peers} peer(s) connected, {circuits} circuit(s) \
-                             carried, {rooms} room(s) on the board"
+                            "vox node: {} peer(s) connected [{}], {} circuit(s) carried, {} \
+                             room(s) on the board",
+                            now.0.len(),
+                            peers,
+                            now.1,
+                            now.2,
                         );
                         last_state = now;
                     }

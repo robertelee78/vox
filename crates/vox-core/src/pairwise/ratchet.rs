@@ -141,6 +141,7 @@ fn message_nonce(mk: &Key32) -> Result<[u8; 12]> {
 
 /// A cached skipped message key, keyed by `(ratchet_pubkey, N)`, with an
 /// insertion time for expiry (milliseconds since the Unix epoch).
+#[derive(Clone)]
 struct SkippedKey {
     mk: Key32,
     inserted_at: u64,
@@ -148,7 +149,7 @@ struct SkippedKey {
 
 /// The skipped-message-key store: a bounded, expiring map from
 /// `(ratchet_pubkey, N)` to the derived message key (ADR-004 §Wire).
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SkippedStore {
     map: HashMap<([u8; X25519_PUB_LEN], u64), SkippedKey>,
 }
@@ -254,6 +255,25 @@ impl Drop for Ratchet {
 }
 
 impl Ratchet {
+    /// Snapshot only for rolling back outbound frames which never crossed their publication
+    /// boundary. Kept narrower than `Clone`: two independently live ratchets must never reuse
+    /// the same sending state.
+    pub(crate) fn snapshot_for_unpublished_rollback(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            dh_self_secret: self.dh_self_secret,
+            dh_self_public: self.dh_self_public,
+            dh_remote: self.dh_remote,
+            send_chain: self.send_chain.clone(),
+            recv_chain: self.recv_chain.clone(),
+            n_send: self.n_send,
+            n_recv: self.n_recv,
+            pn: self.pn,
+            skipped: self.skipped.clone(),
+            aead_algo: self.aead_algo,
+        }
+    }
+
     /// The local ratchet public key (for the message header).
     #[must_use]
     pub fn self_public(&self) -> [u8; X25519_PUB_LEN] {

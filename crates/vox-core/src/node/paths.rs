@@ -1038,7 +1038,18 @@ pub fn check_socket_owner(socket: &Path) -> Result<()> {
 /// A failure at any step leaves `path` as it was: the old file is replaced only by the rename,
 /// and only once the new bytes are on the device.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_private_via(path, bytes, &path.with_extension("tmp"))
+    write_private_via(path, bytes, &path.with_extension("tmp"), || Ok(()))
+}
+
+/// Stage and flush a private file, then run `before_publish` immediately before the atomic
+/// rename. A caller with a causal deadline can therefore refuse the commit after slow staging;
+/// the old named file remains intact when the check refuses it.
+pub(crate) fn write_private_file_checked(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    write_private_via(path, bytes, &path.with_extension("tmp"), before_publish)
 }
 
 /// [`write_private_file`] for a file **two processes may write at once**: an agent session's
@@ -1055,10 +1066,15 @@ pub fn write_private_file_unique(path: &Path, bytes: &[u8]) -> Result<()> {
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(format!(".{}.{n}.tmp", std::process::id()));
-    write_private_via(path, bytes, &path.with_file_name(name))
+    write_private_via(path, bytes, &path.with_file_name(name), || Ok(()))
 }
 
-fn write_private_via(path: &Path, bytes: &[u8], tmp: &Path) -> Result<()> {
+fn write_private_via(
+    path: &Path,
+    bytes: &[u8],
+    tmp: &Path,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     use std::io::Write as _;
     let tmp = tmp.to_path_buf();
     let fail = |op: &'static str, at: &Path, e: std::io::Error| Error::Path {
@@ -1083,6 +1099,10 @@ fn write_private_via(path: &Path, bytes: &[u8], tmp: &Path) -> Result<()> {
         .map_err(|e| fail("write file", &tmp, e));
     drop(file);
     if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = before_publish() {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }

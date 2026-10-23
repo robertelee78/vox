@@ -246,11 +246,12 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
         return Ok(());
     }
     println!(
-        "{}  {}\ninstallation {}\ncomputer trust: {}",
+        "{}  {}\ninstallation {}\ncomputer trust: {}\npolicy revision {}",
         status.this_computer.name,
         status.this_computer.fingerprint,
         status.this_computer.installation,
-        status.state
+        status.state,
+        status.revision
     );
     println!("{}", status.policy);
     if let Some(p) = &status.pairing {
@@ -276,27 +277,48 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
             vox_text::shell::command(&["vox", "computer", "cancel", id])
         );
     }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
     for application in &status.applications {
+        // The last exchange this daemon started and the last it answered, each with the policy
+        // revision it sent and the one it stood at after merging: which exchange carried a
+        // change (ADR-038 FX-28).
+        let mut carried = String::new();
+        for (what, record) in [
+            ("started", application.last_started_exchange),
+            ("answered", application.last_answered_exchange),
+        ] {
+            if let Some(r) = record {
+                carried.push_str(&format!(
+                    "; last exchange {what} {} s ago sent revision {}, merged to revision {}",
+                    now_ms.saturating_sub(r.at_ms) / 1000,
+                    r.sent_revision,
+                    r.merged_revision
+                ));
+            }
+        }
         let exchanged = match application.last_exchange_ms {
             Some(at) => {
-                let ago = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64)
-                    .saturating_sub(at)
-                    / 1000;
+                let ago = now_ms.saturating_sub(at) / 1000;
                 format!(
-                    "; exchanged {} time(s) in {} attempt(s) since the daemon started, last {ago} s ago{}",
+                    "; exchanged {} time(s) in {} attempt(s) since the daemon started, last {ago} s ago{}{}",
                     application.exchanges,
                     application.exchange_attempts,
                     if application.exchange_failures > 0 {
                         format!(", {} failed in a row", application.exchange_failures)
                     } else {
                         String::new()
+                    },
+                    if application.exchange_in_flight {
+                        "; exchange in flight"
+                    } else {
+                        ""
                     }
                 )
             }
             None => format!(
-                "; not exchanged since the daemon started{}",
+                "; not exchanged since the daemon started{}{}",
                 if application.exchange_failures > 0 {
                     format!(
                         ", {} attempt(s) failed in a row",
@@ -304,11 +326,25 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
                     )
                 } else {
                     String::new()
+                },
+                if application.exchange_in_flight {
+                    "; exchange in flight"
+                } else {
+                    ""
                 }
             ),
         };
+        let convergence = application.missed_revision.map_or_else(
+            || format!("; convergence {}", application.convergence_state),
+            |revision| {
+                format!(
+                    "; convergence {}, missed revision {revision}, repaired late {}",
+                    application.convergence_state, application.repaired_late
+                )
+            },
+        );
         println!(
-            "{}  {}  {}{exchanged}",
+            "{}  {}  {}{convergence}{exchanged}{carried}",
             application.computer.name,
             application.computer.fingerprint,
             if application.confirmed {
@@ -319,8 +355,33 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
         );
     }
     for node in &status.nodes {
+        // A node of this computer says at which policy revision its binding was derived and
+        // when: current when it names the status's revision, stale otherwise (ADR-038 FX-28).
+        let binding = match (node.binding_revision, node.binding_derived_ms) {
+            (Some(revision), Some(at)) => format!(
+                "; binding derived at policy revision {revision}{}, {} s ago",
+                if revision == status.revision {
+                    " (current)"
+                } else {
+                    " (stale)"
+                },
+                now_ms.saturating_sub(at) / 1000
+            ),
+            (Some(revision), None) => format!(
+                "; binding derived at policy revision {revision}{}",
+                if revision == status.revision {
+                    " (current)"
+                } else {
+                    " (stale)"
+                }
+            ),
+            (None, _) if node.computer == status.this_computer.fingerprint => {
+                "; binding not derived since the daemon started".to_owned()
+            }
+            (None, _) => String::new(),
+        };
         println!(
-            "{}  {}  computer {}  {}",
+            "{}  {}  computer {}  {}{binding}",
             node.name,
             node.fingerprint,
             node.computer,
@@ -346,6 +407,14 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
     println!("Removal confirmation frontier: {}", status.frontier);
     for pending in &status.pending_nodes {
         println!("pending: {pending}");
+    }
+    for missed in &status.application_misses {
+        println!(
+            "application late: {}  {}  revision {}",
+            missed.name.as_deref().unwrap_or("unnamed node"),
+            missed.node,
+            missed.revision
+        );
     }
     if let Some(why) = &status.problem {
         println!("pending: {why}");

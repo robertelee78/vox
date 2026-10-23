@@ -49,7 +49,7 @@ pub use client::{
 };
 pub use computer::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
-    PairingPreview,
+    ExchangeRecord, PairingPreview,
 };
 
 /// Anything that went wrong, with the core's reason.

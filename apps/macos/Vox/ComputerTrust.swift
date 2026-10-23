@@ -92,6 +92,9 @@ struct ComputerTrustView: View {
                         Text(status.policy)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("computer-trust-policy")
+                        Text("Policy revision \(status.revision)")
+                            .font(Theme.mono).secondaryText()
+                            .accessibilityIdentifier("computer-policy-revision")
                         if !model.reachable {
                             Text("Last known state. Checking with Vox…").secondaryText()
                         }
@@ -120,6 +123,12 @@ struct ComputerTrustView: View {
                                                 .fixedSize(horizontal: false, vertical: true)
                                             Text(node.personal ? "Personal node · can drive non-personal nodes" : "Managed node · read access")
                                                 .secondaryText()
+                                            if let revision = node.bindingRevision,
+                                               let derived = node.bindingDerivedMs {
+                                                Text("Binding derived at policy revision \(revision) · Unix ms \(derived)")
+                                                    .font(Theme.mono).secondaryText()
+                                                    .accessibilityIdentifier("computer-binding-evidence-" + node.fingerprint)
+                                            }
                                         }
                                     }
                                     Button(application.computer.fingerprint == status.thisComputer.fingerprint
@@ -132,6 +141,20 @@ struct ComputerTrustView: View {
                                     Text(applicationState(application, status: status))
                                         .secondaryText()
                                         .accessibilityIdentifier("computer-application-" + application.computer.fingerprint)
+                                    Text("Exchanged \(application.exchanges) time(s) in \(application.exchangeAttempts) attempt(s) · \(application.exchangeFailures) failed in a row")
+                                        .font(Theme.mono).secondaryText()
+                                        .accessibilityIdentifier("computer-exchange-counts-" + application.computer.fingerprint)
+                                    Text(convergenceEvidence(application))
+                                        .font(Theme.mono).secondaryText()
+                                        .accessibilityIdentifier("computer-convergence-" + application.computer.fingerprint)
+                                    if let exchange = application.lastStartedExchange {
+                                        Text("Last started exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                            .font(Theme.mono).secondaryText()
+                                    }
+                                    if let exchange = application.lastAnsweredExchange {
+                                        Text("Last answered exchange: sent revision \(exchange.sentRevision), merged revision \(exchange.mergedRevision), Unix ms \(exchange.atMs)")
+                                            .font(Theme.mono).secondaryText()
+                                    }
                                 }
                             }
                         }
@@ -356,11 +379,26 @@ struct ComputerTrustView: View {
     }
 
     private func applicationState(_ application: ComputerApplication, status: ComputerStatus) -> String {
-        if status.state == "quarantined" { return "Trust suspended" }
-        if !model.reachable {
-            return application.confirmed ? "Last known: confirmed" : "Last known: awaiting confirmation"
+        var states: [String] = []
+        if status.state == "quarantined" { states.append("Trust suspended") }
+        let confirmation = application.confirmed ? "Application confirmed" : "Awaiting application confirmation"
+        states.append(model.reachable ? confirmation : "Last known: \(confirmation.lowercased())")
+        if application.convergenceState == "repaired-late" {
+            states.append("Repaired late")
+        } else if application.convergenceState == "expired" {
+            states.append("Expired before convergence")
+        } else if application.convergenceState == "replaced" {
+            states.append("Expired revision replaced")
         }
-        return application.confirmed ? "Confirmed" : "Awaiting confirmation"
+        return states.joined(separator: "; ")
+    }
+
+    private func convergenceEvidence(_ application: ComputerApplication) -> String {
+        guard let revision = application.missedRevision else {
+            return "Convergence: \(application.convergenceState)"
+        }
+        let repaired = application.repairedLate ? "yes" : "no"
+        return "Convergence: \(application.convergenceState) · missed revision \(revision) · repaired late \(repaired)"
     }
 
     private func identity(_ computer: ComputerIdentity, title: String) -> some View {

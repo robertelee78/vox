@@ -523,12 +523,35 @@ impl Keyring {
 
     /// Seal and write the keyring. Requires an unlocked identity.
     pub fn save(&self, store: &Store, signer: &dyn RootSigner) -> Result<()> {
+        self.save_checked(store, signer, || Ok(()))
+    }
+
+    /// Seal and stage the keyring, then check the caller's causal condition immediately before
+    /// the durable transaction commit.
+    pub(crate) fn save_checked(
+        &self,
+        store: &Store,
+        signer: &dyn RootSigner,
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let mut batch = store.batch()?;
+        self.queue_save(&mut batch, signer)?;
+        before_commit()?;
+        batch.commit()
+    }
+
+    /// Stage the keyring beside its pending delivery and removal records in one transaction.
+    pub(crate) fn queue_save(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        signer: &dyn RootSigner,
+    ) -> Result<()> {
         let sek = trust_sek(signer)?;
         let sealed = seal_segment(&sek, SegmentKind::Trust, TRUST_SEGMENT_ID, &self.to_bytes())?;
         let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
         blob.extend_from_slice(&sealed.nonce);
         blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(TRUST_META_KEY, &blob)
+        batch.put_meta(TRUST_META_KEY, &blob)
     }
 
     /// Read and open the keyring, or an empty one if this node has never trusted
