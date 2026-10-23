@@ -1065,13 +1065,11 @@ impl Node {
         // Prepare before any node-store effect, including pending key/removal metadata and
         // trust-decision stamps. If a newer revision already won, none of this plan is applied.
         // Expiry is recovery from the retained prepared/applied sets and needs no new grant.
-        if !expired {
-            if !computer.prepare_application_until(me, revision, &covered, deadline)? {
-                return Ok(KeyringApplication {
-                    changes: Vec::new(),
-                    settled: false,
-                });
-            }
+        if !expired && !computer.prepare_application_until(me, revision, &covered, deadline)? {
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: false,
+            });
         }
         let aliases: Vec<_> = covered
             .iter()
