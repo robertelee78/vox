@@ -2823,6 +2823,8 @@ impl Node {
         let now = self.now_ms().get();
         let net = self.net.as_ref().cloned();
         let pstore = profile.store_handle();
+        let tx = self.net_tx.clone();
+        let authority = self.computer_authority();
         let worker = tokio::spawn(async move {
             let _slot = slot;
             let deadline =
@@ -2836,11 +2838,11 @@ impl Node {
             // therefore remains truthfully attributed to the retiring actor generation.
             job.hold_for_proof(room, peer).await;
             if flow.needs_board() && !worker_fence.is_retired() {
-                if let Some(net) = net {
+                if let (Some(net), Some(authority)) = (net, authority.as_ref()) {
                     flow.admitted_authors = tokio::select! {
                         biased;
                         ()=worker_fence.retired()=>0,
-                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,room,epoch,crate::time::Ms(now)))=>result.unwrap_or(0),
+                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,authority,&tx,room,epoch,crate::time::Ms(now)))=>result.unwrap_or(0),
                     };
                 }
             }

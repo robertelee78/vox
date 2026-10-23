@@ -76,6 +76,12 @@ const SPOOF_HEAD: usize = 1 + 20;
 /// A spoofed datagram's size, and how often one is sent.
 const SPOOF_SIZE: usize = 1200;
 const SPOOF_EVERY: Duration = Duration::from_millis(20);
+/// A test-apparatus round trip, never sent to Vox. This exercises the same public socket, inside
+/// socket, open switch and return path as forwarded traffic before a proof starts a PRODUCT clock.
+const OPEN_PROBE: &[u8] = b"vox-proof-port-forward-open-v1";
+/// Only a deadman for the in-process forwarding apparatus. Expiry is always `APPARATUS`, never a
+/// product verdict or evidence about how long Vox may take.
+const OPEN_PROBE_DEADMAN: Duration = Duration::from_secs(30);
 
 pub struct PortForward {
     /// The forward's public address — what the host advertises.
@@ -99,14 +105,32 @@ impl PortForward {
             .unwrap_or_else(|e| panic!("APPARATUS: the port forward's public socket: {e}"));
         let state = Arc::new(State::default());
         state.open.store(open, Ordering::SeqCst);
+        let probe_echo = UdpSocket::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("APPARATUS: could not bind port-forward probe echo: {e}"));
+        let probe_addr = probe_echo.local_addr().unwrap_or_else(|e| {
+            panic!("APPARATUS: could not read port-forward probe address: {e}")
+        });
+        probe_echo
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not configure port-forward probe: {e}"));
+        let probe_st = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            while !probe_st.stop.load(Ordering::SeqCst) {
+                let Ok((n, from)) = probe_echo.recv_from(&mut buf) else {
+                    continue;
+                };
+                let _ = probe_echo.send_to(&buf[..n], from);
+            }
+        });
         let st = Arc::clone(&state);
         // Delayed datagrams guest → host, in arrival order: one constant delay keeps them in order.
-        let (late, due) = std::sync::mpsc::channel::<(Arc<UdpSocket>, Vec<u8>, Instant)>();
+        let (late, due) = std::sync::mpsc::channel::<(Arc<UdpSocket>, Vec<u8>, Instant, bool)>();
         let late_st = Arc::clone(&state);
         std::thread::spawn(move || {
-            while let Ok((sock, data, at)) = due.recv() {
+            while let Ok((sock, data, at, apparatus_probe)) = due.recv() {
                 std::thread::sleep(at.saturating_duration_since(Instant::now()));
-                if sock.send(&data).is_ok() {
+                if sock.send(&data).is_ok() && !apparatus_probe {
                     late_st
                         .to_host
                         .fetch_add(data.len() as u64, Ordering::SeqCst);
@@ -127,15 +151,18 @@ impl PortForward {
                     Err(_) => continue,
                 };
                 let at = Instant::now();
-                st.first_seen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry(from)
-                    .or_insert(at);
-                st.arrivals
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((at, from));
+                let apparatus_probe = &buf[..n] == OPEN_PROBE;
+                if !apparatus_probe {
+                    st.first_seen
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .entry(from)
+                        .or_insert(at);
+                    st.arrivals
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((at, from));
+                }
                 if !st.open.load(Ordering::SeqCst) {
                     st.dropped.fetch_add(1, Ordering::SeqCst);
                     continue;
@@ -144,9 +171,10 @@ impl PortForward {
                     let s = UdpSocket::bind("127.0.0.1:0").unwrap_or_else(|e| {
                         panic!("APPARATUS: could not bind a port forward inside socket: {e}")
                     });
-                    s.connect(host).unwrap_or_else(|e| {
+                    let destination = if apparatus_probe { probe_addr } else { host };
+                    s.connect(destination).unwrap_or_else(|e| {
                         panic!(
-                            "APPARATUS: could not aim a port forward inside socket at {host}: {e}"
+                            "APPARATUS: could not aim a port forward inside socket at {destination}: {e}"
                         )
                     });
                     s.set_read_timeout(Some(Duration::from_millis(50)))
@@ -159,7 +187,7 @@ impl PortForward {
                         while !st.stop.load(Ordering::SeqCst) {
                             let Ok(n) = back.recv(&mut buf) else { continue };
                             // A short header (RFC 9000 §17.3): the form bit clear.
-                            if n > SPOOF_HEAD && buf[0] & 0x80 == 0 {
+                            if !apparatus_probe && n > SPOOF_HEAD && buf[0] & 0x80 == 0 {
                                 *st.last_short
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -169,20 +197,27 @@ impl PortForward {
                                 st.dropped.fetch_add(1, Ordering::SeqCst);
                                 continue;
                             }
-                            if public.send_to(&buf[..n], from).is_ok() {
+                            if public.send_to(&buf[..n], from).is_ok() && !apparatus_probe {
                                 st.to_guest.fetch_add(n as u64, Ordering::SeqCst);
                             }
                         }
                     });
                     s
                 });
-                *st.last_from
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(from);
+                if !apparatus_probe {
+                    *st.last_from
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(from);
+                }
                 let delay = Duration::from_micros(st.delay_us.load(Ordering::SeqCst));
                 if !delay.is_zero() {
-                    let _ = late.send((Arc::clone(sock), buf[..n].to_vec(), at + delay));
-                } else if sock.send(&buf[..n]).is_ok() {
+                    let _ = late.send((
+                        Arc::clone(sock),
+                        buf[..n].to_vec(),
+                        at + delay,
+                        apparatus_probe,
+                    ));
+                } else if sock.send(&buf[..n]).is_ok() && !apparatus_probe {
                     st.to_host.fetch_add(n as u64, Ordering::SeqCst);
                 }
             }
@@ -204,6 +239,37 @@ impl PortForward {
 
     pub fn open(&self) {
         self.state.open.store(true, Ordering::SeqCst);
+    }
+
+    /// Open the forward and causally prove its exact userspace path works before a product timing
+    /// assertion begins. The probe traverses both forwarding legs but is diverted to an apparatus
+    /// echo socket, so Vox never sees it and cannot make this check pass. A broken or descheduled
+    /// emulator is an apparatus failure, not a product timeout.
+    pub fn open_and_verify(&self) -> Instant {
+        self.open();
+        let probe = UdpSocket::bind("[::1]:0")
+            .unwrap_or_else(|e| panic!("APPARATUS: could not bind port-forward verifier: {e}"));
+        probe
+            .set_read_timeout(Some(OPEN_PROBE_DEADMAN))
+            .unwrap_or_else(|e| {
+                panic!("APPARATUS: could not configure port-forward verifier: {e}")
+            });
+        probe
+            .send_to(OPEN_PROBE, self.public)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not send port-forward probe: {e}"));
+        let mut answer = [0u8; 128];
+        let (n, from) = probe.recv_from(&mut answer).unwrap_or_else(|e| {
+            panic!(
+                "APPARATUS: opened port forward did not carry its own round-trip probe before the {OPEN_PROBE_DEADMAN:?} deadman: {e}"
+            )
+        });
+        assert!(
+            from == self.public && &answer[..n] == OPEN_PROBE,
+            "APPARATUS: port-forward probe returned from {from} with unexpected bytes"
+        );
+        // This proof-process monotonic instant is causally after the successful round trip.
+        // Emulator scheduling and probe transit are apparatus work, never PRODUCT latency.
+        Instant::now()
     }
 
     pub fn close(&self) {

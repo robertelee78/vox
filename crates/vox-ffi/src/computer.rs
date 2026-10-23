@@ -45,6 +45,25 @@ impl From<core::PairingPreview> for PairingPreview {
         }
     }
 }
+/// One completed management-state exchange, with the policy revisions it carried.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ExchangeRecord {
+    /// Unix milliseconds when the exchange completed.
+    pub at_ms: u64,
+    /// This daemon's policy revision sent to the peer.
+    pub sent_revision: u64,
+    /// This daemon's policy revision after merging the peer's state.
+    pub merged_revision: u64,
+}
+impl From<core::ExchangeRecord> for ExchangeRecord {
+    fn from(v: core::ExchangeRecord) -> Self {
+        Self {
+            at_ms: v.at_ms,
+            sent_revision: v.sent_revision,
+            merged_revision: v.merged_revision,
+        }
+    }
+}
 /// Application receipt for one member at the exact current group frontier.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ComputerApplication {
@@ -52,12 +71,42 @@ pub struct ComputerApplication {
     pub computer: ComputerIdentity,
     /// Verified complete application; false means pending, not necessarily offline.
     pub confirmed: bool,
+    /// Last completed exchange since this daemon started.
+    pub last_exchange_ms: Option<u64>,
+    /// Completed exchanges since this daemon started.
+    pub exchanges: u64,
+    /// Started exchanges since this daemon started, including failures.
+    pub exchange_attempts: u64,
+    /// Whether this daemon currently has an exchange reserved toward this member.
+    pub exchange_in_flight: bool,
+    /// Consecutive exchanges which did not satisfy their causal contract.
+    pub exchange_failures: u32,
+    /// Exact policy revision whose convergence deadline was missed.
+    pub missed_revision: Option<u64>,
+    /// Whether that missed revision was exchanged only after its deadline.
+    pub repaired_late: bool,
+    /// pending / expired / repaired-late / replaced / converged.
+    pub convergence_state: String,
+    /// Last exchange this daemon started with the member.
+    pub last_started_exchange: Option<ExchangeRecord>,
+    /// Last exchange the member started and this daemon answered.
+    pub last_answered_exchange: Option<ExchangeRecord>,
 }
 impl From<core::ComputerApplication> for ComputerApplication {
     fn from(v: core::ComputerApplication) -> Self {
         Self {
             computer: v.computer.into(),
             confirmed: v.confirmed,
+            last_exchange_ms: v.last_exchange_ms,
+            exchanges: v.exchanges,
+            exchange_attempts: v.exchange_attempts,
+            exchange_in_flight: v.exchange_in_flight,
+            exchange_failures: v.exchange_failures,
+            missed_revision: v.missed_revision,
+            repaired_late: v.repaired_late,
+            convergence_state: v.convergence_state,
+            last_started_exchange: v.last_started_exchange.map(Into::into),
+            last_answered_exchange: v.last_answered_exchange.map(Into::into),
         }
     }
 }
@@ -72,6 +121,10 @@ pub struct ComputerNode {
     pub name: String,
     /// Saved personal selection.
     pub personal: bool,
+    /// Policy revision at which this local binding was last derived.
+    pub binding_revision: Option<u64>,
+    /// Unix milliseconds when this local binding was last derived.
+    pub binding_derived_ms: Option<u64>,
 }
 impl From<core::ComputerNode> for ComputerNode {
     fn from(v: core::ComputerNode) -> Self {
@@ -80,6 +133,8 @@ impl From<core::ComputerNode> for ComputerNode {
             fingerprint: v.fingerprint,
             name: v.name,
             personal: v.personal,
+            binding_revision: v.binding_revision,
+            binding_derived_ms: v.binding_derived_ms,
         }
     }
 }
@@ -112,8 +167,10 @@ pub struct ComputerStatus {
     pub this_computer: ComputerIdentity,
     /// Fixed permission policy, shown before confirmation.
     pub policy: String,
-    /// individual / waiting / needs-approval / applying / confirmed.
+    /// individual / waiting / needs-approval / applying / expired / confirmed.
     pub state: String,
+    /// Current computer-policy revision.
+    pub revision: u64,
     /// One-time invitation, never included in logs or error messages.
     pub invite_link: Option<String>,
     /// Cancellation identifier before the peer has proved itself.
@@ -149,6 +206,7 @@ impl From<core::ComputerStatus> for ComputerStatus {
             this_computer: v.this_computer.into(),
             policy: v.policy,
             state: v.state,
+            revision: v.revision,
             invite_link: v.invite_link,
             invite_id: v.invite_id,
             invite_expires_ms: v.invite_expires_ms,

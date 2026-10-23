@@ -82,6 +82,23 @@ pub struct Session {
 }
 
 impl Session {
+    /// Snapshot an outbound session only while preparing frames which have not crossed their
+    /// final publication boundary. If that publication is refused, replacing the live value with
+    /// this snapshot makes the attempt observationally absent and prevents an unbounded skipped
+    /// message-key gap. Kept narrower than `Clone`: arbitrary session duplication would risk two
+    /// live ratchets reusing one state.
+    pub(crate) fn snapshot_for_unpublished_rollback(&self) -> Self {
+        Self {
+            ratchet: self.ratchet.snapshot_for_unpublished_rollback(),
+            suite_id: self.suite_id,
+            channel_id: self.channel_id,
+            epoch: self.epoch,
+            commitment: self.commitment.clone(),
+            opening_ratchet: self.opening_ratchet,
+            last_resort_grade: self.last_resort_grade,
+        }
+    }
+
     /// The negotiated ciphersuite id.
     #[must_use]
     pub fn suite_id(&self) -> u16 {

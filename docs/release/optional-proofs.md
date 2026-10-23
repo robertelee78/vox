@@ -153,6 +153,96 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 `update_proof`'s other test, `vox_update_replaces_an_install_it_owns_and_refuses_the_rest`, measures this build's refusals, record lookup, `--check` and `--rollback`, and is not optional.
 
+### Computer convergence journeys
+
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, historical misses disappear across restart, or Ready exposes an old application after a later operator policy changes the personal-node role while losing current managed or manual grants. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
+| `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
+
+FX-28's nineteen executable mutants are run one at a time with
+`scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
+`preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
+`deadline-as-storage-failure`, `withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
+`fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
+`redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
+`due-backoff-drops-causal-cause`,
+`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
+`stale-trust-projection`, `stale-rekey-authority`, or
+`legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
+only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
+not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
+authenticated peer which fills the other daemon's bounded management slots and leaves every
+response unread. `lock-through-computer-write` restores the former state lock across an exact held
+durable Computer write; shipped status must still answer with the last committed revision inside
+its existing actor-liveness contract. `deadline-as-storage-failure` turns an exact pre-rename
+causal refusal into permanent storage quarantine again. `withdrawal-not-durable` omits the refused
+join's prepared and pending board-withdrawal journals; after the responder path reopens with the
+joining daemon stopped, restart must still remove both exact accepted records from that real board.
+`ready-fence-accepts-unsettled` bypasses only the daemon's final state-locked
+publication fence after a successful receipt. A later real operator change supersedes that
+receipt while startup is held; the mutant exposes the stale or held-back projection instead of
+the current personal role and exact managed/manual grants. `stale-post-authority` bypasses the durable-policy fence around an
+ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
+trusted rows; `stale-room-create-authority` bypasses only the first durable commit of an exact
+sealed room create, so its shipped create answer and room list expose stale authority;
+`stale-rekey-authority` bypasses the final fence around exact sender-key queue
+admission after every preceding await. `legacy-ended-unanswered-not-selected` suppresses only
+the real `ENDED_UNANSWERED` compatibility-route selection; the shipped roster then fails to say
+that the exact peer runs an older Vox, before the authority race is staged. Full transcripts are
+written under `target/fx28-mutants/`. That same causal route makes the authority rejection seal
+through the legacy long-lived ratchet; the normal build restores its exact unpublished session
+snapshot, while the stale-authority mutant independently makes the shipped revoked reader expose
+the forbidden post. These are
+on-demand diagnostics, not CI or release gates, and are serialized like the journeys.
+
+The former expiry-before-keyring-commit phase and the `expired-plan-drops-prepared` and
+`keyring-commit-not-recoverable` mutants are removed. The node-store commit now serializes the
+exact policy revision and expiry state across one atomic batch of keyring and dependent metadata;
+a superseding plan commits nothing. A sender's missed exchange is historical timing evidence and
+does not revoke an authenticated receiver policy. The dedicated pre-receipt crash phase and its
+knobs are removed too: an actual later removal derives its denied peers from authenticated
+binding history regardless of a prepared receipt, so the old omitted-preparation mutation no
+longer affects it. The same journey retains unchanged restart and final Ready supersession;
+the independent preview/approval crash journey retains the operator's durable intent claim.
+
+`redeem-rejects-pending-registration` restores the immediate policy refusal when the exact
+inviter registration is still being published. The anchor journey holds that real registration,
+observes the matching redemption, then releases publication and requires the same shipped pairing
+command to authenticate the valid code. Known refusal and direct reach remain independent.
+
+`owner-refusal-decoded-as-payload` skips recognition of the existing tagged peer refusal.
+The anchor journey retries a cancelled invitation over an established computer connection and
+requires the shipped command to preserve the owner's cancellation reason rather than report
+malformed response data. It does not accept a transport failure as evidence of cancellation.
+
+`due-backoff-drops-causal-cause` restores the due-backoff selector's early return before causal
+classification. After an early failed exchange and its retry are staged, the anchor journey
+requires the same unfinished cause to become expired in shipped status. A pending-state read
+started after the original conservative return boundary is a product failure. A positive expired
+read proves the structural outcome without inferring the instant it was published.
+
+`fresh-preview-inherits-old-deadline` makes a new pairing request inherit an older ordinary
+exchange's clock. The existing anchor journey holds that fresh reservation while the ordinary
+miss stays visible, then verifies the exact invitation after reachability returns. Preview does
+not acknowledge ordinary delivery. `late-application-abandons-work` drops only the accepted actor
+causally held past its observation boundary. The journey requires that same revision to become
+current and usable after release without a role toggle, detach, unlock or restart, while its
+historical miss remains visible. Its return boundary stays fixed throughout the observation.
+`detach-keeps-reconciliation` retains the departing actor's owned flight and live pending row.
+The existing replacement journey first observes that exact public pending result and miss, then
+requires same-policy reattachment to clear live pending status and confirm its actual grant while
+retaining history. Its existing delayed-reply interval stages the race; failure to stage it is
+APPARATUS and cannot count as a product or mutant verdict.
+
+Startup derives the actual current binding and settles its exact application before the
+state-locked Ready publication. Genuine policy movement continues the same accepted operation;
+observation lateness does not destroy it. Every authority-bearing use also checks current durable
+policy. The pause mutant is judged by the saved state shown by shipped `vox room session`, with
+a registered Session and known pause status, even when the original command reports delivery
+unknown. Ordinary text append and sender-key admission have their own use-boundary mutants above.
+
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 
 | Proof | Helps troubleshoot | Run | Needs | Time |

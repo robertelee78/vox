@@ -1000,9 +1000,23 @@ impl Witness {
         match &self.only {
             Only::Anyone => true,
             Only::Drive => {
-                self.computer.as_ref().is_none_or(|(computer, applied)| {
-                    computer.policy_current(applied.load(std::sync::atomic::Ordering::Acquire))
-                }) && member.is_some_and(|m| self.view.borrow().drive.contains(&m))
+                // The decision and its policy tag come from one watch snapshot. Release that
+                // borrow before taking the Computer lock, as NodeHandle::coherent_view does.
+                let (allowed, policy) = {
+                    let view = self.view.borrow();
+                    (
+                        member.is_some_and(|m| view.drive.contains(&m)),
+                        view.computer_policy,
+                    )
+                };
+                allowed
+                    && self.computer.as_ref().is_none_or(|(computer, _)| {
+                        self.owner
+                            .zip(policy)
+                            .is_some_and(|(owner, (applied, expired))| {
+                                computer.policy_current(applied, expired, owner)
+                            })
+                    })
             }
             Only::Node(n) => member == Some(*n),
         }

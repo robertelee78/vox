@@ -86,6 +86,19 @@ struct Initiated {
     hello_delivered: bool,
 }
 
+/// Exact registration and ratchet state before an older-peer frame is sealed but not published.
+/// Restoring this value makes a rejected attempt observationally absent, including its session
+/// serial and hello ownership, so retries cannot accumulate an untransmitted `MAX_SKIP` gap.
+struct LegacySessionRollback {
+    pair: (Digest32, Digest32),
+    session: Option<crate::pairwise::session::Session>,
+    initiated: Option<Initiated>,
+    accepted: Option<Digest32>,
+    reopened: bool,
+    serial: Option<u64>,
+    last_serial: u64,
+}
+
 /// **Which of two competing sessions for one pair both ends keep** (ADR-004 O2): the
 /// one opened by the lower fingerprint. Two members that opened a session to each other
 /// at the same moment each hold their own; both apply this rule and so keep the same
@@ -704,6 +717,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::BoundedHeadCompleted { .. } => "finishing an authenticated current head",
         NetEvent::BoundedRoomAdvanced { .. } => "publishing accepted current room work",
+        NetEvent::BoundedSyncProgress { .. } => "advancing bounded current/history work",
+        NetEvent::BoardRecordsOwed { .. } => "publishing authorized board records",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
@@ -722,6 +737,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AddressWaitOver { .. } => "withholding an address no board holds the room for",
         NetEvent::AnchorNoteDue { .. } => "saying which anchors never took a room",
         NetEvent::SkdmTaken { .. } => "noting a key the recipient took",
+        NetEvent::JoinBoardPublication { .. } => "retaining a join publication's rollback",
         NetEvent::JoinAnswered { .. } => "filing a join that finished",
         NetEvent::BoardGrew { .. } => "passing on a record that landed on our board",
         NetEvent::LeaveWaitOver { .. } => "answering a leave nobody took",
@@ -762,7 +778,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
-        NetEvent::ComputerPolicy(_) => "applying computer trust",
+        NetEvent::ComputerPolicy { .. } => "applying computer trust",
         NetEvent::LocalTrustBlacklist(_) => "reading local trust removal decisions",
         NetEvent::TrustLocalNode { .. } => "applying the daemon's local trust policy",
     }
@@ -783,14 +799,22 @@ type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
 
-/// Put a pre-join record on the board at `conn`. A **refusal is fine**: it means our
-/// previous announcement is still live (the ADR-012 refresh floor declines a faster
-/// replacement), and being announced is all this is for. Only a transport failure is
-/// an error.
+/// Put a pre-join record on the board at `conn`. Only a stale-record refusal is fine: it means
+/// this identity's newer announcement is already live, and being announced is all this is for.
+/// A policy, capacity or malformed-record refusal means the board did not authorize the Join
+/// stream which follows and must remain the join's causal error. Swallowing every refusal made a
+/// future-dated pre-join look accepted; the responder then correctly classed the joiner Unknown
+/// and the person was told the downstream `authenticator invalid` fiction instead of the board
+/// publication failure.
 async fn announce(conn: &VoxConnection, prejoin_wire: &[u8]) -> crate::error::Result<()> {
     let mut client = crate::nat::service::RendezvousClient::open(conn).await?;
     let res = match client.put(prejoin_wire).await {
-        Ok(()) | Err(crate::error::Error::RendezvousRejected(_)) => Ok(()),
+        Ok(()) => Ok(()),
+        Err(crate::error::Error::RendezvousRejected(reason))
+            if reason == crate::nat::service::RejectReason::Stale.as_str() =>
+        {
+            Ok(())
+        }
         Err(e) => Err(e),
     };
     client.finish();
@@ -1203,7 +1227,10 @@ enum NetEvent {
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
     /// Daemon-internal only: no IPC request maps to these policy operations.
     LocalTrustBlacklist(oneshot::Sender<crate::error::Result<Option<BTreeSet<Digest32>>>>),
-    ComputerPolicy(oneshot::Sender<crate::error::Result<()>>),
+    ComputerPolicy {
+        guard: computer::ComputerPolicyGuard,
+        reply: oneshot::Sender<crate::error::Result<()>>,
+    },
     TrustLocalNode {
         fingerprint: Digest32,
         name: String,
@@ -1400,6 +1427,16 @@ enum NetEvent {
         room_instance: [u8; 16],
         generation: Digest32,
     },
+    BoundedSyncProgress {
+        token: u64,
+    },
+    /// Missing board records admitted under the exact Computer authority captured by the
+    /// off-actor exchange. Queue admission is the irreversible authorization boundary; this
+    /// actor-owned event performs only the already-authorized transport write.
+    BoardRecordsOwed {
+        conn: Arc<crate::transport::quic::VoxConnection>,
+        records: Vec<Vec<u8>>,
+    },
     BoundedSyncDone {
         channel_id: Digest32,
         peer: Digest32,
@@ -1585,6 +1622,11 @@ enum NetEvent {
     JoinAdmit {
         /// The room being joined.
         channel_id: Digest32,
+        /// The exact live room and attachment which supplied the authenticated exchange context.
+        original: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        attachment: u64,
+        /// The identity authenticated by the join's transport and proof.
+        peer: Digest32,
         /// The joiner's proven identity.
         identity: Box<crate::identity::composite::CompositePublicKey>,
         /// The witness this node signed for it (ADR-016 M17.6): kept, as an admission notice, so
@@ -1715,6 +1757,14 @@ enum NetEvent {
         result: Box<crate::error::Result<()>>,
         /// The `Forward` command's reply.
         reply: oneshot::Sender<Outcome>,
+    },
+    /// A joiner's task finished: make the room, or say why not, and answer the command.
+    JoinBoardPublication {
+        channel_id: Digest32,
+        attachment: u64,
+        board: Arc<VoxConnection>,
+        withdrawal: Option<Vec<u8>>,
+        ack: oneshot::Sender<crate::error::Result<()>>,
     },
     /// A joiner's task finished: make the room, or say why not, and answer the command.
     JoinerDone {
@@ -3173,6 +3223,7 @@ struct Joiner {
     net: Arc<NodeNet>,
     tx: mpsc::Sender<NetEvent>,
     me: Digest32,
+    attachment: u64,
     parsed: crate::node::link::InviteLink,
     routes: Vec<(Digest32, crate::nat::multiaddr::EndpointList)>,
     signer: Arc<crate::atrest::vault::VaultRootSigner>,
@@ -3315,6 +3366,70 @@ impl JoinSteps {
 }
 
 impl Joiner {
+    /// Retain the signed narrowing action before an announcement can make this joining
+    /// identity remotely visible. The actor serializes the public recovery journal; a crash,
+    /// failed seal or policy refusal can then withdraw without needing a stored room key.
+    async fn retain_board_cleanup(&self, board: &Arc<VoxConnection>) -> Result<(), JoinerLost> {
+        self.retain_board_cleanup_at(board, 0, self.now)
+            .await
+            .map_err(|error| JoinerLost::of(fault_of(&error)))
+    }
+
+    /// Complete the durable actor handoff before the join protocol acknowledges a proposed
+    /// admission. The signed Member withdrawal covers the actual witness epoch and timestamp,
+    /// even if the responder's clock is later than this joiner's starting clock.
+    async fn retain_board_cleanup_at(
+        &self,
+        board: &Arc<VoxConnection>,
+        epoch: u64,
+        timestamp_ms: u64,
+    ) -> crate::error::Result<()> {
+        let withdrawal = crate::nat::withdraw::BoardWithdraw::build(
+            self.signer.as_ref(),
+            &self.parsed.channel_id,
+            epoch,
+            crate::nat::withdraw::WithdrawScope::Member,
+            timestamp_ms.max(self.now),
+        )?
+        .to_wire();
+        let (ack, received) = oneshot::channel();
+        self.tx
+            .send(NetEvent::JoinBoardPublication {
+                channel_id: self.parsed.channel_id,
+                attachment: self.attachment,
+                board: Arc::clone(board),
+                withdrawal: Some(withdrawal),
+                ack,
+            })
+            .await
+            .map_err(|_| Error::AtRestLocked)?;
+        received.await.map_err(|_| Error::AtRestLocked)?
+    }
+
+    /// An answered refusal proves this exact announcement published nothing. Remove its route
+    /// before reporting the failure, so a rejected future-dated pre-join cannot manufacture a
+    /// future tombstone and block the same person's corrected-clock retry.
+    async fn forget_refused_board_cleanup(
+        &self,
+        board: &Arc<VoxConnection>,
+    ) -> Result<(), JoinerLost> {
+        let (ack, received) = oneshot::channel();
+        self.tx
+            .send(NetEvent::JoinBoardPublication {
+                channel_id: self.parsed.channel_id,
+                attachment: self.attachment,
+                board: Arc::clone(board),
+                withdrawal: None,
+                ack,
+            })
+            .await
+            .map_err(|_| JoinerLost::of(Fault::Locked))?;
+        received
+            .await
+            .map_err(|_| JoinerLost::of(Fault::Locked))?
+            .map_err(|error| JoinerLost::of(fault_of(&error)))
+    }
+
     fn helper_context(&self) -> crate::node::network::HelperContext {
         crate::node::network::HelperContext {
             room: Some(self.parsed.channel_id),
@@ -3834,9 +3949,13 @@ impl Joiner {
                 "announcing this joiner to board {}",
                 short(board.peer_id())
             ));
+            self.retain_board_cleanup(&board).await?;
             let Err(e) = announce(&board, &prejoin_wire).await else {
                 break;
             };
+            if matches!(e, Error::RendezvousRejected(_)) {
+                self.forget_refused_board_cleanup(&board).await?;
+            }
             steps.took("announce to the board (failed)", t);
             refused.push(format!(
                 "board {} took no pre-join record: {e}",
@@ -3971,7 +4090,11 @@ impl Joiner {
                 };
                 match dialled {
                     Ok(c) => {
+                        self.retain_board_cleanup(&c).await?;
                         if let Err(e) = announce(&c, &prejoin_wire).await {
+                            if matches!(e, Error::RendezvousRejected(_)) {
+                                self.forget_refused_board_cleanup(&c).await?;
+                            }
                             last_fault = fault_of(&e);
                             // Said, as a failed dial is: a join that failed here reported no
                             // reason at all (V210-83).
@@ -4029,7 +4152,9 @@ impl Joiner {
                  the member's answer)"
             ));
             let exchanged = net
-                .start_join(&conn, ctx, &self.passphrase, signer, &ik)
+                .start_join(&conn, ctx, &self.passphrase, signer, &ik, |proposal| {
+                    self.retain_board_cleanup_at(&conn, proposal.epoch, proposal.timestamp_ms)
+                })
                 .await;
             // **The solve apart from the rest** (V210-62): the proof of work is this machine's
             // own CPU and random in length by design, the rest is waiting on the responder. One
@@ -4205,7 +4330,9 @@ pub struct NodeHandle {
     /// Fresh for each actor lifetime, so a repaired client cannot reuse an old display token.
     display_incarnation: Digest32,
     computer: Option<Arc<crate::node::computer::Computer>>,
-    computer_revision: Arc<std::sync::atomic::AtomicU64>,
+    /// The exact identity and one monotonic deadline minted by this actor's latest successful
+    /// startup. The daemon reads this once and spends the same boundary through Ready.
+    startup_computer_boundary: Arc<std::sync::Mutex<Option<(std::time::Instant, Digest32)>>>,
     cmd_tx: mpsc::Sender<(NodeCommand, oneshot::Sender<Outcome>)>,
     /// Posts waiting for one room's bounded publication owner to yield. The command queue does
     /// not bound sleeping client futures, so their retained text has its own fixed node budget.
@@ -4476,15 +4603,32 @@ impl NodeHandle {
         query_history(&self.net_tx, channel_id, query).await
     }
 
-    /// Borrow metadata directly: cloning NodeView also clones every room's complete order.
-    pub(crate) fn inspect_view<T>(&self, read: impl FnOnce(&NodeView, bool) -> T) -> T {
-        let policy_current = self.computer.as_ref().is_none_or(|c| {
-            c.policy_current(
-                self.computer_revision
-                    .load(std::sync::atomic::Ordering::Acquire),
-            )
+    /// Clone one metadata projection, then classify that exact copy against durable policy. The
+    /// order matters: a revocation that lands before classification suppresses its trust rows;
+    /// one that lands afterward overlaps this read, which linearizes at the classification. No
+    /// potentially large view clone or formatting holds the Computer state lock.
+    pub(crate) fn coherent_view(&self) -> (NodeView, bool) {
+        // Clone rows and their exact applied revision/expiry together, then drop the watch
+        // borrow before taking the Computer lock. Separate atomic revision reads cannot certify
+        // these rows, particularly when a revision expires without changing its number.
+        let view = self.view_rx.borrow().clone();
+        let policy_current = self.computer.as_ref().is_none_or(|computer| {
+            view.computer_policy.is_some_and(|(applied, expired)| {
+                view.identity.as_ref().is_some_and(|identity| {
+                    computer.policy_current(applied, expired, identity.fingerprint)
+                })
+            })
         });
-        read(&self.view_rx.borrow(), policy_current)
+        #[cfg(feature = "test-knobs")]
+        let policy_current =
+            policy_current || crate::node::computer::fx28_mutant("stale-trust-projection");
+        (view, policy_current)
+    }
+
+    /// Inspect the published view without cloning its complete room orders. The work-board caller
+    /// reads room membership only; authority-bearing trust projections use `coherent_view`.
+    pub(crate) fn inspect_published_view<T>(&self, read: impl FnOnce(&NodeView) -> T) -> T {
+        read(&self.view_rx.borrow())
     }
 
     /// Resolve a `.vox` name against this node's rooms and keyring (PRD-001 R20): the
@@ -4596,15 +4740,12 @@ impl NodeHandle {
     /// The latest view (cheap clone of the watch value).
     #[must_use]
     pub fn view(&self) -> NodeView {
-        let mut view = self.view_rx.borrow().clone();
-        if let Some(c) = &self.computer {
-            if !c.policy_current(
-                self.computer_revision
-                    .load(std::sync::atomic::Ordering::Acquire),
-            ) {
-                // Fail closed while the actor reconciles the newly durable policy.
-                view.drive.clear();
-            }
+        let (mut view, policy_current) = self.coherent_view();
+        if !policy_current {
+            // Fail closed while the actor reconciles the newly durable policy. Read trust is
+            // authority too: callers must not turn an old keyring row into an effective grant.
+            view.trusted.clear();
+            view.drive.clear();
         }
         view
     }
@@ -4899,10 +5040,112 @@ impl EventStream {
     }
 }
 
-/// A signed room withdrawal awaiting anchors, including routes that outlive room purge.
+const PENDING_WITHDRAWALS_META_KEY: &str = "pending-board-withdrawals";
+const PENDING_JOIN_CLEANUP_META_KEY: &str = "pending-join-board-cleanup";
+const PENDING_WITHDRAWALS_VERSION: u64 = 1;
+const MAX_PENDING_WITHDRAWALS: usize = 4096;
+const MAX_WITHDRAWAL_TARGETS: usize = 4096;
+const MAX_WITHDRAWAL_ROUTES: usize = 64;
+
+/// A signed room withdrawal awaiting boards, including routes that outlive room purge.
+#[derive(Clone)]
 struct PendingWithdrawal {
     wire: Vec<u8>,
     routes: BTreeMap<Digest32, Vec<std::net::SocketAddr>>,
+}
+
+fn pending_withdrawals_bytes(
+    pending: &BTreeMap<Digest32, PendingWithdrawal>,
+) -> crate::error::Result<Vec<u8>> {
+    if pending.len() > MAX_PENDING_WITHDRAWALS {
+        return Err(Error::SizeLimitExceeded("pending board withdrawals"));
+    }
+    let mut e = crate::cbor::Encoder::new();
+    e.array(2)
+        .uint(PENDING_WITHDRAWALS_VERSION)
+        .array(pending.len());
+    for (room, withdrawal) in pending {
+        if withdrawal.routes.len() > MAX_WITHDRAWAL_TARGETS {
+            return Err(Error::SizeLimitExceeded("pending withdrawal targets"));
+        }
+        e.array(3)
+            .bytes(room)
+            .bytes(&withdrawal.wire)
+            .array(withdrawal.routes.len());
+        for (target, routes) in &withdrawal.routes {
+            if routes.len() > MAX_WITHDRAWAL_ROUTES {
+                return Err(Error::SizeLimitExceeded("pending withdrawal routes"));
+            }
+            e.array(2).bytes(target).array(routes.len());
+            for route in routes {
+                e.text(&route.to_string());
+            }
+        }
+    }
+    Ok(e.finish())
+}
+
+fn read_pending_withdrawals(
+    bytes: &[u8],
+) -> crate::error::Result<BTreeMap<Digest32, PendingWithdrawal>> {
+    let bad = |why| Error::MalformedAtRest(why);
+    let mut d = crate::cbor::Decoder::new(bytes);
+    if d.array().map_err(|_| bad("pending withdrawals"))? != 2
+        || d.uint().map_err(|_| bad("pending withdrawals version"))? != PENDING_WITHDRAWALS_VERSION
+    {
+        return Err(bad("pending withdrawals version"));
+    }
+    let count = d.array().map_err(|_| bad("pending withdrawals count"))?;
+    if count > MAX_PENDING_WITHDRAWALS {
+        return Err(bad("pending withdrawals count"));
+    }
+    let mut pending = BTreeMap::new();
+    for _ in 0..count {
+        if d.array().map_err(|_| bad("pending withdrawal"))? != 3 {
+            return Err(bad("pending withdrawal arity"));
+        }
+        let room = Digest32::try_from(d.bytes().map_err(|_| bad("pending withdrawal room"))?)
+            .map_err(|_| bad("pending withdrawal room length"))?;
+        let wire = d
+            .bytes()
+            .map_err(|_| bad("pending withdrawal wire"))?
+            .to_vec();
+        let target_count = d
+            .array()
+            .map_err(|_| bad("pending withdrawal target count"))?;
+        if target_count > MAX_WITHDRAWAL_TARGETS {
+            return Err(bad("pending withdrawal target count"));
+        }
+        let mut routes = BTreeMap::new();
+        for _ in 0..target_count {
+            if d.array().map_err(|_| bad("pending withdrawal target"))? != 2 {
+                return Err(bad("pending withdrawal target arity"));
+            }
+            let target =
+                Digest32::try_from(d.bytes().map_err(|_| bad("pending withdrawal target id"))?)
+                    .map_err(|_| bad("pending withdrawal target id length"))?;
+            let route_count = d
+                .array()
+                .map_err(|_| bad("pending withdrawal route count"))?;
+            if route_count > MAX_WITHDRAWAL_ROUTES {
+                return Err(bad("pending withdrawal route count"));
+            }
+            let mut target_routes = Vec::with_capacity(route_count);
+            for _ in 0..route_count {
+                let route = d
+                    .text()
+                    .map_err(|_| bad("pending withdrawal route"))?
+                    .parse()
+                    .map_err(|_| bad("pending withdrawal route address"))?;
+                target_routes.push(route);
+            }
+            routes.insert(target, target_routes);
+        }
+        pending.insert(room, PendingWithdrawal { wire, routes });
+    }
+    d.finish()
+        .map_err(|_| bad("pending withdrawals trailing"))?;
+    Ok(pending)
 }
 
 /// An opened room stays private until one bounded recovery/retention turn completes.
@@ -4991,6 +5234,16 @@ enum RoomPublicationKind {
     Anchors,
 }
 
+/// What durable room state existed before this publication began.  Only a failed create or join
+/// owns newly-written room rows and may purge them; opening an existing room owns only its live
+/// projection and must leave the user's stored room and reopen record intact.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomPublicationOwnership {
+    Existing,
+    Joined,
+    Created,
+}
+
 /// One original room reply, fenced to the room it actually published.
 /// Reopens use the same completion without retaining an individual reply.
 struct RoomPublication {
@@ -5000,6 +5253,8 @@ struct RoomPublication {
     reopening: bool,
     /// Settings need current local policy/configuration, not history or an anchor round.
     kind: RoomPublicationKind,
+    /// The exact Computer projection which authorized creating/joining/opening this incarnation.
+    authority: Option<(computer::ComputerAuthority, RoomPublicationOwnership)>,
 }
 
 #[derive(Clone, Copy)]
@@ -5059,6 +5314,9 @@ pub struct Node {
     bind: Option<Bind>,
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
+    startup_computer_boundary: Arc<std::sync::Mutex<Option<(std::time::Instant, Digest32)>>>,
+    /// Expiry of the exact settled projection, never sampled from newer durable policy.
+    computer_expired: bool,
     /// One sequence for this actor, including rooms closed and reopened between snapshots.
     display_sequence: std::sync::atomic::AtomicU64,
     /// The headless transport identity, if this node runs without a vault.
@@ -5300,6 +5558,11 @@ pub struct Node {
     board_authors: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// `(room, board)` publish rounds in flight on their own tasks; see `publish_channel_to_anchor`.
     publishing: std::collections::BTreeSet<(Digest32, Digest32)>,
+    /// Authenticated transport routes actually used to publish each room to each board. A board
+    /// which is a room member need not be an anchor, and its connection may be gone by the time a
+    /// stale publication must be withdrawn. Keep the observed route until the room is retracted,
+    /// so the durable withdrawal can still name where it must go after a restart.
+    board_routes: BTreeMap<(Digest32, Digest32), Vec<std::net::SocketAddr>>,
     /// Publishes asked for while that `(room, board)` round was in flight: run when it ends, and
     /// counted under the cause that asked first (several asks while one round runs are one round).
     publish_again: BTreeMap<(Digest32, Digest32), PublishCause>,
@@ -5323,6 +5586,10 @@ pub struct Node {
     /// One completion per room, after current detail is published and any required
     /// initial anchor round ends. Neither room keys nor a snapshot survive a wait.
     publish_waiters: BTreeMap<Digest32, RoomPublication>,
+    /// Carried from the first durable room write to the publication waiter. Ownership selects
+    /// both the room-create mutant boundary and whether failed publication may purge new rows.
+    room_publication_authority:
+        BTreeMap<Digest32, (computer::ComputerAuthority, RoomPublicationOwnership)>,
     publication_after: Option<Digest32>,
     publication_pending: bool,
     publication_again: bool,
@@ -5389,6 +5656,9 @@ pub struct Node {
     // Wire and the room's effective anchor identities at withdrawal. The room may be
     // purged before an offline anchor returns, so its scope must survive that purge.
     withdrawn: BTreeMap<Digest32, PendingWithdrawal>,
+    /// Signed rollback retained before a joining task publishes to a board. It is not sent
+    /// during a successful join; failure or startup recovery promotes it before partial purge.
+    join_cleanup: BTreeMap<Digest32, PendingWithdrawal>,
     /// Per room, the members that had left as of the last tend (V030-08), to see one come back.
     departed_seen: BTreeMap<Digest32, std::collections::BTreeSet<Digest32>>,
     /// Per `(room, member)`: consecutive keys not taken, and the unix millisecond before which the
@@ -5411,6 +5681,12 @@ pub struct Node {
     /// acknowledgement or a completed store-and-forward append. Kept through refusal so a stale
     /// published room view cannot briefly report completion before the fallback updates it.
     key_delivery_settling: BTreeSet<(Digest32, Digest32)>,
+    /// Test-only exact legacy-route marker, emitted only after the changed user view is published.
+    #[cfg(feature = "test-knobs")]
+    fx28_ended_unanswered_marker: Option<(std::path::PathBuf, Vec<u8>)>,
+    /// Test-only exact re-key pair paused after a staged `ENDED_UNANSWERED` selection.
+    #[cfg(feature = "test-knobs")]
+    fx28_rekey_pause: Option<(Digest32, Digest32)>,
     /// Per `(room, member, generation)`: the key delivery opened for it (ADR-030 D-4), until the
     /// member takes it, a later key supersedes it, or the member says its opening cannot work.
     deliveries: BTreeMap<(Digest32, Digest32, u64), Delivery>,
@@ -5855,6 +6131,8 @@ impl Node {
             bind,
             computer,
             computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            computer_expired: false,
+            startup_computer_boundary: Arc::new(std::sync::Mutex::new(None)),
             display_sequence: std::sync::atomic::AtomicU64::new(1),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
             room_anchors: BTreeMap::new(),
@@ -5935,6 +6213,7 @@ impl Node {
             pairwise_epoch: watch::channel(0).0,
             board_authors: BTreeMap::new(),
             publishing: std::collections::BTreeSet::new(),
+            board_routes: BTreeMap::new(),
             publish_again: BTreeMap::new(),
             stale_retries: BTreeMap::new(),
             republish_pending: std::collections::BTreeSet::new(),
@@ -5942,6 +6221,7 @@ impl Node {
             publish_failures: std::collections::BTreeMap::new(),
             publish_retry_pending: BTreeSet::new(),
             publish_waiters: BTreeMap::new(),
+            room_publication_authority: BTreeMap::new(),
             publication_after: None,
             publication_pending: false,
             publication_again: false,
@@ -5966,6 +6246,7 @@ impl Node {
             winding: BTreeMap::new(),
             departed_seen: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
+            join_cleanup: BTreeMap::new(),
             governance_work: governance::Maintenance::default(),
             key_backoff: BTreeMap::new(),
             rekey_after: BTreeMap::new(),
@@ -5974,6 +6255,10 @@ impl Node {
             reoffer: BTreeSet::new(),
             keys_in_flight: BTreeMap::new(),
             key_delivery_settling: BTreeSet::new(),
+            #[cfg(feature = "test-knobs")]
+            fx28_ended_unanswered_marker: None,
+            #[cfg(feature = "test-knobs")]
+            fx28_rekey_pause: None,
             deliveries: BTreeMap::new(),
             delivery_reserved: BTreeMap::new(),
             key_waiting: BTreeMap::new(),
@@ -6103,12 +6388,12 @@ impl Node {
         let paths = node.paths.clone();
         let decisions = node.decisions.clone();
         let computer = node.computer.clone();
-        let computer_revision = Arc::clone(&node.computer_revision);
+        let startup_computer_boundary = Arc::clone(&node.startup_computer_boundary);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx, flow_release_rx));
         let handle = NodeHandle {
             display_incarnation,
             computer,
-            computer_revision,
+            startup_computer_boundary,
             cmd_tx,
             post_slots,
             view_rx,
@@ -6166,7 +6451,6 @@ impl Node {
                     self.governance_work.wake_expired(self.now_ms().get());
                 }
                 () = tokio::task::yield_now(), if self.governance_work.pending || self.room_preparation_work_ready() || (!self.legacy_cleanup_rooms.is_empty() && std::time::Instant::now() >= self.legacy_cleanup_due) || self.key_package_work_ready() => {
-                    if self.apply_computer_keyring().await.is_err() { continue; }
                     for _ in 0..4 {
                         let turn = maintenance_next;
                         maintenance_next = (maintenance_next + 1) % 4;
@@ -6197,14 +6481,11 @@ impl Node {
                 received = cmd_rx.recv() => {
                     let Some((command, reply)) = received else { break };
                     let shutdown = matches!(command, NodeCommand::Shutdown);
-                    // Creating/unlocking the identity must reach start_network(), which applies
-                    // computer policy before registering an endpoint. A locked store cannot be
-                    // reconciled before Unlock has opened it.
-                    let opens_identity = matches!(command, NodeCommand::Unlock { .. } | NodeCommand::CreateIdentity { .. });
-                    if !shutdown && !opens_identity && self.apply_computer_keyring().await.is_err() {
-                        let _=reply.send(Outcome::Failed(Fault::Storage));
-                        continue;
-                    }
+                    // Computer policy is applied by its causal `ComputerPolicy` event (and by
+                    // startup before Ready), never by minting a fresh wall-clock deadline for an
+                    // unrelated command.  Authority-bearing handlers below fence their exact
+                    // irreversible write; reads remain available and fail closed projections do
+                    // not take the whole node out of service while reconciliation is pending.
                     let name = command_name(&command);
                     let started = std::time::Instant::now();
                     // Proof the actor is taking commands (V210-83): it changes nothing, so nothing
@@ -6403,7 +6684,6 @@ impl Node {
                 Some(event) = net_rx.recv() => {
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
-                    if !matches!(&event, NetEvent::ComputerPolicy(_)) && self.apply_computer_keyring().await.is_err() { continue; }
                     if let NetEvent::Status(reply) = event {
                         // Snapshotting the pool fences every synchronous release handoff included
                         // in it. Drain exactly those already-granted orders before rendering the
@@ -6463,7 +6743,6 @@ impl Node {
                     self.schedule().await;
                 }
                 _ = ingress_wake.notified() => {
-                    if self.apply_computer_keyring().await.is_err() { continue; }
                     let mut progressed = false;
                     for _ in 0..16 {
                         progressed |= self.drain_session_ingress().await;
@@ -6477,7 +6756,14 @@ impl Node {
                 _ = ticker.tick() => {
                     self.publication_pending |= !self.publish_waiters.is_empty();
                     self.publication_again |= !self.publish_waiters.is_empty();
-                    if self.apply_computer_keyring().await.is_err() { continue; }
+                    // A joined sparse room that is not yet settled owes its settlement one
+                    // attempt every tick: nothing else reliably re-arms it. Sync session and
+                    // head-completion events call it too, but a room whose remaining piece
+                    // is its own feed's acknowledgement gets no further sync event until
+                    // the fetch that acknowledgement needs is itself driven — by this call.
+                    for room in self.channels.keys().copied().collect::<Vec<_>>() {
+                        self.settle_room(&room).await;
+                    }
                     // Audit durable bounded result slots as maintenance. Completion now sends a
                     // reliable event and admission release has its own exact wake, so progress
                     // does not depend on reaching this periodic audit.
@@ -6838,12 +7124,8 @@ impl Node {
                 fingerprint,
                 petname,
             } => {
-                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
-                    if c.grouped() {
-                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
-                            return Outcome::Failed(fault_of(&e));
-                        }
-                    }
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
                 }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
@@ -6863,12 +7145,8 @@ impl Node {
                 history,
                 capability,
             } => {
-                if let (Some(c), Some(profile)) = (&self.computer, &self.profile) {
-                    if c.grouped() {
-                        if let Err(e) = c.individual_choice(profile.fingerprint(), fingerprint) {
-                            return Outcome::Failed(fault_of(&e));
-                        }
-                    }
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
                 }
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
@@ -6880,7 +7158,12 @@ impl Node {
             NodeCommand::SetCapability {
                 fingerprint,
                 capability,
-            } => self.set_capability(fingerprint, capability).await,
+            } => {
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
+                }
+                self.set_capability(fingerprint, capability).await
+            }
             NodeCommand::Rename {
                 fingerprint,
                 petname,
@@ -6908,6 +7191,9 @@ impl Node {
                 }
             }
             NodeCommand::Untrust { fingerprint } => {
+                if let Err(error) = self.choose_individual_trust(fingerprint).await {
+                    return Outcome::Failed(fault_of(&error));
+                }
                 let alias = self.trust.petname(&fingerprint).map(str::to_owned);
                 let out = self.untrust_identity(&fingerprint).await;
                 // **A member just removed is not offered back at once** (ADR-028 K-18): its offers
@@ -7110,6 +7396,7 @@ impl Node {
                     // The identity is usable but the ring is not: lock again rather
                     // than run without key-agreement keys.
                     drop(self.lock_all().await);
+                    eprintln!("vox node: identity unlock could not load its prekey ring: {e}");
                     // The passphrase was just proved by the vault, so a blob that will not open
                     // is not a wrong passphrase (V210-40).
                     return Outcome::Failed(match e {
@@ -7117,8 +7404,19 @@ impl Node {
                         e => fault_of(&e),
                     });
                 }
+                if let Err(e) = self.load_pending_withdrawals() {
+                    // Forgetting a signed withdrawal can resurrect records for a room whose
+                    // signing material was already purged. Refuse the unlock rather than run
+                    // with a board-cleanup obligation we cannot recover truthfully.
+                    drop(self.lock_all().await);
+                    eprintln!(
+                        "vox node: identity unlock could not recover pending board withdrawals: {e}"
+                    );
+                    return Outcome::Failed(fault_of(&e));
+                }
                 if let Err(e) = self.start_network() {
                     drop(self.lock_all().await);
+                    eprintln!("vox node: identity unlock could not start networking: {e}");
                     return Outcome::Failed(fault_of(&e));
                 }
                 // **Attaching opens no keyring window** (ADR-028 K-12): only a passphrase
@@ -7134,22 +7432,32 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
-        self.prepare_computer_binding()?;
-        for attempt in 0..8 {
-            self.apply_computer_keyring_at(0)?;
-            if self.computer.as_ref().is_none_or(|c| {
-                c.policy_current(
-                    self.computer_revision
-                        .load(std::sync::atomic::Ordering::Acquire),
-                )
-            }) {
-                break;
-            }
-            if attempt == 7 {
-                return Err(Error::Profile(
-                    "computer policy is still changing; try Unlock again after it settles",
-                ));
-            }
+        let identity = self.profile.as_ref().map(Profile::fingerprint).or_else(|| {
+            self.headless
+                .as_ref()
+                .map(|signer| crate::identity::composite::RootSigner::fingerprint(signer.as_ref()))
+        });
+        let Some(identity) = identity else {
+            return Err(crate::error::Error::Profile("no identity on this node"));
+        };
+        // Identity unlocking and its KDF are complete here: this boundary measures computer-trust
+        // startup, not passphrase work. One actor-owned observation end covers policy application
+        // and every daemon Ready reconciliation. A miss does not cancel accepted valid work;
+        // actual policy movement retries under this same original observation end. The identity
+        // travels with it so headless actors do not depend on a vault projection in `NodeView`.
+        let deadline =
+            std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
+        *self
+            .startup_computer_boundary
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((deadline, identity));
+        self.settle_startup_computer_policy(identity, deadline)?;
+        #[cfg(feature = "test-knobs")]
+        {
+            let revision = self
+                .computer_revision
+                .load(std::sync::atomic::Ordering::Acquire);
+            self.hold_after_computer_application_receipt_for_proof(identity, revision)?;
         }
         let Some(bind) = self.bind.as_ref() else {
             return Ok(());
@@ -7518,8 +7826,6 @@ impl Node {
             }
             return;
         }
-        let seq = self.next_record_seq(channel_id);
-        let base = self.record_timestamp(channel_id);
         // The admission goes out with the bundle: a node that cannot say how it became
         // a member publishes nothing, rather than publishing an unevidenced key (M17.6).
         let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
@@ -7529,195 +7835,230 @@ impl Node {
             }
             None => return,
         };
-        let records = {
-            let Some(profile) = self.profile.as_ref() else {
-                return;
-            };
-            let Ok(signer) = profile.signer() else { return };
-            let Some(ring) = self.prekeys.as_ref() else {
-                return;
-            };
-            let ring = ring.lock().await;
-            let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
-            net.own_records(signer, channel_id, epoch, &ring, seq, stamp, admission)
-        };
-        let Ok((address, bundle)) = records else {
+        let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
             return;
         };
-        // **Bounded, and it stops at the first dead stream.** Each put waits for the board's answer,
-        // which a live board gives in milliseconds, but a connection that died without saying so waits
-        // out the full frame patience (`SYNC_FRAME_TIMEOUT`, 20s) *per put*, and every one of those
-        // waits is on the actor. Measured in `perf_r40_relayed_chat_gate`: a member whose room's own
-        // anchor (another member) had just shut down published to it over the relayed connection still
-        // in the manager. The address put, then two mirrored records, each waited 20s:
-        // `busy 60s — filing a sync that finished`, one run in five, and nobody could be answered.
-        // The ordering above still holds whenever the board answers. A board that answers nothing within
-        // `ANCHOR_PUBLISH_PATIENCE` is given up on for this round. A transport error ends the round,
-        // since the rest would ride the same dead stream; a refusal does not.
-        #[cfg_attr(not(feature = "test-knobs"), allow(unused_mut))]
-        let mut own = vec![
-            ("the room's genesis", genesis_wire),
-            ("our member bundle", bundle.to_wire()),
-            ("our address", address.to_wire()),
-        ];
-        #[cfg(feature = "test-knobs")]
-        if test_hold_address(&conn.local_id(), channel_id) {
-            own.pop();
-        }
-        // A direct prekey renewal gives an active member only this node's refreshed records. Full
-        // board mirroring is for an anchor or the initial join round; repeating the whole board to
-        // every connected member would turn one consumed prekey into O(members × room records)
-        // retained bytes and signing work.
-        let direct_member_refresh = !serves_room
-            && matches!(
-                cause,
-                PublishCause::Renewal | PublishCause::AskedAgain | PublishCause::Retry
-            );
-        let mirrored = if direct_member_refresh {
-            Vec::new()
-        } else {
-            net.board_records(channel_id, epoch)
-        };
-        // **Off the actor, and still in order.** The round awaits a board's answers, which on a
-        // connection that died without saying so is `ANCHOR_PUBLISH_PATIENCE` of waiting, and that
-        // was on the actor: `busy 5.0s — filing a sync that finished`, a person's post held behind
-        // it (the V29-21 verdict: every run still had posts over 1s). The ordering the round exists
-        // for, these records on the board before a session with that board reads it, is kept
-        // explicitly instead: while a round to a board is in flight, that board's port for the room
-        // (ADR-025) waits rather than starting a session (`publishing`). One round per
-        // (room, board) at a time; a publish asked for meanwhile runs once the round ends.
-        if !self.publishing.insert((*channel_id, board_id)) {
-            match self.publish_again.entry((*channel_id, board_id)) {
-                std::collections::btree_map::Entry::Vacant(waiting) => {
-                    waiting.insert(cause);
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {
-                    crate::node::status::SyncBook::note_publish_merged(&self.sync_book, cause);
-                }
-            }
+        let ring = ring.lock().await;
+        let Some(authority) = self.computer_authority() else {
             return;
-        }
-        crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
-        #[cfg(feature = "test-knobs")]
-        let held = test_hold_room_from_anchors(&conn.local_id(), channel_id);
-        let conn = Arc::clone(conn);
-        let tx = self.net_tx.clone();
-        let cid = *channel_id;
-        tokio::spawn(async move {
-            let conn = &conn;
-            let round = async {
-                let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
-                #[cfg(feature = "test-knobs")]
-                if held {
-                    outcomes.push((
-                        "this publish round",
-                        Some(format!(
-                            "held for a proof ({TEST_HOLD_ROOM_FROM_ANCHORS_ENV})"
-                        )),
-                    ));
-                    return (outcomes, true, false);
-                }
-                // **A stream that will not open is a failed round, and says so.** It used to return
-                // no outcomes at all — "the next round's business" — which reported nothing and, for
-                // a room nothing else triggers a publish for, left it off that board indefinitely.
-                let client = match crate::nat::service::RendezvousClient::open(conn).await {
-                    Ok(client) => client,
-                    Err(e) => {
-                        outcomes.push(("this publish round", Some(format!("no stream: {e}"))));
-                        return (outcomes, true, false);
-                    }
+        };
+        // Signing fresh membership material and making its first publication observable are one
+        // synchronous authority boundary. Every room/prekey await is above it; the durable
+        // Computer state lock remains held through the exact `publishing` insertion and spawn.
+        let Some(()) = authority.publish(|| {
+            let seq = self.next_record_seq(channel_id);
+            let base = self.record_timestamp(channel_id);
+            let records = {
+                let Some(profile) = self.profile.as_ref() else {
+                    return;
                 };
-                let mut client = client;
-                // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
-                // log author; each kind's outcome is carried, success as well as failure, so a refusal
-                // that *stops* clears its memo below.
-                //
-                // **Our bundle before our address**: an address record carries no key, so a board can
-                // only verify it against a bundle it already holds (`network.rs` `board_records` emits
-                // bundles first for the same reason).
-                // Whether the board holds the room as a joiner needs it — genesis, bundle and
-                // address — once this round ends: each put taken, or refused only as older than what
-                // the board already holds (V210-96).
-                let mut holds_room = true;
-                for (kind, wire) in &own {
-                    let result = client.put(wire).await;
-                    let dead =
-                        matches!(&result, Err(e) if !matches!(e, Error::RendezvousRejected(_)));
-                    holds_room &= match &result {
-                        Ok(()) => true,
-                        Err(Error::RendezvousRejected(r)) => {
-                            *r == crate::nat::service::RejectReason::Stale.as_str()
-                        }
-                        Err(_) => false,
-                    };
-                    outcomes.push((kind, result.err().map(|e| e.to_string())));
-                    if dead {
-                        return (outcomes, true, false);
-                    }
+                let Ok(signer) = profile.signer() else { return };
+                let stamp =
+                    spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
+                if let Err(error) = Self::refresh_join_cleanup(
+                    profile,
+                    &mut self.join_cleanup,
+                    *channel_id,
+                    epoch,
+                    stamp,
+                    Some(conn),
+                ) {
+                    eprintln!("vox node: join publication could not retain its rollback: {error}");
+                    return;
                 }
-                // And every other member's records this node's board holds: an anchor learns a
-                // channel's members only from a member that vouches for them (M15.2a).
-                //
-                // **In order.** Convergence depends on these records being on the board before the
-                // next session with it reads them: spawning the send with nothing holding that
-                // session back once dropped the anchor-convergence gate from 3 runs in 5 to 1 in 6.
-                // `publishing` is what holds it back now.
-                let mut mirrored_refused = 0usize;
-                let mut mirrored_why = String::new();
-                let mut mirrored_dead = false;
-                for wire in &mirrored {
-                    match client.put(wire).await {
-                        Ok(()) => {}
-                        // A board that already holds something newer from that member has fresher news
-                        // than the copy we vouch with: nothing was refused that anyone needed.
-                        Err(Error::RendezvousRejected(r))
-                            if r == crate::nat::service::RejectReason::Stale.as_str() => {}
-                        Err(e) => {
-                            let dead = !matches!(e, Error::RendezvousRejected(_));
-                            mirrored_refused += 1;
-                            if mirrored_why.is_empty() {
-                                mirrored_why = e.to_string();
-                            }
-                            if dead {
-                                mirrored_dead = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                client.finish();
-                outcomes.push((
-                    "another member's record we vouch for",
-                    (mirrored_refused > 0)
-                        .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
-                ));
-                (outcomes, mirrored_dead, holds_room)
+                net.own_records(signer, channel_id, epoch, &ring, seq, stamp, admission)
             };
-            let (outcomes, failed, holds_room) =
-                match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
-                    Ok(done) => done,
-                    Err(_) => (
-                        vec![(
+            let Ok((address, bundle)) = records else {
+                return;
+            };
+            // **Bounded, and it stops at the first dead stream.** Each put waits for the board's answer,
+            // which a live board gives in milliseconds, but a connection that died without saying so waits
+            // out the full frame patience (`SYNC_FRAME_TIMEOUT`, 20s) *per put*, and every one of those
+            // waits is on the actor. Measured in `perf_r40_relayed_chat_gate`: a member whose room's own
+            // anchor (another member) had just shut down published to it over the relayed connection still
+            // in the manager. The address put, then two mirrored records, each waited 20s:
+            // `busy 60s — filing a sync that finished`, one run in five, and nobody could be answered.
+            // The ordering above still holds whenever the board answers. A board that answers nothing within
+            // `ANCHOR_PUBLISH_PATIENCE` is given up on for this round. A transport error ends the round,
+            // since the rest would ride the same dead stream; a refusal does not.
+            #[cfg_attr(not(feature = "test-knobs"), allow(unused_mut))]
+            let mut own = vec![
+                ("the room's genesis", genesis_wire),
+                ("our member bundle", bundle.to_wire()),
+                ("our address", address.to_wire()),
+            ];
+            #[cfg(feature = "test-knobs")]
+            if test_hold_address(&conn.local_id(), channel_id) {
+                own.pop();
+            }
+            // A direct prekey renewal gives an active member only this node's refreshed records. Full
+            // board mirroring is for an anchor or the initial join round; repeating the whole board to
+            // every connected member would turn one consumed prekey into O(members × room records)
+            // retained bytes and signing work.
+            let direct_member_refresh = !serves_room
+                && matches!(
+                    cause,
+                    PublishCause::Renewal | PublishCause::AskedAgain | PublishCause::Retry
+                );
+            let mirrored = if direct_member_refresh {
+                Vec::new()
+            } else {
+                net.board_records(channel_id, epoch)
+            };
+            // **Off the actor, and still in order.** The round awaits a board's answers, which on a
+            // connection that died without saying so is `ANCHOR_PUBLISH_PATIENCE` of waiting, and that
+            // was on the actor: `busy 5.0s — filing a sync that finished`, a person's post held behind
+            // it (the V29-21 verdict: every run still had posts over 1s). The ordering the round exists
+            // for, these records on the board before a session with that board reads it, is kept
+            // explicitly instead: while a round to a board is in flight, that board's port for the room
+            // (ADR-025) waits rather than starting a session (`publishing`). One round per
+            // (room, board) at a time; a publish asked for meanwhile runs once the round ends.
+            if !self.publishing.insert((*channel_id, board_id)) {
+                match self.publish_again.entry((*channel_id, board_id)) {
+                    std::collections::btree_map::Entry::Vacant(waiting) => {
+                        waiting.insert(cause);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        crate::node::status::SyncBook::note_publish_merged(&self.sync_book, cause);
+                    }
+                }
+                return;
+            }
+            let route = conn.quinn().remote_address();
+            let routes = self
+                .board_routes
+                .entry((*channel_id, board_id))
+                .or_default();
+            if !routes.contains(&route) {
+                if routes.len() == MAX_WITHDRAWAL_ROUTES {
+                    routes.remove(0);
+                }
+                routes.push(route);
+            }
+            crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
+            #[cfg(feature = "test-knobs")]
+            let held = test_hold_room_from_anchors(&conn.local_id(), channel_id);
+            let conn = Arc::clone(conn);
+            let tx = self.net_tx.clone();
+            let cid = *channel_id;
+            tokio::spawn(async move {
+                let conn = &conn;
+                let round = async {
+                    let mut outcomes: Vec<(&'static str, Option<String>)> = Vec::new();
+                    #[cfg(feature = "test-knobs")]
+                    if held {
+                        outcomes.push((
                             "this publish round",
                             Some(format!(
-                                "the board answered nothing within {}s",
-                                ANCHOR_PUBLISH_PATIENCE.as_secs()
+                                "held for a proof ({TEST_HOLD_ROOM_FROM_ANCHORS_ENV})"
                             )),
-                        )],
-                        true,
-                        false,
-                    ),
+                        ));
+                        return (outcomes, true, false);
+                    }
+                    // **A stream that will not open is a failed round, and says so.** It used to return
+                    // no outcomes at all — "the next round's business" — which reported nothing and, for
+                    // a room nothing else triggers a publish for, left it off that board indefinitely.
+                    let client = match crate::nat::service::RendezvousClient::open(conn).await {
+                        Ok(client) => client,
+                        Err(e) => {
+                            outcomes.push(("this publish round", Some(format!("no stream: {e}"))));
+                            return (outcomes, true, false);
+                        }
+                    };
+                    let mut client = client;
+                    // **Said, not swallowed.** A refused bundle is a member no other member can admit as a
+                    // log author; each kind's outcome is carried, success as well as failure, so a refusal
+                    // that *stops* clears its memo below.
+                    //
+                    // **Our bundle before our address**: an address record carries no key, so a board can
+                    // only verify it against a bundle it already holds (`network.rs` `board_records` emits
+                    // bundles first for the same reason).
+                    // Whether the board holds the room as a joiner needs it — genesis, bundle and
+                    // address — once this round ends: each put taken, or refused only as older than what
+                    // the board already holds (V210-96).
+                    let mut holds_room = true;
+                    for (kind, wire) in &own {
+                        let result = client.put(wire).await;
+                        let dead =
+                            matches!(&result, Err(e) if !matches!(e, Error::RendezvousRejected(_)));
+                        holds_room &= match &result {
+                            Ok(()) => true,
+                            Err(Error::RendezvousRejected(r)) => {
+                                *r == crate::nat::service::RejectReason::Stale.as_str()
+                            }
+                            Err(_) => false,
+                        };
+                        outcomes.push((kind, result.err().map(|e| e.to_string())));
+                        if dead {
+                            return (outcomes, true, false);
+                        }
+                    }
+                    // And every other member's records this node's board holds: an anchor learns a
+                    // channel's members only from a member that vouches for them (M15.2a).
+                    //
+                    // **In order.** Convergence depends on these records being on the board before the
+                    // next session with it reads them: spawning the send with nothing holding that
+                    // session back once dropped the anchor-convergence gate from 3 runs in 5 to 1 in 6.
+                    // `publishing` is what holds it back now.
+                    let mut mirrored_refused = 0usize;
+                    let mut mirrored_why = String::new();
+                    let mut mirrored_dead = false;
+                    for wire in &mirrored {
+                        match client.put(wire).await {
+                            Ok(()) => {}
+                            // A board that already holds something newer from that member has fresher news
+                            // than the copy we vouch with: nothing was refused that anyone needed.
+                            Err(Error::RendezvousRejected(r))
+                                if r == crate::nat::service::RejectReason::Stale.as_str() => {}
+                            Err(e) => {
+                                let dead = !matches!(e, Error::RendezvousRejected(_));
+                                mirrored_refused += 1;
+                                if mirrored_why.is_empty() {
+                                    mirrored_why = e.to_string();
+                                }
+                                if dead {
+                                    mirrored_dead = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    client.finish();
+                    outcomes.push((
+                        "another member's record we vouch for",
+                        (mirrored_refused > 0)
+                            .then(|| format!("{mirrored_refused} refused, first: {mirrored_why}")),
+                    ));
+                    (outcomes, mirrored_dead, holds_room)
                 };
-            let _ = tx
-                .send(NetEvent::PublishDone {
-                    channel_id: cid,
-                    board: board_id,
-                    outcomes,
-                    failed,
-                    holds_room,
-                })
-                .await;
-        });
+                let (outcomes, failed, holds_room) =
+                    match tokio::time::timeout(ANCHOR_PUBLISH_PATIENCE, round).await {
+                        Ok(done) => done,
+                        Err(_) => (
+                            vec![(
+                                "this publish round",
+                                Some(format!(
+                                    "the board answered nothing within {}s",
+                                    ANCHOR_PUBLISH_PATIENCE.as_secs()
+                                )),
+                            )],
+                            true,
+                            false,
+                        ),
+                    };
+                let _ = tx
+                    .send(NetEvent::PublishDone {
+                        channel_id: cid,
+                        board: board_id,
+                        outcomes,
+                        failed,
+                        holds_room,
+                    })
+                    .await;
+            });
+        }) else {
+            return;
+        };
     }
 
     /// Answer a create or join once the room can be found through this node's own route, or
@@ -7787,6 +8128,9 @@ impl Node {
                     outcome,
                     reopening,
                     kind,
+                    authority: (kind == RoomPublicationKind::Open)
+                        .then(|| self.room_publication_authority.remove(&room))
+                        .flatten(),
                 },
             );
         }
@@ -7988,6 +8332,47 @@ impl Node {
                     fault_of(&error)
                 };
                 self.fail_room_publication(room, waiting, fault);
+                return;
+            }
+        }
+        if let Some((authority, ownership)) = &waiting.authority {
+            let current = if *ownership == RoomPublicationOwnership::Created {
+                authority.publish_room_creation(|| ()).is_some()
+            } else {
+                authority.current()
+            };
+            if !current {
+                if *ownership == RoomPublicationOwnership::Existing {
+                    // Opening or startup reopening does not own this durable room. Keep its live
+                    // projection and original reply, then retry under the revision which made
+                    // the old authority token stale. Retracting it here silently closed a saved
+                    // room for the rest of the daemon session.
+                    waiting.authority = self
+                        .computer_authority()
+                        .map(|authority| (authority, RoomPublicationOwnership::Existing));
+                    self.publication_again |= waiting.authority.is_some();
+                    self.publish_waiters.insert(room, waiting);
+                    return;
+                }
+                // Create/join may already have put this room or member on a board before the
+                // final authority fence discovered the concurrent Computer change. Publish the
+                // narrowing withdrawal first and retain it for later anchors; only then may the
+                // local unpublished room be purged.
+                let scope = if *ownership == RoomPublicationOwnership::Created {
+                    crate::nat::withdraw::WithdrawScope::Room
+                } else {
+                    crate::nat::withdraw::WithdrawScope::Member
+                };
+                if let Err(fault) = self.withdraw_from_boards(&room, scope, authority).await {
+                    self.fail_room_publication(room, waiting, fault);
+                    return;
+                }
+                let outcome =
+                    self.reject_room_publication(&room, *ownership, Fault::ComputerPolicy);
+                self.publish().await;
+                if let Some(reply) = waiting.reply {
+                    let _ = reply.send(outcome);
+                }
                 return;
             }
         }
@@ -8949,52 +9334,72 @@ impl Node {
         if self.withdrawn.contains_key(channel_id) {
             return;
         }
-        // Armed before the round rather than after it: the records are signed below. **Only here**:
-        // every full round (this, then every anchor) comes through here, and a round to one anchor
-        // must not re-arm it, or an anchor reconnecting more often than every half-lifetime put
-        // the renewal off for good, and the own board and every other anchor lapsed.
-        self.arm_record_renewal(channel_id);
-        let seq = self.next_record_seq(channel_id);
-        let base = self.record_timestamp(channel_id);
-        let Some(profile) = self.profile.as_ref() else {
-            return;
-        };
-        let Ok(signer) = profile.signer() else { return };
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
         let channel = shared.lock().await;
-        let Some(ring) = self.prekeys.as_ref() else {
+        let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
             return;
         };
         let ring = ring.lock().await;
-        let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
-        let _ = net.publish_local(&channel.genesis().to_wire());
-        let admission = channel.own_admission().clone();
-        if let Ok((address, bundle)) = net.own_records(
-            signer,
-            channel_id,
-            channel.epoch(),
-            &ring,
-            seq,
-            stamp,
-            admission,
-        ) {
-            #[cfg(feature = "test-knobs")]
-            let held = test_hold_address(&net.manager().endpoint().local_id(), channel_id);
-            #[cfg(not(feature = "test-knobs"))]
-            let held = false;
-            if !held {
-                let _ = net.publish_local(&address.to_wire());
+        let Some(authority) = self.computer_authority() else {
+            return;
+        };
+        let _ = authority.publish(|| {
+            // Armed before the round rather than after it: the records are signed below. **Only
+            // here**: every full round (this, then every anchor) comes through here, and a round
+            // to one anchor must not re-arm it, or an anchor reconnecting more often than every
+            // half-lifetime put the renewal off for good, and the own board and every other
+            // anchor lapsed. The arm, fresh signature, and exact local publication all remain
+            // under the same current Computer authority.
+            self.arm_record_renewal(channel_id);
+            let seq = self.next_record_seq(channel_id);
+            let base = self.record_timestamp(channel_id);
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let Ok(signer) = profile.signer() else { return };
+            let stamp = spaced_stamp(&mut self.records_stamped, *channel_id, base, ring.offered());
+            if let Err(error) = Self::refresh_join_cleanup(
+                profile,
+                &mut self.join_cleanup,
+                *channel_id,
+                channel.epoch(),
+                stamp,
+                None,
+            ) {
+                eprintln!(
+                    "vox node: local join publication could not retain its rollback: {error}"
+                );
+                return;
             }
-            let _ = net.publish_local(&bundle.to_wire());
-        }
-        // The room's admission notices and members' withdraws this node keeps (#520): a board
-        // starts empty, and these are what tell every member of a newcomer that is offline, and of
-        // none that left.
-        for wire in channel.board_kept() {
-            let _ = net.publish_local(&wire);
-        }
+            let _ = net.publish_local(&channel.genesis().to_wire());
+            let admission = channel.own_admission().clone();
+            if let Ok((address, bundle)) = net.own_records(
+                signer,
+                channel_id,
+                channel.epoch(),
+                &ring,
+                seq,
+                stamp,
+                admission,
+            ) {
+                #[cfg(feature = "test-knobs")]
+                let held = test_hold_address(&net.manager().endpoint().local_id(), channel_id);
+                #[cfg(not(feature = "test-knobs"))]
+                let held = false;
+                if !held {
+                    let _ = net.publish_local(&address.to_wire());
+                }
+                let _ = net.publish_local(&bundle.to_wire());
+            }
+            // The room's admission notices and members' withdraws this node keeps (#520): a board
+            // starts empty, and these are what tell every member of a newcomer that is offline,
+            // and of none that left.
+            for wire in channel.board_kept() {
+                let _ = net.publish_local(&wire);
+            }
+        });
     }
 
     /// Republish the membership snapshot and peer policy the served board and the
@@ -9242,13 +9647,15 @@ impl Node {
             }
             NetEvent::JoinAdmit {
                 channel_id,
+                original,
+                attachment,
+                peer,
                 identity,
                 witness,
                 ack,
             } => {
                 // The join proved this identity; admit it as an author so its entries — and its
                 // records on this node's board — are accepted. Reading still needs consent.
-                let now_ms = self.now_ms();
                 // **Test-only** (`test-knobs`): this node fails every joiner's admission as a node
                 // locked mid-join does — admitting nothing — so a proof can see what the joiner is
                 // told.
@@ -9256,35 +9663,80 @@ impl Node {
                 let fails = std::env::var_os(TEST_ADMISSION_FAILS_ENV).is_some();
                 #[cfg(not(feature = "test-knobs"))]
                 let fails = false;
-                let mut notice = None;
+                let authority = self.computer_authority();
+                let net = self.net.as_ref().map(Arc::clone);
                 let admitted = match (
                     self.profile.as_ref().filter(|_| !fails),
                     self.channels.get(&channel_id).map(Arc::clone),
+                    authority,
                 ) {
-                    (Some(profile), Some(shared)) => {
+                    (Some(profile), Some(shared), Some(authority)) => {
                         let mut ch = shared.lock().await;
-                        let admitted = ch
-                            .admit_author(profile.store(), &identity, now_ms)
-                            .map(|_| ch.name().map(str::to_owned));
-                        // A member that left and proved the passphrase again is in again here,
-                        // until its own return reaches the others through this node (V030-08).
-                        if admitted.is_ok() {
-                            ch.readmit(identity.fingerprint());
-                            // Its admission, as this node witnessed it, kept and put on this
-                            // node's board, so every member learns of the joiner while it is
-                            // offline (#520).
-                            if let Ok(n) = crate::nat::notice::AdmissionNotice::new(
-                                (*identity).clone(),
-                                (*witness).clone(),
-                            ) {
-                                let _ = ch.keep_notice(profile.store(), &n);
-                                notice = Some(n.to_wire());
-                            }
-                        }
-                        admitted
+                        let now_ms = self.now_ms();
+                        authority
+                            .publish(|| -> crate::error::Result<Option<String>> {
+                                // Authentication ran off actor while this room could end, leave,
+                                // close/reopen, or change epoch. Admission is the irreversible
+                                // boundary: recheck the exact live owner and witness under this
+                                // same lock, immediately before any author/notice mutation.
+                                if attachment != self.delivery_epoch
+                                    || original
+                                        .upgrade()
+                                        .is_none_or(|original| !Arc::ptr_eq(&original, &shared))
+                                {
+                                    return Err(Error::JoinRefused(
+                                        "the room or attachment changed during the join",
+                                    ));
+                                }
+                                if ch.ended(now_ms.get()).is_some() {
+                                    return Err(Error::JoinRoomEnded);
+                                }
+                                if ch.has_left(&ch.me()) {
+                                    return Err(Error::JoinResponderLeft);
+                                }
+                                if !ch.can_answer_join() {
+                                    return Err(Error::JoinRefused(
+                                        "the room can no longer answer this join",
+                                    ));
+                                }
+                                if identity.fingerprint() != peer {
+                                    return Err(Error::MalformedJoin(
+                                        "admission identity differs from the authenticated joiner",
+                                    ));
+                                }
+                                witness.verify(
+                                    &crate::identity::composite::RootSigner::public_key(
+                                        profile.signer()?,
+                                    ),
+                                    &channel_id,
+                                    ch.epoch(),
+                                    &peer,
+                                )?;
+                                let notice = crate::nat::notice::AdmissionNotice::new(
+                                    (*identity).clone(),
+                                    (*witness).clone(),
+                                )?;
+                                ch.admit_author_with_notice(profile.store(), &notice, now_ms)?;
+                                // A member that left and proved the passphrase again is in again
+                                // here, until its own return reaches the others through this node.
+                                ch.readmit(identity.fingerprint());
+                                // Membership and its notice are durable together before live
+                                // publication. Success cannot acknowledge a seat after durable
+                                // Computer policy has moved, or one a restart cannot announce.
+                                if let Some(net) = &net {
+                                    let _ = net.publish_local(&notice.to_wire());
+                                }
+                                Ok(ch.name().map(str::to_owned))
+                            })
+                            .unwrap_or(Err(Error::Profile(
+                                "computer policy changed before the room mutation",
+                            )))
                     }
-                    (None, _) => Err(Error::Profile("locked")),
-                    (_, None) => Err(Error::Profile("no such room on this node")),
+                    (Some(_), Some(_), None) => Err(Error::Profile(
+                        "computer policy changed before the room mutation",
+                    )),
+                    (None, _, _) => Err(Error::Profile("locked")),
+                    (_, None, _) => Err(Error::Profile("no such room on this node")),
                 };
                 // **Not admitted, not accepted.** This was dropped, and the joiner was told it was
                 // in whatever happened: a room already full took nobody, and its joiner exited 0.
@@ -9306,11 +9758,6 @@ impl Node {
                     // joiner's later member-record publication, permanently losing messages posted
                     // in the ForwardOnly gap. Successful key sealing, an untrusted admission or
                     // the joiner's address publication removes it below (V210-102).
-                    if let Some(net) = self.net.as_ref() {
-                        if let Some(wire) = &notice {
-                            let _ = net.publish_local(wire);
-                        }
-                    }
                 }
                 let _ = ack.send(admitted);
             }
@@ -9464,6 +9911,24 @@ impl Node {
                 });
                 let _ = ack.send(());
             }
+            NetEvent::JoinBoardPublication {
+                channel_id,
+                attachment,
+                board,
+                withdrawal,
+                ack,
+            } => {
+                let result =
+                    if attachment != self.delivery_epoch || !self.joining.contains(&channel_id) {
+                        Err(Error::Profile("the join no longer owns this attachment"))
+                    } else {
+                        match withdrawal {
+                            Some(wire) => self.retain_join_cleanup(channel_id, &board, wire),
+                            None => self.forget_refused_join_board(channel_id, &board),
+                        }
+                    };
+                let _ = ack.send(result);
+            }
             NetEvent::JoinerDone {
                 reply,
                 parsed,
@@ -9494,7 +9959,10 @@ impl Node {
                         if !lost.why.is_empty() {
                             self.say_why_the_join_failed(&lost.why);
                         }
-                        Outcome::Failed(lost.fault)
+                        match self.abort_join_cleanup(&room, lost.fault) {
+                            Ok(outcome) => outcome,
+                            Err(error) => Outcome::Failed(fault_of(&error)),
+                        }
                     }
                 };
                 // Whatever arrived for this room while it was being joined, in arrival order — into
@@ -9543,27 +10011,71 @@ impl Node {
                 let outcome = match sealed {
                     Err(e) => Outcome::Failed(fault_of(&e)),
                     Ok(_) if taken => Outcome::Failed(Fault::RoomNameTaken),
-                    Ok((sek, wrap)) => match self.profile.as_ref() {
-                        None => Outcome::Failed(Fault::NoIdentity),
-                        Some(profile) => match ChannelState::create_from_sealed(
-                            profile,
-                            &room_name,
-                            &passphrase,
-                            *genesis,
-                            sek,
-                            &wrap,
-                            now,
-                            &anchors,
-                        ) {
-                            Ok(ch) => match service {
-                                None => self.finish_create_channel(ch).await,
-                                Some((tag, endpoint, kind)) => {
-                                    self.finish_serve_room(ch, &tag, endpoint, kind).await
+                    Ok((sek, wrap)) => {
+                        #[cfg(feature = "test-knobs")]
+                        self.hold_room_create_publication_for_proof().await;
+                        let Some(profile) = self.profile.as_ref() else {
+                            return self
+                                .answer_when_published(
+                                    room,
+                                    reply,
+                                    Outcome::Failed(Fault::NoIdentity),
+                                )
+                                .await;
+                        };
+                        let Some(authority) = self.computer_authority() else {
+                            return self
+                                .answer_when_published(
+                                    room,
+                                    reply,
+                                    Outcome::Failed(Fault::ComputerPolicy),
+                                )
+                                .await;
+                        };
+                        // Argon2 and service probing completed off actor. Hold exact durable
+                        // Computer authority across the room commit and, for `serve`, the coupled
+                        // service/share commit. A policy change can therefore leave neither a
+                        // committed empty service room nor a stale signed share behind.
+                        let created = authority.publish_room_creation(|| {
+                            let mut channel = ChannelState::create_from_sealed(
+                                profile,
+                                &room_name,
+                                &passphrase,
+                                *genesis,
+                                sek,
+                                &wrap,
+                                now,
+                                &anchors,
+                            )?;
+                            if let Some((tag, endpoint, kind)) = &service {
+                                let offered = channel
+                                    .add_service(
+                                        profile.store(),
+                                        profile,
+                                        tag,
+                                        *endpoint,
+                                        *kind,
+                                        true,
+                                    )
+                                    .and_then(|_| channel.say_share(profile, tag, true, now));
+                                if let Err(error) = offered {
+                                    // `create_from_sealed` committed first. Remove that private,
+                                    // unpublished room before reporting the coupled operation's
+                                    // failure; a cleanup failure is the louder storage failure.
+                                    Self::purge_unpublished_channel(profile, &room)?;
+                                    return Err(error);
                                 }
-                            },
-                            Err(e) => Outcome::Failed(fault_of(&e)),
-                        },
-                    },
+                            }
+                            Ok(channel)
+                        });
+                        match created {
+                            None => Outcome::Failed(Fault::ComputerPolicy),
+                            Some(Err(error)) => Outcome::Failed(fault_of(&error)),
+                            Some(Ok(channel)) => {
+                                self.finish_create_channel(channel, authority).await
+                            }
+                        }
+                    }
                 };
                 // The view first, then the answer — as for a join above.
                 self.answer_when_published(room, reply, outcome).await;
@@ -9912,7 +10424,7 @@ impl Node {
                     if !self.anchor_serves_room(&room, &peer) {
                         continue;
                     }
-                    if let Some(r) = self.admin_roster(&room).await {
+                    if let Ok(Some(r)) = self.admin_roster(&room).await {
                         puts.push(r);
                     }
                 }
@@ -10069,11 +10581,20 @@ impl Node {
                     // the pair's long-lived session from now, as it expects them, and that is said
                     // beside it. Its kept deliveries in sessions of their own are no use to it.
                     if why == crate::node::pairwise_stream::ENDED_UNANSWERED {
+                        #[cfg(feature = "test-knobs")]
+                        if !crate::node::computer::fx28_mutant(
+                            "legacy-ended-unanswered-not-selected",
+                        ) {
+                            self.older.insert((channel_id, peer), false);
+                        }
+                        #[cfg(not(feature = "test-knobs"))]
                         self.older.insert((channel_id, peer), false);
                         self.deliveries
                             .retain(|(room, member, _), _| *room != channel_id || *member != peer);
                         self.delivery_reserved
                             .retain(|(room, member, _), _| *room != channel_id || *member != peer);
+                        #[cfg(feature = "test-knobs")]
+                        self.mark_ended_unanswered_for_proof(channel_id, peer);
                     }
                     if session.is_none()
                         && self
@@ -10249,6 +10770,24 @@ impl Node {
                 holds_room,
             } => {
                 self.publishing.remove(&(channel_id, board));
+                // A Computer-policy withdrawal can be queued while this older publish is still
+                // on its board stream. Send the retained withdrawal after the round's completion
+                // as well: this ordering makes the withdrawal, never the stale publication, the
+                // last word even when the first cleanup send raced the in-flight round.
+                if let Some(wire) = self
+                    .withdrawn
+                    .get(&channel_id)
+                    .filter(|pending| pending.routes.contains_key(&board))
+                    .map(|pending| pending.wire.clone())
+                {
+                    if let Some(conn) = self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&board))
+                    {
+                        Self::put_withdraws(&conn, vec![wire]);
+                    }
+                }
                 // A port to this board's peer is ineligible while a publish round to it runs (its
                 // records must reach the board before a session reads it). The round ending is the
                 // event that makes the port eligible again, so the room's ports are evaluated now
@@ -10490,10 +11029,14 @@ impl Node {
                 };
                 // A failed write leaves the key owed, and it is sent again: never the other way.
                 let mut channel = shared.lock().await;
-                let _ = channel.note_delivered(profile.store(), peer, chain_id);
-                if whole_history {
-                    let _ = channel.note_history_delivered(profile.store(), &peer);
-                }
+                let delivered = channel
+                    .note_delivered(profile.store(), peer, chain_id)
+                    .is_ok();
+                let history_delivered = !whole_history
+                    || channel
+                        .note_history_delivered(profile.store(), &peer)
+                        .is_ok();
+                let _durably_recorded = delivered && history_delivered;
                 let still_owed = channel
                     .key_delivery_pending(profile.store(), &peer)
                     .unwrap_or(true);
@@ -10504,6 +11047,14 @@ impl Node {
                 {
                     self.key_delivery_settling.remove(&(channel_id, peer));
                 }
+                #[cfg(feature = "test-knobs")]
+                self.mark_delivery_drained_for_proof(
+                    channel_id,
+                    peer,
+                    history,
+                    whole_history,
+                    _durably_recorded,
+                );
             }
             NetEvent::RoomStored { channel_id } => {
                 // A worker persisted entries: the room's generation moved, and its ports are
@@ -10726,6 +11277,26 @@ impl Node {
                         }
                     }
                 }
+            }
+            NetEvent::BoundedSyncProgress { token } => {
+                let _ = token;
+                self.accept_bounded_sync();
+            }
+            NetEvent::BoardRecordsOwed { conn, records } => {
+                tokio::spawn(async move {
+                    let Ok(mut client) = crate::nat::service::RendezvousClient::open(&conn).await
+                    else {
+                        return;
+                    };
+                    for wire in records {
+                        if let Err(error) = client.put(&wire).await {
+                            if !matches!(error, Error::RendezvousRejected(_)) {
+                                break;
+                            }
+                        }
+                    }
+                    client.finish();
+                });
             }
             NetEvent::BoundedSyncDone {
                 channel_id,
@@ -11122,15 +11693,25 @@ impl Node {
                 .await;
                 let _ = reply.send(result);
             }
-            NetEvent::ComputerPolicy(reply) => {
-                let result = match self.prepare_computer_binding() {
-                    Ok(()) => self.apply_computer_keyring().await,
+            NetEvent::ComputerPolicy { guard, reply } => {
+                #[cfg(feature = "test-knobs")]
+                self.hold_computer_policy_for_proof(&guard).await;
+                #[cfg(feature = "test-knobs")]
+                let reply_delay = self.hold_computer_policy_reply_for_proof();
+                let result = match self.prepare_computer_binding_guarded(&guard) {
+                    Ok(()) => self.apply_computer_keyring_guarded(&guard).await,
                     Err(e) => Err(e),
                 };
-                if result.is_ok() {
-                    self.refresh_reachers().await;
-                    self.tend_drive_keys().await;
+                #[cfg(feature = "test-knobs")]
+                if let Some(delay) = reply_delay {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = reply.send(result);
+                    });
+                } else {
+                    let _ = reply.send(result);
                 }
+                #[cfg(not(feature = "test-knobs"))]
                 let _ = reply.send(result);
             }
             NetEvent::LocalTrustBlacklist(reply) => {
@@ -11539,6 +12120,8 @@ impl Node {
         let tx = self.net_tx.clone();
         self.reap_join_tasks();
         let admit_tx = self.net_tx.clone();
+        let admission_room = Arc::downgrade(&shared);
+        let attachment = self.delivery_epoch;
         let signals = Some((slot.worked(), slot.take_ended()));
         let log_node = self
             .paths
@@ -11577,6 +12160,9 @@ impl Node {
                         let admitted = if admit_tx
                             .send(NetEvent::JoinAdmit {
                                 channel_id,
+                                original: admission_room,
+                                attachment,
+                                peer,
                                 identity: Box::new(identity),
                                 witness: Box::new(witness),
                                 ack,
@@ -12697,6 +13283,10 @@ impl Node {
                 return;
             }
         };
+        if self.joining.contains(&parsed.channel_id) {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
         let (Some(net), Some(ring)) = (
             self.net.as_ref().map(Arc::clone),
             self.prekeys.as_ref().map(Arc::clone),
@@ -12812,6 +13402,7 @@ impl Node {
             net,
             tx: self.net_tx.clone(),
             me,
+            attachment: self.delivery_epoch,
             parsed: parsed.clone(),
             routes,
             signer,
@@ -12990,51 +13581,78 @@ impl Node {
                         .collect::<String>()
                 ),
             });
-            return Outcome::Failed(Fault::RoomNameTaken);
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::RoomNameTaken);
         }
+        let Some(authority) = self.computer_authority() else {
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
+        };
         let channel = {
             let Some(profile) = self.profile.as_ref() else {
-                return Outcome::Failed(Fault::NoIdentity);
+                return self.reject_join_cleanup(&parsed.channel_id, Fault::NoIdentity);
             };
-            match ChannelState::join_channel_from_sealed(
-                profile,
-                &genesis,
-                &parsed.channel_id,
-                joined.room_name.as_deref(),
-                &passphrase,
-                now_ms,
-                sealed,
-                // Keep the responder's witness to this join (M17.6). It is republished with
-                // every bundle record this node ever puts on a board for this room, so it is
-                // persisted rather than held: a node that lost it could publish nothing and
-                // would fall off every board. The joiner already verified it binds its own key,
-                // this room and this epoch, in `run_initiator`. Written with the room, in one
-                // batch, so a join that fails here leaves no room behind (V210-80).
-                crate::nat::record::Admission::Witnessed(Box::new(joined.witness.clone())),
-            ) {
-                Ok(c) => c,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
+            let joined = authority.publish(|| {
+                ChannelState::join_channel_from_sealed(
+                    profile,
+                    &genesis,
+                    &parsed.channel_id,
+                    joined.room_name.as_deref(),
+                    &passphrase,
+                    now_ms,
+                    sealed,
+                    // Keep the responder's witness to this join (M17.6). It is republished with
+                    // every bundle record this node ever puts on a board for this room, so it is
+                    // persisted rather than held: a node that lost it could publish nothing and
+                    // would fall off every board. The joiner already verified it binds its own
+                    // key, this room and this epoch, in `run_initiator`. Written with the room,
+                    // in one batch, so a join that fails here leaves no room behind (V210-80).
+                    crate::nat::record::Admission::Witnessed(Box::new(joined.witness.clone())),
+                )
+            });
+            match joined {
+                None => return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy),
+                Some(Ok(channel)) => channel,
+                Some(Err(error)) => {
+                    return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
+                }
             }
         };
         let mut channel = channel;
         let retention = self.node_retention_for(&parsed.channel_id);
         let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::NoIdentity);
         };
-        if let Err(error) = channel
-            .set_node_retention(profile.store(), retention)
-            .and_then(|()| {
-                channel.set_node_step_retention(
-                    profile.store(),
-                    self.node_step_retention.for_room(&parsed.channel_id),
-                )
+        let step_retention = self.node_step_retention.for_room(&parsed.channel_id);
+        let retained = authority.publish(|| {
+            channel
+                .set_node_retention(profile.store(), retention)
+                .and_then(|()| channel.set_node_step_retention(profile.store(), step_retention))
+        });
+        let Some(retained) = retained else {
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
+        };
+        if let Err(error) = retained {
+            return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
+        }
+        // A joined room is remembered before it becomes live, just like a created room. Use the
+        // same captured authority as the durable join so a replaced Computer policy can leave
+        // neither a live nor a restart-visible partial join.
+        if authority
+            .publish(|| {
+                self.remember_or_say(&channel);
             })
+            .is_none()
         {
-            return Outcome::Failed(fault_of(&error));
+            return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
         }
         // A room joined again is published again (V030-14): its withdraw is kept no longer.
-        self.withdrawn.remove(&parsed.channel_id);
-        self.remember_or_say(&channel);
+        if self.withdrawn.contains_key(&parsed.channel_id) {
+            let mut next = self.withdrawn.clone();
+            next.remove(&parsed.channel_id);
+            if let Err(error) = Self::save_pending_withdrawals(profile, &next) {
+                return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
+            }
+            self.withdrawn = next;
+        }
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -13042,6 +13660,9 @@ impl Node {
         // A close followed by a join can reuse the same room id before a maintenance sweep has
         // pruned its old instance. The new instance must establish its own checked fold.
         self.governance_work.wake_room(parsed.channel_id);
+        // Every board route was retained before its pre-join announcement, before the successful
+        // exchange and off-actor seal. Every exit above can therefore withdraw without first
+        // installing the room or relying on a live connection surviving until cleanup.
         // Every member whose bundle is on the board is an admitted author **on the
         // M17.6 evidence its record carries** — a self-signed record proves possession
         // of a key and nothing else. Sync hard-fails on an entry from an author we
@@ -13057,6 +13678,7 @@ impl Node {
             let _ = admit_board_records(
                 &shared,
                 profile.store(),
+                &authority,
                 &set.bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now_ms,
@@ -13076,10 +13698,20 @@ impl Node {
             self.channels.get(&parsed.channel_id).map(Arc::clone),
         ) {
             let mut channel = shared.lock().await;
-            let _ = channel.note_member(profile.store(), responder);
-            // And every member the link marks one (`m=`).
-            for member in parsed.members.iter().filter(|m| **m != me) {
-                let _ = channel.note_member(profile.store(), *member);
+            let noted = authority.publish(|| {
+                channel.note_member(profile.store(), responder)?;
+                // And every member the link marks one (`m=`).
+                for member in parsed.members.iter().filter(|m| **m != me) {
+                    channel.note_member(profile.store(), *member)?;
+                }
+                Ok(())
+            });
+            drop(channel);
+            let Some(noted) = noted else {
+                return self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy);
+            };
+            if let Err(error) = noted {
+                return self.reject_join_cleanup(&parsed.channel_id, fault_of(&error));
             }
         }
         // The join's link routes served only that operation. The room's signed history,
@@ -13093,6 +13725,17 @@ impl Node {
             .await;
         if !self.anchor_ids.contains(&conn.peer_id()) {
             self.publish_channel_to_anchor(&parsed.channel_id, &conn, PublishCause::Join)
+                .await;
+        }
+        #[cfg(feature = "test-knobs")]
+        self.hold_room_join_after_board_for_proof().await;
+        if !authority.current() {
+            return self
+                .withdraw_and_reject_unpublished_live_channel(
+                    &parsed.channel_id,
+                    RoomPublicationOwnership::Joined,
+                    &authority,
+                )
                 .await;
         }
         // **Joining releases no sender key** (M17.6). This is the correction to
@@ -13125,11 +13768,23 @@ impl Node {
         // and only luck decided whether it did.
         // Nothing else replaces the release. A joiner becomes readable when it trusts
         // someone, which is a human act, and `deliver_owed_consents` issues the grant.
-        let _ = self.event_tx.send(NodeEvent::Joined {
-            channel_id: parsed.channel_id,
-            responder,
+        let completed = authority.publish(|| -> crate::error::Result<()> {
+            self.complete_join_cleanup(&parsed.channel_id)?;
+            let _ = self.event_tx.send(NodeEvent::Joined {
+                channel_id: parsed.channel_id,
+                responder,
+            });
+            self.room_publication_authority.insert(
+                parsed.channel_id,
+                (authority.clone(), RoomPublicationOwnership::Joined),
+            );
+            Ok(())
         });
-        Outcome::Done
+        match completed {
+            Some(Ok(())) => Outcome::Done,
+            Some(Err(error)) => self.reject_join_cleanup(&parsed.channel_id, fault_of(&error)),
+            None => self.reject_join_cleanup(&parsed.channel_id, Fault::ComputerPolicy),
+        }
     }
 
     /// Release this identity's sender key to `target` and record the grant: deliver
@@ -13194,6 +13849,8 @@ impl Node {
             return Outcome::Failed(Fault::Unreachable);
         };
         let modern = !matches!(self.older.get(&(*channel_id, target)), Some(false));
+        let pair = (*channel_id, target);
+        let legacy_before = self.snapshot_legacy_session(pair, !modern);
         let mut older = if modern {
             if let Err(wait) = self
                 .delivery_bundle_waiting(channel_id, target, false)
@@ -13206,6 +13863,7 @@ impl Node {
         } else {
             let route = self.older_route(channel_id, target).await;
             if !self.sessions.contains_key(&(*channel_id, target)) {
+                self.restore_legacy_session(legacy_before);
                 return Outcome::Failed(Fault::Unreachable);
             }
             route
@@ -13275,70 +13933,85 @@ impl Node {
         let Some((frames, carries_hello, session)) =
             self.key_frames(channel_id, target, &skdm, &mut older).await
         else {
+            self.restore_legacy_session(legacy_before);
             return Outcome::Failed(Fault::Unreachable);
         };
         // Written by this member's writer, off the actor (V210-71). A write that fails is a key
         // not taken, re-owed like any other.
-        let (Some(profile), Some(shared)) = (
-            self.profile.as_ref(),
-            self.channels.get(channel_id).map(Arc::clone),
-        ) else {
+        let Some(profile) = self.profile.as_ref() else {
+            self.restore_legacy_session(legacy_before);
             return Outcome::Failed(Fault::UnknownChannel);
         };
-        // **The held key leaves the store before the consent is recorded, never after.** Removed
-        // after, a failed save left a delivered key on disk, and after a revocation and a new
-        // consent that stale pre-rotation key would have been the one delivered (found in
-        // verification of #203). Removed first, a key on disk means no consent was recorded for
-        // it. So a failed removal is refused, loudly, with nothing recorded: the key stays held,
-        // and the next attempt delivers the same key again. A failure between the removal and the
-        // record can only lose the held key, so that consent is taken again from a later position:
-        // narrower, never wider.
-        if let Err(e) = forget_consent_key(&mut self.consent_keys, profile, channel_id, target) {
-            return Outcome::Failed(fault_of(&e));
-        }
-        let history_owed = {
-            let mut channel = shared.lock().await;
-            // What this consent releases, from its earliest position (V210-45): every later
-            // release to `target` starts there and never before it.
-            let entitled_from = plan
-                .as_ref()
-                .and_then(|p| p.first().copied())
-                .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
-            // The generations before the live one that the decision — or a full-history grant —
-            // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
-            match channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms) {
-                Ok((_, history_owed)) => history_owed,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            }
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            self.restore_legacy_session(legacy_before);
+            return Outcome::Failed(Fault::UnknownChannel);
         };
-        // The grant is on the log now, and a reader renders nothing without it: pushed at once,
-        // as every local append is, not on the next tick (V210-78).
-        self.note_local_governance_append(channel_id);
-        // The generation delivered is the key's own: a key taken before a rotation is the older
-        // one, and a refusal must re-owe exactly that (V210-30).
+        // Complete every await before the final authority check. The policy-state lock held by
+        // `publish_with_current_authority` then spans the synchronous consent record and delivery
+        // enqueue, so a durable revocation cannot land in between them.
+        let mut channel = shared.lock().await;
+        let authority = self.computer_authority();
+        let entitled_from = plan
+            .as_ref()
+            .and_then(|p| p.first().copied())
+            .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
         let chain_id = skdm.body.chain_id;
-        // The consent is a fact once decided; whether the key landed is learnt off the actor, and
-        // it is recorded as delivered only then (V210-88).
-        // In flight from here until the member answers (V210-88): a crash before then leaves it owed.
-        let epoch = self.key_in_flight(*channel_id, target);
         let opening = frames
             .first()
             .filter(|_| session.is_none())
             .map(|frame| crate::hash::sha256(frame));
-        queue.send(PairwiseJob {
-            conn,
-            frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
-            channel_id: *channel_id,
-            after: AfterWrite::Key {
-                chain_id,
-                opening,
-                hello: carries_hello,
-                session,
-                history: false,
-                epoch,
-            },
-            credit: job,
-        });
+        let commit = || -> crate::error::Result<bool> {
+            // **The held key leaves the store before the consent is recorded, never after.**
+            // Removed after, a failed save left a delivered key on disk. Removed first, failure
+            // can only narrow: a later attempt takes consent again from a later position.
+            forget_consent_key(&mut self.consent_keys, profile, channel_id, target)?;
+            // What this consent releases, from its earliest position (V210-45): every later
+            // release to `target` starts there and never before it.
+            // The generations before the live one that the decision — or a full-history grant —
+            // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
+            let (_, history_owed) =
+                channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms)?;
+            // The consent is a fact once decided; whether the key landed is learnt off the actor,
+            // and is recorded delivered only then. A crash before the answer leaves it owed.
+            *self
+                .keys_in_flight
+                .entry((*channel_id, target))
+                .or_default() += 1;
+            let epoch = self.delivery_epoch;
+            queue.send(PairwiseJob {
+                conn,
+                frames: frames.into_iter().map(Vec::into_boxed_slice).collect(),
+                channel_id: *channel_id,
+                after: AfterWrite::Key {
+                    chain_id,
+                    opening,
+                    hello: carries_hello,
+                    session,
+                    history: false,
+                    epoch,
+                },
+                credit: job,
+            });
+            Ok(history_owed)
+        };
+        let committed = authority.and_then(|authority| authority.publish(commit));
+        let history_owed = match committed {
+            Some(Ok(history_owed)) => history_owed,
+            Some(Err(error)) => {
+                drop(channel);
+                self.restore_legacy_session(legacy_before);
+                return Outcome::Failed(fault_of(&error));
+            }
+            None => {
+                drop(channel);
+                self.restore_legacy_session(legacy_before);
+                return Outcome::Failed(Fault::NotTrusted);
+            }
+        };
+        drop(channel);
+        // The grant is on the log now, and a reader renders nothing without it: pushed at once,
+        // as every local append is, not on the next tick (V210-78).
+        self.note_local_governance_append(channel_id);
         if history_owed {
             // At once rather than on the tick: the connection and session are live now.
             let _ = self.deliver_rekeys_for(channel_id, asked).await;
@@ -13399,26 +14072,41 @@ impl Node {
         &mut self,
         fingerprint: Digest32,
     ) -> Option<crate::node::consent_order::Stamp> {
-        let profile = self.profile.as_ref()?;
-        let signer = profile.signer().ok()?;
         let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
         let mut floor = 0u64;
         for ch in &shared {
             floor = floor.max(ch.lock().await.newest_mint_seq());
         }
-        crate::node::consent_order::stamp_trust(profile.store(), signer, fingerprint, floor).ok()
+        // Every room-lock await is complete before the exact state-lock-spanning fence around
+        // the consent-order commit. A stale binding produces no decision, which is the narrow
+        // result: no room history is entitled by this trust command.
+        let authority = self.computer_authority()?;
+        let profile = self.profile.as_ref()?;
+        let signer = profile.signer().ok()?;
+        authority
+            .publish(|| {
+                crate::node::consent_order::stamp_trust(profile.store(), signer, fingerprint, floor)
+                    .ok()
+            })
+            .flatten()
     }
 
     /// Mark where every open room's sender key stands at `fingerprint`'s trust decision, drawn by
-    /// [`Self::draw_trust_stamp`] (V210-45).
+    /// [`Self::draw_trust_stamp`] (V210-45). Returns `Ok(false)` when the captured Computer policy
+    /// moved before the all-room commit; nothing was written or installed, and the current policy
+    /// pass must retry.
     async fn mark_trust_decision(
         &mut self,
         fingerprint: Digest32,
         decision: crate::node::consent_order::Stamp,
-    ) {
-        let Some(profile) = self.profile.as_ref() else {
-            return;
+    ) -> crate::error::Result<bool> {
+        // Capture the exact projection before any await. The final synchronous commit revalidates
+        // this same token; a policy which moves while rooms are being sealed cannot authorize its
+        // predecessor's marks.
+        let Some(authority) = self.computer_authority() else {
+            return Ok(false);
         };
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
         let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
         // **One commit for every room** (#189): each room marks and seals under its own lock,
         // and the write happens once, after, with no room's lock held. A commit per room made
@@ -13426,37 +14114,55 @@ impl Node {
         // 1,600 rooms. The write transaction is never held while awaiting a room's lock: a sync
         // holds a room's lock while it waits for a write transaction, so that order would
         // deadlock. Nothing else on the actor runs between the seals and the commit, and nothing
-        // off it writes a room's marks, so no newer marks can be overwritten by these.
-        let mut sealed: Vec<(SharedChannel, Digest32, crate::atrest::store::SealedSegment)> =
-            Vec::new();
+        // off it writes a room's marks, so no newer marks can be overwritten by these. Sealing is
+        // non-mutating: live marks remain exactly aligned with the store until the batch commits.
+        let mut sealed = Vec::new();
         for ch in shared {
-            let (seg, id) = {
-                let mut room = ch.lock().await;
-                (
-                    room.mark_trust_sealed(fingerprint, decision),
-                    room.channel_id(),
-                )
+            let (prepared, id) = {
+                let room = ch.lock().await;
+                let id = room.channel_id();
+                let prepared = match room.mark_trust_sealed(fingerprint, decision) {
+                    Ok(prepared) => prepared,
+                    // Preparation has not changed memory or storage. Match the single-room path:
+                    // only a failed durable write poisons a room.
+                    Err(error) => return Err(error),
+                };
+                (prepared, id)
             };
-            if let Ok(Some(seg)) = seg {
-                sealed.push((ch, id, seg));
+            if let Some(prepared) = prepared {
+                sealed.push((ch, id, prepared));
             }
         }
         if sealed.is_empty() {
-            return;
+            // This no-op is still the caller's final Computer-policy fence. A policy move while
+            // the rooms were inspected must restart the causal pass just like a refused write.
+            return Ok(authority.current());
         }
-        let written = (|| -> crate::error::Result<()> {
+        let Some(written) = authority.publish(|| -> crate::error::Result<()> {
             let mut batch = profile.store().batch()?;
-            for (_, id, seg) in &sealed {
-                ChannelState::queue_marks(&mut batch, id, seg)?;
+            for (_, id, prepared) in &sealed {
+                ChannelState::queue_marks(&mut batch, id, prepared)?;
             }
             batch.commit()
-        })();
-        if let Err(e) = written {
-            // As a failed per-room write always did: memory is ahead of the store.
+        }) else {
+            // An expected policy supersession is not a room/storage failure. Preparation changed
+            // no live state, so the current causal policy pass can retry without rollback.
+            return Ok(false);
+        };
+        if let Err(error) = written {
+            // A real storage failure has the same fail-closed result as the former per-room write.
             for (ch, _, _) in sealed {
-                ch.lock().await.poison(&e);
+                ch.lock().await.poison(&error);
             }
+            return Err(error);
         }
+        // The durable batch now owns these exact positions. Install them even if Computer policy
+        // moves after the commit: skipping installation would put memory behind its committed
+        // segment. No other actor work can prepare a newer mark while this method is running.
+        for (ch, _, prepared) in sealed {
+            ch.lock().await.install_trust_mark(prepared);
+        }
+        Ok(true)
     }
 
     /// Drop, in a room just opened, every sender key held from a member this owner does not trust
@@ -13514,11 +14220,17 @@ impl Node {
             .get(channel_id)
             .ok_or(Error::Profile("room is not open"))?;
         let mut channel = shared.lock().await;
-        let result = (|| {
-            let order =
-                crate::node::consent_order::ConsentOrder::load(profile.store(), profile.signer()?)?;
-            channel.mark_decisions_on_open(profile.store(), &order)
-        })();
+        let result = self
+            .with_current_computer_authority(|| {
+                let order = crate::node::consent_order::ConsentOrder::load(
+                    profile.store(),
+                    profile.signer()?,
+                )?;
+                channel.mark_decisions_on_open(profile.store(), &order)
+            })
+            .ok_or(Error::Profile(
+                "computer policy changed before the room mutation",
+            ))?;
         if let Err(error) = &result {
             channel.poison(error);
         }
@@ -13579,29 +14291,44 @@ impl Node {
             Ok(s) => s,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
-        // Persist BEFORE adopting it: a keyring that consented but did not survive
-        // a restart would silently re-consent on every boot.
-        if let Err(e) = next.save(profile.store(), signer) {
-            return Outcome::Failed(fault_of(&e));
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        // Persist BEFORE adopting it: a keyring that consented but did not survive a restart
+        // would silently re-consent on every boot. Drawing the decision awaited every room; hold
+        // exact current Computer authority through the keyring commit and its coupled removal of
+        // a former pending withdrawal.
+        let saved = authority.publish(|| -> crate::error::Result<()> {
+            next.save(profile.store(), signer)?;
+            // A removal still waiting on a closed room is withdrawn with this decision (V210-118
+            // amendment). Not load-bearing: left behind, it would change the lock on the reopen,
+            // and the consent owed to a trusted member would then be released again.
+            if let Ok(mut locks) =
+                crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
+            {
+                if locks.forget(&fingerprint) {
+                    let _ = locks.save(profile.store(), signer);
+                }
+            }
+            Ok(())
+        });
+        match saved {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
+            None => return Outcome::Failed(Fault::ComputerPolicy),
         }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
-        // A removal still waiting on a closed room is withdrawn with this decision (V210-118
-        // amendment). Not load-bearing: left behind, it would change the lock on the reopen, and
-        // the consent owed to a trusted member would then be released again.
-        if let Ok(mut locks) =
-            crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
-        {
-            if locks.forget(&fingerprint) {
-                let _ = locks.save(profile.store(), signer);
-            }
-        }
         if let Some(decision) = decision {
             // Where each open room's sender key stands at the decision (V210-45). A rename is
             // the same decision and keeps its place. Nothing else runs on the actor in between,
             // so no post is sealed between the place and the marks. A failure here narrows what
             // the member will read and never widens it, so it does not undo the trust.
-            self.mark_trust_decision(fingerprint, decision).await;
+            match self.mark_trust_decision(fingerprint, decision).await {
+                Ok(true) => {}
+                Ok(false) => return Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => return Outcome::Failed(fault_of(&error)),
+            }
         }
         // A member may have been admitted while it was not trusted and missed the earlier live
         // capability record. Publish a fresh signed record when local trust starts or widens the
@@ -13673,44 +14400,45 @@ impl Node {
         // it came from, in every room, open or not: a later re-trust takes a key of its own
         // moment, never this one's (V210-30).
         let mut pending = self.consent_keys.clone();
-        if pending.forget(fingerprint) {
-            if let Err(e) = pending.save(profile.store(), signer) {
-                return Outcome::Failed(fault_of(&e));
-            }
-            self.consent_keys = pending;
-        }
-        // The decision goes with the trust (V210-45). Not load-bearing: a re-trust always draws
-        // a new place in the consent order, and a decision is only read for a trusted identity,
-        // so a failure here leaves nothing that could widen a later release.
-        let _ = crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint);
         // Record every room before the ring changes. Closed rooms act when reopened; an open
         // room whose narrowing write fails retains the same durable retry across restart.
         let rooms = match profile.store().channels() {
             Ok(rooms) => rooms,
             Err(error) => return Outcome::Failed(fault_of(&error)),
         };
-        if !rooms.is_empty() {
-            let mut locks =
-                match crate::node::pending_lock::PendingLocks::load(profile.store(), signer) {
-                    Ok(l) => l,
-                    Err(e) => return Outcome::Failed(fault_of(&e)),
-                };
-            for room in rooms {
-                if !locks.insert(room, *fingerprint) {
-                    return Outcome::Failed(Fault::Internal);
-                }
-            }
-            if let Err(e) = locks.save(profile.store(), signer) {
-                return Outcome::Failed(fault_of(&e));
+        let mut locks = match crate::node::pending_lock::PendingLocks::load(profile.store(), signer)
+        {
+            Ok(l) => l,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        for room in rooms {
+            if !locks.insert(room, *fingerprint) {
+                return Outcome::Failed(Fault::Internal);
             }
         }
         // The ring is written FIRST and unconditionally, exactly as a revocation's
         // log fact lands before its re-keys: if the rotations below cannot all be
         // delivered, the decision must still have been taken. A removal that were
         // undone by an unreachable peer would be a removal in name only.
-        if let Err(e) = next.save(profile.store(), signer) {
-            return Outcome::Failed(fault_of(&e));
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        let durable = authority.publish(|| -> crate::error::Result<()> {
+            if pending.forget(fingerprint) {
+                pending.save(profile.store(), signer)?;
+            }
+            // The order entry, durable narrowing debt and keyring are one policy decision. No
+            // stale actor projection may commit any of them after its Computer revision moved.
+            crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint)?;
+            locks.save(profile.store(), signer)?;
+            next.save(profile.store(), signer)
+        });
+        match durable {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
+            None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        self.consent_keys = pending;
         self.trust = next;
         self.deliveries
             .retain(|(_, peer, _), _| peer != fingerprint);
@@ -13794,18 +14522,23 @@ impl Node {
             .get(room)
             .map(Arc::clone)
             .ok_or(Error::Profile("room is not open"))?;
-        let result = shared
-            .lock()
-            .await
-            .withdraw_consent(profile, target, self.now_ms());
+        let mut channel = shared.lock().await;
+        let result = self
+            .with_current_computer_authority(|| {
+                channel.withdraw_consent(profile, target, self.now_ms())
+            })
+            .ok_or(Error::Profile(
+                "computer policy changed before the room mutation",
+            ))?;
         let generation = match result {
             Ok(Some(revocation)) => revocation.body.new_chain_id,
             Ok(None) => return Ok(()),
             Err(error) => {
-                shared.lock().await.poison(&error);
+                channel.poison(&error);
                 return Err(error);
             }
         };
+        drop(channel);
         self.deliveries
             .retain(|(r, peer, _), _| r != room || *peer != target);
         self.delivery_reserved
@@ -13885,7 +14618,7 @@ impl Node {
     /// Nothing here waits for a dial (see `reach_member`); consent follows on `Dialed`. Waiting
     /// made `vox trust add` freeze the node for 10s per offline trusted member per room.
     async fn deliver_owed_consents(&mut self, asked_for: Option<Digest32>) {
-        if self.net.is_none() {
+        if self.net.is_none() || !self.computer_authority_current() {
             return;
         }
         self.deliver_reopens().await;
@@ -13945,6 +14678,11 @@ impl Node {
                 );
             }
             for target in owed {
+                // A computer-policy event may have entered the queue while room state was read.
+                // Do not spend authority derived from the older projection after that point.
+                if !self.computer_authority_current() {
+                    return;
+                }
                 // `consent` emits `Consented` on success; a failure here is a peer
                 // that is not reachable yet, which the next tick retries.
                 let asked = asked_for == Some(target);
@@ -14023,6 +14761,10 @@ impl Node {
         let now_ms = self.now_ms().get();
         let targets: BTreeSet<Digest32> = owed.into_iter().chain(history.keys().copied()).collect();
         for target in targets {
+            #[cfg(feature = "test-knobs")]
+            if self.fx28_rekey_pause == Some((*channel_id, target)) {
+                continue;
+            }
             if !self.trust.is_trusted(&target) {
                 continue; // A historical consent never overrides the current keyring.
             }
@@ -14113,6 +14855,15 @@ impl Node {
             else {
                 continue; // the entire batch remains owed; no key or ratchet was consumed
             };
+            let pair = (*channel_id, target);
+            let legacy_route = matches!(self.older.get(&pair), Some(false));
+            // The older-peer route seals into the pair's long-lived mutable ratchet before final
+            // queue admission. Snapshot every piece of that session registration before the
+            // await which may create it. If durable Computer authority rejects the batch, these
+            // exact pre-seal values are restored together, so retry neither burns another message
+            // index nor opens a second session/hello. Modern deliveries instead retain their
+            // exact sealed bytes in `deliveries`.
+            let legacy_before = self.snapshot_legacy_session(pair, legacy_route);
             let mut older = self.older_route(channel_id, target).await;
             let mut all_sent = true;
             let mut jobs = Vec::with_capacity(keys.len());
@@ -14156,9 +14907,76 @@ impl Node {
                 self.history_in_flight.insert(pair, (watched, !all_sent));
             }
             // The complete batch was admitted before sealing. Reserved sends cannot fail or
-            // wait, and this peer's writer preserves ratchet order (V210-71).
-            for (queue, job) in jobs {
-                queue.send(job);
+            // wait, and this peer's writer preserves ratchet order (V210-71). Every preceding
+            // connection, room and session operation awaited, so durable Computer policy is
+            // checked once more under its state lock at the irreversible queue admission.
+            #[cfg(feature = "test-knobs")]
+            let live_generation = shared.lock().await.sender_generation();
+            #[cfg(feature = "test-knobs")]
+            let prepared_generations: Vec<_> = keys
+                .iter()
+                .take(watched as usize)
+                .map(|key| key.body.chain_id)
+                .collect();
+            #[cfg(feature = "test-knobs")]
+            let held_for_proof = self
+                .hold_rekey_enqueue_for_proof(
+                    *channel_id,
+                    target,
+                    legacy_route,
+                    all_sent,
+                    live_generation,
+                    &prepared_generations,
+                )
+                .await;
+            #[cfg(feature = "test-knobs")]
+            let published = {
+                if crate::node::computer::fx28_mutant("stale-rekey-authority") {
+                    for (queue, job) in jobs {
+                        queue.send(job);
+                    }
+                    true
+                } else {
+                    self.with_current_computer_authority(|| {
+                        for (queue, job) in jobs {
+                            queue.send(job);
+                        }
+                        true
+                    })
+                    .unwrap_or(false)
+                }
+            };
+            #[cfg(not(feature = "test-knobs"))]
+            let published = {
+                self.with_current_computer_authority(|| {
+                    for (queue, job) in jobs {
+                        queue.send(job);
+                    }
+                    true
+                })
+                .unwrap_or(false)
+            };
+            if !published {
+                // Preparation counted these exact frames as in flight. Since none reached its
+                // writer, unwind only those volatile counters. A modern delivery's exact sealed
+                // retry frame remains. The legacy route has no frame cache, so restore the exact
+                // pre-seal session registration atomically before any retry can run.
+                self.restore_legacy_session(legacy_before);
+                for _ in 0..watched {
+                    self.key_landed(*channel_id, target);
+                }
+                if owes_history {
+                    self.history_in_flight.remove(&pair);
+                }
+                #[cfg(feature = "test-knobs")]
+                if held_for_proof {
+                    self.mark_rekey_authority_decision_for_proof(false);
+                }
+                continue;
+            }
+            #[cfg(feature = "test-knobs")]
+            if held_for_proof {
+                self.mark_rekey_authority_decision_for_proof(true);
             }
             if all_sent {
                 delivered += 1;
@@ -14365,6 +15183,68 @@ impl Node {
         Ok(bundle)
     }
 
+    fn snapshot_legacy_session(
+        &self,
+        pair: (Digest32, Digest32),
+        legacy: bool,
+    ) -> Option<LegacySessionRollback> {
+        legacy.then(|| LegacySessionRollback {
+            pair,
+            session: self
+                .sessions
+                .get(&pair)
+                .map(crate::pairwise::session::Session::snapshot_for_unpublished_rollback),
+            initiated: self.initiated.get(&pair).cloned(),
+            accepted: self.accepted_hello.get(&pair).copied(),
+            reopened: self.reopen.contains(&pair),
+            serial: self.session_serial.get(&pair).copied(),
+            last_serial: self.last_session_serial,
+        })
+    }
+
+    fn restore_legacy_session(&mut self, rollback: Option<LegacySessionRollback>) {
+        let Some(rollback) = rollback else { return };
+        let pair = rollback.pair;
+        match rollback.session {
+            Some(session) => {
+                self.sessions.insert(pair, session);
+            }
+            None => {
+                self.sessions.remove(&pair);
+            }
+        }
+        match rollback.initiated {
+            Some(initiated) => {
+                self.initiated.insert(pair, initiated);
+            }
+            None => {
+                self.initiated.remove(&pair);
+            }
+        }
+        match rollback.accepted {
+            Some(accepted) => {
+                self.accepted_hello.insert(pair, accepted);
+            }
+            None => {
+                self.accepted_hello.remove(&pair);
+            }
+        }
+        if rollback.reopened {
+            self.reopen.insert(pair);
+        } else {
+            self.reopen.remove(&pair);
+        }
+        match rollback.serial {
+            Some(serial) => {
+                self.session_serial.insert(pair, serial);
+            }
+            None => {
+                self.session_serial.remove(&pair);
+            }
+        }
+        self.last_session_serial = rollback.last_serial;
+    }
+
     /// How this node's keys go to `target` in `channel_id` this round (ADR-030 W-4): `None` in
     /// sessions of their own (D-1); `Some(hello)` in the pair's long-lived session, opened now if
     /// there is none (its hello to ride the first key), for a member marked [`Self::older`] whose
@@ -14532,11 +15412,15 @@ impl Node {
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             return;
         };
+        let Some(authority) = self.computer_authority() else {
+            return;
+        };
         let now_ms = self.now_ms();
         if fresh > 0 {
             let _ = admit_board_records(
                 &shared,
                 &store,
+                &authority,
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now_ms,
@@ -14548,6 +15432,7 @@ impl Node {
         let from_notices = admit_board_notices(
             &shared,
             &store,
+            &authority,
             &net,
             channel_id,
             ChannelState::MAX_ADMISSIONS_PER_SWEEP,
@@ -15141,6 +16026,9 @@ impl Node {
                 (anchors, ch.epoch())
             };
             for anchor in anchors {
+                let Some(authority) = self.computer_authority() else {
+                    continue;
+                };
                 let Some(conn) = self
                     .anchors_up
                     .get(&anchor)
@@ -15155,10 +16043,13 @@ impl Node {
                     Arc::clone(shared),
                     *cid,
                 );
+                let tx = self.net_tx.clone();
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(
                         SETUP_PATIENCE,
-                        exchange_boards(&net, &conn, &shared, &store, cid, known, now_ms),
+                        exchange_boards(
+                            &net, &conn, &shared, &store, &authority, &tx, cid, known, now_ms,
+                        ),
                     )
                     .await;
                 });
@@ -15515,6 +16406,7 @@ impl Node {
         });
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
+        let authority = self.computer_authority();
         let cid = channel_id;
         let now_ms = self.now_ms();
         let tx = self.net_tx.clone();
@@ -15531,10 +16423,11 @@ impl Node {
                     // connection was filed dead, past the limit D6 states (a frame timeout plus
                     // the budgets).
                     let setup = async {
-                        if let Some(pstore) = admit_store {
-                            admitted_authors =
-                                exchange_boards(&net, &conn, shared, &pstore, cid, known, now_ms)
-                                    .await;
+                        if let (Some(pstore), Some(authority)) = (admit_store, authority.as_ref()) {
+                            admitted_authors = exchange_boards(
+                                &net, &conn, shared, &pstore, authority, &tx, cid, known, now_ms,
+                            )
+                            .await;
                         }
                     };
                     let _ = tokio::time::timeout(SETUP_PATIENCE, setup).await;
@@ -16015,6 +16908,17 @@ impl Node {
             return Err(Error::Profile("no such room on this node"));
         };
         let c = shared.lock().await;
+        if c.ended((self.millis_clock)()).is_some() {
+            return Err(Error::JoinRoomEnded);
+        }
+        if c.has_left(&c.me()) {
+            return Err(Error::JoinResponderLeft);
+        }
+        if !c.can_answer_join() {
+            return Err(Error::JoinRefused(
+                "the room can no longer answer this join",
+            ));
+        }
         if c.is_author(&joiner) {
             return Ok((c.epoch(), Vec::new()));
         }
@@ -16460,9 +17364,13 @@ impl Node {
                 return false;
             }
             let now_ms = self.now_ms();
+            let Some(authority) = self.computer_authority() else {
+                return false;
+            };
             let _ = admit_board_records(
                 &shared,
                 &store,
+                &authority,
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now_ms,
@@ -16541,50 +17449,85 @@ impl Node {
                     };
                     release
                 };
-                if !self.post_key_package(&channel_id, peer, &skdm).await {
-                    self.offline_fallbacks.insert(
-                        (channel_id, peer),
-                        OfflineFallback {
-                            attempt,
-                            source_room: owner.room,
-                            room: channel_id,
-                            peer,
-                            asked: owner.asked,
-                            package_seq: None,
-                            consent_seq: None,
-                        },
-                    );
-                    continue;
-                }
-                let package_seq = shared.lock().await.own_verified_head();
+                // Seal against the current bundle first. Only after every await is complete do
+                // the package append, held-key removal and consent record run together under the
+                // exact actor policy revision which authorized this release.
+                let posted_as = (
+                    channel_id,
+                    peer,
+                    crate::governance::membership::skdm_ref(&skdm),
+                );
+                let package = if self.packages_posted.contains(&posted_as) {
+                    None
+                } else {
+                    let Some(package) = self.prepare_key_package(&channel_id, peer, &skdm).await
+                    else {
+                        self.offline_fallbacks.insert(
+                            (channel_id, peer),
+                            OfflineFallback {
+                                attempt,
+                                source_room: owner.room,
+                                room: channel_id,
+                                peer,
+                                asked: owner.asked,
+                                package_seq: None,
+                                consent_seq: None,
+                            },
+                        );
+                        continue;
+                    };
+                    Some(package)
+                };
                 let now_ms = self.now_ms();
-                let issued = {
+                let mut package_appended = false;
+                let mut package_seq = before_package;
+                let committed = {
                     let Some(profile) = self.profile.as_ref() else {
                         return;
                     };
-                    // Forgotten before the consent is recorded, as on the direct path.
-                    if forget_consent_key(&mut self.consent_keys, profile, &channel_id, peer)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    // Recorded exactly as the direct path records it: the entitlement from the
-                    // plan's first position, and the generations before the live one owed as
-                    // history, which go out below.
                     let entitled_from = plan
                         .as_ref()
                         .and_then(|p| p.first().copied())
                         .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
                     let mut channel = shared.lock().await;
-                    channel
-                        .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
-                        .is_ok()
-                        && (entitled_from.0 >= skdm.body.chain_id
-                            || channel
-                                .owe_history(profile.store(), peer, entitled_from.0)
-                                .is_ok())
+                    let authority = self.computer.as_ref().map(|computer| {
+                        (
+                            Arc::clone(computer),
+                            self.computer_revision
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            self.computer_expired,
+                            profile.fingerprint(),
+                        )
+                    });
+                    let mut commit = || -> crate::error::Result<()> {
+                        if let Some(package) = &package {
+                            channel.append_key_package(profile, package, (self.millis_clock)())?;
+                            package_appended = true;
+                        }
+                        package_seq = channel.own_verified_head();
+                        // Forgotten before the consent is recorded, as on the direct path.
+                        forget_consent_key(&mut self.consent_keys, profile, &channel_id, peer)?;
+                        // Recorded exactly as the direct path records it: the entitlement from
+                        // the plan's first position, and the generations before the live one owed
+                        // as history, which go out below.
+                        channel.issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)?;
+                        if entitled_from.0 < skdm.body.chain_id {
+                            channel.owe_history(profile.store(), peer, entitled_from.0)?;
+                        }
+                        Ok(())
+                    };
+                    match authority {
+                        Some((computer, applied, expired, node)) => {
+                            computer.publish_with_current_authority(applied, expired, node, commit)
+                        }
+                        None => Some(commit()),
+                    }
                 };
-                if issued {
+                if let Some(package) = package.as_ref().filter(|_| package_appended) {
+                    self.note_key_package_posted(posted_as, package);
+                    self.note_local_governance_append(&channel_id);
+                }
+                if matches!(committed, Some(Ok(()))) {
                     self.note_local_governance_append(&channel_id);
                     let consent_seq = shared.lock().await.own_verified_head();
                     self.offline_fallbacks.insert(
@@ -16650,8 +17593,14 @@ impl Node {
             };
             self.key_delivery_settling.insert((channel_id, peer));
             let mut all_posted = true;
+            let Some(authority) = self.computer_authority() else {
+                continue;
+            };
             for key in &keys {
-                if !self.post_key_package(&channel_id, peer, key).await {
+                if !self
+                    .post_key_package_authorized(&channel_id, peer, key, Some(authority.clone()))
+                    .await
+                {
                     all_posted = false;
                     break;
                 }
@@ -16664,14 +17613,16 @@ impl Node {
                 return;
             };
             let mut channel = shared.lock().await;
-            let history_noted = if owed_history {
-                channel.note_history_delivered(profile.store(), &peer)
-            } else {
-                Ok(())
-            };
-            let completed = history_noted
-                .and_then(|()| channel.note_delivered(profile.store(), peer, generation));
-            let still_owed = completed.is_err()
+            let completed = authority.publish(|| {
+                let history_noted = if owed_history {
+                    channel.note_history_delivered(profile.store(), &peer)
+                } else {
+                    Ok(())
+                };
+                history_noted
+                    .and_then(|()| channel.note_delivered(profile.store(), peer, generation))
+            });
+            let still_owed = !matches!(completed, Some(Ok(())))
                 || channel
                     .key_delivery_pending(profile.store(), &peer)
                     .unwrap_or(true);
@@ -16685,23 +17636,16 @@ impl Node {
         }
     }
 
-    /// Seal `skdm` to `target` and post it to the room's log as a key-package (ADR-023
-    /// decision 4, M23.3). Returns whether it was posted.
-    ///
-    /// Needs the target's published prekey bundle, which this node holds once it has read a
-    /// board that carries it. Without one there is nothing to seal to, and the key stays owed.
-    async fn post_key_package(
+    /// Prepare a key package asynchronously, then put only its final synchronous room-log append
+    /// under the current computer-authority fence. `None` is for publications whose authority is
+    /// not computer policy (ordinary room re-key/history delivery).
+    async fn post_key_package_authorized(
         &mut self,
         channel_id: &Digest32,
         target: Digest32,
         skdm: &crate::group::skdm::Skdm,
+        authority: Option<crate::node::actor::computer::ComputerAuthority>,
     ) -> bool {
-        if self.net.is_none() {
-            return false;
-        }
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return false;
-        };
         // Posted already: on the log, and taken from there (a batch retried whole).
         let posted_as = (
             *channel_id,
@@ -16711,56 +17655,84 @@ impl Node {
         if self.packages_posted.contains(&posted_as) {
             return true;
         }
-        let Ok(ctx) = shared.lock().await.join_context() else {
+        let Some(package) = self.prepare_key_package(channel_id, target, skdm).await else {
             return false;
         };
-        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
-        // A burst waits for a fresh one-time prekey as a burst of frames does, at most 30 s while
-        // the member is connected; a member away goes to its signed prekey at once (S-5).
-        let Ok(bundle) = self.delivery_bundle_waiting(channel_id, target, true).await else {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return false;
-        };
-        let package = {
-            let Some(ring) = self.prekeys.as_ref().map(Arc::clone) else {
-                return false;
-            };
-            let ring = ring.lock().await;
-            match crate::node::keypackage::KeyPackage::seal(
-                ring.identity_dh(),
-                &bundle,
-                &ctx,
-                target,
-                skdm,
-            ) {
-                Ok(p) => p,
-                Err(_) => return false,
-            }
         };
         let posted = {
             let Some(profile) = self.profile.as_ref() else {
                 return false;
             };
-            shared
-                .lock()
-                .await
-                .append_key_package(profile, &package, (self.millis_clock)())
-                .is_ok()
+            let mut channel = shared.lock().await;
+            let mut append = || {
+                channel
+                    .append_key_package(profile, &package, (self.millis_clock)())
+                    .is_ok()
+            };
+            match authority {
+                Some(authority) => authority.publish(append).unwrap_or(false),
+                None => append(),
+            }
         };
         if posted {
-            // A one-time prekey is named by one delivery only, frame or package (ADR-030 P-3): a
-            // second naming it would be opened as a replay, last-resort-grade.
-            if let Some(prekey_id) = package
-                .initial_message()
-                .ok()
-                .and_then(|init| init.one_time_prekey_id)
-            {
-                self.refused_otps.note(target, prekey_id);
-            }
-            self.packages_posted.insert(posted_as);
+            self.note_key_package_posted(posted_as, &package);
             // An entry like any other: it goes out on the next push.
             self.note_local_append(channel_id);
         }
         posted
+    }
+
+    /// Complete every asynchronous key-package preparation step. The caller takes the room lock
+    /// and current-policy lock only around its final synchronous append (and any coupled record).
+    async fn prepare_key_package(
+        &mut self,
+        channel_id: &Digest32,
+        target: Digest32,
+        skdm: &crate::group::skdm::Skdm,
+    ) -> Option<crate::node::keypackage::KeyPackage> {
+        self.net.as_ref()?;
+        let shared = self.channels.get(channel_id).map(Arc::clone)?;
+        let Ok(ctx) = shared.lock().await.join_context() else {
+            return None;
+        };
+        // Never a stale bundle, nor a one-time prekey already named or refused (ADR-030 P-2, P-3).
+        // A burst waits for a fresh one-time prekey as a burst of frames does, at most 30 s while
+        // the member is connected; a member away goes to its signed prekey at once (S-5).
+        let Ok(bundle) = self.delivery_bundle_waiting(channel_id, target, true).await else {
+            return None;
+        };
+        {
+            let ring = self.prekeys.as_ref().map(Arc::clone)?;
+            let ring = ring.lock().await;
+            crate::node::keypackage::KeyPackage::seal(
+                ring.identity_dh(),
+                &bundle,
+                &ctx,
+                target,
+                skdm,
+            )
+            .ok()
+        }
+    }
+
+    /// Record the in-memory consequences of a package whose durable append already succeeded.
+    fn note_key_package_posted(
+        &mut self,
+        posted_as: (Digest32, Digest32, Digest32),
+        package: &crate::node::keypackage::KeyPackage,
+    ) {
+        // A one-time prekey is named by one delivery only, frame or package (ADR-030 P-3): a
+        // second naming it would be opened as a replay, last-resort-grade.
+        if let Some(prekey_id) = package
+            .initial_message()
+            .ok()
+            .and_then(|init| init.one_time_prekey_id)
+        {
+            self.refused_otps.note(posted_as.1, prekey_id);
+        }
+        self.packages_posted.insert(posted_as);
     }
 
     fn key_package_work_ready(&self) -> bool {
@@ -17946,6 +18918,22 @@ impl Node {
             mut send,
             recv,
         } = stream;
+        #[cfg(feature = "test-knobs")]
+        if self.end_key_unanswered_for_proof(
+            peer,
+            match &first {
+                crate::node::pairwise_stream::PairwiseFrame::RotationHello {
+                    channel_id, ..
+                } => Some(*channel_id),
+                _ => None,
+            },
+        ) {
+            // Finish without reading/admitting or answering the key. The real sender's watcher
+            // owns classification of this structural EOF as `ENDED_UNANSWERED`.
+            let _recv = recv;
+            let _ = send.finish();
+            return;
+        }
         // **Taken, or said not to be.** A sender cannot learn from the transport whether its key
         // was taken: QUIC acknowledges the bytes before this node decides anything. So a stream
         // that carried a key is answered, one byte once the key is taken, and reset with a wire
@@ -18394,6 +19382,7 @@ impl Node {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
             }
         }
+        self.room_publication_authority.clear();
         self.publication_after = None;
         self.publication_pending = false;
         self.publication_again = false;
@@ -18444,6 +19433,7 @@ impl Node {
         // What the boards held was learnt over the network that goes down with the lock; an address
         // asked for meanwhile is not handed out by a locked node (V210-96).
         self.on_board.clear();
+        self.board_routes.clear();
         self.publish_trouble.clear();
         // Retry timers may still deliver their public, key-free pair after this actor is locked.
         // Clear the retry authority now; each timer keeps its pending token until dequeue, then
@@ -18556,12 +19546,20 @@ impl Node {
     }
 
     /// Everything after a room exists: hold it, give it anchors, publish it, say so.
-    fn finish_create_channel(&mut self, ch: ChannelState) -> Boxed<'_, Outcome> {
-        Box::pin(self.finish_create_channel_unboxed(ch))
+    fn finish_create_channel(
+        &mut self,
+        ch: ChannelState,
+        authority: computer::ComputerAuthority,
+    ) -> Boxed<'_, Outcome> {
+        Box::pin(self.finish_create_channel_unboxed(ch, authority))
     }
 
     /// [`Self::finish_create_channel`], unboxed: see [`Boxed`].
-    async fn finish_create_channel_unboxed(&mut self, mut ch: ChannelState) -> Outcome {
+    async fn finish_create_channel_unboxed(
+        &mut self,
+        mut ch: ChannelState,
+        authority: computer::ComputerAuthority,
+    ) -> Outcome {
         // The node's own retention before the room is visible to anything that can start a
         // session on it (the retention fix, e2a74b9): every creation path comes through here.
         let id = ch.channel_id();
@@ -18569,25 +19567,85 @@ impl Node {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        if let Err(error) = ch
-            .set_node_retention(profile.store(), retention)
-            .and_then(|()| {
-                ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))
-            })
-        {
+        let step_retention = self.node_step_retention.for_room(&id);
+        let retained = authority.publish_room_creation(|| {
+            ch.set_node_retention(profile.store(), retention)
+                .and_then(|()| ch.set_node_step_retention(profile.store(), step_retention))
+        });
+        let Some(retained) = retained else {
+            return match Self::purge_unpublished_channel(profile, &id) {
+                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            };
+        };
+        if let Err(error) = retained {
+            if let Err(cleanup) = Self::purge_unpublished_channel(profile, &id) {
+                return Outcome::Failed(fault_of(&cleanup));
+            }
             return Outcome::Failed(fault_of(&error));
         }
-        self.remember_or_say(&ch);
-        self.channels
-            .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+        // `remember_open` is a second durable write. A Computer revision can move on its own
+        // task between the room commit and this actor turn, so it gets the same exact token and
+        // the room is narrowed away if that token is no longer current.
+        if authority
+            .publish_room_creation(|| {
+                self.remember_or_say(&ch);
+            })
+            .is_none()
+        {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::NoIdentity);
+            };
+            return match Self::purge_unpublished_channel(profile, &id) {
+                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            };
+        }
+        let inserted = authority.publish_room_creation(|| {
+            self.channels
+                .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
+        });
+        if inserted.is_none() {
+            let Some(profile) = self.profile.as_ref() else {
+                return Outcome::Failed(Fault::NoIdentity);
+            };
+            return match Self::purge_unpublished_channel(profile, &id) {
+                Ok(()) => Outcome::Failed(Fault::ComputerPolicy),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            };
+        }
         self.adopt_channel_anchors(&id).await;
         self.refresh_network_view().await;
         self.publish_channel_locally(&id).await;
         self.publish_channel_to_anchors(&id, PublishCause::Opened)
             .await;
-        let _ = self
-            .event_tx
-            .send(NodeEvent::ChannelOpened { channel_id: id });
+        if authority.publish_room_creation(|| ()).is_none() {
+            return self
+                .withdraw_and_reject_unpublished_live_channel(
+                    &id,
+                    RoomPublicationOwnership::Created,
+                    &authority,
+                )
+                .await;
+        }
+        if authority
+            .publish_room_creation(|| {
+                let _ = self
+                    .event_tx
+                    .send(NodeEvent::ChannelOpened { channel_id: id });
+                self.room_publication_authority
+                    .insert(id, (authority.clone(), RoomPublicationOwnership::Created));
+            })
+            .is_none()
+        {
+            return self
+                .withdraw_and_reject_unpublished_live_channel(
+                    &id,
+                    RoomPublicationOwnership::Created,
+                    &authority,
+                )
+                .await;
+        }
         Outcome::Done
     }
 
@@ -18714,76 +19772,6 @@ impl Node {
         });
     }
 
-    /// Finish a service room whose key was sealed off the actor, and offer its one service,
-    /// atomically (ADR-017).
-    ///
-    /// The two halves are one command because either alone is a lie: a service room with
-    /// no service hands out an address for nothing, and a service in a room nobody can
-    /// join is unreachable. If the service cannot be offered the room is
-    /// not kept.
-    fn finish_serve_room<'a>(
-        &'a mut self,
-        channel: ChannelState,
-        tag: &'a str,
-        endpoint: SocketAddr,
-        kind: crate::governance::share::ServiceKind,
-    ) -> Boxed<'a, Outcome> {
-        Box::pin(self.finish_serve_room_unboxed(channel, tag, endpoint, kind))
-    }
-
-    /// [`Self::finish_serve_room`], unboxed: see [`Boxed`].
-    async fn finish_serve_room_unboxed(
-        &mut self,
-        mut channel: ChannelState,
-        tag: &str,
-        endpoint: SocketAddr,
-        kind: crate::governance::share::ServiceKind,
-    ) -> Outcome {
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        let id = channel.channel_id();
-        let now_ms = self.now_ms();
-        // Offered and said to the room (V030-25) together: a share its members cannot list is
-        // half a share.
-        if let Err(e) = channel
-            .add_service(profile.store(), profile, tag, endpoint, kind, true)
-            .and_then(|_| channel.say_share(profile, tag, true, now_ms))
-        {
-            // Drop the room rather than keep a half-made one. Nothing outside this
-            // function has seen it: it is not in `self.channels` and has not been
-            // published, so forgetting it here is the whole of the rollback.
-            return Outcome::Failed(fault_of(&e));
-        }
-        let retention = self.node_retention_for(&id);
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        if let Err(error) = channel
-            .set_node_retention(profile.store(), retention)
-            .and_then(|()| {
-                channel.set_node_step_retention(
-                    profile.store(),
-                    self.node_step_retention.for_room(&id),
-                )
-            })
-        {
-            return Outcome::Failed(fault_of(&error));
-        }
-        self.remember_or_say(&channel);
-        self.channels
-            .insert(id, Arc::new(tokio::sync::Mutex::new(channel)));
-        self.adopt_channel_anchors(&id).await;
-        self.refresh_network_view().await;
-        self.publish_channel_locally(&id).await;
-        self.publish_channel_to_anchors(&id, PublishCause::Opened)
-            .await;
-        let _ = self
-            .event_tx
-            .send(NodeEvent::ChannelOpened { channel_id: id });
-        Outcome::Done
-    }
-
     /// Add `ch` to the rooms this node reopens by itself at unlock (#208), with the keys that
     /// reopen it, sealed under the identity ([`crate::node::open_rooms`]).
     fn remember_open(&self, ch: &ChannelState) -> crate::error::Result<()> {
@@ -18799,6 +19787,297 @@ impl Node {
         Ok(())
     }
 
+    /// Persist the signed public withdrawals and the exact boards still owed them. The room may
+    /// be purged immediately afterwards, so this write is the recovery boundary that preserves
+    /// both the withdrawal and where it must go across a crash.
+    fn save_pending_withdrawals(
+        profile: &Profile,
+        pending: &BTreeMap<Digest32, PendingWithdrawal>,
+    ) -> crate::error::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("withdrawal-not-durable") {
+            return Ok(());
+        }
+        profile.store().put_meta(
+            PENDING_WITHDRAWALS_META_KEY,
+            &pending_withdrawals_bytes(pending)?,
+        )
+    }
+
+    fn load_pending_withdrawals(&mut self) -> crate::error::Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .ok_or(Error::AtRestLocked)?;
+        self.withdrawn = match profile.store().get_meta(PENDING_WITHDRAWALS_META_KEY)? {
+            Some(bytes) => read_pending_withdrawals(&bytes)?,
+            None => BTreeMap::new(),
+        };
+        self.join_cleanup = match profile.store().get_meta(PENDING_JOIN_CLEANUP_META_KEY)? {
+            Some(bytes) => read_pending_withdrawals(&bytes)?,
+            None => BTreeMap::new(),
+        };
+        // A successful join removed its preparation inside its final authority fence. Anything
+        // left here belongs to a join interrupted before that boundary, never an existing room
+        // opened by its passphrase. Promote its narrowing action and purge its partial room in
+        // one transaction before any remembered room is reopened or the network starts.
+        for room in self.join_cleanup.keys().copied().collect::<Vec<_>>() {
+            self.abort_join_cleanup(&room, Fault::Locked)?;
+        }
+        Ok(())
+    }
+
+    fn save_join_cleanup(
+        profile: &Profile,
+        pending: &BTreeMap<Digest32, PendingWithdrawal>,
+    ) -> crate::error::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if crate::node::computer::fx28_mutant("withdrawal-not-durable") {
+            return Ok(());
+        }
+        profile.store().put_meta(
+            PENDING_JOIN_CLEANUP_META_KEY,
+            &pending_withdrawals_bytes(pending)?,
+        )
+    }
+
+    /// This journal is prepared recovery, not an active withdrawal: successful joining continues
+    /// publishing normally. The actor acknowledges it before the task can announce to a board.
+    fn retain_join_cleanup(
+        &mut self,
+        room: Digest32,
+        board: &Arc<VoxConnection>,
+        wire: Vec<u8>,
+    ) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        if self.channels.contains_key(&room) || profile.store().get_sek_wrap(&room)?.is_some() {
+            return Err(Error::Profile(
+                "an existing room cannot become join rollback state",
+            ));
+        }
+        let withdrawal = crate::nat::withdraw::BoardWithdraw::from_wire(&wire)?;
+        if withdrawal.channel_id != room
+            || withdrawal.scope != crate::nat::withdraw::WithdrawScope::Member
+            || withdrawal.author_id != profile.fingerprint()
+        {
+            return Err(Error::Profile(
+                "join rollback does not name this member and room",
+            ));
+        }
+        withdrawal.verify(&crate::identity::composite::RootSigner::public_key(
+            profile.signer()?,
+        ))?;
+        let mut next = self.join_cleanup.clone();
+        let pending = next.entry(room).or_insert_with(|| PendingWithdrawal {
+            wire: wire.clone(),
+            routes: BTreeMap::new(),
+        });
+        let prior = crate::nat::withdraw::BoardWithdraw::from_wire(&pending.wire)?;
+        if withdrawal.timestamp_ms >= prior.timestamp_ms {
+            pending.wire = wire;
+        }
+        let route = board.quinn().remote_address();
+        let routes = pending.routes.entry(board.peer_id()).or_default();
+        if !routes.contains(&route) {
+            if routes.len() == MAX_WITHDRAWAL_ROUTES {
+                routes.remove(0);
+            }
+            routes.push(route);
+        }
+        Self::save_join_cleanup(profile, &next)?;
+        self.join_cleanup = next;
+        self.on_board.insert((room, board.peer_id()));
+        if let Some(routes) = self
+            .join_cleanup
+            .get(&room)
+            .and_then(|pending| pending.routes.get(&board.peer_id()))
+        {
+            self.board_routes
+                .insert((room, board.peer_id()), routes.clone());
+        }
+        Ok(())
+    }
+
+    fn forget_refused_join_board(
+        &mut self,
+        room: Digest32,
+        board: &Arc<VoxConnection>,
+    ) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let mut next = self.join_cleanup.clone();
+        if let Some(pending) = next.get_mut(&room) {
+            let peer = board.peer_id();
+            if let Some(routes) = pending.routes.get_mut(&peer) {
+                routes.retain(|route| *route != board.quinn().remote_address());
+                if routes.is_empty() {
+                    pending.routes.remove(&peer);
+                }
+            }
+            if pending.routes.is_empty() {
+                next.remove(&room);
+            }
+        }
+        Self::save_join_cleanup(profile, &next)?;
+        self.join_cleanup = next;
+        self.board_routes.remove(&(room, board.peer_id()));
+        self.on_board.remove(&(room, board.peer_id()));
+        Ok(())
+    }
+
+    /// Every record published while a join is incomplete is covered by its prepared withdrawal.
+    /// A pre-key refresh may stamp records ahead of the clock, so persist that exact stamp before
+    /// publishing, rather than reconstructing it after a crash from the wall clock.
+    fn refresh_join_cleanup(
+        profile: &Profile,
+        pending: &mut BTreeMap<Digest32, PendingWithdrawal>,
+        room: Digest32,
+        epoch: u64,
+        stamp: u64,
+        board: Option<&Arc<VoxConnection>>,
+    ) -> crate::error::Result<()> {
+        let Some(existing) = pending.get(&room) else {
+            return Ok(());
+        };
+        let prior = crate::nat::withdraw::BoardWithdraw::from_wire(&existing.wire)?;
+        let stamp = stamp.max(prior.timestamp_ms);
+        let mut next = pending.clone();
+        let entry = next
+            .get_mut(&room)
+            .ok_or(Error::Profile("join rollback disappeared"))?;
+        entry.wire = crate::nat::withdraw::BoardWithdraw::build(
+            profile.signer()?,
+            &room,
+            epoch,
+            crate::nat::withdraw::WithdrawScope::Member,
+            stamp,
+        )?
+        .to_wire();
+        if let Some(board) = board {
+            let route = board.quinn().remote_address();
+            let routes = entry.routes.entry(board.peer_id()).or_default();
+            if !routes.contains(&route) {
+                if routes.len() == MAX_WITHDRAWAL_ROUTES {
+                    routes.remove(0);
+                }
+                routes.push(route);
+            }
+        }
+        Self::save_join_cleanup(profile, &next)?;
+        *pending = next;
+        Ok(())
+    }
+
+    fn complete_join_cleanup(&mut self, room: &Digest32) -> crate::error::Result<()> {
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let mut next = self.join_cleanup.clone();
+        next.remove(room);
+        Self::save_join_cleanup(profile, &next)?;
+        self.join_cleanup = next;
+        Ok(())
+    }
+
+    fn reject_join_cleanup(&mut self, room: &Digest32, fault: Fault) -> Outcome {
+        match self.abort_join_cleanup(room, fault) {
+            Ok(outcome) => outcome,
+            Err(error) => Outcome::Failed(fault_of(&error)),
+        }
+    }
+
+    /// Promote the prepared rollback and purge only the partial room owned by this join in one
+    /// durable transaction. Neither a crash nor a failure can lose the signed board action, and
+    /// an existing room with no preparation is never deleted by this path.
+    fn abort_join_cleanup(
+        &mut self,
+        room: &Digest32,
+        fault: Fault,
+    ) -> crate::error::Result<Outcome> {
+        let Some(cleanup) = self.join_cleanup.get(room).cloned() else {
+            return Ok(Outcome::Failed(fault));
+        };
+        let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
+        let signer = profile.signer()?;
+        let mut withdrawn = self.withdrawn.clone();
+        let pending = withdrawn.entry(*room).or_insert_with(|| cleanup.clone());
+        for (board, routes) in cleanup.routes {
+            let kept = pending.routes.entry(board).or_default();
+            for route in routes {
+                if !kept.contains(&route) && kept.len() < MAX_WITHDRAWAL_ROUTES {
+                    kept.push(route);
+                }
+            }
+        }
+        let old = crate::nat::withdraw::BoardWithdraw::from_wire(&pending.wire)?;
+        let prepared = crate::nat::withdraw::BoardWithdraw::from_wire(&cleanup.wire)?;
+        if old.scope != crate::nat::withdraw::WithdrawScope::Room
+            && old.timestamp_ms < prepared.timestamp_ms
+        {
+            pending.wire = cleanup.wire;
+        }
+        let mut unfinished = self.join_cleanup.clone();
+        unfinished.remove(room);
+        let mut open = OpenRooms::load(profile.store(), signer)?;
+        let changed = open.forget(room);
+        let mut batch = profile.store().batch()?;
+        #[cfg(feature = "test-knobs")]
+        let persist = !crate::node::computer::fx28_mutant("withdrawal-not-durable");
+        #[cfg(not(feature = "test-knobs"))]
+        let persist = true;
+        if persist {
+            batch.put_meta(
+                PENDING_WITHDRAWALS_META_KEY,
+                &pending_withdrawals_bytes(&withdrawn)?,
+            )?;
+        }
+        batch.put_meta(
+            PENDING_JOIN_CLEANUP_META_KEY,
+            &pending_withdrawals_bytes(&unfinished)?,
+        )?;
+        if changed {
+            batch.put_meta(
+                crate::node::open_rooms::OPEN_ROOMS_META_KEY,
+                &open.sealed(signer)?,
+            )?;
+        }
+        batch.purge_channel(room)?;
+        batch.commit()?;
+        self.withdrawn = withdrawn;
+        self.join_cleanup = unfinished;
+        self.retract_live_channel(room);
+        if let (Some(net), Some(pending)) = (self.net.as_ref(), self.withdrawn.get(room)) {
+            let _ = net.publish_local(&pending.wire);
+            for board in pending.routes.keys() {
+                if let Some(conn) = net.manager().existing(board) {
+                    Self::put_withdraws(&conn, vec![pending.wire.clone()]);
+                }
+            }
+        }
+        Ok(Outcome::Failed(fault))
+    }
+
+    fn replace_pending_withdrawals(
+        &mut self,
+        next: BTreeMap<Digest32, PendingWithdrawal>,
+    ) -> crate::error::Result<()> {
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|profile| profile.is_unlocked())
+            .ok_or(Error::AtRestLocked)?;
+        Self::save_pending_withdrawals(profile, &next)?;
+        self.withdrawn = next;
+        Ok(())
+    }
+
+    fn forget_pending_withdrawal(&mut self, channel_id: &Digest32) -> crate::error::Result<()> {
+        if !self.withdrawn.contains_key(channel_id) {
+            return Ok(());
+        }
+        let mut next = self.withdrawn.clone();
+        next.remove(channel_id);
+        self.replace_pending_withdrawals(next)
+    }
+
     /// [`Self::remember_open`], and if it cannot, **say so and keep going**.
     ///
     /// Every caller has already made or opened the room — it is in the store, and a created
@@ -18811,6 +20090,108 @@ impl Node {
                 channel_id: ch.channel_id(),
                 why: e.to_string(),
             });
+        }
+    }
+
+    /// Remove a room whose create/join completion cannot be published. The room rows and the
+    /// encrypted reopen set change in one transaction: a crash can expose neither a remembered
+    /// missing room nor an unpublished room that comes back after restart.
+    fn purge_unpublished_channel(
+        profile: &Profile,
+        channel_id: &Digest32,
+    ) -> crate::error::Result<()> {
+        let signer = profile.signer()?;
+        let mut open = OpenRooms::load(profile.store(), signer)?;
+        let changed = open.forget(channel_id);
+        let mut batch = profile.store().batch()?;
+        if changed {
+            batch.put_meta(
+                crate::node::open_rooms::OPEN_ROOMS_META_KEY,
+                &open.sealed(signer)?,
+            )?;
+        }
+        batch.purge_channel(channel_id)?;
+        batch.commit()
+    }
+
+    /// Retract a room which was inserted only to finish an asynchronous create/join publication.
+    /// The durable room and reopen entry are removed in the same store batch before failure is
+    /// reported, so a rejected authority can leave no live or restart-visible partial room.
+    fn reject_unpublished_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
+        self.retract_live_channel(channel_id);
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        match Self::purge_unpublished_channel(profile, channel_id) {
+            Ok(()) => Outcome::Failed(fault),
+            Err(error) => Outcome::Failed(fault_of(&error)),
+        }
+    }
+
+    /// A create/join can finish its asynchronous board publication before its final Computer
+    /// authority fence. Narrow that already-visible material before purging the local room. If a
+    /// withdrawal cannot be built, retain the local room and its signing material: erasing the
+    /// only remaining ability to withdraw would make the remote publication permanent.
+    async fn withdraw_and_reject_unpublished_live_channel(
+        &mut self,
+        channel_id: &Digest32,
+        ownership: RoomPublicationOwnership,
+        authority: &computer::ComputerAuthority,
+    ) -> Outcome {
+        if ownership == RoomPublicationOwnership::Joined
+            && self.join_cleanup.contains_key(channel_id)
+        {
+            let outcome = self.reject_join_cleanup(channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
+        let scope = if ownership == RoomPublicationOwnership::Created {
+            crate::nat::withdraw::WithdrawScope::Room
+        } else {
+            crate::nat::withdraw::WithdrawScope::Member
+        };
+        if let Err(fault) = self
+            .withdraw_from_boards(channel_id, scope, authority)
+            .await
+        {
+            return Outcome::Failed(fault);
+        }
+        let outcome = self.reject_unpublished_live_channel(channel_id, Fault::ComputerPolicy);
+        self.publish().await;
+        outcome
+    }
+
+    /// Remove only the transient projection of a stored room.  An explicit open or startup
+    /// reopen never owns the room rows and therefore must not reuse create/join rollback.
+    fn reject_existing_live_channel(&mut self, channel_id: &Digest32, fault: Fault) -> Outcome {
+        self.retract_live_channel(channel_id);
+        Outcome::Failed(fault)
+    }
+
+    fn reject_room_publication(
+        &mut self,
+        channel_id: &Digest32,
+        ownership: RoomPublicationOwnership,
+        fault: Fault,
+    ) -> Outcome {
+        match ownership {
+            RoomPublicationOwnership::Existing => {
+                self.reject_existing_live_channel(channel_id, fault)
+            }
+            RoomPublicationOwnership::Joined | RoomPublicationOwnership::Created => {
+                self.reject_unpublished_live_channel(channel_id, fault)
+            }
+        }
+    }
+
+    fn retract_live_channel(&mut self, channel_id: &Digest32) {
+        self.channels.remove(channel_id);
+        self.room_publication_authority.remove(channel_id);
+        self.fresh_details.remove(channel_id);
+        self.board_routes.retain(|(room, _), _| room != channel_id);
+        if let Some(net) = self.net.as_ref() {
+            net.membership().clear_channel(channel_id);
+            net.forget_room_on_board(channel_id);
         }
     }
 
@@ -19161,6 +20542,7 @@ impl Node {
 
     fn cancel_room_preparation(&mut self, id: &Digest32, fault: Fault) -> bool {
         let opening = self.opening_rooms.remove(id).is_some();
+        self.room_publication_authority.remove(id);
         let publishing = if let Some(waiting) = self.publish_waiters.remove(id) {
             if let Some(reply) = waiting.reply {
                 let _ = reply.send(Outcome::Failed(fault));
@@ -19335,7 +20717,13 @@ impl Node {
         let ch = prepared.channel.get_mut();
         if ch.legacy_startup_cleanup_blocks_current() {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-            ch.advance_legacy_startup_cleanup(profile.store())?;
+            let Some(cleaned) = self.with_current_computer_authority(|| {
+                ch.advance_legacy_startup_cleanup(profile.store())
+            }) else {
+                prepared.wait_on("current computer trust", self.now_ms().get());
+                return Ok(false);
+            };
+            cleaned?;
             prepared.legacy_cleanup_due = ch
                 .legacy_startup_cleanup_blocks_current()
                 .then_some(std::time::Instant::now() + TICK);
@@ -19347,7 +20735,13 @@ impl Node {
         {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let now = self.now_ms();
-            let governance = ch.advance_governance(profile.store(), now)?;
+            let Some(governance) = self
+                .with_current_computer_authority(|| ch.advance_governance(profile.store(), now))
+            else {
+                prepared.wait_on("current computer trust", self.now_ms().get());
+                return Ok(false);
+            };
+            let governance = governance?;
             if !governance.ready {
                 if governance.pending {
                     prepared.progressed("folding its governance records", now.get());
@@ -19360,21 +20754,27 @@ impl Node {
                 // A paused exact v1 publication owns the mutable indexes. Publish only its
                 // accepted cache so Resume/Cancel remain reachable. Key release and mutation
                 // remain fenced; no private/projection/retention write enters the work roots.
-                ch.forget_keys_except(profile.store(), &self.trust.trusted())?;
-                ch.set_node_retention(
-                    profile.store(),
-                    self.node_retention.for_room(&ch.channel_id()),
-                )?;
-                ch.set_node_step_retention(
-                    profile.store(),
-                    self.node_step_retention.for_room(&ch.channel_id()),
-                )?;
-                let order = crate::node::consent_order::ConsentOrder::load(
-                    profile.store(),
-                    profile.signer()?,
-                )?;
-                ch.mark_decisions_on_open(profile.store(), &order)?;
-                return Ok(true);
+                let Some(prepared_cache) = self.with_current_computer_authority(|| {
+                    ch.forget_keys_except(profile.store(), &self.trust.trusted())?;
+                    ch.set_node_retention(
+                        profile.store(),
+                        self.node_retention.for_room(&ch.channel_id()),
+                    )?;
+                    ch.set_node_step_retention(
+                        profile.store(),
+                        self.node_step_retention.for_room(&ch.channel_id()),
+                    )?;
+                    let order = crate::node::consent_order::ConsentOrder::load(
+                        profile.store(),
+                        profile.signer()?,
+                    )?;
+                    ch.mark_decisions_on_open(profile.store(), &order)?;
+                    Ok(true)
+                }) else {
+                    prepared.wait_on("current computer trust", self.now_ms().get());
+                    return Ok(false);
+                };
+                return prepared_cache;
             }
             ch.require_governance_ready(profile.store(), now)?;
         }
@@ -19397,19 +20797,28 @@ impl Node {
                 let opened = self
                     .open_logged_key_package(&pending.package, &ctx, now.get())
                     .await?;
-                let installed = if let Some(skdm) = opened {
-                    match self.profile.as_ref() {
-                        Some(profile) => {
-                            let installed = ch.accept_skdm(profile.store(), &skdm, now);
-                            if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
-                                self.governance_work.pending = true;
+                let Some(authority) = self.computer_authority() else {
+                    prepared.wait_on("current computer trust", self.now_ms().get());
+                    return Ok(false);
+                };
+                let Some(installed) = authority.publish(|| {
+                    if let Some(skdm) = opened {
+                        match self.profile.as_ref() {
+                            Some(profile) => {
+                                let installed = ch.accept_skdm(profile.store(), &skdm, now);
+                                if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
+                                    self.governance_work.pending = true;
+                                }
+                                installed.map(|_| ())
                             }
-                            installed.map(|_| ())
+                            None => Err(Error::AtRestLocked),
                         }
-                        None => Err(Error::AtRestLocked),
+                    } else {
+                        Ok(())
                     }
-                } else {
-                    Ok(())
+                }) else {
+                    prepared.wait_on("current computer trust", self.now_ms().get());
+                    return Ok(false);
                 };
                 // Refusals are acknowledged only after the attempt finishes. Storage faults
                 // leave the durable cursor behind this package so restart can recover it.
@@ -19419,7 +20828,13 @@ impl Node {
                     }
                 }
                 let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-                ch.key_package_attempted(profile.store(), &pending.author, pending.log_id)?;
+                let Some(attempted) = authority.publish(|| {
+                    ch.key_package_attempted(profile.store(), &pending.author, pending.log_id)
+                }) else {
+                    prepared.wait_on("current computer trust", self.now_ms().get());
+                    return Ok(false);
+                };
+                attempted?;
                 prepared.progressed("opening members' key packages", self.now_ms().get());
                 return Ok(false);
             }
@@ -19430,7 +20845,17 @@ impl Node {
         }
         {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-            if ch.advance_legacy_sessions(profile.store(), self.now_ms().get())? {
+            let Some(authority) = self.computer_authority() else {
+                prepared.wait_on("current computer trust", self.now_ms().get());
+                return Ok(false);
+            };
+            let Some(advanced) = authority
+                .publish(|| ch.advance_legacy_sessions(profile.store(), self.now_ms().get()))
+            else {
+                prepared.wait_on("current computer trust", self.now_ms().get());
+                return Ok(false);
+            };
+            if advanced? {
                 prepared.progressed("carrying its earlier Sessions over", self.now_ms().get());
                 return Ok(false);
             }
@@ -19438,11 +20863,19 @@ impl Node {
         let id = ch.channel_id();
         let retention = self.node_retention_for(&id);
         let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-        ch.set_node_retention(profile.store(), retention)?;
-        ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))?;
-        if !ch.finish_session_upgrade(profile.store(), self.now_ms().get())?
-            && ch.session_upgrade_local_work()
-        {
+        let Some(authority) = self.computer_authority() else {
+            prepared.wait_on("current computer trust", self.now_ms().get());
+            return Ok(false);
+        };
+        let Some(upgrade_finished) = authority.publish(|| -> crate::error::Result<bool> {
+            ch.set_node_retention(profile.store(), retention)?;
+            ch.set_node_step_retention(profile.store(), self.node_step_retention.for_room(&id))?;
+            ch.finish_session_upgrade(profile.store(), self.now_ms().get())
+        }) else {
+            prepared.wait_on("current computer trust", self.now_ms().get());
+            return Ok(false);
+        };
+        if !upgrade_finished? && ch.session_upgrade_local_work() {
             prepared.progressed("finishing its Session upgrade", self.now_ms().get());
             return Ok(false);
         }
@@ -19457,8 +20890,13 @@ impl Node {
         if ch.session_upgrade_local_work() {
             // An error here is said as the wait and tried again, paced: it never closes a room
             // that was opening before this step existed.
-            let step = match ch.advance_private_sessions_step(profile.store(), self.now_ms().get())
-            {
+            let Some(advanced) = authority
+                .publish(|| ch.advance_private_sessions_step(profile.store(), self.now_ms().get()))
+            else {
+                prepared.wait_on("current computer trust", self.now_ms().get());
+                return Ok(false);
+            };
+            let step = match advanced {
                 Ok(step) => step,
                 Err(error) => {
                     prepared.wait_on(
@@ -19482,12 +20920,17 @@ impl Node {
         // A refresh that did bounded work comes back at once; one that could do nothing yet
         // says what it waits for and is paced like every other wait (ADR-038 FX-24): a step
         // that reports progress while doing nothing re-queued the decider's room every 50 ms.
-        match ch.refresh_session_records(
-            profile,
-            &self.drive_holders(),
-            &[],
-            self.now_ms().get(),
-        )? {
+        // Every await in room preparation is complete before this publication. Derive the
+        // holder set while the current Computer authority is held, and retain that authority
+        // through the synchronous rotation/floor/Session writes performed by the refresh.
+        let Some(refresh) = self.with_current_computer_authority(|| {
+            let holders = self.drive_holders();
+            ch.refresh_session_records(profile, &holders, &[], self.now_ms().get())
+        }) else {
+            prepared.wait_on("current computer trust", self.now_ms().get());
+            return Ok(false);
+        };
+        match refresh? {
             SessionRefresh::Complete => {}
             SessionRefresh::Progressed => {
                 prepared.progressed("refreshing its Session records", self.now_ms().get());
@@ -19498,16 +20941,37 @@ impl Node {
                 return Ok(false);
             }
         }
-        ch.sweep_retention(profile.store(), self.now_ms())?;
-        if ch.legacy_classification_pending(profile.store())? {
+        let Some(view_work) = authority.publish(|| -> crate::error::Result<(bool, bool)> {
+            ch.sweep_retention(profile.store(), self.now_ms())?;
+            let classifying = ch.legacy_classification_pending(profile.store())?;
+            let advanced_views = if classifying {
+                false
+            } else {
+                ch.advance_room_views(profile.store())?.0
+            };
+            Ok((classifying, advanced_views))
+        }) else {
+            prepared.wait_on("current computer trust", self.now_ms().get());
+            return Ok(false);
+        };
+        let (classifying, advanced_views) = view_work?;
+        if classifying {
             prepared.progressed("classifying its earlier saved history", self.now_ms().get());
             return Ok(false);
         }
-        if ch.advance_room_views(profile.store())?.0 {
+        if advanced_views {
             prepared.progressed("building its room views", self.now_ms().get());
             return Ok(false);
         }
-        self.reconcile_prepared_trust(prepared)
+        let Some(authority) = self.computer_authority() else {
+            prepared.wait_on("current computer trust", self.now_ms().get());
+            return Ok(false);
+        };
+        let Some(reconciled) = authority.publish(|| self.reconcile_prepared_trust(prepared)) else {
+            prepared.wait_on("current computer trust", self.now_ms().get());
+            return Ok(false);
+        };
+        reconciled
     }
 
     /// Narrow current trust before publishing, at most one withdrawal or one 64-member
@@ -19571,15 +21035,23 @@ impl Node {
     async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
         let channel_id = ch.channel_id();
         let governance_deadline = ch.governance_deadline();
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
         if ch.legacy_startup_cleanup_pending() {
             self.legacy_cleanup_rooms.entry(channel_id).or_insert(None);
             self.legacy_cleanup_due = std::time::Instant::now();
         }
         // What the open set aside is reported (V210-74), as a reopen reports it.
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
-        self.remember_or_say(&ch);
-        self.channels
-            .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        let published = authority.publish(|| {
+            self.remember_or_say(&ch);
+            self.channels
+                .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
+        });
+        if published.is_none() {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        }
         // Reopening replaces the room instance. Never inherit a settled marker retained for the
         // prior instance while it was absent from the open-room map.
         self.governance_work.wake_room(channel_id);
@@ -19596,7 +21068,25 @@ impl Node {
             .await;
         self.install_key_packages(&channel_id).await;
         self.reach_members_of(&channel_id).await;
-        let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+        if !authority.current() {
+            let outcome = self.reject_existing_live_channel(&channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
+        if authority
+            .publish(|| {
+                let _ = self.event_tx.send(NodeEvent::ChannelOpened { channel_id });
+                self.room_publication_authority.insert(
+                    channel_id,
+                    (authority.clone(), RoomPublicationOwnership::Existing),
+                );
+            })
+            .is_none()
+        {
+            let outcome = self.reject_existing_live_channel(&channel_id, Fault::ComputerPolicy);
+            self.publish().await;
+            return outcome;
+        }
         Outcome::Done
     }
 
@@ -19638,6 +21128,7 @@ impl Node {
                 }
                 // And no address to it is handed out now (V210-96).
                 self.on_board.retain(|(r, _)| r != channel_id);
+                self.board_routes.retain(|(r, _), _| r != channel_id);
                 self.publish_trouble.retain(|(r, _), _| r != channel_id);
                 self.anchor_owed.retain(|(r, _), _| r != channel_id);
                 let (closed, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.address_waiters)
@@ -19692,6 +21183,10 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
             return;
         }
+        let Some(authority) = self.computer_authority() else {
+            let _ = reply.send(Outcome::Failed(Fault::ComputerPolicy));
+            return;
+        };
         let now_ms = self.now_ms();
         let written = {
             let Some(profile) = self.profile.as_ref() else {
@@ -19699,12 +21194,19 @@ impl Node {
                 return;
             };
             let mut ch = shared.lock().await;
-            let written = ch.say_presence(profile, false, now_ms).map(|_| {
-                (
-                    ch.generation().load(std::sync::atomic::Ordering::Relaxed),
-                    ch.members().into_iter().all(|m| m == ch.me()),
-                )
-            });
+            let written = authority
+                .publish(|| {
+                    ch.say_presence(profile, false, now_ms).map(|_| {
+                        (
+                            ch.generation().load(std::sync::atomic::Ordering::Relaxed),
+                            ch.members().into_iter().all(|m| m == ch.me()),
+                        )
+                    })
+                })
+                .ok_or(Error::Profile(
+                    "computer policy changed before the room mutation",
+                ))
+                .and_then(|written| written);
             if written.is_ok() {
                 match detail_of(
                     &ch,
@@ -19730,8 +21232,17 @@ impl Node {
                 return;
             }
         };
-        self.withdraw_from_boards(&channel_id, crate::nat::withdraw::WithdrawScope::Member)
-            .await;
+        if let Err(fault) = self
+            .withdraw_from_boards(
+                &channel_id,
+                crate::nat::withdraw::WithdrawScope::Member,
+                &authority,
+            )
+            .await
+        {
+            let _ = reply.send(Outcome::Failed(fault));
+            return;
+        }
         // Nobody else is in the room: there is nobody to tell.
         if alone {
             let _ = reply.send(self.purge_room(&channel_id).await);
@@ -19809,8 +21320,10 @@ impl Node {
             self.purge_room(&channel_id).await
         } else {
             // In the room again: its records go on boards again.
-            self.withdrawn.remove(&channel_id);
-            Outcome::Failed(Fault::LeaveUndone)
+            match self.forget_pending_withdrawal(&channel_id) {
+                Ok(()) => Outcome::Failed(Fault::LeaveUndone),
+                Err(error) => Outcome::Failed(fault_of(&error)),
+            }
         };
         for reply in heard.into_iter().filter_map(|(_, _, reply, _)| reply) {
             let _ = reply.send(outcome);
@@ -19825,26 +21338,25 @@ impl Node {
         &mut self,
         channel_id: &Digest32,
         scope: crate::nat::withdraw::WithdrawScope,
-    ) -> usize {
+        _authority: &computer::ComputerAuthority,
+    ) -> Result<usize, Fault> {
         let now_ms = self.now_ms().get();
-        let (Some(net), Some(profile)) = (self.net.as_ref().map(Arc::clone), self.profile.as_ref())
-        else {
-            return 0;
-        };
-        let Ok(signer) = profile.signer() else {
-            return 0;
-        };
+        let net = self.net.as_ref().map(Arc::clone);
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return 0;
+            return Err(Fault::ChannelNotOpen);
         };
         let epoch = shared.lock().await.epoch();
-        let Ok(w) =
-            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now_ms)
-        else {
-            return 0;
+        let Some(profile) = self.profile.as_ref() else {
+            return Err(Fault::NoIdentity);
         };
+        let signer = profile.signer().map_err(|error| fault_of(&error))?;
+        let w =
+            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now_ms)
+                .map_err(|error| fault_of(&error))?;
         let wire = w.to_wire();
-        let _ = net.publish_local(&wire);
+        if let Some(net) = net.as_ref() {
+            let _ = net.publish_local(&wire);
+        }
         let mut assigned = BTreeMap::new();
         for anchor in self.anchors.nodes().iter().chain(
             self.room_anchors
@@ -19856,44 +21368,88 @@ impl Node {
                 .entry(anchor.id)
                 .or_insert_with(|| anchor.endpoints.direct_candidates());
         }
-        self.withdrawn.insert(
+        // A board need not be an anchor. In particular, a join publishes to the member that
+        // answered it. Retain every board which already holds this room and every publish still
+        // in flight; `PublishDone` sends the withdrawal again after that older round ends, so a
+        // late publication cannot race past the cleanup.
+        let direct_boards: BTreeSet<Digest32> = self
+            .on_board
+            .iter()
+            .chain(self.publishing.iter())
+            .filter(|(room, _)| room == channel_id)
+            .map(|(_, board)| *board)
+            .collect();
+        for board in direct_boards {
+            let routes = assigned.entry(board).or_default();
+            if let Some(observed) = self.board_routes.get(&(*channel_id, board)) {
+                for route in observed {
+                    if !routes.contains(route) && routes.len() < MAX_WITHDRAWAL_ROUTES {
+                        routes.push(*route);
+                    }
+                }
+            }
+            for route in self.peer_book.endpoints(&board).direct_candidates() {
+                if !routes.contains(&route) && routes.len() < MAX_WITHDRAWAL_ROUTES {
+                    routes.push(route);
+                }
+            }
+            if let Some(conn) = net.as_ref().and_then(|net| net.manager().existing(&board)) {
+                let route = conn.quinn().remote_address();
+                if !routes.contains(&route) && routes.len() < MAX_WITHDRAWAL_ROUTES {
+                    routes.push(route);
+                }
+            }
+        }
+        let mut next = self.withdrawn.clone();
+        next.insert(
             *channel_id,
             PendingWithdrawal {
                 wire: wire.clone(),
                 routes: assigned,
             },
         );
-        let anchors: Vec<Arc<VoxConnection>> = self
-            .anchor_ids
-            .iter()
-            .filter(|id| self.anchor_serves_room(channel_id, id))
-            .filter_map(|id| net.manager().existing(id))
-            .collect();
+        self.replace_pending_withdrawals(next)
+            .map_err(|error| fault_of(&error))?;
+        let anchors: Vec<Arc<VoxConnection>> = net.as_ref().map_or_else(Vec::new, |net| {
+            self.withdrawn
+                .get(channel_id)
+                .into_iter()
+                .flat_map(|pending| pending.routes.keys())
+                .filter_map(|id| net.manager().existing(id))
+                .collect()
+        });
         for conn in &anchors {
             Self::put_withdraws(conn, vec![wire.clone()]);
         }
-        anchors.len()
+        Ok(anchors.len())
     }
 
     /// The room's admin roster, signed (V030-14), when this node is its creator: who besides it a
     /// board takes the room off from. Stamped with the newest admin change on the log, so putting
     /// it again changes nothing on a board that holds it.
-    async fn admin_roster(&self, channel_id: &Digest32) -> Option<Vec<u8>> {
-        let profile = self.profile.as_ref()?;
-        let signer = profile.signer().ok()?;
-        let shared = self.channels.get(channel_id).map(Arc::clone)?;
+    async fn admin_roster(&self, channel_id: &Digest32) -> Result<Option<Vec<u8>>, Fault> {
+        let profile = self.profile.as_ref().ok_or(Fault::NoIdentity)?;
+        let signer = profile.signer().map_err(|error| fault_of(&error))?;
+        let shared = self
+            .channels
+            .get(channel_id)
+            .map(Arc::clone)
+            .ok_or(Fault::ChannelNotOpen)?;
         let mut ch = shared.lock().await;
         let me = ch.me();
         if me != ch.genesis().creator_pubkey().fingerprint() {
-            return None;
+            return Ok(None);
         }
         let stamp = match ch.admin_change_clock(profile.store()) {
-            Ok(stamp) => stamp?,
+            Ok(stamp) => match stamp {
+                Some(stamp) => stamp,
+                None => return Ok(None),
+            },
             Err(error) => {
                 if !ChannelState::governance_refreshing(&error) {
                     ch.poison(&error);
                 }
-                return None;
+                return Err(fault_of(&error));
             }
         };
         // This is one protocol-bounded signed message, not a historical admin projection.
@@ -19907,11 +21463,11 @@ impl Node {
                     if !ChannelState::governance_refreshing(&error) {
                         ch.poison(&error);
                     }
-                    return None;
+                    return Err(fault_of(&error));
                 }
             };
             if admins.len().saturating_add(page.targets.len()) > crate::nat::withdraw::MAX_ROSTER {
-                return None;
+                return Err(Fault::Internal);
             }
             admins.extend(page.targets);
             match page.next {
@@ -19919,28 +21475,42 @@ impl Node {
                 None => break,
             }
         }
-        crate::nat::withdraw::AdminRoster::build(signer, channel_id, stamp, admins)
-            .ok()
-            .map(|r| r.to_wire())
+        let authority = self.computer_authority().ok_or(Fault::ComputerPolicy)?;
+        authority
+            .publish(|| {
+                crate::nat::withdraw::AdminRoster::build(signer, channel_id, stamp, admins)
+                    .map(|r| r.to_wire())
+            })
+            .ok_or(Fault::ComputerPolicy)?
+            .map(Some)
+            .map_err(|error| fault_of(&error))
     }
 
     /// Put the room's admin roster on this node's board and every anchor connected now (V030-14).
-    async fn publish_admin_roster(&mut self, channel_id: &Digest32) {
-        let Some(wire) = self.admin_roster(channel_id).await else {
-            return;
+    async fn publish_admin_roster(&mut self, channel_id: &Digest32) -> Result<(), Fault> {
+        let Some(wire) = self.admin_roster(channel_id).await? else {
+            return Ok(());
         };
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return;
+            return Ok(());
         };
-        let _ = net.publish_local(&wire);
-        for conn in self
-            .anchor_ids
-            .iter()
-            .filter(|id| self.anchor_serves_room(channel_id, id))
-            .filter_map(|id| net.manager().existing(id))
-        {
-            Self::put_withdraws(&conn, vec![wire.clone()]);
-        }
+        let Some(authority) = self.computer_authority() else {
+            return Err(Fault::ComputerPolicy);
+        };
+        authority
+            .publish(|| {
+                let _ = net.publish_local(&wire);
+                for conn in self
+                    .anchor_ids
+                    .iter()
+                    .filter(|id| self.anchor_serves_room(channel_id, id))
+                    .filter_map(|id| net.manager().existing(id))
+                {
+                    Self::put_withdraws(&conn, vec![wire.clone()]);
+                }
+            })
+            .ok_or(Fault::ComputerPolicy)?;
+        Ok(())
     }
 
     /// Put `withdraws` on the board at `conn`, off the actor. A put the board never answered —
@@ -19998,20 +21568,32 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
         {
             let mut ch = shared.lock().await;
             if ch.ended((self.millis_clock)()).is_some() {
                 return Outcome::Failed(Fault::RoomEnded);
             }
-            if let Err(e) = ch.end(profile, now_ms) {
+            let ended = authority.publish(|| ch.end(profile, now_ms));
+            let Some(ended) = ended else {
+                return Outcome::Failed(Fault::ComputerPolicy);
+            };
+            if let Err(e) = ended {
                 // The faulty peer a board must not obey (V030-14's proof): it takes the room off
                 // boards though it may not end it.
                 #[cfg(feature = "mutant-sender")]
                 if crate::log::sync::mutant::withdraws_unentitled() {
                     drop(ch);
                     let anchors = self
-                        .withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
-                        .await;
+                        .withdraw_from_boards(
+                            channel_id,
+                            crate::nat::withdraw::WithdrawScope::Room,
+                            &authority,
+                        )
+                        .await
+                        .unwrap_or(0);
                     eprintln!(
                         "{}: put a room withdraw for {} to {anchors} anchor(s) though this node \
                          may not end it",
@@ -20023,8 +21605,16 @@ impl Node {
             }
         }
         self.note_local_governance_append(channel_id);
-        self.withdraw_from_boards(channel_id, crate::nat::withdraw::WithdrawScope::Room)
-            .await;
+        if let Err(fault) = self
+            .withdraw_from_boards(
+                channel_id,
+                crate::nat::withdraw::WithdrawScope::Room,
+                &authority,
+            )
+            .await
+        {
+            return Outcome::Failed(fault);
+        }
         // The checked local publication completes first; the regular lifecycle turn
         // then winds the room down without overtaking this command's reply.
         Outcome::Done
@@ -20050,18 +21640,28 @@ impl Node {
         {
             let mut ch = shared.lock().await;
             let done = if admin {
-                ch.add_admin(profile, member, now_ms).map(|_| ())
+                self.with_current_computer_authority(|| {
+                    ch.add_admin(profile, member, now_ms).map(|_| ())
+                })
             } else {
                 // The public command is held by begin_admin_removal across bounded turns.
                 return Outcome::Failed(Fault::Internal);
+            };
+            let Some(done) = done else {
+                return Outcome::Failed(Fault::ComputerPolicy);
             };
             if let Err(e) = done {
                 return Outcome::Failed(fault_of(&e));
             }
         }
         self.note_local_governance_append(channel_id);
-        // Bounded governance maintenance publishes the checked roster (V030-14)
-        // before the local completion is eligible to answer.
+        // The certificate is the durable admin decision. Its own append necessarily makes the
+        // derived governance view refresh, so trying to build the roster synchronously here
+        // reported `GovernanceRefreshing` after the admin had already been added. Governance
+        // owns the projection and retries it until the board roster reflects that certificate.
+        self.governance_work.admin_rosters.insert(*channel_id);
+        self.governance_work.pending = true;
+        self.governance_work.again = true;
         Outcome::Done
     }
 
@@ -20076,7 +21676,12 @@ impl Node {
         };
         {
             let mut ch = shared.lock().await;
-            if let Err(e) = ch.choose_idle_end(profile, idle_secs, now_ms) {
+            let chosen = self
+                .with_current_computer_authority(|| ch.choose_idle_end(profile, idle_secs, now_ms));
+            let Some(chosen) = chosen else {
+                return Outcome::Failed(Fault::ComputerPolicy);
+            };
+            if let Err(e) = chosen {
                 return Outcome::Failed(fault_of(&e));
             }
         }
@@ -20329,8 +21934,15 @@ impl Node {
                 }
             }
             if idle_ended_here && !self.withdrawn.contains_key(&cid) {
-                self.withdraw_from_boards(&cid, crate::nat::withdraw::WithdrawScope::Room)
-                    .await;
+                if let Some(authority) = self.computer_authority() {
+                    let _ = self
+                        .withdraw_from_boards(
+                            &cid,
+                            crate::nat::withdraw::WithdrawScope::Room,
+                            &authority,
+                        )
+                        .await;
+                }
             }
             if !over {
                 continue;
@@ -20435,21 +22047,33 @@ impl Node {
                 self.offer_own_head(channel_id, own_hint, own_targets);
                 return;
             }
-            let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {
-                ch.settle_sparse(profile, now_ms)
-            } else {
-                if !matches!(ch.settle(profile.store()), Ok(true)) {
-                    return;
-                }
-                ch.catch_up_generation(profile, now_ms)
-                    .and_then(|_| ch.say_presence(profile, true, now_ms))
-            };
-            let back = settlement.map(|back| {
-                // Shares made while the room was unsettled are said now (V030-25). A share
-                // left unsaid is offered but unlisted, which is not worth failing the room.
-                let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
-                back || said
+            let settlement = self.with_current_computer_authority(|| {
+                let settlement = if ch.uses_sparse_history(profile.store()).unwrap_or(true) {
+                    Some(ch.settle_sparse(profile, now_ms))
+                } else if matches!(ch.settle(profile.store()), Ok(true)) {
+                    Some(
+                        ch.catch_up_generation(profile, now_ms)
+                            .and_then(|_| ch.say_presence(profile, true, now_ms)),
+                    )
+                } else {
+                    None
+                };
+                settlement.map(|settlement| {
+                    settlement.map(|back| {
+                        // Shares made while the room was unsettled are said now (V030-25). A
+                        // share left unsaid is offered but unlisted, which is not worth failing
+                        // the room. It is part of the same authority-bearing write transaction.
+                        let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
+                        back || said
+                    })
+                })
             });
+            let Some(settlement) = settlement else {
+                return;
+            };
+            let Some(back) = settlement else {
+                return;
+            };
             (back, own_hint, own_targets)
         };
         match back {
@@ -20546,29 +22170,36 @@ impl Node {
         let (outcome, governance_appended) = {
             let mut channel = shared.lock().await;
             let mut governance_appended = false;
-            let outcome = channel
-                .add_service(profile.store(), profile, service_tag, local, kind, persist)
-                .and_then(|_| {
-                    // A share is said to the room so its members can list it (V030-25); a
-                    // transient offer — a file being handed over — is not a share. If it cannot
-                    // be said, the service is not offered either.
-                    if !persist {
-                        return Ok(());
-                    }
-                    // A room joined and not yet synced cannot be written to (V210-164): the share
-                    // is offered now and said when the room settles (`say_unsaid_shares`).
-                    match channel.say_share(profile, service_tag, true, now_ms) {
-                        Err(crate::error::Error::RoomNotSynced) => Ok(()),
-                        Err(e) => {
-                            let _ = channel.remove_service(profile.store(), service_tag);
-                            Err(e)
-                        }
-                        Ok(()) => {
-                            governance_appended = true;
-                            Ok(())
-                        }
-                    }
-                });
+            let outcome = self
+                .with_current_computer_authority(|| {
+                    channel
+                        .add_service(profile.store(), profile, service_tag, local, kind, persist)
+                        .and_then(|_| {
+                            // A share is said to the room so its members can list it (V030-25); a
+                            // transient offer — a file being handed over — is not a share. If it
+                            // cannot be said, the service is not offered either.
+                            if !persist {
+                                return Ok(());
+                            }
+                            // A room joined and not yet synced cannot be written to (V210-164):
+                            // the share is offered now and said when the room settles.
+                            match channel.say_share(profile, service_tag, true, now_ms) {
+                                Err(crate::error::Error::RoomNotSynced) => Ok(()),
+                                Err(e) => {
+                                    let _ = channel.remove_service(profile.store(), service_tag);
+                                    Err(e)
+                                }
+                                Ok(()) => {
+                                    governance_appended = true;
+                                    Ok(())
+                                }
+                            }
+                        })
+                })
+                .ok_or(Error::Profile(
+                    "computer policy changed before the room mutation",
+                ))
+                .and_then(|outcome| outcome);
             if outcome.is_ok() {
                 self.publish_service_offers(&channel);
             }
@@ -20604,15 +22235,24 @@ impl Node {
         let (outcome, governance_appended) = {
             let mut channel = shared.lock().await;
             let was_shared = channel.is_shared(service_tag);
-            let removed = channel.remove_service(profile.store(), service_tag);
-            // The room is told it is no longer shared (V030-25). Not saying so leaves it listed
-            // where nothing answers — a wrong listing, not a failed removal: the service is gone
-            // either way.
-            let governance_appended = matches!(removed, Ok(true))
-                && was_shared
-                && channel
-                    .say_share(profile, service_tag, false, now_ms)
-                    .is_ok();
+            let mut governance_appended = false;
+            let removed = self
+                .with_current_computer_authority(|| {
+                    let removed = channel.remove_service(profile.store(), service_tag);
+                    // The room is told it is no longer shared (V030-25). Not saying so leaves it
+                    // listed where nothing answers — a wrong listing, not a failed removal: the
+                    // service is gone either way.
+                    governance_appended = matches!(removed, Ok(true))
+                        && was_shared
+                        && channel
+                            .say_share(profile, service_tag, false, now_ms)
+                            .is_ok();
+                    removed
+                })
+                .ok_or(Error::Profile(
+                    "computer policy changed before the room mutation",
+                ))
+                .and_then(|removed| removed);
             if matches!(removed, Ok(true)) {
                 self.publish_service_offers(&channel);
             }
@@ -21218,6 +22858,23 @@ impl Node {
     /// Called whenever either input moves — the keyring (`Trust`/`Revoke`) or a channel's
     /// author set (any board admission) — and once per accept as a backstop.
     async fn refresh_reachers(&mut self) {
+        let _ = self.refresh_reachers_causal(None).await;
+    }
+
+    /// Recompute reachers for one computer-policy event. Its owner is checked after every await
+    /// and immediately before publication: a command deadline or exact target supersession
+    /// empties registered gates, while elapsed live-follower observation time is not authority.
+    async fn refresh_reachers_guarded(
+        &mut self,
+        guard: &computer::ComputerPolicyGuard,
+    ) -> crate::error::Result<()> {
+        self.refresh_reachers_causal(Some(guard)).await
+    }
+
+    async fn refresh_reachers_causal(
+        &mut self,
+        causal: Option<&computer::ComputerPolicyGuard>,
+    ) -> crate::error::Result<()> {
         // A **locked** node is not a node that withdrew its trust. `lock` clears the keyring
         // because it is sealed under the identity (ADR-020 §3), so recomputing here would
         // produce an empty set and read as "everyone was withdrawn" — tearing down every live
@@ -21225,11 +22882,19 @@ impl Node {
         // about what this node can *read*, so live tunnels are left alone and the sets keep
         // their last values until the next unlock.
         if self.profile.is_none() {
-            return;
+            return Ok(());
         }
         let trusted = self.trust.trusted();
         for (cid, shared) in &self.channels {
             let ch = shared.lock().await;
+            if let Some(guard) = causal {
+                if let Err(error) = guard.active(self.computer.as_ref()) {
+                    if let Some(computer) = &self.computer {
+                        computer.invalidate_reachers();
+                    }
+                    return Err(error);
+                }
+            }
             // (in this node's ring) AND (a current author of this room). Neither alone:
             // trust is room-independent so it cannot name the room, and membership is a
             // passphrase and a proof of work rather than a decision about a person.
@@ -21245,11 +22910,28 @@ impl Node {
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
             if let Some(computer) = &self.computer {
+                if let Some(guard) = causal {
+                    if let Err(error) = guard.active(self.computer.as_ref()) {
+                        computer.invalidate_reachers();
+                        return Err(error);
+                    }
+                }
                 computer.publish_reachers(
                     slot,
                     next,
                     self.computer_revision
                         .load(std::sync::atomic::Ordering::Acquire),
+                    self.computer_expired,
+                    self.profile
+                        .as_ref()
+                        .filter(|profile| profile.is_unlocked())
+                        .map(Profile::fingerprint)
+                        .or_else(|| {
+                            self.headless.as_ref().map(|signer| {
+                                crate::identity::composite::RootSigner::fingerprint(signer.as_ref())
+                            })
+                        })
+                        .ok_or(Error::Profile("managed node has no unlocked identity"))?,
                 );
             } else {
                 crate::node::tunnel::publish_reachers(slot, next);
@@ -21276,8 +22958,17 @@ impl Node {
             }
             held
         });
+        if let Some(guard) = causal {
+            if let Err(error) = guard.active(self.computer.as_ref()) {
+                if let Some(computer) = &self.computer {
+                    computer.invalidate_reachers();
+                }
+                return Err(error);
+            }
+        }
         // The app layer reads the same live sets, for both halves of its gate.
         self.app.set_reachers(&self.reachers);
+        Ok(())
     }
 
     /// Append the complete signed room set, preserving independent machine/other-room scopes.
@@ -21308,8 +22999,15 @@ impl Node {
                     }
                 }
             }
-            next.merge_endpoints(add)
-                .and_then(|()| ch.set_anchors(profile, &next, now))
+            match next.merge_endpoints(add) {
+                Ok(()) => self
+                    .with_current_computer_authority(|| ch.set_anchors(profile, &next, now))
+                    .ok_or(Error::Profile(
+                        "computer policy changed before the room mutation",
+                    )),
+                Err(error) => Err(error),
+            }
+            .and_then(|changed| changed)
         };
         if let Err(error) = changed {
             return Outcome::Failed(fault_of(&error));
@@ -21332,10 +23030,16 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let appended = match shared.lock().await.set_name(profile, name, now_ms) {
+        let mut ch = shared.lock().await;
+        let renamed = self.with_current_computer_authority(|| ch.set_name(profile, name, now_ms));
+        let Some(renamed) = renamed else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        let appended = match renamed {
             Ok(appended) => appended,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
+        drop(ch);
         self.note_local_governance_append(channel_id);
         Outcome::Appended(appended)
     }
@@ -21388,7 +23092,13 @@ impl Node {
             self.sweep_retention().await;
             return Outcome::OwnRetention { own: ttl, room };
         }
-        if let Err(e) = shared.lock().await.set_retention(profile, ttl, now_ms) {
+        let mut ch = shared.lock().await;
+        let retained =
+            self.with_current_computer_authority(|| ch.set_retention(profile, ttl, now_ms));
+        let Some(retained) = retained else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        if let Err(e) = retained {
             return Outcome::Failed(fault_of(&e));
         }
         self.note_local_governance_append(channel_id);
@@ -21444,7 +23154,13 @@ impl Node {
             self.sweep_retention().await;
             return Outcome::OwnRetention { own: ttl, room };
         }
-        if let Err(e) = shared.lock().await.set_step_retention(profile, ttl, now_ms) {
+        let mut ch = shared.lock().await;
+        let retained =
+            self.with_current_computer_authority(|| ch.set_step_retention(profile, ttl, now_ms));
+        let Some(retained) = retained else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        if let Err(e) = retained {
             return Outcome::Failed(fault_of(&e));
         }
         self.note_local_governance_append(channel_id);
@@ -21564,7 +23280,10 @@ impl Node {
             let _ = here;
             ch.set_checkpoint_idle(self.checkpoint_idle_secs);
             if let Some(profile) = self.profile.as_ref() {
-                if ch.checkpoint_if_due(profile, now_ms).unwrap_or(false) {
+                if self
+                    .with_current_computer_authority(|| ch.checkpoint_if_due(profile, now_ms))
+                    .is_some_and(|checkpointed| checkpointed.unwrap_or(false))
+                {
                     checkpointed.push(*cid);
                 }
             }
@@ -21591,6 +23310,9 @@ impl Node {
             .filter(|p| p.is_unlocked())
             .ok_or("this node is locked")?;
         let owner = profile.fingerprint();
+        if by != owner && !self.computer_authority_current() {
+            return Err("attention waits for current computer trust".into());
+        }
         if by != owner
             && (!matches!(operation, crate::node::attention::Operation::Page(_))
                 || !self.trust.has_drive(&by)
@@ -21615,7 +23337,9 @@ impl Node {
                 return Err("the selected room changed; refresh and retry".into());
             }
         }
-        channel.attention(profile.store(), owner, operation, (self.millis_clock)())
+        let write = || channel.attention(profile.store(), owner, operation, (self.millis_clock)());
+        self.with_current_computer_authority(write)
+            .ok_or_else(|| "attention waits for current computer trust".to_owned())?
     }
 
     async fn room_pause(
@@ -21664,11 +23388,24 @@ impl Node {
             return Err(Fault::ReadSelectionChanged);
         }
         if let Some(paused) = paused {
-            if let Err(error) =
-                ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)())
-            {
-                ch.poison(&error);
-                return Err(fault_of(&error));
+            #[cfg(feature = "test-knobs")]
+            self.hold_room_pause_publication_for_proof().await;
+            let write = || ch.set_room_pause(profile.store(), paused, by, (self.millis_clock)());
+            // The room lock is already held and every await is complete. Computer policy never
+            // takes a room lock while holding its state lock, so this room -> policy order is
+            // safe and the exact durable pause write cannot outlive its authority. The local
+            // owner is fenced too: Computer policy authorizes the node identity, not just remote
+            // agents acting through it.
+            let written = self
+                .computer_authority()
+                .and_then(|authority| authority.publish_room_pause(write));
+            match written {
+                None => return Err(Fault::Refused),
+                Some(Ok(())) => {}
+                Some(Err(error)) => {
+                    ch.poison(&error);
+                    return Err(fault_of(&error));
+                }
             }
         }
         let selection = vox_agentcomms::drive::PauseSelection {
@@ -21725,7 +23462,13 @@ impl Node {
                 }
             }
         }
-        match ch.admit_read_marks(profile, &entries, (self.millis_clock)()) {
+        let admitted = self.with_current_computer_authority(|| {
+            ch.admit_read_marks(profile, &entries, (self.millis_clock)())
+        });
+        let Some(admitted) = admitted else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        match admitted {
             Ok(()) => Outcome::Done,
             Err(error) => {
                 if !matches!(
@@ -21777,7 +23520,13 @@ impl Node {
         if ch.is_poisoned() {
             return false;
         }
-        let result = ch.flush_read_marks(profile, (self.millis_clock)(), READ_RECORD_EVERY_MS);
+        let Some(result) = self.with_current_computer_authority(|| {
+            ch.flush_read_marks(profile, (self.millis_clock)(), READ_RECORD_EVERY_MS)
+        }) else {
+            // Accepted marks remain durable and the reconciled actor retries them. A stale actor
+            // may not advance the read ratchet or append their signed receipt.
+            return false;
+        };
         match result {
             Ok(false) => false,
             Ok(true) => {
@@ -22028,42 +23777,45 @@ impl Node {
         let Some(channel) = self.channels.get(&pending.room).cloned() else {
             return false;
         };
-        let holders = self.drive_holders();
         let now = (self.millis_clock)();
-        let result = {
+        let committed = {
             let Ok(mut channel) = channel.try_lock() else {
                 return false;
             };
-            channel
-                .require_governance_ready(profile.store(), crate::time::Ms(now))
-                .and_then(|current| {
-                    channel.rotate_drive_if_lost(
-                        profile.store(),
-                        &holders,
-                        crate::time::Ms(now),
-                        current,
-                    )
-                })
-                .and_then(|_| {
-                    channel.append_ingress_session(
-                        profile,
-                        &pending.session,
-                        &pending.body,
-                        &holders,
-                        now,
-                        &pending.completion,
-                    )
-                })
+            self.with_current_computer_authority(|| {
+                let holders = self.drive_holders();
+                channel
+                    .require_governance_ready(profile.store(), crate::time::Ms(now))
+                    .and_then(|current| {
+                        channel.rotate_drive_if_lost(
+                            profile.store(),
+                            &holders,
+                            crate::time::Ms(now),
+                            current,
+                        )
+                    })
+                    .and_then(|_| {
+                        channel.append_ingress_session(
+                            profile,
+                            &pending.session,
+                            &pending.body,
+                            &holders,
+                            now,
+                            &pending.completion,
+                        )
+                    })
+            })
         };
-        match result {
-            Ok(_) => {
+        match committed {
+            Some(Ok(_)) => {
                 self.session_ingress_error = None;
                 self.note_local_append(&pending.room);
+                let holders = self.drive_holders();
                 self.tend_drive_keys_in(&pending.room, &holders).await;
                 self.say_session_news(&pending.room).await;
                 true
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 if !matches!(error, crate::error::Error::RoomNotSynced) {
                     self.session_ingress_error = Some(format!(
                         "Session activity is saved and waiting for its room: {error}"
@@ -22071,6 +23823,7 @@ impl Node {
                 }
                 false
             }
+            None => false,
         }
     }
 
@@ -22086,33 +23839,38 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let holders = self.drive_holders();
         let now_millis = (self.millis_clock)();
-        let entry = {
+        let committed = {
             let mut ch = shared.lock().await;
-            // **Never sealed under a key a member that lost drive still holds** (SC-2b): the key
-            // changes here, before the entry, whatever the tick has not got to yet.
-            // The fold is one bounded governance turn away, never a peer round trip (ADR-037 R1,
-            // R2): an append that finds it behind takes that turn here instead of refusing an
-            // entry its harness sends once. Measured: a fold released from a hold stayed behind
-            // until the one-second tick, and the harness's next append was refused meanwhile.
-            let now = crate::time::Ms(now_millis);
-            let current = match ch.require_governance_ready(profile.store(), now) {
-                Err(e) if ChannelState::governance_refreshing(&e) => ch
-                    .advance_governance(profile.store(), now)
-                    .and_then(|_| ch.require_governance_ready(profile.store(), now)),
-                other => other,
-            };
-            match current.and_then(|current| {
-                ch.rotate_drive_if_lost(profile.store(), &holders, now, current)
-            }) {
-                Ok(_) => ch.append_session(profile, session_id, body, &holders, now_millis),
-                Err(e) => Err(e),
-            }
+            // The room lock is the last asynchronous preparation. Re-read holders only inside
+            // the held current-policy transaction, then persist rotation and entry together;
+            // revocation cannot land between the holder set and either irreversible record.
+            self.with_current_computer_authority(|| {
+                let holders = self.drive_holders();
+                // **Never sealed under a key a member that lost drive still holds** (SC-2b): the
+                // key changes here, before the entry, whatever the tick has not got to yet.
+                // The fold is one bounded governance turn away, never a peer round trip.
+                let now = crate::time::Ms(now_millis);
+                let current = match ch.require_governance_ready(profile.store(), now) {
+                    Err(e) if ChannelState::governance_refreshing(&e) => ch
+                        .advance_governance(profile.store(), now)
+                        .and_then(|_| ch.require_governance_ready(profile.store(), now)),
+                    other => other,
+                };
+                current
+                    .and_then(|current| {
+                        ch.rotate_drive_if_lost(profile.store(), &holders, now, current)
+                    })
+                    .and_then(|_| {
+                        ch.append_session(profile, session_id, body, &holders, now_millis)
+                    })
+                    .map(|entry| (entry, holders))
+            })
         };
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => return Outcome::Failed(fault_of(&e)),
+        let (entry, holders) = match committed {
+            None => return Outcome::Failed(Fault::NotTrusted),
+            Some(Ok(committed)) => committed,
+            Some(Err(e)) => return Outcome::Failed(fault_of(&e)),
         };
         self.note_local_append(channel_id);
         self.tend_drive_keys_in(channel_id, &holders).await;
@@ -22170,18 +23928,54 @@ impl Node {
 
     /// [`Self::tend_drive_keys_in`] in every open room.
     async fn tend_drive_keys(&mut self) -> bool {
+        self.tend_drive_keys_guarded(None).await.unwrap_or(false)
+    }
+
+    async fn tend_drive_keys_guarded_by_policy(
+        &mut self,
+        guard: &computer::ComputerPolicyGuard,
+    ) -> crate::error::Result<bool> {
+        self.tend_drive_keys_guarded(Some(guard)).await
+    }
+
+    async fn tend_drive_keys_guarded(
+        &mut self,
+        guard: Option<&computer::ComputerPolicyGuard>,
+    ) -> crate::error::Result<bool> {
+        self.computer_drive_guard(guard)?;
         let holders = self.drive_holders();
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         let mut changed = false;
         for channel_id in channels {
+            self.computer_drive_guard(guard)?;
             let before = self.session_projection_revision(&channel_id).await;
-            self.tend_drive_keys_in(&channel_id, &holders).await;
+            self.computer_drive_guard(guard)?;
+            self.tend_drive_keys_in_guarded(&channel_id, &holders, guard)
+                .await?;
+            self.computer_drive_guard(guard)?;
             let after = self.session_projection_revision(&channel_id).await;
+            self.computer_drive_guard(guard)?;
             // A failed read also schedules publication, where its actual error is
             // reported/poisoned; it must not silently look like an unchanged token.
             changed |= before.is_err() || after.is_err() || before.ok() != after.ok();
         }
-        changed
+        Ok(changed)
+    }
+
+    fn computer_drive_guard(
+        &self,
+        guard: Option<&computer::ComputerPolicyGuard>,
+    ) -> crate::error::Result<()> {
+        if let Some(guard) = guard {
+            guard.active(self.computer.as_ref())?;
+        }
+        if self.computer_authority_current() {
+            Ok(())
+        } else {
+            Err(Error::Profile(
+                "computer trust is pending application on this node",
+            ))
+        }
     }
 
     async fn session_projection_revision(
@@ -22204,41 +23998,75 @@ impl Node {
     /// longer holds it. A member whose prekeys this node has not read yet stays owed, and the tick
     /// tries again.
     async fn tend_drive_keys_in(&mut self, channel_id: &Digest32, holders: &BTreeSet<Digest32>) {
+        let _ = self
+            .tend_drive_keys_in_guarded(channel_id, holders, None)
+            .await;
+    }
+
+    async fn tend_drive_keys_in_guarded(
+        &mut self,
+        channel_id: &Digest32,
+        holders: &BTreeSet<Digest32>,
+        guard: Option<&computer::ComputerPolicyGuard>,
+    ) -> crate::error::Result<()> {
+        self.computer_drive_guard(guard)?;
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return;
+            return Ok(());
         };
         let now_ms = self.now_ms();
         let now_millis = (self.millis_clock)();
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
-                return;
+                return Ok(());
             };
             let mut ch = shared.lock().await;
+            self.computer_drive_guard(guard)?;
             // Pending policy cannot authorize private expiry or a drive-key release.
             // The shared maintenance branch advances governance independently. The token is
             // the proof the release and the drive-generation choice take (ADR-037 R3).
             let Ok(current) = ch.require_governance_ready(profile.store(), now_ms) else {
-                return;
+                return Ok(());
             };
             // Recovery/control catch-up must run before an announcement can refuse
             // for pending facts, or the same refusal would starve its own repair.
-            if ch.advance_sessions(profile.store(), now_millis).is_err() {
-                return;
+            let Some(advanced) = self.with_current_computer_authority(|| {
+                ch.advance_sessions(profile.store(), now_millis)
+            }) else {
+                return Ok(());
+            };
+            if advanced.is_err() {
+                return Ok(());
             }
+            self.computer_drive_guard(guard)?;
             // Ordinary-key declarations name only this node's authenticated legacy hashes.
             // They let read-only peers identify withheld steps without granting drive.
-            if ch.announce_legacy_sessions(profile, now_millis).is_err() {
-                return;
+            let Some(announced) = self.with_current_computer_authority(|| {
+                ch.announce_legacy_sessions(profile, now_millis)
+            }) else {
+                return Ok(());
+            };
+            if announced.is_err() {
+                return Ok(());
             }
-            if ch.announce_private_support(profile, now_millis).is_err() {
-                return;
+            self.computer_drive_guard(guard)?;
+            let Some(announced) = self.with_current_computer_authority(|| {
+                ch.announce_private_support(profile, now_millis)
+            }) else {
+                return Ok(());
+            };
+            if announced.is_err() {
+                return Ok(());
             }
-            if ch
-                .rotate_drive_if_lost(profile.store(), holders, now_ms, current)
-                .is_err()
-            {
-                return;
+            self.computer_drive_guard(guard)?;
+            let Some(rotated) = self.with_current_computer_authority(|| {
+                ch.rotate_drive_if_lost(profile.store(), holders, now_ms, current)
+            }) else {
+                return Ok(());
+            };
+            if rotated.is_err() {
+                return Ok(());
             }
+            self.computer_drive_guard(guard)?;
             use crate::node::channel::session_projection::{Query, Reply};
             let has_session = match ch.session_query(
                 profile.store(),
@@ -22250,28 +24078,43 @@ impl Node {
             ) {
                 Ok(Reply::HasOpen(open)) => open,
                 // A rebuilding or failed projection does not assert absence or release keys.
-                _ => return,
+                _ => return Ok(()),
             };
-            if has_session
-                && ch
-                    .ensure_drive(profile.store(), holders, now_ms, current)
-                    .is_err()
-            {
-                return;
+            self.computer_drive_guard(guard)?;
+            if has_session {
+                let Some(ensured) = self.with_current_computer_authority(|| {
+                    ch.ensure_drive(profile.store(), holders, now_ms, current)
+                }) else {
+                    return Ok(());
+                };
+                if ensured.is_err() {
+                    return Ok(());
+                }
             }
-            let owed = match ch.owed_drive(profile, holders, now_ms) {
-                Ok(owed) => owed,
-                Err(_) => return,
+            self.computer_drive_guard(guard)?;
+            let Some(owed) =
+                self.with_current_computer_authority(|| ch.owed_drive(profile, holders, now_ms))
+            else {
+                return Ok(());
             };
-            if !owed.is_empty()
-                && !ch
-                    .refresh_session_records(profile, holders, &owed, now_millis)
-                    .is_ok_and(|refresh| refresh == SessionRefresh::Complete)
-            {
-                return;
+            let owed = match owed {
+                Ok(owed) => owed,
+                Err(_) => return Ok(()),
+            };
+            self.computer_drive_guard(guard)?;
+            if !owed.is_empty() {
+                let Some(refreshed) = self.with_current_computer_authority(|| {
+                    ch.refresh_session_records(profile, holders, &owed, now_millis)
+                }) else {
+                    return Ok(());
+                };
+                if !refreshed.is_ok_and(|refresh| refresh == SessionRefresh::Complete) {
+                    return Ok(());
+                }
             }
             let mut releases = Vec::new();
             for member in owed {
+                self.computer_drive_guard(guard)?;
                 if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member, current) {
                     releases.push((member, skdm, generation));
                 }
@@ -22279,16 +24122,41 @@ impl Node {
             releases
         };
         for (member, skdm, generation) in releases {
-            if !self.post_key_package(channel_id, member, &skdm).await {
+            self.computer_drive_guard(guard)?;
+            let authority = self.computer_authority();
+            if self.computer.is_some() && authority.is_none() {
+                return Ok(());
+            }
+            let posted = if let Some(deadline) = guard.and_then(|guard| guard.causal_deadline()) {
+                match tokio::time::timeout_at(
+                    deadline.into(),
+                    self.post_key_package_authorized(channel_id, member, &skdm, authority),
+                )
+                .await
+                {
+                    Ok(posted) => posted,
+                    Err(_) => {
+                        return Err(Error::Profile(
+                            "computer trust key publication crossed its causal deadline",
+                        ))
+                    }
+                }
+            } else {
+                self.post_key_package_authorized(channel_id, member, &skdm, authority)
+                    .await
+            };
+            if !posted {
                 continue;
             }
+            self.computer_drive_guard(guard)?;
             let Some(profile) = self.profile.as_ref() else {
-                return;
+                return Ok(());
             };
-            let _ = shared
-                .lock()
-                .await
-                .note_drive_delivered(profile.store(), member, generation);
+            let mut channel = shared.lock().await;
+            self.computer_drive_guard(guard)?;
+            let _ = self.with_current_computer_authority(|| {
+                channel.note_drive_delivered(profile.store(), member, generation)
+            });
         }
         // The member that lost drive still holds the old key: until an entry is sealed under the
         // new one, nothing tells it the key changed. Written once every member that keeps drive
@@ -22296,22 +24164,32 @@ impl Node {
         // then, the tick tries again.
         let written = {
             let Some(profile) = self.profile.as_ref() else {
-                return;
+                return Ok(());
             };
             let mut ch = shared.lock().await;
+            self.computer_drive_guard(guard)?;
             let unsaid = match ch.key_change_unsaid(profile.store()) {
                 Ok(unsaid) => unsaid,
                 Err(error) => {
                     ch.poison(&error);
-                    return;
+                    return Ok(());
                 }
             };
-            unsaid
-                && ch
-                    .owed_drive(profile, holders, now_ms)
-                    .is_ok_and(|owed| owed.is_empty())
-                && ch
-                    .append_session(
+            self.computer_drive_guard(guard)?;
+            if !unsaid {
+                false
+            } else {
+                self.computer_drive_guard(guard)?;
+                self.with_current_computer_authority(|| {
+                    // `owed_drive` may publish Session floors. Keep both that prerequisite and
+                    // the key-change Session under one exact current-policy authority.
+                    if !ch
+                        .owed_drive(profile, holders, now_ms)
+                        .is_ok_and(|owed| owed.is_empty())
+                    {
+                        return false;
+                    }
+                    ch.append_session(
                         profile,
                         crate::node::drive::KEY_CHANGED,
                         r#"{"kind":"drive-key"}"#,
@@ -22319,10 +24197,14 @@ impl Node {
                         now_millis,
                     )
                     .is_ok()
+                })
+                .unwrap_or(false)
+            }
         };
         if written {
             self.note_local_append(channel_id);
         }
+        Ok(())
     }
 
     async fn send_text(
@@ -22362,9 +24244,25 @@ impl Node {
         // composed from two clock reads can go backwards across a second boundary, which is the
         // ordering inversion this change exists to remove.
         let now_millis = (self.millis_clock)();
-        let appended = match ch.append_text(profile, text, now_millis) {
-            Ok(r) => row_of(&r),
-            Err(error) => {
+        // The room lock follows every await. Hold durable Computer policy across the exact append
+        // so a revision that moved after command admission cannot publish with stale authority.
+        #[cfg(feature = "test-knobs")]
+        self.hold_text_append_publication_for_proof().await;
+        #[cfg(feature = "test-knobs")]
+        let appended = {
+            if crate::node::computer::fx28_mutant("stale-post-authority") {
+                Some(ch.append_text(profile, text, now_millis))
+            } else {
+                self.with_current_computer_authority(|| ch.append_text(profile, text, now_millis))
+            }
+        };
+        #[cfg(not(feature = "test-knobs"))]
+        let appended =
+            self.with_current_computer_authority(|| ch.append_text(profile, text, now_millis));
+        let appended = match appended {
+            None => return Outcome::Failed(Fault::ComputerPolicy),
+            Some(Ok(r)) => row_of(&r),
+            Some(Err(error)) => {
                 let fault = fault_of(&error);
                 if matches!(fault, Fault::Internal) {
                     // Internal promises a log detail. Keep only the error and public room ID,
@@ -22385,7 +24283,68 @@ impl Node {
         // A rotation that cannot persist poisons the channel, which the *next*
         // command reports; it does not un-send the message that just went out, so the
         // append is still reported as the success it was.
-        let rotated = ch.should_rotate_sender(now_ms) && ch.rotate_sender(profile, now_ms).is_ok();
+        #[cfg(feature = "test-knobs")]
+        let proof_post_action =
+            std::env::var_os("VOX_TEST_FX28_ROTATE_AFTER_POST").and_then(|arm| {
+                // The value names a one-shot apparatus arm. `<node>\t<room>` forces a rotation;
+                // `<node>\t<room>\trelease-paused\t<peer>` instead releases the exact re-key pair
+                // paused by the staged `ENDED_UNANSWERED`. Only that exact shipped post consumes
+                // it, so an earlier baseline or concurrent post cannot drive unrelated work.
+                let node = self
+                    .paths
+                    .profile_dir
+                    .file_name()
+                    .and_then(|name| name.to_str());
+                let room = crate::node::link::b32_encode(channel_id);
+                let marker = std::path::PathBuf::from(&arm).with_extension("result");
+                let staged = std::fs::read_to_string(&arm).ok()?;
+                let fields: Vec<_> = staged.trim_end().split('\t').collect();
+                let exact_node_room = node.is_some_and(|node| {
+                    fields.first().copied() == Some(node)
+                        && fields.get(1).copied() == Some(room.as_str())
+                });
+                let action = match fields.as_slice() {
+                    [_, _] if exact_node_room => Some(None),
+                    [_, _, "release-paused", peer] if exact_node_room => {
+                        crate::node::link::b32_decode(peer, "FX-28 paused re-key peer")
+                            .ok()
+                            .map(Some)
+                    }
+                    _ => None,
+                };
+                if action.is_none() {
+                    let _ = crate::node::computer::publish_proof_marker(
+                        &marker.with_extension("fault"),
+                        format!(
+                            "post-side re-key arm named {:?}; this actor post was {:?}",
+                            staged.trim_end(),
+                            node.map(|node| format!("{node}\t{room}"))
+                                .as_deref()
+                                .unwrap_or("<unknown node>")
+                        )
+                        .as_bytes(),
+                    );
+                    return None;
+                }
+                if let Err(error) = std::fs::remove_file(&arm) {
+                    let _ = crate::node::computer::publish_proof_marker(
+                        &marker.with_extension("fault"),
+                        format!("consume forced rotation arm: {error}").as_bytes(),
+                    );
+                    return None;
+                }
+                Some((marker, action.flatten()))
+            });
+        #[cfg(feature = "test-knobs")]
+        let proof_rotation = proof_post_action
+            .as_ref()
+            .is_some_and(|(_, peer)| peer.is_none());
+        #[cfg(not(feature = "test-knobs"))]
+        let proof_rotation = false;
+        let rotated = (ch.should_rotate_sender(now_ms) || proof_rotation)
+            && self
+                .with_current_computer_authority(|| ch.rotate_sender(profile, now_ms))
+                .is_some_and(|rotated| rotated.is_ok());
         let detail = {
             let published = self.view_tx.borrow();
             detail_of(
@@ -22416,8 +24375,68 @@ impl Node {
         // ADR-016: push immediately after a local append. Marking it here and
         // letting the tick do the work keeps authoring off the network path.
         self.note_local_append(&channel_id);
-        if rotated {
-            let _ = self.deliver_rekeys_for(&channel_id, false).await;
+        #[cfg(feature = "test-knobs")]
+        let released_paused = proof_post_action.as_ref().is_some_and(|(marker, peer)| {
+            peer.is_some_and(|peer| {
+                let pair = (channel_id, peer);
+                if self.fx28_rekey_pause == Some(pair)
+                    && self.older.get(&pair) == Some(&false)
+                {
+                    self.fx28_rekey_pause = None;
+                    true
+                } else {
+                    crate::node::computer::publish_proof_fault(
+                        &marker.with_extension("fault"),
+                        &format!(
+                            "paused re-key release for {} in {} found pause {:?} and route {:?}; exact legacy selection did not survive",
+                            crate::node::link::b32_encode(&peer),
+                            crate::node::link::b32_encode(&channel_id),
+                            self.fx28_rekey_pause.map(|(room, peer)| (
+                                crate::node::link::b32_encode(&room),
+                                crate::node::link::b32_encode(&peer)
+                            )),
+                            self.older.get(&pair)
+                        ),
+                    );
+                    false
+                }
+            })
+        });
+        #[cfg(feature = "test-knobs")]
+        let release_requested = proof_post_action
+            .as_ref()
+            .is_some_and(|(_, peer)| peer.is_some());
+        #[cfg(not(feature = "test-knobs"))]
+        let released_paused = false;
+        #[cfg(not(feature = "test-knobs"))]
+        let release_requested = false;
+        let drive_rekey = if release_requested {
+            released_paused
+        } else {
+            rotated
+        };
+        let _delivered = if drive_rekey {
+            self.deliver_rekeys_for(&channel_id, false).await
+        } else {
+            0
+        };
+        #[cfg(feature = "test-knobs")]
+        if let Some((marker, release_peer)) = proof_post_action {
+            let node = self
+                .paths
+                .profile_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<unknown>");
+            let room = crate::node::link::b32_encode(&channel_id);
+            let _ = crate::node::computer::publish_proof_marker(
+                &marker,
+                format!(
+                    "{node}\t{room}\trotated={rotated}\trelease_requested={}\treleased_paused={released_paused}\tcomplete_target_batches={_delivered}\n",
+                    release_peer.is_some()
+                )
+                .as_bytes(),
+            );
         }
         Outcome::Done
     }
@@ -22459,6 +24478,7 @@ impl Node {
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
         self.view_tx.send_replace(NodeView {
+            computer_policy: self.applied_computer_policy(),
             room_anchors: self.anchor_inventory.clone(),
             anchor_reach: self.anchor_reach(),
             anchor_inventory_error: self.anchor_inventory_load_error.clone(),
@@ -22552,6 +24572,10 @@ impl Node {
         self.fresh_details
             .retain(|id, _| self.channels.contains_key(id) && !read.contains(id));
         self.view_tx.send_replace(view);
+        #[cfg(feature = "test-knobs")]
+        if let Some((marker, contents)) = self.fx28_ended_unanswered_marker.take() {
+            let _ = crate::node::computer::publish_proof_marker(&marker, &contents);
+        }
     }
 
     /// The node's view, built **without waiting long on any room a session holds.**
@@ -22801,6 +24825,7 @@ impl Node {
             });
         }
         let view = NodeView {
+            computer_policy: self.applied_computer_policy(),
             room_anchors: inventory.into_values().collect(),
             anchor_reach: self.anchor_reach(),
             anchor_inventory_error,
@@ -23001,8 +25026,13 @@ impl Node {
         if !next.set_capability(&fingerprint, capability) {
             return Outcome::Failed(Fault::NotConsented);
         }
-        if let Err(e) = next.save(profile.store(), signer) {
-            return Outcome::Failed(fault_of(&e));
+        let Some(authority) = self.computer_authority() else {
+            return Outcome::Failed(Fault::ComputerPolicy);
+        };
+        match authority.publish(|| next.save(profile.store(), signer)) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
+            None => return Outcome::Failed(Fault::ComputerPolicy),
         }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
@@ -23146,11 +25176,14 @@ impl crate::node::up::Names for NodeNames {
 /// member could release no key to a member it had not synced with since (#410:
 /// a_taken_first_key_is_not_sent_again's positive control, after the anchor stopped being a sync
 /// partner).
+#[allow(clippy::too_many_arguments)]
 async fn exchange_boards(
     net: &NodeNet,
-    conn: &crate::transport::quic::VoxConnection,
+    conn: &Arc<crate::transport::quic::VoxConnection>,
     shared: &tokio::sync::Mutex<ChannelState>,
     pstore: &crate::node::store::Store,
+    authority: &crate::node::actor::computer::ComputerAuthority,
+    tx: &mpsc::Sender<NetEvent>,
     cid: Digest32,
     known: u64,
     now: crate::time::Ms,
@@ -23161,6 +25194,7 @@ async fn exchange_boards(
     let admitted_authors = admit_board_records(
         shared,
         pstore,
+        authority,
         &set.bundles,
         ChannelState::MAX_ADMISSIONS_PER_SWEEP,
         now,
@@ -23171,30 +25205,33 @@ async fn exchange_boards(
     // membership it knows. Bundles go first: they carry the key an address record is verified
     // with (M15.2a). Mirroring to the anchors follows on the actor when `SyncDone` lands, because
     // that needs channel state.
-    for wire in set
-        .bundles
-        .iter()
-        .map(MemberBundleRecord::to_wire)
-        .chain(set.members.iter().map(RendezvousRecord::to_wire))
-        // The members' withdraws, then the admission notices (#520): a withdraw first, so this
-        // node's board refuses a notice of a member that left.
-        .chain(
-            set.withdraws
-                .iter()
-                .map(crate::nat::withdraw::BoardWithdraw::to_wire),
-        )
-        .chain(
-            set.notices
-                .iter()
-                .map(crate::nat::notice::AdmissionNotice::to_wire),
-        )
-    {
-        let _ = net.publish_local(&wire);
-    }
+    let _ = authority.publish(|| {
+        for wire in set
+            .bundles
+            .iter()
+            .map(MemberBundleRecord::to_wire)
+            .chain(set.members.iter().map(RendezvousRecord::to_wire))
+            // The members' withdraws, then the admission notices (#520): a withdraw first, so
+            // this node's board refuses a notice of a member that left.
+            .chain(
+                set.withdraws
+                    .iter()
+                    .map(crate::nat::withdraw::BoardWithdraw::to_wire),
+            )
+            .chain(
+                set.notices
+                    .iter()
+                    .map(crate::nat::notice::AdmissionNotice::to_wire),
+            )
+        {
+            let _ = net.publish_local(&wire);
+        }
+    });
     let admitted_authors = admitted_authors
         + admit_board_notices(
             shared,
             pstore,
+            authority,
             net,
             &cid,
             ChannelState::MAX_ADMISSIONS_PER_SWEEP,
@@ -23209,16 +25246,16 @@ async fn exchange_boards(
     // holds newer) costs nothing, and the peer's own sync still reads this board.
     let missing = net.board_records_missing_from(&cid, known, &set);
     if !missing.is_empty() {
-        if let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await {
-            for wire in &missing {
-                if let Err(e) = client.put(wire).await {
-                    if !matches!(e, Error::RendezvousRejected(_)) {
-                        break;
-                    }
-                }
-            }
-            client.finish();
-        }
+        // The off-actor worker does not retain authority past this synchronous queue admission.
+        // A replaced Computer projection therefore cannot enqueue any transport publication;
+        // once admitted, the actor event owns completing that already-authorized operation.
+        let _ = authority.publish(|| {
+            tx.try_send(NetEvent::BoardRecordsOwed {
+                conn: Arc::clone(conn),
+                records: missing,
+            })
+            .is_ok()
+        });
     }
     admitted_authors
 }
@@ -23232,6 +25269,7 @@ async fn exchange_boards(
 async fn admit_board_notices(
     shared: &tokio::sync::Mutex<ChannelState>,
     store: &crate::node::store::Store,
+    authority: &crate::node::actor::computer::ComputerAuthority,
     net: &NodeNet,
     channel_id: &Digest32,
     quota: usize,
@@ -23243,53 +25281,57 @@ async fn admit_board_notices(
         return 0;
     }
     let mut channel = shared.lock().await;
-    for w in &withdraws {
-        let _ = channel.keep_withdraw(store, w);
-    }
-    let mut pending: Vec<crate::nat::notice::AdmissionNotice> = Vec::new();
-    for n in notices {
-        if channel.is_author(&n.joiner()) {
-            let _ = channel.keep_notice(store, &n);
-        } else {
-            pending.push(n);
-        }
-    }
-    // Witnessed before witnessing: a member admitted early in the batch can be the witness of one
-    // later in it.
-    pending.sort_by_key(|n| n.witness.timestamp_ms);
-    let mut admitted = 0usize;
-    while admitted < quota {
-        let before = admitted;
-        pending.retain(|n| {
-            if admitted >= quota {
-                return true;
+    authority
+        .publish(|| {
+            for w in &withdraws {
+                let _ = channel.keep_withdraw(store, w);
             }
-            match channel.admit_from_notice(store, n, now_ms) {
-                Ok(true) => {
-                    admitted += 1;
-                    let (members, cap) =
-                        (channel.author_count(), crate::node::channel::max_authors());
-                    if members > cap {
-                        net.manager().note(
-                            n.joiner(),
-                            format!(
-                                "admitted to room {} past its cap of {cap}, now {members} \
-                                 members: another member admitted it",
-                                crate::node::network::short_id(channel.channel_id())
-                            ),
-                        );
-                    }
-                    false
+            let mut pending: Vec<crate::nat::notice::AdmissionNotice> = Vec::new();
+            for n in notices {
+                if channel.is_author(&n.joiner()) {
+                    let _ = channel.keep_notice(store, &n);
+                } else {
+                    pending.push(n);
                 }
-                Ok(false) => false,
-                Err(_) => true,
             }
-        });
-        if admitted == before {
-            break;
-        }
-    }
-    admitted
+            // Witnessed before witnessing: a member admitted early in the batch can be the
+            // witness of one later in it.
+            pending.sort_by_key(|n| n.witness.timestamp_ms);
+            let mut admitted = 0usize;
+            while admitted < quota {
+                let before = admitted;
+                pending.retain(|n| {
+                    if admitted >= quota {
+                        return true;
+                    }
+                    match channel.admit_from_notice(store, n, now_ms) {
+                        Ok(true) => {
+                            admitted += 1;
+                            let (members, cap) =
+                                (channel.author_count(), crate::node::channel::max_authors());
+                            if members > cap {
+                                net.manager().note(
+                                    n.joiner(),
+                                    format!(
+                                        "admitted to room {} past its cap of {cap}, now {members} \
+                                         members: another member admitted it",
+                                        crate::node::network::short_id(channel.channel_id())
+                                    ),
+                                );
+                            }
+                            false
+                        }
+                        Ok(false) => false,
+                        Err(_) => true,
+                    }
+                });
+                if admitted == before {
+                    break;
+                }
+            }
+            admitted
+        })
+        .unwrap_or(0)
 }
 
 /// Admit as many board records as their M17.6 evidence allows, to a fixpoint.
@@ -23307,6 +25349,7 @@ async fn admit_board_notices(
 async fn admit_board_records(
     shared: &tokio::sync::Mutex<ChannelState>,
     store: &crate::node::store::Store,
+    authority: &crate::node::actor::computer::ComputerAuthority,
     records: &[crate::nat::record::MemberBundleRecord],
     quota: usize,
     now_ms: crate::time::Ms,
@@ -23348,46 +25391,50 @@ async fn admit_board_records(
         return 0;
     }
     let mut channel = shared.lock().await;
-    let mut admitted = 0usize;
-    while admitted < quota {
-        let before = admitted;
-        pending.retain(|(record, key)| {
-            if admitted >= quota {
-                return true;
-            }
-            match channel.admit_from_board(store, key, &record.admission, now_ms) {
-                Ok(true) => {
-                    admitted += 1;
-                    // **Past the cap only when another member admitted it on its own view**
-                    // (V210-128): said, so a room that went past its cap shows how.
-                    let (members, cap) =
-                        (channel.author_count(), crate::node::channel::max_authors());
-                    if members > cap {
-                        if let Some(net) = net {
-                            net.manager().note(
-                                key.fingerprint(),
-                                format!(
-                                    "admitted to room {} past its cap of {cap}, now {members} \
-                                     members: another member admitted it",
-                                    crate::node::network::short_id(channel.channel_id())
-                                ),
-                            );
-                        }
+    authority
+        .publish(|| {
+            let mut admitted = 0usize;
+            while admitted < quota {
+                let before = admitted;
+                pending.retain(|(record, key)| {
+                    if admitted >= quota {
+                        return true;
                     }
-                    false
+                    match channel.admit_from_board(store, key, &record.admission, now_ms) {
+                        Ok(true) => {
+                            admitted += 1;
+                            // **Past the cap only when another member admitted it on its own
+                            // view** (V210-128): said, so a room that went past its cap shows how.
+                            let (members, cap) =
+                                (channel.author_count(), crate::node::channel::max_authors());
+                            if members > cap {
+                                if let Some(net) = net {
+                                    net.manager().note(
+                                        key.fingerprint(),
+                                        format!(
+                                            "admitted to room {} past its cap of {cap}, now {members} \
+                                             members: another member admitted it",
+                                            crate::node::network::short_id(channel.channel_id())
+                                        ),
+                                    );
+                                }
+                            }
+                            false
+                        }
+                        // Already admitted: nothing to do and nothing to retry.
+                        Ok(false) => false,
+                        // The evidence does not hold up *yet* — its witness may be admitted by
+                        // a later pass. Kept for the next one; dropped when a pass adds nobody.
+                        Err(_) => true,
+                    }
+                });
+                if admitted == before {
+                    break;
                 }
-                // Already admitted: nothing to do and nothing to retry.
-                Ok(false) => false,
-                // The evidence does not hold up *yet* — its witness may be admitted by
-                // a later pass. Kept for the next one; dropped when a pass adds nobody.
-                Err(_) => true,
             }
-        });
-        if admitted == before {
-            break;
-        }
-    }
-    admitted
+            admitted
+        })
+        .unwrap_or(0)
 }
 
 /// The event a [`crate::node::tunnel::TunnelNote`] is said as.
@@ -23926,6 +25973,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
+        Error::Profile("computer policy changed before the room mutation") => Fault::ComputerPolicy,
         Error::Profile(
             "Legacy history required; resume explicit recovery before posting in this room",
         ) => Fault::LegacyHistoryRequired,

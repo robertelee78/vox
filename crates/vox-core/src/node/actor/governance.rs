@@ -31,7 +31,7 @@ fn hold_sweep_after(room: &Digest32) -> bool {
 pub(super) struct Maintenance {
     pub pending: bool,
     after: Option<Digest32>,
-    again: bool,
+    pub(super) again: bool,
     /// Rooms whose checked governance fold is current. Other retained room work must not reopen
     /// and re-evaluate the same sealed facts; an exact governance input or authority deadline
     /// removes only its room from this set.
@@ -39,6 +39,10 @@ pub(super) struct Maintenance {
     consent_after: BTreeMap<Digest32, Digest32>,
     deadlines: BTreeMap<Digest32, u64>,
     deadline_order: BTreeSet<(u64, Digest32)>,
+    /// Admin changes already committed to the room log whose board roster still owes a
+    /// successful projection.  A refresh or Computer-policy handoff is retryable, not a reason
+    /// to report that the durable admin change failed.
+    pub(super) admin_rosters: BTreeSet<Digest32>,
     pub(super) removal: Option<Removal>,
 }
 
@@ -197,12 +201,31 @@ impl Node {
                 Ok(false) => {}
             }
             drop(channel);
-            self.publish_admin_roster(&work.room).await;
+            if let Err(fault) = self.publish_admin_roster(&work.room).await {
+                // The certificate removal is already durable. Report that truthfully and retain
+                // the board projection as owed work; a failed secondary publication must not
+                // turn a successful removal into a false command failure.
+                self.governance_work.admin_rosters.insert(work.room);
+                self.governance_work.again |= matches!(fault, Fault::GovernanceRefreshing);
+                eprintln!(
+                    "vox node: removed the room admin; its board roster remains pending: {}",
+                    fault.explain()
+                );
+            }
             self.publish().await;
             let _ = work.reply.send(Outcome::Done);
             return;
         }
-        let result = channel.remove_admin(profile, &work.member, work.after, self.now_ms());
+        let result = self.with_current_computer_authority(|| {
+            channel.remove_admin(profile, &work.member, work.after, self.now_ms())
+        });
+        let Some(result) = result else {
+            // Keep the exact cursor and any already-durable certificates.  The queued policy
+            // event (or the ordinary tick) retries after reconciliation; re-arming this
+            // always-ready branch here would spin the actor and delay that very event.
+            self.governance_work.removal = Some(work);
+            return;
+        };
         drop(channel);
         match result {
             Err(error) if ChannelState::governance_refreshing(&error) => {
@@ -295,6 +318,9 @@ impl Node {
                 .retain(|room, _| self.channels.contains_key(room));
             self.governance_work
                 .settled
+                .retain(|room| self.channels.contains_key(room));
+            self.governance_work
+                .admin_rosters
                 .retain(|room| self.channels.contains_key(room));
             let rooms = self.channels.keys().copied().collect();
             self.governance_work.retain_deadlines(&rooms);
@@ -469,10 +495,23 @@ impl Node {
                 }
             }
         }
-        if governance_ready && governance_changed {
+        if governance_ready
+            && (governance_changed || self.governance_work.admin_rosters.contains(&room))
+        {
             self.adopt_channel_anchors(&room).await;
             self.refresh_network_view().await;
-            self.publish_admin_roster(&room).await;
+            match self.publish_admin_roster(&room).await {
+                Ok(()) => {
+                    self.governance_work.admin_rosters.remove(&room);
+                }
+                Err(fault) => {
+                    self.governance_work.admin_rosters.insert(room);
+                    // A policy handoff is woken by its own event.  Immediate self-requeue here
+                    // can monopolize the actor while authority is necessarily stale. Permanent
+                    // faults likewise remain visible as owed work without spinning this actor.
+                    self.governance_work.again |= matches!(fault, Fault::GovernanceRefreshing);
+                }
+            }
         }
         if governance_changed || backfilled > 0 || legacy_finished || views_finished {
             self.publish().await;

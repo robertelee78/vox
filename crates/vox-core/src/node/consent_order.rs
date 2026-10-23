@@ -252,6 +252,34 @@ impl ConsentOrder {
         Self::open(blob.as_deref(), signer)
     }
 
+    /// Stage a policy's trust-decision removals and additions in the same transaction as its
+    /// keyring and pending keys. Reading inside the batch also preserves stamps minted by an
+    /// off-actor room writer before this transaction acquired the store's writer slot.
+    pub(crate) fn queue_policy(
+        batch: &mut crate::node::store::Batch<'_>,
+        signer: &VaultRootSigner,
+        removed: &[Digest32],
+        added: &[Digest32],
+        floor: u64,
+    ) -> Result<Vec<(Digest32, Stamp)>> {
+        batch.update_meta(CONSENT_ORDER_META_KEY, |blob| {
+            let mut order = Self::open(blob, signer)?;
+            for peer in removed {
+                order.trusted.remove(peer);
+            }
+            let mut changes = Vec::with_capacity(added.len());
+            for peer in added {
+                if !order.trusted.contains_key(peer) && order.trusted.len() >= MAX_TRUSTED {
+                    return Err(Error::SizeLimitExceeded("trust order entries"));
+                }
+                let stamp = order.next(floor)?;
+                order.trusted.insert(*peer, stamp.seq);
+                changes.push((*peer, stamp));
+            }
+            Ok((order.seal(signer)?, changes))
+        })
+    }
+
     /// Apply `f` to the persisted order in one store transaction and persist the result before
     /// returning, so a value is on disk before anybody can use it.
     fn update<T>(

@@ -14,7 +14,10 @@
 //! | 4 | joiner → responder | `PROOF` — sealed identity PoP | [`JoinInitiator::complete_cpace`](crate::join::session::JoinInitiator::complete_cpace) |
 //! | 5 | responder → joiner | `PROOF` — sealed identity PoP | [`JoinResponder::complete_cpace`](crate::join::session::JoinResponder::complete_cpace), [`JoinProofPending::verify_peer_sealed`](crate::join::session::JoinProofPending::verify_peer_sealed) |
 //! | 6 | joiner → responder | `INIT` — PQXDH [`InitialMessage`] | [`JoinInitiatorBootstrap::bootstrap`](crate::join::session::JoinInitiatorBootstrap::bootstrap) |
-//! | 7 | responder → joiner | `ACCEPTED` / `REJECTED` | [`JoinResponderBootstrap::bootstrap`](crate::join::session::JoinResponderBootstrap::bootstrap) |
+//! | 7 | responder → joiner | `ADMISSION_PROPOSED` — domain-separated signed proposal of exact witness fields | [`JoinResponderBootstrap::bootstrap`](crate::join::session::JoinResponderBootstrap::bootstrap) |
+//! | 8 | joiner → responder | `ADMISSION_PREPARED` — hash of that witness after durable rollback preparation | caller's durable join cleanup |
+//! | 9 | responder → joiner | `ACCEPTED` / `REJECTED` — admission committed or refused | responder's actor admission |
+//! | 10 | joiner → responder | `OPEN` — empty ratchet message | open the responder's sending direction |
 //!
 //! ## Why the joiner speaks first
 //! ADR-016's frame list starts with the responder's challenge, which silently assumes
@@ -102,6 +105,128 @@ const OP_REJECTED: u64 = 7;
 const OP_FULL: u64 = 9;
 const OP_TAKEN: u64 = 10;
 const OP_NOT_AGREED: u64 = 11;
+const OP_ADMISSION_PROPOSED: u64 = 12;
+const OP_ADMISSION_PREPARED: u64 = 13;
+const ADMISSION_PROPOSAL_DOMAIN: &[u8] = b"vox/join-admission-proposal/v1\0";
+
+/// An authenticated proposal of the exact fields admission would witness. Its signature has a
+/// distinct domain and cannot pass `JoinWitness::verify`, so a joiner that never prepares rollback
+/// or whose admission is later refused receives no reusable admission authority.
+#[derive(Clone)]
+pub struct AdmissionProposal {
+    /// The room proposed for admission.
+    pub channel_id: Digest32,
+    /// Its exact membership epoch.
+    pub epoch: u64,
+    /// The proven joining identity.
+    pub joiner_id: Digest32,
+    /// The authenticated responder proposing admission.
+    pub responder_id: Digest32,
+    /// The exact timestamp the final witness will carry.
+    pub timestamp_ms: u64,
+    signature: CompositeSignature,
+}
+
+impl AdmissionProposal {
+    fn unsigned(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(5)
+            .bytes(&self.channel_id)
+            .uint(self.epoch)
+            .bytes(&self.joiner_id)
+            .bytes(&self.responder_id)
+            .uint(self.timestamp_ms);
+        e.finish()
+    }
+
+    fn signing_input(&self) -> Vec<u8> {
+        [ADMISSION_PROPOSAL_DOMAIN, self.unsigned().as_slice()].concat()
+    }
+
+    fn from_witness(witness: &JoinWitness, signer: &dyn RootSigner) -> Result<Self> {
+        let mut e = Encoder::new();
+        e.array(5)
+            .bytes(&witness.channel_id)
+            .uint(witness.epoch)
+            .bytes(&witness.joiner_id)
+            .bytes(&witness.witness_id)
+            .uint(witness.timestamp_ms);
+        let input = [ADMISSION_PROPOSAL_DOMAIN, e.finish().as_slice()].concat();
+        Ok(Self {
+            channel_id: witness.channel_id,
+            epoch: witness.epoch,
+            joiner_id: witness.joiner_id,
+            responder_id: witness.witness_id,
+            timestamp_ms: witness.timestamp_ms,
+            signature: signer.sign(&input)?,
+        })
+    }
+
+    fn to_body(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(2)
+            .bytes(&self.unsigned())
+            .bytes(&self.signature.to_bytes());
+        e.finish()
+    }
+
+    fn from_body(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 2 {
+            return Err(Error::MalformedJoin("admission proposal arity"));
+        }
+        let mut fields = Decoder::new(d.bytes()?);
+        if fields.array()? != 5 {
+            return Err(Error::MalformedJoin("admission proposal fields"));
+        }
+        let channel_id = *take_fixed::<32>(&mut fields, "proposal room")?;
+        let epoch = fields.uint()?;
+        let joiner_id = *take_fixed::<32>(&mut fields, "proposal joiner")?;
+        let responder_id = *take_fixed::<32>(&mut fields, "proposal responder")?;
+        let timestamp_ms = fields.uint()?;
+        fields.finish()?;
+        let signature = CompositeSignature::from_bytes(&*take_fixed::<COMPOSITE_SIG_LEN>(
+            &mut d,
+            "proposal signature",
+        )?)?;
+        d.finish()?;
+        Ok(Self {
+            channel_id,
+            epoch,
+            joiner_id,
+            responder_id,
+            timestamp_ms,
+            signature,
+        })
+    }
+
+    fn verify(
+        &self,
+        responder: &CompositePublicKey,
+        ctx: &JoinContext,
+        joiner: Digest32,
+    ) -> Result<()> {
+        if self.channel_id != ctx.channel_id
+            || self.epoch != ctx.epoch
+            || self.joiner_id != joiner
+            || self.responder_id != responder.fingerprint()
+            || self.joiner_id == self.responder_id
+        {
+            return Err(Error::MalformedJoin(
+                "admission proposal identity or context",
+            ));
+        }
+        responder.verify(&self.signing_input(), &self.signature)
+    }
+
+    fn covers(&self, witness: &JoinWitness) -> bool {
+        self.channel_id == witness.channel_id
+            && self.epoch == witness.epoch
+            && self.joiner_id == witness.joiner_id
+            && self.responder_id == witness.witness_id
+            && self.timestamp_ms == witness.timestamp_ms
+    }
+}
 
 /// Why a responder refused a join (see the module docs: deliberately coarse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +337,20 @@ pub enum JoinFrame {
         /// `InitialMessage::to_wire` bytes.
         message: Vec<u8>,
     },
+    /// The responder's domain-separated signed proposal, before it commits admission. The joiner
+    /// verifies it and durably retains a withdrawal covering its epoch and timestamp before
+    /// acknowledging. Disclosing the witness does not mean the admission transaction succeeded.
+    AdmissionProposed {
+        /// Signed `AdmissionProposal` bytes for the exact witness fields admission will commit.
+        proposal: Vec<u8>,
+    },
+    /// The joiner's durable rollback preparation covers this exact proposal. The
+    /// authenticated stream and digest bind this acknowledgement to one proposal, never a prior
+    /// exchange or a differently stamped witness.
+    AdmissionPrepared {
+        /// SHA-256 of the signed admission proposal bytes.
+        proposal_hash: Digest32,
+    },
     /// The join succeeded, and the responder's **witness** to it (M17.6).
     ///
     /// The responder is the only party that saw the joiner's ADR-005 proof, so it is
@@ -248,7 +387,7 @@ pub enum JoinFrame {
         /// It gave no answer in time.
         unanswered: bool,
     },
-    /// **Step 8, joiner → responder:** one ratchet message with an empty plaintext,
+    /// **Step 10, joiner → responder:** one ratchet message with an empty plaintext,
     /// whose only job is to open the responder's sending direction (M17.6).
     ///
     /// A PQXDH responder begins with no chains — `Ratchet::init_responder`: *"with no
@@ -319,6 +458,12 @@ impl JoinFrame {
             }
             Self::Init { message } => {
                 e.array(2).uint(OP_INIT).bytes(message);
+            }
+            Self::AdmissionProposed { proposal } => {
+                e.array(2).uint(OP_ADMISSION_PROPOSED).bytes(proposal);
+            }
+            Self::AdmissionPrepared { proposal_hash } => {
+                e.array(2).uint(OP_ADMISSION_PREPARED).bytes(proposal_hash);
             }
             Self::Accepted { witness, name } => {
                 e.array(3).uint(OP_ACCEPTED).bytes(witness).text(name);
@@ -392,6 +537,12 @@ impl JoinFrame {
             },
             (OP_INIT, 2) => Self::Init {
                 message: d.bytes()?.to_vec(),
+            },
+            (OP_ADMISSION_PROPOSED, 2) => Self::AdmissionProposed {
+                proposal: d.bytes()?.to_vec(),
+            },
+            (OP_ADMISSION_PREPARED, 2) => Self::AdmissionPrepared {
+                proposal_hash: *take_fixed::<32>(&mut d, "prepared proposal hash")?,
             },
             (OP_ACCEPTED, 3) => Self::Accepted {
                 witness: d.bytes()?.to_vec(),
@@ -596,13 +747,21 @@ impl std::fmt::Debug for JoinOutcome {
 ///
 /// `ctx` binds channelID, epoch, suite and the ADR-003 floor; `passphrase` is the
 /// channel passphrase collected out of band (never from the link, ADR-016).
-pub async fn run_initiator(
+/// `prepare_before_admission` MUST durably retain an exact Member withdrawal covering the
+/// verified proposal's epoch and timestamp before returning `Ok`. It is called before the
+/// responder can commit or publish admission, so a crash or later local failure can retract it.
+pub async fn run_initiator<F, Fut>(
     conn: &VoxConnection,
     ctx: JoinContext,
     passphrase: &[u8],
     root: &(dyn RootSigner + Send + Sync),
     ik: &X25519IdentityKey,
-) -> Result<JoinOutcome> {
+    prepare_before_admission: F,
+) -> Result<JoinOutcome>
+where
+    F: FnOnce(AdmissionProposal) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let streams = open_typed(conn, StreamKind::Join).await?;
     initiator_exchange(
         conn,
@@ -612,6 +771,7 @@ pub async fn run_initiator(
         root,
         ik,
         JoinPurpose::Admission,
+        prepare_before_admission,
     )
     .await?
     .ok_or(Error::MalformedJoin("join stopped before admission"))
@@ -646,6 +806,7 @@ pub async fn run_initiator_validation(
         root,
         ik,
         JoinPurpose::PassphraseValidation,
+        |_| std::future::ready(Err(Error::MalformedJoin("validation proposed admission"))),
     )
     .await?
     {
@@ -660,7 +821,8 @@ enum JoinPurpose {
     PassphraseValidation,
 }
 
-async fn initiator_exchange(
+#[allow(clippy::too_many_arguments)] // authentication inputs, purpose and durable preparation
+async fn initiator_exchange<F, Fut>(
     conn: &VoxConnection,
     streams: (SendStream, RecvStream),
     ctx: JoinContext,
@@ -668,7 +830,12 @@ async fn initiator_exchange(
     root: &(dyn RootSigner + Send + Sync),
     ik: &X25519IdentityKey,
     purpose: JoinPurpose,
-) -> Result<Option<JoinOutcome>> {
+    prepare_before_admission: F,
+) -> Result<Option<JoinOutcome>>
+where
+    F: FnOnce(AdmissionProposal) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     let responder_fp = conn.peer_id();
     let (mut send, mut recv) = streams;
 
@@ -873,15 +1040,46 @@ async fn initiator_exchange(
     )
     .await?;
 
-    // 7. ACCEPTED, carrying the responder's witness to this join (M17.6).
+    // 7/8. The responder proposes exact witness fields under a separate signature domain, so the
+    // proposal grants no reusable admission authority. Only after durable rollback is prepared
+    // does this side acknowledge permission to perform admission using those same fields.
+    let proposed = match recv_frame(&mut recv).await? {
+        JoinFrame::AdmissionProposed { proposal } => proposal,
+        JoinFrame::Rejected(r) => return Err(rejected(r)),
+        _ => return Err(Error::MalformedJoin("expected admission proposal")),
+    };
+    let proposal = AdmissionProposal::from_body(&proposed)?;
+    proposal.verify(&responder_pub, &ctx, root.fingerprint())?;
+    prepare_before_admission(proposal.clone()).await?;
+    send_frame(
+        &mut send,
+        &JoinFrame::AdmissionPrepared {
+            proposal_hash: crate::hash::sha256(&proposed),
+        },
+    )
+    .await?;
+
+    // 9. ACCEPTED confirms admission committed, with a valid final witness for the prepared fields.
     let (witness, room_name) = match recv_frame(&mut recv).await? {
-        JoinFrame::Accepted { witness, name } => (
-            JoinWitness::from_body(&witness)?,
+        JoinFrame::Accepted { witness, name } => {
+            let witness = JoinWitness::from_body(&witness)?;
+            witness.verify(
+                &responder_pub,
+                &ctx.channel_id,
+                ctx.epoch,
+                &root.fingerprint(),
+            )?;
+            if !proposal.covers(&witness) {
+                return Err(Error::MalformedJoin(
+                    "accepted witness differs from prepared proposal",
+                ));
+            }
             // Only a name that is one: anything else is not shown, and the log decides anyway.
-            crate::governance::name::room_name(&name)
+            let name = crate::governance::name::room_name(&name)
                 .ok()
-                .filter(|n| *n == name),
-        ),
+                .filter(|n| *n == name);
+            (witness, name)
+        }
         JoinFrame::Rejected(r) => return Err(rejected(r)),
         JoinFrame::Full { members } => return Err(Error::RoomFull { members }),
         JoinFrame::Taken => return Err(Error::SeatTaken),
@@ -890,16 +1088,7 @@ async fn initiator_exchange(
         }
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
-    // Checked here, against the identity the handshake pinned, so a responder cannot
-    // hand back a witness for some other key or some other room and have it kept.
-    witness.verify(
-        &responder_pub,
-        &ctx.channel_id,
-        ctx.epoch,
-        &root.fingerprint(),
-    )?;
-
-    // 8. OPEN — one ratchet message, empty plaintext, so the responder can send at all.
+    // 10. OPEN — one ratchet message, empty plaintext, so the responder can send at all.
     //    On this stream rather than a later one, so it is processed before the join
     //    returns (see `JoinFrame::Open`).
     let mut session = session;
@@ -984,6 +1173,11 @@ pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
 /// [`JoinFrame::Full`] for a room already full, [`JoinReject::NotAdmitted`] otherwise, never the
 /// refusal a wrong passphrase gets — and the exchange returns that error. An `Ok` carries the
 /// room's shared name, which the acceptance tells the joiner (ADR-028 R-1).
+/// A domain-separated proposal of the exact witness fields is sent first; its signature cannot
+/// authorize membership. The authenticated initiator must acknowledge durable rollback
+/// preparation for its digest before this callback can run. An acknowledgement
+/// for different witness bytes, an early EOF, or a failed initiator preparation performs no
+/// admission. The callback must commit that same witness rather than minting a newer one.
 ///
 /// The joiner treats `Accepted` as "I am in", and the very next thing it does is publish its
 /// records to this node's board. Those records are refused unless this node has already admitted
@@ -1041,6 +1235,23 @@ where
     };
     match &mut result {
         Ok(outcome) => {
+            // The initiator must retain exact rollback coverage before this side commits or
+            // publishes admission. In particular, a later seal failure/crash cannot leave a
+            // witness newer than its durable withdrawal. A missing/mismatched acknowledgement
+            // ends the exchange before the admission callback is invoked.
+            let proposed = AdmissionProposal::from_witness(&outcome.witness, cfg.root)?.to_body();
+            send_frame(
+                &mut send,
+                &JoinFrame::AdmissionProposed {
+                    proposal: proposed.clone(),
+                },
+            )
+            .await?;
+            match recv_frame(&mut recv).await? {
+                JoinFrame::AdmissionPrepared { proposal_hash }
+                    if proposal_hash == crate::hash::sha256(&proposed) => {}
+                _ => return Err(Error::MalformedJoin("expected exact prepared admission")),
+            }
             // **Admitted before it is told it is in.** See `admit_before_accepting`. And told it
             // is in only if it was: an admission that failed was dropped here, so a joiner the
             // room could not take (it was full) heard `Accepted`, exited 0, and was a member of
@@ -1056,6 +1267,8 @@ where
                     let refusal = match e {
                         Error::RoomFull { members } => JoinFrame::Full { members },
                         Error::SeatTaken => JoinFrame::Taken,
+                        Error::JoinRoomEnded => JoinFrame::Rejected(JoinReject::RoomEnded),
+                        Error::JoinResponderLeft => JoinFrame::Rejected(JoinReject::ResponderLeft),
                         Error::SeatNotAgreed { member, unanswered } => {
                             JoinFrame::NotAgreed { member, unanswered }
                         }
@@ -1078,7 +1291,7 @@ where
                 },
             )
             .await?;
-            // Step 8: the joiner's ratchet message, read **before returning**, so the
+            // Step 10: the joiner's ratchet message, read **before returning**, so the
             // session handed to the caller can already send. Without it this node holds
             // a session it can receive on and never speak on, and its first `Consent`
             // fails with "no sending chain" (see `JoinFrame::Open`).
