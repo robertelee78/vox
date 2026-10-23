@@ -6287,30 +6287,100 @@ fn stale_remote_pause_is_refused(
         pause_stdout.trim(),
         String::from_utf8_lossy(&paused.stderr).trim()
     );
+    let pause_read_deadline = Instant::now() + RETURN_WITHIN;
     assert!(
-        wait_until(RETURN_WITHIN, || {
-            roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
-                && roster_current(&computer(b, &["status"]), &["beta", "delta"])
-        }),
+        wait_until(
+            pause_read_deadline.saturating_duration_since(Instant::now()),
+            || {
+                roster_current(&computer(a, &["status"]), &["alpha", "gamma", "epsilon"])
+                    && roster_current(&computer(b, &["status"]), &["beta", "delta"])
+            }
+        ),
         "APPARATUS: nodes did not settle after the stale-publication refusal"
     );
-    let (ok, session_out, session_err) = b.run(
-        &[
-            "room",
-            "session",
-            &room,
-            PAUSE_SESSION,
-            "--node",
-            "delta",
-            "--json",
-        ],
-        "",
-    );
-    assert!(
-        ok,
-        "APPARATUS: delta's exact registered Session could not read the stale-pause room after reconciliation: stdout {session_out}; stderr {session_err}"
-    );
-    let session_shown = format!("{session_out}{session_err}");
+    let observe_session = || {
+        let (ok, listed, err) = b.run(
+            &["room", "sessions", &room, "--node", "delta", "--json"],
+            "",
+        );
+        assert!(
+            ok,
+            "APPARATUS: reobserve delta's exact registered Session before reading saved pause: stdout {listed}; stderr {err}"
+        );
+        let sessions: Vec<serde_json::Value> = listed
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("APPARATUS: shipped Session listing was not JSON: {error}: {line}")
+                })
+            })
+            .filter(|session: &serde_json::Value| session["id"] == PAUSE_SESSION)
+            .collect();
+        assert!(
+            sessions.len() == 1 && sessions[0]["node"] == delta && sessions[0]["open"] == true,
+            "APPARATUS: saved-pause read lost its exact open Session or owner: stdout {listed}; stderr {err}"
+        );
+        sessions[0]["opened_millis"].as_u64().unwrap_or_else(|| {
+            panic!("APPARATUS: exact Session listing omitted its opening: {listed}")
+        })
+    };
+    let expected_opening = observe_session();
+    let session_shown = loop {
+        assert!(
+            Instant::now() < pause_read_deadline,
+            "APPARATUS: exact Session selection did not settle within the retained pause-read/convergence boundary"
+        );
+        assert_eq!(
+            observe_session(),
+            expected_opening,
+            "APPARATUS: the staged Session reopened while selecting the saved pause read"
+        );
+        let (ok, session_out, session_err) = b.run(
+            &[
+                "room",
+                "session",
+                &room,
+                PAUSE_SESSION,
+                "--node",
+                "delta",
+                "--json",
+            ],
+            "",
+        );
+        // A changing published selection asks a person to select again. Only that exact
+        // refusal can reobserve/reselect; no other failure gets an automatic retry or new clock.
+        const SELECTION_CHANGED: &str = "the room's Sessions changed while selecting; try again";
+        let refusal = session_err
+            .trim()
+            .strip_prefix("vox: ")
+            .unwrap_or(session_err.trim());
+        if !ok && session_out.trim().is_empty() && refusal == SELECTION_CHANGED {
+            continue;
+        }
+        assert!(
+            ok,
+            "APPARATUS: delta's exact registered Session could not read the stale-pause room after reconciliation: stdout {session_out}; stderr {session_err}"
+        );
+        assert!(
+            !session_out.trim().is_empty()
+                && session_out.lines().filter(|line| !line.trim().is_empty()).all(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|row| row["line"].is_string() && row["kind"].is_string())
+                }),
+            "APPARATUS: exact Session activity was unavailable, so saved pause is unknown: stdout {session_out}; stderr {session_err}"
+        );
+        assert_eq!(
+            observe_session(),
+            expected_opening,
+            "APPARATUS: saved pause was read across a replacement Session opening"
+        );
+        assert!(
+            Instant::now() < pause_read_deadline,
+            "APPARATUS: saved pause read completed after its retained read/convergence boundary"
+        );
+        break format!("{session_out}{session_err}");
+    };
     assert!(
         !session_shown.contains("Pause status unknown:"),
         "APPARATUS: shipped `vox room session` could not establish the saved pause state after reconciliation: {session_shown}"
