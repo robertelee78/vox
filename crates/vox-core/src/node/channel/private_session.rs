@@ -2314,11 +2314,11 @@ impl ChannelState {
         (!self.poisoned
             && !self.drive.receivers.is_empty()
             && !self.private_sessions.pulling.contains(&peer)
-            && !self
+            && self
                 .private_sessions
                 .attempted
                 .get(&peer)
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(1)))
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(1)))
         .then_some(self.private_sessions.revision)
     }
 

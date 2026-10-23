@@ -11205,9 +11205,13 @@ impl Node {
                     crate::transport::streams::refuse(&mut send, &mut recv);
                     return;
                 };
-                let page_charge = work_charge
-                    .split_off(crate::node::sessionstream::PAGE_ENVELOPE)
-                    .expect("current private page reservation has two exact halves");
+                let Some(page_charge) =
+                    work_charge.split_off(crate::node::sessionstream::PAGE_ENVELOPE)
+                else {
+                    eprintln!("vox: private page reservation is smaller than its page envelope");
+                    crate::transport::streams::refuse(&mut send, &mut recv);
+                    return;
+                };
                 self.join_tasks.spawn(async move {
                     let _connection = conn;
                     let page = history_demand::current_private_room(
@@ -23963,9 +23967,15 @@ impl Node {
                 return;
             }
         };
-        let page_charge = work_charge
-            .split_off(crate::node::sessionstream::PAGE_ENVELOPE)
-            .expect("current private page reservation has two exact halves");
+        let Some(page_charge) = work_charge.split_off(crate::node::sessionstream::PAGE_ENVELOPE)
+        else {
+            self.private_pulls.remove(&key);
+            crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |status| {
+                status.last_failure =
+                    Some("private page reservation is smaller than its page envelope".into())
+            });
+            return;
+        };
         let Some((store, guard)) = self.current_private_context() else {
             self.private_pulls.remove(&key);
             return;
