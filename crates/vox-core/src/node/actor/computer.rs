@@ -855,12 +855,27 @@ impl NodeHandle {
         &self,
         superseded: &std::sync::atomic::AtomicBool,
     ) -> bool {
-        if crate::node::computer::fx28_mutant("late-application-abandons-work") {
-            superseded.store(true, std::sync::atomic::Ordering::Release);
-            true
-        } else {
-            false
+        if !crate::node::computer::fx28_mutant("late-application-abandons-work") {
+            return false;
         }
+        // Isolate this fault to the actor causally held for the late-application claim;
+        // earlier independent deadline scenarios must not mask its assertion.
+        let Ok(spec) = std::env::var(TEST_HOLD_COMPUTER_POLICY_ENV) else {
+            return false;
+        };
+        let mut fields = spec.splitn(4, '\t');
+        let (Some(node), Some(_arm), Some(engaged), Some(_release)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        if self.paths.profile_dir.file_name().and_then(|name| name.to_str()) != Some(node)
+            || !std::path::Path::new(engaged).is_file()
+        {
+            return false;
+        }
+        superseded.store(true, std::sync::atomic::Ordering::Release);
+        true
     }
 
     /// Run the daemon's synchronous Ready publication only while the exact durable application

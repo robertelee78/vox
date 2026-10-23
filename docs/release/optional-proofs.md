@@ -161,9 +161,10 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
 | `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
 
-FX-28's ten executable mutants are run one at a time with
+FX-28's twelve executable mutants are run one at a time with
 `scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
 `preview-approval-not-durable`, `stopped-reader-fresh-write`, `stale-tick-authority`, `stale-join-authority`,
+`fresh-preview-inherits-old-deadline`, `late-application-abandons-work`,
 `ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
 `stale-trust-projection`, `stale-rekey-authority`, or
 `legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
@@ -197,12 +198,20 @@ binding history regardless of a prepared receipt, so the old omitted-preparation
 longer affects it. The same journey retains unchanged restart and final Ready supersession;
 the independent preview/approval crash journey retains the operator's durable intent claim.
 
-Startup has no separate pre-network durable-reread claim: every authority-bearing use checks the
-current durable policy and fails closed, which the independent `stale-tick-authority` mutant
-proves through a shipped room command. Ordinary text append and sender-key admission have their
-own independent use-boundary mutants above. The startup-specific boundary is the state-locked
-Ready publication above; duplicating its predicate in the actor made either mutant rescue the
-other.
+`fresh-preview-inherits-old-deadline` makes a new pairing request inherit an older ordinary
+exchange's clock. The existing anchor journey holds that fresh reservation while the ordinary
+miss stays visible, then verifies the exact invitation after reachability returns. Preview does
+not acknowledge ordinary delivery. `late-application-abandons-work` drops only the accepted actor
+causally held past its observation boundary. The journey requires that same revision to become
+current and usable after release without a role toggle, detach, unlock or restart, while its
+historical miss remains visible. Its return boundary stays fixed throughout the observation.
+
+Startup derives the actual current binding and settles its exact application before the
+state-locked Ready publication. Genuine policy movement continues the same accepted operation;
+observation lateness does not destroy it. Every authority-bearing use also checks current durable
+policy. The pause mutant is judged by the saved state shown by shipped `vox room session`, with
+a registered Session and known pause status, even when the original command reports delivery
+unknown. Ordinary text append and sender-key admission have their own use-boundary mutants above.
 
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 
