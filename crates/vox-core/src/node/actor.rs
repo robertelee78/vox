@@ -1148,8 +1148,7 @@ enum NetEvent {
     /// Daemon-internal only: no IPC request maps to these policy operations.
     LocalTrustBlacklist(oneshot::Sender<crate::error::Result<Option<BTreeSet<Digest32>>>>),
     ComputerPolicy {
-        deadline: std::time::Instant,
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        guard: computer::ComputerPolicyGuard,
         reply: oneshot::Sender<crate::error::Result<()>>,
     },
     TrustLocalNode {
@@ -7204,12 +7203,15 @@ impl Node {
             .startup_computer_boundary
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((deadline, identity));
-        let cancelled = std::sync::atomic::AtomicBool::new(false);
-        self.prepare_computer_binding_causal(deadline, &cancelled, true)?;
+        let guard = computer::ComputerPolicyGuard::Deadline {
+            deadline,
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        self.prepare_computer_binding_causal(&guard, true)?;
         loop {
             // Only the receipt from this exact keyring application can open networking. Seeing
             // an expired marker is not completion: its durable revocation branch must finish.
-            let application = self.apply_computer_keyring_at_until(0, deadline, &cancelled)?;
+            let application = self.apply_computer_keyring_at_guarded(0, &guard)?;
             if !application.settled {
                 continue;
             }
@@ -11348,20 +11350,13 @@ impl Node {
                 .await;
                 let _ = reply.send(result);
             }
-            NetEvent::ComputerPolicy {
-                deadline,
-                cancelled,
-                reply,
-            } => {
+            NetEvent::ComputerPolicy { guard, reply } => {
                 #[cfg(feature = "test-knobs")]
                 self.hold_computer_policy_for_proof().await;
                 #[cfg(feature = "test-knobs")]
                 let reply_delay = self.hold_computer_policy_reply_for_proof();
-                let result = match self.prepare_computer_binding_until(deadline, &cancelled) {
-                    Ok(()) => {
-                        self.apply_computer_keyring_until(deadline, &cancelled)
-                            .await
-                    }
+                let result = match self.prepare_computer_binding_guarded(&guard) {
+                    Ok(()) => self.apply_computer_keyring_guarded(&guard).await,
                     Err(e) => Err(e),
                 };
                 #[cfg(feature = "test-knobs")]
@@ -22035,21 +22030,19 @@ impl Node {
         let _ = self.refresh_reachers_causal(None).await;
     }
 
-    /// Recompute reachers for one computer-policy event. The event's absolute boundary is
-    /// checked after every await and immediately before each publication; crossing it empties
-    /// every registered computer gate instead of publishing late authority.
-    async fn refresh_reachers_until(
+    /// Recompute reachers for one computer-policy event. Its owner is checked after every await
+    /// and immediately before publication: a command deadline or exact target supersession
+    /// empties registered gates, while elapsed live-follower observation time is not authority.
+    async fn refresh_reachers_guarded(
         &mut self,
-        deadline: std::time::Instant,
-        cancelled: &std::sync::atomic::AtomicBool,
+        guard: &computer::ComputerPolicyGuard,
     ) -> crate::error::Result<()> {
-        self.refresh_reachers_causal(Some((deadline, cancelled)))
-            .await
+        self.refresh_reachers_causal(Some(guard)).await
     }
 
     async fn refresh_reachers_causal(
         &mut self,
-        causal: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+        causal: Option<&computer::ComputerPolicyGuard>,
     ) -> crate::error::Result<()> {
         // A **locked** node is not a node that withdrew its trust. `lock` clears the keyring
         // because it is sealed under the identity (ADR-020 §3), so recomputing here would
@@ -22063,8 +22056,8 @@ impl Node {
         let trusted = self.trust.trusted();
         for (cid, shared) in &self.channels {
             let ch = shared.lock().await;
-            if let Some((deadline, cancelled)) = causal {
-                if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+            if let Some(guard) = causal {
+                if let Err(error) = guard.active(self.computer.as_ref()) {
                     if let Some(computer) = &self.computer {
                         computer.invalidate_reachers();
                     }
@@ -22086,8 +22079,8 @@ impl Node {
             // A recompute is not a decision: this wakes the serving tasks only if the set
             // really moved. The rule and its reason live in `publish_reachers`.
             if let Some(computer) = &self.computer {
-                if let Some((deadline, cancelled)) = causal {
-                    if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+                if let Some(guard) = causal {
+                    if let Err(error) = guard.active(self.computer.as_ref()) {
                         computer.invalidate_reachers();
                         return Err(error);
                     }
@@ -22134,8 +22127,8 @@ impl Node {
             }
             held
         });
-        if let Some((deadline, cancelled)) = causal {
-            if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+        if let Some(guard) = causal {
+            if let Err(error) = guard.active(self.computer.as_ref()) {
                 if let Some(computer) = &self.computer {
                     computer.invalidate_reachers();
                 }
@@ -23098,18 +23091,16 @@ impl Node {
         self.tend_drive_keys_guarded(None).await.unwrap_or(false)
     }
 
-    async fn tend_drive_keys_until(
+    async fn tend_drive_keys_guarded_by_policy(
         &mut self,
-        deadline: std::time::Instant,
-        cancelled: &std::sync::atomic::AtomicBool,
+        guard: &computer::ComputerPolicyGuard,
     ) -> crate::error::Result<bool> {
-        self.tend_drive_keys_guarded(Some((deadline, cancelled)))
-            .await
+        self.tend_drive_keys_guarded(Some(guard)).await
     }
 
     async fn tend_drive_keys_guarded(
         &mut self,
-        guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+        guard: Option<&computer::ComputerPolicyGuard>,
     ) -> crate::error::Result<bool> {
         self.computer_drive_guard(guard)?;
         let holders = self.drive_holders();
@@ -23133,10 +23124,10 @@ impl Node {
 
     fn computer_drive_guard(
         &self,
-        guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+        guard: Option<&computer::ComputerPolicyGuard>,
     ) -> crate::error::Result<()> {
-        if let Some((deadline, cancelled)) = guard {
-            Self::computer_policy_active(deadline, cancelled)?;
+        if let Some(guard) = guard {
+            guard.active(self.computer.as_ref())?;
         }
         if self.computer_authority_current() {
             Ok(())
@@ -23176,7 +23167,7 @@ impl Node {
         &mut self,
         channel_id: &Digest32,
         holders: &BTreeSet<Digest32>,
-        guard: Option<(std::time::Instant, &std::sync::atomic::AtomicBool)>,
+        guard: Option<&computer::ComputerPolicyGuard>,
     ) -> crate::error::Result<()> {
         self.computer_drive_guard(guard)?;
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
@@ -23296,7 +23287,7 @@ impl Node {
             if self.computer.is_some() && authority.is_none() {
                 return Ok(());
             }
-            let posted = if let Some((deadline, _cancelled)) = guard {
+            let posted = if let Some(deadline) = guard.and_then(|guard| guard.causal_deadline()) {
                 match tokio::time::timeout_at(
                     deadline.into(),
                     self.post_key_package_authorized(channel_id, member, &skdm, authority),

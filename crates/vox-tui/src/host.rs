@@ -167,15 +167,27 @@ enum Slot {
 }
 
 /// An attached node.
+struct ComputerReconciliation {
+    target: vox_core::node::computer::ComputerPolicyTarget,
+    pass: u64,
+    superseded: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ComputerReconciliation {
+    fn drop(&mut self) {
+        self.superseded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 struct Attached {
     handle: NodeHandle,
     paths: Paths,
     /// Which attach this is: a release or a panic meant for an earlier one changes nothing.
     generation: u64,
-    /// Exact `(policy revision, pass generation)` currently reconciling this attach. A later
-    /// pass replaces ownership even at the same revision, so an earlier result cannot overwrite
-    /// the current node's application status.
-    computer_reconciliation: Option<(u64, u64)>,
+    /// Exact policy target and pass currently reconciling this attach. Dropping it supersedes the
+    /// actor future on policy movement, detach, or daemon shutdown; elapsed time never does.
+    computer_reconciliation: Option<ComputerReconciliation>,
     /// Attached implicitly: it detaches when its last holder goes (L-3).
     implicit: bool,
     /// The actual credential that opened this identity was empty (or this is a headless node).

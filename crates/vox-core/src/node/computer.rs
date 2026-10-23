@@ -144,12 +144,42 @@ pub(crate) fn publish_proof_fault(path: &std::path::Path, detail: &str) {
     }
 }
 
-/// One durable policy revision and the absolute ends of the two user-visible contracts its
+/// The exact durable policy projection an attached node must apply.
+///
+/// Expiry can change without advancing the operator-policy revision, so revision alone is not
+/// sufficient ownership for a delayed actor message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputerPolicyTarget {
+    revision: u64,
+    expired: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ComputerChangeBoundary {
+    Deadline(std::time::Instant),
+    Current(ComputerChange),
+}
+
+impl ComputerPolicyTarget {
+    /// Durable operator-policy revision.
+    #[must_use]
+    pub fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// Whether this exact revision is durably expired and therefore revocation-only.
+    #[must_use]
+    pub fn expired(self) -> bool {
+        self.expired
+    }
+}
+
+/// One exact durable policy target and the absolute ends of the two user-visible contracts its
 /// cause began. A remote merge may shorten the local apply deadline, but never restarts the
 /// outer return deadline shared by exchange and reconciliation.
 #[derive(Clone, Copy, Debug)]
 pub struct ComputerChange {
-    revision: u64,
+    target: ComputerPolicyTarget,
     apply_deadline: std::time::Instant,
     return_deadline: std::time::Instant,
 }
@@ -157,10 +187,10 @@ pub struct ComputerChange {
 impl ComputerChange {
     /// A local cause gets the apply-or-detach contract from the instant it is observed.
     #[must_use]
-    pub fn now(revision: u64) -> Self {
+    pub fn now(target: ComputerPolicyTarget) -> Self {
         let now = std::time::Instant::now();
         Self {
-            revision,
+            target,
             apply_deadline: now + COMPUTER_CHANGE_SHOWN_WITHIN,
             return_deadline: now + COMPUTER_RETURN_SHOWN_WITHIN,
         }
@@ -170,12 +200,12 @@ impl ComputerChange {
     /// must carry the current exact revision without granting it a fresh convergence window.
     #[must_use]
     pub fn at(
-        revision: u64,
+        target: ComputerPolicyTarget,
         apply_deadline: std::time::Instant,
         return_deadline: std::time::Instant,
     ) -> Self {
         Self {
-            revision,
+            target,
             apply_deadline,
             return_deadline,
         }
@@ -184,7 +214,13 @@ impl ComputerChange {
     /// The durable policy revision carried by this event.
     #[must_use]
     pub fn revision(self) -> u64 {
-        self.revision
+        self.target.revision
+    }
+
+    /// The exact revision and expiry state carried by this event.
+    #[must_use]
+    pub fn target(self) -> ComputerPolicyTarget {
+        self.target
     }
 
     /// The absolute end of this event's apply-or-detach contract.
@@ -1064,6 +1100,9 @@ pub(crate) struct State {
     /// A peer's missed deadline is historical status on that peer, never authority here: the
     /// exchange carrying the policy is itself its authenticated repair.
     received_misses: BTreeMap<Digest32, u64>,
+    /// Latest local application boundary missed by each managed node. Completion clears the
+    /// node's live pending state but not this historical fact; one record per node bounds growth.
+    application_misses: BTreeMap<Digest32, u64>,
     /// A causal exchange obligation is recorded before any network work begins. A timely merge
     /// removes it in the same durable transaction; after a crash an unresolved obligation is a
     /// miss, never permission to manufacture a fresh convergence clock.
@@ -1680,7 +1719,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(31)
+        e.array(32)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1831,14 +1870,19 @@ impl State {
         for (peer, revision) in &self.received_misses {
             e.array(2).bytes(peer).uint(*revision);
         }
+        e.array(self.application_misses.len());
+        for (node, revision) in &self.application_misses {
+            e.array(2).bytes(node).uint(*revision);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        // 31 elements; older current-version states have no distinct operator-policy revision,
-        // durable pre-keyring application record, or inbound/outbound miss distinction.
+        // 32 elements; older current-version states have no distinct operator-policy revision,
+        // durable pre-keyring application record, inbound/outbound miss distinction, or local
+        // node-application miss history.
         let fields = count(&mut d)?;
-        if !(25..=31).contains(&fields) {
+        if !(25..=32).contains(&fields) {
             return Err(bad());
         }
         let description = Description::decode(d.bytes()?)?;
@@ -2188,8 +2232,20 @@ impl State {
                 }
             }
         }
+        let mut application_misses = BTreeMap::new();
+        if fields >= 32 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let node = digest(&mut d)?;
+                let at = d.uint()?;
+                if at > revision || application_misses.insert(node, at).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            application_misses,
             received_misses,
             prepared,
             pending_exchanges,
@@ -2484,6 +2540,21 @@ pub struct DerivedBinding {
     pub at_ms: u64,
 }
 impl Computer {
+    /// Exact durable policy projection current at this instant. Callers carry both fields through
+    /// delayed work; expiry can move without a new operator-policy revision.
+    pub fn policy_target(&self) -> ComputerPolicyTarget {
+        let state = lock(&self.state);
+        ComputerPolicyTarget {
+            revision: state.policy_revision,
+            expired: Self::revision_expired(&state),
+        }
+    }
+
+    pub(crate) fn policy_target_is(&self, target: ComputerPolicyTarget) -> bool {
+        let state = lock(&self.state);
+        state.policy_revision == target.revision && Self::revision_expired(&state) == target.expired
+    }
+
     /// Journal revision of the last effective operator-policy change. Transport-only journal
     /// movement cannot replace a missed policy contract.
     pub fn policy_revision(&self) -> u64 {
@@ -2657,13 +2728,36 @@ impl Computer {
         name: &str,
         deadline: std::time::Instant,
     ) -> Result<()> {
+        self.bind_node_guarded(signer, name, ComputerChangeBoundary::Deadline(deadline))
+            .map(|current| {
+                debug_assert!(current, "a deadline boundary cannot be superseded");
+            })
+    }
+
+    /// Bind only while the accepted follower event still owns the exact policy projection.
+    /// `false` means policy movement superseded this event; its own broadcast owns the successor.
+    pub(crate) fn bind_node_for_change(
+        &self,
+        signer: &dyn RootSigner,
+        name: &str,
+        change: ComputerChange,
+    ) -> Result<bool> {
+        self.bind_node_guarded(signer, name, ComputerChangeBoundary::Current(change))
+    }
+
+    fn bind_node_guarded(
+        &self,
+        signer: &dyn RootSigner,
+        name: &str,
+        boundary: ComputerChangeBoundary,
+    ) -> Result<bool> {
         let local = self.signer.fingerprint();
         let key = signer.fingerprint();
         loop {
             let Some(group) = self.binding_group() else {
-                return Ok(());
+                return Ok(true);
             };
-            let current = self.change_until(deadline, |s| {
+            let bind = |s: &mut State| {
                 // `binding_group` and this transaction take the state lock separately. A remote
                 // removal or replacement incarnation can land between them; never use the
                 // captured group's grant to sign in the newer state. Retry a replacement group
@@ -2684,101 +2778,135 @@ impl Computer {
                 if s.quarantined.contains(&local) {
                     return Ok(true);
                 }
-            let (_old_revision, old_personal, mut bindings) = match s.rosters.get(&local) {
-                Some(r) => r.read(&local, &group)?,
-                None => (0, None, Vec::new()),
-            };
-            let authority = s.derive()?;
-            let approval = s.binding_approvals.get(&key).cloned();
-            let mut retained = None;
-            let mut was_local = false;
-            let mut known = false;
-            for id in &authority.accepted {
-                let e = s.history[id].event()?;
-                for binding in e.bindings {
-                    if binding.verify(&e.author, &group)? != key { continue; }
-                    known = true;
-                    was_local |= e.author == local;
-                    if e.author == local && authority.binding_owners.get(&key) == Some(&binding.id()) {
-                        retained = Some(binding);
+                let (_old_revision, old_personal, mut bindings) = match s.rosters.get(&local) {
+                    Some(r) => r.read(&local, &group)?,
+                    None => (0, None, Vec::new()),
+                };
+                let authority = s.derive()?;
+                let approval = s.binding_approvals.get(&key).cloned();
+                let mut retained = None;
+                let mut was_local = false;
+                let mut known = false;
+                for id in &authority.accepted {
+                    let e = s.history[id].event()?;
+                    for binding in e.bindings {
+                        if binding.verify(&e.author, &group)? != key {
+                            continue;
+                        }
+                        known = true;
+                        was_local |= e.author == local;
+                        if e.author == local
+                            && authority.binding_owners.get(&key) == Some(&binding.id())
+                        {
+                            retained = Some(binding);
+                        }
                     }
                 }
-            }
-            if known && retained.is_none() && approval.is_none() {
-                if was_local { return Ok(true); } // Released: never silently reclaim an old vault.
-                return Err(Error::Profile("this node is bound to another computer; explicitly approve its signed transfer or recovery before unlocking it"));
-            }
-            if approval.is_some() { bindings.retain(|b| b.verify(&local, &group).ok() != Some(key)); }
-            let mut changed = false;
-            if let Some(binding) = bindings
-                .iter_mut()
-                .find(|b| b.verify(&local, &group).ok() == Some(key))
-            {
-                if binding.name != name {
+                if known && retained.is_none() && approval.is_none() {
+                    if was_local {
+                        return Ok(true);
+                    } // Released: never silently reclaim an old vault.
+                    return Err(Error::Profile("this node is bound to another computer; explicitly approve its signed transfer or recovery before unlocking it"));
+                }
+                if approval.is_some() {
+                    bindings.retain(|b| b.verify(&local, &group).ok() != Some(key));
+                }
+                let mut changed = false;
+                if let Some(binding) = bindings
+                    .iter_mut()
+                    .find(|b| b.verify(&local, &group).ok() == Some(key))
+                {
+                    if binding.name != name {
+                        binding.name = name.to_owned();
+                        changed = true;
+                    }
+                }
+                if !bindings
+                    .iter()
+                    .any(|b| b.verify(&local, &group).ok() == Some(key))
+                {
+                    // Reuse this node's own signed binding after local roster removal or rename.
+                    // A copied fingerprint file or name cannot construct this proof.
+                    let body = if let Some(approval) = &approval {
+                        let mut body = Encoder::new();
+                        body.array(6)
+                            .uint(PROTOCOL)
+                            .bytes(&signer.public_key().to_bytes())
+                            .bytes(&self.signer.public_key().to_bytes())
+                            .bytes(&group)
+                            .bytes(&random_array::<32>()?)
+                            .bytes(&approval.encode());
+                        body.finish()
+                    } else {
+                        Binding::body(
+                            &signer.public_key(),
+                            &self.signer.public_key(),
+                            &group,
+                            &random_array()?,
+                        )
+                    };
+                    if approval.is_some() {
+                        retained = None;
+                    }
+                    let mut binding = if let Some(binding) = retained {
+                        binding
+                    } else {
+                        Binding {
+                            node: Signed::create(
+                                b"vox/computer-binding/v1\0",
+                                body.clone(),
+                                signer,
+                            )?,
+                            computer: Signed::create(
+                                b"vox/computer-binding/v1\0",
+                                body,
+                                self.signer.as_ref(),
+                            )?,
+                            name: name.to_owned(),
+                        }
+                    };
                     binding.name = name.to_owned();
+                    bindings.push(binding);
                     changed = true;
                 }
-            }
-            if !bindings
-                .iter()
-                .any(|b| b.verify(&local, &group).ok() == Some(key))
-            {
-                // Reuse this node's own signed binding after local roster removal or rename.
-                // A copied fingerprint file or name cannot construct this proof.
-                let body = if let Some(approval) = &approval {
-                    let mut body = Encoder::new();
-                    body.array(6).uint(PROTOCOL).bytes(&signer.public_key().to_bytes())
-                        .bytes(&self.signer.public_key().to_bytes()).bytes(&group)
-                        .bytes(&random_array::<32>()?).bytes(&approval.encode());
-                    body.finish()
-                } else { Binding::body(&signer.public_key(), &self.signer.public_key(), &group, &random_array()?) };
-                if approval.is_some() { retained = None; }
-                let mut binding = if let Some(binding) = retained {
-                    binding
-                } else {
-                    Binding {
-                        node: Signed::create(b"vox/computer-binding/v1\0", body.clone(), signer)?,
-                        computer: Signed::create(
-                            b"vox/computer-binding/v1\0",
-                            body,
-                            self.signer.as_ref(),
-                        )?,
-                        name: name.to_owned(),
-                    }
-                };
-                binding.name = name.to_owned();
-                bindings.push(binding);
-                changed = true;
-            }
-            if s.selected == Some(key) {
-                s.selected_name = name.to_owned();
-            }
-            let selection = s.selected.filter(|selected| {
-                bindings
-                    .iter()
-                    .any(|b| b.verify(&local, &group).ok() == Some(*selected))
-            });
-            changed |= selection != old_personal;
-            if changed {
-                bindings.sort_by_key(|b| sha256(&b.node.public));
-                let r = Control::create(s, &bindings, selection, self.signer.as_ref())?;
-                s.retain_roster(r)?;
-                s.binding_approvals.remove(&key);
-            }
-            // The revision the binding now stands at: the one the roster event just made, or
-            // the one it was found current at. Saved with the state, so a restart does not
-            // derive it again.
-            s.derived.insert(
-                key,
-                DerivedBinding {
-                    revision: s.policy_revision,
-                    at_ms: pairing::now(),
-                },
-            );
-            Ok(true)
-            })?;
+                if s.selected == Some(key) {
+                    s.selected_name = name.to_owned();
+                }
+                let selection = s.selected.filter(|selected| {
+                    bindings
+                        .iter()
+                        .any(|b| b.verify(&local, &group).ok() == Some(*selected))
+                });
+                changed |= selection != old_personal;
+                if changed {
+                    bindings.sort_by_key(|b| sha256(&b.node.public));
+                    let r = Control::create(s, &bindings, selection, self.signer.as_ref())?;
+                    s.retain_roster(r)?;
+                    s.binding_approvals.remove(&key);
+                }
+                // The revision the binding now stands at: the one the roster event just made, or
+                // the one it was found current at. Saved with the state, so a restart does not
+                // derive it again.
+                s.derived.insert(
+                    key,
+                    DerivedBinding {
+                        revision: s.policy_revision,
+                        at_ms: pairing::now(),
+                    },
+                );
+                Ok(true)
+            };
+            let current = match boundary {
+                ComputerChangeBoundary::Deadline(deadline) => {
+                    Some(self.change_until(deadline, bind)?)
+                }
+                ComputerChangeBoundary::Current(change) => self.change_for_target(change, bind)?,
+            };
+            let Some(current) = current else {
+                return Ok(false);
+            };
             if current {
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -2950,6 +3078,37 @@ impl Computer {
         !Self::revision_expired(&state) && Self::application_settled_in(&state, node, revision)
     }
 
+    /// Durably remember that this node missed the local observation boundary for the exact
+    /// still-current policy. A later completion repairs current state but cannot rewrite history.
+    /// `false` means policy movement superseded the observed flight before the miss was recorded.
+    pub fn record_application_miss(&self, node: Digest32, change: ComputerChange) -> Result<bool> {
+        blocking_transaction(|| {
+            let _change = lock(&self.changes);
+            self.storage_ready()?;
+            let held = lock(&self.state).clone();
+            if held.policy_revision != change.target.revision
+                || Self::revision_expired(&held) != change.target.expired
+            {
+                return Ok(false);
+            }
+            let mut state = held.clone();
+            let revision = change.revision();
+            state
+                .application_misses
+                .entry(node)
+                .and_modify(|held| *held = (*held).max(revision))
+                .or_insert(revision);
+            if held.body() != state.body() {
+                if let Err(error) = self.save_before(&state, None) {
+                    self.storage_failure();
+                    return Err(error);
+                }
+                *lock(&self.state) = state;
+            }
+            Ok(true)
+        })
+    }
+
     /// Record application only after the actor saved the complete keyring under the ordinary
     /// node store protection. A crash before this write repeats reconciliation before networking.
     pub fn mark_applied(&self, node: Digest32, revision: u64, covered: &[Digest32]) -> Result<()> {
@@ -2974,7 +3133,41 @@ impl Computer {
         covered: &[Digest32],
         deadline: std::time::Instant,
     ) -> Result<bool> {
-        self.change_until(deadline, |state| {
+        self.prepare_application_guarded(
+            node,
+            revision,
+            expected_expired,
+            covered,
+            ComputerChangeBoundary::Deadline(deadline),
+        )
+    }
+
+    pub(crate) fn prepare_application_for_change(
+        &self,
+        node: Digest32,
+        revision: u64,
+        expected_expired: bool,
+        covered: &[Digest32],
+        change: ComputerChange,
+    ) -> Result<bool> {
+        self.prepare_application_guarded(
+            node,
+            revision,
+            expected_expired,
+            covered,
+            ComputerChangeBoundary::Current(change),
+        )
+    }
+
+    fn prepare_application_guarded(
+        &self,
+        node: Digest32,
+        revision: u64,
+        expected_expired: bool,
+        covered: &[Digest32],
+        boundary: ComputerChangeBoundary,
+    ) -> Result<bool> {
+        blocking_transaction(|| self.change_guarded_blocking(boundary, |state| {
             let current = state.policy_revision;
             let expired = Self::revision_expired(state);
             if current != revision || expired != expected_expired {
@@ -3015,7 +3208,8 @@ impl Computer {
                 }
             }
             Ok(true)
-        })
+        }))
+        .map(|prepared| prepared.unwrap_or(false))
     }
 
     /// Commit one node's complete policy projection only if the prepared plan still names the
@@ -3271,6 +3465,12 @@ impl Computer {
             let (_, personal, mut bindings) = roster.read(&local, &group)?;
             let was = bindings.len();
             bindings.retain(|b| names.contains(&b.name));
+            let retained: BTreeSet<_> = bindings
+                .iter()
+                .filter_map(|binding| binding.verify(&local, &group).ok())
+                .collect();
+            s.application_misses
+                .retain(|node, _| retained.contains(node));
             let selected = personal.filter(|id| {
                 bindings
                     .iter()
@@ -3298,13 +3498,37 @@ impl Computer {
         aliases: &[(Digest32, String)],
         deadline: std::time::Instant,
     ) -> Result<()> {
-        self.change_until(deadline, |s| {
-            s.aliases
-                .entry(node)
-                .or_default()
-                .extend(aliases.iter().cloned());
-            Ok(())
+        self.retain_aliases_guarded(node, aliases, ComputerChangeBoundary::Deadline(deadline))
+            .map(|retained| {
+                debug_assert!(retained, "a deadline boundary cannot be superseded");
+            })
+    }
+
+    pub(crate) fn retain_aliases_for_change(
+        &self,
+        node: Digest32,
+        aliases: &[(Digest32, String)],
+        change: ComputerChange,
+    ) -> Result<bool> {
+        self.retain_aliases_guarded(node, aliases, ComputerChangeBoundary::Current(change))
+    }
+
+    fn retain_aliases_guarded(
+        &self,
+        node: Digest32,
+        aliases: &[(Digest32, String)],
+        boundary: ComputerChangeBoundary,
+    ) -> Result<bool> {
+        blocking_transaction(|| {
+            self.change_guarded_blocking(boundary, |s| {
+                s.aliases
+                    .entry(node)
+                    .or_default()
+                    .extend(aliases.iter().cloned());
+                Ok(())
+            })
         })
+        .map(|retained| retained.is_some())
     }
     /// A local alias survives a revoked permission.
     pub fn alias(&self, node: &Digest32, peer: &Digest32) -> Option<String> {
@@ -3458,6 +3682,7 @@ impl Computer {
             derived: BTreeMap::new(),
             missed_exchanges: BTreeMap::new(),
             received_misses: BTreeMap::new(),
+            application_misses: BTreeMap::new(),
             pending_exchanges: BTreeMap::new(),
         };
         let c = Arc::new(Self {
@@ -3534,24 +3759,49 @@ impl Computer {
         deadline: std::time::Instant,
         f: impl FnOnce(&mut State) -> Result<T>,
     ) -> Result<T> {
-        blocking_transaction(|| self.change_until_blocking(deadline, f))
+        blocking_transaction(|| {
+            self.change_guarded_blocking(ComputerChangeBoundary::Deadline(deadline), f)
+                .map(|value| value.expect("a deadline boundary cannot be superseded"))
+        })
     }
 
-    fn change_until_blocking<T>(
+    /// Commit work only while `target` is still the exact durable policy projection. Unlike an
+    /// observation deadline, target movement is real supersession and therefore discards the
+    /// uncommitted closure. The caller receives `None` and yields to the event for the new target.
+    fn change_for_target<T>(
         &self,
-        deadline: std::time::Instant,
+        change: ComputerChange,
         f: impl FnOnce(&mut State) -> Result<T>,
-    ) -> Result<T> {
+    ) -> Result<Option<T>> {
+        blocking_transaction(|| {
+            self.change_guarded_blocking(ComputerChangeBoundary::Current(change), f)
+        })
+    }
+
+    fn change_guarded_blocking<T>(
+        &self,
+        boundary: ComputerChangeBoundary,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<Option<T>> {
         // A writer owns the transaction order, but readers own no part of its filesystem work:
         // status and authorization observations remain live while staging or flush is slow.
         let _change = lock(&self.changes);
         self.storage_ready()?;
-        if std::time::Instant::now() >= deadline {
-            return Err(Error::Profile(
-                "the computer change reached its causal convergence deadline before its transaction began",
-            ));
-        }
         let held = lock(&self.state).clone();
+        match boundary {
+            ComputerChangeBoundary::Deadline(deadline) if std::time::Instant::now() >= deadline => {
+                return Err(Error::Profile(
+                    "the computer change reached its causal convergence deadline before its transaction began",
+                ));
+            }
+            ComputerChangeBoundary::Current(change)
+                if held.policy_revision != change.target.revision
+                    || Self::revision_expired(&held) != change.target.expired =>
+            {
+                return Ok(None);
+            }
+            _ => {}
+        }
         let mut next = held.clone();
         let value = match f(&mut next) {
             Ok(value) => value,
@@ -3593,10 +3843,12 @@ impl Computer {
             }
         }
         if held.body() != next.body() {
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::Profile(
-                    "the computer change reached its causal convergence deadline before it could be saved",
-                ));
+            if let ComputerChangeBoundary::Deadline(deadline) = boundary {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Profile(
+                        "the computer change reached its causal convergence deadline before it could be saved",
+                    ));
+                }
             }
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
@@ -3609,7 +3861,11 @@ impl Computer {
             #[cfg(feature = "test-knobs")]
             let mutant_state_guard =
                 fx28_mutant("lock-through-computer-write").then(|| lock(&self.state));
-            let saved = self.save_before(&next, Some(deadline));
+            let deadline = match boundary {
+                ComputerChangeBoundary::Deadline(deadline) => Some(deadline),
+                ComputerChangeBoundary::Current(_) => None,
+            };
+            let saved = self.save_before(&next, deadline);
             #[cfg(feature = "test-knobs")]
             drop(mutant_state_guard);
             if let Err(error) = saved {
@@ -3620,6 +3876,7 @@ impl Computer {
                 #[cfg(not(feature = "test-knobs"))]
                 let deadline_is_storage_failure = false;
                 if deadline_is_storage_failure
+                    || deadline.is_none()
                     || !matches!(&error, Error::Profile(why) if *why == COMPUTER_COMMIT_CAUSAL_EXPIRED)
                 {
                     self.storage_failure();
@@ -3628,7 +3885,8 @@ impl Computer {
                     .store(false, std::sync::atomic::Ordering::Release);
                 return Err(error);
             }
-            let committed_late = std::time::Instant::now() >= deadline;
+            let committed_late =
+                deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
             if authorization_changed {
                 self.invalidate_reachers();
             }
@@ -3644,9 +3902,12 @@ impl Computer {
                 if authorization_changed {
                     let now = std::time::Instant::now();
                     let _ = self.changed.send(ComputerChange::at(
-                        published.policy_revision,
+                        ComputerPolicyTarget {
+                            revision: published.policy_revision,
+                            expired: Self::revision_expired(&published),
+                        },
                         now,
-                        deadline,
+                        deadline.expect("a late commit has a deadline"),
                     ));
                 }
                 return Err(Error::Profile(
@@ -3659,13 +3920,24 @@ impl Computer {
                 // `journal_changed`; treating it as policy repeatedly reconciled every node.
                 // The local apply contract may shorten an outer return deadline, never extend it.
                 let _ = self.changed.send(ComputerChange::at(
-                    published.policy_revision,
-                    deadline.min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN),
-                    deadline,
+                    ComputerPolicyTarget {
+                        revision: published.policy_revision,
+                        expired: Self::revision_expired(&published),
+                    },
+                    match boundary {
+                        ComputerChangeBoundary::Deadline(deadline) => {
+                            deadline.min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN)
+                        }
+                        ComputerChangeBoundary::Current(change) => change.apply_deadline,
+                    },
+                    match boundary {
+                        ComputerChangeBoundary::Deadline(deadline) => deadline,
+                        ComputerChangeBoundary::Current(change) => change.return_deadline,
+                    },
                 ));
             }
         }
-        Ok(value)
+        Ok(Some(value))
     }
 
     pub(crate) fn missed_exchanges(&self) -> (u64, BTreeMap<Digest32, (u64, bool)>) {
@@ -3807,7 +4079,10 @@ impl Computer {
             if authorization_changed {
                 let now = std::time::Instant::now();
                 let _ = self.changed.send(ComputerChange::at(
-                    published.policy_revision,
+                    ComputerPolicyTarget {
+                        revision: published.policy_revision,
+                        expired: Self::revision_expired(&published),
+                    },
                     now + COMPUTER_CHANGE_SHOWN_WITHIN,
                     now + COMPUTER_RETURN_SHOWN_WITHIN,
                 ));

@@ -181,6 +181,16 @@ pub struct ComputerNode {
     #[serde(default)]
     pub binding_derived_ms: Option<u64>,
 }
+/// Historical local application boundary missed by one managed node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputerApplicationMiss {
+    /// Full node identity; names are presentation and can change.
+    pub node: String,
+    /// Last authenticated presented name, when the node remains in this computer's roster.
+    pub name: Option<String>,
+    /// Latest exact local policy revision which missed its observation boundary.
+    pub revision: u64,
+}
 /// One available explicit operation derived from retained authenticated binding evidence.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerBindingAction {
@@ -232,6 +242,10 @@ pub struct ComputerStatus {
     pub selected_name: Option<String>,
     /// Managed nodes still needing attach/unlock or policy reconciliation.
     pub pending_nodes: Vec<String>,
+    /// Latest durable local application miss per managed node. Successful late completion clears
+    /// `pending_nodes`, not this historical observation.
+    #[serde(default)]
+    pub application_misses: Vec<ComputerApplicationMiss>,
     /// Last reach or protocol failure, without any secret or full link.
     pub problem: Option<String>,
 }
@@ -339,6 +353,7 @@ pub struct Management {
     inflight: Mutex<BTreeMap<Digest32, Flight>>,
     slots: Arc<tokio::sync::Semaphore>,
     problem: Mutex<Option<String>>,
+    unavailable_nodes: Mutex<Vec<String>>,
     pending_nodes: Mutex<Vec<String>>,
     transport_cache: Mutex<BTreeMap<(Digest32, Digest32), RegisteredLease>>,
     revoked_transport: Mutex<std::collections::BTreeSet<(Digest32, Digest32, u64)>>,
@@ -799,6 +814,7 @@ impl Management {
             inflight: Mutex::new(BTreeMap::new()),
             slots: Arc::new(tokio::sync::Semaphore::new(MANAGEMENT_SLOTS)),
             problem: Mutex::new(problem),
+            unavailable_nodes: Mutex::new(Vec::new()),
             pending_nodes: Mutex::new(Vec::new()),
             transport_cache: Mutex::new(BTreeMap::new()),
             revoked_transport: Mutex::new(Default::default()),
@@ -869,7 +885,7 @@ impl Management {
                                     // conservative failure boundary.
                                     let now = std::time::Instant::now();
                                     me.retry_changed_now(ComputerChange::at(
-                                        me.computer.policy_revision(),
+                                        me.computer.policy_target(),
                                         now,
                                         now,
                                     ));
@@ -1569,7 +1585,8 @@ impl Management {
                 })
             })
             .transpose()?;
-        let mut pending_nodes = lock(&self.pending_nodes).clone();
+        let mut pending_nodes = lock(&self.unavailable_nodes).clone();
+        pending_nodes.extend(lock(&self.pending_nodes).iter().cloned());
         for node in s.binding_approvals.keys() {
             pending_nodes.push(format!(
                 "{}: binding approved here; unlock its local vault to sign and apply it",
@@ -1687,6 +1704,21 @@ impl Management {
             }
         }
         former.retain(|id, _| !descriptions.contains_key(id));
+        let application_misses = s
+            .application_misses
+            .iter()
+            .map(|(node, revision)| ComputerApplicationMiss {
+                node: text_id(node),
+                name: nodes
+                    .iter()
+                    .find(|candidate| {
+                        candidate.computer == text_id(&local)
+                            && candidate.fingerprint == text_id(node)
+                    })
+                    .map(|candidate| candidate.name.clone()),
+                revision: *revision,
+            })
+            .collect();
         let expired = applications
             .iter()
             .any(|application| application.convergence_state == "expired");
@@ -1736,6 +1768,7 @@ impl Management {
             selected_node: s.selected.as_ref().map(text_id),
             selected_name: s.selected.map(|_| s.selected_name.clone()),
             pending_nodes,
+            application_misses,
             problem: if storage_failed {
                 Some(STORAGE_FAILED.into())
             } else if !s.quarantined.is_empty() {
@@ -1747,7 +1780,7 @@ impl Management {
     }
     /// Report outstanding current-node application, never claiming success for detached vaults.
     pub fn pending_nodes(&self, nodes: Vec<String>) {
-        *lock(&self.pending_nodes) = nodes;
+        *lock(&self.unavailable_nodes) = nodes;
     }
     /// One node's application failed or did not finish: said in the status, in place of any
     /// earlier word about that node.

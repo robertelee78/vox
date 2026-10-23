@@ -511,6 +511,11 @@ pub enum Error {
     #[error("node: {0}")]
     Profile(&'static str),
 
+    /// An accepted local policy application lost ownership to a newer exact revision or expiry
+    /// state. This is follower control flow, not a storage or authorization fault.
+    #[error("computer policy changed while its prior application was pending")]
+    ComputerPolicySuperseded,
+
     /// A data root this version does not read: a directory of it outside `nodes/` holds a vault,
     /// an anchor's key or a store, and is not a node (#423). It is refused before anything is
     /// written, and left as it is.

@@ -42,9 +42,8 @@ impl Router {
         self.inner.rt.spawn(async move {
             // Daemon start is the first cause. Every later pass carries the deadline of the
             // event that caused it; a remote merge does not get a new reconciliation clock.
-            let mut change = vox_core::node::computer::ComputerChange::now(
-                management.computer.policy_revision(),
-            );
+            let mut change =
+                vox_core::node::computer::ComputerChange::now(management.computer.policy_target());
             let mut advertised = endpoints.borrow_and_update().clone();
             loop {
                 let Some(inner) = weak.upgrade() else {
@@ -61,10 +60,9 @@ impl Router {
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 // A missed earlier event may already be at its bound; never
                                 // replace it with a later five-second window.
-                                let revision = management.computer.policy_revision();
                                 let now = std::time::Instant::now();
                                 vox_core::node::computer::ComputerChange::at(
-                                    revision, now, now,
+                                    management.computer.policy_target(), now, now,
                                 )
                             }
                             Err(broadcast::error::RecvError::Closed) => return,
@@ -102,17 +100,18 @@ impl Router {
     }
 
     /// One reconciliation pass: the roster follows the nodes on disk, and every attached node
-    /// that is behind the policy derives its binding and applies its keyring on a task of its
-    /// own, bounded by the causal event's absolute deadline; each records the application receipt when it is
-    /// done. The pass itself waits for none of them, so a revision arriving meanwhile starts its
-    /// own pass at once and a stuck node holds nothing but itself. A node at the current
-    /// revision is not asked; one that fails or does not answer is said in the status and remains
-    /// attached but non-authoritative. `Computer::policy_current` and the synchronously invalidated
-    /// reacher gates fail its old projection closed. Keeping the actor is essential: a later valid
-    /// policy event must be able to reconcile it without an unlock or daemon restart.
+    /// that is behind the policy derives its binding and applies its keyring on a task of its own.
+    /// The causal deadline records a public historical miss but never discards same-current work;
+    /// exact policy movement or attachment lifecycle supersedes it. Each successful task records
+    /// the application receipt. The pass itself waits for none of them, so a revision arriving
+    /// meanwhile starts its own pass at once and a stuck node holds nothing but itself. A current
+    /// node is not asked; an unfinished or failed one is said in status and remains attached but
+    /// non-authoritative. `Computer::policy_current` and synchronously invalidated reacher gates
+    /// fail its old projection closed until the accepted application completes.
     async fn reconcile_computer_trust(&self, change: vox_core::node::computer::ComputerChange) {
         let management = Arc::clone(&self.inner.defaults.computer);
         let revision = change.revision();
+        let target = change.target();
         let deadline = change.apply_deadline();
         if management.computer.binding_group().is_none() && !management.computer.grouped() {
             return;
@@ -136,20 +135,15 @@ impl Router {
         let mut behind = Vec::new();
         let pass = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
         let attached: Vec<_> = {
-            let mut slots = lock(&self.inner.slots);
+            let slots = lock(&self.inner.slots);
             slots
-                .iter_mut()
+                .iter()
                 .filter_map(|(name, slot)| match slot {
-                    Slot::Attached(attached) => {
-                        // Same-revision passes can overlap too. Claim this exact pass before an
-                        // older task can report or erase the current node's pending status.
-                        attached.computer_reconciliation = Some((revision, pass));
-                        Some((
-                            name.as_str().to_owned(),
-                            attached.handle.clone(),
-                            attached.generation,
-                        ))
-                    }
+                    Slot::Attached(attached) => Some((
+                        name.as_str().to_owned(),
+                        attached.handle.clone(),
+                        attached.generation,
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -168,7 +162,14 @@ impl Router {
             if handle.computer_current() {
                 continue;
             }
-            behind.push((info.name.clone(), handle.clone(), *generation));
+            let Some(identity) = info.fingerprint else {
+                pending.push(format!(
+                    "{}: the Ready actor has no authenticated identity for computer trust",
+                    info.name
+                ));
+                continue;
+            };
+            behind.push((info.name.clone(), handle.clone(), *generation, identity));
         }
         management.pending_nodes(pending);
         if behind.is_empty() {
@@ -177,18 +178,59 @@ impl Router {
             }
             return;
         }
-        for (name, handle, generation) in behind {
+        let claimed: Vec<_> = {
+            let mut slots = lock(&self.inner.slots);
+            behind
+                .into_iter()
+                .filter_map(|(name, handle, generation, identity)| {
+                    let Some(Slot::Attached(attached)) = slots.get_mut(&name) else {
+                        return None;
+                    };
+                    if attached.generation != generation {
+                        return None;
+                    }
+                    if attached
+                        .computer_reconciliation
+                        .as_ref()
+                        .is_some_and(|flight| flight.target == target)
+                    {
+                        return None;
+                    }
+                    let superseded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    attached.computer_reconciliation = Some(ComputerReconciliation {
+                        target,
+                        pass,
+                        superseded: Arc::clone(&superseded),
+                    });
+                    Some((name, handle, generation, identity, superseded))
+                })
+                .collect()
+        };
+        for (name, handle, generation, identity, superseded) in claimed {
             let router = self.clone();
             let management = Arc::clone(&management);
             self.inner.rt.spawn(async move {
-                let outcome = handle
-                    .reconcile_computer(deadline)
-                    .await
-                    .map_err(|error| error.to_string());
+                let application = handle.reconcile_computer_current(change, Arc::clone(&superseded));
+                tokio::pin!(application);
+                let outcome = tokio::select! {
+                    biased;
+                    result = &mut application => result,
+                    () = tokio::time::sleep_until(deadline.into()) => {
+                        router.mark_computer_reconciliation_late(
+                            &name, generation, identity, change, pass,
+                        );
+                        #[cfg(feature = "test-knobs")]
+                        if handle.abandon_late_computer_application_for_proof(&superseded) {
+                            return;
+                        }
+                        application.await
+                    }
+                }
+                .map_err(|error| error.to_string());
                 match outcome {
                     Ok(()) => {
                         if !router.finish_computer_reconciliation(
-                            &name, generation, revision, pass, None,
+                            &name, generation, target, pass, None,
                         ) {
                             return;
                         }
@@ -198,7 +240,7 @@ impl Router {
                     }
                     Err(why) => {
                         if router.finish_computer_reconciliation(
-                            &name, generation, revision, pass, Some(&why),
+                            &name, generation, target, pass, Some(&why),
                         ) {
                             eprintln!(
                                 "vox daemon: node {name} computer trust reconciliation at revision {revision} failed: {why}"
@@ -210,18 +252,75 @@ impl Router {
         }
     }
 
+    fn mark_computer_reconciliation_late(
+        &self,
+        node: &NodeName,
+        generation: u64,
+        identity: vox_core::hash::Digest32,
+        change: vox_core::node::computer::ComputerChange,
+        pass: u64,
+    ) {
+        {
+            let slots = lock(&self.inner.slots);
+            let owned = matches!(
+                slots.get(node),
+                Some(Slot::Attached(attached))
+                    if attached.generation == generation
+                        && attached.computer_reconciliation.as_ref().is_some_and(|flight|
+                            flight.target == change.target() && flight.pass == pass)
+            );
+            if !owned {
+                return;
+            }
+            self.inner.defaults.computer.node_pending(
+                node.as_str(),
+                &format!(
+                    "computer trust revision {} missed its local application boundary; the accepted application is still running",
+                    change.revision()
+                ),
+            );
+        }
+        let management = &self.inner.defaults.computer;
+        match management
+            .computer
+            .record_application_miss(identity, change)
+        {
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(error) => {
+                let slots = lock(&self.inner.slots);
+                if matches!(
+                    slots.get(node),
+                    Some(Slot::Attached(attached))
+                        if attached.generation == generation
+                            && attached.computer_reconciliation.as_ref().is_some_and(|flight|
+                                flight.target == change.target() && flight.pass == pass)
+                ) {
+                    management.node_pending(
+                        node.as_str(),
+                        &format!("computer trust lateness could not be recorded: {error}"),
+                    );
+                }
+            }
+        }
+    }
+
     fn finish_computer_reconciliation(
         &self,
         node: &NodeName,
         generation: u64,
-        revision: u64,
+        target: vox_core::node::computer::ComputerPolicyTarget,
         pass: u64,
         failure: Option<&str>,
     ) -> bool {
         match lock(&self.inner.slots).get_mut(node) {
             Some(Slot::Attached(attached)) => {
                 if attached.generation != generation
-                    || attached.computer_reconciliation != Some((revision, pass))
+                    || self.inner.defaults.computer.computer.policy_target() != target
+                    || !attached
+                        .computer_reconciliation
+                        .as_ref()
+                        .is_some_and(|flight| flight.target == target && flight.pass == pass)
                 {
                     return false;
                 }

@@ -17,6 +17,75 @@ pub(super) struct KeyringApplication {
     pub(super) settled: bool,
 }
 
+/// Ownership of one actor-side Computer application. A causal command deadline can still cancel
+/// its own command; the live follower instead owns an exact policy target until real policy or
+/// lifecycle supersession. Elapsed observation time is deliberately absent from `Current`.
+#[derive(Clone)]
+pub(super) enum ComputerPolicyGuard {
+    Deadline {
+        deadline: std::time::Instant,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    },
+    Current {
+        change: crate::node::computer::ComputerChange,
+        superseded: Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+impl ComputerPolicyGuard {
+    pub(super) fn active(
+        &self,
+        computer: Option<&Arc<crate::node::computer::Computer>>,
+    ) -> crate::error::Result<()> {
+        match self {
+            Self::Deadline {
+                deadline,
+                cancelled,
+            } => {
+                if cancelled.load(std::sync::atomic::Ordering::Acquire)
+                    || std::time::Instant::now() >= *deadline
+                {
+                    Err(Error::Profile(
+                        "computer trust did not apply before its causal deadline",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Current { change, superseded } => {
+                if superseded.load(std::sync::atomic::Ordering::Acquire)
+                    || computer.is_some_and(|computer| !computer.policy_target_is(change.target()))
+                {
+                    Err(Error::ComputerPolicySuperseded)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn deadline(&self) -> std::time::Instant {
+        match self {
+            Self::Deadline { deadline, .. } => *deadline,
+            Self::Current { change, .. } => change.apply_deadline(),
+        }
+    }
+
+    pub(super) fn causal_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Deadline { deadline, .. } => Some(*deadline),
+            Self::Current { .. } => None,
+        }
+    }
+
+    fn change(&self) -> Option<crate::node::computer::ComputerChange> {
+        match self {
+            Self::Deadline { .. } => None,
+            Self::Current { change, .. } => Some(*change),
+        }
+    }
+}
+
 /// A captured actor projection whose final use is checked against durable Computer state. The
 /// token contains no authority by itself: [`ComputerAuthority::publish`] takes the state lock and
 /// revalidates the exact revision and binding through the synchronous irreversible operation.
@@ -673,8 +742,10 @@ impl NodeHandle {
         let (reply, rx) = oneshot::channel();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let send = self.net_tx.send(NetEvent::ComputerPolicy {
-            deadline,
-            cancelled: Arc::clone(&cancelled),
+            guard: ComputerPolicyGuard::Deadline {
+                deadline,
+                cancelled: Arc::clone(&cancelled),
+            },
             reply,
         });
         tokio::pin!(send);
@@ -703,6 +774,45 @@ impl NodeHandle {
                 cancelled.store(true, std::sync::atomic::Ordering::Release);
                 Err(Error::Profile("computer trust did not apply before its causal deadline"))
             }
+        }
+    }
+
+    /// Keep the accepted live follower event alive past its observation boundary. Only exact
+    /// policy movement, detach/shutdown, or a stopped actor can supersede this future.
+    pub async fn reconcile_computer_current(
+        &self,
+        change: crate::node::computer::ComputerChange,
+        superseded: Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::error::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        self.hold_computer_reconcile_send_for_proof().await?;
+        if superseded.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::ComputerPolicySuperseded);
+        }
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::ComputerPolicy {
+                guard: ComputerPolicyGuard::Current { change, superseded },
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Unreachable("the node has stopped"))?;
+        rx.await
+            .map_err(|_| Error::Unreachable("the node has stopped"))?
+    }
+
+    /// Proof mutant for the former defect: after the public miss is recorded, discard the exact
+    /// accepted follower event instead of allowing its same-current application to complete.
+    #[cfg(feature = "test-knobs")]
+    pub fn abandon_late_computer_application_for_proof(
+        &self,
+        superseded: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        if crate::node::computer::fx28_mutant("late-application-abandons-work") {
+            superseded.store(true, std::sync::atomic::Ordering::Release);
+            true
+        } else {
+            false
         }
     }
 
@@ -799,36 +909,19 @@ impl Node {
         self.with_current_computer_authority(|| ()).is_some()
     }
 
-    pub(super) fn computer_policy_active(
-        deadline: std::time::Instant,
-        cancelled: &std::sync::atomic::AtomicBool,
-    ) -> crate::error::Result<()> {
-        if cancelled.load(std::sync::atomic::Ordering::Acquire)
-            || std::time::Instant::now() >= deadline
-        {
-            Err(Error::Profile(
-                "computer trust did not apply before its causal deadline",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(super) fn prepare_computer_binding_until(
+    pub(super) fn prepare_computer_binding_guarded(
         &self,
-        deadline: std::time::Instant,
-        cancelled: &std::sync::atomic::AtomicBool,
+        guard: &ComputerPolicyGuard,
     ) -> crate::error::Result<()> {
-        self.prepare_computer_binding_causal(deadline, cancelled, false)
+        self.prepare_computer_binding_causal(guard, false)
     }
 
     pub(super) fn prepare_computer_binding_causal(
         &self,
-        deadline: std::time::Instant,
-        cancelled: &std::sync::atomic::AtomicBool,
+        guard: &ComputerPolicyGuard,
         may_replace_expired: bool,
     ) -> crate::error::Result<()> {
-        Self::computer_policy_active(deadline, cancelled)?;
+        guard.active(self.computer.as_ref())?;
         let Some(computer) = &self.computer else {
             return Ok(());
         };
@@ -859,23 +952,29 @@ impl Node {
             ));
         };
         if !may_replace_expired && computer.current_revision_expired() {
-            // Reconciliation must enter `apply_computer_keyring_until` to remove the expired
+            // Reconciliation must enter the guarded keyring application to remove the expired
             // revision's managed grants in place. Refusing here detached the node before the
             // only revocation path could run. Startup may deliberately replace an expired cause
             // by binding a newly attached node; an already-running actor may not.
             return Ok(());
         }
-        computer.bind_node_until(signer, name, deadline)
+        match guard.change() {
+            Some(change) => computer
+                .bind_node_for_change(signer, name, change)?
+                .then_some(())
+                .ok_or(Error::ComputerPolicySuperseded),
+            None => computer.bind_node_until(signer, name, guard.deadline()),
+        }
     }
 
-    /// Reconcile the durable plan under the causal boundary owned by the change that woke it.
-    /// Persist the keyring before its journal receipt; repeat safely after a crash.
-    pub(super) async fn apply_computer_keyring_until(
+    /// Reconcile the durable plan under the owner of the change that woke it. Command/startup
+    /// work retains its causal deadline; the live follower retains exact policy ownership across
+    /// an elapsed observation boundary. Persist the keyring before its journal receipt.
+    pub(super) async fn apply_computer_keyring_guarded(
         &mut self,
-        deadline: std::time::Instant,
-        cancelled: &std::sync::atomic::AtomicBool,
+        guard: &ComputerPolicyGuard,
     ) -> crate::error::Result<()> {
-        Self::computer_policy_active(deadline, cancelled)?;
+        guard.active(self.computer.as_ref())?;
         let Some(c) = self.computer.clone() else {
             return Ok(());
         };
@@ -900,51 +999,53 @@ impl Node {
             return Ok(());
         }
         'policy: loop {
-            Self::computer_policy_active(deadline, cancelled)?;
+            guard.active(self.computer.as_ref())?;
             // Binding and keyring are one policy projection. A remote roster can move policy
             // after the event's initial binding preparation while this loop is committing an
-            // older keyring plan. Re-derive the binding on every retry within the same causal
-            // boundary; otherwise the keyring reaches revision N while its binding remains at
-            // N-1, making `policy_current` impossible and spinning until the deadline.
-            self.prepare_computer_binding_until(deadline, cancelled)?;
+            // older keyring plan. Re-derive the binding on every retry under the same owner;
+            // otherwise the keyring reaches revision N while its binding remains at N-1 and
+            // `policy_current` can never become true.
+            self.prepare_computer_binding_guarded(guard)?;
             let mut floor = 0;
             for room in self.channels.values() {
                 floor = floor.max(room.lock().await.newest_mint_seq());
-                Self::computer_policy_active(deadline, cancelled)?;
+                guard.active(self.computer.as_ref())?;
             }
-            let application = self.apply_computer_keyring_at_until(floor, deadline, cancelled)?;
+            let application = self.apply_computer_keyring_at_guarded(floor, guard)?;
             if !application.settled {
                 continue;
             }
             if c.current_revision_expired() {
-                // `apply_computer_keyring_at_until` has durably removed every grant from this
+                // The guarded keyring application has durably removed every grant from this
                 // missed revision and published the empty projection.  Drive-key maintenance
                 // requires a live management policy and used to fail here, turning successful
                 // fail-closed recovery into a daemon-wide outage.
+                guard.active(self.computer.as_ref())?;
                 self.publish().await;
+                guard.active(self.computer.as_ref())?;
                 return Ok(());
             }
             // A policy revision can grant an already admitted member read or drive. That member
             // may not have received the live capability record before this boundary, so publish
             // discovery again. It carries no authority; rooms coalesce it to one signed record.
             self.owe_private_support_in_open_rooms().await;
-            Self::computer_policy_active(deadline, cancelled)?;
+            guard.active(self.computer.as_ref())?;
             for (id, stamp) in application.changes {
                 if !self.mark_trust_decision(id, stamp).await? {
                     continue 'policy;
                 }
-                Self::computer_policy_active(deadline, cancelled)?;
+                guard.active(self.computer.as_ref())?;
             }
             // The existing room machinery performs pending removals, sender-key rotation, and
             // consent delivery. Computer policy does not create a second room authorization path.
-            self.refresh_reachers_until(deadline, cancelled).await?;
+            self.refresh_reachers_guarded(guard).await?;
             for prepared in self.preparing_rooms.values_mut() {
                 prepared.channel.get_mut().release_held_packages();
             }
             let rooms: Vec<_> = self.channels.keys().copied().collect();
             for room in rooms {
                 self.act_on_removals_while_closed(&room).await?;
-                Self::computer_policy_active(deadline, cancelled)?;
+                guard.active(self.computer.as_ref())?;
                 if let Err(error) = self.mark_decisions_on_open(&room).await {
                     let applied = self
                         .computer_revision
@@ -956,16 +1057,16 @@ impl Node {
                     }
                     return Err(error);
                 }
-                Self::computer_policy_active(deadline, cancelled)?;
+                guard.active(self.computer.as_ref())?;
                 if let Some(channel) = self.channels.get(&room) {
                     channel.lock().await.release_held_packages();
                 }
                 self.install_key_packages(&room).await;
-                Self::computer_policy_active(deadline, cancelled)?;
+                guard.active(self.computer.as_ref())?;
             }
             self.deliver_owed_consents(None).await;
-            Self::computer_policy_active(deadline, cancelled)?;
-            if let Err(error) = self.tend_drive_keys_until(deadline, cancelled).await {
+            guard.active(self.computer.as_ref())?;
+            if let Err(error) = self.tend_drive_keys_guarded_by_policy(guard).await {
                 let applied = self
                     .computer_revision
                     .load(std::sync::atomic::Ordering::Acquire);
@@ -976,12 +1077,12 @@ impl Node {
                 }
                 return Err(error);
             }
-            if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+            if let Err(error) = guard.active(self.computer.as_ref()) {
                 c.invalidate_reachers();
                 return Err(error);
             }
             self.publish().await;
-            if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+            if let Err(error) = guard.active(self.computer.as_ref()) {
                 c.invalidate_reachers();
                 return Err(error);
             }
@@ -1003,13 +1104,13 @@ impl Node {
         }
     }
 
-    pub(super) fn apply_computer_keyring_at_until(
+    pub(super) fn apply_computer_keyring_at_guarded(
         &mut self,
         floor: u64,
-        deadline: std::time::Instant,
-        cancelled: &std::sync::atomic::AtomicBool,
+        guard: &ComputerPolicyGuard,
     ) -> crate::error::Result<KeyringApplication> {
-        Self::computer_policy_active(deadline, cancelled)?;
+        guard.active(self.computer.as_ref())?;
+        let deadline = guard.deadline();
         let Some(computer) = self.computer.clone() else {
             return Ok(KeyringApplication {
                 changes: Vec::new(),
@@ -1085,12 +1186,20 @@ impl Node {
             .map(|(id, _, _)| *id)
             .chain(plan.denied.iter().copied())
             .collect();
-        Self::computer_policy_active(deadline, cancelled)?;
+        guard.active(self.computer.as_ref())?;
         // Prepare before any node-store effect, including pending key/removal metadata and
         // trust-decision stamps. If a newer revision already won, none of this plan is applied.
         // Expiry prepares its retained rollback set too: a crash after revocation must not leave
         // an older live applied receipt able to certify the changed keyring after repair.
-        if !computer.prepare_application_until(me, revision, expired, &covered, deadline)? {
+        let prepared = match guard.change() {
+            Some(change) => {
+                computer.prepare_application_for_change(me, revision, expired, &covered, change)?
+            }
+            None => {
+                computer.prepare_application_until(me, revision, expired, &covered, deadline)?
+            }
+        };
+        if !prepared {
             return Ok(KeyringApplication {
                 changes: Vec::new(),
                 settled: false,
@@ -1104,7 +1213,16 @@ impl Node {
                     .map(|name| (*peer, name.to_owned()))
             })
             .collect();
-        computer.retain_aliases_until(me, &aliases, deadline)?;
+        let aliases_retained = match guard.change() {
+            Some(change) => computer.retain_aliases_for_change(me, &aliases, change)?,
+            None => {
+                computer.retain_aliases_until(me, &aliases, deadline)?;
+                true
+            }
+        };
+        if !aliases_retained {
+            return Err(Error::ComputerPolicySuperseded);
+        }
         let mut next = self.trust.clone();
         let mut newly = Vec::new();
         let mut removed = Vec::new();
@@ -1159,12 +1277,12 @@ impl Node {
             .profile
             .as_ref()
             .ok_or(Error::Profile("managed profile disappeared"))?;
-        Self::computer_policy_active(deadline, cancelled)?;
+        guard.active(self.computer.as_ref())?;
         // The staged plan may lose to a durable expiry or newer policy before taking its writer
         // fence. The exact fence below commits all node effects together or none; there is no
         // pending-key deletion with an unchanged live keyring.
         let Some(changes) = computer.commit_application_if_current(revision, expired, || {
-            Self::computer_policy_active(deadline, cancelled)?;
+            guard.active(self.computer.as_ref())?;
             let signer = profile.signer()?;
             let mut batch = profile.store().batch()?;
             next.queue_save(&mut batch, signer)?;
@@ -1173,7 +1291,7 @@ impl Node {
             let changes = crate::node::consent_order::ConsentOrder::queue_policy(
                 &mut batch, signer, &removed, &newly, floor,
             )?;
-            Self::computer_policy_active(deadline, cancelled)?;
+            guard.active(self.computer.as_ref())?;
             batch.commit()?;
             Ok(changes)
         })?
@@ -1207,11 +1325,11 @@ impl Node {
             });
         }
         // The durable keyring and its application receipt are now one settled projection.
-        // Publish its exact revision, notifications and live view before checking elapsed time:
-        // a deadline crossed during the receipt write must not strand a completed application
-        // behind the actor's old revision or an old trust view. The timing verdict still fails
-        // below. A later durable policy change still fences every irreversible publication
-        // because `policy_current` compares this exact revision with durable state.
+        // Publish its exact revision, notifications and live view before checking its owner. A
+        // command deadline crossed during the receipt write must not strand a completed
+        // application; a live follower has no elapsed-time cancellation. A later durable policy
+        // change still fences every irreversible publication because `policy_current` compares
+        // this exact revision with durable state.
         self.computer_expired = expired;
         self.computer_revision
             .store(revision, std::sync::atomic::Ordering::Release);
@@ -1219,7 +1337,7 @@ impl Node {
             self.note_capability(id, was);
         }
         self.publish_computer_trust_projection();
-        if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+        if let Err(error) = guard.active(self.computer.as_ref()) {
             computer.invalidate_reachers();
             return Err(error);
         }

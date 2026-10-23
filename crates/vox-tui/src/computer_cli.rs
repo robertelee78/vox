@@ -408,6 +408,14 @@ fn show(status: &ComputerStatus, json: bool) -> Result<(), AppError> {
     for pending in &status.pending_nodes {
         println!("pending: {pending}");
     }
+    for missed in &status.application_misses {
+        println!(
+            "application late: {}  {}  revision {}",
+            missed.name.as_deref().unwrap_or("unnamed node"),
+            missed.node,
+            missed.revision
+        );
+    }
     if let Some(why) = &status.problem {
         println!("pending: {why}");
     }
