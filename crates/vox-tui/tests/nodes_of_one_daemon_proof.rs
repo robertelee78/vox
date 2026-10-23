@@ -48,9 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 #[cfg(feature = "optional-proofs")]
-use vox_core::node::computer::{
-    computer_exchange_backoff, COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED,
-};
+use vox_core::node::computer::COMPUTER_QUIET_EXCHANGE_AFTER as FALLBACK_NAMED;
 use vox_core::node::computer::{
     COMPUTER_CHANGE_SHOWN_WITHIN as CHANGE_SHOWN_WITHIN, COMPUTER_PAIR_WITHIN as PAIR_WITHIN,
     COMPUTER_RETURN_SHOWN_WITHIN as RETURN_WITHIN,
@@ -1892,8 +1890,21 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
     let (closed_ok, closed_out, closed_err) =
         b.run(&["computer", "pair", link, "--preview", "--json"], "");
-    assert!(!closed_ok && !closed_err.contains("deadline") && !closed_err.contains("timed out"),
-        "PRODUCT [FX28 cancelled-code]: the cancelled code was accepted or left waiting until a deadline instead of returning a terminal refusal: stdout {closed_out}; stderr {closed_err}");
+    let closed_shown = format!("{closed_out}{closed_err}");
+    assert!(
+        !closed_ok && !closed_shown.contains("deadline") && !closed_shown.contains("timed out"),
+        "PRODUCT [FX28 cancelled-code]: the cancelled code was accepted or left waiting until a deadline instead of returning a terminal refusal: stdout {closed_out}; stderr {closed_err}"
+    );
+    let anchor_refusal =
+        closed_shown.contains("rendezvous record rejected by store policy: rejected: policy");
+    let owner_refusal = closed_shown.contains(
+        "computer pairing code expired, cancelled, or unknown; no new trust was established",
+    ) || closed_shown
+        .contains("computer pairing code expired or was cancelled");
+    assert!(
+        anchor_refusal || owner_refusal,
+        "APPARATUS: the cancelled-code command failed without an attributable terminal anchor or owner refusal; dial, IPC, malformed response, or other errors cannot establish cancellation: stdout {closed_out}; stderr {closed_err}"
+    );
     // A new invitation still fits the existing retention budget and must not resurrect the
     // cancelled operation. Establish the computers only from this new operation.
     let invitation = computer(&a, &["invite"]);
@@ -2081,103 +2092,13 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
             .ok()
             .as_deref(),
         Some(b_id.as_str()),
-        "APPARATUS: retry-ready held a peer other than the operator takeover target"
+        "APPARATUS: retry-ready held a peer other than the unfinished first cause's target"
     );
 
-    // Exercise the operator takeover while every path is still down. B's fresh invitation is a
-    // shipped request targeting the same computer. The apparatus marker above is created only
-    // after the superseded retry released its reservation and while the scheduler is parked before
-    // consuming retry_ready, so the command reserves that exact peer. An explicit pairing attempt
-    // is one-shot: an anchor which returns after the command has truthfully failed cannot resurrect
-    // that process. Automatic computer convergence remains separate durable work.
-    let takeover_invitation = computer(&b, &["invite"]);
-    let expected_local = computer(&a, &["status"])["this_computer"].clone();
-    let expected_peer = takeover_invitation["this_computer"].clone();
-    let takeover_link = takeover_invitation["invite_link"]
-        .as_str()
-        .expect("PRODUCT: takeover invitation named no invite_link")
-        .to_owned();
-    let takeover_invite_id = takeover_invitation["invite_id"]
-        .as_str()
-        .expect("PRODUCT: takeover invitation named no invite_id")
-        .to_owned();
-    let mut offline_preview = a
-        .cmd(&["computer", "pair", &takeover_link, "--preview", "--json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("APPARATUS: could not start the shipped offline operator preview");
-    loop {
-        if application_toward(&a, &b_id)["exchange_in_flight"] == true {
-            break;
-        }
-        if offline_preview
-            .try_wait()
-            .expect("APPARATUS: inspect the shipped offline operator preview")
-            .is_some()
-        {
-            // A truthful offline error can complete between status observations. Its exact
-            // reachability cause is asserted below; missing the transient reservation is not
-            // evidence that the command failed to reserve the intended peer.
-            break;
-        }
-        assert!(
-            daemon_alive(left.child.id()),
-            "APPARATUS: left daemon exited before the retry-ready operator reserved its peer"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    std::os::unix::net::UnixStream::connect(&retry_ready_release).unwrap_or_else(|e| {
-        panic!(
-            "APPARATUS: could not release the scheduler's exact retry-ready boundary at {}: {e}",
-            retry_ready_release.display()
-        )
-    });
-    let offline_output = offline_preview
-        .wait_with_output()
-        .expect("APPARATUS: could not collect the shipped offline operator preview");
-    let offline_stdout = String::from_utf8_lossy(&offline_output.stdout);
-    let offline_stderr = String::from_utf8_lossy(&offline_output.stderr);
-    let offline_shown = format!("{offline_stdout}{offline_stderr}");
-    assert!(
-        !offline_output.status.success(),
-        "APPARATUS: the operator preview succeeded while its only bridge was deliberately offline, so the unreachable-path precondition was not staged: {offline_stdout}{offline_stderr}"
-    );
-    assert!(
-        offline_shown.contains(
-            "computer could not be reached; the pairing code was not checked"
-        ) && !offline_shown.contains("authentication")
-            && !offline_shown.contains("policy"),
-        "PRODUCT: the unreachable shipped operator preview did not stop at the truthful reachability cause before checking the pairing code, or fabricated an authentication/policy result: stdout {offline_stdout}; stderr {offline_stderr}"
-    );
-    println!(
-        "[proof] the first shipped operator preview failed truthfully while its only bridge was offline; no later path event can resume that completed process"
-    );
-
-    // Keep the only path down until a failed replacement's source-owned ordinary backoff would
-    // pass the first revision's absolute deadline. Correct code backstops that retry by the first
-    // deadline; a replacement that minted a new deadline cannot. Failure-count changes are the
-    // shipped status observation; this wait is only APPARATUS staging.
-    let mut observed_failures = u32::try_from(failures_before).unwrap_or(u32::MAX);
-    assert!(
-        wait_until(first_deadline.saturating_duration_since(Instant::now()), || {
-            let failures = application_toward(&a, &b_id)["exchange_failures"]
-                .as_u64()
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(0);
-            if failures <= observed_failures {
-                return false;
-            }
-            observed_failures = failures;
-            computer_exchange_backoff(failures)
-                > first_deadline.saturating_duration_since(Instant::now())
-        }),
-        "APPARATUS: shipped exchange status never staged a failed replacement whose source-owned backoff crossed the causal first deadline; application: {}; left: {}",
-        application_toward(&a, &b_id),
-        left.said()
-    );
-
+    // The replacement owns the same unfinished first cause. Do not wait for an incidental
+    // failure count, backoff crossing, or a separate explicit command: an ordinary attempt may
+    // legitimately remain in flight for its whole retained return interval. The later outage
+    // separately proves the missed ordinary cause and fresh operator command boundaries.
     let expected_roster_before_race = [
         ("anchor-return-first", first.as_str()),
         ("anchor-return-second", second.as_str()),
@@ -2197,9 +2118,16 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         "APPARATUS: both computer daemons registered at the restored anchor only after the first revision's causal deadline; the recovery precondition was staged too late: {}",
         relay.said()
     );
+    // Release the exact owned cause only after both daemons have a real path again. The
+    // restored anchor and this apparatus release contribute no new operator policy or deadline.
+    std::os::unix::net::UnixStream::connect(&retry_ready_release).unwrap_or_else(|e| {
+        panic!(
+            "APPARATUS: could not release the scheduler's exact retry-ready boundary at {}: {e}",
+            retry_ready_release.display()
+        )
+    });
     // Failed registration remains durable work. The restored path alone must now carry both
-    // superseding policy revisions and their grants under the first cause's retained deadline;
-    // the completed offline command contributes no future work.
+    // superseding policy revisions and their grants under the first cause's retained deadline.
     let recovered_automatically = wait_until(
         first_deadline.saturating_duration_since(Instant::now()),
         || {
@@ -2231,72 +2159,6 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
     );
     println!(
         "[proof] after {recovered_after:?}, remote-anchor-only recovery carried both revisions through a new peer connection before the first revision's {RETURN_WITHIN:?} deadline"
-    );
-
-    // The first process ended before restoration. A new operator command may now retry the same
-    // still-unchecked invitation on the causally verified path; this is not a continuation of the
-    // earlier command.
-    let (retry_ok, retry_out, retry_err) = a.run(
-        &["computer", "pair", &takeover_link, "--preview", "--json"],
-        "",
-    );
-    assert!(
-        anchor_currently_has(&relay, &[&a_id, &b_id]),
-        "APPARATUS: the restored anchor stopped naming both exact computer identities while the fresh operator retry ran; no PRODUCT verdict follows:\n{}",
-        relay.said()
-    );
-    assert!(
-        retry_ok,
-        "PRODUCT: the fresh shipped operator preview failed after the anchor causally named both computers: stdout {retry_out}; stderr {retry_err}"
-    );
-    let takeover_preview: serde_json::Value = serde_json::from_str(&retry_out).unwrap_or_else(|e| {
-        panic!(
-            "PRODUCT: the successful fresh `computer pair --preview --json` did not return readable JSON: {e}: {retry_out}"
-        )
-    });
-    assert!(
-        takeover_preview["this_computer"] == expected_local
-            && takeover_preview["pairing"]["peer"] == expected_peer
-            && takeover_preview["pairing"]["operation_id"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty())
-            && takeover_preview["pairing"]["approved_here"] == false
-            && takeover_preview["pairing"]["approved_there"] == false
-            && takeover_preview["pairing"]["expires_ms"]
-                == takeover_invitation["invite_expires_ms"],
-        "PRODUCT: the successful fresh preview did not show the exact authenticated local computer, inviting peer, unapproved operation and expiry: {takeover_preview}"
-    );
-    computer(&b, &["cancel", &takeover_invite_id]);
-    let converged_after_cancel = wait_until(
-        first_deadline.saturating_duration_since(Instant::now()),
-        || {
-            let left_status = computer(&a, &["status"]);
-            let status = computer(&b, &["status"]);
-            exact_roster(&left_status, &expected_roster_before_race)
-                && exact_roster(&status, &expected_roster_before_race)
-                && exact_grants(
-                    &b,
-                    "after-remote-anchor-b",
-                    &expected_bob_grants_before_race,
-                )
-                && left_status["state"] == "confirmed"
-                && status["state"] == "confirmed"
-        },
-    );
-    assert!(
-        anchor_currently_has(&relay, &[&a_id, &b_id]),
-        "APPARATUS: the restored anchor stopped naming both exact computer identities before cancellation convergence reached its PRODUCT verdict:\n{}",
-        relay.said()
-    );
-    assert!(
-        converged_after_cancel,
-        "PRODUCT: after the fresh reachable preview was cancelled, both computers did not return to the exact confirmed roster and grants before the retained first-cause deadline; left: {}; right: {}; anchor: {}",
-        computer(&a, &["status"]),
-        computer(&b, &["status"]),
-        relay.said()
-    );
-    println!(
-        "[proof] a new shipped preview used the same previously unchecked invitation after reachability returned, then cancellation converged without reviving the completed offline process"
     );
 
     // Stage the other operator race independently. The shipped preview owns a reservation but has
