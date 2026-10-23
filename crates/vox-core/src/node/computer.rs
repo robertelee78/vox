@@ -2550,6 +2550,31 @@ impl Computer {
         }
     }
 
+    /// Startup rejected by an in-progress authority write must await that writer, not repeatedly
+    /// reapply the still-published old target. The existing writer guard covers staging through
+    /// publication (or failure); take no view, slot or state lock while waiting for it.
+    pub(crate) fn policy_target_after_writer(&self) -> Result<ComputerPolicyTarget> {
+        blocking_transaction(|| {
+            let _change = lock(&self.changes);
+            if self
+                .authority_blocked
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(Error::Profile(
+                    "the computer policy writer did not finish publishing its durable result",
+                ));
+            }
+            let state = lock(&self.state);
+            if state.genesis.is_some() || !state.intervals.is_empty() {
+                self.storage_ready()?;
+            }
+            Ok(ComputerPolicyTarget {
+                revision: state.policy_revision,
+                expired: Self::revision_expired(&state),
+            })
+        })
+    }
+
     pub(crate) fn policy_target_is(&self, target: ComputerPolicyTarget) -> bool {
         let state = lock(&self.state);
         state.policy_revision == target.revision && Self::revision_expired(&state) == target.expired

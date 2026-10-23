@@ -740,7 +740,7 @@ impl NodeHandle {
         ))?;
         loop {
             let change = crate::node::computer::ComputerChange::at(
-                computer.policy_target(),
+                computer.policy_target_after_writer()?,
                 observation_end,
                 observation_end,
             );
@@ -911,7 +911,7 @@ impl Node {
         };
         loop {
             let change = crate::node::computer::ComputerChange::at(
-                computer.policy_target(),
+                computer.policy_target_after_writer()?,
                 observation_end,
                 observation_end,
             );
