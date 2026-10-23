@@ -3931,14 +3931,15 @@ impl Management {
         else {
             return;
         };
+        // Removing the one-shot arm elects the sole owner before touching its socket.
+        // A concurrent ordinary request must not unlink an already-held answer's release path.
+        if std::fs::remove_file(arm).is_err() {
+            return;
+        }
         let _ = std::fs::remove_file(release);
         let Ok(listener) = tokio::net::UnixListener::bind(release) else {
             return;
         };
-        if std::fs::remove_file(arm).is_err() {
-            let _ = std::fs::remove_file(release);
-            return;
-        }
         if std::fs::write(engaged, text_id(&peer)).is_err() {
             let _ = std::fs::remove_file(release);
             return;
