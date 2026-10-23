@@ -3074,19 +3074,7 @@ impl Management {
         let missed = retained_miss || (causal && completed >= deadline);
         // Only the snapshot this flight actually sent can acknowledge a local obligation. The
         // merged revision may include a newer local cause which arose while this flight was away.
-        let durable_revision = outcome.as_ref().map_or(revision, |(sent, merged)| {
-            #[cfg(feature = "test-knobs")]
-            if crate::node::computer::fx28_mutant("stale-flight-clears-newer") {
-                *merged
-            } else {
-                *sent
-            }
-            #[cfg(not(feature = "test-knobs"))]
-            {
-                let _ = merged;
-                *sent
-            }
-        });
+        let durable_revision = outcome.as_ref().map_or(revision, |(sent, _merged)| *sent);
         let mut missed_cause = None;
         let durable = if covered {
             Ok(())

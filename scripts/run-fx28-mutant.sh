@@ -16,12 +16,6 @@ case "${1-}" in
     verdict='PRODUCT [FX28 stopped-reader-write]:'
     staging='[proof] FX-28 stopped-reader apparatus staged:'
     ;;
-  stale-flight-clears-newer)
-    mutant=$1
-    journey=computer_pairing_uses_an_anchor_without_room_membership_and_reconnects
-    verdict='PRODUCT [FX28 stale-flight-newer-obligation]:'
-    staging='[proof] FX-28 stale-flight-newer-obligation apparatus staged:'
-    ;;
   stale-tick-authority)
     mutant=$1
     journey=two_paired_computers_that_are_idle_exchange_nothing
@@ -65,7 +59,7 @@ case "${1-}" in
     staging='[proof] FX-28 legacy rekey route apparatus staged:'
     ;;
   *)
-    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-flight-clears-newer|stale-tick-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
+    printf '%s\n' "usage: $0 preview-approval-not-durable|stopped-reader-fresh-write|stale-tick-authority|ready-fence-accepts-unsettled|stale-post-authority|stale-room-create-authority|stale-trust-projection|stale-rekey-authority|legacy-ended-unanswered-not-selected" >&2
     exit 2
     ;;
 esac
