@@ -636,6 +636,11 @@ struct RegistrationWaiters {
 type RegistrationKey = (Digest32, Digest32);
 type RegistrationEvents = Arc<Mutex<BTreeMap<RegistrationKey, RegistrationWaiters>>>;
 
+struct ComputerRevocation {
+    expires_ms: u64,
+    source: Source,
+}
+
 /// Test-only exact publication hold: owner arm, held registration, release socket, waiting
 /// redeemer marker, apparatus fault. Normal builds contain neither the name nor the hook.
 #[cfg(feature = "test-knobs")]
@@ -699,9 +704,11 @@ pub struct RendezvousService {
     rooms: AnchorRooms,
     computer_anchor: Option<Digest32>,
     computer_registrations: Arc<Mutex<BTreeMap<(Digest32, Digest32), ComputerRegistration>>>,
-    /// Authenticated revocations retain only an already-known registration lifetime. They do
-    /// not consume active registration capacity or invent expiry for an unknown/restarted key.
-    computer_revocations: Arc<Mutex<BTreeMap<RegistrationKey, u64>>>,
+    /// Authenticated revocations retain the admitted source and already-known lifetime. Active
+    /// and unexpired revoked entries share the existing admission budgets: cancellation moves
+    /// the same reservation, so recent revocations may cause a new capacity refusal. Unknown
+    /// registrations, including after restart, never acquire an invented expiry or reservation.
+    computer_revocations: Arc<Mutex<BTreeMap<RegistrationKey, ComputerRevocation>>>,
     computer_registration_events: RegistrationEvents,
 }
 
@@ -820,7 +827,7 @@ impl RendezvousService {
     fn registration_revoked(&self, key: RegistrationKey) -> bool {
         let now = (self.clock)();
         let mut revoked = lock(&self.computer_revocations);
-        revoked.retain(|_, until| *until > now);
+        revoked.retain(|_, record| record.expires_ms > now);
         revoked.contains_key(&key)
     }
 
@@ -966,7 +973,7 @@ impl RendezvousService {
         let now = (self.clock)();
         let mut records = lock(&self.computer_registrations);
         let mut revoked = lock(&self.computer_revocations);
-        revoked.retain(|_, until| *until > now);
+        revoked.retain(|_, record| record.expires_ms > now);
         records.retain(|key, r| {
             if r.expires_ms <= now {
                 r.expiry.send_replace(None);
@@ -1012,13 +1019,21 @@ impl RendezvousService {
                     return Ok(());
                 }
                 let source = source.ok_or(RejectReason::Policy)?;
-                if records.len() >= MAX_COMPUTER_REGISTRATIONS
+                // The original registration reserved its retained lifetime, not merely its
+                // active interval. Moving it to revocations cannot create free admission slots
+                // while still retaining its evidence and source/accounting cost.
+                if records.len() + revoked.len() >= MAX_COMPUTER_REGISTRATIONS
                     || records.keys().filter(|(id, _)| *id == owner).count()
+                        + revoked.keys().filter(|(id, _)| *id == owner).count()
                         >= MAX_COMPUTER_REGISTRATIONS_PER_OWNER
                     || records
                         .values()
                         .filter(|r| r.source.level(0) == source.level(0))
                         .count()
+                        + revoked
+                            .values()
+                            .filter(|r| r.source.level(0) == source.level(0))
+                            .count()
                         >= MAX_COMPUTER_REGISTRATIONS_PER_SOURCE
                 {
                     return Err(RejectReason::Capacity);
@@ -1059,8 +1074,11 @@ impl RendezvousService {
                 if let Some(r) = records.remove(&(owner, *registration)) {
                     revoked
                         .entry((owner, *registration))
-                        .and_modify(|until| *until = (*until).max(r.expires_ms))
-                        .or_insert(r.expires_ms);
+                        .and_modify(|held| held.expires_ms = held.expires_ms.max(r.expires_ms))
+                        .or_insert(ComputerRevocation {
+                            expires_ms: r.expires_ms,
+                            source: r.source,
+                        });
                     r.expiry.send_replace(None);
                     #[cfg(feature = "test-knobs")]
                     self.mark_registration_revoked_for_proof((owner, *registration));

@@ -1852,7 +1852,7 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .expect("PRODUCT: pairing preview omitted its operation identity");
     // Cancellation must stay a known refusal, even after the active registration is removed.
     // The anchor marker is emitted only for this exact already-published owner's revocation;
-    // it supplies no fabricated expiry and consumes no active-registration capacity.
+    // it supplies no fabricated expiry and retains the original admission reservation.
     computer(&a, &["cancel", op]);
     computer(&b, &["cancel", op]);
     let known_revoked = registration_waiting.with_extension("revoked");
@@ -1894,8 +1894,8 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         b.run(&["computer", "pair", link, "--preview", "--json"], "");
     assert!(!closed_ok && !closed_err.contains("deadline") && !closed_err.contains("timed out"),
         "PRODUCT [FX28 cancelled-code]: the cancelled code was accepted or left waiting until a deadline instead of returning a terminal refusal: stdout {closed_out}; stderr {closed_err}");
-    // A new invitation remains usable; revocation history must not consume active capacity or
-    // resurrect the cancelled operation. Establish the computers only from this new operation.
+    // A new invitation still fits the existing retention budget and must not resurrect the
+    // cancelled operation. Establish the computers only from this new operation.
     let invitation = computer(&a, &["invite"]);
     let link = invitation["invite_link"]
         .as_str()
