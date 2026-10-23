@@ -68,6 +68,25 @@ struct Task {
     operation: Operation,
 }
 
+/// One inventory exchange prepended to an already-retained foreground flow. It is deliberately
+/// outside `tasks`/`replay`: announcing an own append must not need a thirteenth retained Flow or
+/// a spare dependency-stack position, and it must not replace the hint/required owner already in
+/// this Flow.
+struct Announcement {
+    request: RequestId,
+    prior_request: RequestId,
+    task: Option<Task>,
+    through: u64,
+    brought: bool,
+    complete: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AnnouncementReceipt {
+    pub(crate) through: u64,
+    pub(crate) brought: bool,
+}
+
 /// Scalar ownership of the existing fixed body slots. A progressing transfer keeps its slot
 /// across quanta; another deferred flow may advance metadata but cannot reset that body.
 #[derive(Default)]
@@ -187,6 +206,16 @@ pub(crate) struct Flow {
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
     replay: Option<Task>,
+    announcement: Option<Announcement>,
+    /// The returned error came from the prefix itself, not an ordinary task that ran while a
+    /// prefix was pending behind a publication owner.
+    announcement_error: bool,
+    /// True only while the worker owns the scalar prefix task. A supervisor-observed panic can
+    /// therefore reconstruct that task without guessing from a merely pending announcement.
+    announcement_active: bool,
+    /// A post arriving while the announcement exchange is in flight must not make announcements
+    /// starve the retained root. One actual ordinary worker quantum runs before another prefix.
+    ordinary_turn_due: bool,
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
@@ -260,7 +289,9 @@ pub(crate) enum Resumed {
 
 impl Flow {
     pub(crate) fn root_name(&self) -> &'static str {
-        if self.archive {
+        if self.announcement_pending() && self.announcement_can_run() {
+            "inventory"
+        } else if self.archive {
             "archive"
         } else if self.hint.is_some() {
             "hint"
@@ -342,6 +373,10 @@ impl Flow {
             local_retry: None,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
+            announcement: None,
+            announcement_error: false,
+            announcement_active: false,
+            ordinary_turn_due: false,
             slots,
             owners: [None, None],
             body_progress: false,
@@ -491,6 +526,10 @@ impl Flow {
                 tasks
             },
             replay: None,
+            announcement: None,
+            announcement_error: false,
+            announcement_active: false,
+            ordinary_turn_due: false,
             live_context: None,
             control_context: control,
             live: None,
@@ -721,7 +760,98 @@ impl Flow {
         Ok(true)
     }
     pub(crate) fn done(&self) -> bool {
-        self.tasks.is_empty() && self.replay.is_none()
+        self.tasks.is_empty() && self.replay.is_none() && self.announcement.is_none()
+    }
+
+    /// Prepend one real inventory exchange to this retained foreground owner. A failed prefix
+    /// remains this same scalar; it never consumes, rebuilds or retires the ordinary root.
+    pub(crate) fn arm_announcement(&mut self, through: u64) -> Result<()> {
+        if self.archive || self.inventory {
+            return Err(Error::Profile(
+                "history announcement prefix requires a retained foreground root",
+            ));
+        }
+        if self.announcement.is_some() {
+            return Ok(());
+        }
+        let request = request_id()?;
+        self.announcement = Some(Announcement {
+            request,
+            prior_request: self.request,
+            task: Some(Task {
+                request,
+                purpose: Purpose::Control,
+                operation: Operation::Wire(Query::Inventory),
+            }),
+            through,
+            brought: false,
+            complete: false,
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn announcement_pending(&self) -> bool {
+        self.announcement
+            .as_ref()
+            .is_some_and(|announcement| !announcement.complete)
+    }
+
+    #[must_use]
+    pub(crate) fn announcement_can_run(&self) -> bool {
+        !self.archive
+            && !self.inventory
+            && !self.publication_wait
+            && self.active_publication_owner().is_none()
+    }
+
+    #[must_use]
+    pub(crate) fn announcement_failed(&self) -> bool {
+        self.announcement_error || self.announcement_active
+    }
+
+    pub(crate) fn retain_failed_announcement(&mut self) -> Result<()> {
+        let Some(announcement) = self.announcement.as_mut() else {
+            return Err(Error::Profile("history announcement owner missing"));
+        };
+        if !announcement.complete && announcement.task.is_none() {
+            announcement.task = Some(Task {
+                request: announcement.request,
+                purpose: Purpose::Control,
+                operation: Operation::Wire(Query::Inventory),
+            });
+        }
+        self.request = announcement.prior_request;
+        self.announcement_error = false;
+        self.announcement_active = false;
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn ordinary_turn_due(&self) -> bool {
+        self.ordinary_turn_due
+    }
+
+    pub(crate) fn take_announcement_receipt(&mut self) -> Option<AnnouncementReceipt> {
+        let announcement = self
+            .announcement
+            .take_if(|announcement| announcement.complete)?;
+        self.ordinary_turn_due = true;
+        Some(AnnouncementReceipt {
+            through: announcement.through,
+            brought: announcement.brought,
+        })
+    }
+
+    fn restore_announcement_task(&mut self, task: Task) -> Result<()> {
+        let Some(announcement) = self.announcement.as_mut() else {
+            return Err(Error::Profile("history announcement owner missing"));
+        };
+        if announcement.complete || announcement.task.is_some() {
+            return Err(Error::Profile("history announcement task already retained"));
+        }
+        announcement.task = Some(task);
+        Ok(())
     }
     /// Whether the next task is a local slice, with no wire exchange, so this turn may run it.
     fn next_slice_is_local(&self) -> bool {
@@ -998,6 +1128,8 @@ impl Flow {
         self.governance_wait = false;
         self.governance_cycles = 0;
         self.external = None;
+        self.announcement_error = false;
+        self.announcement_active = false;
         // Local slices run back to back inside one turn; a slice that needs the wire, waits,
         // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
         // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
@@ -1034,6 +1166,12 @@ impl Flow {
             if result.is_err()
                 || self.waiting
                 || self.external.is_some()
+                // The actor owns the separate announcement receipt/accounting boundary. Do not
+                // let an ordinary local phase run behind it in this worker return.
+                || self
+                    .announcement
+                    .as_ref()
+                    .is_some_and(|announcement| announcement.complete)
                 || (!publication_active
                     && (slices >= LOCAL_SLICES_PER_TURN
                         || quantum_started.elapsed() >= LOCAL_TURN_BUDGET
@@ -1153,7 +1291,25 @@ impl Flow {
                 self.tasks.push(root);
             }
         }
-        let Some(task) = self.tasks.pop() else {
+        // A publication Begin..Cleanup owner is correctness-critical and remains ahead of the
+        // announcement prefix. Once no exact publication phase is active, the scalar inventory
+        // task gets one response quantum ahead of the ordinary retained stack.
+        let announcement_task = if self.active_publication_owner().is_none() {
+            self.announcement
+                .as_mut()
+                .and_then(|announcement| announcement.task.take())
+        } else {
+            None
+        };
+        let (task, announcement_task) = if let Some(task) = announcement_task {
+            self.announcement_active = true;
+            (task, true)
+        } else if let Some(task) = self.tasks.pop() {
+            // Initialization, publication-owner lookup and worker admission do not spend the
+            // fairness quantum. Only selecting an actual ordinary task does.
+            self.ordinary_turn_due = false;
+            (task, false)
+        } else {
             return Ok(());
         };
         // Retirement's scalar always names the operation that can disappear from the bounded
@@ -1161,12 +1317,23 @@ impl Flow {
         if !self.archive {
             self.request = task.request;
         }
+        let original_task = task.clone();
         let mut retry_task = Some(Task {
             operation: match &task.operation {
                 Operation::Wire(query) => Operation::ResumeWire(query.clone()),
                 operation => operation.clone(),
             },
             ..task.clone()
+        });
+        // Prefix work has its own empty/nonempty account. Preserve progress already made by the
+        // ordinary root, then restore it after the inventory exchange.
+        let ordinary_brought = announcement_task.then(|| std::mem::take(&mut self.brought));
+        let ordinary_request = announcement_task.then(|| {
+            self.announcement
+                .as_ref()
+                .map_or(self.retirement_request, |announcement| {
+                    announcement.prior_request
+                })
         });
         let result = self
             .execute_task(
@@ -1180,16 +1347,59 @@ impl Flow {
                 inbox,
                 inbox_generation,
                 now,
+                announcement_task,
                 &mut retry_task,
             )
             .await;
+        if let Some(request) = ordinary_request {
+            self.request = request;
+        }
+        let announcement_brought = announcement_task.then(|| {
+            let brought = self.brought;
+            self.brought = ordinary_brought.unwrap_or(false);
+            brought
+        });
         match result {
             Err(Error::HistoryCapacity(pressure)) => {
                 if let Some(task) = retry_task {
-                    self.push(task)?;
+                    if announcement_task {
+                        self.restore_announcement_task(task)?;
+                    } else {
+                        self.push(task)?;
+                    }
                 }
                 self.byte_pressure = Some(*pressure);
                 self.waiting = true;
+                self.announcement_active = false;
+                if let Some(brought) = announcement_brought {
+                    if let Some(announcement) = self.announcement.as_mut() {
+                        announcement.brought |= brought;
+                    }
+                }
+                Ok(())
+            }
+            Err(error) if announcement_task => {
+                // A new stream retries the inventory prefix. The ordinary stack and every local
+                // continuation remain exactly where they were when this prefix began.
+                self.restore_announcement_task(original_task)?;
+                if let Some(brought) = announcement_brought {
+                    if let Some(announcement) = self.announcement.as_mut() {
+                        announcement.brought |= brought;
+                    }
+                }
+                self.announcement_error = true;
+                self.announcement_active = false;
+                Err(error)
+            }
+            Ok(()) if announcement_task => {
+                let Some(announcement) = self.announcement.as_mut() else {
+                    return Err(Error::Profile("history announcement owner missing"));
+                };
+                announcement.brought |= announcement_brought.unwrap_or(false);
+                if announcement.task.is_none() {
+                    announcement.complete = true;
+                }
+                self.announcement_active = false;
                 Ok(())
             }
             result => result,
@@ -1211,6 +1421,7 @@ impl Flow {
         inbox: &super::HintInbox,
         inbox_generation: u64,
         now: u64,
+        announcement_task: bool,
         retry_task: &mut Option<Task>,
     ) -> Result<()> {
         let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
@@ -1753,7 +1964,7 @@ impl Flow {
                 } else {
                     task.request
                 };
-                let result = super::exchange(
+                let mut result = super::exchange(
                     &receiver,
                     conn,
                     job.clone(),
@@ -1774,6 +1985,46 @@ impl Flow {
                 if brought_now {
                     self.work_committed
                         .store(true, std::sync::atomic::Ordering::Release);
+                }
+                if announcement_task {
+                    if result.status == Status::Busy {
+                        self.restore_announcement_task(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    if result.status != Status::Complete
+                        || result.continuation.is_some()
+                        || !result.needs.is_empty()
+                        || !result.verifiers.is_empty()
+                        || result.body_ready.is_some()
+                        || result.role_ready.is_some()
+                        || !result.heads.is_empty()
+                        || result.departure_receipt.is_some()
+                    {
+                        return Err(Error::MalformedBundle(
+                            "history announcement inventory response",
+                        ));
+                    }
+                    let Some(inventory) = result.inventory.take() else {
+                        return Err(Error::MalformedBundle(
+                            "history announcement inventory missing",
+                        ));
+                    };
+                    for page in inventory.hints.chunks(64) {
+                        let offered = source
+                            .offer_inventory(job, inbox, inbox_generation, self.room, page)
+                            .await?;
+                        self.offered = self.offered.saturating_add(offered.added as u64);
+                        self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
+                        let added = offered.added != 0;
+                        self.brought |= added;
+                        if added {
+                            self.work_committed
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    *retry_task = None;
+                    return Ok(());
                 }
                 if self.route_origin.is_some()
                     && !matches!(result.status, Status::Busy | Status::EvidenceUnavailable)
@@ -2042,14 +2293,15 @@ impl Flow {
                     // A Busy delivery may follow a committed body append but precede its
                     // body_ready handoff (authorization/ACK metadata can yield). Preserve Busy
                     // pacing and rebind this exact body from disk on the next allowed turn.
-                    self.push(Task {
+                    let retry = Task {
                         operation: if body {
                             Operation::ResumeWire(query)
                         } else {
                             task.operation.clone()
                         },
                         ..task
-                    })?;
+                    };
+                    self.push(retry)?;
                     self.waiting = true;
                     return Ok(());
                 }

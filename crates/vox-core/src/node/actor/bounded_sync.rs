@@ -1822,6 +1822,30 @@ impl Node {
                 self.dispose_rearming_hint(flow);
                 continue;
             }
+            if let Some(receipt) = flow.take_announcement_receipt() {
+                if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    // Only this completed inventory response names what the peer actually saw.
+                    // An append racing it remains greater and owes the next announcement.
+                    port.announced_seq = port.announced_seq.max(receipt.through);
+                }
+                crate::node::status::SyncBook::with(
+                    &self.sync_book,
+                    work.room,
+                    work.peer,
+                    |counts| {
+                        counts.completed += 1;
+                        counts
+                            .reasons
+                            .count(crate::node::status::RoundReason::Announce);
+                        counts.fetched_completed += 1;
+                        if !receipt.brought {
+                            counts.empty += 1;
+                            counts.fetched_empty += 1;
+                        }
+                    },
+                );
+                self.note_lane_sync(work.room, work.peer);
+            }
             if let Some(seq) = flow.mine_held.take() {
                 // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
                 // on the actor's next turn; the settlement tick then stops offering the own
@@ -1938,6 +1962,27 @@ impl Node {
                 continue;
             }
             if let Some(error) = returned.error {
+                if flow.announcement_failed() && flow.retain_failed_announcement().is_ok() {
+                    // The announcement used its own scalar task. A refused/broken stream keeps
+                    // the ordinary hint/required stack and retries this prefix through the port's
+                    // existing transport backoff; it does not finish or re-arm that root.
+                    self.bounded_sync.deferred.push_back(flow);
+                    crate::node::status::SyncBook::with(
+                        &self.sync_book,
+                        work.room,
+                        work.peer,
+                        |counts| {
+                            counts.failed += 1;
+                            counts.last_failure = Some(error);
+                        },
+                    );
+                    self.enter_backoff(
+                        work.room,
+                        work.peer,
+                        crate::node::status::BackoffKind::Unreachable,
+                    );
+                    continue;
+                }
                 // A peer that does not yet hold a selected current body or a required current
                 // evidence, and a room whose Session-readiness facts are still refreshing, are
                 // bounded waiting conditions, not peer failures: this same port's next round
@@ -2393,18 +2438,26 @@ impl Node {
                 .ports
                 .get(&(room, peer))
                 .is_some_and(crate::node::ports::Port::needs);
-        if announce_first {
-            if let Some(parked) = self.bounded_sync.ready[0]
-                .take_if(|flow| flow.room == room && flow.peer == peer && !flow.inventory)
-            {
-                self.bounded_sync.deferred.push_back(parked);
-            }
-        }
+        // A retained hint/required flow prepends the announcement on that same owner. Parking it
+        // and allocating a fresh inventory Flow deadlocks when all retained positions are full:
+        // the inventory is the producer that would let those retained flows finish. A successful
+        // prefix gives its ordinary root one real quantum before another append can preempt it.
+        let announcement_preempts = self.bounded_sync.ready[0].as_ref().is_some_and(|flow| {
+            flow.room == room
+                && flow.peer == peer
+                && !flow.inventory
+                && flow.announcement_can_run()
+                && (flow.announcement_pending() || (announce_first && !flow.ordinary_turn_due()))
+        });
         let existing = (0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS).find(|index| {
             self.bounded_sync.running[*index].is_none()
                 && self.bounded_sync.ready[*index]
                     .as_ref()
-                    .is_some_and(|flow| flow.room == room && flow.peer == peer && !flow.waiting)
+                    .is_some_and(|flow| {
+                        flow.room == room
+                            && flow.peer == peer
+                            && (!flow.waiting || announcement_preempts)
+                    })
         });
         let mut admitted_archive = None;
         let mut admitted_control = None;
@@ -2418,7 +2471,7 @@ impl Node {
             // cannot monopolize the other lane or cause an archive continuation to run.
             if let Some(index) =
                 (0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS).find(|i| {
-                    !announce_first
+                    !announcement_preempts
                         && self.bounded_sync.running[*i].is_none()
                         && self.bounded_sync.ready[*i].as_ref().is_some_and(|flow| {
                             flow.room == room
@@ -2713,7 +2766,14 @@ impl Node {
             }
         };
         let index = usize::from(flow.archive);
-        let lane = flow.lane();
+        let announcement = flow.announcement_can_run()
+            && (flow.announcement_pending()
+                || (announce_first && !flow.inventory && !flow.ordinary_turn_due()));
+        let lane = if announcement {
+            crate::node::history_budget::Lane::Control
+        } else {
+            flow.lane()
+        };
         // From here on this Flow is the sole owner of any consumed archive dispatch, required
         // dependency or hint. Every refusal parks this exact owner until its admission edge.
         let job = if lane == crate::node::history_budget::Lane::Archive {
@@ -2921,6 +2981,14 @@ impl Node {
             }
             return false;
         }
+        let Some(own_seq) = self.ports.get(&(room, peer)).map(|port| port.own_seq) else {
+            self.dispose_rearming_hint(flow);
+            return false;
+        };
+        if announcement && flow.arm_announcement(own_seq).is_err() {
+            self.shelve_exact(flow, index);
+            return false;
+        }
         let Some(port) = self.ports.get_mut(&(room, peer)) else {
             self.dispose_rearming_hint(flow);
             return false;
@@ -2958,7 +3026,11 @@ impl Node {
             fence: fence.clone(),
             running,
             departure_receipt: None,
-            reason: flow.reason,
+            reason: if announcement {
+                crate::node::status::RoundReason::Announce
+            } else {
+                flow.reason
+            },
         });
         let archive = flow
             .archive_request
