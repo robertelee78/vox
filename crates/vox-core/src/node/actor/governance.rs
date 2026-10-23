@@ -53,6 +53,20 @@ impl Maintenance {
         self.pending || self.again || self.removal.is_some()
     }
 
+    /// A completed Computer-policy application releases only work which explicitly retained
+    /// that authority handoff. Preserve wakes for rooms already passed by the current sweep.
+    pub(super) fn resume_after_computer_policy(&mut self) {
+        let rooms: BTreeSet<_> = self
+            .admin_rosters
+            .iter()
+            .copied()
+            .chain(self.removal.as_ref().map(|removal| removal.room))
+            .collect();
+        for room in rooms {
+            self.wake_room(room);
+        }
+    }
+
     pub(super) fn next_deadline(&self) -> Option<u64> {
         self.deadline_order.first().map(|(deadline, _)| *deadline)
     }

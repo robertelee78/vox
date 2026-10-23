@@ -717,7 +717,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::BoundedHeadCompleted { .. } => "finishing an authenticated current head",
         NetEvent::BoundedRoomAdvanced { .. } => "publishing accepted current room work",
-        NetEvent::BoundedSyncProgress { .. } => "advancing bounded current/history work",
         NetEvent::BoardRecordsOwed { .. } => "publishing authorized board records",
         NetEvent::BoundedSyncDone { .. } => "filing a bounded history response",
         NetEvent::PrivateSessionAsk { .. } => "authorizing private Session records",
@@ -1426,9 +1425,6 @@ enum NetEvent {
         epoch: u64,
         room_instance: [u8; 16],
         generation: Digest32,
-    },
-    BoundedSyncProgress {
-        token: u64,
     },
     /// Missing board records admitted under the exact Computer authority captured by the
     /// off-actor exchange. Queue admission is the irreversible authorization boundary; this
@@ -11278,10 +11274,6 @@ impl Node {
                     }
                 }
             }
-            NetEvent::BoundedSyncProgress { token } => {
-                let _ = token;
-                self.accept_bounded_sync();
-            }
             NetEvent::BoardRecordsOwed { conn, records } => {
                 tokio::spawn(async move {
                     let Ok(mut client) = crate::nat::service::RendezvousClient::open(&conn).await
@@ -11702,6 +11694,9 @@ impl Node {
                     Ok(()) => self.apply_computer_keyring_guarded(&guard).await,
                     Err(e) => Err(e),
                 };
+                if result.is_ok() {
+                    self.governance_work.resume_after_computer_policy();
+                }
                 #[cfg(feature = "test-knobs")]
                 if let Some(delay) = reply_delay {
                     tokio::spawn(async move {
