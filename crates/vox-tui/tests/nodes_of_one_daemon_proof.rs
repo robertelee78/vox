@@ -1991,7 +1991,17 @@ fn computer_pairing_uses_an_anchor_without_room_membership_and_reconnects() {
         .child
         .wait()
         .expect("APPARATUS: stopped anchor did not exit");
-    right = start(&b, "[::1]:0", &v6, &[]);
+    // This process also owns the later durable-merge-before-reply phase. Preserve its
+    // one-shot hook across the outage restart; the arm is created only when that phase begins.
+    right = start(
+        &b,
+        "[::1]:0",
+        &v6,
+        &[(
+            "VOX_TEST_HOLD_COMPUTER_ANSWER_AFTER_MERGE_FILE",
+            &answer_after_merge_spec,
+        )],
+    );
 
     let before = application_toward(&a, &b_id);
     let attempts_before = before["exchange_attempts"].as_u64().unwrap_or(0);
