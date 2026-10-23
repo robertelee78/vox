@@ -2511,13 +2511,15 @@ impl Computer {
 
     /// A failed policy write invalidates current grants even when the durable revision did not
     /// advance. Restart revalidates the retained state and its ability to be saved before attach.
-    pub(crate) fn policy_current(&self, applied: u64, node: Digest32) -> bool {
+    pub(crate) fn policy_current(&self, applied: u64, expired: bool, node: Digest32) -> bool {
         let s = lock(&self.state);
         !self
             .authority_blocked
             .load(std::sync::atomic::Ordering::Acquire)
             && ((s.genesis.is_none() && s.intervals.is_empty())
-                || (self.storage_ready().is_ok() && s.policy_revision == applied)
+                || (self.storage_ready().is_ok()
+                    && s.policy_revision == applied
+                    && Self::revision_expired(&s) == expired)
                     && if Self::revision_expired(&s)
                         || s.grant(&self.signer.fingerprint()).is_none()
                     {
@@ -2540,6 +2542,7 @@ impl Computer {
     pub(crate) fn publish_with_current_authority<T>(
         &self,
         applied: u64,
+        expired: bool,
         node: Digest32,
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
@@ -2551,6 +2554,7 @@ impl Computer {
             && (unmanaged
                 || (self.storage_ready().is_ok()
                     && state.policy_revision == applied
+                    && Self::revision_expired(&state) == expired
                     && if Self::revision_expired(&state)
                         || state.grant(&self.signer.fingerprint()).is_none()
                     {
@@ -3103,9 +3107,11 @@ impl Computer {
                 receipt = ApplicationReceipt::Reconcile;
                 return Ok(());
             }
-            if let Some(applied) = state.applied.get_mut(&node) {
-                applied.grants.clear();
-            }
+            // Revocation settled this expired projection, not the live policy at the same
+            // revision. Absence is settled while expired; if authenticated repair clears that
+            // expiry without moving the revision, no live applied receipt may short-circuit
+            // restoring the policy's grants (including after restart).
+            state.applied.remove(&node);
             state.prepared.remove(&node);
             // Receipts are statements by computers, not by their managed nodes.
             state.receipts.remove(&self.signer.fingerprint());
@@ -3117,9 +3123,15 @@ impl Computer {
     /// Whether the durable Computer journal proves this exact node projection is complete.
     /// Expiry is complete only after its prepared rollback set is gone and its recorded
     /// computer-managed grants are empty; observing the expiry marker alone is not settlement.
-    pub(crate) fn application_settled(&self, node: &Digest32, revision: u64) -> bool {
+    pub(crate) fn application_settled(
+        &self,
+        node: &Digest32,
+        revision: u64,
+        expired: bool,
+    ) -> bool {
         let state = lock(&self.state);
-        Self::application_settled_in(&state, node, revision)
+        Self::revision_expired(&state) == expired
+            && Self::application_settled_in(&state, node, revision)
     }
 
     fn application_settled_in(state: &State, node: &Digest32, revision: u64) -> bool {
@@ -3152,14 +3164,17 @@ impl Computer {
         &self,
         node: &Digest32,
         revision: u64,
+        expired: bool,
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
         let state = lock(&self.state);
         #[cfg(feature = "test-knobs")]
-        let settled = Self::application_settled_in(&state, node, revision)
+        let settled = (Self::revision_expired(&state) == expired
+            && Self::application_settled_in(&state, node, revision))
             || fx28_mutant("ready-fence-accepts-unsettled");
         #[cfg(not(feature = "test-knobs"))]
-        let settled = Self::application_settled_in(&state, node, revision);
+        let settled = Self::revision_expired(&state) == expired
+            && Self::application_settled_in(&state, node, revision);
         settled.then(publish)
     }
 
@@ -3789,6 +3804,7 @@ impl Computer {
         gate: &crate::node::tunnel::Reachers,
         next: std::collections::BTreeSet<Digest32>,
         applied: u64,
+        expired: bool,
         node: Digest32,
     ) {
         let state = lock(&self.state);
@@ -3804,6 +3820,7 @@ impl Computer {
                 && ((state.genesis.is_none() && state.intervals.is_empty())
                     || (self.storage_ready().is_ok()
                         && applied == state.policy_revision
+                        && Self::revision_expired(&state) == expired
                         && if Self::revision_expired(&state)
                             || state.grant(&self.signer.fingerprint()).is_none()
                         {

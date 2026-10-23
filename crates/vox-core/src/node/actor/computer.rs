@@ -26,6 +26,7 @@ pub(super) enum ComputerAuthority {
     Managed {
         computer: Arc<crate::node::computer::Computer>,
         applied: u64,
+        expired: bool,
         node: Digest32,
     },
 }
@@ -41,8 +42,9 @@ impl ComputerAuthority {
             Self::Managed {
                 computer,
                 applied,
+                expired,
                 node,
-            } => computer.publish_with_current_authority(*applied, *node, publish),
+            } => computer.publish_with_current_authority(*applied, *expired, *node, publish),
         }
     }
 
@@ -588,10 +590,13 @@ impl NodeHandle {
         let Some(computer) = &self.computer else {
             return (true, String::new());
         };
-        let applied = self
-            .computer_revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        if !computer.policy_current(applied, me) {
+        let Some((applied, expired)) = view.computer_policy else {
+            return (
+                false,
+                "computer policy is pending application on this node".into(),
+            );
+        };
+        if !computer.policy_current(applied, expired, me) {
             return (
                 false,
                 "computer policy is pending application on this node".into(),
@@ -602,7 +607,7 @@ impl NodeHandle {
             Ok(None) => (true, String::new()),
             Err(e) => (false, e.to_string()),
         };
-        if !computer.policy_current(applied, me) {
+        if !computer.policy_current(applied, expired, me) {
             return (
                 false,
                 "computer policy changed; refresh before changing individual trust".into(),
@@ -621,16 +626,15 @@ impl NodeHandle {
         if !computer.grouped() && computer.binding_group().is_none() {
             return true;
         }
-        let applied = self
-            .computer_revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        let me = self
-            .view_rx
-            .borrow()
-            .identity
-            .as_ref()
-            .map(|id| id.fingerprint);
-        me.is_some_and(|me| computer.policy_current(applied, me))
+        let (me, policy) = {
+            let view = self.view_rx.borrow();
+            (
+                view.identity.as_ref().map(|id| id.fingerprint),
+                view.computer_policy,
+            )
+        };
+        me.zip(policy)
+            .is_some_and(|(me, (applied, expired))| computer.policy_current(applied, expired, me))
     }
 
     /// Ask the already attached node to sign its management binding and durably apply policy.
@@ -703,14 +707,24 @@ impl NodeHandle {
         let Some(computer) = &self.computer else {
             return Some(ready());
         };
-        let revision = self
-            .computer_revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        computer.with_application_settled(&identity, revision, ready)
+        let (revision, expired) = self.view_rx.borrow().computer_policy?;
+        computer.with_application_settled(&identity, revision, expired, ready)
     }
 }
 
 impl Node {
+    /// The policy of the actor's settled keyring, never a newly sampled durable policy. Views
+    /// carry this pair with their rows so a same-revision expiry cannot certify an old grant.
+    pub(super) fn applied_computer_policy(&self) -> Option<(u64, bool)> {
+        self.computer.as_ref().map(|_| {
+            (
+                self.computer_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+                self.computer_expired,
+            )
+        })
+    }
+
     /// Journal an explicit per-node trust choice only when retired Computer history would
     /// otherwise remove it. This is local node policy, not a new Computer policy revision: it
     /// neither wakes the other nodes nor creates an exchange obligation to another machine.
@@ -764,6 +778,7 @@ impl Node {
         Some(ComputerAuthority::Managed {
             computer: Arc::clone(computer),
             applied,
+            expired: self.computer_expired,
             node: me,
         })
     }
@@ -870,7 +885,7 @@ impl Node {
                 self.computer_revision
                     .load(std::sync::atomic::Ordering::Acquire)
                     == revision
-                    && c.application_settled(&identity, revision)
+                    && c.application_settled(&identity, revision, self.computer_expired)
             })
         {
             return Ok(());
@@ -925,7 +940,9 @@ impl Node {
                     let applied = self
                         .computer_revision
                         .load(std::sync::atomic::Ordering::Acquire);
-                    if identity.is_some_and(|node| !c.policy_current(applied, node)) {
+                    if identity
+                        .is_some_and(|node| !c.policy_current(applied, self.computer_expired, node))
+                    {
                         continue 'policy;
                     }
                     return Err(error);
@@ -943,7 +960,9 @@ impl Node {
                 let applied = self
                     .computer_revision
                     .load(std::sync::atomic::Ordering::Acquire);
-                if identity.is_some_and(|node| !c.policy_current(applied, node)) {
+                if identity
+                    .is_some_and(|node| !c.policy_current(applied, self.computer_expired, node))
+                {
                     continue 'policy;
                 }
                 return Err(error);
@@ -967,7 +986,7 @@ impl Node {
                 .or_else(|| self.headless.as_ref().map(|signer| signer.fingerprint()));
             if self.computer.as_ref().is_none_or(|computer| {
                 identity.is_some_and(|identity| {
-                    computer.application_settled(&identity, applied_revision)
+                    computer.application_settled(&identity, applied_revision, self.computer_expired)
                 })
             }) {
                 return Ok(());
@@ -997,6 +1016,7 @@ impl Node {
         computer.storage_ready()?;
         let revision = computer.policy_revision();
         if !computer.current_revision_expired()
+            && !self.computer_expired
             && self
                 .computer_revision
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -1009,7 +1029,8 @@ impl Node {
         }
         let Some(profile) = &self.profile else {
             if let Some(signer) = &self.headless {
-                let receipt = if computer.current_revision_expired() {
+                let expired = computer.current_revision_expired();
+                let receipt = if expired {
                     computer.mark_expired_until(signer.fingerprint(), revision, deadline)?
                 } else if !computer.applied(&signer.fingerprint(), revision) {
                     computer.mark_applied_until(signer.fingerprint(), revision, &[], deadline)?
@@ -1017,8 +1038,12 @@ impl Node {
                     crate::node::computer::ApplicationReceipt::Current
                 };
                 if receipt == crate::node::computer::ApplicationReceipt::Current {
+                    self.computer_expired = expired;
                     self.computer_revision
                         .store(revision, std::sync::atomic::Ordering::Release);
+                    self.view_tx.send_modify(|view| {
+                        view.computer_policy = self.applied_computer_policy();
+                    });
                 }
                 return Ok(KeyringApplication {
                     changes: Vec::new(),
@@ -1040,8 +1065,10 @@ impl Node {
         // Applied at this revision already: recorded after the keyring was saved, and kept
         // across a restart, so nothing is derived or written again (ADR-038 FX-28).
         if computer.applied(&me, revision) {
+            self.computer_expired = false;
             self.computer_revision
                 .store(revision, std::sync::atomic::Ordering::Release);
+            self.publish_computer_trust_projection();
             return Ok(KeyringApplication {
                 changes: Vec::new(),
                 settled: true,
@@ -1182,20 +1209,13 @@ impl Node {
         // behind the actor's old revision or an old trust view. The timing verdict still fails
         // below. A later durable policy change still fences every irreversible publication
         // because `policy_current` compares this exact revision with durable state.
+        self.computer_expired = expired;
         self.computer_revision
             .store(revision, std::sync::atomic::Ordering::Release);
         for (id, was) in changed_drive {
             self.note_capability(id, was);
         }
-        self.view_tx.send_modify(|view| {
-            view.trusted = self.trust_rows();
-            view.drive = self
-                .trust
-                .iter()
-                .map(|(fp, _)| *fp)
-                .filter(|fp| self.trust.has_drive(fp))
-                .collect();
-        });
+        self.publish_computer_trust_projection();
         if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
             computer.invalidate_reachers();
             return Err(error);
@@ -1204,6 +1224,21 @@ impl Node {
             changes,
             settled: true,
         })
+    }
+
+    /// Publish rows and their exact application tag under only the watch write lock. Readers
+    /// drop their watch borrow before validating the copied tag under the Computer state lock.
+    fn publish_computer_trust_projection(&self) {
+        self.view_tx.send_modify(|view| {
+            view.computer_policy = self.applied_computer_policy();
+            view.trusted = self.trust_rows();
+            view.drive = self
+                .trust
+                .iter()
+                .map(|(fp, _)| *fp)
+                .filter(|fp| self.trust.has_drive(fp))
+                .collect();
+        });
     }
 
     /// Hold startup after the exact applied receipt succeeded and before the daemon's final

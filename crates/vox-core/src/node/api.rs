@@ -711,6 +711,9 @@ pub struct ChannelDetail {
 /// The node's latest-wins view (published over a `watch`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeView {
+    /// Exact actor-applied Computer policy of these trust rows. Internal publication metadata,
+    /// copied with the rows; never inferred from a separately observed atomic revision.
+    pub(crate) computer_policy: Option<(u64, bool)>,
     /// Display-only last-known anchors of every saved room, separate from dialing authority.
     pub room_anchors: Vec<RoomAnchorView>,
     /// Actual dial observations for anchors this running node uses, not saved provenance.

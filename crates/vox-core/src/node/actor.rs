@@ -4206,7 +4206,6 @@ pub struct NodeHandle {
     /// Fresh for each actor lifetime, so a repaired client cannot reuse an old display token.
     display_incarnation: Digest32,
     computer: Option<Arc<crate::node::computer::Computer>>,
-    computer_revision: Arc<std::sync::atomic::AtomicU64>,
     /// The exact identity and one monotonic deadline minted by this actor's latest successful
     /// startup. The daemon reads this once and spends the same boundary through Ready.
     startup_computer_boundary: Arc<std::sync::Mutex<Option<(std::time::Instant, Digest32)>>>,
@@ -4485,17 +4484,16 @@ impl NodeHandle {
     /// one that lands afterward overlaps this read, which linearizes at the classification. No
     /// potentially large view clone or formatting holds the Computer state lock.
     pub(crate) fn coherent_view(&self) -> (NodeView, bool) {
-        let applied = self
-            .computer_revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        // Load the actor revision before cloning the rows it publishes before that release
-        // store.  The opposite order could pair old trust rows with the new revision and call
-        // them current.
+        // Clone rows and their exact applied revision/expiry together, then drop the watch
+        // borrow before taking the Computer lock. Separate atomic revision reads cannot certify
+        // these rows, particularly when a revision expires without changing its number.
         let view = self.view_rx.borrow().clone();
         let policy_current = self.computer.as_ref().is_none_or(|computer| {
-            view.identity
-                .as_ref()
-                .is_some_and(|identity| computer.policy_current(applied, identity.fingerprint))
+            view.computer_policy.is_some_and(|(applied, expired)| {
+                view.identity.as_ref().is_some_and(|identity| {
+                    computer.policy_current(applied, expired, identity.fingerprint)
+                })
+            })
         });
         #[cfg(feature = "test-knobs")]
         let policy_current =
@@ -5163,6 +5161,8 @@ pub struct Node {
     computer: Option<Arc<crate::node::computer::Computer>>,
     computer_revision: Arc<std::sync::atomic::AtomicU64>,
     startup_computer_boundary: Arc<std::sync::Mutex<Option<(std::time::Instant, Digest32)>>>,
+    /// Expiry of the exact settled projection, never sampled from newer durable policy.
+    computer_expired: bool,
     /// One sequence for this actor, including rooms closed and reopened between snapshots.
     display_sequence: std::sync::atomic::AtomicU64,
     /// The headless transport identity, if this node runs without a vault.
@@ -5956,6 +5956,7 @@ impl Node {
             bind,
             computer,
             computer_revision: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            computer_expired: false,
             startup_computer_boundary: Arc::new(std::sync::Mutex::new(None)),
             display_sequence: std::sync::atomic::AtomicU64::new(1),
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
@@ -6208,13 +6209,11 @@ impl Node {
         let paths = node.paths.clone();
         let decisions = node.decisions.clone();
         let computer = node.computer.clone();
-        let computer_revision = Arc::clone(&node.computer_revision);
         let startup_computer_boundary = Arc::clone(&node.startup_computer_boundary);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
             display_incarnation,
             computer,
-            computer_revision,
             startup_computer_boundary,
             cmd_tx,
             post_slots,
@@ -16837,6 +16836,7 @@ impl Node {
                             Arc::clone(computer),
                             self.computer_revision
                                 .load(std::sync::atomic::Ordering::Acquire),
+                            self.computer_expired,
                             profile.fingerprint(),
                         )
                     });
@@ -16857,8 +16857,8 @@ impl Node {
                         Ok(())
                     };
                     match authority {
-                        Some((computer, applied, node)) => {
-                            computer.publish_with_current_authority(applied, node, commit)
+                        Some((computer, applied, expired, node)) => {
+                            computer.publish_with_current_authority(applied, expired, node, commit)
                         }
                         None => Some(commit()),
                     }
@@ -22097,6 +22097,7 @@ impl Node {
                     next,
                     self.computer_revision
                         .load(std::sync::atomic::Ordering::Acquire),
+                    self.computer_expired,
                     self.profile
                         .as_ref()
                         .filter(|profile| profile.is_unlocked())
@@ -23644,6 +23645,7 @@ impl Node {
             .map(|eps| eps.addrs().iter().map(ToString::to_string).collect())
             .unwrap_or_default();
         self.view_tx.send_replace(NodeView {
+            computer_policy: self.applied_computer_policy(),
             room_anchors: self.anchor_inventory.clone(),
             anchor_reach: self.anchor_reach(),
             anchor_inventory_error: self.anchor_inventory_load_error.clone(),
@@ -23990,6 +23992,7 @@ impl Node {
             });
         }
         let view = NodeView {
+            computer_policy: self.applied_computer_policy(),
             room_anchors: inventory.into_values().collect(),
             anchor_reach: self.anchor_reach(),
             anchor_inventory_error,
