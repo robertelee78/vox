@@ -788,13 +788,14 @@ impl Management {
                 (
                     peer,
                     Exchanged {
-                        attempts: 1,
-                        failures: 1,
                         revision,
-                        problem: Some(if repaired {
-                            "the exchange repaired state only after its causal convergence deadline"
-                                .into()
-                        } else {
+                        // A durable miss is history, not a fabricated attempt or failure in
+                        // this daemon process. Repaired history has no current operational
+                        // fault. Unresolved work is already late: keep that owner and enter the
+                        // existing operational repair path without creating a new causal clock.
+                        deadline: (!repaired).then(std::time::Instant::now),
+                        deadline_policy_revision: (!repaired).then_some(revision),
+                        problem: (!repaired).then(|| {
                             "the exchange did not finish before its causal convergence deadline"
                                 .into()
                         }),
