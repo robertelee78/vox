@@ -6298,11 +6298,23 @@ fn stale_remote_pause_is_refused(
         ),
         "APPARATUS: nodes did not settle after the stale-publication refusal"
     );
-    let observe_session = || {
+    let observe_session = || loop {
+        assert!(
+            Instant::now() < pause_read_deadline,
+            "APPARATUS: exact Session listing did not settle within the retained pause-read/convergence boundary"
+        );
         let (ok, listed, err) = b.run(
             &["room", "sessions", &room, "--node", "delta", "--json"],
             "",
         );
+        const LISTING_CHANGED: &str =
+            "the room's Sessions changed while listing; run the command again";
+        let refusal = err.trim().strip_prefix("vox: ").unwrap_or(err.trim());
+        if !ok && refusal == LISTING_CHANGED {
+            // Discard any partial listing and select again only because Vox explicitly says
+            // its selection changed. This spends the same retained observation boundary.
+            continue;
+        }
         assert!(
             ok,
             "APPARATUS: reobserve delta's exact registered Session before reading saved pause: stdout {listed}; stderr {err}"
@@ -6321,9 +6333,9 @@ fn stale_remote_pause_is_refused(
             sessions.len() == 1 && sessions[0]["node"] == delta && sessions[0]["open"] == true,
             "APPARATUS: saved-pause read lost its exact open Session or owner: stdout {listed}; stderr {err}"
         );
-        sessions[0]["opened_millis"].as_u64().unwrap_or_else(|| {
+        break sessions[0]["opened_millis"].as_u64().unwrap_or_else(|| {
             panic!("APPARATUS: exact Session listing omitted its opening: {listed}")
-        })
+        });
     };
     let expected_opening = observe_session();
     let session_shown = loop {
