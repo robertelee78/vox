@@ -403,6 +403,11 @@ impl Page {
 /// The actor replaced, paused or stopped this request; a worker still holding its context stops
 /// at its next store step. A local decision, never a fault of the room or of the peer.
 pub(crate) const CANCELLED: &str = "history worker was cancelled";
+const BUFFER_BUSY: &str = "history demand buffer budget is busy";
+
+pub(crate) fn buffer_busy(error: &Error) -> bool {
+    matches!(error, Error::Profile(BUFFER_BUSY))
+}
 
 fn invalid(message: &'static str) -> Error {
     Error::Profile(message)
@@ -411,8 +416,7 @@ fn bad() -> Error {
     Error::MalformedAtRest("history demand state")
 }
 fn charge(job: &Job, bytes: usize) -> Result<BufferCharge> {
-    job.reserve(bytes)
-        .ok_or_else(|| invalid("history demand buffer budget is busy"))
+    job.reserve(bytes).ok_or_else(|| invalid(BUFFER_BUSY))
 }
 
 /// The exact demand-state working envelope prepaid with a staged record. Semantic application
@@ -422,6 +426,15 @@ pub(crate) struct AdmissionCharge {
 }
 
 impl AdmissionCharge {
+    /// Peak while reconstructing a staged body: one page's temporary state/page buffers and,
+    /// when it shares the record's lane, the original demand Snapshot are simultaneously live.
+    pub(crate) fn reconstruction_peak(record: usize, shared_snapshot: bool) -> Result<usize> {
+        record
+            .checked_add(STATE_WORK + PAGE_WORK)
+            .and_then(|bytes| bytes.checked_add(if shared_snapshot { STATE_WORK } else { 0 }))
+            .ok_or(Error::SizeLimitExceeded("history reconstruction envelope"))
+    }
+
     pub(crate) fn total(record: usize) -> Result<usize> {
         record
             .checked_add(STATE_WORK)
@@ -815,6 +828,7 @@ fn held_in_page(offset: u64, page: u64) -> usize {
 
 /// Commit at most two coalesced storage pages plus the exact offset before returning ACK credit.
 /// A duplicate chunk is idempotent only when every byte matches; its end was already persisted.
+/// Return the persisted offset and completion from this same checked state, without a second read.
 pub fn append(
     context: &Context,
     active: &mut Active,
@@ -822,7 +836,7 @@ pub fn append(
     offset: u64,
     bytes: &[u8],
     job: &Job,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     let _charge = charge(job, STATE_WORK + 2 * PAGE_WORK)?;
     if bytes.is_empty() || bytes.len() > MAX_CHUNK_BYTES {
         return Err(invalid("history chunk bounds"));
@@ -881,13 +895,14 @@ pub fn append(
     }
     if duplicate {
         context.check()?;
-        return Ok(end);
+        return Ok((end, body.offset == body.length));
     }
     body.offset = end;
+    let complete = body.offset == body.length;
     state.cursor = None;
     put(&mut batch, key, &scope, &state)?;
     commit(batch, active, context)?;
-    Ok(end)
+    Ok((end, complete))
 }
 
 fn read_bound(

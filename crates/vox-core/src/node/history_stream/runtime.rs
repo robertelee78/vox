@@ -137,6 +137,7 @@ pub(crate) struct Flow {
     /// kept across its slices; counted on the lane when a round completes.
     pub(crate) reason: crate::node::status::RoundReason,
     pub(crate) waiting: bool,
+    pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
     pub(crate) published: bool,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
@@ -314,6 +315,7 @@ impl Flow {
             mine_held: None,
             reason: crate::node::status::RoundReason::Request,
             waiting: false,
+            byte_pressure: None,
             published: false,
             rendered: false,
             governance: false,
@@ -440,6 +442,7 @@ impl Flow {
             mine_held: None,
             reason: crate::node::status::RoundReason::Page,
             waiting: false,
+            byte_pressure: None,
             published: false,
             rendered: false,
             governance: false,
@@ -982,6 +985,7 @@ impl Flow {
         now: u64,
     ) -> Result<()> {
         self.waiting = false;
+        self.byte_pressure = None;
         self.body_progress = false;
         self.governance_wait = false;
         self.governance_cycles = 0;
@@ -2020,6 +2024,13 @@ impl Flow {
                     } else {
                         self.push(continuation)?;
                     }
+                }
+                if let Some(pressure) = result.byte_pressure {
+                    // The exact local continuation was retained above. Its worker and temporary
+                    // buffers must leave before the actor starts the byte-release handoff.
+                    self.byte_pressure = Some(pressure);
+                    self.waiting = true;
+                    return Ok(());
                 }
                 if result.busy {
                     // Local admission deliberately collapses disk pressure and an occupied

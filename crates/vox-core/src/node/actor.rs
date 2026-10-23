@@ -11090,10 +11090,34 @@ impl Node {
                 }
             }
             NetEvent::BoundedBytesReady { token, room, peer } => {
-                if self.bounded_sync.release_byte_admission(token, room, peer)
-                    && self.port_eligible(&(room, peer), std::time::Instant::now())
-                {
-                    self.sched_rooms.insert(room);
+                if let Some(record) = self.bounded_sync.release_byte_admission(token, room, peer) {
+                    // Only an exact retained record's byte-release edge disproves a previous
+                    // capacity backoff. Transport/policy pacing keeps its separate meaning.
+                    if record
+                        && self.ports.get_mut(&(room, peer)).is_some_and(|port| {
+                            if port
+                                .backoff
+                                .is_some_and(|b| b.kind == crate::node::status::BackoffKind::Busy)
+                            {
+                                port.clear_backoff();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                    {
+                        crate::node::status::SyncBook::with(
+                            &self.sync_book,
+                            room,
+                            peer,
+                            |counts| {
+                                counts.backoff = None;
+                            },
+                        );
+                    }
+                    if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+                        self.sched_rooms.insert(room);
+                    }
                 }
             }
             NetEvent::BackoffExpired {

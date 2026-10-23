@@ -466,7 +466,80 @@ impl Drop for Worker {
 #[derive(Clone)]
 pub struct Job(Arc<Worker>);
 
+type ByteWake = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>;
+
+/// A failed record allocation's exact capacity dependency. It retains no worker slot or
+/// allocation charge; poll it only after the refused step's temporary buffers have dropped.
+pub(crate) struct BytePressure {
+    budget: Arc<Budget>,
+    lane: Lane,
+    required: usize,
+    wake: ByteWake,
+}
+
+fn byte_wake(budget: &Budget, lane: Lane) -> ByteWake {
+    let index = usize::from(matches!(lane, Lane::LargeControl | Lane::Live));
+    let mut wake = Box::pin(Arc::clone(&budget.bytes_changed[index]).notified_owned());
+    wake.as_mut().enable();
+    wake
+}
+
+impl BytePressure {
+    pub(crate) fn lane(&self) -> Lane {
+        self.lane
+    }
+
+    pub(crate) async fn released(self) {
+        // Archive bytes belong to one worker, not a shared pool. After that worker exits,
+        // the ordinary archive admission gate supplies a fresh worker with the validated cap.
+        if self.lane == Lane::Archive {
+            return;
+        }
+        let mut wake = self.wake;
+        loop {
+            let used = match self.lane {
+                Lane::Control => self.budget.control_bytes.load(Ordering::Acquire),
+                Lane::LargeControl | Lane::Live => {
+                    self.budget.foreground_bytes.load(Ordering::Acquire)
+                }
+                Lane::Archive => return,
+            };
+            if used
+                .checked_add(self.required)
+                .is_some_and(|total| total <= self.lane.buffer_limit())
+            {
+                return;
+            }
+            // Own temporary releases may have made the original notification ready. They
+            // authorize no retry unless the complete reconstruction peak now fits. Subscribe
+            // again before the next predicate so an intervening external release is not lost.
+            wake.await;
+            wake = byte_wake(&self.budget, self.lane);
+        }
+    }
+}
+
 impl Job {
+    pub(crate) fn lane(&self) -> Lane {
+        self.0.lane
+    }
+
+    /// Subscribe before attempting the record reservation. The dependency is transferred to
+    /// the actor only on refusal, and starts waiting after the worker has released its buffers.
+    pub(crate) fn byte_pressure(&self, required: usize) -> crate::error::Result<BytePressure> {
+        if required > self.0.lane.buffer_limit() {
+            return Err(crate::error::Error::SizeLimitExceeded(
+                "history record reconstruction envelope",
+            ));
+        }
+        Ok(BytePressure {
+            budget: Arc::clone(&self.0.budget),
+            lane: self.0.lane,
+            required,
+            wake: byte_wake(&self.0.budget, self.0.lane),
+        })
+    }
+
     pub(crate) fn flow_owner(&self) -> Option<u64> {
         self.0.flow_owner
     }

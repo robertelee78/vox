@@ -298,7 +298,32 @@ struct ByteAdmission {
     token: u64,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
+    owner: Option<ByteOwner>,
     task: tokio::task::JoinHandle<()>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ByteOwner {
+    request: stream::RequestId,
+    instance: [u8; 16],
+    generation: Digest32,
+}
+impl ByteOwner {
+    fn of(flow: &Flow) -> Self {
+        Self {
+            request: flow.retirement_request(),
+            instance: flow.instance,
+            generation: flow.generation,
+        }
+    }
+}
+struct ByteWait {
+    wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    owner: Option<ByteOwner>,
+}
+impl ByteWait {
+    fn unowned(wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) -> Self {
+        Self { wake, owner: None }
+    }
 }
 struct PoolAdmission {
     token: u64,
@@ -577,17 +602,37 @@ impl Controller {
         token: u64,
         room: Digest32,
         peer: Digest32,
-    ) -> bool {
+    ) -> Option<bool> {
         if self
             .byte_admission
             .get(&(room, peer))
             .is_some_and(|admission| admission.token == token)
         {
+            let record = self.byte_admission.get(&(room, peer))?.owner.is_some();
+            if record && !self.record_bytes_blocked(room, peer) {
+                return None;
+            }
             self.cancel_byte_admission(room, peer);
-            true
+            Some(record)
         } else {
-            false
+            None
         }
+    }
+    fn record_bytes_blocked(&mut self, room: Digest32, peer: Digest32) -> bool {
+        let Some(owner) = self.byte_admission.get(&(room, peer)).and_then(|a| a.owner) else {
+            return false;
+        };
+        let retained = self
+            .ready
+            .iter()
+            .filter_map(Option::as_ref)
+            .chain(self.deferred.iter())
+            .any(|flow| flow.room == room && flow.peer == peer && ByteOwner::of(flow) == owner);
+        if !retained {
+            // A retired room/generation must not park its replacement behind an old release.
+            self.cancel_byte_admission(room, peer);
+        }
+        retained
     }
     fn wait_for_bytes(
         &mut self,
@@ -596,7 +641,7 @@ impl Controller {
         room: Digest32,
         peer: Digest32,
         work: AdmissionWork,
-        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        waiting: ByteWait,
     ) {
         if self.byte_admission.contains_key(&(room, peer)) {
             return;
@@ -604,6 +649,7 @@ impl Controller {
         let token = *next_token;
         *next_token += 1;
         let tx = net_tx.clone();
+        let ByteWait { wake, owner } = waiting;
         let task = tokio::spawn(async move {
             wake.await;
             let _ = tx
@@ -616,6 +662,7 @@ impl Controller {
                 token,
                 root: work.root,
                 lane: work.lane,
+                owner,
                 task,
             },
         );
@@ -2008,6 +2055,35 @@ impl Node {
             // on the same port, and leaving its old Busy backoff intact spaces that real work at
             // the exponential cap even though capacity has just made progress. Transport, policy
             // and no-progress backoffs retain their distinct meaning.
+            if let Some(pressure) = flow.byte_pressure.take() {
+                let admission = AdmissionWork {
+                    root: flow.root_name(),
+                    lane: pressure.lane(),
+                };
+                let waiting = ByteWait {
+                    owner: Some(ByteOwner::of(&flow)),
+                    wake: Box::pin(pressure.released()),
+                };
+                if index == 0 {
+                    self.bounded_sync.deferred.push_back(flow);
+                } else {
+                    self.bounded_sync.ready[index] = Some(flow);
+                }
+                // The worker has finished and parked: neither this future nor the retained
+                // Flow owns reconstruction buffers or a worker slot. Subscribe/recheck the
+                // full retry peak, without turning byte pressure into a timed Busy retry.
+                self.bounded_sync
+                    .cancel_byte_admission(work.room, work.peer);
+                self.bounded_sync.wait_for_bytes(
+                    &self.net_tx,
+                    &mut self.next_token,
+                    work.room,
+                    work.peer,
+                    admission,
+                    waiting,
+                );
+                continue;
+            }
             let local_progress = flow.done() || !flow.waiting || flow.body_progress;
             let cleared_busy = local_progress
                 && self
@@ -2189,7 +2265,9 @@ impl Node {
         self.accept_bounded_sync();
         // Only the exact release handoff may make an impossible-path continuation runnable.
         // Generic actor traffic still evaluates queued ports, but cannot stand in for that edge.
-        if self.bounded_sync.pool_admission_blocked(room, peer) {
+        if self.bounded_sync.pool_admission_blocked(room, peer)
+            || self.bounded_sync.record_bytes_blocked(room, peer)
+        {
             return false;
         }
         let Some(profile) = self.profile.as_ref() else {
@@ -2356,7 +2434,7 @@ impl Node {
                             room,
                             peer,
                             pending_work,
-                            bytes_wake,
+                            ByteWait::unowned(bytes_wake),
                         );
                         self.note_start(room, peer, "control_budget_busy");
                         return false;
@@ -2666,7 +2744,7 @@ impl Node {
                 room,
                 peer,
                 AdmissionWork::from_flow(&flow),
-                bytes_wake,
+                ByteWait::unowned(bytes_wake),
             );
             self.note_start(room, peer, "control_budget_busy");
             self.shelve_exact(flow, index);

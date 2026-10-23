@@ -18,6 +18,8 @@ use super::transport::{Read, Transport};
 use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
 
 const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024;
+const RECORD_METADATA_WORK: usize = 64 * 1024;
+const ENTRY_VALIDATION_WORK: usize = 512 * 1024;
 // One atomic metadata object, or one selected staged body, per receiver handoff.
 const MAX_NEEDS: usize = 1;
 
@@ -556,6 +558,7 @@ impl Receiver {
                     let job = io.job().clone();
                     let fence = self.source.fence.clone();
                     let deadline = self.source.deadline;
+                    let committed = self.source.commit_ledger();
                     let (persisted, complete) = tokio::task::spawn_blocking(move || {
                         current(&fence, deadline)?;
                         let Frame::Chunk {
@@ -571,7 +574,7 @@ impl Receiver {
                             .active
                             .lock()
                             .map_err(|_| Error::Profile("history activation lock failed"))?;
-                        let persisted = demand::append(
+                        let progress = demand::append(
                             &staging.context,
                             &mut active,
                             exact,
@@ -579,13 +582,10 @@ impl Receiver {
                             bytes,
                             &job,
                         )?;
-                        let snapshot = demand::inspect(&staging.context, &job)?
-                            .ok_or(Error::Profile("history body disappeared"))?;
-                        let complete =
-                            snapshot.state().body.as_ref().is_some_and(|body| {
-                                body.entry == exact && body.offset == body.length
-                            });
-                        Ok((persisted, complete))
+                        // Keep the successful persisted append visible even if this exchange is
+                        // cancelled before later metadata or ACK handling can report its work.
+                        committed.store(true, std::sync::atomic::Ordering::Release);
+                        Ok(progress)
                     })
                     .await
                     .map_err(|_| Error::Unreachable("history chunk persistence stopped"))??;
@@ -596,7 +596,6 @@ impl Receiver {
                     if complete && unexpected_body == Some(entry) {
                         self.hold_unexpected_body_durable(&entry).await?;
                     }
-                    self.source.note_work_committed();
                     // Durable nonempty chunk progress remains progress even if later metadata
                     // or ACK allocation is Busy within this same bounded response.
                     result.body_progress = true;
@@ -746,6 +745,7 @@ pub(crate) enum Assembly {
     Ready(Arc<Record>),
     Pending,
     Busy,
+    BytePressure(crate::node::history_budget::BytePressure),
 }
 
 impl Receiver {
@@ -795,8 +795,13 @@ impl Receiver {
             else {
                 return Ok(Assembly::Busy);
             };
+            let peak = demand::AdmissionCharge::reconstruction_peak(
+                envelope,
+                job.lane() == record_job.lane(),
+            )?;
+            let pressure = record_job.byte_pressure(peak)?;
             let Some(mut charge) = record_job.reserve(envelope) else {
-                return Ok(Assembly::Busy);
+                return Ok(Assembly::BytePressure(pressure));
             };
             let admission = completion
                 .then(|| demand::AdmissionCharge::split_from(&mut charge))
@@ -808,7 +813,13 @@ impl Receiver {
                 .div_ceil(crate::log::history::MAX_CHUNK_BYTES as u64)
             {
                 current(&fence, deadline)?;
-                let held = demand::read_page(&staging.context, &active, page, &record_job)?;
+                let held = match demand::read_page(&staging.context, &active, page, &record_job) {
+                    Ok(held) => held,
+                    Err(error) if demand::buffer_busy(&error) => {
+                        return Ok(Assembly::BytePressure(pressure));
+                    }
+                    Err(error) => return Err(error),
+                };
                 payload.extend_from_slice(held.as_slice());
             }
             entry.payload = Some(payload);
@@ -868,17 +879,22 @@ impl Receiver {
         }
         let job = record.job.clone();
         let committed = self.source.commit_ledger();
-        self.read_precharged(&job, 512 * 1024, record, move |room, store, record| {
-            if record.entry.skeleton.author_id != binding.author
-                || record.entry.skeleton.seq != binding.from
-            {
-                return Err(Error::Profile("history entry record changed"));
-            }
-            if room.channel_id() != binding.room {
-                return Err(Error::Profile("history entry room changed"));
-            }
-            admission::advance_entry(room, store, &committed, binding).map(Some)
-        })
+        self.read_precharged(
+            &job,
+            ENTRY_VALIDATION_WORK,
+            record,
+            move |room, store, record| {
+                if record.entry.skeleton.author_id != binding.author
+                    || record.entry.skeleton.seq != binding.from
+                {
+                    return Err(Error::Profile("history entry record changed"));
+                }
+                if room.channel_id() != binding.room {
+                    return Err(Error::Profile("history entry room changed"));
+                }
+                admission::advance_entry(room, store, &committed, binding).map(Some)
+            },
+        )
         .await
     }
 }
@@ -998,12 +1014,13 @@ impl Receiver {
         head: Digest32,
         seq: u64,
         completion: bool,
+        local_work: usize,
     ) -> Result<Assembly> {
         let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Assembly::Busy);
         };
         let header = self
-            .read(&work_job, 64 * 1024, move |room, store| {
+            .read(&work_job, RECORD_METADATA_WORK, move |room, store| {
                 let input = room.history_read(store)?;
                 input.history_pending_header(&head, seq)
             })
@@ -1029,8 +1046,14 @@ impl Receiver {
         let Some(record_job) = job.record_job(envelope).await else {
             return Ok(Assembly::Busy);
         };
+        let peak = envelope
+            .checked_add(local_work.max(RECORD_METADATA_WORK))
+            .ok_or(Error::SizeLimitExceeded(
+                "history record reconstruction envelope",
+            ))?;
+        let pressure = record_job.byte_pressure(peak)?;
         let Some(mut charge) = record_job.reserve(envelope) else {
-            return Ok(Assembly::Busy);
+            return Ok(Assembly::BytePressure(pressure));
         };
         let admission = completion
             .then(|| demand::AdmissionCharge::split_from(&mut charge))
@@ -1309,6 +1332,7 @@ pub(crate) struct LocalResult {
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
     pub(crate) busy: bool,
+    pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
 }
 impl LocalResult {
     fn next(step: LocalStep) -> Self {
@@ -1319,6 +1343,7 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: false,
+            byte_pressure: None,
         }
     }
     fn done() -> Self {
@@ -1329,6 +1354,7 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: false,
+            byte_pressure: None,
         }
     }
     fn wait(step: LocalStep, need: LocalNeed) -> Self {
@@ -1339,6 +1365,7 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: false,
+            byte_pressure: None,
         }
     }
     fn busy(step: LocalStep) -> Self {
@@ -1349,6 +1376,14 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: true,
+            byte_pressure: None,
+        }
+    }
+
+    fn byte_pressure(step: LocalStep, pressure: crate::node::history_budget::BytePressure) -> Self {
+        Self {
+            byte_pressure: Some(pressure),
+            ..Self::next(step)
         }
     }
 }
@@ -1412,11 +1447,20 @@ impl Receiver {
         let assembly = if full {
             self.assemble(job, completion).await?
         } else {
-            self.header_record(job, head, seq, completion).await?
+            let local_work = if matches!(phase, EntryPhase::Validate(_)) {
+                ENTRY_VALIDATION_WORK
+            } else {
+                RECORD_METADATA_WORK
+            };
+            self.header_record(job, head, seq, completion, local_work)
+                .await?
         };
         let mut record = match assembly {
             Assembly::Ready(record) => record,
             Assembly::Busy => return Ok(LocalResult::busy(step)),
+            Assembly::BytePressure(pressure) => {
+                return Ok(LocalResult::byte_pressure(step, pressure));
+            }
             Assembly::Pending => {
                 return Ok(if full {
                     LocalResult::wait(step, LocalNeed::StagedBody)
@@ -1502,6 +1546,7 @@ impl Receiver {
                     rendered,
                     governance: is_governance,
                     busy: false,
+                    byte_pressure: None,
                 },
             }
         };
