@@ -1178,21 +1178,16 @@ impl Node {
                 settled: false,
             });
         }
-        // The durable keyring and its application receipt are now one settled authority
-        // projection. Publish that exact revision to the actor before running the ordinary room
-        // follow-up below: those paths revalidate `computer_revision`, and leaving the old value
-        // installed makes reconciliation reject itself as "pending" and the daemon detach a
-        // correctly updated node. A policy move after this store still makes every publication
-        // fence fail because `policy_current` compares this revision with durable state.
-        Self::computer_policy_active(deadline, cancelled)?;
+        // The durable keyring and its application receipt are now one settled projection.
+        // Publish its exact revision, notifications and live view before checking elapsed time:
+        // a deadline crossed during the receipt write must not strand a completed application
+        // behind the actor's old revision or an old trust view. The timing verdict still fails
+        // below. A later durable policy change still fences every irreversible publication
+        // because `policy_current` compares this exact revision with durable state.
         self.computer_revision
             .store(revision, std::sync::atomic::Ordering::Release);
         for (id, was) in changed_drive {
             self.note_capability(id, was);
-        }
-        if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
-            computer.invalidate_reachers();
-            return Err(error);
         }
         self.view_tx.send_modify(|view| {
             view.trusted = self.trust_rows();
@@ -1203,6 +1198,10 @@ impl Node {
                 .filter(|fp| self.trust.has_drive(fp))
                 .collect();
         });
+        if let Err(error) = Self::computer_policy_active(deadline, cancelled) {
+            computer.invalidate_reachers();
+            return Err(error);
+        }
         Ok(KeyringApplication {
             changes,
             settled: true,
