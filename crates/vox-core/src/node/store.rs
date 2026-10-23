@@ -948,6 +948,24 @@ pub struct Batch<'a> {
 }
 
 impl Batch<'_> {
+    /// Read and replace one metadata entry inside this batch's serialized write transaction.
+    /// The replacement remains invisible with the rest of the batch until commit.
+    pub(crate) fn update_meta<T>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(Option<&[u8]>) -> Result<(Vec<u8>, T)>,
+    ) -> Result<T> {
+        let mut meta = self.txn.open_table(META).map_err(storage("open meta"))?;
+        let current = meta
+            .get(name)
+            .map_err(storage("read meta"))?
+            .map(|v| v.value().to_vec());
+        let (next, out) = f(current.as_deref())?;
+        meta.insert(name, next.as_slice())
+            .map_err(storage("write meta"))?;
+        Ok(out)
+    }
+
     /// Read a fixed metadata incarnation inside the same serialized publication transaction.
     pub(crate) fn get_meta_prefix<const N: usize>(&self, name: &str) -> Result<Option<[u8; N]>> {
         let meta = self.txn.open_table(META).map_err(storage("open meta"))?;

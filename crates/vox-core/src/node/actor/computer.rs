@@ -1054,6 +1054,28 @@ impl Node {
             .map(|(id, _, _)| *id)
             .chain(plan.denied.iter().copied())
             .collect();
+        Self::computer_policy_active(deadline, cancelled)?;
+        // Prepare before any node-store effect, including pending key/removal metadata and
+        // trust-decision stamps. If a newer revision already won, none of this plan is applied.
+        // Expiry is recovery from the retained prepared/applied sets and needs no new grant.
+        if !expired {
+            #[cfg(feature = "test-knobs")]
+            if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable")
+                && !computer.prepare_application_until(me, revision, &covered, deadline)?
+            {
+                return Ok(KeyringApplication {
+                    changes: Vec::new(),
+                    settled: false,
+                });
+            }
+            #[cfg(not(feature = "test-knobs"))]
+            if !computer.prepare_application_until(me, revision, &covered, deadline)? {
+                return Ok(KeyringApplication {
+                    changes: Vec::new(),
+                    settled: false,
+                });
+            }
+        }
         let aliases: Vec<_> = covered
             .iter()
             .filter_map(|peer| {
@@ -1065,9 +1087,11 @@ impl Node {
         computer.retain_aliases_until(me, &aliases, deadline)?;
         let mut next = self.trust.clone();
         let mut newly = Vec::new();
+        let mut removed = Vec::new();
         let mut changed_drive = Vec::new();
-        // Persist closed/open room removal work before removing the keyring entry. On a crash,
-        // the ordinary room reopen path finishes it before authorizing new room activity.
+        // Stage closed/open room removal work with the keyring removal. Their single commit
+        // leaves restart either the old grant and its delivery work, or the removed grant and
+        // the pending room work which must finish before authorizing new room activity.
         let mut locks =
             crate::node::pending_lock::PendingLocks::load(profile.store(), profile.signer()?)?;
         let mut pending = self.consent_keys.clone();
@@ -1086,15 +1110,10 @@ impl Node {
             pending.forget(id);
             changed_drive.push((*id, next.has_drive(id)));
             next.untrust(id);
-            let _ =
-                crate::node::consent_order::forget_trust(profile.store(), profile.signer()?, id);
+            removed.push(*id);
         }
-        Self::computer_policy_active(deadline, cancelled)?;
-        locks.save(profile.store(), profile.signer()?)?;
-        Self::computer_policy_active(deadline, cancelled)?;
-        pending.save(profile.store(), profile.signer()?)?;
-        self.consent_keys = pending;
         for (id, name, capability) in plan.grants {
+            locks.forget(&id);
             if self.trust.capability(&id) == Some(capability) {
                 continue;
             }
@@ -1116,59 +1135,39 @@ impl Node {
             // Exact replacement consumes a stronger manual drive grant. There is no shadow grant.
             next.trust_as(id, &name, history, capability)?;
         }
-        let mut changes = Vec::new();
-        for id in newly {
-            Self::computer_policy_active(deadline, cancelled)?;
-            changes.push((
-                id,
-                crate::node::consent_order::stamp_trust(
-                    profile.store(),
-                    profile.signer()?,
-                    id,
-                    floor,
-                )?,
-            ));
-        }
         let profile = self
             .profile
             .as_ref()
             .ok_or(Error::Profile("managed profile disappeared"))?;
         Self::computer_policy_active(deadline, cancelled)?;
-        // A live policy first makes its possible keyring commit recoverable. An expired policy
-        // is already recovery: its durable prepared record is the authority for `plan.denied`,
-        // and attempting to prepare it again would reject the expiry before revocation could be
-        // saved. If either following write is interrupted, startup repeats the same idempotent
-        // branch until `mark_expired_until` clears the records after the revoked keyring lands.
+        // The staged plan may lose to a durable expiry or newer policy before taking its writer
+        // fence. The proof parks here, without a node-store writer or Computer writer held, so
+        // that real policy movement can win. The exact fence below then commits all node effects
+        // together or none; there is no pending-key deletion with an unchanged live keyring.
+        #[cfg(feature = "test-knobs")]
         if !expired {
-            #[cfg(feature = "test-knobs")]
-            if !crate::node::computer::fx28_mutant("keyring-commit-not-recoverable")
-                && !computer.prepare_application_until(me, revision, &covered, deadline)?
-            {
-                return Ok(KeyringApplication {
-                    changes: Vec::new(),
-                    settled: false,
-                });
-            }
-            #[cfg(not(feature = "test-knobs"))]
-            if !computer.prepare_application_until(me, revision, &covered, deadline)? {
-                return Ok(KeyringApplication {
-                    changes: Vec::new(),
-                    settled: false,
-                });
-            }
+            Self::hold_after_computer_application_prepared_for_proof(me, revision, &covered)?;
         }
-        Self::computer_policy_active(deadline, cancelled)?;
-        next.save_checked(profile.store(), profile.signer()?, || {
+        let Some(changes) = computer.commit_application_if_current(revision, expired, || {
             Self::computer_policy_active(deadline, cancelled)?;
-            // This is the real commit boundary: the redb transaction is fully staged and its
-            // causal condition passed; returning publishes it. The proof can let authenticated
-            // expiry land in precisely the remaining interval.
-            #[cfg(feature = "test-knobs")]
-            if !expired {
-                Self::hold_after_computer_application_prepared_for_proof(me, revision, &covered)?;
-            }
-            Ok(())
-        })?;
+            let signer = profile.signer()?;
+            let mut batch = profile.store().batch()?;
+            next.queue_save(&mut batch, signer)?;
+            locks.queue_save(&mut batch, signer)?;
+            pending.queue_save(&mut batch, signer)?;
+            let changes = crate::node::consent_order::ConsentOrder::queue_policy(
+                &mut batch, signer, &removed, &newly, floor,
+            )?;
+            Self::computer_policy_active(deadline, cancelled)?;
+            batch.commit()?;
+            Ok(changes)
+        })?
+        else {
+            return Ok(KeyringApplication {
+                changes: Vec::new(),
+                settled: false,
+            });
+        };
         #[cfg(feature = "test-knobs")]
         if !expired {
             Self::crash_after_computer_keyring_commit_for_proof(me, revision, &covered);
@@ -1176,6 +1175,7 @@ impl Node {
         // The keyring commit is now irreversible. Always classify it against durable Computer
         // policy and, when needed, perform its rollback before consulting the caller's deadline.
         self.trust = next;
+        self.consent_keys = pending;
         let receipt = if expired {
             computer.mark_expired_until(me, revision, deadline)?
         } else {

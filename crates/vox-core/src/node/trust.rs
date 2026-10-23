@@ -534,12 +534,24 @@ impl Keyring {
         signer: &dyn RootSigner,
         before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        let mut batch = store.batch()?;
+        self.queue_save(&mut batch, signer)?;
+        before_commit()?;
+        batch.commit()
+    }
+
+    /// Stage the keyring beside its pending delivery and removal records in one transaction.
+    pub(crate) fn queue_save(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        signer: &dyn RootSigner,
+    ) -> Result<()> {
         let sek = trust_sek(signer)?;
         let sealed = seal_segment(&sek, SegmentKind::Trust, TRUST_SEGMENT_ID, &self.to_bytes())?;
         let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
         blob.extend_from_slice(&sealed.nonce);
         blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta_checked(TRUST_META_KEY, &blob, before_commit)
+        batch.put_meta(TRUST_META_KEY, &blob)
     }
 
     /// Read and open the keyring, or an empty one if this node has never trusted

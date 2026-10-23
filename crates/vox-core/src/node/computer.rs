@@ -3007,6 +3007,30 @@ impl Computer {
         })
     }
 
+    /// Commit one node's complete policy projection only if the prepared plan still names the
+    /// current revision and expiry state. The Computer writer guard prevents policy movement
+    /// through the node-store commit, while the state lock is released before filesystem I/O so
+    /// status remains readable. Callers must open their node transaction inside `commit`, never
+    /// hold a node-store writer while acquiring this guard.
+    pub(crate) fn commit_application_if_current<T>(
+        &self,
+        revision: u64,
+        expired: bool,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        blocking_transaction(|| {
+            let _change = lock(&self.changes);
+            self.storage_ready()?;
+            {
+                let state = lock(&self.state);
+                if state.policy_revision != revision || Self::revision_expired(&state) != expired {
+                    return Ok(None);
+                }
+            }
+            commit().map(Some)
+        })
+    }
+
     pub(crate) fn mark_applied_until(
         &self,
         node: Digest32,
