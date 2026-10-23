@@ -7193,39 +7193,23 @@ impl Node {
             return Err(crate::error::Error::Profile("no identity on this node"));
         };
         // Identity unlocking and its KDF are complete here: this boundary measures computer-trust
-        // startup, not passphrase work. One actor-owned deadline covers the successful policy
-        // application and every daemon Ready reconciliation. Retries spend what remains; nobody
-        // downstream mints a replacement. The identity travels with it so headless actors do not
-        // depend on a vault projection appearing in `NodeView`.
+        // startup, not passphrase work. One actor-owned observation end covers policy application
+        // and every daemon Ready reconciliation. A miss does not cancel accepted valid work;
+        // actual policy movement retries under this same original observation end. The identity
+        // travels with it so headless actors do not depend on a vault projection in `NodeView`.
         let deadline =
             std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
         *self
             .startup_computer_boundary
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((deadline, identity));
-        let guard = computer::ComputerPolicyGuard::Deadline {
-            deadline,
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        self.prepare_computer_binding_causal(&guard, true)?;
-        loop {
-            // Only the receipt from this exact keyring application can open networking. Seeing
-            // an expired marker is not completion: its durable revocation branch must finish.
-            let application = self.apply_computer_keyring_at_guarded(0, &guard)?;
-            if !application.settled {
-                continue;
-            }
-            #[cfg(feature = "test-knobs")]
-            {
-                let revision = self
-                    .computer_revision
-                    .load(std::sync::atomic::Ordering::Acquire);
-                self.hold_after_computer_application_receipt_for_proof(identity, revision)?;
-            }
-            // The receipt is this actor's causal completion. Live use-time authority gates fail
-            // closed against later policy movement; the daemon's state-locked fence independently
-            // reconciles that movement before publishing Ready.
-            break;
+        self.settle_startup_computer_policy(identity, deadline)?;
+        #[cfg(feature = "test-knobs")]
+        {
+            let revision = self
+                .computer_revision
+                .load(std::sync::atomic::Ordering::Acquire);
+            self.hold_after_computer_application_receipt_for_proof(identity, revision)?;
         }
         let Some(bind) = self.bind.as_ref() else {
             return Ok(());

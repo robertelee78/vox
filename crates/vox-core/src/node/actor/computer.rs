@@ -730,9 +730,46 @@ impl NodeHandle {
     /// Ready remains unpublished until the exact durable application is settled again.
     pub async fn reconcile_computer_startup(
         &self,
-        deadline: std::time::Instant,
+        observation_end: std::time::Instant,
     ) -> crate::error::Result<()> {
-        self.reconcile_computer_inner(deadline).await
+        let Some(computer) = &self.computer else {
+            return Ok(());
+        };
+        let (_, identity) = self.startup_computer_boundary().ok_or(Error::Profile(
+            "startup has no owned computer-trust boundary",
+        ))?;
+        loop {
+            let change = crate::node::computer::ComputerChange::at(
+                computer.policy_target(),
+                observation_end,
+                observation_end,
+            );
+            // This is the same accepted startup, including after a real target change. Its
+            // original observation end can report lateness but never cancels its continuation.
+            let application = self.reconcile_computer_current_inner(
+                change,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            tokio::pin!(application);
+            let result = tokio::select! {
+                result = &mut application => result,
+                () = tokio::time::sleep_until(observation_end.into()) => {
+                    if computer.grouped() {
+                        computer.record_application_miss(identity, change)?;
+                    }
+                    application.await
+                }
+            };
+            match result {
+                Err(Error::ComputerPolicySuperseded) => continue,
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
+            match computer.require_startup_binding(identity, change.target()) {
+                Err(Error::ComputerPolicySuperseded) => continue,
+                result => return result,
+            }
+        }
     }
 
     async fn reconcile_computer_inner(
@@ -786,6 +823,16 @@ impl NodeHandle {
     ) -> crate::error::Result<()> {
         #[cfg(feature = "test-knobs")]
         self.hold_computer_reconcile_send_for_proof().await?;
+        self.reconcile_computer_current_inner(change, superseded)
+            .await
+    }
+
+    /// Startup uses the same owned actor work without the later-Attached proof hold.
+    async fn reconcile_computer_current_inner(
+        &self,
+        change: crate::node::computer::ComputerChange,
+        superseded: Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::error::Result<()> {
         if superseded.load(std::sync::atomic::Ordering::Acquire) {
             return Err(Error::ComputerPolicySuperseded);
         }
@@ -832,6 +879,51 @@ impl NodeHandle {
 }
 
 impl Node {
+    /// Finish this accepted Unlock's policy work. Only an actual policy supersession repeats a
+    /// pass; elapsed observation time never discards the unlocked credential or renews a clock.
+    pub(super) fn settle_startup_computer_policy(
+        &mut self,
+        identity: Digest32,
+        observation_end: std::time::Instant,
+    ) -> crate::error::Result<()> {
+        let Some(computer) = self.computer.clone() else {
+            return Ok(());
+        };
+        loop {
+            let change = crate::node::computer::ComputerChange::at(
+                computer.policy_target(),
+                observation_end,
+                observation_end,
+            );
+            let guard = ComputerPolicyGuard::Current {
+                change,
+                superseded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let result = (|| {
+                // Binding belongs to this pass too: a remote revision may have moved after
+                // the preceding pass prepared or committed the keyring.
+                self.prepare_computer_binding_causal(&guard, true)?;
+                guard.active(self.computer.as_ref())?;
+                computer.require_startup_binding(identity, change.target())?;
+                let application = self.apply_computer_keyring_at_guarded(0, &guard)?;
+                guard.active(self.computer.as_ref())?;
+                if !application.settled {
+                    // The exact node commit or receipt observed real policy movement.
+                    return Err(Error::ComputerPolicySuperseded);
+                }
+                computer.require_startup_binding(identity, change.target())?;
+                if computer.grouped() && std::time::Instant::now() >= observation_end {
+                    computer.record_application_miss(identity, change)?;
+                }
+                Ok(())
+            })();
+            match result {
+                Err(Error::ComputerPolicySuperseded) => continue,
+                result => return result,
+            }
+        }
+    }
+
     /// The policy of the actor's settled keyring, never a newly sampled durable policy. Views
     /// carry this pair with their rows so a same-revision expiry cannot certify an old grant.
     pub(super) fn applied_computer_policy(&self) -> Option<(u64, bool)> {

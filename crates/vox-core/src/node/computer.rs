@@ -3369,10 +3369,47 @@ impl Computer {
         }
     }
 
-    /// Publish one synchronous startup boundary only while the durable application journal is
-    /// exactly settled. The state lock stays held through `publish`, so policy movement after the
-    /// actor's applied receipt cannot land between this final check and the daemon's Ready
-    /// transition.
+    fn startup_binding_current_in(
+        &self,
+        state: &State,
+        node: &Digest32,
+        revision: u64,
+        expired: bool,
+    ) -> bool {
+        (state.genesis.is_none() && state.intervals.is_empty())
+            || expired
+            || state.grant(&self.signer.fingerprint()).is_none()
+            || state
+                .derived
+                .get(node)
+                .is_some_and(|binding| binding.revision == revision)
+    }
+
+    /// A changed target retries the accepted startup. Missing ownership at that same target is
+    /// a real refusal: an old vault must never silently reclaim a released/transferred binding.
+    pub(crate) fn require_startup_binding(
+        &self,
+        node: Digest32,
+        target: ComputerPolicyTarget,
+    ) -> Result<()> {
+        let state = lock(&self.state);
+        if state.policy_revision != target.revision
+            || Self::revision_expired(&state) != target.expired
+        {
+            return Err(Error::ComputerPolicySuperseded);
+        }
+        if !self.startup_binding_current_in(&state, &node, target.revision, target.expired) {
+            return Err(Error::Profile(
+                "this vault's Computer binding is no longer approved here; a released or transferred vault requires deliberate transfer or recovery before Ready",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publish Ready only while this exact application and its live binding are current. The
+    /// state lock stays held through `publish`, so policy movement after the actor's receipt
+    /// cannot land between this check and Ready. Revoked/unmanaged projections need no live
+    /// binding; they still must have completed their durable application.
     pub(crate) fn with_application_settled<T>(
         &self,
         node: &Digest32,
@@ -3381,13 +3418,16 @@ impl Computer {
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
         let state = lock(&self.state);
+        let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
+        let settled = !self
+            .authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+            && (unmanaged || self.storage_ready().is_ok())
+            && Self::revision_expired(&state) == expired
+            && Self::application_settled_in(&state, node, revision)
+            && self.startup_binding_current_in(&state, node, revision, expired);
         #[cfg(feature = "test-knobs")]
-        let settled = (Self::revision_expired(&state) == expired
-            && Self::application_settled_in(&state, node, revision))
-            || fx28_mutant("ready-fence-accepts-unsettled");
-        #[cfg(not(feature = "test-knobs"))]
-        let settled = Self::revision_expired(&state) == expired
-            && Self::application_settled_in(&state, node, revision);
+        let settled = settled || fx28_mutant("ready-fence-accepts-unsettled");
         settled.then(publish)
     }
 
