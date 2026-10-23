@@ -46,6 +46,7 @@ pub(super) struct Transport {
     job: Job,
     fence: Arc<Fence>,
     deadline: Instant,
+    send_finished: bool,
 }
 
 impl Transport {
@@ -62,6 +63,7 @@ impl Transport {
             job,
             fence,
             deadline,
+            send_finished: false,
         }
     }
 
@@ -187,12 +189,19 @@ impl Transport {
     pub(super) fn finish(&mut self) -> Result<()> {
         self.send
             .finish()
-            .map_err(|_| Error::Unreachable("history stream closed before finish"))
+            .map_err(|_| Error::Unreachable("history stream closed before finish"))?;
+        self.send_finished = true;
+        Ok(())
     }
 
     pub(super) fn abort(&mut self, code: WireError) {
         let code = quinn::VarInt::from_u32(u32::from(code.code()));
-        let _ = self.send.reset(code);
+        // Quinn reset may discard queued bytes even after FIN was accepted. A later local
+        // cancellation must not erase an ACK whose graceful send completion already succeeded.
+        // This records queued FIN, not peer delivery; genuine wire failures remain failures.
+        if !self.send_finished {
+            let _ = self.send.reset(code);
+        }
         let _ = self.recv.stop(code);
     }
 }

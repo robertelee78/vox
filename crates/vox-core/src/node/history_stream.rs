@@ -637,6 +637,22 @@ impl<'a> Frame<'a> {
     /// The caller already owns the independently charged source objects. Lack of room is a
     /// local busy/yield result; it is not malformed peer input.
     pub fn encode(&self, job: &Job) -> Result<Option<Encoded>> {
+        let (maximum, envelope) = self.encoding_envelope()?;
+        let Some(charge) = job.reserve(envelope) else {
+            return Ok(None);
+        };
+        self.encode_precharged(maximum, charge).map(Some)
+    }
+
+    /// An owned client continuation must acquire its encoding before committing the work
+    /// that requires this frame. Refusal carries the exact capacity dependency to that owner.
+    pub(super) fn encode_required(&self, job: &Job) -> Result<Encoded> {
+        let (maximum, envelope) = self.encoding_envelope()?;
+        let charge = job.reserve_or_pressure(envelope)?;
+        self.encode_precharged(maximum, charge)
+    }
+
+    fn encoding_envelope(&self) -> Result<(usize, usize)> {
         let maximum = match self {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
@@ -665,9 +681,15 @@ impl<'a> Frame<'a> {
                 ..
             } => MAX_FRAME_BYTES,
         };
-        let Some(charge) = job.reserve(4 * maximum) else {
-            return Ok(None);
-        };
+        let envelope = maximum
+            .checked_mul(4)
+            .ok_or(Error::SizeLimitExceeded("history encoded frame"))?;
+        Ok((maximum, envelope))
+    }
+
+    // One encoder and validation path for both optional server output and required client ACKs.
+    // The owned reservation covers the same nested proof and final-frame copies in either case.
+    fn encode_precharged(&self, maximum: usize, charge: BufferCharge) -> Result<Encoded> {
         let mut e = Encoder::new();
         let mut tail = None;
         let id = match self {
@@ -802,10 +824,10 @@ impl<'a> Frame<'a> {
         if let Some(tail) = tail {
             bytes.extend_from_slice(&tail);
         }
-        Ok(Some(Encoded {
+        Ok(Encoded {
             bytes,
             _charge: charge,
-        }))
+        })
     }
 
     pub fn decode(bytes: &'a [u8]) -> Result<Self> {

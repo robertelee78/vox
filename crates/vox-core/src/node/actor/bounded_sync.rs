@@ -299,6 +299,8 @@ struct ByteAdmission {
     root: &'static str,
     lane: crate::node::history_budget::Lane,
     owner: Option<ByteOwner>,
+    /// Scheduling need captured by the ended worker, never the port's newer current need.
+    port_request: Option<u64>,
     task: tokio::task::JoinHandle<()>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -319,10 +321,15 @@ impl ByteOwner {
 struct ByteWait {
     wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
     owner: Option<ByteOwner>,
+    port_request: Option<u64>,
 }
 impl ByteWait {
     fn unowned(wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) -> Self {
-        Self { wake, owner: None }
+        Self {
+            wake,
+            owner: None,
+            port_request: None,
+        }
     }
 }
 struct PoolAdmission {
@@ -634,6 +641,43 @@ impl Controller {
         }
         retained
     }
+    fn take_superseded_byte_hint(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        inbox: &stream::HintInbox,
+    ) -> Option<(Flow, u64)> {
+        let admission = self.byte_admission.get(&(room, peer))?;
+        let owner = admission.owner?;
+        let port_request = admission.port_request?;
+        let superseded = |flow: &Flow| {
+            flow.room == room
+                && flow.peer == peer
+                && ByteOwner::of(flow) == owner
+                && !flow.archive
+                && flow.archive_request.is_none()
+                && flow.required_root.is_none()
+                && flow.hint.is_some_and(|hint| {
+                    inbox.newer_pending(room, flow.hint_peer, hint.author, hint.size)
+                })
+        };
+        // Only the exact byte waiter's parked hinted owner can be replaced. Archive and
+        // required roots, other ports and replacement generations keep their continuations.
+        let flow = if let Some(index) = self
+            .ready
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(superseded))
+        {
+            self.ready[index].take()?
+        } else {
+            let index = self.deferred.iter().position(superseded)?;
+            self.deferred.remove(index)?
+        };
+        // No await occurs between identity selection and cancellation. A queued old ready
+        // event cannot consume a future replacement, because its unique token no longer exists.
+        self.cancel_byte_admission(room, peer);
+        Some((flow, port_request))
+    }
     fn wait_for_bytes(
         &mut self,
         net_tx: &mpsc::Sender<NetEvent>,
@@ -649,7 +693,11 @@ impl Controller {
         let token = *next_token;
         *next_token += 1;
         let tx = net_tx.clone();
-        let ByteWait { wake, owner } = waiting;
+        let ByteWait {
+            wake,
+            owner,
+            port_request,
+        } = waiting;
         let task = tokio::spawn(async move {
             wake.await;
             let _ = tx
@@ -663,6 +711,7 @@ impl Controller {
                 root: work.root,
                 lane: work.lane,
                 owner,
+                port_request,
                 task,
             },
         );
@@ -2062,6 +2111,7 @@ impl Node {
                 };
                 let waiting = ByteWait {
                     owner: Some(ByteOwner::of(&flow)),
+                    port_request: Some(work.request),
                     wake: Box::pin(pressure.released()),
                 };
                 if index == 0 {
@@ -2263,6 +2313,34 @@ impl Node {
         conn: Arc<VoxConnection>,
     ) -> bool {
         self.accept_bounded_sync();
+        if let Some((flow, ended_request)) =
+            self.bounded_sync
+                .take_superseded_byte_hint(room, peer, &self.history_hints)
+        {
+            // The newer scalar head hint is already pending; it is the causal replacement
+            // edge, not permission to retry the refused old allocation. Retirement preserves
+            // durable facts and re-arms only the exact obsolete hint through the existing path.
+            self.dispose_rearming_hint(flow);
+            let mut cleared_busy = false;
+            if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                port.req_done = port.req_done.max(ended_request);
+                port.raise();
+                if port
+                    .backoff
+                    .is_some_and(|backoff| backoff.kind == crate::node::status::BackoffKind::Busy)
+                {
+                    port.clear_backoff();
+                    cleared_busy = true;
+                }
+            }
+            crate::node::status::SyncBook::with(&self.sync_book, room, peer, |counts| {
+                counts.partial += 1;
+                if cleared_busy {
+                    counts.backoff = None;
+                }
+            });
+            self.sched_rooms.insert(room);
+        }
         // Only the exact release handoff may make an impossible-path continuation runnable.
         // Generic actor traffic still evaluates queued ports, but cannot stand in for that edge.
         if self.bounded_sync.pool_admission_blocked(room, peer)

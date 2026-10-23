@@ -13,7 +13,7 @@ use crate::wire::WireError;
 
 use super::admission::{self, Advanced, Staged};
 use super::credit::Response;
-use super::source::{Lookup, Source};
+use super::source::{Lookup, PreparedRead, Source};
 use super::transport::{Read, Transport};
 use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
 
@@ -567,6 +567,28 @@ impl Receiver {
                     let Some(staging) = &self.staging else {
                         return Err(Error::Profile("history chunk has no activation"));
                     };
+                    let final_chunk = credit.pending_ack_completes(request, entry, next)?;
+                    let ack = Frame::Ack {
+                        request,
+                        entry,
+                        next_offset: next,
+                    };
+                    let encoded = ack.encode_required(io.job())?;
+                    credit.charge_overhead(encoded.as_slice().len() + 4)?;
+                    let Some(authority) = self.source.prepare_committed_read(io.job()).await?
+                    else {
+                        io.abort(WireError::SessionBusy);
+                        result.status = Status::Busy;
+                        return Ok(result);
+                    };
+                    let checkpoint = final_chunk
+                        .then(|| {
+                            Ok::<_, Error>((
+                                demand::AdmissionCharge::reserve(io.job())?,
+                                demand::AdmissionCharge::reserve(io.job())?,
+                            ))
+                        })
+                        .transpose()?;
                     let staging = staging.clone();
                     let job = io.job().clone();
                     let fence = self.source.fence.clone();
@@ -605,49 +627,42 @@ impl Receiver {
                     if persisted != next {
                         return Err(Error::MalformedAtRest("history persisted offset differs"));
                     }
+                    if complete != final_chunk {
+                        return Err(Error::MalformedAtRest(
+                            "history completed body differs from ACK credit",
+                        ));
+                    }
                     #[cfg(feature = "test-knobs")]
                     if complete && unexpected_body == Some(entry) {
                         self.hold_unexpected_body_durable(&entry).await?;
                     }
                     // Durable nonempty chunk progress remains progress even if later metadata
-                    // or ACK allocation is Busy within this same bounded response.
+                    // or wire delivery fails within this same bounded response.
                     result.body_progress = true;
-                    // Current room access is checked again after durable storage and before ACK.
-                    if !self.authorize(io.job()).await? {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    }
+                    // The prepared read owns every byte needed for this exact post-commit
+                    // authority check. Elapsed observation time cannot replace the durable
+                    // append, while lifecycle and the captured grant remain exact fences.
+                    self.authorize_committed(authority).await?;
                     credit.acknowledge(request, entry, persisted)?;
-                    let ack = Frame::Ack {
-                        request,
-                        entry,
-                        next_offset: persisted,
-                    };
-                    let Some(encoded) = ack.encode(io.job())? else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
-                    credit.charge_overhead(encoded.as_slice().len() + 4)?;
                     io.write_encoded(&encoded).await?;
                     if complete {
                         result.body_ready = Some(entry);
+                        // Queue the final ACK and FIN before any local metadata operation. The
+                        // transport remembers this success, so a later local failure cannot reset
+                        // and discard the sender's causal Live-grant release.
+                        io.finish()?;
+                        let checkpoint = checkpoint
+                            .ok_or(Error::Profile("completed body has no prepaid checkpoint"))?;
                         result.continuation = self
-                            .checkpoint_response(
+                            .checkpoint_response_precharged(
                                 io.job(),
                                 request,
                                 &query,
                                 Status::ControlPending,
                                 None,
+                                checkpoint,
                             )
                             .await?;
-                        // The ACK must reach the source so it can release this completed Live
-                        // grant. Gracefully finish the send direction; resetting it here can
-                        // discard the buffered ACK. The actor still owns the provisional body's
-                        // opaque inclusion/control/authority admission, and this stream accepts
-                        // no additional entry.
-                        io.finish()?;
                         result.status = Status::ControlPending;
                         return Ok(result);
                     }
@@ -933,6 +948,34 @@ impl Receiver {
         status: Status,
         hint: Option<Continuation>,
     ) -> Result<Option<Continuation>> {
+        self.checkpoint_response_inner(job, request, query, status, hint, None)
+            .await
+    }
+
+    async fn checkpoint_response_precharged(
+        &self,
+        job: &crate::node::history_budget::Job,
+        request: RequestId,
+        query: &Query,
+        status: Status,
+        hint: Option<Continuation>,
+        admission: (demand::AdmissionCharge, demand::AdmissionCharge),
+    ) -> Result<Option<Continuation>> {
+        // The job is unused on the prepaid branch; retain the common helper's exact state and
+        // cursor checks without permitting it to allocate after the durable append.
+        self.checkpoint_response_inner(job, request, query, status, hint, Some(admission))
+            .await
+    }
+
+    async fn checkpoint_response_inner(
+        &self,
+        job: &crate::node::history_budget::Job,
+        request: RequestId,
+        query: &Query,
+        status: Status,
+        hint: Option<Continuation>,
+        admission: Option<(demand::AdmissionCharge, demand::AdmissionCharge)>,
+    ) -> Result<Option<Continuation>> {
         if !matches!(query, Query::Entry { .. } | Query::Page { .. }) {
             return Ok(hint);
         }
@@ -944,13 +987,22 @@ impl Receiver {
         let deadline = self.source.deadline;
         let job = job.clone();
         tokio::task::spawn_blocking(move || {
-            current(&fence, deadline)?;
+            let committed = admission.is_some();
+            if !committed {
+                current(&fence, deadline)?;
+            }
             let mut active = staging
                 .active
                 .lock()
                 .map_err(|_| Error::Profile("history activation lock failed"))?;
-            let snapshot = demand::inspect(&staging.context, &job)?
-                .ok_or(Error::Profile("history activation disappeared"))?;
+            let (snapshot, write) = match admission {
+                Some((inspect, write)) => (
+                    demand::inspect_precharged(&staging.context, inspect)?,
+                    Some(write),
+                ),
+                None => (demand::inspect(&staging.context, &job)?, None),
+            };
+            let snapshot = snapshot.ok_or(Error::Profile("history activation disappeared"))?;
             let state = snapshot.state();
             if !active.matches(state) || active.request() != request {
                 return Err(Error::Profile("history response activation changed"));
@@ -1002,13 +1054,23 @@ impl Receiver {
                 _ => demand::Progress::Pending,
             };
             drop(snapshot);
-            demand::checkpoint(
-                &staging.context,
-                &mut active,
-                progress,
-                normalized.as_ref(),
-                &job,
-            )?;
+            if let Some(write) = write.as_ref() {
+                demand::checkpoint_precharged(
+                    &staging.context,
+                    &mut active,
+                    progress,
+                    normalized.as_ref(),
+                    write,
+                )?;
+            } else {
+                demand::checkpoint(
+                    &staging.context,
+                    &mut active,
+                    progress,
+                    normalized.as_ref(),
+                    &job,
+                )?;
+            }
             Ok(normalized)
         })
         .await
@@ -1991,11 +2053,21 @@ impl Receiver {
             })
             .await
     }
-    async fn authorize(&self, job: &crate::node::history_budget::Job) -> Result<bool> {
-        Ok(matches!(
-            self.read(job, 0, |_, _| Ok(Some(()))).await?,
-            Lookup::Found(_)
-        ))
+    async fn authorize_committed(&self, admission: PreparedRead) -> Result<()> {
+        let grant = self.grant();
+        match self
+            .source
+            .read_committed(admission, move |room, store| {
+                grant.check(room, store)?;
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            Lookup::Busy | Lookup::Missing => Err(Error::Profile(
+                "committed history authority read disappeared",
+            )),
+        }
     }
 }
 

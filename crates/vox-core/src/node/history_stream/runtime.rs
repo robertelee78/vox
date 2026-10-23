@@ -1667,18 +1667,40 @@ impl Flow {
                                         .filter(|next| *next >= state.bounds.lo);
                                     self.archive_wire_bytes =
                                         self.archive_wire_bytes.saturating_add(saved.length);
+                                    self.push(Task {
+                                        operation: Operation::Local(LocalStep::Entry {
+                                            request: task.request,
+                                            head: state.bounds.head,
+                                            seq: saved.seq,
+                                            body: true,
+                                            role_header: false,
+                                            phase: EntryPhase::Start,
+                                        }),
+                                        ..task.clone()
+                                    })?;
+                                } else {
+                                    // Current body requests are dependencies of an already
+                                    // retained Local phase. As with normal body_ready delivery,
+                                    // resume that exact owner instead of adding a second Start.
+                                    // A nested dependency may live on tasks while an older,
+                                    // different root occupies the scalar replay slot.
+                                    let owns_body = |pending: &Task| {
+                                        pending.request == task.request
+                                            && pending.purpose == task.purpose
+                                            && matches!(pending.operation,
+                                                Operation::Local(LocalStep::Entry { request, head, seq, body: true, role_header: false, .. })
+                                                if request == task.request
+                                                    && head == state.bounds.head
+                                                    && seq == saved.seq)
+                                    };
+                                    if !self.tasks.iter().any(owns_body)
+                                        && !self.replay.as_ref().is_some_and(owns_body)
+                                    {
+                                        return Err(Error::Profile(
+                                            "completed current body has no retained local owner",
+                                        ));
+                                    }
                                 }
-                                self.push(Task {
-                                    operation: Operation::Local(LocalStep::Entry {
-                                        request: task.request,
-                                        head: state.bounds.head,
-                                        seq: saved.seq,
-                                        body: true,
-                                        role_header: false,
-                                        phase: EntryPhase::Start,
-                                    }),
-                                    ..task.clone()
-                                })?;
                                 return Ok(());
                             }
                             query = Query::Entry {

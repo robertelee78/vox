@@ -62,6 +62,19 @@ pub(super) enum Lookup<T> {
     Missing,
 }
 
+/// Capacity for an exact read, reserved before the durable operation it must follow. It owns
+/// no room lock or store snapshot; the actual read still checks current lifecycle and authority.
+pub(super) struct PreparedRead {
+    charge: BufferCharge,
+    scratch: BufferCharge,
+}
+
+#[derive(Clone, Copy)]
+enum ReadBoundary {
+    Observing,
+    Committed,
+}
+
 #[derive(Clone)]
 pub(super) struct Source {
     pub(super) room: Arc<Mutex<ChannelState>>,
@@ -213,10 +226,14 @@ impl Source {
     }
 
     fn current(&self) -> Result<()> {
+        self.current_at(ReadBoundary::Observing)
+    }
+
+    fn current_at(&self, boundary: ReadBoundary) -> Result<()> {
         if self.fence.is_retired() {
             return Err(Error::Unreachable("history request cancelled"));
         }
-        if Instant::now() >= self.deadline {
+        if matches!(boundary, ReadBoundary::Observing) && Instant::now() >= self.deadline {
             return Err(Error::Unreachable("history request deadline elapsed"));
         }
         Ok(())
@@ -277,6 +294,45 @@ impl Source {
         .await
     }
 
+    /// Pre-admit the exact authority-read envelope before a body append can commit. This
+    /// does no read and confers no authority; read_committed still checks the live room/grant.
+    pub(super) async fn prepare_committed_read(&self, job: &Job) -> Result<Option<PreparedRead>> {
+        self.current()?;
+        self.reserve_read(job, 0, DIRECTORY_ENVELOPE).await
+    }
+
+    pub(super) async fn read_committed<T, F>(
+        &self,
+        admission: PreparedRead,
+        read: F,
+    ) -> Result<Lookup<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
+    {
+        self.read_reserved(admission, ReadBoundary::Committed, read)
+            .await
+    }
+
+    async fn reserve_read(
+        &self,
+        job: &Job,
+        envelope: usize,
+        temporary: usize,
+    ) -> Result<Option<PreparedRead>> {
+        let work_envelope = envelope
+            .checked_add(temporary)
+            .ok_or(Error::SizeLimitExceeded("history read envelope"))?;
+        let Some(work_job) = job.record_job(work_envelope).await else {
+            return Ok(None);
+        };
+        let mut scratch = work_job.reserve_or_pressure(work_envelope)?;
+        let charge = scratch
+            .split_off(envelope)
+            .ok_or(Error::Profile("history read reservation changed"))?;
+        Ok(Some(PreparedRead { charge, scratch }))
+    }
+
     async fn read_charged<T, F>(
         &self,
         job: &Job,
@@ -289,24 +345,32 @@ impl Source {
         F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
     {
         self.current()?;
-        let work_envelope = envelope
-            .checked_add(temporary)
-            .ok_or(Error::SizeLimitExceeded("history read envelope"))?;
-        let Some(work_job) = job.record_job(work_envelope).await else {
-            return Ok(Lookup::Busy);
-        };
-        let mut scratch = match work_job.reserve_or_pressure(work_envelope) {
-            Ok(charge) => charge,
-            // A serving stream keeps its existing wire Busy outcome. An owned client Flow
-            // instead retains the exact local continuation behind this capacity dependency.
+        let admission = match self.reserve_read(job, envelope, temporary).await {
+            Ok(Some(admission)) => admission,
+            Ok(None) => return Ok(Lookup::Busy),
+            // A serving stream retains its wire Busy outcome; an owned client Flow retains
+            // its exact local continuation behind the typed capacity dependency.
             Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
                 return Ok(Lookup::Busy);
             }
             Err(error) => return Err(error),
         };
-        let charge = scratch
-            .split_off(envelope)
-            .ok_or(Error::Profile("history read reservation changed"))?;
+        self.read_reserved(admission, ReadBoundary::Observing, read)
+            .await
+    }
+
+    async fn read_reserved<T, F>(
+        &self,
+        admission: PreparedRead,
+        boundary: ReadBoundary,
+        read: F,
+    ) -> Result<Lookup<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut ChannelState, &Store) -> Result<Option<T>> + Send + 'static,
+    {
+        self.current_at(boundary)?;
+        let PreparedRead { charge, scratch } = admission;
         // A round deadline may end wire work, but it cannot make a queued local room step fail.
         // The mutex release is the causal wake for this bounded operation; wall-clock expiry is
         // neither evidence that the room is wedged nor permission to abandon a publication that
@@ -316,12 +380,12 @@ impl Source {
             () = self.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
             room = self.room.clone().lock_owned() => room,
         };
-        self.current()?;
+        self.current_at(boundary)?;
         let source = self.clone();
         // Once dispatched, the closure owns both charges and the room guard. Dropping the
         // async waiter detaches it; credit cannot be reused while the disk read still runs.
         let task = tokio::task::spawn_blocking(move || {
-            source.current()?;
+            source.current_at(boundary)?;
             let departed_receipt = source.own_head_receipt
                 && room.is_author(&source.peer)
                 && room.has_left(&source.peer);
