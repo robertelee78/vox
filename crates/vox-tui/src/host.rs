@@ -264,7 +264,7 @@ impl Drop for HolderGuard {
                 Some(Slot::Attached(a)) if a.generation == self.generation => {
                     a.holders = a.holders.saturating_sub(1);
                     if a.implicit && a.holders == 0 && a.sessions.is_empty() {
-                        begin_detach(&mut slots, &self.node)
+                        begin_detach(&mut slots, &self.node, &inner.defaults.computer)
                     } else {
                         None
                     }
@@ -297,10 +297,19 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn begin_detach(
     slots: &mut BTreeMap<NodeName, Slot>,
     node: &NodeName,
+    management: &vox_core::node::computer::Management,
 ) -> Option<(Box<Attached>, watch::Sender<DetachOutcome>)> {
     let (tx, rx) = watch::channel(None);
     match slots.insert(node.clone(), Slot::Detaching(rx)) {
-        Some(Slot::Attached(a)) => Some((a, tx)),
+        Some(Slot::Attached(mut a)) => {
+            // Lifecycle supersession belongs to this slot transition, not later actor cleanup.
+            // Drop the exact owned flight now so its guard cannot keep publishing while detach
+            // waits for other work. This same slot lock fences every pending-result writer and
+            // prevents a replacement attachment from acquiring status that we could erase.
+            drop(a.computer_reconciliation.take());
+            management.node_detached(node.as_str());
+            Some((a, tx))
+        }
         Some(other) => {
             slots.insert(node.clone(), other);
             None
@@ -2985,7 +2994,7 @@ impl Router {
                     crate::wake::end_checked(&a.paths, session).map_err(failed)?;
                     a.sessions.remove(session);
                     let going = if a.implicit && a.holders == 0 && a.sessions.is_empty() {
-                        begin_detach(&mut slots, node)
+                        begin_detach(&mut slots, node, &self.inner.defaults.computer)
                     } else {
                         None
                     };
@@ -3042,10 +3051,12 @@ impl Router {
             let step = {
                 let mut slots = lock(&self.inner.slots);
                 match slots.get(node) {
-                    Some(Slot::Attached(_)) => match begin_detach(&mut slots, node) {
-                        Some(going) => DStep::Go(going),
-                        None => DStep::NotAttached,
-                    },
+                    Some(Slot::Attached(_)) => {
+                        match begin_detach(&mut slots, node, &self.inner.defaults.computer) {
+                            Some(going) => DStep::Go(going),
+                            None => DStep::NotAttached,
+                        }
+                    }
                     Some(Slot::Attaching(rx)) => DStep::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => DStep::WaitDetach(rx.clone()),
                     None if matches!(cause, DetachCause::Requested) => {
@@ -3739,7 +3750,7 @@ impl Router {
             let mut slots = lock(&self.inner.slots);
             match slots.get(node) {
                 Some(Slot::Attached(a)) if a.generation == generation => {
-                    begin_detach(&mut slots, node)
+                    begin_detach(&mut slots, node, &self.inner.defaults.computer)
                 }
                 _ => None,
             }

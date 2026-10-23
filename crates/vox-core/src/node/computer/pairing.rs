@@ -1838,6 +1838,13 @@ impl Management {
     pub fn node_applied(&self, node: &str) {
         lock(&self.pending_nodes).remove(node);
     }
+
+    /// Retire the departing attachment's live pending result without claiming application or
+    /// removing historical misses. The daemon calls this synchronously under the slot lock
+    /// which retires that attachment, before any replacement can own or publish its status.
+    pub fn node_detached(&self, node: &str) {
+        lock(&self.pending_nodes).remove(node);
+    }
     fn transport_leases(&self, supplied: Option<&Link>) -> Result<Vec<TransportLease>> {
         let s = lock(&self.computer.state);
         let local = s.description.fingerprint()?;
