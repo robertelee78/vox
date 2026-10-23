@@ -6058,8 +6058,8 @@ fn change_reaches_a_live_computer(
 }
 
 /// Hold one real remote drive mutation at its final publication boundary, move durable Computer
-/// policy through another shipped action, then judge the released request by what shipped
-/// `vox room pause` tells its caller. The marker proves causal staging; no elapsed silence is a
+/// policy through another shipped action, then read the saved pause state through a real Session.
+/// The marker proves causal staging; neither an unknown command reply nor elapsed silence is a
 /// PRODUCT verdict.
 #[allow(clippy::too_many_arguments)]
 fn stale_remote_pause_is_refused(
@@ -6103,6 +6103,40 @@ fn stale_remote_pause_is_refused(
             })
         }),
         "APPARATUS: beta and delta did not both expose the staged room roster"
+    );
+
+    // A real harness hook opens the Session whose shipped read below observes the room's durable
+    // pause state. Prove the exact owner and Session are present before staging the stale write;
+    // otherwise a later missing-session error could be mistaken for an unpaused room.
+    const PAUSE_SESSION: &str = "fx28-stale-pause-session";
+    let payload = format!(
+        r#"{{"session_id":"{PAUSE_SESSION}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"observe the saved room pause state"}}"#,
+        b._tmp.path().display()
+    );
+    let (ok, out, err) = b.run(
+        &["agent", "hook", "--node", "delta", "--room", &room],
+        &payload,
+    );
+    assert!(
+        ok,
+        "APPARATUS: delta's shipped Session hook for stale-pause observation failed: {out}{err}"
+    );
+    assert!(
+        wait_until(RETURN_WITHIN, || {
+            let (ok, listed, _) = b.run(
+                &["room", "sessions", &room, "--node", "delta", "--json"],
+                "",
+            );
+            ok && listed
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|session| {
+                    session["id"] == PAUSE_SESSION
+                        && session["node"] == delta
+                        && session["open"] == true
+                })
+        }),
+        "APPARATUS: delta's exact shipped Session was not registered in the stale-pause room"
     );
 
     std::fs::write(hold_arm, b"hold delta's admitted remote pause\n")
@@ -6162,19 +6196,9 @@ fn stale_remote_pause_is_refused(
         .wait_with_output()
         .expect("APPARATUS: collect the causally released room-pause command");
     let pause_stdout = String::from_utf8_lossy(&paused.stdout);
-    let acknowledged_saved_pause = pause_stdout.lines().any(|line| {
-        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|report| {
-            report["admitted"] == true && report["report"]["selection"]["state"]["paused"] == true
-        })
-    });
-    assert!(
-        !paused.status.success() && !acknowledged_saved_pause,
-        "PRODUCT [FX28 stale-tick-authority]: after durable Computer policy moved while its exact admitted remote pause was held, shipped `vox room pause` still published and acknowledged the stale drive mutation: stdout {}; stderr {}",
-        String::from_utf8_lossy(&paused.stdout),
-        String::from_utf8_lossy(&paused.stderr)
-    );
     println!(
-        "[proof] after durable policy moved, releasing the exact admitted stale-authority publication made shipped `vox room pause` refuse it: stdout {}; stderr {}",
+        "[proof] after durable policy moved, the released stale-authority `vox room pause` command was diagnostic only (exit {}): stdout {}; stderr {}",
+        paused.status,
         pause_stdout.trim(),
         String::from_utf8_lossy(&paused.stderr).trim()
     );
@@ -6184,6 +6208,34 @@ fn stale_remote_pause_is_refused(
                 && roster_current(&computer(b, &["status"]), &["beta", "delta"])
         }),
         "APPARATUS: nodes did not settle after the stale-publication refusal"
+    );
+    let (ok, session_out, session_err) = b.run(
+        &[
+            "room",
+            "session",
+            &room,
+            PAUSE_SESSION,
+            "--node",
+            "delta",
+            "--json",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "APPARATUS: delta's exact registered Session could not read the stale-pause room after reconciliation: stdout {session_out}; stderr {session_err}"
+    );
+    let session_shown = format!("{session_out}{session_err}");
+    assert!(
+        !session_shown.contains("Pause status unknown:"),
+        "APPARATUS: shipped `vox room session` could not establish the saved pause state after reconciliation: {session_shown}"
+    );
+    assert!(
+        !session_shown.contains("Paused by "),
+        "PRODUCT [FX28 stale-tick-authority]: after durable Computer policy moved while its exact admitted remote pause was held, shipped `vox room session` says the stale mutation was durably saved: {session_shown}"
+    );
+    println!(
+        "[proof] shipped `vox room session` read the reconciled room's saved state and did not report the stale remote pause"
     );
 
     // The same final-use rule covers an ordinary local post. Hold it after its room lock and all
