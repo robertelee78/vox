@@ -12,7 +12,8 @@
   the flow-state pool synced nothing); amended 2026-10-21 (FX-37: room creation overflowed a
   normal Tokio worker stack while reconstructing an ML-DSA root key for one signature); amended
   2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict);
-  amended 2026-10-23 (FX-28: atomic node application and durable room-admission rollback)
+  amended 2026-10-23 (FX-28: atomic node application, durable room-admission rollback, fresh
+  pairing requests and observation deadlines that do not discard valid work)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -263,14 +264,18 @@ The decider then answered twelve questions, one at a time. His answers are the d
   period, after the peer becomes reachable again. Two daemons on which nothing changed MUST
   start no pairing exchange except FX-15's named fallback and MUST derive no node binding again.
   A node actor which has not applied the revision at the local observation boundary remains
-  attached but non-authoritative: status names it pending, its prior projection fails every
-  current-policy fence, and a later policy event can reconcile the same unlocked actor. Detaching
-  it would destroy the only in-memory credential able to recover and turn a bounded miss into a
-  permanent unlock requirement. Releasing held work after its original local deadline does not
-  renew that clock: the shipped journey causes a later policy event and requires that event to
-  reconcile the same Ready actor inside its own causal boundary, then restores the original
-  personal-node role through a second independently bounded event before using it in the next
-  room operation.
+  attached but non-authoritative: status names it pending and its prior projection fails every
+  current-policy fence. The accepted application retains ownership and continues when its queue,
+  room lock or storage can progress. Crossing the observation boundary records lateness; it is
+  not an authorization lease and MUST NOT discard still-current work or its unlocked credential.
+  Only an actual policy/expiry change, detach, lock or shutdown supersedes that work. Completion
+  clears the exact owned pending result while preserving the historical miss. A later unrelated
+  policy action, restart or manual retry MUST NOT be required to recover. Startup follows the
+  same distinction: it derives and applies the actual current binding before Ready, repeating
+  only for actual policy supersession within the same accepted startup operation. The shipped
+  journey holds an accepted actor past its observation boundary, observes the miss and fail-closed
+  state, then releases that event and requires usable current authority without another policy
+  action. A late completion never rewrites the original miss as on-time.
   These are the shipped, user-visible work records; a machine-dependent CPU threshold is not a
   verdict. "We need the detection of change logic to be sound. Easy for local daemon to notice,
   but daemon to daemon update needs to be solid" (the decider, 2026-10-20). Decision: a node's binding is derived
@@ -309,12 +314,21 @@ The decider then answered twelve questions, one at a time. His answers are the d
   `repaired-late`; restart and a same-state failed preview preserve both the miss and repair. No
   second exchange is required merely to tell the receiver that the first restored exchange was
   successful. A later operator policy change replaces the old cause in current convergence status,
-  but neither it nor a repair rewrites the original miss as on-time. The daemon-to-node event carries the same absolute deadline and a
-  cancellation token through its bounded queue and actor. Every durable actor stage rechecks both;
-  caller timeout cancels queued work rather than merely dropping its reply, and continuously moving
-  revisions retry until that causal deadline instead of an arbitrary revision count. The shipped
-  journey causally holds one actor, proves its healthy sibling applies while the held actor stays
-  Ready without claiming the new grant, and then releases that exact message. The shipped journey
+  but neither it nor a repair rewrites the original miss as on-time. Decision, 2026-10-23 (the
+  decider): a new explicit pairing request owns its admission boundary; it MUST NOT inherit an
+  older background exchange's elapsed deadline. The old cause keeps its miss and unfinished
+  obligations while the new request checks the code under the existing verification and approval
+  rules. A preview does not acknowledge background delivery. Reserving the peer for that request
+  does not suppress observation of an older background miss or manufacture another sync attempt.
+  Local application ownership is separate from the transport exchange's bounded attempt. The
+  daemon-to-node event names the exact policy revision and expiry plus its attachment/pass owner.
+  Its retained observation deadline classifies on-time versus late; true supersession cancels
+  obsolete work. Every durable actor stage and the final writer fence validate that exact current
+  policy. The owner keeps awaiting the same accepted event after reporting lateness, with no fresh
+  clock, timer-driven reconciliation or retry-count cap. The shipped journey causally holds one
+  actor, proves its healthy sibling applies while the held actor stays Ready without claiming
+  the new grant, and then releases that exact message. Its automatic completion clears pending
+  while the latest local miss per node remains durably visible across restart. The shipped journey
   also restarts one daemon with its Unix clock one hour ahead and then proves changes in both
   directions from a causal observation on the proof process's monotonic clock, never by comparing
   either daemon's Unix timestamp. After those clock-independence and quiet-boundary claims, its
