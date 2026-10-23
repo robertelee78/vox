@@ -711,11 +711,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
 
   > **Decision amendment (the decider, 2026-10-23).** The pool limit is exactly
   > `2 × active-or-retiring hosted node identities`, with no fixed or minimum floor; generations
-  > of one identity share its two running positions. A parked continuation retains its exact
-  > actor-owned `Flow` but no worker, byte charge, outbound slot or flow-state charge. The causal
-  > release and retention requirements above remain. This approved Decision replaces the earlier
-  > unapproved `max(16, 2 × hosted identities)` formula and its incorrect 2026-10-21 attribution;
-  > the measured historical 16-of-16 failure remains evidence, not a capacity policy.
+  > of one identity share its two running positions. Parked work retains its exact actor-owned
+  > `Flow` but no worker, byte charge, outbound slot or flow-state charge. This replaces the
+  > earlier `max(16, 2 × hosted identities)` formula; the causal release and retention requirements
+  > above remain. Historical 16-of-16 measurements describe the defect, not the capacity policy.
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
