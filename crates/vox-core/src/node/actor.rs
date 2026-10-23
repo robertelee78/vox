@@ -1513,6 +1513,11 @@ enum NetEvent {
     JoinAdmit {
         /// The room being joined.
         channel_id: Digest32,
+        /// The exact live room and attachment which supplied the authenticated exchange context.
+        original: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        attachment: u64,
+        /// The identity authenticated by the join's transport and proof.
+        peer: Digest32,
         /// The joiner's proven identity.
         identity: Box<crate::identity::composite::CompositePublicKey>,
         /// The witness this node signed for it (ADR-016 M17.6): kept, as an admission notice, so
@@ -9404,13 +9409,15 @@ impl Node {
             }
             NetEvent::JoinAdmit {
                 channel_id,
+                original,
+                attachment,
+                peer,
                 identity,
                 witness,
                 ack,
             } => {
                 // The join proved this identity; admit it as an author so its entries — and its
                 // records on this node's board — are accepted. Reading still needs consent.
-                let now_ms = self.now_ms();
                 // **Test-only** (`test-knobs`): this node fails every joiner's admission as a node
                 // locked mid-join does — admitting nothing — so a proof can see what the joiner is
                 // told.
@@ -9427,8 +9434,46 @@ impl Node {
                 ) {
                     (Some(profile), Some(shared), Some(authority)) => {
                         let mut ch = shared.lock().await;
+                        let now_ms = self.now_ms();
                         authority
-                            .publish(|| {
+                            .publish(|| -> crate::error::Result<Option<String>> {
+                                // Authentication ran off actor while this room could end, leave,
+                                // close/reopen, or change epoch. Admission is the irreversible
+                                // boundary: recheck the exact live owner and witness under this
+                                // same lock, immediately before any author/notice mutation.
+                                if attachment != self.delivery_epoch
+                                    || original
+                                        .upgrade()
+                                        .is_none_or(|original| !Arc::ptr_eq(&original, &shared))
+                                {
+                                    return Err(Error::JoinRefused(
+                                        "the room or attachment changed during the join",
+                                    ));
+                                }
+                                if ch.ended(now_ms.get()).is_some() {
+                                    return Err(Error::JoinRoomEnded);
+                                }
+                                if ch.has_left(&ch.me()) {
+                                    return Err(Error::JoinResponderLeft);
+                                }
+                                if !ch.can_answer_join() {
+                                    return Err(Error::JoinRefused(
+                                        "the room can no longer answer this join",
+                                    ));
+                                }
+                                if identity.fingerprint() != peer {
+                                    return Err(Error::MalformedJoin(
+                                        "admission identity differs from the authenticated joiner",
+                                    ));
+                                }
+                                witness.verify(
+                                    &crate::identity::composite::RootSigner::public_key(
+                                        profile.signer()?,
+                                    ),
+                                    &channel_id,
+                                    ch.epoch(),
+                                    &peer,
+                                )?;
                                 let admitted = ch
                                     .admit_author(profile.store(), &identity, now_ms)
                                     .map(|_| ch.name().map(str::to_owned));
@@ -11744,6 +11789,8 @@ impl Node {
         let tx = self.net_tx.clone();
         self.reap_join_tasks();
         let admit_tx = self.net_tx.clone();
+        let admission_room = Arc::downgrade(&shared);
+        let attachment = self.delivery_epoch;
         let signals = Some((slot.worked(), slot.take_ended()));
         let log_node = self
             .paths
@@ -11782,6 +11829,9 @@ impl Node {
                         let admitted = if admit_tx
                             .send(NetEvent::JoinAdmit {
                                 channel_id,
+                                original: admission_room,
+                                attachment,
+                                peer,
                                 identity: Box::new(identity),
                                 witness: Box::new(witness),
                                 ack,
@@ -16224,6 +16274,17 @@ impl Node {
             return Err(Error::Profile("no such room on this node"));
         };
         let c = shared.lock().await;
+        if c.ended((self.millis_clock)()).is_some() {
+            return Err(Error::JoinRoomEnded);
+        }
+        if c.has_left(&c.me()) {
+            return Err(Error::JoinResponderLeft);
+        }
+        if !c.can_answer_join() {
+            return Err(Error::JoinRefused(
+                "the room can no longer answer this join",
+            ));
+        }
         if c.is_author(&joiner) {
             return Ok((c.epoch(), Vec::new()));
         }

@@ -1267,6 +1267,8 @@ where
                     let refusal = match e {
                         Error::RoomFull { members } => JoinFrame::Full { members },
                         Error::SeatTaken => JoinFrame::Taken,
+                        Error::JoinRoomEnded => JoinFrame::Rejected(JoinReject::RoomEnded),
+                        Error::JoinResponderLeft => JoinFrame::Rejected(JoinReject::ResponderLeft),
                         Error::SeatNotAgreed { member, unanswered } => {
                             JoinFrame::NotAgreed { member, unanswered }
                         }
