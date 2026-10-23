@@ -470,11 +470,20 @@ type ByteWake = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 
 
 /// A failed record allocation's exact capacity dependency. It retains no worker slot or
 /// allocation charge; poll it only after the refused step's temporary buffers have dropped.
-pub(crate) struct BytePressure {
+pub struct BytePressure {
     budget: Arc<Budget>,
     lane: Lane,
     required: usize,
     wake: ByteWake,
+}
+
+impl std::fmt::Debug for BytePressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BytePressure")
+            .field("lane", &self.lane)
+            .field("required", &self.required)
+            .finish_non_exhaustive()
+    }
 }
 
 fn byte_wake(budget: &Budget, lane: Lane) -> ByteWake {
@@ -538,6 +547,27 @@ impl Job {
             required,
             wake: byte_wake(&self.0.budget, self.0.lane),
         })
+    }
+
+    /// Successful demand work allocates no waiter. On refusal subscribe and retry once before
+    /// retaining the exact dependency: a release between the first check and enrollment is
+    /// observed by the second check. Control's running Flow-state charge is included in the
+    /// fresh envelope; independent pools are never summed.
+    pub(crate) fn reserve_or_pressure(&self, bytes: usize) -> crate::error::Result<BufferCharge> {
+        if let Some(charge) = self.reserve(bytes) {
+            return Ok(charge);
+        }
+        let required = self
+            .0
+            .bytes
+            .load(Ordering::Acquire)
+            .checked_add(bytes)
+            .ok_or(crate::error::Error::SizeLimitExceeded(
+                "history working envelope",
+            ))?;
+        let pressure = self.byte_pressure(required)?;
+        self.reserve(bytes)
+            .ok_or_else(|| crate::error::Error::HistoryCapacity(Box::new(pressure)))
     }
 
     pub(crate) fn flow_owner(&self) -> Option<u64> {

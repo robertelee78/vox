@@ -403,11 +403,6 @@ impl Page {
 /// The actor replaced, paused or stopped this request; a worker still holding its context stops
 /// at its next store step. A local decision, never a fault of the room or of the peer.
 pub(crate) const CANCELLED: &str = "history worker was cancelled";
-const BUFFER_BUSY: &str = "history demand buffer budget is busy";
-
-pub(crate) fn buffer_busy(error: &Error) -> bool {
-    matches!(error, Error::Profile(BUFFER_BUSY))
-}
 
 fn invalid(message: &'static str) -> Error {
     Error::Profile(message)
@@ -416,7 +411,7 @@ fn bad() -> Error {
     Error::MalformedAtRest("history demand state")
 }
 fn charge(job: &Job, bytes: usize) -> Result<BufferCharge> {
-    job.reserve(bytes).ok_or_else(|| invalid(BUFFER_BUSY))
+    job.reserve_or_pressure(bytes)
 }
 
 /// The exact demand-state working envelope prepaid with a staged record. Semantic application
@@ -426,6 +421,9 @@ pub(crate) struct AdmissionCharge {
 }
 
 impl AdmissionCharge {
+    pub(crate) fn reserve(job: &Job) -> Result<Self> {
+        charge(job, STATE_WORK).map(|charge| Self { _charge: charge })
+    }
     /// Peak while reconstructing a staged body: one page's temporary state/page buffers and,
     /// when it shares the record's lane, the original demand Snapshot are simultaneously live.
     pub(crate) fn reconstruction_peak(record: usize, shared_snapshot: bool) -> Result<usize> {
@@ -588,7 +586,14 @@ fn next_serial(serial: u64) -> Result<u64> {
 
 /// Local status/cache inspection only; does not create an Active handle or request peer work.
 pub fn inspect(context: &Context, job: &Job) -> Result<Option<Snapshot>> {
-    let charge = charge(job, STATE_WORK)?;
+    inspect_precharged(context, AdmissionCharge::reserve(job)?)
+}
+
+pub(crate) fn inspect_precharged(
+    context: &Context,
+    admission: AdmissionCharge,
+) -> Result<Option<Snapshot>> {
+    let charge = admission._charge;
     let key = key(context)?;
     let scope = scope(context);
     context
@@ -1086,7 +1091,17 @@ pub fn checkpoint(
     cursor: Option<&Continuation>,
     job: &Job,
 ) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    checkpoint_precharged(context, active, progress, cursor, &charge)
+}
+
+pub(crate) fn checkpoint_precharged(
+    context: &Context,
+    active: &mut Active,
+    progress: Progress,
+    cursor: Option<&Continuation>,
+    _charge: &AdmissionCharge,
+) -> Result<()> {
     if matches!(progress, Progress::Cancelled | Progress::Paused) {
         return Err(invalid("use explicit history cancel/pause"));
     }
@@ -1219,8 +1234,11 @@ pub(crate) fn checkpoint_legacy(
     Ok(())
 }
 
-pub fn pause(context: &Context, active: &mut Active, job: &Job) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
+pub(crate) fn pause_precharged(
+    context: &Context,
+    active: &mut Active,
+    _charge: &AdmissionCharge,
+) -> Result<()> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;

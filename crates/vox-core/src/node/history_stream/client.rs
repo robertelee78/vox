@@ -23,6 +23,20 @@ const ENTRY_VALIDATION_WORK: usize = 512 * 1024;
 // One atomic metadata object, or one selected staged body, per receiver handoff.
 const MAX_NEEDS: usize = 1;
 
+fn fresh_worker_peak(job: &crate::node::history_budget::Job, bytes: usize) -> Result<usize> {
+    bytes
+        .checked_add(
+            if job.lane() == crate::node::history_budget::Lane::Control {
+                crate::node::history_budget::FLOW_STATE_BYTES
+            } else {
+                0
+            },
+        )
+        .ok_or(Error::SizeLimitExceeded(
+            "history record reconstruction envelope",
+        ))
+}
+
 /// Proof-only interruption point after a hostile nonrecipient body has been refused and the
 /// archive cursor is durably parked on its authenticated header, but before semantic settlement.
 /// The trigger is renamed with `.engaged`; removing that engaged marker releases the worker.
@@ -527,7 +541,6 @@ impl Receiver {
                                     &header,
                                     &job,
                                 )?;
-                                current(&fence, deadline)?;
                                 Ok(expected_offset)
                             })
                             .await
@@ -795,9 +808,12 @@ impl Receiver {
             else {
                 return Ok(Assembly::Busy);
             };
-            let peak = demand::AdmissionCharge::reconstruction_peak(
-                envelope,
-                job.lane() == record_job.lane(),
+            let peak = fresh_worker_peak(
+                &record_job,
+                demand::AdmissionCharge::reconstruction_peak(
+                    envelope,
+                    job.lane() == record_job.lane(),
+                )?,
             )?;
             let pressure = record_job.byte_pressure(peak)?;
             let Some(mut charge) = record_job.reserve(envelope) else {
@@ -813,13 +829,7 @@ impl Receiver {
                 .div_ceil(crate::log::history::MAX_CHUNK_BYTES as u64)
             {
                 current(&fence, deadline)?;
-                let held = match demand::read_page(&staging.context, &active, page, &record_job) {
-                    Ok(held) => held,
-                    Err(error) if demand::buffer_busy(&error) => {
-                        return Ok(Assembly::BytePressure(pressure));
-                    }
-                    Err(error) => return Err(error),
-                };
+                let held = demand::read_page(&staging.context, &active, page, &record_job)?;
                 payload.extend_from_slice(held.as_slice());
             }
             entry.payload = Some(payload);
@@ -999,7 +1009,6 @@ impl Receiver {
                 normalized.as_ref(),
                 &job,
             )?;
-            current(&fence, deadline)?;
             Ok(normalized)
         })
         .await
@@ -1046,11 +1055,14 @@ impl Receiver {
         let Some(record_job) = job.record_job(envelope).await else {
             return Ok(Assembly::Busy);
         };
-        let peak = envelope
-            .checked_add(local_work.max(RECORD_METADATA_WORK))
-            .ok_or(Error::SizeLimitExceeded(
-                "history record reconstruction envelope",
-            ))?;
+        let peak = fresh_worker_peak(
+            &record_job,
+            envelope
+                .checked_add(local_work.max(RECORD_METADATA_WORK))
+                .ok_or(Error::SizeLimitExceeded(
+                    "history record reconstruction envelope",
+                ))?,
+        )?;
         let pressure = record_job.byte_pressure(peak)?;
         let Some(mut charge) = record_job.reserve(envelope) else {
             return Ok(Assembly::BytePressure(pressure));

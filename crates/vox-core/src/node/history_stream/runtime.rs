@@ -40,10 +40,15 @@ enum Operation {
         seq: u64,
     },
     Wire(Query),
+    /// A refused local allocation may follow a durable body append/checkpoint. Rebind from
+    /// the exact saved staging cursor before another network request, rather than replaying
+    /// an old offset or forgetting a complete body's remaining semantic application.
+    ResumeWire(Query),
     LocalProof(Query),
     Local(LocalStep),
     Reclaim(Purpose),
     ReclaimUnavailable,
+    FinishArchive,
     Governance,
 }
 /// How long one turn keeps running local slices before it yields to the actor.
@@ -731,6 +736,7 @@ impl Flow {
                     | Operation::Tail { .. }
                     | Operation::Reclaim(_)
                     | Operation::ReclaimUnavailable
+                    | Operation::FinishArchive
                     | Operation::Governance
             )
         )
@@ -758,9 +764,11 @@ impl Flow {
             .or(self.replay.as_ref())
             .map(|task| (&task.operation, task.purpose))
         {
-            Some((Operation::Wire(Query::Entry { .. } | Query::Page { .. }), Purpose::History)) => {
-                Lane::Archive
-            }
+            Some((
+                Operation::Wire(Query::Entry { .. } | Query::Page { .. })
+                | Operation::ResumeWire(Query::Entry { .. } | Query::Page { .. }),
+                Purpose::History,
+            )) => Lane::Archive,
             Some((_, Purpose::Live)) => Lane::Live,
             _ => Lane::Control,
         }
@@ -1010,6 +1018,17 @@ impl Flow {
                     now,
                 )
                 .await;
+            let result = match result {
+                Err(Error::HistoryCapacity(pressure)) => {
+                    // Initialization/publication-owner reads precede task selection. Their
+                    // allocation refusal retains the unchanged stack; no popped task exists
+                    // to reconstruct here. Post-selection helpers retain their own phase.
+                    self.byte_pressure = Some(*pressure);
+                    self.waiting = true;
+                    Ok(())
+                }
+                result => result,
+            };
             slices += 1;
             let publication_active = self.active_publication_owner().is_some();
             if result.is_err()
@@ -1142,7 +1161,60 @@ impl Flow {
         if !self.archive {
             self.request = task.request;
         }
+        let mut retry_task = Some(Task {
+            operation: match &task.operation {
+                Operation::Wire(query) => Operation::ResumeWire(query.clone()),
+                operation => operation.clone(),
+            },
+            ..task.clone()
+        });
+        let result = self
+            .execute_task(
+                task,
+                source,
+                store,
+                conn,
+                job,
+                fence,
+                deadline,
+                inbox,
+                inbox_generation,
+                now,
+                &mut retry_task,
+            )
+            .await;
+        match result {
+            Err(Error::HistoryCapacity(pressure)) => {
+                if let Some(task) = retry_task {
+                    self.push(task)?;
+                }
+                self.byte_pressure = Some(*pressure);
+                self.waiting = true;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// Each fallible helper owns either the still-popped task or a more precise finalization
+    /// continuation. Successfully derived tasks remain on the stack and are never rolled back.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_task(
+        &mut self,
+        task: Task,
+        source: Source,
+        store: Arc<Store>,
+        conn: &VoxConnection,
+        job: &Job,
+        fence: Arc<Fence>,
+        deadline: tokio::time::Instant,
+        inbox: &super::HintInbox,
+        inbox_generation: u64,
+        now: u64,
+        retry_task: &mut Option<Task>,
+    ) -> Result<()> {
         let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
+        let resuming_wire = matches!(task.operation, Operation::ResumeWire(_));
         match task.operation.clone() {
             Operation::LiveWindow { author, head } => {
                 if author == self.node {
@@ -1552,13 +1624,76 @@ impl Flow {
                     }
                 }
             }
-            Operation::Wire(mut query) => {
+            Operation::Wire(mut query) | Operation::ResumeWire(mut query) => {
                 let body = matches!(query, Query::Entry { .. } | Query::Page { .. });
+                if resuming_wire && body {
+                    if let Some(staging) = self.stage(task.purpose) {
+                        let snapshot = inspect(&staging.context, job)
+                            .await?
+                            .ok_or(Error::Profile("history retry state missing"))?;
+                        let active = staging
+                            .active
+                            .lock()
+                            .map_err(|_| Error::Profile("history activation lock failed"))?;
+                        let state = snapshot.state();
+                        if !active.matches(state)
+                            || active.request() != task.request
+                            || active.binding() != self.binding()
+                        {
+                            return Err(Error::Profile("history retry activation changed"));
+                        }
+                        if let Some(saved) = &state.body {
+                            let exact = match query {
+                                Query::Entry { head, seq, .. } => {
+                                    head == state.bounds.head && seq == saved.seq
+                                }
+                                Query::Page { head, lo, hi, .. } => {
+                                    head == state.bounds.head && saved.seq >= lo && saved.seq <= hi
+                                }
+                                _ => false,
+                            };
+                            if !exact {
+                                return Err(Error::Profile(
+                                    "history retry body differs from request",
+                                ));
+                            }
+                            if saved.offset == saved.length {
+                                // Bytes alone establish no room effect. Resume the normal opaque
+                                // inclusion/control/authority checks under the original request.
+                                if task.purpose == Purpose::History {
+                                    self.archive_next = saved
+                                        .seq
+                                        .checked_sub(1)
+                                        .filter(|next| *next >= state.bounds.lo);
+                                    self.archive_wire_bytes =
+                                        self.archive_wire_bytes.saturating_add(saved.length);
+                                }
+                                self.push(Task {
+                                    operation: Operation::Local(LocalStep::Entry {
+                                        request: task.request,
+                                        head: state.bounds.head,
+                                        seq: saved.seq,
+                                        body: true,
+                                        role_header: false,
+                                        phase: EntryPhase::Start,
+                                    }),
+                                    ..task.clone()
+                                })?;
+                                return Ok(());
+                            }
+                            query = Query::Entry {
+                                head: state.bounds.head,
+                                seq: saved.seq,
+                                offset: saved.offset,
+                            };
+                        }
+                    }
+                }
                 if task.purpose == Purpose::History
                     && body
                     && self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES
                 {
-                    self.finish_archive(job).await?;
+                    self.finish_archive_owned(job, &task, retry_task).await?;
                     self.tasks.clear();
                     return Ok(());
                 }
@@ -1760,7 +1895,7 @@ impl Flow {
                 }
                 if matches!(result.status, Status::BodyNotHeld | Status::Cancelled) {
                     if self.archive && body {
-                        self.finish_archive(job).await?;
+                        self.finish_archive_owned(job, &task, retry_task).await?;
                         self.tasks.clear();
                         return Ok(());
                     }
@@ -1882,13 +2017,23 @@ impl Flow {
                     // edge retries this same owner. In particular, do not checkpoint/pause the
                     // shipped archive request and require a person to resume work the peer only
                     // deferred.
-                    self.push(task)?;
+                    // A Busy delivery may follow a committed body append but precede its
+                    // body_ready handoff (authorization/ACK metadata can yield). Preserve Busy
+                    // pacing and rebind this exact body from disk on the next allowed turn.
+                    self.push(Task {
+                        operation: if body {
+                            Operation::ResumeWire(query)
+                        } else {
+                            task.operation.clone()
+                        },
+                        ..task
+                    })?;
                     self.waiting = true;
                     return Ok(());
                 }
                 if result.status == Status::EvidenceUnavailable {
                     if self.archive && body {
-                        self.finish_archive(job).await?;
+                        self.finish_archive_owned(job, &task, retry_task).await?;
                         self.tasks.clear();
                     } else {
                         self.push(task)?;
@@ -1916,35 +2061,39 @@ impl Flow {
                     } else if result.body_ready.is_none() {
                         // The one requested quantum ended. Its exact body/page continuation is
                         // already durable; only a new explicit Resume may request more bytes.
-                        self.finish_archive(job).await?;
+                        self.finish_archive_owned(job, &task, retry_task).await?;
                         self.tasks.clear();
                         return Ok(());
-                    }
-                    let staging = self
-                        .history
-                        .as_ref()
-                        .ok_or(Error::Profile("archive staging missing"))?;
-                    let state = inspect(&staging.context, job)
-                        .await?
-                        .ok_or(Error::Profile("archive state missing"))?;
-                    if let Some(body) = &state.state().body {
-                        self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
-                        self.archive_wire_bytes =
-                            self.archive_wire_bytes.saturating_add(body.length);
-                        self.push(Task {
-                            request: wire_request,
-                            purpose: Purpose::History,
-                            operation: Operation::Local(LocalStep::Entry {
+                    } else {
+                        let staging = self
+                            .history
+                            .as_ref()
+                            .ok_or(Error::Profile("archive staging missing"))?;
+                        let state = inspect(&staging.context, job)
+                            .await?
+                            .ok_or(Error::Profile("archive state missing"))?;
+                        if let Some(body) = &state.state().body {
+                            self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
+                            self.archive_wire_bytes =
+                                self.archive_wire_bytes.saturating_add(body.length);
+                            self.push(Task {
                                 request: wire_request,
-                                head: state.state().bounds.head,
-                                seq: body.seq,
-                                body: true,
-                                role_header: false,
-                                phase: EntryPhase::Start,
-                            }),
-                        })?;
+                                purpose: Purpose::History,
+                                operation: Operation::Local(LocalStep::Entry {
+                                    request: wire_request,
+                                    head: state.state().bounds.head,
+                                    seq: body.seq,
+                                    body: true,
+                                    role_header: false,
+                                    phase: EntryPhase::Start,
+                                }),
+                            })?;
+                        }
                     }
                 }
+                // No demand helper follows these derived tasks. In particular a role-only
+                // header needs no body inspect after its exact Local continuation was pushed.
+                *retry_task = None;
                 for query in result.needs.into_iter().rev() {
                     self.push(Task {
                         request: task.request,
@@ -1987,6 +2136,9 @@ impl Flow {
             }
             Operation::Local(step) => {
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
+                // The returned next/need now owns the continuation. Archive finalization
+                // installs its own retry instead of duplicating a next phase pushed below.
+                *retry_task = None;
                 if let Some(next) = result.next {
                     if matches!(next, LocalStep::Entry { head, seq, phase: EntryPhase::Effect(_), .. }
                         if self.live_unavailable == Some((head, seq)))
@@ -2090,7 +2242,7 @@ impl Flow {
                             return Err(Error::MalformedAtRest("body dependency has no entry"));
                         };
                         if task.purpose == Purpose::History {
-                            self.finish_archive(job).await?;
+                            self.finish_archive_owned(job, &task, retry_task).await?;
                             self.tasks.clear();
                         } else {
                             self.push(Task {
@@ -2157,7 +2309,7 @@ impl Flow {
                     && self.tasks.is_empty()
                     && !self.archive_continue(job).await?
                 {
-                    self.finish_archive(job).await?;
+                    self.finish_archive_owned(job, &task, retry_task).await?;
                 }
             }
             Operation::ReclaimUnavailable => {
@@ -2169,6 +2321,10 @@ impl Flow {
                 if !self.reclaim_stage(Purpose::Live, job, true).await? {
                     self.push(task)?;
                 }
+            }
+            Operation::FinishArchive => {
+                self.finish_archive(job).await?;
+                self.tasks.clear();
             }
             Operation::Governance => {
                 let generation = self.generation;
@@ -2383,6 +2539,19 @@ impl Flow {
         Ok(true)
     }
 
+    async fn finish_archive_owned(
+        &mut self,
+        job: &Job,
+        task: &Task,
+        retry_task: &mut Option<Task>,
+    ) -> Result<()> {
+        *retry_task = Some(Task {
+            operation: Operation::FinishArchive,
+            ..task.clone()
+        });
+        self.finish_archive(job).await
+    }
+
     async fn finish_archive(&mut self, job: &Job) -> Result<()> {
         let Some(staging) = self.history.clone() else {
             return Ok(());
@@ -2398,8 +2567,23 @@ impl Flow {
                         .active
                         .lock()
                         .map_err(|_| Error::Profile("history activation lock failed"))?;
-                    if snapshot.state().body.is_none() && !snapshot.state().reclaiming() {
+                    if snapshot.state().request != active.request()
+                        || snapshot.state().binding != active.binding()
+                    {
+                        return Err(Error::Profile("archive finalization activation changed"));
+                    }
+                    // Role-only admission can already have completed this request. A terminal
+                    // or deliberately paused activation is a durable result, never permission
+                    // to checkpoint again through an invalid live handle.
+                    if active.matches(snapshot.state())
+                        && snapshot.state().body.is_none()
+                        && !snapshot.state().reclaiming()
+                    {
                         if let Some(next) = next {
+                            // This branch ends More/Complete, so it never needs a subsequent
+                            // pause. Prepay only its work and single reload before the commit.
+                            let work = demand::AdmissionCharge::reserve(&job)?;
+                            let reload = demand::AdmissionCharge::reserve(&job)?;
                             let state = snapshot.state();
                             let cursor = (next >= state.bounds.lo && state.remaining > 0)
                                 .then_some(super::Continuation {
@@ -2412,7 +2596,7 @@ impl Flow {
                                     offset: 0,
                                     entries_remaining: state.remaining,
                                 });
-                            demand::checkpoint(
+                            demand::checkpoint_precharged(
                                 &staging.context,
                                 &mut active,
                                 if cursor.is_some() {
@@ -2421,17 +2605,19 @@ impl Flow {
                                     demand::Progress::Complete
                                 },
                                 cursor.as_ref(),
-                                &job,
+                                &work,
                             )?;
-                            snapshot = demand::inspect(&staging.context, &job)?
+                            snapshot = demand::inspect_precharged(&staging.context, reload)?
                                 .ok_or(Error::Profile("archive state missing"))?;
                         }
                     }
                     if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
+                        let work = demand::AdmissionCharge::reserve(&job)?;
+                        let reload = demand::AdmissionCharge::reserve(&job)?;
                         // This explicit quantum has ended; no worker will silently retry it.
                         // Keep its exact body/cursor and make Resume the next action.
-                        demand::pause(&staging.context, &mut active, &job)?;
-                        snapshot = demand::inspect(&staging.context, &job)?
+                        demand::pause_precharged(&staging.context, &mut active, &work)?;
+                        snapshot = demand::inspect_precharged(&staging.context, reload)?
                             .ok_or(Error::Profile("archive state missing"))?;
                     }
                     Ok(crate::node::actor::saved_history_status(

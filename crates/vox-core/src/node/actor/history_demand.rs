@@ -1292,7 +1292,29 @@ fn prepare(
             fence,
         );
     }
-    let (bounds, author, query, active, remaining) = if let Action::Resume { request } = action {
+    // This immutable room snapshot determines whether activation must be followed by
+    // a durable pause. Reserve that follow-up before start/resume can commit an Active;
+    // cached/no-selection paths never acquire an unnecessary pause credit.
+    enum PeerAdmission {
+        Available(Digest32),
+        Unavailable(demand::AdmissionCharge),
+    }
+    let peer = peers
+        .into_iter()
+        .find(|peer| room.is_member(peer) && !room.has_left(peer));
+    let admit_peer = || {
+        peer.map_or_else(
+            || {
+                demand::AdmissionCharge::reserve(job)
+                    .map(PeerAdmission::Unavailable)
+                    .map_err(|e| e.to_string())
+            },
+            |peer| Ok(PeerAdmission::Available(peer)),
+        )
+    };
+    let (bounds, author, query, active, remaining, peer) = if let Action::Resume { request } =
+        action
+    {
         let saved = saved.as_ref().ok_or("No history request is saved.")?;
         let state = saved.state();
         if state.request != request {
@@ -1330,6 +1352,7 @@ fn prepare(
                 wire_bytes: 1024 * 1024,
             }
         };
+        let peer = admit_peer()?;
         let active = demand::resume(&context, request, binding, job).map_err(|e| e.to_string())?;
         (
             state.bounds,
@@ -1337,6 +1360,7 @@ fn prepare(
             query,
             active,
             state.remaining,
+            peer,
         )
     } else {
         // An explicit new ask is the person's newer intent: it ends a paused earlier quantum
@@ -1370,6 +1394,7 @@ fn prepare(
             return Ok(answer);
         };
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
+        let peer = admit_peer()?;
         let active =
             demand::start(&context, request, binding, bounds, job).map_err(|e| e.to_string())?;
         let query = Query::Page {
@@ -1379,26 +1404,26 @@ fn prepare(
             entries: bounds.entries,
             wire_bytes: 1024 * 1024,
         };
-        (bounds, author, query, active, bounds.entries)
+        (bounds, author, query, active, bounds.entries, peer)
     };
     let request = active.request();
-    let Some(peer) = peers
-        .into_iter()
-        .find(|peer| room.is_member(peer) && !room.has_left(peer))
-    else {
-        let mut active = active;
-        demand::pause(&context, &mut active, job).map_err(|e| e.to_string())?;
-        answer.status = status(
-            id,
-            instance,
-            Phase::Unavailable,
-            "No trusted room peer is available; this request is saved and paused.",
-        );
-        answer.status.request = Some(request);
-        answer.status.head = Some(bounds.head);
-        answer.status.author = Some(author);
-        answer.status.remaining = remaining;
-        return Ok(answer);
+    let peer = match peer {
+        PeerAdmission::Available(peer) => peer,
+        PeerAdmission::Unavailable(credit) => {
+            let mut active = active;
+            demand::pause_precharged(&context, &mut active, &credit).map_err(|e| e.to_string())?;
+            answer.status = status(
+                id,
+                instance,
+                Phase::Unavailable,
+                "No trusted room peer is available; this request is saved and paused.",
+            );
+            answer.status.request = Some(request);
+            answer.status.head = Some(bounds.head);
+            answer.status.author = Some(author);
+            answer.status.remaining = remaining;
+            return Ok(answer);
+        }
     };
     answer.status = status(
         id,
@@ -1465,7 +1490,21 @@ fn prepare_private(
         audience: peer,
         grant: answer.generation,
     };
-    let (bounds, plan, mut active) = if let Action::Resume { request } = action {
+    let donor_unavailable = !peers.contains(&peer) || peer == node;
+    let admit_followup = || {
+        // Preserve the fresh durable status read after activation, without allowing its
+        // byte reservation (or an unavailable donor's pause) to hide that committed result.
+        let inspect_credit = demand::AdmissionCharge::reserve(job).map_err(|e| e.to_string())?;
+        let pause_credit = donor_unavailable
+            .then(|| demand::AdmissionCharge::reserve(job))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((inspect_credit, pause_credit))
+    };
+    let (bounds, plan, mut active, inspect_credit, pause_credit) = if let Action::Resume {
+        request,
+    } = action
+    {
         let state = saved.ok_or("No saved private history request.")?;
         let plan = state
             .private
@@ -1480,8 +1519,9 @@ fn prepare_private(
                     .into(),
             );
         }
+        let (inspect_credit, pause_credit) = admit_followup()?;
         let active = demand::resume(&context, request, binding, job).map_err(|e| e.to_string())?;
-        (state.bounds, plan, active)
+        (state.bounds, plan, active, inspect_credit, pause_credit)
     } else {
         if let Some(state) = saved.filter(|s| {
             !matches!(
@@ -1524,16 +1564,17 @@ fn prepare_private(
             positions: Vec::new(),
         };
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
+        let (inspect_credit, pause_credit) = admit_followup()?;
         let active = demand::start_private(&context, request, binding, bounds, plan.clone(), job)
             .map_err(|e| e.to_string())?;
-        (bounds, plan, active)
+        (bounds, plan, active, inspect_credit, pause_credit)
     };
-    let snapshot = demand::inspect(&context, job)
+    let snapshot = demand::inspect_precharged(&context, inspect_credit)
         .map_err(|e| e.to_string())?
         .ok_or("Private history state disappeared.")?;
     answer.status = saved_status(snapshot.state(), None, Some(&active));
-    if !peers.contains(&peer) || peer == node {
-        demand::pause(&context, &mut active, job).map_err(|e| e.to_string())?;
+    if let Some(credit) = pause_credit {
+        demand::pause_precharged(&context, &mut active, &credit).map_err(|e| e.to_string())?;
         answer.status.phase = Phase::Paused;
         answer.status.detail =
             "The selected private donor is unavailable; resume explicitly after it reconnects."

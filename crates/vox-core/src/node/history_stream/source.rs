@@ -295,12 +295,18 @@ impl Source {
         let Some(work_job) = job.record_job(work_envelope).await else {
             return Ok(Lookup::Busy);
         };
-        let Some(charge) = work_job.reserve(envelope) else {
-            return Ok(Lookup::Busy);
+        let mut scratch = match work_job.reserve_or_pressure(work_envelope) {
+            Ok(charge) => charge,
+            // A serving stream keeps its existing wire Busy outcome. An owned client Flow
+            // instead retains the exact local continuation behind this capacity dependency.
+            Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
+                return Ok(Lookup::Busy);
+            }
+            Err(error) => return Err(error),
         };
-        let Some(scratch) = work_job.reserve(temporary) else {
-            return Ok(Lookup::Busy);
-        };
+        let charge = scratch
+            .split_off(envelope)
+            .ok_or(Error::Profile("history read reservation changed"))?;
         // A round deadline may end wire work, but it cannot make a queued local room step fail.
         // The mutex release is the causal wake for this bounded operation; wall-clock expiry is
         // neither evidence that the room is wedged nor permission to abandon a publication that
