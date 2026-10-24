@@ -719,6 +719,24 @@ impl Job {
         if !std::path::Path::new(&path).exists() {
             return;
         }
+        // An optional canonical room selector scopes only this proof barrier. All legacy
+        // contents, including an empty file, retain the existing all-room hold behavior.
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Some(selected) = contents
+                .strip_prefix("room=")
+                .and_then(|selected| selected.strip_suffix('\n'))
+            {
+                if let Ok(selected_room) =
+                    crate::node::link::b32_decode(selected, "proof hold room")
+                {
+                    if crate::node::link::b32_encode(&selected_room) == selected
+                        && selected_room != room
+                    {
+                        return;
+                    }
+                }
+            }
+        }
         let Some(owner) = self.0.flow_owner else {
             return;
         };
