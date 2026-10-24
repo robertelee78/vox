@@ -2414,7 +2414,7 @@ fn stage_pressure_sidecars(
         );
         // A real held unrelated room makes health's negative assertion nonvacuous even though
         // these pressure-only readers deliberately never join the original quiet-2 room.
-        let own_name = format!("{name}-isolated-{nonce}");
+        let own_name = format!("{name}-isolated");
         let (ok, out, err) = vox(
             &staged.host,
             &as_node(
@@ -2431,16 +2431,17 @@ fn stage_pressure_sidecars(
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "APPARATUS: {name}'s unrelated room failed: {out}{err}");
-        let listed = attached_as(&staged.host, "host", Some(name));
-        let own_room = listed
-            .lines()
-            .find(|line| line.contains(&own_name))
-            .and_then(|line| line.split_whitespace().next())
-            .expect("APPARATUS: sidecar's real unrelated room not listed");
-        unrelated.insert(
-            name,
-            vox_core::node::link::b32_encode(&room_id(&staged.host, name, own_room)),
-        );
+        let shown = fx35_synced(&staged.host, Some(name));
+        let status: serde_json::Value = serde_json::from_str(&shown.status)
+            .expect("PRODUCT: sidecar's room status was not JSON");
+        let own_room = status["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|room| room["name"] == own_name)
+            .and_then(|room| room["id"].as_str())
+            .expect("APPARATUS: sidecar's real unrelated room not listed for its own node");
+        unrelated.insert(name, own_room.to_owned());
         let source_ready = format!("{name}-source-ready-{nonce}");
         let reader_ready = format!("{name}-reader-ready-{nonce}");
         stage_post(peer_dir, *peer_node, peer_name, room, &source_ready);
