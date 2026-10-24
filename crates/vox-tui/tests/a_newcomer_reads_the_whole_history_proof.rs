@@ -110,6 +110,9 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
+// The product constant is intentionally compiled out without `test-knobs`; this optional proof
+// must still compile in the ordinary optional-proof profile.
+const TEST_EXPIRING_ADMIN_ENV: &str = "VOX_TEST_EXPIRING_ADMIN";
 /// External deadman for the optional whole-journey timing measurement. The blocking catch-up
 /// claim does not use this to decide whether a page is wedged.
 const BOUND: Duration = Duration::from_secs(300);
@@ -5870,7 +5873,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         "VOX_TEST_FOLD_HOLD_FILE",
         "VOX_TEST_HOLD_PACKAGES_FILE",
         "VOX_TEST_HOLD_RENDER_FILE",
-        vox_core::node::channel::TEST_EXPIRING_ADMIN_ENV,
+        TEST_EXPIRING_ADMIN_ENV,
         "VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE",
     ]);
     watchdog::arm();
@@ -5945,7 +5948,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         .to_owned();
     let fold_knob = [
         ("VOX_TEST_FOLD_HOLD_FILE", fold_hold_path.as_str()),
-        (vox_core::node::channel::TEST_EXPIRING_ADMIN_ENV, "1"),
+        (TEST_EXPIRING_ADMIN_ENV, "1"),
         (
             "VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE",
             sweep_hold_path.as_str(),
