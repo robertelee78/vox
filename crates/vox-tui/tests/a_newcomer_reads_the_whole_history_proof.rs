@@ -1652,12 +1652,8 @@ fn stage_hosted_nodes(
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or_else(|| panic!("APPARATUS: staged room {name} is not listed: {listed}"))
             .to_owned();
-        let room = vox_core::node::link::b32_encode(&room_id_as(
-            &host,
-            maker,
-            maker_name,
-            &room_selector,
-        ));
+        let room =
+            vox_core::node::link::b32_encode(&room_id_as(&host, maker, maker_name, &room_selector));
         let (ok, link, err) = vox(&host, &as_node(&["room", "link", &room], maker), None);
         assert!(ok, "APPARATUS: staging room link failed: {err}");
         let link = link
