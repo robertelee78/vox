@@ -340,10 +340,6 @@ const _: () = assert!(
     "a stop's budget is at most 4.5 s"
 );
 
-/// How long a `Shutdown` waits for work that outlives the actor — a sync session on a blocking
-/// thread, an aborted join — to let go of the profile's store before answering. With the network
-/// stopped each of them ends at its next read, so this is a ceiling, not an expected wait.
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// How long building the view may wait, in total across every room, for rooms sync sessions hold
 /// before using those rooms' previous entries. A session holds a room for one protocol step at a
 /// time. One deadline for the whole view, not one per room: with `ports::OUTBOUND_SLOTS` outbound sessions (and their inbound peers) each
@@ -4328,6 +4324,44 @@ const fn worth_another_responder(fault: Fault) -> bool {
     )
 }
 
+#[derive(Clone, Debug, Default)]
+struct TerminationState {
+    reason: Option<ActorEnd>,
+    physically_closed: bool,
+    failure: Option<String>,
+}
+
+/// Non-secret observation of retirement and actual node resource closure.
+/// A retirement reason is not permission to reopen the profile.
+#[derive(Clone, Debug)]
+pub struct NodeTermination {
+    state: watch::Receiver<TerminationState>,
+}
+
+impl NodeTermination {
+    /// Observe why this node stopped accepting commands, before its owned work is joined.
+    pub async fn retiring(&mut self) -> Option<ActorEnd> {
+        self.state
+            .wait_for(|state| state.reason.is_some())
+            .await
+            .ok()
+            .and_then(|state| state.reason.clone())
+    }
+
+    /// Wait for actual task/secret/database/transaction and directory-guard closure.
+    /// A cleanup task ending without this receipt is an error, never physical completion.
+    pub async fn closed(&mut self) -> std::result::Result<(), String> {
+        self.state
+            .wait_for(|state| state.physically_closed || state.failure.is_some())
+            .await
+            .map_err(|_| "node cleanup ended without physical completion".to_owned())
+            .and_then(|state| match &state.failure {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            })
+    }
+}
+
 /// A client's handle to a running node.
 ///
 /// Several clients may hold clones of one handle and each take its own event
@@ -4335,6 +4369,7 @@ const fn worth_another_responder(fault: Fault) -> bool {
 /// and none of them can starve another (ADR-020 §7).
 #[derive(Debug, Clone)]
 pub struct NodeHandle {
+    termination: NodeTermination,
     /// Fresh for each actor lifetime, so a repaired client cannot reuse an old display token.
     display_incarnation: Digest32,
     computer: Option<Arc<crate::node::computer::Computer>>,
@@ -4479,6 +4514,13 @@ impl std::fmt::Debug for KeyringWindow {
 }
 
 impl NodeHandle {
+    /// Observe this exact actor's retirement and physical resource completion without keeping
+    /// its Store, keys or worker leases alive.
+    #[must_use]
+    pub fn termination(&self) -> NodeTermination {
+        self.termination.clone()
+    }
+
     /// Where the node's files are.
     #[must_use]
     pub fn paths(&self) -> &Paths {
@@ -5298,6 +5340,7 @@ struct PrivatePullOwner {
 
 /// The node actor's state (owned by its task).
 pub struct Node {
+    termination: watch::Sender<TerminationState>,
     history_demand: history_demand::Controller,
     bounded_sync: bounded_sync::Controller,
     /// Stable across lock/unlock controller replacement, so every generation's completion wakes
@@ -5973,6 +6016,32 @@ fn forget_consent_key(
     Ok(())
 }
 
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_else(|| "(no message)".to_owned())
+}
+
+async fn catch_node_loop<F: std::future::Future>(
+    future: F,
+) -> std::result::Result<F::Output, Box<dyn std::any::Any + Send>> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
+
 /// How a node's actor task ended (ADR-026 L-6), read from the handle
 /// [`Node::spawn_supervised`] returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6134,7 +6203,9 @@ impl Node {
         if let Some(node) = profile.as_ref().map(Profile::fingerprint) {
             bounded_sync.recover_node_retirements(node);
         }
+        let (termination, termination_state) = watch::channel(TerminationState::default());
         let node = Self {
+            termination,
             history_demand: history_demand::Controller::default(),
             bounded_sync,
             bounded_completion_wake,
@@ -6417,6 +6488,9 @@ impl Node {
         let startup_computer_boundary = Arc::clone(&node.startup_computer_boundary);
         let actor = tokio::spawn(node.run(cmd_rx, net_rx, flow_release_rx));
         let handle = NodeHandle {
+            termination: NodeTermination {
+                state: termination_state,
+            },
             display_incarnation,
             computer,
             startup_computer_boundary,
@@ -6446,6 +6520,77 @@ impl Node {
             crate::node::history_budget::FlowRelease,
         >,
     ) {
+        let mut shutdown_reply = None;
+        let panic = catch_node_loop(self.run_loop(
+            &mut cmd_rx,
+            &mut net_rx,
+            &mut flow_release_rx,
+            &mut shutdown_reply,
+        ))
+        .await
+        .err()
+        .map(|payload| panic_message(payload.as_ref()));
+        // Close ingress before notifying the host. An unwind permits cleanup only, never
+        // another business command or fresh authority on this actor.
+        cmd_rx.close();
+        drop(cmd_rx);
+        drop(net_rx);
+        drop(flow_release_rx);
+        self.bounded_sync.fence();
+        self.history_demand.fence();
+        drop(self.flow_pool_registration.take());
+        let termination = self.termination.clone();
+        let reason = panic.as_ref().map_or(ActorEnd::Stopped, |message| {
+            ActorEnd::Panicked(message.clone())
+        });
+        termination.send_modify(|state| state.reason = Some(reason));
+        let closed = self
+            .profile
+            .as_ref()
+            .and_then(|profile| profile.store().profile_closed());
+        // Retain the actual task sets through result/receiver cleanup, blocking joins and
+        // exact old Flow retirement. The secret-work barrier alone cannot drop a handed result.
+        self.stop_network().await;
+        if self.lock_all().await.await.is_err() {
+            termination.send_modify(|state| {
+                state.failure = Some("node secret cleanup ended without completion".to_owned());
+            });
+            if let Some(message) = panic {
+                std::panic::resume_unwind(Box::new(message));
+            }
+            return;
+        }
+        for (_, reply) in std::mem::take(&mut self.unlock_after_lock) {
+            let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
+        }
+        self.settle_lock().await;
+        self.publish().await;
+        let _ = self.event_tx.send(NodeEvent::Shutdown);
+        self.profile = None;
+        drop(self);
+        if let Some(closed) = closed {
+            closed.wait().await;
+        }
+        termination.send_modify(|state| state.physically_closed = true);
+        if let Some(reply) = shutdown_reply {
+            let _ = reply.send(Outcome::Done);
+        }
+        if let Some(message) = panic {
+            // Preserve panic classification after teardown without a second panic hook or
+            // retaining arbitrary original panic-payload resource owners during cleanup.
+            std::panic::resume_unwind(Box::new(message));
+        }
+    }
+
+    async fn run_loop(
+        &mut self,
+        cmd_rx: &mut mpsc::Receiver<(NodeCommand, oneshot::Sender<Outcome>)>,
+        net_rx: &mut mpsc::Receiver<NetEvent>,
+        flow_release_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+            crate::node::history_budget::FlowRelease,
+        >,
+        shutdown_reply: &mut Option<oneshot::Sender<Outcome>>,
+    ) {
         // Two inputs, one writer: client commands and the network's inbound work are
         // interleaved here, so channel state is only ever mutated by this task
         // (ADR-016). The actor holds a `net_tx` clone, so `net_rx` never closes and
@@ -6453,8 +6598,6 @@ impl Node {
         let ingress_wake = Arc::clone(&self.session_ingress_wake);
         let bounded_completion_wake = Arc::clone(&self.bounded_completion_wake);
         let mut ticker = tokio::time::interval(TICK);
-        // A `Shutdown`'s reply, held until the node is actually gone: see the end of this function.
-        let mut shutdown_reply: Option<oneshot::Sender<Outcome>> = None;
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Preparation, cleanup, governance and package scans share one select slot. Rotate between
         // ready classes; each retains its own room cursor and yields after one bounded turn.
@@ -6696,7 +6839,7 @@ impl Node {
                     self.note_if_stalled(name, started);
                     self.publish().await;
                     if shutdown {
-                        shutdown_reply = Some(reply);
+                        *shutdown_reply = Some(reply);
                         break;
                     }
                     if let Some((room, kind)) = local_change.filter(|_| outcome.is_done()) {
@@ -6859,37 +7002,6 @@ impl Node {
                     self.decisions.flush_folded((self.millis_clock)());
                 }
             }
-        }
-        // Channel closed or shutdown: lock (wipe every SEK + the signer) and stop.
-        let store = self.log_store();
-        self.stop_network().await;
-        // Here the actor does wait for the lock to settle: it is stopping, and `Done` means gone.
-        let _ = self.lock_all().await.await;
-        for (_, reply) in std::mem::take(&mut self.unlock_after_lock) {
-            let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
-        }
-        self.settle_lock().await;
-        self.publish().await;
-        let _ = self.event_tx.send(NodeEvent::Shutdown);
-        // **`Done` means gone.** `Shutdown` used to be answered before any of the above ran, and
-        // even after it the profile's store stayed open for a few milliseconds more — held by
-        // work that outlives the actor's own fields: an aborted join exchange drops its handle at
-        // its next await, and a sync session on a blocking thread when its read fails. A caller
-        // that opened the same profile the moment it was told `Done` found it busy: v0.2.8's gate
-        // went red on exactly that (`vox daemon` exiting `ProfileBusy` in `remote_interrupt_proof`),
-        // tolerated there by a retry. So the actor gives up its own handles, waits — bounded — until
-        // it holds the store's last reference, and answers only then.
-        self.profile = None;
-        if let Some(store) = store {
-            let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN;
-            while std::sync::Arc::strong_count(&store) > 1 && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            // Dropped here: with no other holder, this closes the store.
-        }
-        if let Some(reply) = shutdown_reply {
-            let _ = reply.send(Outcome::Done);
         }
     }
 
