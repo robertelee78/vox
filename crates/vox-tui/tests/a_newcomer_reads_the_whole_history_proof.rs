@@ -1213,7 +1213,7 @@ struct Staged {
 fn stage_post(dir: &Path, node: Option<&str>, name: &str, room: &str, text: &str) -> Duration {
     let asked = Instant::now();
     loop {
-        let (ok, out, err) = stage_post_once(dir, node, room, text, false);
+        let (ok, out, err) = stage_post_once(dir, node, room, text);
         if ok {
             return asked.elapsed();
         }
@@ -1227,29 +1227,6 @@ fn stage_post(dir: &Path, node: Option<&str>, name: &str, room: &str, text: &str
     }
 }
 
-fn stage_large_post(
-    dir: &Path,
-    node: Option<&str>,
-    name: &str,
-    room: &str,
-    text: &str,
-) -> Duration {
-    let asked = Instant::now();
-    loop {
-        let (ok, out, err) = stage_post_once(dir, node, room, text, true);
-        if ok {
-            return asked.elapsed();
-        }
-        let busy = err.contains("still being applied") || out.contains("still being applied");
-        assert!(
-            busy,
-            "APPARATUS: {name}'s large staging post in {room} was refused before the measured \
-             moment: {out}{err}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
 /// Run one setup post through the shipped binary. This helper owns no product timeout; the proof's
 /// external deadman is the only wall-clock apparatus bound.
 fn stage_post_once(
@@ -1257,13 +1234,12 @@ fn stage_post_once(
     node: Option<&str>,
     room: &str,
     text: &str,
-    stdin: bool,
 ) -> (bool, String, String) {
-    let mut args = vec!["room", "post", room, if stdin { "-" } else { text }];
+    let mut args = vec!["room", "post", room, text];
     if let Some(node) = node {
         args.extend(["--node", node]);
     }
-    vox(dir, &args, stdin.then_some(text))
+    vox(dir, &args, None)
 }
 
 /// Create ordinary shipped archive demand on two hosted nodes. The peer posts beyond the live
@@ -1299,20 +1275,13 @@ fn stage_two_archive_jobs(staged: &Staged) -> String {
         .unwrap_or_else(|| panic!("APPARATUS: archive-pressure room is not listed: {listed}"))
         .to_owned();
 
-    // More rows than the live window leaves a real older page. Source-owned sizes make this
-    // pressure evolve with the product rather than copying today's 128/16 values.
+    // More rows than the live window leaves a real older page. Derive the record count from
+    // the product's live window and archive-job count; large bodies are not this pressure stage.
     let archive_rows =
         vox_core::log::history::MAX_PAGE_ENTRIES + vox_core::node::history_budget::ARCHIVE_JOBS;
-    let payload_bytes =
-        vox_core::log::history::MAX_PAYLOAD_BYTES - vox_core::log::history::MAX_HEADER_BYTES;
     for index in 0..archive_rows {
-        let mut body = format!("archive-pressure-{index} ");
-        if index < vox_core::node::history_budget::ARCHIVE_JOBS {
-            body.push_str(&"a".repeat(payload_bytes.saturating_sub(body.len())));
-            stage_large_post(peer_dir, *peer_node, peer_name, &room, &body);
-        } else {
-            stage_post(peer_dir, *peer_node, peer_name, &room, &body);
-        }
+        let body = format!("archive-pressure-{index} ");
+        stage_post(peer_dir, *peer_node, peer_name, &room, &body);
     }
     let (ok, link, err) = vox(
         peer_dir,
@@ -2490,10 +2459,11 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .expect("APPARATUS: pressure tail disappeared")
             .wait_for(ready, name, false);
     }
-    // Two real shipped archive requests are already running. The separate proof-only archive
-    // barrier is installed before either request is made, so observing both admissions proves
-    // they cannot finish before live pressure reaches the seventeenth reservation. A near-maximum
-    // post by the peer in the shared room then makes one live round eligible on every hosted node.
+    // Hold two real shipped archive requests at their admitted jobs. The separate proof-only
+    // archive barrier is installed before either request, so observing both admissions proves
+    // they cannot finish before live pressure reaches the seventeenth reservation. A fresh
+    // Content post by the peer then makes one live round eligible on every hosted node. Body
+    // size does not choose the lane; these barriers stage running flow-state ownership.
     // The barriers hold already-admitted jobs. A feature-gated apparatus file temporarily asks
     // the pool to use its own source-defined floor: fifteen live plus the daemon's two
     // source-owned archive jobs then reaches the otherwise impossible retained path without a
@@ -2545,15 +2515,12 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         .expect("APPARATUS: flow-state pressure hold path was not staged");
     std::fs::File::create(hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not create {}: {error}", hold.display()));
-    let pressure_body = "x".repeat(
-        vox_core::log::history::MAX_PAYLOAD_BYTES - vox_core::log::history::MAX_HEADER_BYTES,
-    );
-    stage_large_post(
+    stage_post(
         pressure_dir,
         *pressure_node,
         pressure_name,
         pressure_room,
-        &pressure_body,
+        "pool-pressure-payload",
     );
     let pressure_target = "pool-pressure-landed";
     stage_post(
