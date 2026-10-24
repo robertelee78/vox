@@ -56,6 +56,12 @@ pub(super) struct Held<T> {
     _charge: BufferCharge,
 }
 
+impl<T> Held<T> {
+    pub(super) fn job(&self) -> Job {
+        self._charge.job()
+    }
+}
+
 pub(super) enum Lookup<T> {
     Found(Held<T>),
     Busy,
@@ -610,11 +616,9 @@ impl Source {
     /// One bounded, charged scalar inventory. Every page rechecks current room access;
     /// the compact index is read without touching content bodies or walking the archive.
     pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
-        let Some(charge) = job.reserve(
+        let charge = job.reserve_or_pressure(
             crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
-        ) else {
-            return Ok(Lookup::Busy);
-        };
+        )?;
         let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
         let mut after = None;
         for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {

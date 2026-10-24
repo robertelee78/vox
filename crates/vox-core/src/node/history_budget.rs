@@ -1028,6 +1028,12 @@ pub struct BufferCharge {
 }
 
 impl BufferCharge {
+    /// Reuse the worker that actually owns this allocation. A dependent operation must not
+    /// request another permit from the same finite pool while this charge retains the first.
+    pub(crate) fn job(&self) -> Job {
+        Job(Arc::clone(&self.worker))
+    }
+
     /// Split an already-accounted reservation without touching either byte counter. Both pieces
     /// retain the same worker, and their drops return exactly the original total.
     pub(crate) fn split_off(&mut self, bytes: usize) -> Option<Self> {

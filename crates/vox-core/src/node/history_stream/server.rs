@@ -89,7 +89,7 @@ pub(super) async fn answer(
         // Inventory is symmetric: the requester sends its one HAVE before receiving ours.
         // Its exact encoded bytes share this request's wire credit, and the decoded Vec stays
         // inside the charged input frame until all bounded insertion slices have completed.
-        let incoming = match io.read(credit.remaining_wire()).await? {
+        let incoming = match io.read_required(credit.remaining_wire()).await? {
             Read::Frame(frame) => frame,
             Read::Busy => return Err(Error::Unreachable("inventory reader busy")),
             Read::End => return Err(Error::MalformedBundle("inventory closed before HAVE")),
@@ -98,9 +98,10 @@ pub(super) async fn answer(
         let Frame::Have(hints) = incoming.frame()? else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
         };
+        let work_job = incoming.job();
         for slice in hints.chunks(64) {
             let offered = source
-                .offer_inventory(io.job(), inbox, inbox_generation, preamble.room, slice)
+                .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
                 .await?;
             *inventory_added |= offered.added != 0;
             if offered.full {
@@ -329,7 +330,11 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let held_proof = match source.proof(&job, &held_head.value, kind, from, to).await? {
+            let work_job = held_head.job();
+            let held_proof = match source
+                .proof(&work_job, &held_head.value, kind, from, to)
+                .await?
+            {
                 Lookup::Found(held) => held,
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
@@ -472,6 +477,9 @@ async fn entry(
         }
         Lookup::Missing => return Ok(result),
     };
+    // Every dependent header/body read overlaps this held head. Keep its actual worker rather
+    // than asking the original Control job to acquire another foreground permit.
+    let job = head.job();
     if seq == 0 || seq > head.value.root.leaves {
         return Err(Error::MalformedBundle("requested entry exceeds head"));
     }

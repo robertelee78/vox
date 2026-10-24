@@ -25,6 +25,10 @@ pub(super) struct Incoming {
 }
 
 impl Incoming {
+    pub(super) fn job(&self) -> Job {
+        self._charge.job()
+    }
+
     pub(super) fn frame(&self) -> Result<Frame<'_>> {
         Frame::decode(&self.bytes)
     }
@@ -38,6 +42,12 @@ pub(super) enum Read {
     Frame(Incoming),
     End,
     Busy,
+}
+
+#[derive(Clone, Copy)]
+enum ReadAdmission {
+    Optional,
+    Required,
 }
 
 pub(super) struct Transport {
@@ -78,21 +88,57 @@ impl Transport {
     /// The caller supplies its remaining response credit including the four-byte prefix.
     /// Reserve before reading even that prefix: Busy never leaves a partially consumed frame.
     pub(super) async fn read(&mut self, remaining_wire: usize) -> Result<Read> {
-        self.read_bounded(remaining_wire, DECODE_ENVELOPE, None)
-            .await
+        self.read_bounded(
+            remaining_wire,
+            DECODE_ENVELOPE,
+            None,
+            ReadAdmission::Optional,
+        )
+        .await
+    }
+
+    /// An owned operation retains its exact capacity cause before consuming any prefix bytes.
+    pub(super) async fn read_required(&mut self, remaining_wire: usize) -> Result<Read> {
+        self.read_bounded(
+            remaining_wire,
+            DECODE_ENVELOPE,
+            None,
+            ReadAdmission::Required,
+        )
+        .await
     }
 
     /// HELLO has a fixed three-byte maximum and no decoded collection. Keep its reservation
     /// ahead of the prefix while leaving the attacker-sized envelope on every variable frame.
     pub(super) async fn read_hello(&mut self) -> Result<Read> {
-        self.read_bounded(MAX_HELLO_FRAME_BYTES + 4, 0, Some(&[0x01]))
-            .await
+        self.read_bounded(
+            MAX_HELLO_FRAME_BYTES + 4,
+            0,
+            Some(&[0x01]),
+            ReadAdmission::Optional,
+        )
+        .await
+    }
+
+    pub(super) async fn read_hello_required(&mut self) -> Result<Read> {
+        self.read_bounded(
+            MAX_HELLO_FRAME_BYTES + 4,
+            0,
+            Some(&[0x01]),
+            ReadAdmission::Required,
+        )
+        .await
     }
 
     /// This handshake position accepts WANT's bounded scalar Query or a smaller CANCEL.
     pub(super) async fn read_want_or_cancel(&mut self) -> Result<Read> {
-        self.read_bounded(MAX_WANT_FRAME_BYTES + 4, 0, Some(&[0x03, 0x09]))
-            .await
+        self.read_bounded(
+            MAX_WANT_FRAME_BYTES + 4,
+            0,
+            Some(&[0x03, 0x09]),
+            ReadAdmission::Optional,
+        )
+        .await
     }
 
     /// ACK and CANCEL are fixed scalar frames. They need no variable-frame decode envelope;
@@ -102,6 +148,7 @@ impl Transport {
             remaining_wire.min(ACK_FRAME_MAX_BYTES + 4),
             0,
             Some(&[0x0A, 0x09]),
+            ReadAdmission::Optional,
         )
         .await
     }
@@ -111,6 +158,7 @@ impl Transport {
         remaining_wire: usize,
         decode_envelope: usize,
         expected_tags: Option<&[u8]>,
+        admission: ReadAdmission,
     ) -> Result<Read> {
         let maximum = remaining_wire.saturating_sub(4).min(MAX_FRAME_BYTES);
         if maximum == 0 {
@@ -122,8 +170,14 @@ impl Transport {
         let Some(work_job) = self.job.record_job(envelope).await else {
             return Ok(Read::Busy);
         };
-        let Some(charge) = work_job.reserve(envelope) else {
-            return Ok(Read::Busy);
+        let charge = match admission {
+            ReadAdmission::Optional => {
+                let Some(charge) = work_job.reserve(envelope) else {
+                    return Ok(Read::Busy);
+                };
+                charge
+            }
+            ReadAdmission::Required => work_job.reserve_or_pressure(envelope)?,
         };
         let until = self.until();
         let fence = Arc::clone(&self.fence);
@@ -161,10 +215,7 @@ impl Transport {
 
     /// The fixed preamble is charged separately from ordinary frame encodings.
     pub(super) async fn write_preamble(&mut self, preamble: super::Preamble) -> Result<usize> {
-        let _charge = self
-            .job
-            .reserve(super::MAX_PREAMBLE * 2)
-            .ok_or(Error::Unreachable("history preamble buffer busy"))?;
+        let _charge = self.job.reserve_or_pressure(super::MAX_PREAMBLE * 2)?;
         let bytes = preamble.encode();
         self.write_bytes(&bytes).await?;
         Ok(bytes.len() + 4)
