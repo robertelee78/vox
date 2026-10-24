@@ -563,6 +563,11 @@ impl Receiver {
                     let Some(staging) = &self.staging else {
                         return Err(Error::Profile("history chunk has no activation"));
                     };
+                    // The decoded chunk remains live through its durable append. Pre-admit the
+                    // mandatory post-append authority read on that exact foreground worker;
+                    // asking the original Control job for another worker while retaining this
+                    // one recreates the same bounded-pool ownership cycle as metadata staging.
+                    let work_job = incoming.job();
                     let final_chunk = credit.pending_ack_completes(request, entry, next)?;
                     let ack = Frame::Ack {
                         request,
@@ -571,7 +576,7 @@ impl Receiver {
                     };
                     let encoded = ack.encode_required(io.job())?;
                     credit.charge_overhead(encoded.as_slice().len() + 4)?;
-                    let Some(authority) = self.source.prepare_committed_read(io.job()).await?
+                    let Some(authority) = self.source.prepare_committed_read(&work_job).await?
                     else {
                         io.abort(WireError::SessionBusy);
                         result.status = Status::Busy;
