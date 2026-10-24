@@ -61,11 +61,21 @@ struct Prepared {
 }
 pub(super) struct Preparation {
     pub(super) token: u64,
+    origin: PreparationOrigin,
+    room: Digest32,
+    instance: [u8; 16],
     fence: Arc<Fence>,
     cancellation: demand::Cancellation,
     result: Arc<StdMutex<Option<Result<Prepared, String>>>>,
     task: tokio::task::JoinHandle<()>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparationOrigin {
+    Explicit,
+    Observation,
+}
+
 struct Running {
     request: RequestId,
     generation: Digest32,
@@ -89,7 +99,15 @@ pub(super) struct Controller {
     running: Option<Running>,
     private_work: Option<PrivateWork>,
     cancelled_legacy: Option<(Digest32, LegacyProvisionalOwner)>,
-    status: Option<Status>,
+    /// The actual operation and the last accepted explicit action result. Request ownership,
+    /// cancellation and worker completion consult only this slot.
+    owner_status: Option<Status>,
+    /// One replaceable read-only Status result. Observing another room never replaces the actual
+    /// operation or a person's explicit action result.
+    observation: Option<Status>,
+    /// An event may accept an observation between CLI polls. Deliver that exact result once before
+    /// a refreshable Unavailable/Paused observation starts another storage read.
+    observation_unread: bool,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
 }
 impl Controller {
@@ -131,7 +149,7 @@ impl Controller {
         {
             self.running = None;
             self.ready = None;
-            self.status = Some(status);
+            self.owner_status = Some(status);
         }
     }
     /// A failed quantum leaves its durable request available for an explicit resume.
@@ -148,14 +166,18 @@ impl Controller {
             running.cancellation.cancel();
         }
         self.ready = None;
-        if let Some(status) = self.status.as_mut().filter(|s| s.request == Some(request)) {
+        if let Some(status) = self
+            .owner_status
+            .as_mut()
+            .filter(|s| s.request == Some(request))
+        {
             status.phase = Phase::Paused;
             status.detail = detail.chars().take(128).collect();
         }
     }
     fn stop_request(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
         if !self
-            .status
+            .owner_status
             .as_ref()
             .is_some_and(|s| s.room == room && s.instance == instance && s.request == Some(request))
         {
@@ -184,21 +206,64 @@ impl Controller {
             running.cancellation.cancel();
         }
         self.ready = None;
-        if let Some(status) = self.status.as_mut().filter(|s| s.request == Some(request)) {
+        if let Some(status) = self
+            .owner_status
+            .as_mut()
+            .filter(|s| s.request == Some(request))
+        {
             status.phase = Phase::Busy;
             status.detail = detail.chars().take(128).collect();
         }
     }
     pub(super) fn retire_room(&mut self, room: Digest32) {
-        if self.status.as_ref().is_none_or(|s| s.room != room) {
+        let owner_matches = self
+            .owner_status
+            .as_ref()
+            .is_some_and(|status| status.room == room);
+        let preparation_matches = self
+            .preparing
+            .as_ref()
+            .is_some_and(|preparation| preparation.room == room);
+        if !owner_matches && !preparation_matches {
+            if self
+                .observation
+                .as_ref()
+                .is_some_and(|status| status.room == room)
+            {
+                self.observation = None;
+                self.observation_unread = false;
+            }
             return;
         }
-        self.fence();
-        self.running = None;
-        self.ready = None;
-        if let Some(status) = &mut self.status {
+        if preparation_matches {
+            if let Some(preparing) = &self.preparing {
+                preparing.fence.retire();
+                preparing.cancellation.cancel();
+            }
+        }
+        if owner_matches {
+            if let Some(running) = &self.running {
+                running.fence.retire();
+                running.cancellation.cancel();
+            }
+            self.running = None;
+            self.ready = None;
+        }
+        if let Some(status) = self
+            .owner_status
+            .as_mut()
+            .filter(|status| status.room == room)
+        {
             status.phase = Phase::Paused;
             status.detail = "This room is no longer active; its saved history request can be cancelled locally.".into();
+        }
+        if self
+            .observation
+            .as_ref()
+            .is_some_and(|status| status.room == room)
+        {
+            self.observation = None;
+            self.observation_unread = false;
         }
     }
 
@@ -232,7 +297,9 @@ impl Controller {
         if let Some(work) = self.private_work.take() {
             let _ = work.task.await;
         }
-        self.status = None;
+        self.owner_status = None;
+        self.observation = None;
+        self.observation_unread = false;
     }
 }
 fn status(room: Digest32, instance: [u8; 16], phase: Phase, detail: &str) -> Status {
@@ -340,18 +407,40 @@ impl Node {
         instance: [u8; 16],
         action: Action,
     ) -> Result<Status, String> {
-        let completed = self.accept_history_demand();
-        if let Some(current) = &self.history_demand.status {
-            if current.room == room
-                && current.instance == instance
-                && matches!(action, Action::Status)
-                && (completed
-                    || self.history_demand.preparing.is_some()
-                    || self.history_demand.running.is_some()
-                    || current.request.is_some()
-                    || !matches!(current.phase, Phase::Unavailable | Phase::Paused))
+        self.accept_history_demand();
+        if matches!(action, Action::Status) {
+            if let Some(current) = self
+                .history_demand
+                .owner_status
+                .as_ref()
+                .filter(|status| status.room == room && status.instance == instance)
             {
                 return Ok(current.clone());
+            }
+            if let Some(current) = self
+                .history_demand
+                .observation
+                .as_ref()
+                .filter(|status| status.room == room && status.instance == instance)
+                .cloned()
+            {
+                let unread = std::mem::take(&mut self.history_demand.observation_unread);
+                let preparing = self
+                    .history_demand
+                    .preparing
+                    .as_ref()
+                    .is_some_and(|preparation| {
+                        preparation.origin == PreparationOrigin::Observation
+                            && preparation.room == room
+                            && preparation.instance == instance
+                    });
+                if unread
+                    || preparing
+                    || current.request.is_some()
+                    || !matches!(current.phase, Phase::Unavailable | Phase::Paused)
+                {
+                    return Ok(current);
+                }
             }
         }
         if self.history_demand.preparing.is_some() {
@@ -364,7 +453,7 @@ impl Node {
         }
         if let Action::Cancel { request } = action {
             if self.history_demand.running.is_some()
-                && !self.history_demand.status.as_ref().is_some_and(|s| {
+                && !self.history_demand.owner_status.as_ref().is_some_and(|s| {
                     s.room == room && s.instance == instance && s.request == Some(request)
                 })
             {
@@ -396,7 +485,7 @@ impl Node {
                     .history_demand
                     .running
                     .as_ref()
-                    .zip(self.history_demand.status.as_ref())
+                    .zip(self.history_demand.owner_status.as_ref())
                     .is_some_and(|(running, current)| {
                         current.room == room
                             && current.instance == instance
@@ -411,7 +500,7 @@ impl Node {
             } else {
                 return Ok(self
                     .history_demand
-                    .status
+                    .owner_status
                     .clone()
                     .filter(|s| s.room == room && s.instance == instance)
                     .unwrap_or_else(|| {
@@ -428,14 +517,19 @@ impl Node {
             self.history_demand.private_work.take()
         } else {
             if self.history_demand.private_work.is_some() {
-                return Ok(self.history_demand.status.clone().unwrap_or_else(|| {
-                    status(
-                        room,
-                        instance,
-                        Phase::Busy,
-                        "Private history work is settling.",
-                    )
-                }));
+                return Ok(self
+                    .history_demand
+                    .owner_status
+                    .clone()
+                    .filter(|status| status.room == room && status.instance == instance)
+                    .unwrap_or_else(|| {
+                        status(
+                            room,
+                            instance,
+                            Phase::Busy,
+                            "Private history work is settling.",
+                        )
+                    }));
             }
             None
         };
@@ -519,15 +613,34 @@ impl Node {
             // A full inbox does not strand the result: schedule() and status also check this slot.
             let _ = tx.try_send(NetEvent::HistoryDemandPrepared { token });
         });
-        let pending = status(
+        let mut pending = status(
             room,
             instance,
             Phase::Preparing,
             "Checking cached history and preparing one bounded request.",
         );
-        self.history_demand.status = Some(pending.clone());
+        pending.request = match action {
+            Action::Cancel { request } | Action::Resume { request } => Some(request),
+            _ => None,
+        };
+        // Only an operation which reached accepted preparation owns public status. Direct
+        // Busy/refusal paths above leave the previous operation's status and ownership intact,
+        // so they cannot relabel an old result as the newer attempted action.
+        let origin = if matches!(action, Action::Status) {
+            self.history_demand.observation = Some(pending.clone());
+            self.history_demand.observation_unread = false;
+            PreparationOrigin::Observation
+        } else {
+            self.history_demand.observation = None;
+            self.history_demand.observation_unread = false;
+            self.history_demand.owner_status = Some(pending.clone());
+            PreparationOrigin::Explicit
+        };
         self.history_demand.preparing = Some(Preparation {
             token,
+            origin,
+            room,
+            instance,
             fence,
             cancellation,
             result,
@@ -666,6 +779,9 @@ impl Node {
         let Some(preparation) = self.history_demand.preparing.as_ref() else {
             return false;
         };
+        let origin = preparation.origin;
+        let target_room = preparation.room;
+        let target_instance = preparation.instance;
         let Ok(mut result) = preparation.result.try_lock() else {
             return false;
         };
@@ -673,6 +789,8 @@ impl Node {
             return false;
         };
         if let Ok(prepared) = ready {
+            let target_matches =
+                prepared.status.room == target_room && prepared.status.instance == target_instance;
             let current = self
                 .profile
                 .as_ref()
@@ -682,35 +800,37 @@ impl Node {
                         .get(&prepared.status.room)
                         .map(|room| (profile, room))
                 });
-            let valid = if prepared.local_only {
-                self.profile
-                    .as_ref()
-                    .is_some_and(|p| p.fingerprint() == prepared.node)
-            } else if let Some((profile, shared)) = current {
-                let Ok(room) = shared.try_lock() else {
-                    return false;
+            let valid = target_matches
+                && if prepared.local_only {
+                    self.profile
+                        .as_ref()
+                        .is_some_and(|p| p.fingerprint() == prepared.node)
+                } else if let Some((profile, shared)) = current {
+                    let Ok(room) = shared.try_lock() else {
+                        return false;
+                    };
+                    prepared
+                        .room
+                        .upgrade()
+                        .is_some_and(|old| Arc::ptr_eq(&old, shared))
+                        && room.epoch() == prepared.epoch
+                        && room.history_instance(profile.store()).ok()
+                            == Some(prepared.status.instance)
+                        && room.is_member(&prepared.node)
+                        && !room.has_left(&prepared.node)
+                        && room.ended(self.now_ms().get()).is_none()
+                        && stream::authorization_generation(
+                            profile.store(),
+                            prepared.node,
+                            prepared.status.room,
+                            prepared.status.instance,
+                            prepared.epoch,
+                        )
+                        .ok()
+                            == Some(prepared.generation)
+                } else {
+                    false
                 };
-                prepared
-                    .room
-                    .upgrade()
-                    .is_some_and(|old| Arc::ptr_eq(&old, shared))
-                    && room.epoch() == prepared.epoch
-                    && room.history_instance(profile.store()).ok() == Some(prepared.status.instance)
-                    && room.is_member(&prepared.node)
-                    && !room.has_left(&prepared.node)
-                    && room.ended(self.now_ms().get()).is_none()
-                    && stream::authorization_generation(
-                        profile.store(),
-                        prepared.node,
-                        prepared.status.room,
-                        prepared.status.instance,
-                        prepared.epoch,
-                    )
-                    .ok()
-                        == Some(prepared.generation)
-            } else {
-                false
-            };
             if !valid {
                 if let Some(Ok(prepared)) = result.take() {
                     if let Some(dispatch) = prepared.dispatch {
@@ -720,10 +840,21 @@ impl Node {
                 }
                 drop(result);
                 self.history_demand.preparing = None;
-                if let Some(status) = &mut self.history_demand.status {
+                let status = match origin {
+                    PreparationOrigin::Explicit => self.history_demand.owner_status.as_mut(),
+                    PreparationOrigin::Observation => self.history_demand.observation.as_mut(),
+                };
+                let mut installed = false;
+                if let Some(status) = status.filter(|status| {
+                    status.room == target_room && status.instance == target_instance
+                }) {
                     status.phase = Phase::Paused;
                     status.detail =
                         "The room or authorization changed; request history again.".into();
+                    installed = true;
+                }
+                if origin == PreparationOrigin::Observation && installed {
+                    self.history_demand.observation_unread = true;
                 }
                 return true;
             }
@@ -735,12 +866,28 @@ impl Node {
         self.history_demand.preparing = None;
         match ready {
             Err(reason) => {
-                if let Some(status) = &mut self.history_demand.status {
+                let status = match origin {
+                    PreparationOrigin::Explicit => self.history_demand.owner_status.as_mut(),
+                    PreparationOrigin::Observation => self.history_demand.observation.as_mut(),
+                };
+                let mut installed = false;
+                if let Some(status) = status.filter(|status| {
+                    status.room == target_room && status.instance == target_instance
+                }) {
                     status.phase = Phase::Unavailable;
                     status.detail = reason.chars().take(128).collect();
+                    installed = true;
+                }
+                if origin == PreparationOrigin::Observation && installed {
+                    self.history_demand.observation_unread = true;
                 }
             }
             Ok(prepared) => {
+                if origin == PreparationOrigin::Observation {
+                    self.history_demand.observation = Some(prepared.status);
+                    self.history_demand.observation_unread = true;
+                    return true;
+                }
                 if let Some(after) = prepared.selection_after {
                     self.history_demand.selection =
                         Some((prepared.status.room, prepared.status.instance, after));
@@ -748,7 +895,7 @@ impl Node {
                 if let Some(owner) = prepared.legacy_cancelled {
                     self.history_demand.cancelled_legacy = Some((prepared.status.room, owner));
                 }
-                self.history_demand.status = Some(prepared.status);
+                self.history_demand.owner_status = Some(prepared.status);
                 if let Some(dispatch) = prepared.legacy {
                     self.history_demand.running = Some(Running {
                         request: dispatch.request,
@@ -1006,6 +1153,11 @@ fn prepare_local(
             answer.status.phase = Phase::Cancelled;
             answer.status.detail = "History request cancelled; provisional bytes reclaimed.".into();
         }
+        Action::Cancel { .. } => {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail =
+                "The requested cancellation does not match the saved history request.".into();
+        }
         _ => return Err("The saved history request changed.".into()),
     }
     Ok(answer)
@@ -1128,10 +1280,17 @@ fn prepare(
         );
     }
     let (bounds, author, query, active, remaining) = if let Action::Resume { request } = action {
-        let saved = saved.as_ref().ok_or("No history request is saved.")?;
+        let Some(saved) = saved.as_ref() else {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail = "No history request is saved to resume.".into();
+            return Ok(answer);
+        };
         let state = saved.state();
         if state.request != request {
-            return Err("The history request changed.".into());
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail =
+                "The requested resume does not match the saved history request.".into();
+            return Ok(answer);
         }
         if state.body.is_none()
             && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq < state.bounds.lo))
@@ -1279,9 +1438,17 @@ fn prepare_private(
     let peer = match action {
         Action::PrivateRecover { peer } => peer,
         Action::Resume { request } => {
-            let state = saved
-                .filter(|s| s.request == request)
-                .ok_or("The private history request changed.")?;
+            let Some(state) = saved else {
+                answer.status.phase = Phase::Unavailable;
+                answer.status.detail = "No private history request is saved to resume.".into();
+                return Ok(answer);
+            };
+            if state.request != request {
+                answer.status.phase = Phase::Unavailable;
+                answer.status.detail =
+                    "The requested resume does not match the saved private history request.".into();
+                return Ok(answer);
+            }
             state
                 .private
                 .as_ref()
