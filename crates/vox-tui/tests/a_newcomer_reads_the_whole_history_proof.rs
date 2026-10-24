@@ -1919,14 +1919,23 @@ fn start_words(name: &str, v: &serde_json::Value) -> Vec<String> {
 
 #[cfg(feature = "optional-proofs")]
 struct TailObserver {
-    child: Child,
+    child: std::sync::Mutex<Child>,
     reader: Option<std::thread::JoinHandle<()>>,
     lines: std::sync::mpsc::Receiver<(Instant, Result<String, String>)>,
+    stderr_path: std::path::PathBuf,
+    public_command: String,
 }
 
 #[cfg(feature = "optional-proofs")]
 impl TailObserver {
     fn attach(dir: &Path, node: Option<&str>, room: &str, since: Option<&str>) -> Self {
+        let stderr = tempfile::Builder::new()
+            .prefix("vox-tail-")
+            .suffix(".stderr")
+            .tempfile()
+            .expect("APPARATUS: create retained tail stderr");
+        let (stderr_file, stderr_path) =
+            stderr.keep().expect("APPARATUS: preserve tail stderr file");
         let mut command = Command::new(VOX);
         let mut args = vec!["room", "tail", room];
         if let Some(since) = since {
@@ -1941,10 +1950,21 @@ impl TailObserver {
             .env_remove("VOX_SESSION")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr_file));
+        let public_command = format!(
+            "{:?} {:?}",
+            command.get_program(),
+            command.get_args().collect::<Vec<_>>()
+        );
         let mut child = command
             .spawn()
             .unwrap_or_else(|error| panic!("APPARATUS: could not start room tail: {error}"));
+        eprintln!(
+            "[tail apparatus] pid={} command={} stderr={}",
+            child.id(),
+            public_command,
+            stderr_path.display()
+        );
         let stdout = child
             .stdout
             .take()
@@ -1966,10 +1986,34 @@ impl TailObserver {
             }
         });
         Self {
-            child,
+            child: std::sync::Mutex::new(child),
             reader: Some(reader),
             lines,
+            stderr_path,
+            public_command,
         }
+    }
+
+    /// Observe only; EOF is not permission to wait for, restart or otherwise heal a tail.
+    fn diagnostic(&self) -> String {
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pid = child.id();
+        let status = match child.try_wait() {
+            Ok(Some(status)) => format!("naturally exited: {status}"),
+            Ok(None) => "not exited at this observation".to_owned(),
+            Err(error) => format!("exit status unavailable: {error}"),
+        };
+        let stderr = std::fs::read(&self.stderr_path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|error| format!("stderr read failed: {error}"));
+        format!(
+            "pid={pid}; command={}; {status}; stderr_file={}; stderr={stderr:?}",
+            self.public_command,
+            self.stderr_path.display()
+        )
     }
 
     fn wait_for(&self, target: &str, who: &str, product: bool) {
@@ -1990,18 +2034,26 @@ impl TailObserver {
                 ),
                 Ok((_, Ok(_))) => {}
                 Ok((_, Err(error))) if product => {
-                    panic!("PRODUCT: {who}'s shipped room tail failed: {error}")
+                    panic!(
+                        "PRODUCT: {who}'s shipped room tail failed: {error}; {}",
+                        self.diagnostic()
+                    )
                 }
                 Err(error) if product => panic!(
                     "PRODUCT: {who}'s already-running shipped room tail ended without showing \
-                     {target:?} from the exact release edge: {error}"
+                     {target:?} from the exact release edge: {error}; {}",
+                    self.diagnostic()
                 ),
                 Ok((_, Err(error))) => {
-                    panic!("APPARATUS: {who}'s staging room tail failed: {error}")
+                    panic!(
+                        "APPARATUS: {who}'s staging room tail failed: {error}; {}",
+                        self.diagnostic()
+                    )
                 }
                 Err(error) => panic!(
                     "APPARATUS: {who}'s staging room tail ended without showing {target:?}: \
-                     {error}"
+                     {error}; {}",
+                    self.diagnostic()
                 ),
             }
         }
@@ -2011,8 +2063,14 @@ impl TailObserver {
 #[cfg(feature = "optional-proofs")]
 impl Drop for TailObserver {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let observed = self.diagnostic();
+        let child = self
+            .child
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = child.kill();
+        let reaped = child.wait();
+        eprintln!("[tail apparatus cleanup] before_cleanup={observed}; cleanup_wait={reaped:?}");
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
