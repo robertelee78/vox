@@ -14,8 +14,9 @@
   2026-10-21 (FX-28: observable needless work, not a machine-dependent CPU cutoff, is the verdict);
   amended 2026-10-23 (FX-28: atomic node application, durable room-admission rollback, fresh
   pairing requests, observation deadlines that do not discard valid work, and the rendezvous
-  registration handoff); amended 2026-10-23 (FX-35: approved exact capacity per active-or-retiring
-  hosted identity, with no fixed floor)
+  registration handoff); amended 2026-10-23 (FX-35: the decider approved exact running capacity
+  per active-or-retiring hosted identity, with no fixed floor); amended 2026-10-24 (FX-35:
+  resource ownership, fair admission selection, Busy attempt credit and legal proof staging)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -59,6 +60,10 @@ trust relationships between computers". What the daemon and the keyrings showed:
   deleted them and started fresh.
 
 The decider then answered twelve questions, one at a time. His answers are the decision.
+
+The non-normative [peer implementation comparison](../design/vox-peer-implementation-review.md)
+records pinned Syncthing/Iroh observations, their limits, and the existing tasks carrying the
+lessons. It changes neither this record's decision status nor any requirement or approval.
 
 ## Terms
 
@@ -165,6 +170,21 @@ The decider then answered twelve questions, one at a time. His answers are the d
   decider with its measurement (ADR-037 R13). Measured cause on 2026-10-19: the settlement tick
   offered the node's own head to every connected peer every second, and the lane never recorded
   a peer's acknowledgement, so the hinted round that fetched nothing ran again each tick.
+  Cross-story evidence on 2026-10-21 is diagnostic, not acceptance: the #986 shipped-binary
+  journey at exact candidate `2db45720f9af55adfca230e01b1208289a6b33d0` (based on
+  `b6e7b0d93`, without #996) restarted Alice, accepted Bob's post `after alice's daemon
+  restarted`, and then never showed that post to Alice while Alice reported Bob's lane at 608
+  completed rounds, zero failed or partial rounds, no running round, and eight board records
+  received. Fresh commands still answered and completed rounds kept increasing, so this was
+  structural non-delivery rather than a stopped process. That candidate still let
+  `offer_inventory` credit a peer's scalar echo of the sender's accepted own head even though
+  the echo proved neither the owed body nor its semantic effect; that reachable path could then
+  suppress the sender's own-head offer while empty rounds continued to complete. #996 removes
+  that inventory credit and accepts only an authenticated, role-complete receipt. The source
+  comparison therefore makes the #986 restart journey depend on #996 and names a concrete cause
+  consistent with the observation; it does not prove that #996 fixes that exact journey. The
+  #986 journey MUST run on the composed #996 candidate before either story cites this wedge as
+  fixed.
   Decision (the decider, 2026-10-21): `held_through` is the last authenticated feed position the
   peer has completely satisfied for that peer's role. An authenticated header whose private
   payload and effect are addressed only to another member counts as satisfied without the other
@@ -206,15 +226,17 @@ The decider then answered twelve questions, one at a time. His answers are the d
   is the walkthrough's defect record, FX-11's is the amendment it produces, and FX-25's is each
   release's asset list.
 - **FX-22.** A governance question about a room (who may read whom, who has consented, what a
-  member offers) MUST read nothing from the store but the governance index's header, and decrypt
-  no fact or entry, when the room's governance has not changed since the question was last
-  answered. Decision: the room keeps its folded consent facts in memory as a semantic projection
-  (per author, the readers it consented to and its reset sequence), never a store snapshot, page
-  or row vector, so the index's bounded-turn rule stands; the index header's revision, which
-  moves with every change to the index, says whether the projection is current, so no
-  in-process bookkeeping can miss a write; the sealed index remains the only durable
-  representation, and a restart loads the projection from the index and the entries it names,
-  never by replaying the log. Measured
+  member offers) MUST answer entirely from the room's in-memory semantic projection, without
+  opening the store or decrypting even the governance index header, while that semantic meaning
+  is unchanged. Decision: the room keeps its folded consent facts in memory (per author, the
+  readers it consented to and its reset sequence), never a store snapshot, page or row vector, so
+  the index's bounded-turn rule stands. Acceptance of a fact whose canonical authorized meaning
+  changes the projection, and expiry of authority at its exact recorded deadline, causally
+  invalidate and rebuild that projection; sequence-only, unauthorized, superseded and same-value
+  facts do not. The internal durable revision tracks canonical work, while the published display
+  revision moves only when a completed fold changes what a person sees. The sealed index remains
+  the only durable representation, and a restart rebuilds in bounded turns from the index and the
+  entries it names, never by replaying the log. Measured
   cause, 2026-10-20 (the decider's daemon, vox 0.4.7; `ps` 155–170% of a core; two 10 s `sample`
   runs, 13,558 busy samples each, about 1.36 cores): 72% of all busy CPU was the status
   publication and 44% of all busy CPU was `trusted_by`, which opened a fresh view (a store
@@ -504,6 +526,21 @@ The decider then answered twelve questions, one at a time. His answers are the d
   peer holds any more (his rooms are sparse: 200, 188 and 76 of one room's entries on three
   nodes) is pulled again from every peer every period: 3.67 syncs per second over 39 peer-room
   pairs, a median 11 s between two syncs of one pair, about 370 commits per sync.
+  Merge RCA (2026-10-22): role-complete receipts required moving sparse effect completion after
+  semantic projection. The old operation had also made the sparse entry discoverable, so moving
+  it exposed two circular dependencies: Presence demanded its own exact published position before
+  it could publish that position, while Content retention/render tried to look the entry up only
+  through the still-unsettled public index. Both parents worked only because they completed every
+  effect early. The composed rule is exact: non-Content may stage its completed marker before its
+  semantic handler only in the same atomic Batch, so a handler failure rolls the marker back;
+  Content remains incomplete until the selected body is semantically admitted, and its retention
+  and expiry decisions consume the transaction's already-authenticated exact entry rather than
+  pretending it was settled. They preserve the source publication's sealed earliest first-seen
+  fact across every deferred retry and restart. A deferred or unavailable body therefore commits
+  neither a false receipt nor a public effect marker, and cannot extend its retention lifetime by
+  retrying. The shipped proof binds its Content verdict to one exact accepted entry hash observed
+  at Bob's effect outcome and then performs one `vox room read`; a polling read may not relabel a
+  later unrelated refusal as this defect.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
   power loss: a node's own entries, consent, trust, keys, Session records and the format marker
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person
@@ -599,8 +636,8 @@ The decider then answered twelve questions, one at a time. His answers are the d
   its limit MUST be exactly `2 × active-or-retiring hosted node identities`, with no fixed or
   minimum floor. Current and retiring generations of the same identity count once. Across those
   generations each identity MUST run at most two bounded-sync rounds at once, so the pool exactly
-  covers the maximum legal running work. Each running round MUST hold exactly one flow-state
-  charge, and
+  covers the maximum legal running work. Each running bounded-sync round MUST hold exactly one
+  flow-state charge, and
   each held flow-state charge MUST be held by exactly one running bounded-sync round.
   Acquisition of the charge and the round's transition to running MUST be one atomic state
   transition for accounting and status; every transition out of running, by completion, failure
@@ -627,7 +664,10 @@ The decider then answered twelve questions, one at a time. His answers are the d
   retries, retained continuations, CPU use or machine load MAY dispose, expire, refuse, retire,
   defer, delay, skip, space or reorder that work. A timeout or connection failure MAY end a
   running round; only its transition out of running releases the charge and causes the next
-  eligible continuation to run.
+  eligible continuation to run. Registering or unregistering a hosted identity MAY resize the
+  accounting limit but MUST NOT grant or wake a continuation. If a charge release races the
+  refusing Flow's enrollment, an unforgeable release-edge identity MAY carry that exact causal
+  edge across enrollment; a resize, tick or unrelated actor event cannot create such an edge.
 
   A start attempt is one scheduler invocation for an eligible port, including its flow-state
   reservation; it ends `started` only when it launches the bounded-sync round, otherwise
@@ -641,19 +681,29 @@ The decider then answered twelve questions, one at a time. His answers are the d
   be taken without waiting), `archive_budget_busy` (an archive port only: the archive-lane job
   could not be reserved), `control_budget_busy` (the control-lane job could not be reserved),
   `live_lane_busy` (the node's live flow slot holds another flow), `no_outbound_slot` (the
-  outbound slot could not be taken), `flow_state_node_busy` (the identity's two running positions
-  are occupied across its current and retiring generations), and `flow_state_pool_full` (every
-  daemon-pool position is occupied by a running charge or an earlier release-edge grant); and the boolean `round_running`, true while a bounded-sync round of that
-  port runs. It MUST report the pool under `lanes.budget.flow_state` as the integers `in_use`
-  and `limit` and, under `by_node`, an object with exactly one member per hosted node, keyed by
+  outbound slot could not be taken), `flow_state_node_busy` (the fingerprint's two source-owned
+  running slots are held across its current and retiring actor generations) and
+  `flow_state_pool_full` (every daemon-pool position is occupied by a running charge or by an
+  earlier release-edge grant), `flow_state_pool_overcommitted` (`occupied > limit`, never
+  misreported as exact fullness), `flow_state_owner_missing` (the admitted worker no longer belongs
+  to a pool actor generation), and `flow_state_order_exhausted` (the process-lifetime monotonic
+  continuation identity space is exhausted); and the
+  boolean `round_running`, true while a bounded-sync round of that port runs. A node-busy
+  refusal MUST NOT be reported as pool-full: `flow_state_node_busy` is possible while
+  `in_use < limit`, whereas `flow_state_pool_full` requires `occupied == limit`. It MUST report
+  the pool under `lanes.budget.flow_state` as the integers `in_use` (running charges), `promised`
+  (release-edge grants not yet consumed by their actors), `occupied` (`in_use + promised`), and
+  `limit` and, under `by_node` and `occupied_by_node`, objects with exactly one member per hosted node, keyed by
   that node's node ID, whose value is that node's integer in-use count; the member values MUST
-  sum to `in_use`; a node's `round_running` values and its own `by_node` member MUST be taken
+  sum to `in_use` and `occupied` respectively; a node's `round_running` values and its own `by_node` member MUST be taken
   from one snapshot, and that member MUST equal the number of that node's ports whose
   `round_running` is true. While at least one port in a room has a retained flow-state
   continuation waiting for the exact release edge, any "no completed sync" text shown for that
   room in `vox status` or in the app MUST contain the literal text `flow-state pool`; when no port
   in the room has such a continuation, that text MUST NOT identify the flow-state pool as the
-  cause. Measured cause,
+  cause. Before the stale threshold, that exact retained ownership is already an unhealthy
+  `room-flow-state-pool:<room>` condition: diagnosis MUST name it immediately rather than wait on
+  elapsed time, and MUST NOT attach it to another room. Measured cause,
   2026-10-21 (UTC, as every date in this record): on the decider's daemon (four hosted nodes,
   three rooms, restarted 02:32Z) every port of every node had started no round, `queued` froze,
   every room said "no completed sync in 10 minutes", and posts moved neither between the two
@@ -663,12 +713,82 @@ The decider then answered twelve questions, one at a time. His answers are the d
   pool full (16 of 16) by the first fifth of the run with 1,951 flows started before and none
   after, the outbound slots 0 of 16 in use and the archive lane empty throughout. The product
   said only the symptom. "please make vox work"; "be methodical" (the decider, 2026-10-21).
+
   > **Decision amendment (the decider, 2026-10-23).** The pool limit is exactly
   > `2 × active-or-retiring hosted node identities`, with no fixed or minimum floor; generations
   > of one identity share its two running positions. Parked work retains its exact actor-owned
   > `Flow` but no worker, byte charge, outbound slot or flow-state charge. This replaces the
   > earlier `max(16, 2 × hosted identities)` formula; the causal release and retention requirements
   > above remain. Historical 16-of-16 measurements describe the defect, not the capacity policy.
+
+
+  Implementation RCA, 2026-10-24. Running capacity is not the only resource dependency. A
+  Control history request could retain a foreground worker through an `Incoming` or `Held`
+  buffer, then ask its original Control-job alias for another foreground worker. Inventory,
+  metadata verification, header reconstruction, Entry, Proof and Chunk-authority paths shared
+  this pattern.
+  Thirty-two Entry requests could retain two 128-KiB metadata workers each, occupying all 64
+  foreground positions with only 8 MiB of metadata, then all wait for a third worker. This is
+  a source-reachable cycle, not the cause established by the sampled 16-node journey. The
+  operation is to carry its actual admitted worker through overlapping reads and account their
+  full simultaneous byte peak; dropping a job variable does not release a worker still owned
+  by a charged buffer. Increasing a cap or waiting longer does not repair this dependency.
+
+  Local capacity, peer Busy and transport failure have different owners. For an owned outgoing
+  Flow, local capacity is to retain the exact operation behind the real local release; `SessionBusy` or `NotYetMember`
+  from a peer is to retain the exact wire continuation under the existing Busy policy, with
+  no invented cross-host release event. A fresh wire attempt does not discard verified partial
+  reception. Required capacity refusal before I/O is to reach the first reset owner as typed
+  capacity and use `SessionBusy`, not misreport a transport failure. Protocol, storage, epoch
+  and authority failures retain their own fences and outcomes; this is not a retry-everything
+  rule. These changes do not alter the approved two-position capacity or receipt semantics.
+
+  The same composed journey first exposed a late completion reservation that poisoned an
+  ordinary room read, an announcement that needed a new retained position while all existing
+  positions were occupied, and private requesters that could consume capacity needed by their
+  responders. The candidate is
+  to prepay record/completion and ACK resources before semantic mutation, keep announcement
+  priority separate from the original Flow's ownership, and reserve the full private Page/apply
+  peak with its derived serving dependency inside the existing total. An identical validated
+  checkpoint has no new fact to seal or commit. Retirement is to distinguish actual progress,
+  byte/publication dependencies and failed storage, join real workers, and erase the exact old
+  secret-bearing capabilities; a timer or unrelated node's recovery cannot manufacture cleanup.
+
+  Evidence remains separate from these source corrections. The `3c15d2174` journey accepted all
+  32 initial posts and completed all 480 cross-member read observations, then ended APPARATUS
+  during archive setup: its fixture derived roughly 16 MiB of room text from the generic log
+  payload bound, while Content text is limited to 64 KiB and the IPC frame to 256 KiB. Real job
+  barriers, not body size, establish that proof's flow-state pressure; legal short posts are to
+  replace both oversized fixtures without changing its release/read assertions. This is not a
+  completed journey or a byte-pressure mutant result. Independent peer-source comparison and
+  the detailed ownership/runtime RCA are recorded on [#1028](https://github.com/robertelee78/vox/issues/1028#issuecomment-6377582483).
+
+
+  A subsequent `8c9832ab3` run accepted the same 32 posts but did not complete delivery before
+  the lead stopped it on diagnosed product smoke. Two public observations showed no change in
+  completed rounds, body/history work or either room's readable rows while 819 additional
+  SessionBusy failures accumulated. Workers were briefly active between observations; the
+  samples do not establish a permanently empty worker pool. The admission number in status is
+  a wake token, not the fair ticket's sequence, and is not evidence of ticket grants or FIFO
+  head progress.
+
+  The retained Control admission could name a different port than the locally selected ready
+  Flow. A candidate could queue or consume a worker before discovering its local live lane was
+  occupied. Selection is to make that exact retained owner runnable first, preserving the whole
+  displaced Flow, or withdraw only its own unusable resource ticket while retaining its logical
+  request/hint. Read-only readiness observation is to preserve the documented first-gate reason;
+  only real admission grants capacity. A diagnostic root label can change from inventory to hint
+  while waiting and MUST NOT replace the actual ticket identity of room, peer and lane.
+
+  Independently, Busy bypass used semantic completion to detect a fresh published generation.
+  A refused attempt correctly completes nothing, so an unchanged unfinished generation could
+  bypass the existing Busy policy repeatedly. Actual foreground attempts are to consume separate
+  scheduler-only generation credit at launch. A newer generation arriving during the attempt
+  retains fresh credit; no request, peer receipt or semantic completion is manufactured. An
+  archive-only Page, private pull or incoming attempt does not spend live foreground credit;
+  a normal legacy full-sync attempt does, regardless of its resource lane. This changes no
+  retry duration or running-capacity policy. The [follow-up RCA](https://github.com/robertelee78/vox/issues/1028#issuecomment-6378076112)
+  distinguishes measured observations, source causes and the still-required working journey.
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
