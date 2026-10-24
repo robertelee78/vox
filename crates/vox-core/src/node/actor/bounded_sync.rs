@@ -3442,6 +3442,7 @@ impl Node {
         let authority = self.computer_authority();
         let worker = tokio::spawn(async move {
             let _slot = slot;
+            #[cfg(not(feature = "test-knobs"))]
             let deadline =
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
             let mut flow = worker_flow.lock().await;
@@ -3454,6 +3455,11 @@ impl Node {
             // actor panic can retire the controller but cannot adopt/park this Flow; its charge
             // therefore remains truthfully attributed to the retiring actor generation.
             job.hold_for_proof(room, peer).await;
+            // Proof staging is not part of the product operation's elapsed budget. Start the
+            // existing round deadline only once the admitted worker is allowed to do real work.
+            #[cfg(feature = "test-knobs")]
+            let deadline =
+                tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
             if flow.needs_board() && !worker_fence.is_retired() {
                 if let (Some(net), Some(authority)) = (net, authority.as_ref()) {
                     flow.admitted_authors = tokio::select! {

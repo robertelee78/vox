@@ -97,7 +97,6 @@ mod attach;
 #[path = "support/typed.rs"]
 mod typed;
 
-#[cfg(feature = "optional-proofs")]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -971,6 +970,20 @@ struct HistoryDemandReply {
     status: vox_core::node::api::HistoryDemandStatus,
 }
 
+#[derive(Clone)]
+struct ArchiveOwner {
+    room: [u8; 32],
+    instance: String,
+    request: String,
+    author: Option<[u8; 32]>,
+    head: Option<[u8; 32]>,
+}
+
+struct ArchiveStage {
+    room: String,
+    owners: BTreeMap<&'static str, ArchiveOwner>,
+}
+
 fn history_observation(dir: &Path, room: &str) -> HistoryObservation {
     let (ok, out, err) = vox(
         dir,
@@ -1276,7 +1289,7 @@ fn stage_post_once(
 /// window before either joins; each node then asks for the page below its oldest held row with
 /// `vox room read --history older`. Returning means both shipped requests were accepted and the
 /// daemon reported both archive jobs admitted together.
-fn stage_two_archive_jobs(staged: &Staged) -> String {
+fn stage_two_archive_jobs(staged: &Staged) -> ArchiveStage {
     let (peer_dir, peer_node, peer_name, _) = &staged.everyone[staged.hosted];
     let (ok, _, err) = vox(
         peer_dir,
@@ -1412,10 +1425,77 @@ fn stage_two_archive_jobs(staged: &Staged) -> String {
             .filter_map(serde_json::Value::as_str)
             .collect();
         if archives == expected {
-            return room;
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    // Bind the later forced-disconnect verdict to the two exact public operations accepted above.
+    // This observation happens before the connection is stopped and before either held worker is
+    // released; it cannot repair the later missing-owner defect.
+    let room_id = vox_core::node::link::b32_decode(&room, "archive-pressure room")
+        .expect("APPARATUS: archive-pressure room id");
+    let mut owners = BTreeMap::new();
+    for (dir, node, name, _) in &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS] {
+        loop {
+            let (ok, out, err) = vox(
+                dir,
+                &as_node(
+                    &["room", "read", &room, "--history", "status", "--json"],
+                    *node,
+                ),
+                None,
+            );
+            assert!(
+                ok,
+                "PRODUCT: {name}'s accepted archive request could not be observed: {out}{err}"
+            );
+            let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!("PRODUCT: {name}'s archive status was not valid JSON ({error}): {out}")
+            });
+            if matches!(
+                reply.status.phase,
+                vox_core::node::api::HistoryDemandPhase::Preparing
+            ) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            let hex = |bytes: &[u8]| {
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            };
+            assert!(
+                reply.schema == "vox.room.history/1"
+                    && reply.status.room == room_id
+                    && reply.instance == hex(&reply.status.instance)
+                    && reply.status.request.is_some()
+                    && reply.request == reply.status.request.as_ref().map(|id| hex(id))
+                    && reply.status.author.is_some()
+                    && reply.status.head.is_some()
+                    && matches!(
+                        reply.status.phase,
+                        vox_core::node::api::HistoryDemandPhase::Pending
+                    ),
+                "APPARATUS: {name}'s Older did not establish one held Pending archive operation: \
+                 {out}"
+            );
+            let request = reply.request.expect("checked archive request");
+            owners.insert(
+                *name,
+                ArchiveOwner {
+                    room: room_id,
+                    instance: reply.instance,
+                    request,
+                    author: reply.status.author,
+                    head: reply.status.head,
+                },
+            );
+            break;
+        }
+    }
+    ArchiveStage { room, owners }
 }
 
 /// Stage [`HOSTED`] on one `vox daemon --no-node` (each made Ready with `vox node unlock`) and
@@ -2381,12 +2461,8 @@ fn generation_accounting_keeps_actor_incarnations_exact(
         let new = generations
             .iter()
             .find(|actor| actor["registered"] == true && actor["in_use"] == 1);
-        let Some(new_actor) = new.and_then(|actor| actor["actor"].as_u64()) else {
-            return None;
-        };
-        if old.is_none() {
-            return None;
-        }
+        let new_actor = new.and_then(|actor| actor["actor"].as_u64())?;
+        old?;
         let bounded = &replacement["lanes"]["bounded"];
         let held = [hold, archive_hold].into_iter().any(|path| {
             charged_flow_hold_entries(path)
@@ -2448,9 +2524,9 @@ fn generation_accounting_keeps_actor_incarnations_exact(
             {
                 continue;
             }
-            if !archive
-                && !(staged.rooms.iter().any(|room| flow["room"] == *room)
-                    || flow["room"] == archive_room)
+            if !(archive
+                || staged.rooms.iter().any(|room| flow["room"] == *room)
+                || flow["room"] == archive_room)
             {
                 continue;
             }
@@ -2476,8 +2552,8 @@ fn generation_accounting_keeps_actor_incarnations_exact(
             if held_slot["actor"] != new_actor || held_slot["archive"] != !archive {
                 continue;
             }
-            if !archive
-                && !(held_slot["room"] == archive_room
+            if !(archive
+                || held_slot["room"] == archive_room
                     && held_slot["request"] == archive_request
                     && held_slot["instance"] == instance)
             {
@@ -3072,7 +3148,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             archive_hold.display()
         )
     });
-    let archive_room = stage_two_archive_jobs(&staged);
+    let archive = stage_two_archive_jobs(&staged);
+    let archive_room = archive.room.clone();
     let hold = staged
         .live_hold
         .as_ref()
@@ -3506,12 +3583,18 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    // The two consumed archive dispatches must also finish. Under the undersized mutant, this
-    // observes the full-pool branch retain and retry exact archive work before the invariant red
-    // is judged; a lost dispatch fails here on the shipped request's own status.
+    // The forced old-connection retirement must publish the exact durable result already reached,
+    // or leave the exact saved request truthfully Paused. Only Paused receives one shipped Resume.
+    // Under the orphan mutant the old Pending/running state has no physical owner, so the
+    // structural verdict below turns red before Status or Resume can prepare replacement work.
     for (dir, node, name, fingerprint) in
         &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS]
     {
+        let accepted = archive
+            .owners
+            .get(*name)
+            .unwrap_or_else(|| panic!("APPARATUS: {name}'s accepted archive owner was not saved"));
+        let mut disconnect_failure: Option<String> = None;
         loop {
             let shown = fx35_synced(dir, *node);
             let status: serde_json::Value =
@@ -3523,18 +3606,9 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     )
                 });
             let history = &status["lanes"]["history"];
-            if matches!(history["phase"].as_str(), Some("Complete" | "More")) {
-                break;
-            }
-            if matches!(
-                history["phase"].as_str(),
-                Some("Paused" | "Unavailable" | "Cancelled" | "Busy")
-            ) {
-                panic!(
-                    "PRODUCT: {name}'s exact shipped archive request ended without its quantum \
-                     after pool pressure: {history}"
-                );
-            }
+            // This structural verdict is deliberately evaluated before Status or Resume can
+            // prepare work. A running public operation without one of these exact physical owners
+            // is the product orphan this phase was built to catch.
             let bounded = &status["lanes"]["bounded"];
             let retained_archive = bounded["ready"]
                 .as_array()
@@ -3563,6 +3637,165 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                  archive ownership): {}",
                 shown.status
             );
+            if matches!(history["phase"].as_str(), Some("Complete" | "More")) {
+                let (ok, out, err) = vox(
+                    dir,
+                    &as_node(
+                        &[
+                            "room",
+                            "read",
+                            &archive_room,
+                            "--history",
+                            "status",
+                            "--history-instance",
+                            &accepted.instance,
+                            "--json",
+                        ],
+                        *node,
+                    ),
+                    None,
+                );
+                assert!(
+                    ok,
+                    "PRODUCT: {name}'s durable archive result could not be observed: {out}{err}"
+                );
+                let completed: HistoryDemandReply =
+                    serde_json::from_str(&out).unwrap_or_else(|error| {
+                        panic!(
+                            "PRODUCT: {name}'s durable archive result was not JSON ({error}): {out}"
+                        )
+                    });
+                assert!(
+                    completed.schema == "vox.room.history/1"
+                        && completed.status.room == accepted.room
+                        && completed.instance == accepted.instance
+                        && completed.request.as_deref() == Some(accepted.request.as_str())
+                        && (completed.status.author == accepted.author
+                            || completed.status.author.is_none())
+                        && completed.status.head == accepted.head
+                        && matches!(
+                            completed.status.phase,
+                            vox_core::node::api::HistoryDemandPhase::Complete
+                                | vox_core::node::api::HistoryDemandPhase::More
+                        ),
+                    "PRODUCT: {name}'s durable terminal archive result did not retain the accepted \
+                     room/request/instance/head: {out}"
+                );
+                break;
+            }
+            if history["phase"] == "Paused" {
+                assert!(
+                    disconnect_failure.is_none(),
+                    "PRODUCT: {name}'s exact archive request paused again after its one explicit \
+                     Resume; first failure was {:?}, current status is {history}",
+                    disconnect_failure
+                );
+                // Paused has no physical owner by design. Identify its exact durable operation
+                // only after the no-orphan assertion above, then resume it once as a person does.
+                let (ok, out, err) = vox(
+                    dir,
+                    &as_node(
+                        &[
+                            "room",
+                            "read",
+                            &archive_room,
+                            "--history",
+                            "status",
+                            "--history-instance",
+                            &accepted.instance,
+                            "--json",
+                        ],
+                        *node,
+                    ),
+                    None,
+                );
+                assert!(
+                    ok,
+                    "PRODUCT: {name}'s paused exact archive request could not be observed: \
+                     {out}{err}"
+                );
+                let paused: HistoryDemandReply =
+                    serde_json::from_str(&out).unwrap_or_else(|error| {
+                        panic!(
+                            "PRODUCT: {name}'s paused archive status was not JSON ({error}): {out}"
+                        )
+                    });
+                assert!(
+                    paused.schema == "vox.room.history/1"
+                        && paused.status.room == accepted.room
+                        && paused.instance == accepted.instance
+                        && paused.request.as_deref() == Some(accepted.request.as_str())
+                        && paused.status.author == accepted.author
+                        && paused.status.head == accepted.head
+                        && matches!(
+                            paused.status.phase,
+                            vox_core::node::api::HistoryDemandPhase::Paused
+                        )
+                        && !paused.status.detail.is_empty(),
+                    "PRODUCT: {name}'s forced disconnect did not leave the exact accepted \
+                     request/instance/author/head Paused with its truthful failure: {out}"
+                );
+                eprintln!(
+                    "[proof] FX-35 archive request paused after forced disconnect: \
+                     owner={name} request={} detail={:?}",
+                    accepted.request, paused.status.detail
+                );
+                let failure = paused.status.detail.clone();
+                let (ok, out, err) = vox(
+                    dir,
+                    &as_node(
+                        &[
+                            "room",
+                            "read",
+                            &archive_room,
+                            "--history",
+                            "resume",
+                            "--history-instance",
+                            &accepted.instance,
+                            "--history-request",
+                            &accepted.request,
+                            "--json",
+                        ],
+                        *node,
+                    ),
+                    None,
+                );
+                assert!(
+                    ok,
+                    "PRODUCT: {name}'s one exact shipped Resume was refused after the forced \
+                     disconnect: {out}{err}"
+                );
+                let resumed: HistoryDemandReply =
+                    serde_json::from_str(&out).unwrap_or_else(|error| {
+                        panic!(
+                            "PRODUCT: {name}'s exact Resume response was not JSON ({error}): {out}"
+                        )
+                    });
+                assert!(
+                    resumed.schema == "vox.room.history/1"
+                        && resumed.status.room == accepted.room
+                        && resumed.instance == accepted.instance
+                        && resumed.request.as_deref() == Some(accepted.request.as_str())
+                        && matches!(
+                            resumed.status.phase,
+                            vox_core::node::api::HistoryDemandPhase::Preparing
+                                | vox_core::node::api::HistoryDemandPhase::Pending
+                        ),
+                    "PRODUCT: {name}'s one Resume did not retain the accepted request/instance \
+                     that owns its bounded interval: {out}"
+                );
+                disconnect_failure = Some(failure);
+                continue;
+            }
+            if matches!(
+                history["phase"].as_str(),
+                Some("Unavailable" | "Cancelled" | "Busy")
+            ) {
+                panic!(
+                    "PRODUCT: {name}'s exact shipped archive request ended without its quantum \
+                     after pool pressure: {history}"
+                );
+            }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
