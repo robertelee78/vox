@@ -1664,59 +1664,34 @@ fn converged(staged: &Staged) {
 
 /// A pool charge can disappear before the actor consumes a finished worker, so equality is not
 /// required. The reverse is impossible: more charges than this controller's actual worker slots
-/// means a parked flow retained one. Observe the structural quiet edge so the park mutant has its
-/// own PRODUCT discriminator, independent of the pool-derived port projection and of elapsed
-/// time.
+/// means a parked flow retained one. Each comparison uses the same node's single status
+/// snapshot. Daemon-wide Control jobs also serve incoming requests and do not identify parked
+/// outbound Flow ownership.
 #[cfg(feature = "optional-proofs")]
 fn parked_flow_charge_discriminator(staged: &Staged) {
-    loop {
-        let mut active = Vec::new();
-        let mut retained_control = Vec::new();
-        for (dir, node, name, fingerprint) in &staged.everyone {
-            let shown = fx35_synced(dir, *node);
-            let value: serde_json::Value =
-                serde_json::from_str(&shown.status).unwrap_or_else(|e| {
-                    panic!(
-                        "PRODUCT: {name}'s flow-state status was not JSON: {e}: {}",
-                        shown.status
-                    )
-                });
-            let charged = value["lanes"]["budget"]["flow_state"]["by_node"][fingerprint]
-                .as_u64()
-                .unwrap_or(u64::MAX);
-            let running = value["lanes"]["bounded"]["running"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|slot| !slot.is_null())
-                .count() as u64;
-            assert!(
-                charged <= running,
-                "PRODUCT: {name}'s flow-state pool retained a parked charge with no controller \
-                 worker owner (charged {charged}, controller slots {running}): {}",
-                shown.status
-            );
-            if running != 0 {
-                active.push(format!("{name}: {running}"));
-            }
-            let control = value["lanes"]["budget"]["control"]
-                .as_u64()
-                .unwrap_or(u64::MAX);
-            if control != 0 {
-                retained_control.push(format!("{name}: {control}"));
-            }
-        }
-        if active.is_empty() && retained_control.is_empty() {
-            return;
-        }
-        if active.is_empty() {
+    for (dir, node, name, fingerprint) in &staged.everyone {
+        let shown = fx35_synced(dir, *node);
+        let value: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_else(|e| {
             panic!(
-                "PRODUCT: bounded controllers have no running worker, but parked flows retain \
-                 admitted \
-                 Control jobs: {retained_control:?}"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
+                "PRODUCT: {name}'s flow-state status was not JSON: {e}: {}",
+                shown.status
+            )
+        });
+        let charged = value["lanes"]["budget"]["flow_state"]["by_node"][fingerprint]
+            .as_u64()
+            .unwrap_or(u64::MAX);
+        let running = value["lanes"]["bounded"]["running"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|slot| !slot.is_null())
+            .count() as u64;
+        assert!(
+            charged <= running,
+            "PRODUCT: {name}'s flow-state pool retained a parked charge with no controller \
+                 worker owner (charged {charged}, controller slots {running}): {}",
+            shown.status
+        );
     }
 }
 
