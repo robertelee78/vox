@@ -2258,7 +2258,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(
     let other_room = &staged.rooms[1];
     assert_ne!(
         room, other_room,
-        "APPARATUS: U4 needs two distinct actual rooms"
+        "APPARATUS: physical restart proof needs two distinct actual rooms"
     );
     assert!(
         staged.pool_floor.as_ref().is_none_or(|path| !path.exists()),
@@ -2309,57 +2309,6 @@ fn generation_accounting_keeps_actor_incarnations_exact(
     let handshake = scoped("retirement-tail-attached");
     stage_post(peer_dir, *peer_node, peer_name, other_room, &handshake);
     tail.wait_for(&handshake, peer_name, false);
-    // Reset the FIXED Bob port using real completed work before any barrier. A historical
-    // PoolFull from the earlier pressure phase must not become the later M4 discriminator.
-    loop {
-        let (ok, out, err) = vox(
-            &staged.host,
-            &as_node(&["room", "read", other_room, "--json"], Some(name)),
-            None,
-        );
-        assert!(
-            ok,
-            "APPARATUS: fixed-port baseline read refused: {out}{err}"
-        );
-        let readable = out
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .expect("APPARATUS: fixed-port baseline JSON")
-            })
-            .any(|row| {
-                row["schema"] == "vox.room.row/1"
-                    && row["room"] == *other_room
-                    && row["author"] == *peer_fp
-                    && row["text"] == handshake
-                    && row["owed"] == false
-            });
-        let shown = fx35_synced(&staged.host, Some(name));
-        let status: serde_json::Value = serde_json::from_str(&shown.status)
-            .expect("PRODUCT: fixed-port completed baseline status JSON");
-        let port = status["lanes"]["ports"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|port| port["room"] == *other_room && port["peer"] == *peer_fp);
-        if readable
-            && port.is_some_and(|port| {
-                port["start_outcome"] == "started"
-                    && port["connected"] == true
-                    && port["needs"] == false
-                    && port["queued"] == false
-                    && port["out_age_ms"].is_null()
-                    && port["round_running"] == false
-                    && port["backing_off"] == false
-                    && port["publishing"] == false
-            })
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
     // Hold one actual ordinary quiet1 worker. The main two Archive recovery assertions have
     // already finished; no new Older is needed merely to construct an impossible overlap.
     for (_, _, marker) in charged_flow_hold_entries(hold) {
@@ -2423,108 +2372,14 @@ fn generation_accounting_keeps_actor_incarnations_exact(
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    // No fresh Flow can skip the local gate behind a controller-retention preflight. The
-    // captured ordinary worker pins index0 and no explicit Archive dispatch can add index1.
-    // Source-only bound: with floor absent, legal current workers cannot fill exact2N before
-    // this held ordinary owner is established; the old pressure result was reset above.
-    let shown = fx35_synced(&staged.host, Some(name));
-    let before: serde_json::Value =
-        serde_json::from_str(&shown.status).expect("PRODUCT: U4 pre-post ownership JSON");
-    let before_bounded = &before["lanes"]["bounded"];
-    let retained: usize = ["ready", "running", "deferred", "retiring"]
-        .iter()
-        .map(|field| {
-            before_bounded[*field]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|flow| !flow.is_null())
-                .count()
-        })
-        .sum::<usize>()
-        + usize::from(!before_bounded["cleanup"].is_null());
-    assert!(
-        retained < 12
-            && before_bounded["running"][1].is_null()
-            && before_bounded["ready"][1].is_null()
-            && before["lanes"]["history"]["ready"] == false,
-        "APPARATUS: U4 fixed ordinary start could be skipped by other retained work: {before}"
-    );
-
-    // One local post raises the FIXED other-room/Bob port. Actor command handling schedules
-    // before servicing a later Status. This is not a search/retry for a convenient gate.
+    // One accepted successor is a persistence obligation across physical teardown.
+    // Its first-gate diagnosis is measured separately by the low-fanout U4 spike.
     let successor = scoped("generation-accounting-successor");
     let (ok, out, err) = stage_post_once(&staged.host, Some(name), other_room, &successor);
     assert!(
         ok,
-        "APPARATUS: one U4 ordinary local post refused: {out}{err}"
+        "APPARATUS: one pre-retirement local post refused: {out}{err}"
     );
-    let shown = fx35_synced(&staged.host, Some(name));
-    let status: serde_json::Value =
-        serde_json::from_str(&shown.status).expect("PRODUCT: U4 status JSON");
-    let budget = &status["lanes"]["budget"];
-    let bounded = &status["lanes"]["bounded"];
-    let fixed = status["lanes"]["ports"]
-        .as_array()
-        .expect("PRODUCT: U4 ports")
-        .iter()
-        .find(|port| port["room"] == *other_room && port["peer"] == *peer_fp)
-        .expect("APPARATUS: fixed other-room Bob port missing");
-    let current = &bounded["running"][0];
-    assert!(
-        current["actor"] == old_actor
-            && current["archive"] == false
-            && current["room"] == *room
-            && current["peer"] == held_owner["peer"]
-            && charged_flow_hold_owners(hold).get(&(
-                old_actor,
-                fingerprint.clone(),
-                room.clone(),
-                held_owner["peer"].as_str().unwrap().to_owned()
-            )) == Some(&1),
-        "APPARATUS: exact ordinary held owner changed before U4: {status}"
-    );
-    let control_available = budget["control"]
-        .as_u64()
-        .zip(budget["foreground_jobs"].as_u64())
-        .is_some_and(|(used, limit)| used < limit)
-        && budget["queued"][1] == 0;
-    let no_control_ticket = !bounded["admissions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|admission| admission["lane"] == "control");
-    let slots = &status["lanes"]["slots"];
-    let outbound_available = slots["in_use"]
-        .as_u64()
-        .zip(slots["limit"].as_u64())
-        .is_some_and(|(used, limit)| used < limit)
-        && slots["per_peer"][peer_fp].as_u64().unwrap_or(0)
-            < vox_core::node::ports::OUTBOUND_PER_PEER as u64;
-    assert!(
-        control_available
-            && no_control_ticket
-            && outbound_available
-            && fixed["connected"] == true
-            && fixed["needs"] == true
-            && fixed["queued"] == true
-            && fixed["publishing"] == false
-            && fixed["backing_off"] == false
-            && fixed["out_age_ms"].is_null()
-            && fixed["round_running"] == false,
-        "APPARATUS: fixed U4 port's real eligibility/earlier gates were not staged: {status}"
-    );
-    assert_eq!(fixed["start_outcome"], "not_started",
-        "APPARATUS: a refused attempt for the fixed posted port was not observed; no retry: {fixed}");
-    assert!(!matches!(fixed["start_reason"].as_str(),
-        Some("room_busy" | "archive_budget_busy" | "control_budget_busy")),
-        "APPARATUS: an earlier real gate ended the fixed attempt; current capacity cannot rewrite that cause: {fixed}");
-    assert_eq!(
-        fixed["start_reason"], "live_lane_busy",
-        "PRODUCT: exact held-Live refusal reported a different first gate: {fixed}"
-    );
-    println!("[proof] exact fixed first cause is LiveBusy: actor={old_actor} node={fingerprint} room={other_room} peer={peer_fp}; no NodeBusy runtime claim");
-
     let (ok, out, err) = vox(
         &staged.host,
         &as_node(&["room", "post", room, FX35_GENERATION_PANIC], Some(name)),
@@ -3161,8 +3016,8 @@ fn assert_pressure_identity(record: &serde_json::Value, owner: &PressureContinua
 /// attached tail is consulted; dropping archive ownership turns the exact shipped archive
 /// request's structural ownership assertion red; omitting the held retiring identity from
 /// `Pool::resize` makes the actual distinct-identity 2N accounting assertion PRODUCT-red;
-/// reporting the actual held ordinary LiveBusy gate as PoolFull makes its fixed-port
-/// first-cause assertion PRODUCT-red. Concurrent same-profile generations and NodeBusy
+/// the ordinary first-gate diagnosis is covered by the separate low-fanout U4 spike.
+/// Concurrent same-profile generations and NodeBusy
 /// remain source-reviewed; this journey does not claim to run them.
 /// removing the retained-room health attribution makes that exact room's shipped diagnosis
 /// PRODUCT-red; unrelated-room exclusion requires the separate real-other-member spike.
