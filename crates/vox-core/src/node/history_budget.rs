@@ -21,6 +21,9 @@ const FOREGROUND_JOBS: usize = 64;
 /// Proof-only foreground capacity override; absent from a production build.
 pub const TEST_FOREGROUND_JOBS_ENV: &str = "VOX_TEST_FOREGROUND_JOBS";
 #[cfg(feature = "test-knobs")]
+/// Proof-only independent small-Control capacity; absent from a production build.
+pub const TEST_CONTROL_JOBS_ENV: &str = "VOX_TEST_CONTROL_JOBS";
+#[cfg(feature = "test-knobs")]
 /// Proof-only file whose presence holds an admitted Live job; absent from production.
 pub const TEST_HOLD_LIVE_JOB_ENV: &str = "VOX_TEST_HOLD_LIVE_JOB_FILE";
 #[cfg(feature = "test-knobs")]
@@ -61,6 +64,15 @@ fn flow_state_limit(hosted: usize) -> usize {
 #[cfg(feature = "test-knobs")]
 fn foreground_jobs() -> usize {
     std::env::var(TEST_FOREGROUND_JOBS_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(FOREGROUND_JOBS)
+}
+
+#[cfg(feature = "test-knobs")]
+fn control_jobs() -> usize {
+    std::env::var(TEST_CONTROL_JOBS_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
@@ -145,6 +157,8 @@ struct State {
     next_ticket: u64,
     live_grants: BTreeMap<LiveKey, LiveGrant>,
     foreground_jobs: usize,
+    #[cfg(feature = "test-knobs")]
+    control_jobs: usize,
 }
 
 impl Default for State {
@@ -158,6 +172,8 @@ impl Default for State {
             next_ticket: 0,
             live_grants: Default::default(),
             foreground_jobs: foreground_jobs(),
+            #[cfg(feature = "test-knobs")]
+            control_jobs: control_jobs(),
         }
     }
 }
@@ -183,10 +199,15 @@ impl State {
             Lane::Archive => {
                 self.archive_nodes.len() < ARCHIVE_JOBS && !self.archive_nodes.contains(&node)
             }
-            // The proof-only capacity override applies to both foreground reservations. In a
-            // production build `foreground_jobs()` is the same source constant, so this does not
-            // change shipped admission; it lets a real daemon causally stage Control pressure.
-            Lane::Control => self.control < self.foreground_jobs,
+            Lane::Control => {
+                // Foreground1 must not also starve the small Control workers needed
+                // to reach that foreground gate. A separate proof may explicitly hold Control1.
+                #[cfg(feature = "test-knobs")]
+                let limit = self.control_jobs;
+                #[cfg(not(feature = "test-knobs"))]
+                let limit = FOREGROUND_JOBS;
+                self.control < limit
+            }
             Lane::LargeControl => {
                 self.foreground < self.foreground_jobs
                     && (self.queues[Lane::Live.index()].is_empty()
@@ -440,6 +461,8 @@ impl Ticket {
             lane: self.lane,
             bytes: AtomicUsize::new(0),
             flow_owner,
+            #[cfg(feature = "test-knobs")]
+            proof_round: Mutex::new(None),
         })))
     }
 }
@@ -463,6 +486,60 @@ struct Worker {
     /// charge and a replacement actor with the same fingerprint therefore retain distinct pool
     /// capacity until the old round really returns it.
     flow_owner: Option<u64>,
+    #[cfg(feature = "test-knobs")]
+    proof_round: Mutex<Option<Arc<ProofRound>>>,
+}
+
+#[cfg(feature = "test-knobs")]
+struct ProofRound {
+    room: Digest32,
+    peer: Digest32,
+    request: [u8; 16],
+    instance: [u8; 16],
+    token: u64,
+}
+
+/// Non-owning apparatus annotation, bounded by the actual exclusive worker future.
+#[cfg(feature = "test-knobs")]
+pub(crate) struct ProofRoundGuard {
+    worker: std::sync::Weak<Worker>,
+    round: Arc<ProofRound>,
+}
+
+#[cfg(feature = "test-knobs")]
+impl Drop for ProofRoundGuard {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.upgrade() {
+            let mut current = worker
+                .proof_round
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if current
+                .as_ref()
+                .is_some_and(|round| Arc::ptr_eq(round, &self.round))
+            {
+                *current = None;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-knobs")]
+struct ProofWaitWitness {
+    path: std::path::PathBuf,
+    fault: std::path::PathBuf,
+}
+
+#[cfg(feature = "test-knobs")]
+impl Drop for ProofWaitWitness {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("APPARATUS: foreground queue witness could not be removed: {error}");
+                let _ = std::fs::write(&self.fault, error.to_string());
+            }
+        }
+    }
 }
 
 impl Worker {
@@ -697,6 +774,96 @@ impl Job {
         let mut wake = Box::pin(Arc::clone(&self.0.budget.bytes_changed[index]).notified_owned());
         wake.as_mut().enable();
         wake
+    }
+
+    /// Observe one real Control round without retaining its worker or changing admission.
+    /// Only the isolated FG1 proof and its existing Live hold path enable this annotation.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn round_for_proof(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        request: [u8; 16],
+        instance: [u8; 16],
+        token: u64,
+    ) -> Option<ProofRoundGuard> {
+        let foreground_one = self.0.budget.state().foreground_jobs == 1;
+        if self.0.lane != Lane::Control
+            || self.0.flow_owner.is_none()
+            || !foreground_one
+            || !std::env::var_os(TEST_HOLD_LIVE_JOB_ENV)
+                .is_some_and(|path| std::path::Path::new(&path).exists())
+        {
+            return None;
+        }
+        let round = Arc::new(ProofRound {
+            room,
+            peer,
+            request,
+            instance,
+            token,
+        });
+        *self
+            .0
+            .proof_round
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&round));
+        Some(ProofRoundGuard {
+            worker: Arc::downgrade(&self.0),
+            round,
+        })
+    }
+
+    // Called only after a real failed try_admit and subscribed wake, outside every Budget lock.
+    #[cfg(feature = "test-knobs")]
+    fn foreground_wait_for_proof(&self, ticket: &Ticket) -> Option<ProofWaitWitness> {
+        let round = self
+            .0
+            .proof_round
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        let actor = self.0.flow_owner?;
+        let base = std::path::PathBuf::from(std::env::var_os(TEST_HOLD_LIVE_JOB_ENV)?);
+        if !base.exists() {
+            return None;
+        }
+        let parent = Arc::as_ptr(&self.0) as usize;
+        let path = std::path::PathBuf::from(format!(
+            "{}.foreground-wait.{actor}.{parent}.{}",
+            base.display(),
+            ticket.ticket
+        ));
+        let hex = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let witness = serde_json::json!({
+            "schema": "vox.proof.foreground-wait/1", "actor": actor,
+            "node": crate::node::link::b32_encode(&self.0.node),
+            "room": crate::node::link::b32_encode(&round.room),
+            "peer": crate::node::link::b32_encode(&round.peer),
+            "request": hex(&round.request), "instance": hex(&round.instance),
+            "token": round.token, "parent_job": parent, "ticket": ticket.ticket,
+            "lane": "large_control",
+        });
+        let temporary = std::path::PathBuf::from(format!(
+            "{}.foreground-publishing.{actor}.{parent}.{}",
+            base.display(),
+            ticket.ticket
+        ));
+        let fault = std::path::PathBuf::from(format!("{}.foreground-fault", base.display()));
+        if let Err(error) = std::fs::write(&temporary, witness.to_string())
+            .and_then(|()| std::fs::rename(&temporary, &path))
+        {
+            eprintln!("APPARATUS: foreground queue witness could not be published: {error}");
+            let _ = std::fs::remove_file(&temporary);
+            let _ = std::fs::write(&fault, error.to_string());
+            return None;
+        }
+        Some(ProofWaitWitness { path, fault })
     }
 
     /// Proof-only: keep one admitted Control, Live or Archive job until apparatus removes its lane's
@@ -980,6 +1147,10 @@ impl Job {
     pub(crate) async fn record_job(&self, envelope: usize) -> Option<Self> {
         if self.0.lane == Lane::Control && envelope > MIB {
             let mut ticket = self.0.budget.enqueue(self.0.node, Lane::LargeControl);
+            #[cfg(feature = "test-knobs")]
+            let mut proof_attempted = false;
+            #[cfg(feature = "test-knobs")]
+            let mut _proof_wait = None;
             loop {
                 // Subscribe first: a release between the failed admission and the await cannot
                 // be lost. The retained ticket keeps its fair position; no periodic retry is
@@ -987,6 +1158,11 @@ impl Job {
                 let wake = ticket.wake();
                 if let Some(job) = ticket.try_admit() {
                     return Some(job);
+                }
+                #[cfg(feature = "test-knobs")]
+                if !proof_attempted {
+                    proof_attempted = true;
+                    _proof_wait = self.foreground_wait_for_proof(&ticket);
                 }
                 wake.await;
             }

@@ -1507,6 +1507,18 @@ fn stage_hosted_nodes(
     single_foreground_job: bool,
     disable_tick_schedule: bool,
 ) -> Staged {
+    if single_foreground_job {
+        assert_eq!(
+            hosted,
+            FX35_WAKE_HOSTED.as_slice(),
+            "APPARATUS: one-foreground fixture requires the exact two reader topology"
+        );
+        assert_eq!(
+            hosted.len(),
+            QUIET_ROOMS.len(),
+            "APPARATUS: each strict foreground reader requires its own Bob-only room"
+        );
+    }
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
     let root = tmp.path();
     let host = root.join("host");
@@ -1614,10 +1626,15 @@ fn stage_hosted_nodes(
             );
         }
     }
-    // The rooms: the first hosted node makes each, and every other node joins by its link.
-    let maker = Some(hosted[0]);
+    // Full delivery uses the original clique. The separate strict-FG fixture gives each
+    // reader a Bob-only room: a sibling server must not need the same FG1 to answer HAVE.
     let mut rooms = Vec::with_capacity(QUIET_ROOMS.len());
-    for name in QUIET_ROOMS {
+    for (index, name) in QUIET_ROOMS.into_iter().enumerate() {
+        let maker = Some(if single_foreground_job {
+            hosted[index]
+        } else {
+            hosted[0]
+        });
         let (ok, _, err) = vox(
             &host,
             &as_node(
@@ -1634,8 +1651,12 @@ fn stage_hosted_nodes(
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or_else(|| panic!("APPARATUS: staged room {name} is not listed: {listed}"))
             .to_owned();
-        let room =
-            vox_core::node::link::b32_encode(&room_id_as(&host, maker, hosted[0], &room_selector));
+        let room = vox_core::node::link::b32_encode(&room_id_as(
+            &host,
+            maker,
+            maker.expect("APPARATUS: room maker"),
+            &room_selector,
+        ));
         let (ok, link, err) = vox(&host, &as_node(&["room", "link", &room], maker), None);
         assert!(ok, "APPARATUS: staging room link failed: {err}");
         let link = link
@@ -1644,7 +1665,7 @@ fn stage_hosted_nodes(
             .unwrap_or(link.trim())
             .to_owned();
         for (dir, node, who, _) in &everyone {
-            if *node == maker {
+            if *node == maker || (single_foreground_job && node.is_some()) {
                 continue;
             }
             let (ok, _, err) = vox(
@@ -1669,15 +1690,18 @@ fn stage_hosted_nodes(
     // applies its last change; callers assess delivery separately from setup.
     let posted = Instant::now();
     let mut waited = Duration::ZERO;
-    for room in &rooms {
+    for (index, room) in rooms.iter().enumerate() {
         for (dir, node, name, _) in &everyone {
+            if single_foreground_job && node.is_some_and(|node| node != hosted[index]) {
+                continue;
+            }
             let text = format!("{name} is here");
             waited = waited.max(stage_post(dir, *node, name, room, &text));
         }
     }
     eprintln!(
-        "[delivery] all {} posts accepted across {} identities and {} rooms; mutual reads follow",
-        everyone.len() * rooms.len(),
+        "[delivery] all {} posts accepted across {} identities and {} rooms; actual member reads follow",
+        if single_foreground_job { 2 * rooms.len() } else { everyone.len() * rooms.len() },
         everyone.len(),
         rooms.len()
     );
@@ -4385,7 +4409,80 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
 #[cfg(feature = "optional-proofs")]
 fn foreground_release_wakes_without_a_tick() {
     let staged = stage_hosted_nodes(&FX35_WAKE_HOSTED, true, true, true);
-    converged(&staged);
+    let (bob_dir, bob_node, bob_name, bob_id) = staged
+        .everyone
+        .last()
+        .expect("APPARATUS: strict foreground donor");
+    // Each network edge crosses daemon budgets. A same-host Inventory server can
+    // otherwise hold FG1 awaiting HAVE that its sibling needs FG1 to construct.
+    for (index, (dir, node, name, id)) in staged.everyone[..staged.hosted].iter().enumerate() {
+        let room = &staged.rooms[index];
+        loop {
+            let shown = fx35_synced(dir, *node);
+            let value: serde_json::Value = serde_json::from_str(&shown.status)
+                .expect("APPARATUS: strict foreground topology JSON");
+            let rooms = value["rooms"]
+                .as_array()
+                .expect("APPARATUS: strict foreground rooms");
+            assert_eq!(
+                rooms.len(),
+                1,
+                "APPARATUS: {name} must have one Bob-only room: {value}"
+            );
+            assert_eq!(
+                rooms[0]["id"], *room,
+                "APPARATUS: {name}'s own room changed"
+            );
+            let members: BTreeSet<_> = rooms[0]["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|member| member["id"].as_str())
+                .collect();
+            let pair: BTreeSet<_> = [id.as_str(), bob_id.as_str()].into_iter().collect();
+            assert_eq!(
+                members, pair,
+                "APPARATUS: strict foreground reader has a same-host sibling edge: {value}"
+            );
+            let (ok, out, err) = vox(dir, &as_node(&["room", "read", room], *node), None);
+            assert!(
+                ok,
+                "APPARATUS: {name}'s strict foreground baseline refused: {out}{err}"
+            );
+            let (bob_ok, bob_out, bob_err) =
+                vox(bob_dir, &as_node(&["room", "read", room], *bob_node), None);
+            assert!(
+                bob_ok,
+                "APPARATUS: Bob's strict foreground baseline refused: {bob_out}{bob_err}"
+            );
+            if out.contains(&format!("{bob_name} is here"))
+                && bob_out.contains(&format!("{name} is here"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // Complete every local tail-ready append before holding FG1. An own append
+    // while a hinted Live admission waits may legally prepend a Control announcement.
+    let mut tails: BTreeMap<&str, TailObserver> = staged.everyone[..staged.hosted]
+        .iter()
+        .enumerate()
+        .map(|(index, (dir, node, name, _))| {
+            (
+                *name,
+                TailObserver::attach(dir, *node, &staged.rooms[index], None),
+            )
+        })
+        .collect();
+    for (index, (dir, node, name, _)) in staged.everyone[..staged.hosted].iter().enumerate() {
+        let ready = format!("tail-attached-for-{name}");
+        stage_post(dir, *node, name, &staged.rooms[index], &ready);
+        tails
+            .get(name)
+            .expect("APPARATUS: strict foreground tail")
+            .wait_for(&ready, name, false);
+    }
     loop {
         let mut busy = Vec::new();
         for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
@@ -4433,66 +4530,213 @@ fn foreground_release_wakes_without_a_tick() {
         .expect("APPARATUS: exact-admission hold path was not staged");
     std::fs::File::create(hold)
         .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hold.display()));
-    let room = &staged.rooms[0];
-    for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+    // A Bob post in each independent room creates real receiving Live work on
+    // both hosted contenders; local posts alone would only owe Bob an announcement.
+    for (index, (_, _, name, _)) in staged.everyone[..staged.hosted].iter().enumerate() {
         let text = format!("{name} re-armed");
-        stage_post(dir, *node, name, room, &text);
+        stage_post(bob_dir, *bob_node, bob_name, &staged.rooms[index], &text);
     }
-    let (waiting_dir, waiting_node, waiting_name, parked) = loop {
-        let mut found = None;
-        let mut running = 0u64;
-        for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
-            let shown = fx35_synced(dir, *node);
-            let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
-            running = running.max(
-                v["lanes"]["budget"]["flow_state"]["in_use"]
-                    .as_u64()
-                    .unwrap_or(0),
+    // A peer's incoming HAVE can itself wait for FG1 before publishing any new
+    // head. Observe the actual held receiver, then make ONE ordinary local append
+    // on the OTHER reader so its outgoing Control producer is owed independently.
+    let held_index = loop {
+        let owners = charged_flow_hold_owners(hold);
+        let mut selected = None;
+        if owners.values().sum::<usize>() == 1 {
+            let ((actor, id, room, peer), _) = owners
+                .iter()
+                .next()
+                .expect("APPARATUS: one held Live owner");
+            let index = staged.everyone[..staged.hosted]
+                .iter()
+                .position(|(_, _, _, node)| node == id)
+                .expect("APPARATUS: strict foreground held an unstaged node");
+            assert_eq!(
+                *room, staged.rooms[index],
+                "APPARATUS: held reader room changed"
             );
-            if let Some(admission) = v["lanes"]["bounded"]["admissions"]
+            assert_eq!(peer, bob_id, "APPARATUS: held reader peer changed");
+            let (dir, node, _, _) = &staged.everyone[index];
+            let shown = fx35_synced(dir, *node);
+            let value: serde_json::Value =
+                serde_json::from_str(&shown.status).expect("APPARATUS: held Live status JSON");
+            let real = value["lanes"]["bounded"]["running"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .find(|admission| {
-                    admission["gate"] == "foreground"
-                        && admission["room"] == *room
-                        && admission["lane"] == "live"
-                })
+                .any(|round| {
+                    round["actor"] == *actor
+                        && round["room"] == *room
+                        && round["peer"] == *bob_id
+                        && round["archive"] == false
+                        && round["lane"] == "live"
+                        && round["finished"] == false
+                });
+            if real
+                && value["lanes"]["budget"]["foreground"] == 1
+                && charged_flow_hold_owners(hold) == owners
             {
-                found = Some((dir.clone(), *node, *name, admission.clone()));
+                selected = Some(index);
             }
         }
-        let has_waiter = found.is_some();
-        if running == 1 {
-            if let Some(waiter) = found {
-                break waiter;
-            }
+        if let Some(index) = selected {
+            break index;
         }
-        let _ = has_waiter;
         std::thread::sleep(Duration::from_millis(20));
     };
+    let waiting_index = (0..staged.hosted)
+        .find(|index| *index != held_index)
+        .expect("APPARATUS: strict foreground needs the other reader");
+    let (waiting_dir, waiting_node, waiting_name, waiting_id) = &staged.everyone[waiting_index];
+    let room = &staged.rooms[waiting_index];
+    let stimulus = format!("foreground-control-stimulus-for-{waiting_name}");
+    let (ok, out, err) = stage_post_once(waiting_dir, *waiting_node, room, &stimulus);
+    assert!(
+        ok,
+        "APPARATUS: sole local Control stimulus was refused: {out}{err}"
+    );
+    eprintln!("[proof] strict foreground Live held; other reader {waiting_name}'s sole Control stimulus accepted");
+
+    let witnesses = || {
+        let fault = std::path::PathBuf::from(format!("{}.foreground-fault", hold.display()));
+        assert!(
+            !fault.exists(),
+            "APPARATUS: foreground witness failed: {:?}",
+            std::fs::read_to_string(&fault)
+        );
+        let prefix = format!(
+            "{}.foreground-wait.",
+            hold.file_name()
+                .expect("APPARATUS: foreground hold basename")
+                .to_string_lossy()
+        );
+        std::fs::read_dir(hold.parent().expect("APPARATUS: foreground hold parent"))
+            .expect("APPARATUS: foreground witness directory")
+            .filter_map(|entry| {
+                let path = entry.expect("APPARATUS: foreground witness entry").path();
+                if !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+                {
+                    return None;
+                }
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+                    Err(error) => panic!("APPARATUS: foreground witness read: {error}"),
+                };
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .expect("APPARATUS: atomically published foreground witness JSON");
+                assert!(
+                    value["schema"] == "vox.proof.foreground-wait/1"
+                        && value["lane"] == "large_control"
+                        && value["parent_job"].as_u64().is_some()
+                        && value["ticket"].as_u64().is_some(),
+                    "APPARATUS: foreground witness schema changed: {value}"
+                );
+                let expected_path = std::path::PathBuf::from(format!(
+                    "{}.foreground-wait.{}.{}.{}",
+                    hold.display(),
+                    value["actor"].as_u64().expect("APPARATUS: witness actor"),
+                    value["parent_job"].as_u64().expect("APPARATUS: parent job"),
+                    value["ticket"].as_u64().expect("APPARATUS: witness ticket")
+                ));
+                assert_eq!(
+                    path, expected_path,
+                    "APPARATUS: foreground witness filename changed parent/ticket binding"
+                );
+                Some((path, bytes, value))
+            })
+            .collect::<Vec<_>>()
+    };
+    let current_control =
+        |status: &serde_json::Value, witness: &serde_json::Value, id: &str, room: &str| {
+            witness["node"] == id
+                && witness["room"] == room
+                && witness["peer"] == *bob_id
+                && status["lanes"]["budget"]["flow_state"]["actors"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|actor| {
+                        actor["actor"] == witness["actor"]
+                            && actor["node"] == id
+                            && actor["registered"] == true
+                    })
+                && status["lanes"]["bounded"]["running"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|round| {
+                        round["archive"] == false
+                            && round["lane"] == "control"
+                            && round["finished"] == false
+                            && ["actor", "room", "peer", "request", "instance", "token"]
+                                .into_iter()
+                                .all(|field| round[field] == witness[field])
+                    })
+        };
+    let exact_running = |status: &serde_json::Value, witness: &serde_json::Value| {
+        let held = charged_flow_hold_owners(hold);
+        if held.values().sum::<usize>() != 1 {
+            return false;
+        }
+        if !held.keys().all(|(actor, node, _, _)| {
+            status["lanes"]["budget"]["flow_state"]["actors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|owner| {
+                    owner["actor"] == *actor
+                        && owner["node"] == *node
+                        && owner["registered"] == true
+                })
+        }) {
+            return false;
+        }
+        let mut expected = held;
+        *expected
+            .entry((
+                witness["actor"].as_u64().expect("APPARATUS: witness actor"),
+                witness["node"]
+                    .as_str()
+                    .expect("APPARATUS: witness node")
+                    .to_owned(),
+                witness["room"]
+                    .as_str()
+                    .expect("APPARATUS: witness room")
+                    .to_owned(),
+                witness["peer"]
+                    .as_str()
+                    .expect("APPARATUS: witness peer")
+                    .to_owned(),
+            ))
+            .or_insert(0) += 1;
+        running_flow_owners(status) == expected
+            && status["lanes"]["budget"]["flow_state"]["in_use"] == 2
+            && status["lanes"]["budget"]["foreground"] == 1
+            && status["lanes"]["budget"]["foreground_jobs"] == 1
+    };
+    loop {
+        let shown = fx35_synced(waiting_dir, *waiting_node);
+        let value: serde_json::Value =
+            serde_json::from_str(&shown.status).expect("APPARATUS: foreground waiter status JSON");
+        if witnesses().iter().any(|(_, _, witness)| {
+            current_control(&value, witness, waiting_id, room) && exact_running(&value, witness)
+        }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // Create one remote result the retained waiter can reveal. It must still be absent before
     // release. The read and the tail subscription may schedule while capacity is held; neither
     // can be the event that starts the waiter after capacity changes.
-    let parked_peer = parked["peer"]
-        .as_str()
-        .expect("APPARATUS: exact foreground admission did not name its peer");
-    let (peer_dir, peer_node, peer_name, _) = staged
-        .everyone
-        .iter()
-        .find(|(_, _, _, fingerprint)| fingerprint == parked_peer)
-        .unwrap_or_else(|| {
-            panic!(
-                "APPARATUS: exact foreground admission named peer {parked_peer}, which is not a \
-                 staged participant: {parked}"
-            )
-        });
     let target = format!("release-event-target-for-{waiting_name}");
-    stage_post(peer_dir, *peer_node, peer_name, room, &target);
+    stage_post(bob_dir, *bob_node, bob_name, room, &target);
     let (ok, before, err) = vox(
-        &waiting_dir,
-        &as_node(&["room", "read", room], waiting_node),
+        waiting_dir,
+        &as_node(&["room", "read", room], *waiting_node),
         None,
     );
     assert!(
@@ -4505,107 +4749,40 @@ fn foreground_release_wakes_without_a_tick() {
          released: {before}"
     );
 
-    let mut command = Command::new(VOX);
-    command
-        .args(as_node(&["room", "tail", room], waiting_node))
-        .env("VOX_DATA_DIR", &waiting_dir)
-        .env("VOX_CONFIG_DIR", waiting_dir.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-        .env_remove("VOX_ROOM")
-        .env_remove("VOX_SESSION")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut tail = command.spawn().unwrap_or_else(|error| {
-        panic!("APPARATUS: could not start release-observer tail: {error}")
-    });
-    let stdout = tail
-        .stdout
-        .take()
-        .expect("APPARATUS: release-observer tail has no stdout");
-    let (lines_tx, lines_rx) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            match line {
-                Ok(line) => {
-                    if lines_tx.send(Ok(line)).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = lines_tx.send(Err(error.to_string()));
-                    return;
-                }
-            }
-        }
-    });
-    let ready = format!("tail-attached-for-{waiting_name}");
-    stage_post(&waiting_dir, waiting_node, waiting_name, room, &ready);
-    loop {
-        match lines_rx.recv() {
-            Ok(Ok(line)) if line.contains(&ready) => break,
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                panic!("APPARATUS: release-observer tail could not read stdout: {error}")
-            }
-            Err(error) => panic!(
-                "APPARATUS: release-observer tail ended without its pre-release ready marker: \
-                 {error}"
-            ),
-        }
-    }
-
-    // Bind the decisive release to the same exact admission observed before any staging command.
-    // This status request may schedule ports, but the held foreground job still owns capacity;
-    // the original admission (same token, gate, room, peer, root and lane) must remain parked.
-    let shown = fx35_synced(&waiting_dir, waiting_node);
-    let value: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_else(|error| {
-        panic!(
-            "PRODUCT: {waiting_name}'s final pre-release status was not JSON: {error}: {}",
-            shown.status
-        )
-    });
-    let still_parked = value["lanes"]["bounded"]["admissions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|admission| admission == &parked);
-    assert!(
-        still_parked,
-        "PRODUCT: {waiting_name}'s exact parked foreground admission changed or disappeared \
-         before its held capacity was released; originally {parked}, now {}",
-        value["lanes"]["bounded"]["admissions"]
-    );
+    let tail = tails
+        .remove(*waiting_name)
+        .expect("APPARATUS: selected strict foreground tail disappeared");
+    // Bind only after every preparatory command. This is a real queued LargeControl
+    // promotion owned by this exact running Control round, not an actor Live FIFO claim.
+    let shown = fx35_synced(waiting_dir, *waiting_node);
+    let value: serde_json::Value =
+        serde_json::from_str(&shown.status).expect("APPARATUS: final foreground waiter JSON");
+    let id = waiting_id;
+    let (path, bytes, witness) = witnesses().into_iter()
+        .find(|(_, _, witness)| current_control(&value, witness, id, room)
+            && exact_running(&value, witness))
+        .unwrap_or_else(|| panic!("APPARATUS: exact foreground promotion/held Live owner changed during target staging: {value}"));
     assert_eq!(
-        value["lanes"]["budget"]["flow_state"]["in_use"], 1,
-        "PRODUCT: {waiting_name}'s held round was not still the only running flow immediately \
-         before the exact admission release: {}",
-        shown.status
+        std::fs::read(&path).expect("APPARATUS: final current promotion witness"),
+        bytes,
+        "APPARATUS: actual queued promotion ended/changed before capacity release"
     );
-
+    eprintln!(
+        "[proof] strict foreground actual queued promotion bound for {waiting_name}: {witness}"
+    );
+    let released = Instant::now();
     std::fs::remove_file(hold)
         .unwrap_or_else(|e| panic!("APPARATUS: could not release {}: {e}", hold.display()));
     // No status, read, post, or other actor request occurs after this point. The retained lane's
     // exact capacity-release notification is the only product event that can expose `target` to
     // the already-running shipped tail while periodic scheduling is disabled.
-    loop {
-        match lines_rx.recv() {
-            Ok(Ok(line)) if line.contains(&target) => break,
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => panic!(
-                "PRODUCT: {waiting_name}'s shipped room tail failed after foreground release: {error}"
-            ),
-            Err(error) => panic!(
-                "PRODUCT: {waiting_name}'s shipped tail ended without the retained target after \
-                 exact foreground release while periodic scheduling was disabled: {error}; \
-                 admission {parked}"
-            ),
-        }
-    }
+    tail.wait_for_after(&target, waiting_name, true, Some(released));
+    assert!(!std::path::Path::new(&format!("{}.foreground-fault", hold.display())).exists(),
+        "APPARATUS: foreground witness cleanup failed; user outcome is not credited by this apparatus");
     loop {
         let (ok, out, err) = vox(
-            &waiting_dir,
-            &as_node(&["room", "read", room], waiting_node),
+            waiting_dir,
+            &as_node(&["room", "read", room], *waiting_node),
             None,
         );
         assert!(
@@ -4613,19 +4790,30 @@ fn foreground_release_wakes_without_a_tick() {
             "PRODUCT: {waiting_name}'s shipped read refused while judging re-armed ports: \
              {out}{err}"
         );
-        let missing: Vec<_> = staged.everyone[..staged.hosted]
-            .iter()
-            .map(|(_, _, name, _)| format!("{name} re-armed"))
-            .filter(|text| !out.contains(text))
-            .collect();
-        if missing.is_empty() {
+        if out.contains(&format!("{waiting_name} re-armed")) {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let _ = tail.kill();
-    let _ = tail.wait();
-    let _ = reader.join();
+    for (index, (dir, node, name, _)) in staged.everyone[..staged.hosted].iter().enumerate() {
+        loop {
+            let (ok, out, err) = vox(
+                dir,
+                &as_node(&["room", "read", &staged.rooms[index]], *node),
+                None,
+            );
+            assert!(
+                ok,
+                "PRODUCT: {name}'s own Bob-room read refused after release: {out}{err}"
+            );
+            if out.contains(&format!("{name} re-armed")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    drop(tail);
+    drop(tails);
 }
 
 /// **A quiet room costs nothing, writes nothing and says when it last synced** (ADR-038 FX-15,
@@ -4692,6 +4880,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_HOLD_CONTROL_JOB_FILE",
         "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
         "VOX_TEST_FOREGROUND_JOBS",
+        "VOX_TEST_CONTROL_JOBS",
         "VOX_TEST_FX29_MUTANT",
         "VOX_TEST_FX29_CONTENT_OUTCOME_FILE",
         "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE",
@@ -5068,6 +5257,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             body_durable_path.as_str(),
         ),
         ("VOX_TEST_FOREGROUND_JOBS", "1"),
+        ("VOX_TEST_CONTROL_JOBS", "1"),
         ("VOX_TEST_HOLD_CONTROL_JOB_FILE", control_hold_path.as_str()),
     ];
     let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_settlement_knob);

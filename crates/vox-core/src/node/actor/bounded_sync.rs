@@ -3454,6 +3454,14 @@ impl Node {
             // The proof barrier belongs after exclusive Flow ownership. While it is held, an
             // actor panic can retire the controller but cannot adopt/park this Flow; its charge
             // therefore remains truthfully attributed to the retiring actor generation.
+            #[cfg(feature = "test-knobs")]
+            let _proof_round = job.round_for_proof(
+                room,
+                peer,
+                running_retirement_key.request,
+                running_retirement_key.instance,
+                token,
+            );
             job.hold_for_proof(room, peer).await;
             // Proof staging is not part of the product operation's elapsed budget. Start the
             // existing round deadline only once the admitted worker is allowed to do real work.
