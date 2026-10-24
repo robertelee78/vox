@@ -2013,7 +2013,7 @@ fn charged_flow_hold_entries(hold: &Path) -> Vec<(u64, String, std::path::PathBu
 }
 
 #[cfg(feature = "optional-proofs")]
-fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
+fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged, hosted_identities: usize) {
     let hold = staged
         .live_hold
         .as_ref()
@@ -2231,7 +2231,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
             .as_object()
             .expect("PRODUCT: generation-accounting status omitted by_node");
         let expected_limit =
-            (vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * staged.hosted) as u64;
+            (vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS * hosted_identities) as u64;
         let actor_sum: u64 = pool["actors"]
             .as_array()
             .into_iter()
@@ -2251,7 +2251,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
             assert!(
                 generations.len() == 2
                     && retiring
-                    && by_node.len() == staged.hosted
+                    && by_node.len() == hosted_identities
                     && by_node
                         .get(&running_fingerprint)
                         .and_then(serde_json::Value::as_u64)
@@ -2341,6 +2341,229 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
     }
 }
 
+// Sidecars participate only in pressure. The original cold delivery/generation participants
+// stay unchanged. These readers never join the room containing the two held Archive requests.
+#[cfg(feature = "optional-proofs")]
+const PRESSURE_SIDECARS: [&str; vox_core::node::history_budget::ARCHIVE_JOBS] =
+    ["pressure-one", "pressure-two"];
+
+#[cfg(feature = "optional-proofs")]
+type PressureMember = (
+    std::path::PathBuf,
+    Option<&'static str>,
+    &'static str,
+    String,
+);
+
+#[cfg(feature = "optional-proofs")]
+fn stage_pressure_sidecars(
+    staged: &Staged,
+    room: &str,
+    nonce: &str,
+) -> (Vec<PressureMember>, BTreeMap<&'static str, String>) {
+    let (peer_dir, peer_node, peer_name, peer_fp) = &staged.everyone[staged.hosted];
+    let (ok, link, err) = vox(
+        peer_dir,
+        &as_node(&["room", "link", room], *peer_node),
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: pressure sidecar room link failed: {link}{err}"
+    );
+    let link = link
+        .lines()
+        .find(|line| line.starts_with("vox://"))
+        .unwrap_or(link.trim());
+    let mut members = Vec::new();
+    let mut unrelated = BTreeMap::new();
+    for name in PRESSURE_SIDECARS {
+        let (ok, fp, err) = vox(&staged.host, &["id", "--node", name], None);
+        assert!(
+            ok,
+            "APPARATUS: pressure sidecar {name} identity failed: {fp}{err}"
+        );
+        let fp = fp.trim().to_owned();
+        unlock(&staged.host, name);
+        attached_as(&staged.host, "host", Some(name));
+        for (dir, node, target, label) in [
+            (&staged.host, Some(name), peer_fp.as_str(), *peer_name),
+            (peer_dir, *peer_node, fp.as_str(), name),
+        ] {
+            let (ok, out, err) = vox(
+                dir,
+                &as_node(&["trust", "add", target, "--name", label], node),
+                None,
+            );
+            assert!(
+                ok,
+                "APPARATUS: pressure sidecar {name} mutual trust failed: {out}{err}"
+            );
+        }
+        let (ok, out, err) = vox(
+            &staged.host,
+            &as_node(
+                &["room", "join", "--passphrase-file", "-", link],
+                Some(name),
+            ),
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(
+            ok,
+            "APPARATUS: pressure sidecar {name} join failed: {out}{err}"
+        );
+        // A real held unrelated room makes health's negative assertion nonvacuous even though
+        // these pressure-only readers deliberately never join the original quiet-2 room.
+        let own_name = format!("{name}-isolated-{nonce}");
+        let (ok, out, err) = vox(
+            &staged.host,
+            &as_node(
+                &[
+                    "room",
+                    "create",
+                    "--passphrase-file",
+                    "-",
+                    "--name",
+                    &own_name,
+                ],
+                Some(name),
+            ),
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(ok, "APPARATUS: {name}'s unrelated room failed: {out}{err}");
+        let listed = attached_as(&staged.host, "host", Some(name));
+        let own_room = listed
+            .lines()
+            .find(|line| line.contains(&own_name))
+            .and_then(|line| line.split_whitespace().next())
+            .expect("APPARATUS: sidecar's real unrelated room not listed");
+        unrelated.insert(
+            name,
+            vox_core::node::link::b32_encode(&room_id(&staged.host, name, own_room)),
+        );
+        let source_ready = format!("{name}-source-ready-{nonce}");
+        let reader_ready = format!("{name}-reader-ready-{nonce}");
+        stage_post(peer_dir, *peer_node, peer_name, room, &source_ready);
+        stage_post(&staged.host, Some(name), name, room, &reader_ready);
+        loop {
+            let (ok, out, err) = vox(
+                &staged.host,
+                &as_node(&["room", "read", room], Some(name)),
+                None,
+            );
+            assert!(
+                ok,
+                "APPARATUS: {name}'s pressure readiness read refused: {out}{err}"
+            );
+            let (peer_ok, peer_out, peer_err) = vox(
+                peer_dir,
+                &as_node(&["room", "read", room], *peer_node),
+                None,
+            );
+            assert!(
+                peer_ok,
+                "APPARATUS: source's sidecar readiness read refused: {peer_out}{peer_err}"
+            );
+            if out.contains(&source_ready) && peer_out.contains(&reader_ready) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        members.push((staged.host.clone(), Some(name), name, fp));
+    }
+    (members, unrelated)
+}
+
+#[cfg(feature = "optional-proofs")]
+#[derive(Clone)]
+struct PressureContinuation {
+    name: &'static str,
+    observed: Instant,
+    order: u64,
+    identity: serde_json::Value,
+    root: String,
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pressure_continuation(
+    status: &serde_json::Value,
+    name: &'static str,
+    node: &str,
+    room: &str,
+    peer: &str,
+) -> Option<PressureContinuation> {
+    let admission = status["lanes"]["bounded"]["admissions"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["gate"] == "pool" && entry["room"] == room && entry["peer"] == peer)?;
+    let order = admission["wait_order"]
+        .as_u64()
+        .expect("PRODUCT: PoolFull admission omitted order");
+    let identity = status["lanes"]["budget"]["flow_state"]["waiting"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["order"] == order)
+        .expect("PRODUCT: actor's PoolFull admission has no exact daemon continuation")
+        .clone();
+    assert_eq!(
+        identity["node"], node,
+        "PRODUCT: PoolFull continuation names another identity"
+    );
+    assert_eq!(
+        identity["room"], room,
+        "PRODUCT: PoolFull continuation names another room"
+    );
+    assert_eq!(
+        identity["peer"], peer,
+        "PRODUCT: PoolFull continuation names another peer"
+    );
+    for field in ["actor", "request", "instance"] {
+        assert!(
+            !identity[field].is_null(),
+            "PRODUCT: PoolFull continuation omitted {field}"
+        );
+    }
+    let retained = status["lanes"]["bounded"]["ready"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(
+            status["lanes"]["bounded"]["deferred"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .find(|flow| {
+            flow["archive"] == false
+                && ["actor", "request", "instance", "room", "peer"]
+                    .iter()
+                    .all(|field| flow[*field] == identity[*field])
+        })
+        .expect("PRODUCT: PoolFull discarded its exact foreground Flow instead of retaining it");
+    Some(PressureContinuation {
+        name,
+        observed: Instant::now(),
+        order,
+        identity,
+        root: retained["root"]
+            .as_str()
+            .expect("PRODUCT: retained Flow omitted root")
+            .to_owned(),
+    })
+}
+
+#[cfg(feature = "optional-proofs")]
+fn assert_pressure_identity(record: &serde_json::Value, owner: &PressureContinuation) {
+    for field in ["actor", "node", "request", "instance", "room", "peer"] {
+        assert_eq!(
+            record[field], owner.identity[field],
+            "PRODUCT: release continuation {} changed its exact {field}",
+            owner.order
+        );
+    }
+}
+
 /// **More than eight hosted nodes read each other, and the flow-state pool holds no port**
 /// (ADR-038 FX-35; #986): [`FX35_HOSTED`] on one daemon and bob on another, two rooms, trust in every
 /// direction, one post each. Every member MUST eventually read every other; only the apparatus
@@ -2366,8 +2589,9 @@ fn generation_accounting_keeps_actor_incarnations_exact(staged: &Staged) {
 /// assertion red; omitting promises from `occupied` turns the granted-but-unconsumed snapshot
 /// PRODUCT-red; restoring `Pool::resize`'s handoff makes unrelated registration grant the exact
 /// retained continuation and turns that assertion PRODUCT-red;
-/// `scratchpad/mutant_fx35_required.py` disposes the exact required root at an admission
-/// refusal, turning the retained-required-root PRODUCT assertion red at the PoolFull snapshot;
+/// The pressure phase retains the actual selected foreground continuation; it does not claim
+/// to manufacture a separate `RequiredOwner` dependency. Required/hint/Archive variants share
+/// the reviewed Flow ownership path; the release mutant falsifies the independent U2 claim.
 /// `scratchpad/mutant_fx35_release_wake.py` removes the synchronous actor handoff after granting
 /// the earliest exact continuation; one shipped status snapshot then reports the same release
 /// order `granted: true` and `handed_off: false`, immediately PRODUCT red before the already-
@@ -2401,10 +2625,11 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     watchdog::arm_for_setup(
         u32::try_from(
             QUIET_ROOMS.len() * (FX35_HOSTED.len() + FX35_WAKE_HOSTED.len())
-                + vox_core::node::history_budget::ARCHIVE_JOBS,
+                + vox_core::node::history_budget::ARCHIVE_JOBS
+                + PRESSURE_SIDECARS.len(),
         )
         .expect("APPARATUS: join count does not fit the watchdog"),
-        u32::try_from(FX35_HOSTED.len() + FX35_WAKE_HOSTED.len() + 2)
+        u32::try_from(FX35_HOSTED.len() + FX35_WAKE_HOSTED.len() + PRESSURE_SIDECARS.len() + 2)
             .expect("APPARATUS: unlock count does not fit the watchdog"),
     );
     let mut staged = stage_hosted_nodes(&FX35_HOSTED, true, false, true);
@@ -2415,24 +2640,41 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     // running shipped observer sees the exact room's target, so a tick or a status/read request
     // cannot stand in for the release/completion wake.
     let pressure_room = &staged.rooms[0];
-    let pressure_tails: BTreeMap<&str, TailObserver> = staged.everyone[..staged.hosted]
+    let nonce = staged
+        ._tmp
+        .path()
+        .file_name()
+        .expect("APPARATUS: no staging nonce")
+        .to_string_lossy()
+        .into_owned();
+    let (sidecars, mut unrelated_rooms) = stage_pressure_sidecars(&staged, pressure_room, &nonce);
+    let mut pressure_members = staged.everyone[..staged.hosted].to_vec();
+    pressure_members.extend(sidecars);
+    let pressure_room_id =
+        vox_core::node::link::b32_encode(&room_id(&staged.host, FX35_HOSTED[0], pressure_room));
+    let unrelated_id =
+        vox_core::node::link::b32_encode(&room_id(&staged.host, FX35_HOSTED[0], &staged.rooms[1]));
+    for (_, _, name, _) in &staged.everyone[..staged.hosted] {
+        unrelated_rooms.insert(*name, unrelated_id.clone());
+    }
+    let pressure_tails: BTreeMap<&str, TailObserver> = pressure_members
         .iter()
         .map(|(dir, node, name, _)| (*name, TailObserver::attach(dir, *node, pressure_room, None)))
         .collect();
-    let ready = "pool-release-tails-attached";
+    let ready = format!("pool-release-tails-attached-{nonce}");
     let (pressure_dir, pressure_node, pressure_name, _) = &staged.everyone[staged.hosted];
     stage_post(
         pressure_dir,
         *pressure_node,
         pressure_name,
         pressure_room,
-        ready,
+        &ready,
     );
-    for (_, _, name, _) in &staged.everyone[..staged.hosted] {
+    for (_, _, name, _) in &pressure_members {
         pressure_tails
             .get(name)
             .expect("APPARATUS: pressure tail disappeared")
-            .wait_for(ready, name, false);
+            .wait_for(&ready, name, false);
     }
     // Hold two real shipped archive requests at their admitted jobs. The separate proof-only
     // archive barrier is installed before either request, so observing both admissions proves
@@ -2442,7 +2684,9 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     // The barriers hold already-admitted jobs. A feature-gated apparatus file temporarily asks
     // the pool to use its own source-defined floor: fifteen live plus the daemon's two
     // source-owned archive jobs then reaches the otherwise impossible retained path without a
-    // copied count. Removing the file restores the production dynamic formula in this same run.
+    // copied count. Two pressure-only readers compensate for the two Archive reader actors whose
+    // local foreground slots can remain occupied by their Archive room's continuations. They
+    // never join that room. Removing the file restores actual production identity accounting.
     let resize_probe = "fx35-resize-probe";
     let pool_floor = staged
         .pool_floor
@@ -2495,23 +2739,22 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         *pressure_node,
         pressure_name,
         pressure_room,
-        "pool-pressure-payload",
+        &format!("pool-pressure-payload-{nonce}"),
     );
-    let pressure_target = "pool-pressure-landed";
+    let pressure_target = format!("pool-pressure-landed-{nonce}");
     stage_post(
         pressure_dir,
         *pressure_node,
         pressure_name,
         pressure_room,
-        pressure_target,
+        &pressure_target,
     );
     let mut pool_full_seen = false;
-    let mut required_pool_full_seen = false;
-    let mut live_pool_full: Option<(&str, Instant, u64, String)> = None;
+    let mut live_pool_full: Option<PressureContinuation> = None;
     let mut most_pressure = 0;
     let mut pressure_staged = false;
     let observed = 'pressure: loop {
-        for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+        for (dir, node, name, _) in &pressure_members {
             let shown = fx35_synced(dir, *node);
             let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
             let pool = &v["lanes"]["budget"]["flow_state"];
@@ -2569,45 +2812,36 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     > vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64
                     || !full_ports.is_empty();
             }
-            for flow in bounded["ready"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(bounded["admissions"].as_array().into_iter().flatten())
-                .filter(|flow| {
-                    flow["room"]
-                        .as_str()
-                        .zip(flow["peer"].as_str())
-                        .is_some_and(|(room, peer)| {
-                            full_ports.contains(&(room.to_owned(), peer.to_owned()))
-                        })
-                })
-            {
-                required_pool_full_seen |= flow["root"] == "required";
-            }
-            if let Some(admission) =
-                bounded["admissions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|admission| {
-                        admission["gate"] == "pool"
-                            && admission["root"] == "required"
-                            && admission["room"] == *pressure_room
-                    })
-            {
-                let wait_order = admission["wait_order"].as_u64().unwrap_or_else(|| {
-                    panic!(
-                        "PRODUCT: {name}'s exact PoolFull admission omitted its monotonic release \
-                         order: {}",
-                        shown.status
-                    )
-                });
-                let peer = admission["peer"]
-                    .as_str()
-                    .expect("PRODUCT: exact PoolFull admission omitted peer")
-                    .to_owned();
-                live_pool_full = Some((*name, Instant::now(), wait_order, peer));
+            let fingerprint = pressure_members
+                .iter()
+                .find(|(_, _, candidate, _)| candidate == name)
+                .expect("APPARATUS: pressure identity disappeared")
+                .3
+                .as_str();
+            if let Some(owner) = pressure_continuation(
+                &v,
+                *name,
+                fingerprint,
+                &pressure_room_id,
+                &staged.everyone[staged.hosted].3,
+            ) {
+                let unrelated = unrelated_rooms
+                    .get(name)
+                    .expect("APPARATUS: no real unrelated room");
+                assert!(
+                    room_health_messages(&v, &pressure_room_id)
+                        .iter()
+                        .any(|message| message.contains("flow-state pool")),
+                    "PRODUCT: retained pressure room has no exact flow-state pool health: {}",
+                    v["unhealthy"]
+                );
+                assert!(room_health_messages(&v, unrelated).iter().all(|message| !message.contains("flow-state pool")),
+                    "PRODUCT: shipped health blamed unrelated held room {unrelated} for flow-state pool: {}", v["unhealthy"]);
+                eprintln!(
+                    "[proof] exact foreground PoolFull owner={} root={} identity={}",
+                    owner.name, owner.root, owner.identity
+                );
+                live_pool_full = Some(owner);
                 most_pressure = most_pressure.max(in_use);
                 break 'pressure most_pressure;
             }
@@ -2619,13 +2853,19 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         std::thread::sleep(Duration::from_millis(20));
     };
     // A real connection close is an eligibility edge, not something the periodic scheduler may
-    // notice later. Stop the exact peer behind the retained required Flow, wait until shipped
+    // notice later. Stop the exact peer behind the retained foreground Flow, wait until shipped
     // status says that member is disconnected, and require both actor admission and daemon pool
     // continuation to be gone in the same observation. The parked Flow remains owned and is
     // re-enrolled after the peer returns, allowing the release-edge claims below to use a fresh
     // exact continuation.
-    if let Some((owner, _, disconnected_order, disconnected_peer)) = live_pool_full.clone() {
-        let (owner_dir, owner_node, _, _) = staged.everyone[..staged.hosted]
+    if let Some(disconnected_owner) = live_pool_full.clone() {
+        let owner = disconnected_owner.name;
+        let disconnected_order = disconnected_owner.order;
+        let disconnected_peer = disconnected_owner.identity["peer"]
+            .as_str()
+            .expect("PRODUCT: no exact peer")
+            .to_owned();
+        let (owner_dir, owner_node, _, _) = pressure_members
             .iter()
             .find(|(_, _, candidate, _)| *candidate == owner)
             .expect("APPARATUS: PoolFull owner disappeared before disconnect");
@@ -2672,37 +2912,37 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             std::thread::yield_now();
         }
         live_pool_full = 'restaged: loop {
-            for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+            for (dir, node, name, _) in &pressure_members {
                 let shown = fx35_synced(dir, *node);
                 let status: serde_json::Value = serde_json::from_str(&shown.status)
                     .expect("PRODUCT: reconnected PoolFull status was not JSON");
-                if let Some(admission) = status["lanes"]["bounded"]["admissions"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|admission| {
-                        admission["gate"] == "pool"
-                            && admission["root"] == "required"
-                            && admission["room"] == *pressure_room
-                    })
+                let fp = pressure_members
+                    .iter()
+                    .find(|(_, _, candidate, _)| candidate == name)
+                    .expect("APPARATUS: reconnect identity disappeared")
+                    .3
+                    .as_str();
+                if let Some(reconnected) =
+                    pressure_continuation(&status, *name, fp, &pressure_room_id, &disconnected_peer)
                 {
-                    let order = admission["wait_order"].as_u64().unwrap_or_else(|| {
-                        panic!(
-                            "PRODUCT: reconnected exact PoolFull admission omitted order: {}",
-                            shown.status
-                        )
-                    });
-                    let peer = admission["peer"]
-                        .as_str()
-                        .expect("PRODUCT: reconnected exact PoolFull admission omitted peer")
-                        .to_owned();
-                    break 'restaged Some((*name, Instant::now(), order, peer));
+                    if reconnected.name != owner {
+                        continue;
+                    }
+                    for field in ["actor", "node", "request", "instance", "room", "peer"] {
+                        assert_eq!(
+                            reconnected.identity[field], disconnected_owner.identity[field],
+                            "PRODUCT: reconnect reconstructed the retained Flow's {field}"
+                        );
+                    }
+                    break 'restaged Some(reconnected);
                 }
             }
             std::thread::yield_now();
         };
     }
-    if let Some((owner, _, wait_order, _)) = &live_pool_full {
+    if let Some(retained_owner) = &live_pool_full {
+        let owner = &retained_owner.name;
+        let wait_order = &retained_owner.order;
         let release_hold = staged
             .release_hold
             .as_ref()
@@ -2743,6 +2983,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     resized["lanes"]
                 )
             });
+        assert_pressure_identity(retained, retained_owner);
         assert_eq!(
             retained["granted"], false,
             "PRODUCT: unrelated hosted-identity registration granted retained continuation \
@@ -2773,22 +3014,19 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         )
     });
     if pool_full_seen {
-        assert!(
-            required_pool_full_seen,
-            "PRODUCT: a shipped bounded start reached PoolFull but status did not retain its \
-             exact required root; the dependency was discarded instead of re-armed"
-        );
-        let (name, observed_at, wait_order, peer) = live_pool_full.unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: a shipped bounded start reached PoolFull but no exact shared-room \
-                 required admission remained for the release edge"
-            )
-        });
-        let (dir, node, _, _) = staged.everyone[..staged.hosted]
+        let retained_owner = live_pool_full
+            .expect("PRODUCT: PoolFull lost the selected exact foreground continuation");
+        let name = retained_owner.name;
+        let observed_at = retained_owner.observed;
+        let wait_order = retained_owner.order;
+        let peer = retained_owner.identity["peer"]
+            .as_str()
+            .expect("PRODUCT: no retained peer");
+        let (dir, node, _, _) = pressure_members
             .iter()
             .find(|(_, _, candidate, _)| *candidate == name)
             .expect("APPARATUS: PoolFull owner disappeared from staged nodes");
-        let observer = staged.everyone[..staged.hosted]
+        let observer = pressure_members
             .iter()
             .find(|(_, _, candidate, _)| *candidate != name)
             .expect("APPARATUS: no unrelated hosted observer for promised capacity");
@@ -2802,7 +3040,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 .into_iter()
                 .flatten()
                 .find(|continuation| continuation["order"] == wait_order);
-            if exact.is_some_and(|continuation| continuation["granted"] == true) {
+            if let Some(exact) = exact.filter(|continuation| continuation["granted"] == true) {
+                assert_pressure_identity(exact, &retained_owner);
                 assert!(
                     pool["promised"].as_u64().is_some_and(|count| count > 0)
                         && pool["occupied"].as_u64()
@@ -2827,23 +3066,23 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 release_hold.display()
             )
         });
-        observe_flow_release_handoff(dir, *node, name, wait_order, pressure_room, &peer);
+        observe_flow_release_handoff(dir, *node, name, wait_order, &pressure_room_id, peer);
         pressure_tails
             .get(name)
             .expect("APPARATUS: PoolFull node lost its pre-attached observer")
-            .wait_for_after(pressure_target, name, true, Some(observed_at));
+            .wait_for_after(&pressure_target, name, true, Some(observed_at));
     }
     drop(pressure_tails);
     loop {
         let mut missing = Vec::new();
-        for (dir, node, name, _) in &staged.everyone[..staged.hosted] {
+        for (dir, node, name, _) in &pressure_members {
             let (ok, out, err) = vox(
                 dir,
                 &as_node(&["room", "read", pressure_room, "--limit", "3"], *node),
                 None,
             );
             assert!(ok, "PRODUCT: {name}'s pressure read refused: {out}{err}");
-            if !out.contains(pressure_target) {
+            if !out.contains(&pressure_target) {
                 missing.push(format!("{name}/{pressure_name}"));
             }
         }
@@ -2912,16 +3151,19 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             std::thread::sleep(Duration::from_millis(200));
         }
     }
-    generation_accounting_keeps_actor_incarnations_exact(&staged);
+    generation_accounting_keeps_actor_incarnations_exact(&staged, pressure_members.len());
     // The product's account of the pool, now that everyone has read everyone.
-    let hosted_fps: BTreeSet<&str> = staged.everyone[..staged.hosted]
+    let hosted_fps: BTreeSet<&str> = pressure_members
         .iter()
         .map(|(_, _, _, fp)| fp.as_str())
         .collect();
     let mut most = 0u64;
     let mut limit: Option<u64> = None;
     let mut broken: Vec<String> = Vec::new();
-    for (dir, node, name, fp) in &staged.everyone {
+    for (dir, node, name, fp) in pressure_members
+        .iter()
+        .chain(staged.everyone[staged.hosted..].iter())
+    {
         let shown = fx35_synced(dir, *node);
         let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
         let pool = &v["lanes"]["budget"]["flow_state"];
