@@ -513,6 +513,18 @@ pub struct BufferCharge {
     bytes: usize,
 }
 
+impl BufferCharge {
+    /// Split an already-accounted reservation without touching either byte counter. Both pieces
+    /// retain the same worker, and their drops return exactly the original total.
+    pub(crate) fn split_off(&mut self, bytes: usize) -> Option<Self> {
+        self.bytes = self.bytes.checked_sub(bytes)?;
+        Some(Self {
+            worker: Arc::clone(&self.worker),
+            bytes,
+        })
+    }
+}
+
 impl Drop for BufferCharge {
     fn drop(&mut self) {
         self.worker.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
