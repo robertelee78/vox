@@ -1221,10 +1221,12 @@ enum NetEvent {
     HistoryDemandPrepared {
         token: u64,
     },
-    /// The exact fair Control ticket retained for a stale archive Resume observed capacity.
+    /// The exact retained Resume dependency observed worker or byte capacity.
     HistoryResumeReady {
         room: Digest32,
+        instance: [u8; 16],
         request: crate::node::history_stream::RequestId,
+        fence: Arc<crate::transport::stream_transport::Fence>,
     },
     RoomHistory {
         channel_id: Digest32,
@@ -11698,9 +11700,16 @@ impl Node {
                     self.queue_cancelled_legacy_cleanup();
                 }
             }
-            NetEvent::HistoryResumeReady { room, request } => {
-                if self.history_demand.resume_wake_matches(room, request) {
-                    self.history_demand.clear_resume_wake();
+            NetEvent::HistoryResumeReady {
+                room,
+                instance,
+                request,
+                fence,
+            } => {
+                if self
+                    .history_demand
+                    .accept_resume_wake(room, instance, request, &fence)
+                {
                     self.retry_owed_history_resume();
                 }
             }

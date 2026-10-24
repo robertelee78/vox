@@ -468,6 +468,61 @@ impl AdmissionCharge {
     }
 }
 
+/// Complete bounded preparation for one accepted Resume. The private branch can retain both
+/// its original and refreshed Snapshot; public/legacy preparation does not reserve that credit.
+/// Activation and an immediate pause are sequential and borrow the same mutation credit.
+pub(crate) struct ResumeAdmission {
+    _scratch: BufferCharge,
+    inspect: Option<AdmissionCharge>,
+    mutation: AdmissionCharge,
+    followup: Option<AdmissionCharge>,
+}
+
+impl ResumeAdmission {
+    pub(crate) fn reserve(job: &Job, scratch: usize, private: bool) -> Result<Self> {
+        let peak = STATE_WORK
+            .checked_mul(if private { 3 } else { 2 })
+            .and_then(|state| scratch.checked_add(state))
+            .ok_or(Error::SizeLimitExceeded(
+                "history resume preparation envelope",
+            ))?;
+        let mut combined = charge(job, peak)?;
+        let inspect = AdmissionCharge::split_from(&mut combined)?;
+        let mutation = AdmissionCharge::split_from(&mut combined)?;
+        let followup = private
+            .then(|| AdmissionCharge::split_from(&mut combined))
+            .transpose()?;
+        Ok(Self {
+            _scratch: combined,
+            inspect: Some(inspect),
+            mutation,
+            followup,
+        })
+    }
+
+    pub(crate) fn inspect(&mut self, context: &Context) -> Result<Option<Snapshot>> {
+        let credit = self
+            .inspect
+            .take()
+            .ok_or_else(|| invalid("history resume inspection credit"))?;
+        inspect_precharged(context, credit)
+    }
+
+    pub(crate) fn mutation(&self) -> &AdmissionCharge {
+        &self.mutation
+    }
+
+    pub(crate) fn take_followup(&mut self) -> Result<AdmissionCharge> {
+        self.followup
+            .take()
+            .ok_or_else(|| invalid("history resume follow-up credit"))
+    }
+
+    pub(crate) fn is_private(&self) -> bool {
+        self.followup.is_some()
+    }
+}
+
 /// Complete memory admission for one local Status or Cancel. The actor obtains this before it
 /// accepts the action; the worker then consumes these exact credits without another reservation.
 pub(crate) struct LocalAdmission {
@@ -763,14 +818,15 @@ fn start_plan(
     })
 }
 
-/// The caller supplies freshly rechecked authority. Bounds and remaining count come only from disk.
-pub fn resume(
+/// The caller prepaid this mutation and supplies freshly rechecked authority. Bounds and
+/// remaining count come only from disk. Precommit authorization/cancellation checks remain;
+/// postcommit observer cancellation cannot replace a successful activation with failure.
+pub(crate) fn resume_precharged(
     context: &Context,
     request: RequestId,
     binding: Binding,
-    job: &Job,
+    _admission: &AdmissionCharge,
 ) -> Result<Active> {
-    let _charge = charge(job, STATE_WORK)?;
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
@@ -787,7 +843,10 @@ pub fn resume(
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Pending;
     put(&mut batch, key, &scope, &state)?;
-    commit_context(batch, context)?;
+    // A successful activation is a durable fact even if observer cancellation arrives just
+    // after commit. Dispatch still requires the actor's fresh authority/lifecycle checks.
+    context.check()?;
+    batch.commit()?;
     Ok(Active {
         node: context.fingerprint(),
         scope,
