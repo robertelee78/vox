@@ -2221,631 +2221,508 @@ fn all_flow_state_charges_held(
 fn generation_accounting_keeps_actor_incarnations_exact(
     staged: &Staged,
     pressure_members: &[PressureMember],
-    archive_room: &str,
+    _archive_room: &str,
 ) {
-    use vox_core::node::api::HistoryDemandPhase as Phase;
-    let hosted_identities = pressure_members.len();
-    let (_, _, running_name, running_fingerprint) =
-        &staged.everyone[vox_core::node::history_budget::ARCHIVE_JOBS];
-    let running_name = *running_name;
+    let (_, _, name, fingerprint) = &staged.everyone[vox_core::node::history_budget::ARCHIVE_JOBS];
+    let name = *name;
+    let nonce = staged
+        ._tmp
+        .path()
+        .file_name()
+        .expect("APPARATUS: fresh fixture nonce")
+        .to_string_lossy();
+    let scoped = |text: &str| format!("{text}-{nonce}");
     let (peer_dir, peer_node, peer_name, peer_fp) = &staged.everyone[staged.hosted];
-    // The holder sidecar can be a quiet1 source. Keep the full hosted identity roster for
-    // accounting, and establish these read grants BEFORE any captured generation cause. The
-    // directed spare is not a quiet1 member and cannot be selected as a quiet1 source.
-    for (sidecar_dir, sidecar_node, sidecar_name, sidecar_fp) in &pressure_members[staged.hosted..]
-    {
-        for (dir, node, target, label) in [
-            (
-                &staged.host,
-                Some(running_name),
-                sidecar_fp.as_str(),
-                *sidecar_name,
-            ),
-            (
-                sidecar_dir,
-                *sidecar_node,
-                running_fingerprint.as_str(),
-                running_name,
-            ),
-        ] {
-            let (ok, out, err) = vox(
-                dir,
-                &as_node(&["trust", "add", target, "--name", label], node),
-                None,
-            );
-            assert!(
-                ok,
-                "APPARATUS: generation reader/sidecar trust setup failed: {out}{err}"
-            );
-        }
-    }
-    // Reuse the populated room, adding only this reader. Two ordinary successors would share
-    // local slot 0 and correctly stop at LiveBusy before reaching the shared identity gate.
-    let (ok, link, err) = vox(
-        peer_dir,
-        &as_node(&["room", "link", archive_room], *peer_node),
-        None,
-    );
-    assert!(ok, "APPARATUS: generation Archive link failed: {link}{err}");
-    let link = link
-        .lines()
-        .find(|line| line.starts_with("vox://"))
-        .unwrap_or(link.trim());
-    let (ok, out, err) = vox(
-        &staged.host,
-        &as_node(
-            &["room", "join", "--passphrase-file", "-", link],
-            Some(running_name),
-        ),
-        Some(&format!("{ROOMPASS}\n")),
+    let room = &staged.rooms[0];
+    let other_room = &staged.rooms[1];
+    assert_ne!(
+        room, other_room,
+        "APPARATUS: U4 needs two distinct actual rooms"
     );
     assert!(
-        ok,
-        "APPARATUS: {running_name}'s generation Archive join failed: {out}{err}"
+        staged.pool_floor.as_ref().is_none_or(|path| !path.exists()),
+        "APPARATUS: retiring-identity accounting cannot use a proof floor"
     );
-    let page = vox_core::log::history::MAX_PAGE_ENTRIES.to_string();
-    let before = loop {
+    let hold = staged
+        .live_hold
+        .as_ref()
+        .expect("APPARATUS: generation hold missing");
+    let archive_hold = staged
+        .archive_hold
+        .as_ref()
+        .expect("APPARATUS: Archive hold missing");
+    assert!(
+        !hold.exists() && !archive_hold.exists(),
+        "APPARATUS: previous pressure holds are still installed"
+    );
+
+    // A plain fresh replay handshake makes the existing Bob tail ready without depending on
+    // old structured warm posts or on the actor that this fixture will deliberately panic.
+    let baseline = scoped("retirement-tail-baseline");
+    stage_post(peer_dir, *peer_node, peer_name, other_room, &baseline);
+    let (ok, out, err) = vox(
+        peer_dir,
+        &as_node(&["room", "read", other_room, "--json"], *peer_node),
+        None,
+    );
+    assert!(ok, "APPARATUS: Bob baseline read failed: {out}{err}");
+    let baseline_row = out
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .expect("APPARATUS: Bob baseline row JSON")
+        })
+        .find(|row| {
+            row["schema"] == "vox.room.row/1"
+                && row["room"] == *other_room
+                && row["author"] == *peer_fp
+                && row["text"] == baseline
+                && row["owed"] == false
+        })
+        .expect("APPARATUS: Bob's exact plain baseline row is absent");
+    let cursor = baseline_row["entry_hash"]
+        .as_str()
+        .expect("APPARATUS: baseline omitted actual hash");
+    let tail = TailObserver::attach(peer_dir, *peer_node, other_room, Some(cursor));
+    let handshake = scoped("retirement-tail-attached");
+    stage_post(peer_dir, *peer_node, peer_name, other_room, &handshake);
+    tail.wait_for(&handshake, peer_name, false);
+    // Reset the FIXED Bob port using real completed work before any barrier. A historical
+    // PoolFull from the earlier pressure phase must not become the later M4 discriminator.
+    loop {
         let (ok, out, err) = vox(
             &staged.host,
-            &as_node(
-                &["room", "read", archive_room, "--json", "--limit", &page],
-                Some(running_name),
-            ),
+            &as_node(&["room", "read", other_room, "--json"], Some(name)),
             None,
         );
         assert!(
             ok,
-            "APPARATUS: generation Archive boundary read failed: {out}{err}"
+            "APPARATUS: fixed-port baseline read refused: {out}{err}"
         );
-        let rows: Vec<serde_json::Value> = out
+        let readable = out
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                serde_json::from_str(line).unwrap_or_else(|error| {
-                    panic!("APPARATUS: generation Archive boundary is not JSON ({error}): {line}")
-                })
+                serde_json::from_str::<serde_json::Value>(line)
+                    .expect("APPARATUS: fixed-port baseline JSON")
             })
-            .collect();
-        if let Some(row) = rows.iter().find(|row| {
-            row["author"] == *peer_fp
-                && row["text"]
-                    .as_str()
-                    .is_some_and(|text| text.starts_with("archive-pressure-"))
-        }) {
-            break row["entry_hash"]
-                .as_str()
-                .expect("APPARATUS: Archive boundary omitted hash")
-                .to_owned();
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
-    let hold = staged
-        .live_hold
-        .as_ref()
-        .expect("APPARATUS: generation Live hold missing");
-    let archive_hold = staged
-        .archive_hold
-        .as_ref()
-        .expect("APPARATUS: generation Archive hold missing");
-    let room = &staged.rooms[0];
-    let decoded_room = vox_core::node::link::b32_decode(room, "generation Live hold room")
-        .expect("APPARATUS: generation Live hold room id");
-    assert_eq!(
-        vox_core::node::link::b32_encode(&decoded_room),
-        *room,
-        "APPARATUS: generation Live hold room must be canonical"
-    );
-    let selector = format!("room={room}\n");
-    for path in [hold, archive_hold] {
-        for (_, _, marker) in charged_flow_hold_entries(path) {
-            std::fs::remove_file(&marker).unwrap_or_else(|error| {
-                panic!(
-                    "APPARATUS: could not clear prior generation marker {}: {error}",
-                    marker.display()
-                )
+            .any(|row| {
+                row["schema"] == "vox.room.row/1"
+                    && row["room"] == *other_room
+                    && row["author"] == *peer_fp
+                    && row["text"] == handshake
+                    && row["owed"] == false
             });
-        }
-        if path == hold {
-            // Publish atomically: a transient empty selector would mean the legacy all-room
-            // barrier and could trap unrelated startup work on the Archive request's port.
-            let temporary = path.with_extension("generation-scope");
-            std::fs::write(&temporary, selector.as_bytes())
-                .expect("APPARATUS: write generation hold selector");
-            std::fs::rename(&temporary, path).expect("APPARATUS: publish generation hold selector");
-            assert_eq!(
-                std::fs::read_to_string(path).expect("APPARATUS: read generation selector"),
-                selector,
-                "APPARATUS: generation Live hold selector bytes changed"
-            );
-        } else {
-            std::fs::File::create(path).unwrap_or_else(|error| {
-                panic!(
-                    "APPARATUS: could not create generation hold {}: {error}",
-                    path.display()
-                )
-            });
-        }
-    }
-    let target = "generation-accounting-target".to_owned();
-    stage_post(peer_dir, *peer_node, peer_name, room, &target);
-    let old_actor = loop {
-        let held = charged_flow_hold_entries(hold)
+        let shown = fx35_synced(&staged.host, Some(name));
+        let status: serde_json::Value = serde_json::from_str(&shown.status)
+            .expect("PRODUCT: fixed-port completed baseline status JSON");
+        let port = status["lanes"]["ports"]
+            .as_array()
             .into_iter()
-            .find(|(_, fingerprint, marker)| {
-                fingerprint == running_fingerprint
-                    && std::fs::read_to_string(marker)
-                        .is_ok_and(|text| text.lines().any(|line| line == format!("room={room}")))
-            });
-        if let Some((actor, _, _)) = held {
-            break actor;
+            .flatten()
+            .find(|port| port["room"] == *other_room && port["peer"] == *peer_fp);
+        if readable
+            && port.is_some_and(|port| {
+                port["start_outcome"] == "started"
+                    && port["connected"] == true
+                    && port["needs"] == false
+                    && port["queued"] == false
+                    && port["out_age_ms"].is_null()
+                    && port["round_running"] == false
+                    && port["backing_off"] == false
+                    && port["publishing"] == false
+            })
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Hold one actual ordinary quiet1 worker. The main two Archive recovery assertions have
+    // already finished; no new Older is needed merely to construct an impossible overlap.
+    for (_, _, marker) in charged_flow_hold_entries(hold) {
+        std::fs::remove_file(marker).expect("APPARATUS: clear old generation marker");
+    }
+    let decoded = vox_core::node::link::b32_decode(room, "retirement held room")
+        .expect("APPARATUS: retirement room is not a full ID");
+    assert_eq!(
+        vox_core::node::link::b32_encode(&decoded),
+        *room,
+        "APPARATUS: retirement room must be canonical"
+    );
+    let temporary = hold.with_extension("retirement-scope");
+    std::fs::write(&temporary, format!("room={room}\n"))
+        .expect("APPARATUS: write retirement room selector");
+    std::fs::rename(&temporary, hold).expect("APPARATUS: publish retirement room selector");
+    assert_eq!(
+        std::fs::read_to_string(hold).expect("APPARATUS: read selector"),
+        format!("room={room}\n"),
+        "APPARATUS: retirement selector changed"
+    );
+    let target = scoped("generation-accounting-target");
+    let (ok, out, err) = stage_post_once(peer_dir, *peer_node, room, &target);
+    assert!(
+        ok,
+        "APPARATUS: one retirement target post refused: {out}{err}"
+    );
+    let (old_actor, held_owner) = loop {
+        let shown = fx35_synced(&staged.host, Some(name));
+        let status: serde_json::Value =
+            serde_json::from_str(&shown.status).expect("PRODUCT: held generation status JSON");
+        let running = &status["lanes"]["bounded"]["running"][0];
+        if running["archive"] == false && running["room"] == *room {
+            if let Some(actor) = running["actor"].as_u64() {
+                let peer = running["peer"].as_str().expect("PRODUCT: held worker peer");
+                if charged_flow_hold_owners(hold).get(&(
+                    actor,
+                    fingerprint.clone(),
+                    room.clone(),
+                    peer.to_owned(),
+                )) == Some(&1)
+                {
+                    let owners: Vec<_> = status["lanes"]["budget"]["flow_state"]["running"]
+                        .as_array()
+                        .expect("PRODUCT: actual running owners")
+                        .iter()
+                        .filter(|owner| {
+                            owner["actor"] == actor
+                                && owner["node"] == *fingerprint
+                                && owner["room"] == *room
+                                && owner["peer"] == peer
+                        })
+                        .cloned()
+                        .collect();
+                    if owners.len() == 1 {
+                        break (actor, owners[0].clone());
+                    }
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+
+    // No fresh Flow can skip the local gate behind a controller-retention preflight. The
+    // captured ordinary worker pins index0 and no explicit Archive dispatch can add index1.
+    // Source-only bound: with floor absent, legal current workers cannot fill exact2N before
+    // this held ordinary owner is established; the old pressure result was reset above.
+    let shown = fx35_synced(&staged.host, Some(name));
+    let before: serde_json::Value =
+        serde_json::from_str(&shown.status).expect("PRODUCT: U4 pre-post ownership JSON");
+    let before_bounded = &before["lanes"]["bounded"];
+    let retained: usize = ["ready", "running", "deferred", "retiring"]
+        .iter()
+        .map(|field| {
+            before_bounded[*field]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|flow| !flow.is_null())
+                .count()
+        })
+        .sum::<usize>()
+        + usize::from(!before_bounded["cleanup"].is_null());
+    assert!(
+        retained < 12
+            && before_bounded["running"][1].is_null()
+            && before_bounded["ready"][1].is_null()
+            && before["lanes"]["history"]["ready"] == false,
+        "APPARATUS: U4 fixed ordinary start could be skipped by other retained work: {before}"
+    );
+
+    // One local post raises the FIXED other-room/Bob port. Actor command handling schedules
+    // before servicing a later Status. This is not a search/retry for a convenient gate.
+    let successor = scoped("generation-accounting-successor");
+    let (ok, out, err) = stage_post_once(&staged.host, Some(name), other_room, &successor);
+    assert!(
+        ok,
+        "APPARATUS: one U4 ordinary local post refused: {out}{err}"
+    );
+    let shown = fx35_synced(&staged.host, Some(name));
+    let status: serde_json::Value =
+        serde_json::from_str(&shown.status).expect("PRODUCT: U4 status JSON");
+    let budget = &status["lanes"]["budget"];
+    let bounded = &status["lanes"]["bounded"];
+    let fixed = status["lanes"]["ports"]
+        .as_array()
+        .expect("PRODUCT: U4 ports")
+        .iter()
+        .find(|port| port["room"] == *other_room && port["peer"] == *peer_fp)
+        .expect("APPARATUS: fixed other-room Bob port missing");
+    let current = &bounded["running"][0];
+    assert!(
+        current["actor"] == old_actor
+            && current["archive"] == false
+            && current["room"] == *room
+            && current["peer"] == held_owner["peer"]
+            && charged_flow_hold_owners(hold).get(&(
+                old_actor,
+                fingerprint.clone(),
+                room.clone(),
+                held_owner["peer"].as_str().unwrap().to_owned()
+            )) == Some(&1),
+        "APPARATUS: exact ordinary held owner changed before U4: {status}"
+    );
+    let control_available = budget["control"]
+        .as_u64()
+        .zip(budget["foreground_jobs"].as_u64())
+        .is_some_and(|(used, limit)| used < limit)
+        && budget["queued"][1] == 0;
+    let no_control_ticket = !bounded["admissions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|admission| admission["lane"] == "control");
+    let slots = &status["lanes"]["slots"];
+    let outbound_available = slots["in_use"]
+        .as_u64()
+        .zip(slots["limit"].as_u64())
+        .is_some_and(|(used, limit)| used < limit)
+        && slots["per_peer"][peer_fp].as_u64().unwrap_or(0)
+            < vox_core::node::ports::OUTBOUND_PER_PEER as u64;
+    assert!(
+        control_available
+            && no_control_ticket
+            && outbound_available
+            && fixed["connected"] == true
+            && fixed["needs"] == true
+            && fixed["queued"] == true
+            && fixed["publishing"] == false
+            && fixed["backing_off"] == false
+            && fixed["out_age_ms"].is_null()
+            && fixed["round_running"] == false,
+        "APPARATUS: fixed U4 port's real eligibility/earlier gates were not staged: {status}"
+    );
+    assert_eq!(fixed["start_outcome"], "not_started",
+        "APPARATUS: a refused attempt for the fixed posted port was not observed; no retry: {fixed}");
+    assert!(!matches!(fixed["start_reason"].as_str(),
+        Some("room_busy" | "archive_budget_busy" | "control_budget_busy")),
+        "APPARATUS: an earlier real gate ended the fixed attempt; current capacity cannot rewrite that cause: {fixed}");
+    assert_eq!(
+        fixed["start_reason"], "live_lane_busy",
+        "PRODUCT: exact held-Live refusal reported a different first gate: {fixed}"
+    );
+    println!("[proof] exact fixed first cause is LiveBusy: actor={old_actor} node={fingerprint} room={other_room} peer={peer_fp}; no NodeBusy runtime claim");
+
     let (ok, out, err) = vox(
         &staged.host,
-        &as_node(
-            &["room", "post", room, FX35_GENERATION_PANIC],
-            Some(running_name),
-        ),
+        &as_node(&["room", "post", room, FX35_GENERATION_PANIC], Some(name)),
         None,
     );
     assert!(
         !ok,
-        "APPARATUS: proof marker did not panic held actor {running_name}: {out}{err}"
+        "APPARATUS: marker did not panic selected actor: {out}{err}"
     );
-    loop {
-        let shown = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
-        let value: serde_json::Value = serde_json::from_str(&shown.status)
-            .expect("PRODUCT: post-panic generation status was not JSON");
-        if value["lanes"]["budget"]["flow_state"]["actors"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|actor| {
-                actor["node"] == *running_fingerprint
-                    && actor["actor"] == old_actor
-                    && actor["registered"] == false
-                    && actor["in_use"] == 1
-            })
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    unlock(&staged.host, running_name);
-    attached_as(&staged.host, "host", Some(running_name));
-    let archive_id = vox_core::node::link::b32_decode(archive_room, "generation Archive room")
-        .expect("APPARATUS: generation Archive room id");
-    let history = |instance: Option<&str>, product: bool| {
-        let mut args = vec![
-            "room",
-            "read",
-            archive_room,
-            "--history",
-            "status",
-            "--json",
-        ];
-        if let Some(instance) = instance {
-            args.extend(["--history-instance", instance]);
-        }
-        let (ok, out, err) = vox(&staged.host, &as_node(&args, Some(running_name)), None);
+    let lifecycle = || {
+        let (ok, out, err) = vox_plain(&staged.host, &["node", "list"], None);
         assert!(
             ok,
-            "{}: exact generation history observation failed: {out}{err}",
-            if product { "PRODUCT" } else { "APPARATUS" }
+            "APPARATUS: public node lifecycle list failed: {out}{err}"
         );
-        let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
-            panic!("PRODUCT: generation history status is not JSON ({error}): {out}")
-        });
-        assert!(
-            reply.schema == "vox.room.history/1"
-                && reply.status.room == archive_id
-                && reply.status.private_peer.is_none(),
-            "APPARATUS: generation history context changed: {out}"
-        );
-        let hex = |bytes: &[u8]| {
-            bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        };
-        assert!(
-            reply.instance == hex(&reply.status.instance)
-                && reply.request == reply.status.request.as_ref().map(|id| hex(id)),
-            "PRODUCT: generation history outer/nested ownership disagrees: {out}"
-        );
-        if let Some(instance) = instance {
-            assert_eq!(
-                reply.instance, instance,
-                "APPARATUS: generation room incarnation changed: {out}"
-            );
-        }
-        reply
-    };
-    let mut initial = history(None, false);
-    let instance = initial.instance.clone();
-    while initial.status.phase == Phase::Preparing {
-        initial = history(Some(&instance), false);
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        initial.request.is_none() && matches!(initial.status.phase, Phase::Idle | Phase::Cached),
-        "APPARATUS: selected generation reader already owns an explicit history request: {:?}",
-        initial.status
-    );
-    // Exactly one real Older; subsequent commands only observe this accepted action. No Resume,
-    // later cursor or guessed historical body is used to manufacture a capacity attempt.
-    let (ok, out, err) = vox(
-        &staged.host,
-        &as_node(
-            &[
-                "room",
-                "read",
-                archive_room,
-                "--history",
-                "older",
-                "--before",
-                &before,
-            ],
-            Some(running_name),
-        ),
-        None,
-    );
-    assert!(
-        ok,
-        "APPARATUS: generation Older command refused: {out}{err}"
-    );
-    let mut accepted = history(Some(&instance), false);
-    while accepted.status.phase == Phase::Preparing {
-        accepted = history(Some(&instance), false);
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        accepted.status.phase == Phase::Pending
-            && accepted.request.is_some()
-            && accepted.status.author.is_some()
-            && accepted.status.head.is_some(),
-        "APPARATUS: one Older did not establish an actual bounded generation dispatch: {:?}",
-        accepted.status
-    );
-    let archive_request = accepted.request.clone().unwrap();
-    let assert_archive_owner = |reply: &HistoryDemandReply| {
-        assert!(
-            reply.instance == instance
-                && reply.request.as_deref() == Some(archive_request.as_str())
-                && (reply.status.author == accepted.status.author
-                    || (reply.status.author.is_none()
-                        && matches!(reply.status.phase, Phase::More | Phase::Complete)))
-                && reply.status.head == accepted.status.head,
-            "PRODUCT: the accepted generation Older changed request/instance/author/head: {:?}",
-            reply.status
-        );
-    };
-
-    #[derive(Clone)]
-    struct Refused {
-        archive: bool,
-        room: String,
-        peer: String,
-        root: String,
-        lane: String,
-        admission: u64,
-        order: u64,
-    }
-    let observe = || -> Option<Refused> {
-        let shown = fx35_synced(&staged.host, Some(running_name));
-        let replacement: serde_json::Value = serde_json::from_str(&shown.status)
-            .expect("PRODUCT: generation-accounting status was not JSON");
-        let pool = &replacement["lanes"]["budget"]["flow_state"];
-        let generations: Vec<_> = pool["actors"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|actor| actor["node"] == *running_fingerprint)
+        let selected: Vec<_> = out
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some(name)).then(|| fields.next().unwrap_or("").to_owned())
+            })
             .collect();
-        let charged: u64 = generations
-            .iter()
-            .filter_map(|actor| actor["in_use"].as_u64())
-            .sum();
-        // This precedes the current-generation ==1 filter: M3 may admit its SECOND current
-        // worker beside the old worker. That is the own capacity violation, not a hidden phase.
-        assert!(charged <= vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS as u64,
-            "PRODUCT: retired and replacement actors minted extra running slots for one identity: {pool}");
-        let old = generations.iter().find(|actor| {
-            actor["actor"] == old_actor && actor["registered"] == false && actor["in_use"] == 1
-        });
-        let new = generations
-            .iter()
-            .find(|actor| actor["registered"] == true && actor["in_use"] == 1);
-        let new_actor = new.and_then(|actor| actor["actor"].as_u64())?;
-        old?;
-        let bounded = &replacement["lanes"]["bounded"];
-        let held = [hold, archive_hold].into_iter().any(|path| {
-            charged_flow_hold_entries(path)
-                .into_iter()
-                .any(|(actor, node, marker)| {
-                    actor == new_actor
-                        && node == *running_fingerprint
-                        && (path != hold
-                            || std::fs::read_to_string(marker).is_ok_and(|text| {
-                                text.lines().any(|line| line == format!("room={room}"))
-                            }))
-                })
-        });
-        if !held {
-            return None;
-        }
-        let old_running = pool["running"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|round| round["node"] == *running_fingerprint && round["actor"] == old_actor);
-        let new_running = pool["running"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|round| round["node"] == *running_fingerprint && round["actor"] == new_actor);
-        if !old_running || !new_running {
-            return None;
-        }
-        // Actual admission/ready ownership stages the third attempt. Expected start_reason is
-        // deliberately NOT in this predicate: M4 must reach its own truthful-first-gate verdict.
-        // Admission lane is the actual attempted quantum; an announcement can be Control even
-        // when the retained Flow reports Live for its next ordinary slice.
-        for admission in bounded["admissions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|admission| admission["gate"] == "node_slots")
-        {
-            let Some(flow) = bounded["ready"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(bounded["deferred"].as_array().into_iter().flatten())
-                .find(|flow| {
-                    flow["actor"] == new_actor
-                        && flow["room"] == admission["room"]
-                        && flow["peer"] == admission["peer"]
-                        && flow["root"] == admission["root"]
-                })
-            else {
-                continue;
-            };
-            let archive = flow["archive"] == true;
-            if archive
-                && !(flow["room"] == archive_room
-                    && flow["request"] == archive_request
-                    && flow["instance"] == instance)
-            {
-                continue;
-            }
-            if !(archive
-                || staged.rooms.iter().any(|room| flow["room"] == *room)
-                || flow["room"] == archive_room)
-            {
-                continue;
-            }
-            let Some(order) = admission["wait_order"].as_u64() else {
-                continue;
-            };
-            let Some(owner) = pool["waiting"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|owner| {
-                    owner["order"] == order
-                        && owner["node"] == *running_fingerprint
-                        && ["actor", "request", "instance", "room", "peer"]
-                            .iter()
-                            .all(|field| owner[*field] == flow[*field])
-                })
-            else {
-                continue;
-            };
-            let _ = owner;
-            let held_slot = &bounded["running"][usize::from(!archive)];
-            if held_slot["actor"] != new_actor || held_slot["archive"] != !archive {
-                continue;
-            }
-            if !(archive
-                || held_slot["room"] == archive_room
-                    && held_slot["request"] == archive_request
-                    && held_slot["instance"] == instance)
-            {
-                continue;
-            }
-            let room = flow["room"]
-                .as_str()
-                .expect("PRODUCT: retained generation room missing");
-            let peer = flow["peer"]
-                .as_str()
-                .expect("PRODUCT: retained generation peer missing");
-            let port = replacement["lanes"]["ports"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|port| port["room"] == room && port["peer"] == peer)
-                .expect("PRODUCT: exact retained generation port disappeared");
-            assert_eq!(
-                port["start_reason"], "flow_state_node_busy",
-                "PRODUCT: exact node_slots refusal reported a different first gate: {port}"
-            );
-            let actor_sum: u64 = pool["actors"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|actor| actor["in_use"].as_u64())
-                .sum();
-            let expected_limit = (vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS
-                * hosted_identities) as u64;
-            assert!(generations.len() == 2 && charged == 2
-                && pool["retiring_nodes"].as_array().is_some_and(|nodes| nodes.iter().any(|node| node == running_fingerprint))
-                && pool["by_node"].as_object().is_some_and(|nodes| nodes.len() == hosted_identities)
-                && pool["by_node"][running_fingerprint].as_u64() == Some(charged)
-                && pool["occupied_by_node"][running_fingerprint] == 2
-                && pool["in_use"].as_u64() == Some(actor_sum)
-                && pool["running"].as_array().map_or(0, Vec::len) as u64 == actor_sum
-                && pool["in_use"].as_u64().is_some_and(|used| used < expected_limit)
-                && pool["limit"] == expected_limit,
-                "PRODUCT: shipped generation accounting did not preserve the shared two slots and exact running owners: {pool}");
-            assert!(room_health_messages(&replacement, room).iter().any(|message| message.contains("flow-state pool")),
-                "PRODUCT: exact generation continuation is absent from its room's shipped health: {}", replacement["unhealthy"]);
-            let unrelated = staged
-                .rooms
-                .iter()
-                .find(|candidate| {
-                    candidate.as_str() != room
-                        && !bounded["admissions"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .any(|other| {
-                                other["room"] == **candidate
-                                    && matches!(
-                                        other["gate"].as_str(),
-                                        Some("pool" | "node_slots" | "overcommitted")
-                                    )
-                            })
-                })
-                .expect("APPARATUS: no unrelated generation room without a retained pool owner");
-            assert!(
-                room_health_messages(&replacement, unrelated)
-                    .iter()
-                    .all(|message| !message.contains("flow-state pool")),
-                "PRODUCT: shipped generation health blamed unrelated room {unrelated}: {}",
-                replacement["unhealthy"]
-            );
-            return Some(Refused {
-                archive,
-                room: room.to_owned(),
-                peer: peer.to_owned(),
-                root: flow["root"]
-                    .as_str()
-                    .expect("PRODUCT: generation root missing")
-                    .to_owned(),
-                lane: admission["lane"]
-                    .as_str()
-                    .expect("PRODUCT: generation lane missing")
-                    .to_owned(),
-                admission: admission["admission"]
-                    .as_u64()
-                    .expect("PRODUCT: generation admission missing"),
-                order,
-            });
-        }
-        None
+        assert_eq!(
+            selected.len(),
+            1,
+            "APPARATUS: selected node lifecycle line missing/duplicate: {out}"
+        );
+        selected[0].clone()
     };
-    let first = loop {
-        if let Some(refused) = observe() {
-            break refused;
+    let retired = loop {
+        let shown = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
+        let status: serde_json::Value =
+            serde_json::from_str(&shown.status).expect("PRODUCT: retiring accounting status JSON");
+        let pool = &status["lanes"]["budget"]["flow_state"];
+        let old = pool["actors"]
+            .as_array()
+            .expect("PRODUCT: pool actors")
+            .iter()
+            .find(|actor| actor["actor"] == old_actor && actor["node"] == *fingerprint);
+        if old.is_some_and(|actor| actor["registered"] == false && actor["in_use"] == 1) {
+            break status;
         }
-        let current = history(Some(&instance), false);
-        assert_archive_owner(&current);
-        assert!(matches!(current.status.phase, Phase::Pending | Phase::Preparing),
-            "APPARATUS: accepted Older did not remain an actual held/bounded generation owner: {:?}", current.status);
+        assert_ne!(
+            lifecycle(),
+            "Locked",
+            "PRODUCT: selected node claims physical stop while its held worker has not retired"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let (live_room, live_peer) = if first.archive {
-        (staged.rooms[0].as_str(), peer_fp.as_str())
-    } else {
-        (first.room.as_str(), first.peer.as_str())
-    };
-    let (source_dir, source_node, source_name, _) = pressure_members
+    let pool = &retired["lanes"]["budget"]["flow_state"];
+    let actors = pool["actors"].as_array().unwrap();
+    let nodes: BTreeSet<_> = actors
         .iter()
-        .chain(staged.everyone[staged.hosted..].iter())
-        .find(|(_, _, _, fingerprint)| fingerprint == live_peer)
-        .expect("APPARATUS: retained Live generation peer is not a staged source");
-    let (ok, out, err) = vox(
-        &staged.host,
-        &as_node(&["room", "read", live_room, "--json"], Some(running_name)),
-        None,
-    );
-    assert!(
-        ok,
-        "APPARATUS: generation tail cursor read failed: {out}{err}"
-    );
-    let rows: Vec<serde_json::Value> = out
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("APPARATUS: generation tail cursor JSON"))
+        .map(|actor| {
+            actor["node"]
+                .as_str()
+                .expect("PRODUCT: accounting actor omitted node")
+        })
         .collect();
-    assert!(
-        rows.len() >= 2,
-        "APPARATUS: generation tail lacks two existing rows: {out}"
-    );
-    let cursor = rows[0]["entry_hash"]
-        .as_str()
-        .expect("APPARATUS: generation tail cursor hash missing");
-    let ready = rows[1]["text"]
-        .as_str()
-        .expect("APPARATUS: generation tail readiness missing");
-    let tail = TailObserver::attach(&staged.host, Some(running_name), live_room, Some(cursor));
-    tail.wait_for(ready, running_name, false);
-    let successor = "generation-accounting-successor".to_owned();
-    stage_post(source_dir, *source_node, source_name, live_room, &successor);
-    // The new source head can replace a hinted Flow. Bind the actual final retained admission
-    // again while BOTH running charges remain held; never pretend an obsolete token survived.
-    let refused = loop {
-        if let Some(refused) = observe() {
-            if refused.archive == first.archive
-                && refused.room == first.room
-                && refused.peer == first.peer
-            {
-                break refused;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let release_started = Instant::now();
-    for path in [hold, archive_hold] {
-        std::fs::remove_file(path).unwrap_or_else(|error| {
-            panic!(
-                "APPARATUS: could not release generation hold {}: {error}",
-                path.display()
-            )
-        });
-    }
-    observe_flow_release_handoff(
-        &staged.host,
-        Some(running_name),
-        running_name,
-        refused.order,
-        &refused.room,
-        &refused.peer,
-    );
-    // Only a refused Live flow claims this tail as its direct user result. For refused Archive,
-    // the SAME explicit action below is the user result; this tail still proves ordinary delivery.
-    tail.wait_for_after(&successor, running_name, true, Some(release_started));
+    let by_node = pool["by_node"]
+        .as_object()
+        .expect("PRODUCT: by_node object");
+    let occupied = pool["occupied_by_node"]
+        .as_object()
+        .expect("PRODUCT: occupied_by_node object");
+    let sum: u64 = actors
+        .iter()
+        .map(|actor| {
+            actor["in_use"]
+                .as_u64()
+                .expect("PRODUCT: actor omitted charge")
+        })
+        .sum();
+    let held_matches = pool["running"]
+        .as_array()
+        .expect("PRODUCT: running owners")
+        .iter()
+        .filter(|owner| **owner == held_owner)
+        .count();
+    assert!(nodes.len() == pressure_members.len()
+        && by_node.keys().map(String::as_str).collect::<BTreeSet<_>>() == nodes
+        && occupied.keys().map(String::as_str).collect::<BTreeSet<_>>() == nodes
+        && by_node[fingerprint].as_u64() == Some(1)
+        && occupied[fingerprint].as_u64() == Some(1)
+        && held_matches == 1 && pool["running"].as_array().unwrap().len() as u64 == sum
+        && pool["in_use"] == sum
+        && by_node.values().filter_map(serde_json::Value::as_u64).sum::<u64>() == sum
+        && pool["occupied"].as_u64() == Some(occupied.values()
+            .filter_map(serde_json::Value::as_u64).sum::<u64>())
+        && pool["limit"].as_u64() == Some((nodes.len()
+            * vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS) as u64)
+        && pool["retiring_nodes"].as_array().is_some_and(|retiring| retiring.iter()
+            .any(|node| node == fingerprint)),
+        "PRODUCT: shipped pool omitted the held retiring identity or its exact 2N accounting: {pool}");
+    // PROPOSED PUBLIC BINDING: A's physical-lifecycle patch renders existing Detaching state;
+    // for this known passphrase-protected saved profile, Locked appears only AFTER receipt.
+    // This proposal is NOT executable until that product surface/source binding is accepted.
+    // A causal user command, not a lucky snapshot before premature detach: the exact old
+    // worker cannot finish while this file remains. This deliberate held-state request is
+    // distinct from the ONE fresh unlock after actual teardown; neither command is retried.
+    // First observe that this host processed retirement. Pool unregister precedes its
+    // watcher. The old product's ellipsis is transitional staging ONLY, never completion or
+    // an own-red for missing the new label. Protected Locked while this worker is held is
+    // already a truthful user-level premature physical-stop failure.
     loop {
-        let current = history(Some(&instance), true);
-        assert_archive_owner(&current);
-        if matches!(current.status.phase, Phase::More | Phase::Complete) {
+        match lifecycle().as_str() {
+            "Ready" => std::thread::sleep(Duration::from_millis(20)),
+            "Detaching" | "…" => break,
+            "Locked" => panic!(
+                "PRODUCT: selected node claims physical stop while its exact worker remains held"
+            ),
+            other => panic!("APPARATUS: unexpected pre-unlock retirement state {other:?}"),
+        }
+    }
+    let blocked_args = attach::persistent_args(
+        &staged.host,
+        &["node", "unlock", name, "--passphrase-file", "-"],
+        IDENTITY,
+    );
+    let blocked_args: Vec<&str> = blocked_args.iter().map(String::as_str).collect();
+    let (ok, out, err) = vox_plain(&staged.host, &blocked_args, None);
+    let shown = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
+    let still: serde_json::Value =
+        serde_json::from_str(&shown.status).expect("PRODUCT: held-state unlock status JSON");
+    assert!(
+        hold.exists()
+            && charged_flow_hold_owners(hold).get(&(
+                old_actor,
+                fingerprint.clone(),
+                room.clone(),
+                held_owner["peer"].as_str().unwrap().to_owned()
+            )) == Some(&1)
+            && still["lanes"]["budget"]["flow_state"]["running"]
+                .as_array()
+                .is_some_and(|owners| owners.iter().any(|owner| *owner == held_owner)),
+        "APPARATUS: original real worker was not held through the blocked unlock: {still}"
+    );
+    let expected = format!("node {name}'s work is still stopping; try again once it has finished");
+    assert!(!ok && format!("{out}{err}").contains(&expected),
+        "PRODUCT: unlock while exact retired work is still held did not truthfully report StillDetaching: ok={ok}, {out}{err}");
+    assert_eq!(
+        lifecycle(),
+        "Detaching",
+        "PRODUCT: held retired node did not truthfully remain Detaching"
+    );
+    std::fs::remove_file(hold).expect("APPARATUS: release exact retired worker");
+    loop {
+        match lifecycle().as_str() {
+            "Detaching" => std::thread::sleep(Duration::from_millis(20)),
+            "Locked" => break,
+            other => panic!("PRODUCT: physical teardown reported unexpected lifecycle {other:?}"),
+        }
+    }
+    let shown = fx35_synced(&staged.host, Some(FX35_HOSTED[0]));
+    let stopped: serde_json::Value =
+        serde_json::from_str(&shown.status).expect("PRODUCT: physical-stop pool status JSON");
+    let pool = &stopped["lanes"]["budget"]["flow_state"];
+    assert!(
+        !pool["actors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|owner| owner["actor"] == old_actor)
+            && pool["by_node"].get(fingerprint).is_none()
+            && pool["limit"].as_u64()
+                == Some(
+                    ((pressure_members.len() - 1)
+                        * vox_core::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS)
+                        as u64
+                ),
+        "PRODUCT: completed physical teardown retained the old accounting owner: {pool}"
+    );
+    unlock(&staged.host, name); // ONE unlock, only after the real physical receipt.
+    loop {
+        let shown = fx35_synced(&staged.host, Some(name));
+        let status: serde_json::Value =
+            serde_json::from_str(&shown.status).expect("PRODUCT: replacement Ready status JSON");
+        assert!(
+            status["status"] == "Ready" && status["identity"] == *fingerprint,
+            "PRODUCT: one post-teardown unlock did not restore the exact identity: {status}"
+        );
+        let preparing = status["preparing"]
+            .as_array()
+            .expect("PRODUCT: room preparations array");
+        assert!(
+            preparing
+                .iter()
+                .all(|pending| staged.rooms.iter().any(|room| pending["id"] == *room)),
+            "APPARATUS: unexpected replacement room preparation: {status}"
+        );
+        if preparing.is_empty() {
             break;
         }
-        assert!(matches!(current.status.phase, Phase::Pending | Phase::Preparing),
-            "PRODUCT: the same accepted Older did not progress after its generation release handoff: {:?}", current.status);
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(20));
     }
-    println!("[proof] generation {} admission {} retained {}/{} ({}, {}) through exact release; same Older request {} / instance {} reached More/Complete and the preattached Live tail received {:?}",
-        if refused.archive { "Archive" } else { "Live" }, refused.admission,
-        refused.room, refused.peer, refused.root, refused.lane, archive_request, instance, successor);
-    // No claim about an arbitrary older Content row follows from a bounded More/Complete.
     loop {
         let (ok, out, err) = vox(
             &staged.host,
-            &as_node(&["room", "read", room], Some(running_name)),
+            &as_node(&["room", "read", room], Some(name)),
             None,
         );
         assert!(
             ok,
-            "PRODUCT: post-generation ordinary read refused: {out}{err}"
+            "PRODUCT: post-physical-stop ordinary read refused: {out}{err}"
         );
         if out.contains(&target) {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    tail.wait_for(&successor, peer_name, true);
+    let fresh = scoped("generation-post-physical-stop");
+    let (ok, out, err) = stage_post_once(&staged.host, Some(name), other_room, &fresh);
+    assert!(
+        ok,
+        "PRODUCT: one fresh post after physical stop/unlock refused: {out}{err}"
+    );
+    tail.wait_for(&fresh, peer_name, true);
+    println!("[proof] retiring actor {old_actor} stayed in exact 2N accounting; actual worker release and physical stop preceded one fresh unlock/post/read; concurrent same-profile generations and NodeBusy are source-reviewed, not runtime claims");
 }
 
 // The original cold delivery population stays unchanged. A pressure sidecar can also supply
@@ -3261,13 +3138,11 @@ fn assert_pressure_identity(record: &serde_json::Value, owner: &PressureContinua
 /// the earliest exact continuation; one shipped status snapshot then reports the same release
 /// order `granted: true` and `handed_off: false`, immediately PRODUCT red before the already-
 /// attached tail is consulted; dropping archive ownership turns the exact shipped archive
-/// request's structural ownership assertion red; `scratchpad/mutant_fx35_node_release.py` removes
-/// `FlowStateCharge::drop`'s capacity-to-continuation handoff, so status shows the exact room/peer/
-/// root/lane NodeBusy admission as the earliest eligible ungranted Flow after its charge is gone,
-/// another terminating PRODUCT state without a scheduling command or tick;
-/// giving a replacement generation two new node slots instead of sharing the retired actor's
-/// source-owned pair prevents the exact NodeBusy verdict and makes the generation assertion
-/// PRODUCT-red; reporting NodeBusy as PoolFull makes the first-gate/in-use assertion PRODUCT-red;
+/// request's structural ownership assertion red; omitting the held retiring identity from
+/// `Pool::resize` makes the actual distinct-identity 2N accounting assertion PRODUCT-red;
+/// reporting the actual held ordinary LiveBusy gate as PoolFull makes its fixed-port
+/// first-cause assertion PRODUCT-red. Concurrent same-profile generations and NodeBusy
+/// remain source-reviewed; this journey does not claim to run them.
 /// removing the retained-room health attribution makes that exact room's shipped diagnosis
 /// PRODUCT-red; attributing every open room to the flow-state pool makes the simultaneous
 /// unrelated-room negative diagnosis PRODUCT-red; removing the PoolFull port reason makes the
@@ -4137,9 +4012,16 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     )
                 });
             let history = &status["lanes"]["history"];
-            // This structural verdict is deliberately evaluated before Status or Resume can
-            // prepare work. A running public operation without one of these exact physical owners
-            // is the product orphan this phase was built to catch.
+            // The daemon status above only observes ownership. Before an explicit History Status
+            // or Resume can prepare replacement work, count the exact queued Dispatch as well as
+            // bounded owners: a same-port live round may legitimately delay taking that Dispatch.
+            let owner = &history["owner"];
+            let accepted_room = vox_core::node::link::b32_encode(&accepted.room);
+            let queued_dispatch = history["ready"] == true
+                && owner["room"].as_str() == Some(accepted_room.as_str())
+                && owner["instance"].as_str() == Some(accepted.instance.as_str())
+                && owner["request"].as_str() == Some(accepted.request.as_str())
+                && owner["peer"].as_str() == Some(staged.everyone[staged.hosted].3.as_str());
             let bounded = &status["lanes"]["bounded"];
             let retained_archive = bounded["ready"]
                 .as_array()
@@ -4161,10 +4043,14 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 .as_u64()
                 .unwrap_or(0);
             assert!(
-                history["running"] != true || running || retained_archive || admission,
-                "PRODUCT: {name}'s shipped archive request remains running, but after a status \
-                 request scheduled its work no exact archive round, retained archive flow, or \
-                 archive admission owns its next step (node charge {charged} cannot stand in for \
+                history["running"] != true
+                    || queued_dispatch
+                    || running
+                    || retained_archive
+                    || admission,
+                "PRODUCT: {name}'s shipped archive request remains running, but no exact queued \
+                 history dispatch, archive round, retained archive flow, or archive admission \
+                 owns its next step (node charge {charged} cannot stand in for \
                  archive ownership): {}",
                 shown.status
             );
