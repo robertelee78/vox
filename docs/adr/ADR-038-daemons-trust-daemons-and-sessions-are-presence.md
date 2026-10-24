@@ -61,6 +61,10 @@ trust relationships between computers". What the daemon and the keyrings showed:
 
 The decider then answered twelve questions, one at a time. His answers are the decision.
 
+The non-normative [peer implementation comparison](../design/vox-peer-implementation-review.md)
+records pinned Syncthing/Iroh observations, their limits, and the existing tasks carrying the
+lessons. It changes neither this record's decision status nor any requirement or approval.
+
 ## Terms
 
 - **Daemon identity**: the persistent identity of one computer's `vox daemon` (ADR-035 CT-1).
