@@ -420,6 +420,27 @@ pub(crate) struct AdmissionCharge {
     _charge: BufferCharge,
 }
 
+/// Exact durable terminal state returned to the one accepted local Cancel owner.
+pub(crate) enum LocalCancelOutcome {
+    NewlyCancelled(Box<CommittedCancel>),
+    AlreadyCancelled(Box<CommittedCancel>),
+    AlreadyComplete,
+}
+
+/// Capability to reclaim only the exact request whose Cancelled fence is already durable.
+pub(crate) struct CommittedCancel {
+    node: Digest32,
+    scope: Digest32,
+    request: RequestId,
+    binding: Binding,
+}
+
+pub(crate) enum CommittedReclaim {
+    More,
+    Complete,
+    Superseded,
+}
+
 impl AdmissionCharge {
     pub(crate) fn reserve(job: &Job) -> Result<Self> {
         charge(job, STATE_WORK).map(|charge| Self { _charge: charge })
@@ -1324,6 +1345,86 @@ pub(crate) fn cancel_precharged(
     schedule_cleanup(&mut state);
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)
+}
+
+/// Commit the exact local cancellation and return capability-bound cleanup ownership. Lifecycle
+/// cancellation immediately before commit still refuses; cancellation observed after a successful
+/// commit cannot change the durable outcome into an error.
+pub(crate) fn cancel_owned_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<LocalCancelOutcome> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
+    if state.request != request {
+        return Err(invalid("history request ID changed"));
+    }
+    let binding = state.binding;
+    let committed = || CommittedCancel {
+        node: context.node,
+        scope,
+        request,
+        binding,
+    };
+    match state.progress {
+        Progress::Cancelled => {
+            return Ok(LocalCancelOutcome::AlreadyCancelled(Box::new(committed())));
+        }
+        Progress::Complete => return Ok(LocalCancelOutcome::AlreadyComplete),
+        _ => {}
+    }
+    state.serial = next_serial(state.serial)?;
+    state.progress = Progress::Cancelled;
+    schedule_cleanup(&mut state);
+    put(&mut batch, key, &scope, &state)?;
+    // Preserve the lifecycle fence until the commit's linearization point. A later observation
+    // cannot truthfully deny the committed result.
+    context.check()?;
+    batch.commit()?;
+    Ok(LocalCancelOutcome::NewlyCancelled(Box::new(committed())))
+}
+
+/// Reclaim one bounded slice owned by an exact durable Cancelled capability. The retained Context
+/// keeps the key and secret-work lease alive, but postcommit lifecycle cancellation cannot revoke
+/// deletion of this exact request. Missing or replaced state is never recreated.
+pub(crate) fn reclaim_committed(
+    context: &Context,
+    committed: &CommittedCancel,
+    _charge: &AdmissionCharge,
+) -> Result<CommittedReclaim> {
+    if context.node != committed.node || context.scope != committed.scope {
+        return Err(invalid("history cancellation owner changed"));
+    }
+    let key = &context.key;
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, key, &committed.scope)? else {
+        return Ok(CommittedReclaim::Superseded);
+    };
+    if state.request != committed.request
+        || state.binding != committed.binding
+        || state.progress != Progress::Cancelled
+    {
+        return Ok(CommittedReclaim::Superseded);
+    }
+    let Some(mut cleanup) = state.cleanup else {
+        return Ok(CommittedReclaim::Complete);
+    };
+    let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+    for page in cleanup.next..=end {
+        batch.delete_segment(&committed.scope, KIND, page)?;
+    }
+    cleanup.next = end + 1;
+    state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    put(&mut batch, key, &committed.scope, &state)?;
+    batch.commit()?;
+    Ok(if state.cleanup.is_none() {
+        CommittedReclaim::Complete
+    } else {
+        CommittedReclaim::More
+    })
 }
 
 /// At most 14 page deletes plus one header write (also <=1 MiB). New start waits for true.
