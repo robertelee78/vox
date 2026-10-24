@@ -256,7 +256,7 @@ impl Receiver {
         #[cfg(feature = "test-knobs")]
         let mut unexpected_body = None;
         loop {
-            let incoming = match io.read(credit.remaining_wire()).await? {
+            let incoming = match io.read_required(credit.remaining_wire()).await? {
                 Read::Frame(frame) => frame,
                 Read::Busy => {
                     io.abort(WireError::SessionBusy);
@@ -349,14 +349,9 @@ impl Receiver {
             };
             match action {
                 Action::Inventory(hints) => {
-                    let Some(charge) = io
-                        .job()
-                        .reserve(hints.capacity() * std::mem::size_of::<super::HeadHint>())
-                    else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
+                    let charge = io.job().reserve_or_pressure(
+                        hints.capacity() * std::mem::size_of::<super::HeadHint>(),
+                    )?;
                     result.inventory = Some(Inventory {
                         hints,
                         _charge: charge,
@@ -367,11 +362,12 @@ impl Receiver {
                     let generation = self.generation;
                     let selected = query.clone();
                     let committed = self.source.commit_ledger();
-                    let Some(work_job) = io.job().record_job(12 * 1024 * 1024).await else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
+                    // The decoded frame still owns its admitted foreground worker. Reuse that
+                    // exact worker for the dependent room read: asking the original Control job
+                    // for a second foreground worker while retaining `incoming` can deadlock the
+                    // bounded worker pool. Its charges still account the complete overlapping
+                    // frame, directory and verifier peak on one owner.
+                    let work_job = incoming.job();
                     let staged = self
                         .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                             let Frame::Meta { object, .. } = incoming.frame()? else {
@@ -1128,11 +1124,11 @@ impl Receiver {
         } else {
             record_envelope
         };
-        // Release the metadata job before attempting a large body job. The small header itself
-        // stays charged until its replacement reservation has been acquired.
-        let Some(record_job) = job.record_job(envelope).await else {
-            return Ok(Assembly::Busy);
-        };
+        // The returned header retains the metadata worker which admitted it. Reuse that exact
+        // worker for reconstruction while the header remains live. Asking the original Control
+        // job for another foreground worker would retain one scarce owner while waiting for a
+        // second owner from the same bounded pool.
+        let record_job = header.job();
         let peak = fresh_worker_peak(
             &record_job,
             envelope

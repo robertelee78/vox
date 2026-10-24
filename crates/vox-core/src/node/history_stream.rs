@@ -143,6 +143,7 @@ pub(crate) async fn serve(
     .await;
     if let Err(error) = &result {
         let code = match error {
+            Error::HistoryCapacity(_) => crate::wire::WireError::SessionBusy,
             Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
                 crate::wire::WireError::ProtocolLimits
             }
