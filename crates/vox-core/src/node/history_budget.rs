@@ -222,6 +222,22 @@ impl State {
             }
         }
     }
+
+    fn ticket_position(&self, node: Digest32, lane: Lane, ticket: u64) -> Option<usize> {
+        if !self.available(node, lane) {
+            return None;
+        }
+        let at = match lane {
+            Lane::Archive => self.queues[lane.index()]
+                .iter()
+                .position(|waiting| !self.archive_nodes.contains(&waiting.node))?,
+            Lane::Control | Lane::LargeControl | Lane::Live => 0,
+        };
+        self.queues[lane.index()]
+            .get(at)
+            .is_some_and(|waiting| waiting.ticket == ticket)
+            .then_some(at)
+    }
 }
 
 /// One exact cleanup obligation. The actor registration and request ID distinguish a retired
@@ -331,6 +347,14 @@ impl Budget {
     pub fn try_start(self: &Arc<Self>, node: Digest32, lane: Lane) -> Option<Job> {
         self.enqueue(node, lane).try_admit()
     }
+
+    /// Whether a fresh Control owner would pass the fair daemon gate now. This observation
+    /// grants nothing: the caller uses it only to name the first refusal before a locally busy
+    /// lane, and [`Ticket::try_admit`] remains the sole authority that creates a worker.
+    pub(crate) fn fresh_control_would_admit(&self, node: Digest32) -> bool {
+        let state = self.state();
+        state.queues[Lane::Control.index()].is_empty() && state.available(node, Lane::Control)
+    }
 }
 
 /// A bounded fair queue position, cancelled on drop unless it has become a worker.
@@ -359,20 +383,24 @@ impl Ticket {
         wake
     }
 
+    /// Observe whether this exact retained owner is the currently admissible fair-queue head.
+    /// The observation consumes neither the ticket nor capacity; a later `try_admit` rechecks
+    /// under the same state lock before it grants the worker.
+    pub(crate) fn would_admit(&self) -> bool {
+        self.queued
+            && self
+                .budget
+                .state()
+                .ticket_position(self.node, self.lane, self.ticket)
+                .is_some()
+    }
+
     pub(crate) fn try_admit(&mut self) -> Option<Job> {
         let mut state = self.budget.state();
-        if !self.queued || !state.available(self.node, self.lane) {
+        if !self.queued {
             return None;
         }
-        let at = match self.lane {
-            Lane::Archive => state.queues[self.lane.index()]
-                .iter()
-                .position(|waiting| !state.archive_nodes.contains(&waiting.node))?,
-            _ => 0,
-        };
-        if state.queues[self.lane.index()].get(at)?.ticket != self.ticket {
-            return None;
-        }
+        let at = state.ticket_position(self.node, self.lane, self.ticket)?;
         state.queues[self.lane.index()].remove(at);
         match self.lane {
             Lane::Archive => {

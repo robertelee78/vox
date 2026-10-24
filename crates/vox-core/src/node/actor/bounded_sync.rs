@@ -661,6 +661,65 @@ impl Controller {
             admission.task.abort();
         }
     }
+    fn cancel_matching_control_admission(&mut self, room: Digest32, peer: Digest32) {
+        let index = crate::node::history_budget::Lane::Control.index();
+        if self.foreground_admission[index]
+            .as_ref()
+            .is_some_and(|admission| admission.room == room && admission.peer == peer)
+        {
+            self.cancel_foreground_admission(index);
+        }
+    }
+    fn control_would_admit(
+        &self,
+        budget: &crate::node::history_budget::Budget,
+        node: Digest32,
+        room: Digest32,
+        peer: Digest32,
+    ) -> bool {
+        let index = crate::node::history_budget::Lane::Control.index();
+        match self.foreground_admission[index].as_ref() {
+            Some(admission) if admission.room == room && admission.peer == peer => {
+                admission.ticket.would_admit()
+            }
+            Some(_) => false,
+            None => budget.fresh_control_would_admit(node),
+        }
+    }
+    /// Give the daemon's retained fair-queue owner a runnable local lane before it tries to
+    /// consume capacity. The displaced Flow remains whole and keeps the exact deque position
+    /// this owner held; no root, cursor, context, announcement or backoff state is rebuilt.
+    fn prioritize_control_admission_owner(&mut self, room: Digest32, peer: Digest32) {
+        if self.running[0].is_some() {
+            return;
+        }
+        let index = crate::node::history_budget::Lane::Control.index();
+        if !self.foreground_admission[index]
+            .as_ref()
+            .is_some_and(|admission| admission.room == room && admission.peer == peer)
+        {
+            return;
+        }
+        if self.ready[0]
+            .as_ref()
+            .is_some_and(|flow| flow.room == room && flow.peer == peer)
+        {
+            return;
+        }
+        let Some(at) = self
+            .deferred
+            .iter()
+            .position(|flow| !flow.archive && flow.room == room && flow.peer == peer)
+        else {
+            return;
+        };
+        let Some(flow) = self.deferred.remove(at) else {
+            return;
+        };
+        if let Some(displaced) = self.ready[0].replace(flow) {
+            self.deferred.insert(at, displaced);
+        }
+    }
     fn cancel_foreground_port(&mut self, room: Digest32, peer: Digest32) {
         for index in 0..self.foreground_admission.len() {
             if self.foreground_admission[index]
@@ -2646,6 +2705,8 @@ impl Node {
         };
         let node = profile.fingerprint();
         let pending_work = self.bounded_pending_identity(room, peer);
+        self.bounded_sync
+            .prioritize_control_admission_owner(room, peer);
         if self.bounded_sync.ready[0].is_none() && self.bounded_sync.running[0].is_none() {
             if let Some(at) = self
                 .bounded_sync
@@ -2738,6 +2799,40 @@ impl Node {
                     // the port. Its release is driven by the exact retiring/completion owner;
                     // do not overwrite the last ended attempt with a start_reason ADR-038 does
                     // not define.
+                    self.bounded_sync
+                        .cancel_matching_control_admission(room, peer);
+                    return false;
+                }
+                let archive_dispatch = self.bounded_sync.ready[1].is_none()
+                    && self.bounded_sync.running[1].is_none()
+                    && self.history_demand.ready_binding(room, peer).is_some();
+                if !archive_dispatch
+                    && (page_only
+                        || self.bounded_sync.ready[0].is_some()
+                        || self.bounded_sync.running[0].is_some())
+                {
+                    // A locally impossible owner must not pin the daemon's fair Control FIFO.
+                    // Observe the documented first gate before withdrawing only this port's
+                    // retained ticket; another port's earlier owner remains untouched. The
+                    // logical request/hint stays in the port queue and the current Flow owner's
+                    // completion or dependency edge causes the next evaluation.
+                    let control_ready = self.bounded_sync.control_would_admit(
+                        &self.history_budget,
+                        node,
+                        room,
+                        peer,
+                    );
+                    self.bounded_sync
+                        .cancel_matching_control_admission(room, peer);
+                    self.note_start(
+                        room,
+                        peer,
+                        if control_ready {
+                            "live_lane_busy"
+                        } else {
+                            "control_budget_busy"
+                        },
+                    );
                     return false;
                 }
                 if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
