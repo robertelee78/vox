@@ -1858,6 +1858,34 @@ impl Node {
         self.bounded_sync.dispose(flow);
     }
 
+    /// Settle the exact archive operation before retiring a Flow which can no longer return
+    /// through its port attempt. A durable More/Complete/Paused checkpoint owns the result even
+    /// if the connection retires just before actor acceptance; otherwise the same saved request
+    /// becomes Paused and requires the person's explicit Resume.
+    fn settle_archive_exit(&mut self, flow: &mut Flow, failure: &str) -> bool {
+        let Some(request) = flow.archive_request else {
+            return false;
+        };
+        if let Some(status) = flow.archive_status.take() {
+            if self.history_demand.completed_current(
+                flow.room,
+                flow.instance,
+                request,
+                flow.generation,
+                status,
+            ) {
+                return true;
+            }
+        }
+        self.history_demand.failed_current(
+            flow.room,
+            flow.instance,
+            request,
+            flow.generation,
+            failure,
+        )
+    }
+
     /// Resume the exact retained Flow that owns a durable room publication. A waiter knows the
     /// request identity from disk; routing that causal edge to the owner's port avoids both a
     /// room-wide wake storm and retrying the waiter while the only productive Flow sleeps.
@@ -2073,6 +2101,7 @@ impl Node {
             }
             if let Some(error) = flow.local_retry.take() {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
+                self.settle_archive_exit(&mut flow, &error);
                 if let Some(hint) = flow.hint {
                     self.history_hints
                         .retry(work.room, flow.hint_peer, hint.author, hint.head);
@@ -2091,11 +2120,18 @@ impl Node {
                     }
                 }
                 self.bounded_sync.dispose(flow);
-                if let Some(port) = self.ports.get_mut(&(work.room, retry_peer)) {
+                let retry_port = if work.archive.is_none() {
+                    self.ports.get_mut(&(work.room, retry_peer))
+                } else {
+                    None
+                };
+                if let Some(port) = retry_port {
                     // Keep the exact work requested, but do not immediately schedule it: an
                     // unrelated actor event or the ordinary maintenance pass may retry after the
                     // local store fault clears. Immediate re-scheduling would spin on a durable
                     // local failure, while peer Busy/Unreachable backoff would blame the wire.
+                    // An archive request instead stays truthfully Paused under its durable request;
+                    // only the person's explicit Resume may authorize another archive quantum.
                     port.raise();
                     port.clear_backoff();
                 }
@@ -2103,6 +2139,11 @@ impl Node {
                 continue;
             }
             if !valid {
+                let failure = returned.failure.as_ref().map_or(
+                    "History round ended before completion; resume the saved request explicitly.",
+                    |failure| failure.text.as_str(),
+                );
+                self.settle_archive_exit(&mut flow, failure);
                 self.dispose_rearming_hint(flow);
                 continue;
             }

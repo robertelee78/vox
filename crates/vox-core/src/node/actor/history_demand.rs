@@ -219,6 +219,36 @@ impl Controller {
             self.owner_status = Some(status);
         }
     }
+
+    /// Install a durable result only for the exact operation still owned by this controller.
+    /// A late Flow from a cancelled request, replaced room or retired node cannot complete the
+    /// replacement merely because it reused the same actor.
+    pub(super) fn completed_current(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        generation: Digest32,
+        status: Status,
+    ) -> bool {
+        if !self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.request == request && running.generation == generation)
+            || !self.owner_status.as_ref().is_some_and(|current| {
+                current.room == room
+                    && current.instance == instance
+                    && current.request == Some(request)
+            })
+            || status.room != room
+            || status.instance != instance
+            || status.request != Some(request)
+        {
+            return false;
+        }
+        self.completed(request, generation, status);
+        true
+    }
     /// A failed quantum leaves its durable request available for an explicit resume.
     pub(super) fn failed(&mut self, request: RequestId, generation: Digest32, detail: &str) {
         if !self
@@ -241,6 +271,36 @@ impl Controller {
             status.phase = Phase::Paused;
             status.detail = detail.chars().take(128).collect();
         }
+    }
+
+    /// Settle only the exact public archive owner named by a returned bounded Flow.
+    ///
+    /// A cancelled/replaced request, a retired room or node, and a later generation have already
+    /// moved `running` or `owner_status`; an old worker must not pause or recreate any of them.
+    /// The caller receives whether this Flow still owned the operation, so it can distinguish a
+    /// truthful saved Pause from disposal of an already superseded capability.
+    pub(super) fn failed_current(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        generation: Digest32,
+        detail: &str,
+    ) -> bool {
+        if !self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.request == request && running.generation == generation)
+            || !self.owner_status.as_ref().is_some_and(|status| {
+                status.room == room
+                    && status.instance == instance
+                    && status.request == Some(request)
+            })
+        {
+            return false;
+        }
+        self.failed(request, generation, detail);
+        true
     }
     fn stop_request(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
         if !self
