@@ -303,9 +303,50 @@ pub(super) async fn erase_retired_node(ledger: &Arc<RetirementLedger>, node: Dig
     }
 }
 
+struct ReturnedFailure {
+    text: String,
+    classification: crate::node::channel::SyncFailure,
+}
+impl ReturnedFailure {
+    fn from_error(error: Error) -> Self {
+        let text = error.to_string();
+        let classification = match error {
+            Error::PeerRefused(code) => crate::node::channel::SyncFailure::Session(
+                crate::log::sync::SessionError::Peer(code),
+            ),
+            _ => crate::node::channel::SyncFailure::Unreachable(text.clone()),
+        };
+        Self {
+            text,
+            classification,
+        }
+    }
+
+    fn unreachable(text: String) -> Self {
+        Self {
+            classification: crate::node::channel::SyncFailure::Unreachable(text.clone()),
+            text,
+        }
+    }
+
+    fn panicked(panic: String) -> Self {
+        Self {
+            text: format!("bounded history worker panicked: {panic}"),
+            classification: crate::node::channel::SyncFailure::Panicked,
+        }
+    }
+
+    fn retryable_peer_busy(&self) -> bool {
+        matches!(
+            &self.classification,
+            crate::node::channel::SyncFailure::Session(crate::log::sync::SessionError::Peer(
+                crate::wire::WireError::SessionBusy | crate::wire::WireError::NotYetMember
+            ))
+        )
+    }
+}
 struct Returned {
-    error: Option<String>,
-    panic: Option<String>,
+    failure: Option<ReturnedFailure>,
 }
 struct Running {
     room: Digest32,
@@ -1812,7 +1853,7 @@ impl Node {
                 Ok(mut result) => result.take(),
                 Err(_) => None,
             };
-            let Some(mut returned) = returned else {
+            let Some(returned) = returned else {
                 continue;
             };
             let flow = work.flow.try_lock().ok().and_then(|mut flow| flow.take());
@@ -1827,9 +1868,6 @@ impl Node {
                 continue;
             };
             let mut flow = flow;
-            if let Some(panic) = returned.panic.take() {
-                returned.error = Some(format!("bounded history worker panicked: {panic}"));
-            }
             // These facts were committed by the worker before it returned. Account for them
             // before deciding whether its attempt is still current: cancellation, retirement,
             // an error after the store callback, or a newer scalar head must not turn durable
@@ -2148,7 +2186,10 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            if let Some(error) = returned.error {
+            if let Some(failure) = returned.failure {
+                let backoff = crate::node::ports::backoff_kind(&failure.classification);
+                let retryable_peer_busy = failure.retryable_peer_busy();
+                let error = failure.text;
                 if flow.announcement_failed() && flow.retain_failed_announcement().is_ok() {
                     // The announcement used its own scalar task. A refused/broken stream keeps
                     // the ordinary hint/required stack and retries this prefix through the port's
@@ -2163,11 +2204,33 @@ impl Node {
                             counts.last_failure = Some(error);
                         },
                     );
-                    self.enter_backoff(
+                    if let Some(backoff) = backoff {
+                        self.enter_backoff(work.room, work.peer, backoff);
+                    }
+                    continue;
+                }
+                if retryable_peer_busy && flow.take_peer_busy_retry() {
+                    // The peer named a transient session collision or has not admitted this
+                    // just-joined member yet. Keep the exact restored ResumeWire/local owner;
+                    // rebuilding from inventory would discard its durable cursor and root.
+                    if index == 0 {
+                        self.bounded_sync.deferred.push_back(flow);
+                    } else {
+                        debug_assert!(self.bounded_sync.ready[index].is_none());
+                        self.bounded_sync.ready[index] = Some(flow);
+                    }
+                    crate::node::status::SyncBook::with(
+                        &self.sync_book,
                         work.room,
                         work.peer,
-                        crate::node::status::BackoffKind::Unreachable,
+                        |counts| {
+                            counts.failed += 1;
+                            counts.last_failure = Some(error);
+                        },
                     );
+                    if let Some(backoff) = backoff {
+                        self.enter_backoff(work.room, work.peer, backoff);
+                    }
                     continue;
                 }
                 // A peer that does not yet hold a selected current body or a required current
@@ -2220,11 +2283,9 @@ impl Node {
                         counts.last_failure = Some(error);
                     },
                 );
-                self.enter_backoff(
-                    work.room,
-                    work.peer,
-                    crate::node::status::BackoffKind::Unreachable,
-                );
+                if let Some(backoff) = backoff {
+                    self.enter_backoff(work.room, work.peer, backoff);
+                }
                 continue;
             }
             if flow.route_complete {
@@ -3246,7 +3307,9 @@ impl Node {
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
             let mut flow = worker_flow.lock().await;
             let Some(flow) = flow.as_mut() else {
-                return Some("bounded history supervisor retained no Flow".to_owned());
+                return Some(ReturnedFailure::unreachable(
+                    "bounded history supervisor retained no Flow".to_owned(),
+                ));
             };
             // The proof barrier belongs after exclusive Flow ownership. While it is held, an
             // actor panic can retire the controller but cannot adopt/park this Flow; its charge
@@ -3261,7 +3324,7 @@ impl Node {
                     };
                 }
             }
-            let error = flow
+            let failure = flow
                 .turn(
                     store,
                     &conn,
@@ -3274,16 +3337,16 @@ impl Node {
                 )
                 .await
                 .err()
-                .map(|e| e.to_string());
+                .map(ReturnedFailure::from_error);
             // The round is over: its flow state goes back here, in the step that ends it
             // (ADR-038 FX-35), not when the actor next looks; a finished task holds no charge.
             flow.park();
-            error
+            failure
         });
         let task = tokio::spawn(async move {
-            let (error, panic) = match worker.await {
-                Ok(error) => (error, None),
-                Err(error) => (None, Some(error.to_string())),
+            let failure = match worker.await {
+                Ok(failure) => failure,
+                Err(error) => Some(ReturnedFailure::panicked(error.to_string())),
             };
             // The inner task can unwind before its normal `park`. Its supervisor owns the exact
             // settlement edge and releases the running charge before publishing completion.
@@ -3291,7 +3354,7 @@ impl Node {
                 flow.park();
             }
             if let Ok(mut result) = output.lock() {
-                *result = Some(Returned { error, panic });
+                *result = Some(Returned { failure });
             }
             completion_wake.notify_one();
         });

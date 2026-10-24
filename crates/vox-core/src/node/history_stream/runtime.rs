@@ -236,6 +236,9 @@ pub(crate) struct Flow {
     /// A post arriving while the announcement exchange is in flight must not make announcements
     /// starve the retained root. One actual ordinary worker quantum runs before another prefix.
     ordinary_turn_due: bool,
+    /// This turn returned one of the two retryable coded peer refusals after restoring its exact
+    /// ordinary continuation. The announcement scalar is deliberately separate provenance.
+    peer_busy_retry: bool,
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
@@ -397,6 +400,7 @@ impl Flow {
             announcement_error: false,
             announcement_active: false,
             ordinary_turn_due: false,
+            peer_busy_retry: false,
             slots,
             owners: [None, None],
             body_progress: false,
@@ -550,6 +554,7 @@ impl Flow {
             announcement_error: false,
             announcement_active: false,
             ordinary_turn_due: false,
+            peer_busy_retry: false,
             live_context: None,
             control_context: control,
             live: None,
@@ -783,6 +788,20 @@ impl Flow {
         self.tasks.is_empty() && self.replay.is_none() && self.announcement.is_none()
     }
 
+    /// Whether an ordinary operation, rather than the separate announcement prefix, remains
+    /// owned by this Flow. A peer-Busy settlement may retain the Flow only when the exact popped
+    /// operation was restored here; an announcement alone is not provenance for retrying it.
+    #[must_use]
+    pub(crate) fn ordinary_pending(&self) -> bool {
+        !self.tasks.is_empty() || self.replay.is_some()
+    }
+
+    /// Consume the proof that this returned peer-Busy result still owns its exact ordinary task.
+    /// A pending announcement alone can never satisfy this predicate.
+    pub(crate) fn take_peer_busy_retry(&mut self) -> bool {
+        std::mem::take(&mut self.peer_busy_retry) && self.ordinary_pending()
+    }
+
     /// Prepend one real inventory exchange to this retained foreground owner. A failed prefix
     /// remains this same scalar; it never consumes, rebuilds or retires the ordinary root.
     pub(crate) fn arm_announcement(&mut self, through: u64) -> Result<()> {
@@ -844,6 +863,7 @@ impl Flow {
         self.request = announcement.prior_request;
         self.announcement_error = false;
         self.announcement_active = false;
+        self.peer_busy_retry = false;
         Ok(())
     }
 
@@ -1233,6 +1253,7 @@ impl Flow {
         self.external = None;
         self.announcement_error = false;
         self.announcement_active = false;
+        self.peer_busy_retry = false;
         // Local slices run back to back inside one turn; a slice that needs the wire, waits,
         // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
         // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
@@ -1492,6 +1513,21 @@ impl Flow {
                 }
                 self.announcement_error = true;
                 self.announcement_active = false;
+                Err(error)
+            }
+            Err(
+                error @ Error::PeerRefused(
+                    crate::wire::WireError::SessionBusy | crate::wire::WireError::NotYetMember,
+                ),
+            ) => {
+                // These are the two coded, transient peer refusals paced as Busy by the port.
+                // Restore the exact popped operation before returning it to the actor: a Wire
+                // operation resumes from durable staging/cursor state, never from offset zero.
+                // If a helper consumed the retry owner, do not fabricate a replacement.
+                if let Some(task) = retry_task {
+                    self.push(task)?;
+                    self.peer_busy_retry = true;
+                }
                 Err(error)
             }
             Ok(()) if announcement_task => {
