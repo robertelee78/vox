@@ -261,6 +261,9 @@ pub struct Port {
     /// Scheduler-only watermark after one current-only exchange found a legacy gap.
     /// This is not evidence that the peer received this generation; agreement still uses done_gen.
     pub legacy_checked_gen: Option<u64>,
+    /// Scheduler-only generation spent by an actual foreground outbound attempt. A refused
+    /// attempt does not acknowledge the peer, but the same fact cannot bypass Busy repeatedly.
+    busy_attempt_gen: u64,
     /// When a completion last made progress, for concurrent completions (progress wins).
     pub last_progress: Option<Instant>,
     /// When this node's own outbound session last completed cleanly, so the periodic request
@@ -299,6 +302,7 @@ impl Port {
             req_done: 0,
             done_gen: 0,
             legacy_checked_gen: None,
+            busy_attempt_gen: 0,
             last_progress: None,
             last_clean_out: None,
             own_seq: 0,
@@ -373,17 +377,27 @@ impl Port {
     /// Whether new published entries bypass a Busy backoff at `now`. The Busy backoff spaces
     /// owed-work retries while nothing new arrived; a peer's newly published entries are new
     /// demand, and holding the round that carries them behind a transient-refusal backoff
-    /// delayed a fresh member's join and floor visibility past the person-facing bounds. A
-    /// transport (Unreachable) backoff still holds: a peer that cannot be reached gains
-    /// nothing from an immediate retry.
+    /// delayed a fresh member's join and floor visibility past the person-facing bounds.
+    /// Each published generation gives one actual foreground attempt this bypass; an unchanged
+    /// unfinished generation is not another new event after a refusal. A transport (Unreachable)
+    /// backoff still holds: a peer that cannot be reached gains nothing from an immediate retry.
     #[must_use]
     pub fn busy_bypass(&self, now: Instant) -> bool {
         self.backoff.is_some_and(|b| {
             b.kind == BackoffKind::Busy
                 && !self.poisoned
                 && self.gen.load(Ordering::Relaxed)
-                    > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
+                    > self
+                        .done_gen
+                        .max(self.legacy_checked_gen.unwrap_or(0))
+                        .max(self.busy_attempt_gen)
         }) && self.backing_off(now)
+    }
+
+    /// Spend bypass credit only when a real foreground outbound attempt was installed. The
+    /// caller captured this generation before launch; a change during flight stays fresh.
+    pub(crate) fn note_foreground_attempt(&mut self, generation: u64) {
+        self.busy_attempt_gen = self.busy_attempt_gen.max(generation);
     }
 
     /// Clear the backoff: a new connection, a new epoch, or a person's `vox room sync`.

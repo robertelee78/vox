@@ -16483,6 +16483,7 @@ impl Node {
         } else {
             crate::node::status::RoundReason::Request
         };
+        let generation = port.gen.load(std::sync::atomic::Ordering::Relaxed);
         port.out = Some(crate::node::ports::Attempt {
             token,
             dir: crate::node::ports::Dir::Out,
@@ -16495,6 +16496,7 @@ impl Node {
             departure_receipt: None,
             reason,
         });
+        port.note_foreground_attempt(generation);
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
         let authority = self.computer_authority();

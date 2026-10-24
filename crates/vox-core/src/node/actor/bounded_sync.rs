@@ -3280,6 +3280,9 @@ impl Node {
                 flow.reason
             },
         });
+        if !flow.archive {
+            port.note_foreground_attempt(generation);
+        }
         let archive = flow
             .archive_request
             .map(|request| (request, flow.generation));
