@@ -3652,7 +3652,31 @@ impl Router {
         let session_retirements =
             self.follow_session_room_removals(node, &handle, &paths, removals, ended.clone());
         drop(room_removed);
-        // Watched from the start, so a panic during the unlock is not lost either.
+        // Logical retirement is visible before actual cleanup finishes. Keep the task-join
+        // watcher independent: detach must never await a signal driven by its own waiter.
+        let panic_reported = Arc::new(AtomicBool::new(false));
+        {
+            let router = Arc::downgrade(&self.inner);
+            let node = node.clone();
+            let mut termination = handle.termination();
+            let panic_reported = Arc::clone(&panic_reported);
+            self.inner.rt.spawn(async move {
+                if let Some(ActorEnd::Panicked(message)) = termination.retiring().await {
+                    if let Some(inner) = router.upgrade() {
+                        if !panic_reported.swap(true, Ordering::AcqRel) {
+                            eprintln!(
+                                "vox daemon: node {node} stopped: its actor panicked: {message}"
+                            );
+                            inner.metrics.node_panics.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Router { inner }
+                            .detach_generation(&node, generation, DetachCause::Panicked(message))
+                            .await;
+                    }
+                }
+            });
+        }
+        // Also covers a panic outside the borrowed command loop, including failed cleanup.
         {
             let router = Arc::downgrade(&self.inner);
             let node = node.clone();
@@ -3660,9 +3684,13 @@ impl Router {
                 let end = ActorEnd::of(actor).await;
                 let _ = ended_tx.send(true);
                 if let ActorEnd::Panicked(message) = end {
-                    eprintln!("vox daemon: node {node} stopped: its actor panicked: {message}");
                     if let Some(inner) = router.upgrade() {
-                        inner.metrics.node_panics.fetch_add(1, Ordering::Relaxed);
+                        if !panic_reported.swap(true, Ordering::AcqRel) {
+                            eprintln!(
+                                "vox daemon: node {node} stopped: its actor panicked: {message}"
+                            );
+                            inner.metrics.node_panics.fetch_add(1, Ordering::Relaxed);
+                        }
                         Router { inner }
                             .detach_generation(&node, generation, DetachCause::Panicked(message))
                             .await;
@@ -3778,6 +3806,7 @@ impl Router {
         done: watch::Sender<DetachOutcome>,
         cause: DetachCause,
     ) -> Result<(), Refusal> {
+        let mut physical_end = a.handle.termination();
         let _ = a.detached.send(true);
         {
             let mut ingress = self.inner.posting.lock().await;
@@ -3804,6 +3833,12 @@ impl Router {
         // bounded (S-1, V210-93): the process leaves then, and its memory with it.
         let stopped = if matches!(cause, DetachCause::DaemonStopping) {
             stop_actor(&a.handle, a.ended.clone(), self.inner.defaults.patience).await
+        } else if matches!(cause, DetachCause::Panicked(_)) {
+            // The borrowed command loop has stopped. Enqueuing Shutdown here would wait for a
+            // command it can no longer service; its existing cleanup owner is already running.
+            let mut ended = a.ended.clone();
+            let _ = ended.wait_for(|ended| *ended).await;
+            true
         } else {
             stop_actor_fully(&a.handle, a.ended.clone()).await;
             true
@@ -3837,6 +3872,21 @@ impl Router {
             }
         }
         drop(a);
+        // This observer owns no profile resources. Releasing host handles first cannot make a
+        // still-live Store/Snapshot/secret worker look physically closed.
+        let physical = if stopped {
+            physical_end.closed().await
+        } else {
+            Err("actual node work did not finish before daemon shutdown".to_owned())
+        };
+        if let Err(why) = physical {
+            let refusal = Refusal::Failed {
+                node: node.clone(),
+                why: format!("node teardown is incomplete: {why}"),
+            };
+            let _ = done.send(Some(Err(refusal.clone())));
+            return Err(refusal);
+        }
         self.inner
             .metrics
             .nodes_attached

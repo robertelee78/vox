@@ -17,6 +17,29 @@ const MIB: usize = 1024 * 1024;
 // cannot consume the terminal DONE credit. Duplicate ACKs are charged too, not free input.
 const ACK_RESERVE: usize = 128;
 
+/// **For proofs only.** While this marker exists, the first private key-package requested by a
+/// non-recipient is deliberately served once, then the marker is renamed with `.engaged`
+/// appended.  This makes a real peer hostile at the wire boundary so another shipped daemon can
+/// prove it refuses the unexpected ciphertext before persistence.  It is absent from installable
+/// builds (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_SERVE_PRIVATE_BODY_ENV: &str = "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE";
+
+fn test_private_body_marker() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    #[cfg(feature = "test-knobs")]
+    {
+        let trigger = std::path::PathBuf::from(std::env::var(TEST_SERVE_PRIVATE_BODY_ENV).ok()?);
+        if !trigger.is_file() {
+            return None;
+        }
+        let mut engaged = trigger.as_os_str().to_os_string();
+        engaged.push(".engaged");
+        Some((trigger, engaged.into()))
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    None
+}
+
 enum Sent {
     Yes,
     Full,
@@ -27,6 +50,7 @@ struct EntryResult {
     status: Status,
     hash: Option<Digest32>,
     offset: u64,
+    role_complete: bool,
 }
 
 #[allow(clippy::too_many_arguments)] // One bound stream and its node-owned scalar hint sink.
@@ -39,6 +63,7 @@ pub(super) async fn answer(
     inbox: &super::HintInbox,
     inbox_generation: u64,
     inventory_added: &mut bool,
+    served_object: &mut bool,
 ) -> Result<Status> {
     let receipt_source;
     let source = if preamble.purpose == Purpose::Control
@@ -64,7 +89,7 @@ pub(super) async fn answer(
         // Inventory is symmetric: the requester sends its one HAVE before receiving ours.
         // Its exact encoded bytes share this request's wire credit, and the decoded Vec stays
         // inside the charged input frame until all bounded insertion slices have completed.
-        let incoming = match io.read(credit.remaining_wire()).await? {
+        let incoming = match io.read_required(credit.remaining_wire()).await? {
             Read::Frame(frame) => frame,
             Read::Busy => return Err(Error::Unreachable("inventory reader busy")),
             Read::End => return Err(Error::MalformedBundle("inventory closed before HAVE")),
@@ -73,9 +98,10 @@ pub(super) async fn answer(
         let Frame::Have(hints) = incoming.frame()? else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
         };
+        let work_job = incoming.job();
         for slice in hints.chunks(64) {
             let offered = source
-                .offer_inventory(io.job(), inbox, inbox_generation, preamble.room, slice)
+                .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
                 .await?;
             *inventory_added |= offered.added != 0;
             if offered.full {
@@ -88,7 +114,7 @@ pub(super) async fn answer(
     let (status, continuation) = if credit.remaining_wire() < super::DONE_RESERVE {
         (Status::Busy, None)
     } else {
-        respond(source, io, preamble, &query, &mut credit).await?
+        respond(source, io, preamble, &query, &mut credit, served_object).await?
     };
     // Source objects and their envelopes have been dropped before the terminal allocation.
     let done = Frame::Done {
@@ -127,12 +153,28 @@ async fn send(
     Ok(Sent::Yes)
 }
 
+async fn send_object(
+    source: &Source,
+    io: &mut Transport,
+    credit: &mut Response,
+    frame: Frame<'_>,
+    credit_reply_reserve: usize,
+    served_object: &mut bool,
+) -> Result<Sent> {
+    let sent = send(source, io, credit, frame, credit_reply_reserve).await?;
+    if matches!(sent, Sent::Yes) {
+        *served_object = true;
+    }
+    Ok(sent)
+}
+
 async fn respond(
     source: &Source,
     io: &mut Transport,
     preamble: Preamble,
     query: &Query,
     credit: &mut Response,
+    served_object: &mut bool,
 ) -> Result<(Status, Option<Continuation>)> {
     let job = io.job().clone();
     let request = preamble.request;
@@ -155,17 +197,14 @@ async fn respond(
                         return Ok(None);
                     };
                     if receipt {
-                        // Delivery acknowledgement cannot precede the required body/effect.
-                        // Merely verifying a signed nonempty head or inclusion never proves
-                        // receipt. A canonical empty head has no terminal entry: holding that
-                        // exact committed head is the complete acknowledgement of an empty feed.
+                        // A receipt names the last authenticated feed position whose source and
+                        // semantic effect are complete for this node's role. The durable restart
+                        // prefix cannot jump across an entry this role still owes. In particular,
+                        // another member's key-package is complete here after its authenticated
+                        // header is dispatched; its private body is never requested or claimed.
                         let read = room.history_read(store)?;
-                        if head.root.leaves == 0 {
-                            if read.history_settled_tip(&author)?.is_some() {
-                                return Ok(None);
-                            }
-                        } else {
-                            let Some(tip) = read.history_settled_tip(&author)? else {
+                        if head.root.leaves != 0 {
+                            let Some((through, hash)) = read.history_held_through(&author) else {
                                 return Ok(None);
                             };
                             let Some(included) = read.history_inclusion_receipt(
@@ -176,8 +215,8 @@ async fn respond(
                             else {
                                 return Ok(None);
                             };
-                            if tip.skeleton.seq != head.root.leaves
-                                || tip.entry_hash() != included.header().entry().entry_hash()
+                            if through != head.root.leaves
+                                || hash != included.header().entry().entry_hash()
                             {
                                 return Ok(None);
                             }
@@ -192,7 +231,7 @@ async fn respond(
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
             let wire = held.value.to_wire();
-            let status = match send(
+            let status = match send_object(
                 source,
                 io,
                 credit,
@@ -201,6 +240,7 @@ async fn respond(
                     object: Object::Head(&wire),
                 },
                 0,
+                served_object,
             )
             .await?
             {
@@ -221,7 +261,7 @@ async fn respond(
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
             let wire = held.value.to_wire()?;
-            let status = match send(
+            let status = match send_object(
                 source,
                 io,
                 credit,
@@ -230,6 +270,7 @@ async fn respond(
                     object: Object::Context(&wire),
                 },
                 0,
+                served_object,
             )
             .await?
             {
@@ -255,7 +296,7 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let status = match send(
+            let status = match send_object(
                 source,
                 io,
                 credit,
@@ -264,6 +305,7 @@ async fn respond(
                     object: Object::Header(&held.value.wire),
                 },
                 0,
+                served_object,
             )
             .await?
             {
@@ -288,7 +330,11 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let held_proof = match source.proof(&job, &held_head.value, kind, from, to).await? {
+            let work_job = held_head.job();
+            let held_proof = match source
+                .proof(&work_job, &held_head.value, kind, from, to)
+                .await?
+            {
                 Lookup::Found(held) => held,
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
@@ -310,14 +356,24 @@ async fn respond(
                 request,
                 object: Object::Proof(held_proof.value),
             };
-            match send(source, io, credit, frame, 0).await? {
+            match send_object(source, io, credit, frame, 0, served_object).await? {
                 Sent::Yes if continuation.is_some() => Ok((Status::More, continuation)),
                 Sent::Yes => Ok((Status::Complete, None)),
                 Sent::Busy | Sent::Full => Ok((Status::Busy, None)),
             }
         }
         Query::Entry { head, seq, offset } => {
-            let result = entry(source, io, preamble, credit, head, seq, offset).await?;
+            let result = entry(
+                source,
+                io,
+                preamble,
+                credit,
+                head,
+                seq,
+                offset,
+                served_object,
+            )
+            .await?;
             let cursor = (result.status != Status::Complete
                 && (result.hash.is_some() || result.offset == 0))
                 .then_some(Continuation {
@@ -339,7 +395,8 @@ async fn respond(
             // reader's next ask cut short left rendered rows below unrendered ones; nothing
             // refilled the hole, and the ask below the bottom row found nothing to fetch.
             for seq in (lo..=hi).rev() {
-                let result = entry(source, io, preamble, credit, head, seq, 0).await?;
+                let result =
+                    entry(source, io, preamble, credit, head, seq, 0, served_object).await?;
                 if result.status != Status::Complete {
                     return Ok((
                         result.status,
@@ -351,6 +408,26 @@ async fn respond(
                             next_seq: seq,
                             entry: result.hash,
                             offset: result.offset,
+                            entries_remaining: credit.headers_left(),
+                        }),
+                    ));
+                }
+                if result.role_complete {
+                    // The receiver still has to prove inclusion and commit this authenticated
+                    // header's role-specific effect. Keep the durable continuation on this
+                    // exact position: only the receiver's semantic-effect transaction may move
+                    // it below the header while decrementing the demand. A cancellation between
+                    // this response and that transaction therefore retries rather than skips it.
+                    return Ok((
+                        Status::More,
+                        Some(Continuation {
+                            query_kind: 4,
+                            head,
+                            lo,
+                            hi,
+                            next_seq: seq,
+                            entry: None,
+                            offset: 0,
                             entries_remaining: credit.headers_left(),
                         }),
                     ));
@@ -367,6 +444,7 @@ async fn respond(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn entry(
     source: &Source,
     io: &mut Transport,
@@ -375,6 +453,7 @@ async fn entry(
     head: Digest32,
     seq: u64,
     offset: u64,
+    served_object: &mut bool,
 ) -> Result<EntryResult> {
     let job = io.job().clone();
     let request = preamble.request;
@@ -383,6 +462,7 @@ async fn entry(
         status: Status::EvidenceUnavailable,
         hash: None,
         offset,
+        role_complete: false,
     };
     let head = match source
         .read(&job, 128 * 1024, move |room, store| {
@@ -397,6 +477,9 @@ async fn entry(
         }
         Lookup::Missing => return Ok(result),
     };
+    // Every dependent header/body read overlaps this held head. Keep its actual worker rather
+    // than asking the original Control job to acquire another foreground permit.
+    let job = head.job();
     if seq == 0 || seq > head.value.root.leaves {
         return Err(Error::MalformedBundle("requested entry exceeds head"));
     }
@@ -475,36 +558,60 @@ async fn entry(
     } else {
         None
     };
+    // Membership grants the public authenticated header, not another member's private key.
+    // Decide this from the verified signed header before even opening the retained body. Page
+    // and Entry share this path, so an archive request cannot override recipient privacy.
+    let private_for_another = parsed.skeleton.v2.as_ref().is_some_and(|v2| {
+        v2.kind == crate::log::history::SignedEntryKind::KeyPackage
+            && v2.recipient != Some(source.peer)
+    });
+    let mut hostile_private_body = private_for_another.then(test_private_body_marker).flatten();
+    let withhold_private_body = private_for_another && hostile_private_body.is_none();
     // Five worst-case record/sealing copies plus fixed work space, scaled to the signed length.
     // A small control uses the small pool; a large record must have the foreground/archive job.
     let envelope = 5 * (length as usize + MAX_HEADER_BYTES + 9) + 4 * MIB;
-    let Some(record_job) = job.record_job(envelope) else {
-        result.status = Status::Busy;
-        return Ok(result);
-    };
-    let payload = match source
-        .read_body(
-            &record_job,
-            envelope,
-            length as usize + MAX_HEADER_BYTES + 9,
-            move |room, store| Ok(Some(room.history_payload(store, &hash)?)),
-        )
-        .await?
-    {
-        Lookup::Found(held) => held,
-        Lookup::Busy => {
+    let record_job = if withhold_private_body {
+        None
+    } else {
+        let Some(record_job) = job.record_job(envelope).await else {
             result.status = Status::Busy;
             return Ok(result);
-        }
-        Lookup::Missing => return Ok(result),
+        };
+        Some(record_job)
     };
-    let bytes = match &payload.value {
-        HistoryPayload::Held { payload_len, bytes } if *payload_len == length => Some(bytes),
-        HistoryPayload::BodyNotHeld { payload_len } if *payload_len == length => None,
-        HistoryPayload::Missing => return Ok(result),
+    let payload = if withhold_private_body {
+        None
+    } else {
+        let Some(record_job) = record_job.as_ref() else {
+            return Err(Error::Profile("history body reservation disappeared"));
+        };
+        Some(
+            match source
+                .read_body(
+                    record_job,
+                    envelope,
+                    length as usize + MAX_HEADER_BYTES + 9,
+                    move |room, store| Ok(Some(room.history_payload(store, &hash)?)),
+                )
+                .await?
+            {
+                Lookup::Found(held) => held,
+                Lookup::Busy => {
+                    result.status = Status::Busy;
+                    return Ok(result);
+                }
+                Lookup::Missing => return Ok(result),
+            },
+        )
+    };
+    let bytes = match payload.as_ref().map(|payload| &payload.value) {
+        None => None,
+        Some(HistoryPayload::Held { payload_len, bytes }) if *payload_len == length => Some(bytes),
+        Some(HistoryPayload::BodyNotHeld { payload_len }) if *payload_len == length => None,
+        Some(HistoryPayload::Missing) => return Ok(result),
         _ => return Err(Error::MalformedAtRest("history body/header length differs")),
     };
-    match send(
+    match send_object(
         source,
         io,
         credit,
@@ -513,6 +620,7 @@ async fn entry(
             object: Object::Header(&header.value.wire),
         },
         0,
+        served_object,
     )
     .await?
     {
@@ -531,6 +639,16 @@ async fn entry(
         }
     }
     result.hash = Some(hash);
+    if withhold_private_body {
+        // This peer's role is fully satisfied by the authenticated header.  Complete the entry
+        // instead of advertising a missing body, so Page can continue past it without a retry.
+        result.status = Status::Complete;
+        result.role_complete = true;
+        if let Some(bound) = live {
+            job.finish_live(bound);
+        }
+        return Ok(result);
+    }
     credit.expect_body(hash, length, offset)?;
     let Some(bytes) = bytes else {
         result.status = if length == 0 {
@@ -558,7 +676,7 @@ async fn entry(
         if let Some(bound) = live {
             job.live_sent(bound, result.offset, result.offset + take as u64)?;
         }
-        match send(
+        match send_object(
             source,
             io,
             credit,
@@ -569,10 +687,22 @@ async fn entry(
                 bytes: &bytes[start..start + take],
             },
             ACK_RESERVE,
+            served_object,
         )
         .await?
         {
-            Sent::Yes => {}
+            Sent::Yes => {
+                if let Some((trigger, engaged)) = hostile_private_body.take() {
+                    // The apparatus records the exact authenticated entry whose chunk crossed the
+                    // sender boundary. The receiver's independent durable marker must match it.
+                    std::fs::write(&trigger, hash).map_err(|_| {
+                        Error::Profile("test hostile-body marker could not record the entry")
+                    })?;
+                    std::fs::rename(trigger, engaged).map_err(|_| {
+                        Error::Profile("test hostile-body marker could not record engagement")
+                    })?;
+                }
+            }
             Sent::Full => {
                 result.status = Status::More;
                 return Ok(result);

@@ -13,6 +13,10 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Exact history allocation pressure; retained work waits for its existing byte pool.
+    #[error("history demand buffer budget is busy")]
+    HistoryCapacity(Box<crate::node::history_budget::BytePressure>),
+
     /// Canonical-CBOR encode/decode failure (includes canonicality violations).
     #[error("cbor: {0}")]
     Cbor(#[from] CborError),

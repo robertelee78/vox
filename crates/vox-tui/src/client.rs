@@ -1512,7 +1512,11 @@ pub async fn node_list(args: &NodeArgs) -> Result<(), AppError> {
     }
     for name in names {
         let info = running.iter().find(|n| n.name == name);
-        let state = info.and_then(|i| i.status).map_or("…", |s| s.as_str());
+        let state = info.map_or("…", |info| match info.state {
+            NodeState::Attaching => "Attaching",
+            NodeState::Detaching => "Detaching",
+            _ => info.status.map_or("…", |status| status.as_str()),
+        });
         let fp = info
             .and_then(|i| i.fingerprint)
             .map(|f| vox_core::node::link::b32_encode(&f))

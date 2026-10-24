@@ -95,8 +95,14 @@ impl ChannelState {
     }
 
     /// Current governance revision, requiring authority to be ready at the room's latest time.
-    pub fn governance_revision(&self, store: &Store) -> Result<u64> {
-        Ok(self.checked_governance(store, self.now_hint)?.revision())
+    pub fn governance_revision(&self, now: crate::time::Ms) -> Result<u64> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if !self.governance_display_current(now.get()) {
+            return Err(crate::error::Error::Profile(super::view::REFRESHING));
+        }
+        Ok(self.governance_display.revision)
     }
 
     /// Resolve an exact service name or base32 service fingerprint from current source facts.
@@ -130,7 +136,9 @@ impl ChannelState {
             Query::Service { .. } => (None, false),
             Query::Admin { .. } => (None, true),
         };
-        let revision = if authority {
+        let revision = if matches!(&query, Query::Consent { .. }) {
+            self.current_governance(store)?.revision()
+        } else if authority {
             self.checked_governance(store, self.now_hint)?.revision()
         } else {
             self.current_governance(store)?.revision()
@@ -286,18 +294,22 @@ impl ChannelState {
                 &self.me(),
                 now.get(),
             )?;
-            self.governance_ready = state.ready;
             let mut changed = false;
+            let mut consent_ready = false;
             if state.ready {
-                let display = self
-                    .checked_governance(store, now.get())?
-                    .display(&self.genesis)?;
-                changed = !was_ready || self.governance_display.revision != display.revision;
+                let view = self.checked_governance(store, now.get())?;
+                let display = view.display(&self.genesis)?;
+                consent_ready = self.advance_consent_facts(&view)?;
+                changed = self.governance_display.revision != display.revision
+                    || (!was_ready && consent_ready);
                 self.governance_display = display;
+                self.governance_ready = consent_ready;
             }
             Ok(GovernanceProgress {
-                ready: state.ready,
-                pending: state.pending,
+                // Irreversible work needs the current checked disk fold, not merely the retained
+                // last-good display that ordinary reads continue to show during a no-op replay.
+                ready: state.ready && consent_ready,
+                pending: state.pending || (state.ready && !consent_ready),
                 changed,
             })
         })();
@@ -331,9 +343,11 @@ impl ChannelState {
         if self.legacy_cache_only(store)? {
             return Ok(false);
         }
-        match self.current_governance(store) {
-            Ok(view) => drop(view),
-            Err(error) if super::refreshing(&error) => return Ok(false),
+        match self.consent_facts() {
+            Ok(facts) => drop(facts),
+            // A backfill drained into a refreshing view is still pending work: the turn after
+            // the refresh renders it (ADR-038 FX-22, #1007).
+            Err(error) if super::refreshing(&error) => return Ok(self.backfill_awaits_refresh()),
             Err(error) => return Err(error),
         }
         Ok(self
@@ -358,13 +372,13 @@ impl ChannelState {
     /// the bounded in-memory display. A ready disk fold alone is not publication.
     pub(crate) fn require_governance_display(
         &self,
-        store: &Store,
+        _store: &Store,
         now: crate::time::Ms,
     ) -> Result<()> {
-        let view = self.checked_governance(store, now.get())?;
-        if !self.governance_display_current(now.get())
-            || self.governance_display.revision != view.revision()
-        {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if !self.governance_display_current(now.get()) {
             return Err(crate::error::Error::Profile(super::view::REFRESHING));
         }
         Ok(())
@@ -374,6 +388,12 @@ impl ChannelState {
         self.governance_ready
             && (self.governance_display.valid_until == 0
                 || now < self.governance_display.valid_until)
+    }
+
+    /// The exact wall-clock boundary at which current authority must be re-evaluated. The actor
+    /// arms this deadline directly; periodic traffic is not a correctness wake.
+    pub(crate) fn governance_deadline(&self) -> Option<u64> {
+        (self.governance_display.valid_until != 0).then_some(self.governance_display.valid_until)
     }
 
     pub(in crate::node::channel) fn grants_policy(
@@ -485,7 +505,7 @@ impl ChannelState {
         batch: &mut crate::node::store::Batch<'_>,
         entry: &crate::log::entry::Entry,
         log: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // A read transaction sees the roots before this caller's publication Batch.
         // Descendants accepted in this same signed batch are ordinary forward progress;
         // only a previously published child makes this a late-parent/body repair.
@@ -494,7 +514,7 @@ impl ChannelState {
             .read(store, &self.sek, &self.channel_id)?
             .child_after(&entry.entry_hash(), None)?
             .is_some();
-        super::accepted_into(
+        let accepted = super::accepted_into(
             batch,
             &self.entries,
             &self.sek,
@@ -506,37 +526,42 @@ impl ChannelState {
             entry,
             late,
         )?;
-        if late {
-            self.governance_ready = false;
+        // The Batch failure path poisons this ChannelState, so it is safe to advance the
+        // in-memory mirror here with the same accepted input: no usable state can outlive a
+        // failed commit. This covers every publication path without polling a sealed header.
+        if accepted.current_advanced {
+            self.note_committed_consent(entry)?;
         }
-        if let Ok(body) = GovEntry::body_bound_to(entry) {
-            if let Some(key) = self.authors.get(&entry.skeleton.author_id) {
-                if body.verify(key).is_ok() {
-                    self.governance_ready = false;
-                    if let GovBody::Presence(presence) = &body {
-                        let held =
-                            self.presence
-                                .entry(entry.skeleton.author_id)
-                                .or_insert(Presence {
-                                    last: (entry.skeleton.seq, presence.body.here),
-                                    back: None,
-                                });
-                        if entry.skeleton.seq >= held.last.0 {
-                            held.last = (entry.skeleton.seq, presence.body.here);
+        if accepted.work_changed {
+            if let Ok(body) = GovEntry::body_bound_to(entry) {
+                if let Some(key) = self.authors.get(&entry.skeleton.author_id) {
+                    if body.verify(key).is_ok() {
+                        if let GovBody::Presence(presence) = &body {
+                            let held =
+                                self.presence
+                                    .entry(entry.skeleton.author_id)
+                                    .or_insert(Presence {
+                                        last: (entry.skeleton.seq, presence.body.here),
+                                        back: None,
+                                    });
+                            if entry.skeleton.seq >= held.last.0 {
+                                held.last = (entry.skeleton.seq, presence.body.here);
+                            }
+                            if presence.body.here
+                                && held.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
+                            {
+                                held.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
+                            }
+                            let state = *held;
+                            let mut index =
+                                self.entries.write(batch, &self.sek, &self.channel_id)?;
+                            index.note_presence(entry.skeleton.author_id, state)?;
+                            index.seal()?;
                         }
-                        if presence.body.here
-                            && held.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
-                        {
-                            held.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
-                        }
-                        let state = *held;
-                        let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
-                        index.note_presence(entry.skeleton.author_id, state)?;
-                        index.seal()?;
                     }
                 }
             }
         }
-        Ok(())
+        Ok(accepted.work_changed)
     }
 }
