@@ -447,6 +447,42 @@ impl AdmissionCharge {
     }
 }
 
+/// Complete memory admission for one local Status or Cancel. The actor obtains this before it
+/// accepts the action; the worker then consumes these exact credits without another reservation.
+pub(crate) struct LocalAdmission {
+    inspect: AdmissionCharge,
+    mutation: Option<AdmissionCharge>,
+}
+
+impl LocalAdmission {
+    pub(crate) fn status(job: &Job) -> Result<Self> {
+        Ok(Self {
+            inspect: AdmissionCharge::reserve(job)?,
+            mutation: None,
+        })
+    }
+
+    pub(crate) fn cancel(job: &Job) -> Result<Self> {
+        let peak = STATE_WORK
+            .checked_mul(2)
+            .ok_or(Error::SizeLimitExceeded("local history operation envelope"))?;
+        let mut combined = charge(job, peak)?;
+        let inspect = AdmissionCharge::split_from(&mut combined)?;
+        Ok(Self {
+            inspect,
+            mutation: Some(AdmissionCharge { _charge: combined }),
+        })
+    }
+
+    pub(crate) fn inspect(
+        self,
+        context: &Context,
+    ) -> Result<(Option<Snapshot>, Option<AdmissionCharge>)> {
+        let snapshot = inspect_precharged(context, self.inspect)?;
+        Ok((snapshot, self.mutation))
+    }
+}
+
 fn key(context: &Context) -> Result<&Sek> {
     context.check()?;
     Ok(&context.key)
@@ -1263,7 +1299,16 @@ pub(crate) fn pause_precharged(
 
 /// First fence demand atomically; bounded reclamation is separate and never starts peer traffic.
 pub fn cancel(context: &Context, request: RequestId, job: &Job) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    cancel_precharged(context, request, &charge)
+}
+
+/// Cancel using an already-accounted state workspace; no allocation admission occurs here.
+pub(crate) fn cancel_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<()> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
@@ -1284,7 +1329,16 @@ pub fn cancel(context: &Context, request: RequestId, job: &Job) -> Result<()> {
 /// At most 14 page deletes plus one header write (also <=1 MiB). New start waits for true.
 /// Safe after restart for cancelled/completed staging: reclamation does not authorize any sync.
 pub fn reclaim(context: &Context, request: RequestId, job: &Job) -> Result<bool> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    reclaim_precharged(context, request, &charge)
+}
+
+/// Reclaim one bounded slice using an already-accounted state workspace.
+pub(crate) fn reclaim_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<bool> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;

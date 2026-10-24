@@ -412,9 +412,10 @@ impl Node {
                 )
             }));
         }
-        if !matches!(&action, Action::Status) {
+        if !matches!(&action, Action::Status | Action::Cancel { .. }) {
             // A person's newer explicit action owns its own result. It cancels an internal
             // re-arm of the older stale generation rather than leaving two Resume owners.
+            // Cancel defers this destructive step until its complete local admission succeeds.
             self.history_demand.clear_resume_owed();
         }
         self.begin_history_demand_with_job(room, instance, action, None)
@@ -450,20 +451,31 @@ impl Node {
                 "A local history request is being prepared.",
             ));
         }
-        if let Action::Cancel { request } = action {
-            if self.history_demand.running.is_some()
+        let cancel_request = if let Action::Cancel { request } = action {
+            if (self.history_demand.running.is_some() || self.history_demand.private_work.is_some())
                 && !self.history_demand.status.as_ref().is_some_and(|s| {
                     s.room == room && s.instance == instance && s.request == Some(request)
                 })
             {
                 return Err(
-                    "The running history request belongs to a different room, instance or request."
+                    "The active history request belongs to a different room, instance or request."
                         .into(),
                 );
             }
-            if self.history_demand.stop_request(room, instance, request) {
-                self.bounded_sync.cancel_archive(room, instance, request);
+            if self
+                .history_demand
+                .resume_owed
+                .as_ref()
+                .is_some_and(|owed| {
+                    owed.room != room || owed.instance != instance || owed.request != request
+                })
+            {
+                return Err(
+                    "The retained history request belongs to a different room, instance or request."
+                        .into(),
+                );
             }
+            Some(request)
         } else if self.history_demand.running.is_some() {
             // An explicit new page ask is the person's newer intent: it ends the quantum still
             // running for an earlier ask (what it published stays) and takes its place. Status
@@ -511,22 +523,20 @@ impl Node {
                         )
                     }));
             }
-        }
-        let prior_private = if matches!(action, Action::Cancel { .. }) {
-            self.history_demand.private_work.take()
+            None
         } else {
-            if self.history_demand.private_work.is_some() {
-                return Ok(self.history_demand.status.clone().unwrap_or_else(|| {
-                    status(
-                        room,
-                        instance,
-                        Phase::Busy,
-                        "Private history work is settling.",
-                    )
-                }));
-            }
             None
         };
+        if cancel_request.is_none() && self.history_demand.private_work.is_some() {
+            return Ok(self.history_demand.status.clone().unwrap_or_else(|| {
+                status(
+                    room,
+                    instance,
+                    Phase::Busy,
+                    "Private history work is settling.",
+                )
+            }));
+        }
         let profile = self.profile.as_ref().ok_or("node is locked")?;
         let node = profile.fingerprint();
         let local_only = matches!(action, Action::Status | Action::Cancel { .. });
@@ -561,6 +571,32 @@ impl Node {
                 job
             }
         };
+        let local_admission = match action {
+            Action::Status => demand::LocalAdmission::status(&job).map(Some),
+            Action::Cancel { .. } => demand::LocalAdmission::cancel(&job).map(Some),
+            _ => Ok(None),
+        };
+        let local_admission = match local_admission {
+            Ok(admission) => admission,
+            Err(crate::error::Error::HistoryCapacity(_)) => {
+                return Ok(status(
+                    room,
+                    instance,
+                    Phase::Busy,
+                    "History preparation buffers are busy; cached messages remain available.",
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let prior_private = if let Some(request) = cancel_request {
+            self.history_demand.clear_resume_owed();
+            if self.history_demand.stop_request(room, instance, request) {
+                self.bounded_sync.cancel_archive(room, instance, request);
+            }
+            self.history_demand.private_work.take()
+        } else {
+            None
+        };
         let peers: Vec<_> = self
             .ports
             .keys()
@@ -584,7 +620,12 @@ impl Node {
         let task = tokio::spawn(async move {
             let work = async {
                 if let Some(prior) = prior_private { let _ = prior.task.await; }
-                let Some(charge) = job.reserve(5 * 1024 * 1024) else { return Err("history preparation buffers are busy".into()); };
+                let charge = if local_admission.is_some() {
+                    None
+                } else {
+                    let Some(charge) = job.reserve(5 * 1024 * 1024) else { return Err("history preparation buffers are busy".into()); };
+                    Some(charge)
+                };
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 let room_guard = if local_only { None } else {
                     let shared = shared.ok_or("room is not open")?;
@@ -601,7 +642,16 @@ impl Node {
                     if read_fence.is_retired() || tokio::time::Instant::now() >= deadline { return Err("history preparation cancelled or expired".into()); }
                     let answer = match room_guard {
                         Some(guard) => prepare(&guard, &store, node, instance, action, context, &job, peers, weak, read_fence.clone(), now, deadline, selection_after),
-                        None => prepare_local(node, room, instance, action, context, &job, &read_fence, deadline),
+                        None => prepare_local(
+                            node,
+                            room,
+                            instance,
+                            action,
+                            context,
+                            local_admission.ok_or("local history admission is missing")?,
+                            &read_fence,
+                            deadline,
+                        ),
                     };
                     if read_fence.is_retired() || tokio::time::Instant::now() >= deadline { return Err("history preparation cancelled or expired".into()); }
                     answer
@@ -1133,6 +1183,28 @@ fn cancel_exact(
     Ok(())
 }
 
+fn cancel_exact_precharged(
+    context: &Context,
+    request: RequestId,
+    charge: &demand::AdmissionCharge,
+    fence: &Fence,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    if fence.is_retired() || tokio::time::Instant::now() >= deadline {
+        return Err("History cleanup cancelled or expired.".into());
+    }
+    demand::cancel_precharged(context, request, charge).map_err(|e| e.to_string())?;
+    while !demand::reclaim_precharged(context, request, charge).map_err(|e| e.to_string())? {
+        if fence.is_retired() || tokio::time::Instant::now() >= deadline {
+            return Err(
+                "History cleanup cancelled or expired; retry cancel to finish cleanup.".into(),
+            );
+        }
+        std::thread::yield_now();
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // One exact locally authorized cleanup/status operation.
 fn prepare_local(
     node: Digest32,
@@ -1140,7 +1212,7 @@ fn prepare_local(
     instance: [u8; 16],
     action: Action,
     context: Arc<Context>,
-    job: &Job,
+    admission: demand::LocalAdmission,
     fence: &Fence,
     deadline: tokio::time::Instant,
 ) -> Result<Prepared, String> {
@@ -1162,7 +1234,7 @@ fn prepare_local(
         local_only: true,
         selection_after: None,
     };
-    let saved = demand::inspect(&context, job).map_err(|e| e.to_string())?;
+    let (saved, mutation) = admission.inspect(&context).map_err(|e| e.to_string())?;
     let Some(saved) = saved else {
         return Ok(answer);
     };
@@ -1191,7 +1263,10 @@ fn prepare_local(
                     author: plan.author,
                 });
             }
-            cancel_exact(&context, request, job, fence, deadline)?;
+            let mutation = mutation
+                .as_ref()
+                .ok_or("local history cancellation admission is missing")?;
+            cancel_exact_precharged(&context, request, mutation, fence, deadline)?;
             answer.status.phase = Phase::Cancelled;
             answer.status.detail = "History request cancelled; provisional bytes reclaimed.".into();
         }
