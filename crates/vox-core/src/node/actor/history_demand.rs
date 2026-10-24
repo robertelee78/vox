@@ -90,6 +90,10 @@ pub(super) struct Controller {
     private_work: Option<PrivateWork>,
     cancelled_legacy: Option<(Digest32, LegacyProvisionalOwner)>,
     status: Option<Status>,
+    /// Status observes a person's last accepted explicit action; it does not turn a failed
+    /// action into a new storage refresh which can overwrite that result. A Status-originated
+    /// refresh remains refreshable when it could not read durable state.
+    status_owned_by_explicit_action: bool,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
 }
 impl Controller {
@@ -233,6 +237,7 @@ impl Controller {
             let _ = work.task.await;
         }
         self.status = None;
+        self.status_owned_by_explicit_action = false;
     }
 }
 fn status(room: Digest32, instance: [u8; 16], phase: Phase, detail: &str) -> Status {
@@ -348,6 +353,7 @@ impl Node {
                 && (completed
                     || self.history_demand.preparing.is_some()
                     || self.history_demand.running.is_some()
+                    || self.history_demand.status_owned_by_explicit_action
                     || current.request.is_some()
                     || !matches!(current.phase, Phase::Unavailable | Phase::Paused))
             {
@@ -519,12 +525,20 @@ impl Node {
             // A full inbox does not strand the result: schedule() and status also check this slot.
             let _ = tx.try_send(NetEvent::HistoryDemandPrepared { token });
         });
-        let pending = status(
+        let mut pending = status(
             room,
             instance,
             Phase::Preparing,
             "Checking cached history and preparing one bounded request.",
         );
+        pending.request = match action {
+            Action::Cancel { request } | Action::Resume { request } => Some(request),
+            _ => None,
+        };
+        // Only an operation which reached accepted preparation owns public status. Direct
+        // Busy/refusal paths above leave the previous operation's status and ownership intact,
+        // so they cannot relabel an old result as the newer attempted action.
+        self.history_demand.status_owned_by_explicit_action = !matches!(action, Action::Status);
         self.history_demand.status = Some(pending.clone());
         self.history_demand.preparing = Some(Preparation {
             token,
@@ -1006,6 +1020,11 @@ fn prepare_local(
             answer.status.phase = Phase::Cancelled;
             answer.status.detail = "History request cancelled; provisional bytes reclaimed.".into();
         }
+        Action::Cancel { .. } => {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail =
+                "The requested cancellation does not match the saved history request.".into();
+        }
         _ => return Err("The saved history request changed.".into()),
     }
     Ok(answer)
@@ -1128,10 +1147,17 @@ fn prepare(
         );
     }
     let (bounds, author, query, active, remaining) = if let Action::Resume { request } = action {
-        let saved = saved.as_ref().ok_or("No history request is saved.")?;
+        let Some(saved) = saved.as_ref() else {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail = "No history request is saved to resume.".into();
+            return Ok(answer);
+        };
         let state = saved.state();
         if state.request != request {
-            return Err("The history request changed.".into());
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail =
+                "The requested resume does not match the saved history request.".into();
+            return Ok(answer);
         }
         if state.body.is_none()
             && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq < state.bounds.lo))
@@ -1279,9 +1305,17 @@ fn prepare_private(
     let peer = match action {
         Action::PrivateRecover { peer } => peer,
         Action::Resume { request } => {
-            let state = saved
-                .filter(|s| s.request == request)
-                .ok_or("The private history request changed.")?;
+            let Some(state) = saved else {
+                answer.status.phase = Phase::Unavailable;
+                answer.status.detail = "No private history request is saved to resume.".into();
+                return Ok(answer);
+            };
+            if state.request != request {
+                answer.status.phase = Phase::Unavailable;
+                answer.status.detail =
+                    "The requested resume does not match the saved private history request.".into();
+                return Ok(answer);
+            }
             state
                 .private
                 .as_ref()
