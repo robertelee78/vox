@@ -2638,7 +2638,7 @@ fn generation_accounting_keeps_actor_incarnations_exact(
             )) == Some(&1)
             && still["lanes"]["budget"]["flow_state"]["running"]
                 .as_array()
-                .is_some_and(|owners| owners.iter().any(|owner| *owner == held_owner)),
+                .is_some_and(|owners| owners.contains(&held_owner)),
         "APPARATUS: original real worker was not held through the blocked unlock: {still}"
     );
     let expected = format!("node {name}'s work is still stopping; try again once it has finished");
