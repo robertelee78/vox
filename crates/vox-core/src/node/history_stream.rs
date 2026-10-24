@@ -130,6 +130,7 @@ pub(crate) async fn serve(
     // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
     // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
     let mut served_object = false;
+    let mut local_inventory_busy = false;
     let result = serve_request(
         &source,
         &mut io,
@@ -138,12 +139,16 @@ pub(crate) async fn serve(
         generation,
         &mut inventory_added,
         &mut served_object,
+        &mut local_inventory_busy,
         &departure_receipt,
     )
     .await;
     if let Err(error) = &result {
         let code = match error {
             Error::HistoryCapacity(_) => crate::wire::WireError::SessionBusy,
+            Error::PeerRefused(crate::wire::WireError::SessionBusy) if local_inventory_busy => {
+                crate::wire::WireError::SessionBusy
+            }
             Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
                 crate::wire::WireError::ProtocolLimits
             }
@@ -151,6 +156,15 @@ pub(crate) async fn serve(
         };
         io.abort(code);
     }
+    // This origin flag is set only by the local HAVE filter when publication/read admission
+    // refuses it. A remote reset carrying the same wire code is not this local outcome. The requester received SessionBusy above; locally it is a partial
+    // serving round, not a failure blamed on that requester and never a completed exchange.
+    let result = match result {
+        Err(Error::PeerRefused(crate::wire::WireError::SessionBusy)) if local_inventory_busy => {
+            Ok(Status::Busy)
+        }
+        result => result,
+    };
     (result, inventory_added, inventory_added || served_object)
 }
 
@@ -163,6 +177,7 @@ async fn serve_request(
     inbox_generation: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,
+    local_inventory_busy: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
     let first = match io.read_hello().await? {
@@ -228,6 +243,7 @@ async fn serve_request(
         inbox_generation,
         inventory_added,
         served_object,
+        local_inventory_busy,
     )
     .await
 }

@@ -15,6 +15,12 @@ type RetirementKey = crate::node::history_budget::RetirementKey;
 type RetirementLedger = crate::node::history_budget::RetirementLedger;
 type RetirementEntry = crate::node::history_budget::RetirementEntry;
 
+fn retiring_flow(mut flow: Flow) -> Flow {
+    flow.stop_publication_wait();
+    flow.discard_received_inventory();
+    flow
+}
+
 fn retirement_key(flow: &Flow) -> RetirementKey {
     RetirementKey {
         actor: flow.actor_incarnation(),
@@ -224,6 +230,8 @@ fn adopt_retirement_cell(
 }
 
 fn spawn_owed_retirement(mut flow: Flow, ledger: Arc<RetirementLedger>, failed: bool) {
+    flow.stop_publication_wait();
+    flow.discard_received_inventory();
     flow.park();
     let key = retirement_key(&flow);
     adopt_retirement_cell(
@@ -278,7 +286,7 @@ pub(super) async fn erase_retired_node(ledger: &Arc<RetirementLedger>, node: Dig
             // Only dependency waiting can remain once we own the actual worker's cell.
             task.abort();
         }
-        if let Some(flow) = held.take() {
+        if let Some(mut flow) = held.take() {
             flow.cancel();
             flow.shared.lock().await.lock_now();
             // Locked-room reopen recovery owns any remaining durable staging cleanup. Drop
@@ -807,6 +815,42 @@ impl Controller {
             admission.task.abort();
         }
     }
+    fn publication_port_blocked(&self, room: Digest32, peer: Digest32) -> bool {
+        let retained = || self.ready.iter().flatten().chain(self.deferred.iter());
+        let waiting = retained()
+            .any(|flow| flow.room == room && flow.peer == peer && flow.publication_blocked());
+        waiting
+            && !retained().any(|producer| {
+                producer.room == room
+                    && producer.peer == peer
+                    && !producer.publication_blocked()
+                    && retained()
+                        .filter(|waiter| {
+                            waiter.room == room
+                                && waiter.peer == peer
+                                && waiter.publication_blocked()
+                        })
+                        .any(|waiter| {
+                            waiter
+                                .publication_owner_wait()
+                                .is_some_and(|owner| producer.has_publication_producer(owner))
+                        })
+            })
+    }
+
+    pub(super) fn release_publication_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    ) -> bool {
+        self.ready
+            .iter_mut()
+            .flatten()
+            .chain(self.deferred.iter_mut())
+            .any(|flow| flow.room == room && flow.peer == peer && flow.release_publication(token))
+    }
+
     pub(super) fn release_byte_admission(
         &mut self,
         token: u64,
@@ -860,6 +904,7 @@ impl Controller {
                 && !flow.archive
                 && flow.archive_request.is_none()
                 && flow.required_root.is_none()
+                && !flow.local_response_pending()
                 && flow.hint.is_some_and(|hint| {
                     inbox.newer_pending(room, flow.hint_peer, hint.author, hint.size)
                 })
@@ -1019,7 +1064,7 @@ impl Controller {
         // Exclusive ownership moves to the retirement queue. Its only permitted next work is
         // Flow::retire_slice's exact local cleanup; that slice cancels every capability before
         // returning. Controller::fence still cancels queued cleanup immediately on node lock.
-        self.retiring.push_back(flow);
+        self.retiring.push_back(retiring_flow(flow));
         self.poll_cleanup();
     }
     fn accept_retirement_slice(
@@ -1034,16 +1079,16 @@ impl Controller {
                 self.retirement_failed.remove(&key);
                 clear_retirement_error(&self.retirement_ledger, key);
             }
-            Ok(RetirementStep::Progress) => self.retiring.push_back(flow),
+            Ok(RetirementStep::Progress) => self.retiring.push_back(retiring_flow(flow)),
             Ok(RetirementStep::Wait(wait)) => {
                 self.wait_for_retirement(key, Box::pin(wait.released()), false);
-                self.retiring.push_back(flow);
+                self.retiring.push_back(retiring_flow(flow));
             }
             Err(error) => {
                 note_retirement_error(&self.retirement_ledger, key, &error.to_string());
                 self.retirement_failed.insert(key);
                 self.wait_for_retirement(key, flow.retirement_erasure(), true);
-                self.retiring.push_back(flow);
+                self.retiring.push_back(retiring_flow(flow));
                 return Err(error);
             }
         }
@@ -1305,13 +1350,13 @@ impl Controller {
         }
         for slot in &mut self.ready {
             if let Some(flow) = slot.take_if(|flow| flow.room == room) {
-                self.retiring.push_back(flow);
+                self.retiring.push_back(retiring_flow(flow));
             }
         }
         let mut keep = VecDeque::new();
         while let Some(flow) = self.deferred.pop_front() {
             if flow.room == room {
-                self.retiring.push_back(flow);
+                self.retiring.push_back(retiring_flow(flow));
             } else {
                 keep.push_back(flow);
             }
@@ -1322,7 +1367,7 @@ impl Controller {
                 work.fence.retire();
                 let _ = work.task.await;
                 if let Some(flow) = work.flow.lock().await.take() {
-                    self.retiring.push_back(flow);
+                    self.retiring.push_back(retiring_flow(flow));
                 }
             }
         }
@@ -1379,7 +1424,7 @@ impl Controller {
                 .is_some_and(|flow| flow.room == room && flow.peer == peer)
             {
                 if let Some(flow) = slot.take() {
-                    self.retiring.push_back(flow);
+                    self.retiring.push_back(retiring_flow(flow));
                 }
             }
         }
@@ -1394,7 +1439,7 @@ impl Controller {
         let mut keep = VecDeque::new();
         while let Some(flow) = self.deferred.pop_front() {
             if flow.room == room && flow.peer == peer {
-                self.retiring.push_back(flow);
+                self.retiring.push_back(retiring_flow(flow));
             } else {
                 keep.push_back(flow);
             }
@@ -1421,9 +1466,9 @@ impl Controller {
         self.pool_admission.clear();
         for flow in self
             .deferred
-            .iter()
-            .chain(self.ready.iter().flatten())
-            .chain(self.retiring.iter())
+            .iter_mut()
+            .chain(self.ready.iter_mut().flatten())
+            .chain(self.retiring.iter_mut())
         {
             flow.cancel();
         }
@@ -1455,10 +1500,11 @@ impl Controller {
         self.fence();
         for slot in &mut self.ready {
             if let Some(flow) = slot.take() {
-                self.retiring.push_back(flow);
+                self.retiring.push_back(retiring_flow(flow));
             }
         }
-        self.retiring.extend(self.deferred.drain(..));
+        self.retiring
+            .extend(self.deferred.drain(..).map(retiring_flow));
         self.required.clear();
         for slot in &mut self.running {
             if let Some(work) = slot.take() {
@@ -1467,7 +1513,7 @@ impl Controller {
                     eprintln!("vox: bounded history supervisor stopped during retirement");
                 }
                 if let Some(flow) = work.flow.lock().await.take() {
-                    self.retiring.push_back(flow);
+                    self.retiring.push_back(retiring_flow(flow));
                 }
             }
         }
@@ -1896,7 +1942,7 @@ impl Node {
             .ready
             .iter_mut()
             .flatten()
-            .find(|flow| flow.room == room && flow.owns_request(owner))
+            .find(|flow| flow.room == room && flow.has_publication_producer(owner))
         {
             flow.waiting = false;
             peer = Some(flow.peer);
@@ -1904,7 +1950,7 @@ impl Node {
             .bounded_sync
             .deferred
             .iter()
-            .position(|flow| flow.room == room && flow.owns_request(owner))
+            .position(|flow| flow.room == room && flow.has_publication_producer(owner))
         {
             if let Some(mut flow) = self.bounded_sync.deferred.remove(at) {
                 flow.waiting = false;
@@ -2388,7 +2434,29 @@ impl Node {
                 }
                 continue;
             }
-            if flow.route_complete {
+            if let Some(wait) = flow.publication_dependency.take() {
+                if let Some(owner) = wait.owner {
+                    self.wake_publication_owner(work.room, owner);
+                }
+                let token = self.next_token;
+                self.next_token += 1;
+                let tx = self.net_tx.clone();
+                flow.wait_for_publication(token, move |token, room, peer| {
+                    tokio::spawn(async move {
+                        wait.wake.await;
+                        let _ = tx
+                            .send(NetEvent::BoundedPublicationReady { token, room, peer })
+                            .await;
+                    })
+                });
+                if index == 0 {
+                    self.bounded_sync.deferred.push_back(flow);
+                } else {
+                    self.bounded_sync.ready[index] = Some(flow);
+                }
+                continue;
+            }
+            if flow.route_complete && !flow.local_response_pending() {
                 let Some(origin) = flow.route_origin.take() else {
                     self.dispose_rearming_hint(flow);
                     continue;
@@ -2736,7 +2804,8 @@ impl Node {
         }
         // Only the exact release handoff may make an impossible-path continuation runnable.
         // Generic actor traffic still evaluates queued ports, but cannot stand in for that edge.
-        if self.bounded_sync.pool_admission_blocked(room, peer)
+        if self.bounded_sync.publication_port_blocked(room, peer)
+            || self.bounded_sync.pool_admission_blocked(room, peer)
             || self.bounded_sync.record_bytes_blocked(room, peer)
         {
             return false;
@@ -2749,12 +2818,9 @@ impl Node {
         self.bounded_sync
             .prioritize_control_admission_owner(room, peer);
         if self.bounded_sync.ready[0].is_none() && self.bounded_sync.running[0].is_none() {
-            if let Some(at) = self
-                .bounded_sync
-                .deferred
-                .iter()
-                .position(|flow| flow.room == room && flow.peer == peer)
-            {
+            if let Some(at) = self.bounded_sync.deferred.iter().position(|flow| {
+                flow.room == room && flow.peer == peer && !flow.publication_blocked()
+            }) {
                 self.bounded_sync.ready[0] = self.bounded_sync.deferred.remove(at);
             }
         }
@@ -2796,6 +2862,7 @@ impl Node {
             flow.room == room
                 && flow.peer == peer
                 && !flow.inventory
+                && !flow.publication_blocked()
                 && flow.announcement_can_run()
                 && (flow.announcement_pending() || (announce_first && !flow.ordinary_turn_due()))
         });
@@ -2806,6 +2873,7 @@ impl Node {
                     .is_some_and(|flow| {
                         flow.room == room
                             && flow.peer == peer
+                            && !flow.publication_blocked()
                             && (!flow.waiting || announcement_preempts)
                     })
         });
@@ -2826,6 +2894,7 @@ impl Node {
                         && self.bounded_sync.ready[*i].as_ref().is_some_and(|flow| {
                             flow.room == room
                                 && flow.peer == peer
+                                && !flow.publication_blocked()
                                 && (!flow.archive || self.bounded_sync.required.is_empty())
                         })
                 })
@@ -3150,6 +3219,10 @@ impl Node {
             }
         };
         let index = usize::from(flow.archive);
+        if flow.publication_blocked() {
+            self.shelve_exact(flow, index);
+            return false;
+        }
         let announcement = flow.announcement_can_run()
             && (flow.announcement_pending()
                 || (announce_first && !flow.inventory && !flow.ordinary_turn_due()));
@@ -3569,7 +3642,7 @@ impl Controller {
         let flow = |f: &Flow| {
             let key = retirement_key(f);
             format!(
-                "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
+                "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{},\"publication_admission\":{},\"publication_owner\":{}}}",
                 key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
                 hex(&key.request),
                 hex(&key.instance),
@@ -3580,7 +3653,9 @@ impl Controller {
                 lane_name(f.lane()),
                 f.archive,
                 f.waiting,
-                f.inventory
+                f.inventory,
+                f.publication_token().map_or_else(|| "null".to_owned(), |token| token.to_string()),
+                f.publication_owner_wait().map_or_else(|| "null".to_owned(), |owner| format!("\"{}\"", hex(&owner)))
             )
         };
         let ready: Vec<String> = self
@@ -3726,6 +3801,27 @@ impl Controller {
                 None,
             )
         }));
+        admissions.extend(
+            self.ready
+                .iter()
+                .flatten()
+                .chain(self.deferred.iter())
+                .filter_map(|flow| {
+                    flow.publication_token().map(|token| {
+                        admission(
+                            "publication",
+                            token,
+                            flow.room,
+                            flow.peer,
+                            flow.root_name(),
+                            flow.lane(),
+                            Some(flow.retirement_request()),
+                            None,
+                            None,
+                        )
+                    })
+                }),
+        );
         admissions.extend(self.pool_admission.iter().map(|((room, peer), waiting)| {
             admission(
                 waiting.gate,

@@ -23,7 +23,20 @@ use crate::transport::stream_transport::Fence;
 
 use super::{Proof, ProofKind, RequestId};
 
+pub(super) enum InventoryOffer {
+    /// A serving read could not be admitted; no inventory filter callback ran.
+    Unavailable,
+    Offered(super::hints::Offer),
+    Publication(crate::node::channel::HistoryPublicationWait),
+}
+
+enum FilteredInventory {
+    Ready(Vec<super::HeadHint>, usize),
+    Publication(crate::node::channel::HistoryPublicationWait),
+}
+
 pub(super) enum DeclineResult {
+    Publication(crate::node::channel::HistoryPublicationWait),
     Stored {
         remembered: bool,
         captured: Digest32,
@@ -170,6 +183,9 @@ impl Source {
             .await?
         {
             Lookup::Found(saved) => match saved.value {
+                crate::node::channel::HistoryDeclineResult::Publication(wait) => {
+                    Ok(DeclineResult::Publication(wait))
+                }
                 crate::node::channel::HistoryDeclineResult::Stored {
                     remembered,
                     current,
@@ -666,19 +682,21 @@ impl Source {
         generation: u64,
         room_id: Digest32,
         hints: &[super::HeadHint],
-    ) -> Result<super::hints::Offer> {
+    ) -> Result<InventoryOffer> {
         if hints.len() > 64 {
             return Err(Error::SizeLimitExceeded("inventory filter slice"));
         }
         // Input copy and returned vector coexist inside this small prepaid envelope.
-        let Some(input_charge) = job.reserve(64 * std::mem::size_of::<super::HeadHint>()) else {
-            return Ok(super::hints::Offer {
-                added: 0,
-                rearmed: 0,
-                full: true,
-            });
-        };
+        let input_charge =
+            match job.reserve_or_pressure(64 * std::mem::size_of::<super::HeadHint>()) {
+                Ok(charge) => charge,
+                Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
+                    return Ok(InventoryOffer::Unavailable);
+                }
+                Err(error) => return Err(error),
+            };
         let peer = self.peer;
+        let captured_authorization = self.authorization;
         let slice = hints.to_vec();
         let committed = Arc::clone(&self.work_committed);
         let output_envelope = 64
@@ -699,6 +717,12 @@ impl Source {
                     room.history_instance(store)?,
                     room.epoch(),
                 )?;
+                if captured_authorization.is_some_and(|(node, generation)| {
+                    node != room.me() || generation != current_authorization
+                }) {
+                    return Err(Error::Profile("history authorization changed"));
+                }
+                let publication_wake = room.history_publication_wake();
                 let read = room.history_read(store)?;
                 let mut missing = Vec::with_capacity(slice.len());
                 let mut changed = Vec::new();
@@ -795,26 +819,42 @@ impl Source {
                 drop(read);
                 changed.sort_unstable();
                 changed.dedup();
+                if !changed.is_empty() && room.history_publication_busy(store)? {
+                    return Ok(Some(FilteredInventory::Publication(
+                        crate::node::channel::HistoryPublicationWait {
+                            owner: room.history_publication_request(store)?,
+                            wake: publication_wake,
+                        },
+                    )));
+                }
                 let rearmed = changed.len();
                 for author in changed {
                     room.forget_history_decline(store, peer, author, &committed)?;
                 }
-                Ok(Some((missing, rearmed)))
+                Ok(Some(FilteredInventory::Ready(missing, rearmed)))
             })
             .await?;
         match filtered {
             Lookup::Found(filtered) => {
-                self.current()?;
-                let (missing, rearmed) = filtered.value;
+                let (missing, rearmed) = match filtered.value {
+                    FilteredInventory::Ready(missing, rearmed) => (missing, rearmed),
+                    FilteredInventory::Publication(wait) => {
+                        return Ok(InventoryOffer::Publication(wait))
+                    }
+                };
                 let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
                 offer.rearmed = rearmed;
-                Ok(offer)
+                Ok(InventoryOffer::Offered(offer))
             }
-            Lookup::Busy | Lookup::Missing => Ok(super::hints::Offer {
-                added: 0,
-                rearmed: 0,
-                full: true,
-            }),
+            Lookup::Busy | Lookup::Missing if self.authorization.is_none() => {
+                Ok(InventoryOffer::Unavailable)
+            }
+            // The owned callback always returns Some and record_job always admits its fixed
+            // envelope; real byte pressure was propagated above. Do not misreport a missing
+            // callback as a completed bounded Inbox insertion.
+            Lookup::Busy | Lookup::Missing => {
+                Err(Error::Profile("owned inventory filter returned no result"))
+            }
         }
     }
 }

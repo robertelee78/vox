@@ -726,6 +726,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ForegroundAdmissionReady { .. } => "starting admitted foreground work",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
+        NetEvent::BoundedPublicationReady { .. } => {
+            "continuing a received response after publication"
+        }
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
@@ -1481,6 +1484,12 @@ enum NetEvent {
     },
     /// The exact shared byte reservation a bounded port met was released.
     BoundedBytesReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
+    /// The exact publication dependency of a retained Flow was released.
+    BoundedPublicationReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
@@ -11258,6 +11267,22 @@ impl Node {
                             },
                         );
                     }
+                    if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+                        self.sched_rooms.insert(room);
+                    }
+                }
+            }
+            NetEvent::BoundedPublicationReady { token, room, peer } => {
+                if self
+                    .bounded_sync
+                    .release_publication_admission(token, room, peer)
+                {
+                    if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                        port.clear_backoff();
+                    }
+                    crate::node::status::SyncBook::with(&self.sync_book, room, peer, |counts| {
+                        counts.backoff = None;
+                    });
                     if self.port_eligible(&(room, peer), std::time::Instant::now()) {
                         self.sched_rooms.insert(room);
                     }

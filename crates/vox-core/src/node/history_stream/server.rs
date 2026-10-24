@@ -64,6 +64,7 @@ pub(super) async fn answer(
     inbox_generation: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,
+    local_inventory_busy: &mut bool,
 ) -> Result<Status> {
     let receipt_source;
     let source = if preamble.purpose == Purpose::Control
@@ -100,9 +101,19 @@ pub(super) async fn answer(
         };
         let work_job = incoming.job();
         for slice in hints.chunks(64) {
-            let offered = source
+            let offered = match source
                 .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
-                .await?;
+                .await?
+            {
+                super::source::InventoryOffer::Offered(offered) => offered,
+                super::source::InventoryOffer::Publication(_)
+                | super::source::InventoryOffer::Unavailable => {
+                    // This serving stream has no retained outgoing Flow. Return the
+                    // existing coded serving Busy and release its HAVE and worker.
+                    *local_inventory_busy = true;
+                    return Err(Error::PeerRefused(crate::wire::WireError::SessionBusy));
+                }
+            };
             *inventory_added |= offered.added != 0;
             if offered.full {
                 return Err(Error::Unreachable("inventory pending capacity busy"));
