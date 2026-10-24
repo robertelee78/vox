@@ -3279,13 +3279,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         &format!("pool-pressure-payload-{nonce}"),
     );
     let pressure_target = format!("pool-pressure-landed-{nonce}");
-    stage_post(
-        pressure_dir,
-        *pressure_node,
-        pressure_name,
-        pressure_room,
-        &pressure_target,
-    );
+    let mut pressure_target_posted = false;
     let mut pool_full_seen = false;
     let mut live_pool_full: Option<PressureContinuation> = None;
     let mut frozen_running: Option<HeldFlowOwners> = None;
@@ -3396,7 +3390,29 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     "APPARATUS: the exact held owner multiset did not fill the source-defined pool: \
                      {held:?}"
                 );
-                frozen_running = Some(held);
+                if !pressure_target_posted {
+                    // Publish the user target only after every charged worker is inside its proof
+                    // barrier. Discard this exploratory candidate: the post may legitimately
+                    // change retained foreground ownership, so the disconnect owner comes from a
+                    // fresh shipped status on the next pass.
+                    frozen_running = Some(held);
+                    stage_post(
+                        pressure_dir,
+                        *pressure_node,
+                        pressure_name,
+                        pressure_room,
+                        &pressure_target,
+                    );
+                    pressure_target_posted = true;
+                    continue 'pressure;
+                }
+                assert_eq!(
+                    frozen_running
+                        .as_ref()
+                        .expect("APPARATUS: pre-target held owner multiset was not captured"),
+                    &held,
+                    "APPARATUS: a charged owner changed after the one target publication"
+                );
                 eprintln!(
                     "[proof] exact foreground PoolFull owner={} root={} identity={}",
                     owner.name, owner.root, owner.identity
