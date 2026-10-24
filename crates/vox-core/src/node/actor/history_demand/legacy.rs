@@ -36,9 +36,17 @@ pub(super) fn prepare_legacy(
         grant: answer.generation,
     };
     let (plan, bounds, active) = if let Action::Resume { request } = action {
-        let state = saved
-            .filter(|state| state.request == request)
-            .ok_or("The saved legacy history request changed.")?;
+        let Some(state) = saved else {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail = "No legacy history request is saved to resume.".into();
+            return Ok(answer);
+        };
+        if state.request != request {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail =
+                "The requested resume does not match the saved legacy history request.".into();
+            return Ok(answer);
+        }
         let plan = state
             .legacy
             .ok_or("The saved request is not legacy history.")?;
