@@ -2229,8 +2229,9 @@ fn generation_accounting_keeps_actor_incarnations_exact(
         &staged.everyone[vox_core::node::history_budget::ARCHIVE_JOBS];
     let running_name = *running_name;
     let (peer_dir, peer_node, peer_name, peer_fp) = &staged.everyone[staged.hosted];
-    // quiet1 also contains the pressure sidecars. A real startup Control flow may select
-    // either as its third port; establish readable sources BEFORE any captured history cause.
+    // The holder sidecar can be a quiet1 source. Keep the full hosted identity roster for
+    // accounting, and establish these read grants BEFORE any captured generation cause. The
+    // directed spare is not a quiet1 member and cannot be selected as a quiet1 source.
     for (sidecar_dir, sidecar_node, sidecar_name, sidecar_fp) in &pressure_members[staged.hosted..]
     {
         for (dir, node, target, label) in [
@@ -2862,27 +2863,86 @@ type PressureMember = (
 );
 
 #[cfg(feature = "optional-proofs")]
-fn stage_pressure_sidecars(
-    staged: &Staged,
+struct PressureSidecars {
+    members: Vec<PressureMember>,
+    unrelated_rooms: BTreeMap<&'static str, String>,
+    waiter: PressureMember,
+    waiter_room: String,
+    waiter_tail_cursor: String,
+    waiter_tail_ready: String,
+}
+
+/// Apparatus topology, read from the selected shipped node: only Bob can own an external port.
+#[cfg(feature = "optional-proofs")]
+fn assert_directed_waiter_topology(
+    status: &serde_json::Value,
     room: &str,
-    nonce: &str,
-) -> (Vec<PressureMember>, BTreeMap<&'static str, String>) {
-    let (peer_dir, peer_node, peer_name, peer_fp) = &staged.everyone[staged.hosted];
-    let (ok, link, err) = vox(
-        peer_dir,
-        &as_node(&["room", "link", room], *peer_node),
-        None,
-    );
+    isolated: &str,
+    waiter: &str,
+    bob: &str,
+) {
     assert!(
-        ok,
-        "APPARATUS: pressure sidecar room link failed: {link}{err}"
+        status["status"] == "Ready" && status["identity"] == waiter,
+        "APPARATUS: directed waiter is not the expected Ready identity: {status}"
     );
-    let link = link
-        .lines()
-        .find(|line| line.starts_with("vox://"))
-        .unwrap_or(link.trim());
+    let rooms = status["rooms"]
+        .as_array()
+        .expect("APPARATUS: directed waiter rooms not an array");
+    let ids: BTreeSet<_> = rooms.iter().filter_map(|row| row["id"].as_str()).collect();
+    assert!(
+        room != isolated && rooms.len() == 2 && ids == BTreeSet::from([room, isolated]),
+        "APPARATUS: directed waiter must hold only its Bob room and isolated room: {rooms:?}"
+    );
+    for shown in rooms {
+        let members: BTreeSet<_> = shown["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|member| member["id"].as_str())
+            .collect();
+        let expected = if shown["id"] == room {
+            BTreeSet::from([waiter, bob])
+        } else {
+            BTreeSet::from([waiter])
+        };
+        assert_eq!(
+            members, expected,
+            "APPARATUS: directed waiter acquired another room peer: {shown}"
+        );
+        if shown["id"] == room {
+            assert!(
+                shown["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|member| member["id"] == bob && member["trusted"] == true),
+                "APPARATUS: directed waiter does not trust its exact Bob source: {shown}"
+            );
+        }
+    }
+    assert!(
+        status["lanes"]["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|port| port["room"] == room && port["peer"] == bob),
+        "APPARATUS: directed waiter has an external port other than its Bob room: {}",
+        status["lanes"]
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+fn stage_pressure_sidecars(staged: &Staged, holder_room: &str, nonce: &str) -> PressureSidecars {
+    let (peer_dir, peer_node, peer_name, peer_fp) = &staged.everyone[staged.hosted];
+    let waiter_name = *PRESSURE_SIDECARS
+        .last()
+        .expect("APPARATUS: no directed pressure sidecar");
     let mut members = Vec::new();
-    let mut unrelated = BTreeMap::new();
+    let mut unrelated_rooms = BTreeMap::new();
+    let mut waiter = None;
+    let mut waiter_room = None;
+    let mut waiter_tail_cursor = None;
+    let mut waiter_tail_ready = None;
     for name in PRESSURE_SIDECARS {
         let (ok, fp, err) = vox(&staged.host, &["id", "--node", name], None);
         assert!(
@@ -2906,6 +2966,46 @@ fn stage_pressure_sidecars(
                 "APPARATUS: pressure sidecar {name} mutual trust failed: {out}{err}"
             );
         }
+        let room = if name == waiter_name {
+            let suffix: String = nonce
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .map(|character| character.to_ascii_lowercase())
+                .collect();
+            assert!(
+                !suffix.is_empty(),
+                "APPARATUS: directed room nonce has no legal characters"
+            );
+            let alias = format!("directed-pressure-{suffix}");
+            let (ok, out, err) = vox(
+                peer_dir,
+                &as_node(
+                    &["room", "create", "--passphrase-file", "-", "--name", &alias],
+                    *peer_node,
+                ),
+                Some(&format!("{ROOMPASS}\n")),
+            );
+            assert!(
+                ok,
+                "APPARATUS: Bob's dedicated pressure room failed: {out}{err}"
+            );
+            vox_core::node::link::b32_encode(&room_id_as(peer_dir, *peer_node, peer_name, &alias))
+        } else {
+            holder_room.to_owned()
+        };
+        let (ok, link, err) = vox(
+            peer_dir,
+            &as_node(&["room", "link", &room], *peer_node),
+            None,
+        );
+        assert!(
+            ok,
+            "APPARATUS: pressure sidecar room link failed: {link}{err}"
+        );
+        let link = link
+            .lines()
+            .find(|line| line.starts_with("vox://"))
+            .unwrap_or(link.trim());
         let (ok, out, err) = vox(
             &staged.host,
             &as_node(
@@ -2918,8 +3018,6 @@ fn stage_pressure_sidecars(
             ok,
             "APPARATUS: pressure sidecar {name} join failed: {out}{err}"
         );
-        // A real held unrelated room makes health's negative assertion nonvacuous even though
-        // these pressure-only readers deliberately never join the original quiet-2 room.
         let own_name = format!("{name}-isolated");
         let (ok, out, err) = vox(
             &staged.host,
@@ -2937,25 +3035,58 @@ fn stage_pressure_sidecars(
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "APPARATUS: {name}'s unrelated room failed: {out}{err}");
-        let shown = fx35_synced(&staged.host, Some(name));
-        let status: serde_json::Value = serde_json::from_str(&shown.status)
-            .expect("PRODUCT: sidecar's room status was not JSON");
-        let own_room = status["rooms"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|room| room["name"] == own_name)
-            .and_then(|room| room["id"].as_str())
-            .expect("APPARATUS: sidecar's real unrelated room not listed for its own node");
-        unrelated.insert(name, own_room.to_owned());
+        let own_room = vox_core::node::link::b32_encode(&room_id_as(
+            &staged.host,
+            Some(name),
+            name,
+            &own_name,
+        ));
+        unrelated_rooms.insert(name, own_room.clone());
         let source_ready = format!("{name}-source-ready-{nonce}");
         let reader_ready = format!("{name}-reader-ready-{nonce}");
-        stage_post(peer_dir, *peer_node, peer_name, room, &source_ready);
-        stage_post(&staged.host, Some(name), name, room, &reader_ready);
+        stage_post(peer_dir, *peer_node, peer_name, &room, &source_ready);
+        // Save a readable arrival BEFORE the later own baseline append. A tail resumed from
+        // this exact hash can prove it subscribed by replaying that later baseline, without
+        // another post while the full pool is held.
+        let source_cursor = loop {
+            let (ok, out, err) = vox(
+                &staged.host,
+                &as_node(&["room", "read", &room, "--json"], Some(name)),
+                None,
+            );
+            assert!(
+                ok,
+                "APPARATUS: {name}'s baseline JSON read refused: {out}{err}"
+            );
+            let rows: Vec<serde_json::Value> = out
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str(line).unwrap_or_else(|error| {
+                        panic!("APPARATUS: sidecar baseline row was not JSON ({error}): {line}")
+                    })
+                })
+                .collect();
+            if let Some(hash) = rows
+                .iter()
+                .find(|row| {
+                    row["schema"] == "vox.room.row/1"
+                        && row["room"] == room
+                        && row["author"] == *peer_fp
+                        && row["text"] == source_ready
+                        && row["owed"] == false
+                })
+                .and_then(|row| row["entry_hash"].as_str())
+            {
+                break hash.to_owned();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        stage_post(&staged.host, Some(name), name, &room, &reader_ready);
         loop {
             let (ok, out, err) = vox(
                 &staged.host,
-                &as_node(&["room", "read", room], Some(name)),
+                &as_node(&["room", "read", &room], Some(name)),
                 None,
             );
             assert!(
@@ -2964,21 +3095,48 @@ fn stage_pressure_sidecars(
             );
             let (peer_ok, peer_out, peer_err) = vox(
                 peer_dir,
-                &as_node(&["room", "read", room], *peer_node),
+                &as_node(&["room", "read", &room], *peer_node),
                 None,
             );
             assert!(
                 peer_ok,
                 "APPARATUS: source's sidecar readiness read refused: {peer_out}{peer_err}"
             );
-            if out.contains(&source_ready) && peer_out.contains(&reader_ready) {
+            if out.contains(&source_ready)
+                && out.contains(&reader_ready)
+                && peer_out.contains(&reader_ready)
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        members.push((staged.host.clone(), Some(name), name, fp));
+        let member = (staged.host.clone(), Some(name), name, fp.clone());
+        if name == waiter_name {
+            let shown = fx35_synced(&staged.host, Some(name));
+            let status: serde_json::Value = serde_json::from_str(&shown.status)
+                .expect("APPARATUS: directed waiter status was not JSON");
+            assert_directed_waiter_topology(&status, &room, &own_room, &fp, peer_fp);
+            let (ok, out, err) = vox(&staged.host, &["node", "lock", name], None);
+            assert!(
+                ok,
+                "APPARATUS: could not lock baselined directed waiter: {out}{err}"
+            );
+            eprintln!("[proof] directed waiter baselined and locked: node={name} room={room} peer={peer_fp} isolated={own_room}");
+            waiter = Some(member.clone());
+            waiter_room = Some(room);
+            waiter_tail_cursor = Some(source_cursor);
+            waiter_tail_ready = Some(reader_ready);
+        }
+        members.push(member);
     }
-    (members, unrelated)
+    PressureSidecars {
+        members,
+        unrelated_rooms,
+        waiter: waiter.expect("APPARATUS: directed waiter was not staged"),
+        waiter_room: waiter_room.expect("APPARATUS: directed waiter room was not staged"),
+        waiter_tail_cursor: waiter_tail_cursor.expect("APPARATUS: directed tail cursor missing"),
+        waiter_tail_ready: waiter_tail_ready.expect("APPARATUS: directed tail readiness missing"),
+    }
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -3147,7 +3305,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     // Attach before pressure. This pool phase observes the source-fenced exact release handoff
     // before consuming the tail's target; status/read/lifecycle commands also stage its owners.
     // Only foreground_release_wakes_without_a_tick forbids CLI requests after its release.
-    let pressure_room = &staged.rooms[0];
+    let holder_room = &staged.rooms[0];
     let nonce = staged
         ._tmp
         .path()
@@ -3155,14 +3313,31 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         .expect("APPARATUS: no staging nonce")
         .to_string_lossy()
         .into_owned();
-    let (sidecars, mut unrelated_rooms) = stage_pressure_sidecars(&staged, pressure_room, &nonce);
+    let directed = stage_pressure_sidecars(&staged, holder_room, &nonce);
+    let waiter = directed.waiter.clone();
+    let (waiter_dir, waiter_node, waiter_name, waiter_fp) = &waiter;
+    let pressure_room = &directed.waiter_room;
+    let mut unrelated_rooms = directed.unrelated_rooms.clone();
     let mut pressure_members = staged.everyone[..staged.hosted].to_vec();
-    pressure_members.extend(sidecars);
+    pressure_members.extend(directed.members.iter().cloned());
+    let holder_members: Vec<_> = pressure_members
+        .iter()
+        .filter(|(_, _, name, _)| name != waiter_name)
+        .cloned()
+        .collect();
     let (room_reader_dir, room_reader_node, room_reader_name, _) = &staged.everyone[0];
-    let pressure_room_id = vox_core::node::link::b32_encode(&room_id_as(
+    let holder_room_id = vox_core::node::link::b32_encode(&room_id_as(
         room_reader_dir,
         *room_reader_node,
         room_reader_name,
+        holder_room,
+    ));
+    let (pressure_dir, pressure_node, pressure_name, pressure_peer) =
+        &staged.everyone[staged.hosted];
+    let pressure_room_id = vox_core::node::link::b32_encode(&room_id_as(
+        pressure_dir,
+        *pressure_node,
+        pressure_name,
         pressure_room,
     ));
     let unrelated_id = vox_core::node::link::b32_encode(&room_id_as(
@@ -3174,23 +3349,22 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     for (_, _, name, _) in &staged.everyone[..staged.hosted] {
         unrelated_rooms.insert(*name, unrelated_id.clone());
     }
-    let pressure_tails: BTreeMap<&str, TailObserver> = pressure_members
+    let mut pressure_tails: BTreeMap<&str, TailObserver> = holder_members
         .iter()
-        .map(|(dir, node, name, _)| (*name, TailObserver::attach(dir, *node, pressure_room, None)))
+        .map(|(dir, node, name, _)| (*name, TailObserver::attach(dir, *node, holder_room, None)))
         .collect();
     let ready = format!("pool-release-tails-attached-{nonce}");
-    let (pressure_dir, pressure_node, pressure_name, _) = &staged.everyone[staged.hosted];
     stage_post(
         pressure_dir,
         *pressure_node,
         pressure_name,
-        pressure_room,
+        holder_room,
         &ready,
     );
-    for (_, _, name, _) in &pressure_members {
+    for (_, _, name, _) in &holder_members {
         pressure_tails
             .get(name)
-            .expect("APPARATUS: pressure tail disappeared")
+            .expect("APPARATUS: holder tail disappeared")
             .wait_for(&ready, name, false);
     }
     // Hold two real shipped archive requests at their admitted jobs. The separate proof-only
@@ -3203,9 +3377,10 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     // held until the one deliberate release. A feature-gated apparatus file temporarily asks
     // the pool to use its own source-defined floor: fourteen foreground plus the daemon's two
     // source-owned archive jobs then reaches the otherwise impossible retained path without a
-    // copied count. Two pressure-only readers compensate for the two Archive reader actors whose
-    // local foreground slots can remain occupied by their Archive room's continuations. They
-    // never join that room. Removing the file restores actual production identity accounting.
+    // copied count. The ordinary sidecar supplements quiet1 holders; the dedicated sidecar is
+    // already baselined with Bob in a separate two-member room and stays locked until the exact
+    // held population is captured. It cannot reserve a competing quiet1 port. Removing the file
+    // restores actual production identity accounting.
     let resize_probe = "fx35-resize-probe";
     let pool_floor = staged
         .pool_floor
@@ -3252,7 +3427,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         .live_hold
         .as_ref()
         .expect("APPARATUS: flow-state pressure hold path was not staged");
-    let pressure_selector = format!("room={pressure_room_id}\n");
+    let pressure_selector = format!("room={holder_room_id}\n");
     let scoped_hold = hold.with_extension("pressure-room");
     std::fs::write(&scoped_hold, pressure_selector.as_bytes()).unwrap_or_else(|error| {
         panic!(
@@ -3275,7 +3450,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         pressure_dir,
         *pressure_node,
         pressure_name,
-        pressure_room,
+        holder_room,
         &format!("pool-pressure-payload-{nonce}"),
     );
     let pressure_target = format!("pool-pressure-landed-{nonce}");
@@ -3286,7 +3461,12 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     let mut most_pressure = 0;
     let mut pressure_staged = false;
     let observed = 'pressure: loop {
-        for (dir, node, name, _) in &pressure_members {
+        let scan = if pressure_target_posted {
+            std::slice::from_ref(&waiter)
+        } else {
+            holder_members.as_slice()
+        };
+        for (dir, node, name, _) in scan {
             let shown = fx35_synced(dir, *node);
             let v: serde_json::Value = serde_json::from_str(&shown.status).unwrap_or_default();
             let pool = &v["lanes"]["budget"]["flow_state"];
@@ -3344,6 +3524,105 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     > vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64
                     || !full_ports.is_empty();
             }
+            if !pressure_target_posted
+                && in_use == vox_core::node::history_budget::FLOW_STATE_CAPACITY as u64
+            {
+                let Some(held) =
+                    all_flow_state_charges_held(&v, hold, archive_hold, Some(&holder_room_id))
+                else {
+                    most_pressure = most_pressure.max(in_use);
+                    continue;
+                };
+                assert_eq!(
+                    pool["promised"], 0,
+                    "APPARATUS: a promise preceded the initial exact held snapshot: {pool}"
+                );
+                assert_eq!(
+                    held.values().sum::<usize>(),
+                    vox_core::node::history_budget::FLOW_STATE_CAPACITY,
+                    "APPARATUS: exact held owners did not fill the floor: {held:?}"
+                );
+                assert!(
+                    !held.keys().any(|(_, node, _, _)| node == waiter_fp)
+                        && !pool["actors"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|actor| actor["node"] == *waiter_fp
+                                && actor["registered"] == true),
+                    "APPARATUS: locked spare owned capacity before capture: {pool}"
+                );
+                frozen_running = Some(held);
+                eprintln!(
+                    "[proof] exact holder population frozen independently of waiter: {}",
+                    pool
+                );
+                unlock(waiter_dir, waiter_name);
+                attached_as(waiter_dir, "directed-waiter", *waiter_node);
+                let shown = fx35_synced(waiter_dir, *waiter_node);
+                let shown: serde_json::Value = serde_json::from_str(&shown.status)
+                    .expect("APPARATUS: reopened directed waiter status was not JSON");
+                assert_directed_waiter_topology(
+                    &shown,
+                    &pressure_room_id,
+                    unrelated_rooms
+                        .get(waiter_name)
+                        .expect("APPARATUS: waiter isolated room missing"),
+                    waiter_fp,
+                    pressure_peer,
+                );
+                assert!(shown["lanes"]["bounded"]["running"].as_array().into_iter().flatten()
+                    .all(serde_json::Value::is_null),
+                    "APPARATUS: reopened waiter already ran while all floor charges were held: {shown}");
+                let tail = TailObserver::attach(
+                    waiter_dir,
+                    *waiter_node,
+                    pressure_room,
+                    Some(&directed.waiter_tail_cursor),
+                );
+                tail.wait_for(&directed.waiter_tail_ready, waiter_name, false);
+                pressure_tails.insert(*waiter_name, tail);
+                // This is the one measurement post. The two-member spare has only Bob's
+                // external port, and its tail has actually replayed its saved readiness row.
+                stage_post(
+                    pressure_dir,
+                    *pressure_node,
+                    pressure_name,
+                    pressure_room,
+                    &pressure_target,
+                );
+                pressure_target_posted = true;
+                eprintln!("[proof] directed target posted once after exact held capture: waiter={waiter_name} room={pressure_room_id}");
+                continue 'pressure;
+            }
+            if !pressure_target_posted {
+                most_pressure = most_pressure.max(in_use);
+                continue;
+            }
+            assert_directed_waiter_topology(
+                &v,
+                &pressure_room_id,
+                unrelated_rooms
+                    .get(waiter_name)
+                    .expect("APPARATUS: waiter isolated room missing"),
+                waiter_fp,
+                pressure_peer,
+            );
+            let held = all_flow_state_charges_held(&v, hold, archive_hold, Some(&holder_room_id))
+                .expect(
+                "APPARATUS: held population escaped while waiting for the directed Bob admission",
+            );
+            assert_eq!(
+                frozen_running
+                    .as_ref()
+                    .expect("APPARATUS: holder snapshot missing"),
+                &held,
+                "APPARATUS: original held owners changed before directed admission"
+            );
+            assert_eq!(
+                pool["promised"], 0,
+                "APPARATUS: a release preceded the directed Bob admission: {pool}"
+            );
             let fingerprint = pressure_members
                 .iter()
                 .find(|(_, _, candidate, _)| candidate == name)
@@ -3380,7 +3659,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                      {pool}"
                 );
                 let Some(held) =
-                    all_flow_state_charges_held(&v, hold, archive_hold, Some(&pressure_room_id))
+                    all_flow_state_charges_held(&v, hold, archive_hold, Some(&holder_room_id))
                 else {
                     continue;
                 };
@@ -3390,22 +3669,6 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     "APPARATUS: the exact held owner multiset did not fill the source-defined pool: \
                      {held:?}"
                 );
-                if !pressure_target_posted {
-                    // Publish the user target only after every charged worker is inside its proof
-                    // barrier. Discard this exploratory candidate: the post may legitimately
-                    // change retained foreground ownership, so the disconnect owner comes from a
-                    // fresh shipped status on the next pass.
-                    frozen_running = Some(held);
-                    stage_post(
-                        pressure_dir,
-                        *pressure_node,
-                        pressure_name,
-                        pressure_room,
-                        &pressure_target,
-                    );
-                    pressure_target_posted = true;
-                    continue 'pressure;
-                }
                 assert_eq!(
                     frozen_running
                         .as_ref()
@@ -3496,10 +3759,31 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             "[proof] FX-35 peer reconnected: original_owner={owner} peer={disconnected_peer}; selecting an actual eligible release owner"
         );
         live_pool_full = 'restaged: loop {
-            for (dir, node, name, _) in &pressure_members {
+            for (dir, node, name, _) in std::slice::from_ref(&waiter) {
                 let shown = fx35_synced(dir, *node);
                 let status: serde_json::Value = serde_json::from_str(&shown.status)
                     .expect("PRODUCT: reconnected PoolFull status was not JSON");
+                assert_directed_waiter_topology(
+                    &status,
+                    &pressure_room_id,
+                    unrelated_rooms
+                        .get(waiter_name)
+                        .expect("APPARATUS: waiter isolated room missing"),
+                    waiter_fp,
+                    pressure_peer,
+                );
+                let still_held =
+                    all_flow_state_charges_held(&status, hold, archive_hold, Some(&holder_room_id))
+                        .expect(
+                            "APPARATUS: a holder escaped before the directed reconnect admission",
+                        );
+                assert_eq!(
+                    frozen_running
+                        .as_ref()
+                        .expect("APPARATUS: original holder snapshot missing"),
+                    &still_held,
+                    "APPARATUS: held owners changed before directed reconnect binding"
+                );
                 let fp = pressure_members
                     .iter()
                     .find(|(_, _, candidate, _)| candidate == name)
@@ -3516,8 +3800,9 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                         port["room"] == pressure_room_id && port["peer"] == disconnected_peer
                             && port["start_reason"] == "flow_state_pool_full"
                     }), "PRODUCT: reconnected owner's exact PoolFull admission names another first gate: {}", status["lanes"]);
-                    // The new eligible owner need not be the disconnected owner. Do not credit
-                    // an old readable target as a consequence of this owner's future release.
+                    // The directed actor still has only Bob as a peer; rebind its current
+                    // continuation after reconnect, without equating pre-disconnect Flow ids.
+                    // Do not credit an old readable target as a future release consequence.
                     // A cached read stages user-visible absence, never absence of stored bytes.
                     let (ok, out, err) = vox(
                         dir,
@@ -3554,6 +3839,10 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                         &pressure_room_id, &disconnected_peer).unwrap_or_else(|| {
                         panic!("APPARATUS: selected release ownership changed while establishing target absence; no new post or restaging retry was issued: {}", final_shown.status)
                     });
+                    assert_ne!(
+                        reconnected.order, disconnected_order,
+                        "PRODUCT: reconnect reused the cancelled exact pool continuation order"
+                    );
                     assert_eq!(reconnected.identity["granted"], false,
                         "APPARATUS: selected release continuation already had a grant before resize staging: {}", final_shown.status);
                     let final_pool = &final_status["lanes"]["budget"]["flow_state"];
@@ -3567,7 +3856,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                         &final_status,
                         hold,
                         archive_hold,
-                        Some(&pressure_room_id),
+                        Some(&holder_room_id),
                     )
                     .expect(
                         "APPARATUS: a running charge escaped its exact proof barrier before final \
@@ -3782,24 +4071,9 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         );
     }
     drop(pressure_tails);
-    loop {
-        let mut missing = Vec::new();
-        for (dir, node, name, _) in &pressure_members {
-            let (ok, out, err) = vox(
-                dir,
-                &as_node(&["room", "read", pressure_room, "--limit", "3"], *node),
-                None,
-            );
-            assert!(ok, "PRODUCT: {name}'s pressure read refused: {out}{err}");
-            if !out.contains(&pressure_target) {
-                missing.push(format!("{name}/{pressure_name}"));
-            }
-        }
-        if missing.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    // Initial convergence already proves every original reader/author/room observation. This
+    // pressure room intentionally has only Bob and the spare: its exact preattached tail above
+    // is the release-delivery claim; nonmembers must not be asked to read its target.
     // The forced old-connection retirement must publish the exact durable result already reached,
     // or leave the exact saved request truthfully Paused. Only Paused receives one shipped Resume.
     // Under the orphan mutant the old Pending/running state has no physical owner, so the
