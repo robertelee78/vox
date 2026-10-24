@@ -1630,11 +1630,12 @@ fn stage_hosted_nodes(
     // reader a Bob-only room: a sibling server must not need the same FG1 to answer HAVE.
     let mut rooms = Vec::with_capacity(QUIET_ROOMS.len());
     for (index, name) in QUIET_ROOMS.into_iter().enumerate() {
-        let maker = Some(if single_foreground_job {
+        let maker_name = if single_foreground_job {
             hosted[index]
         } else {
             hosted[0]
-        });
+        };
+        let maker = Some(maker_name);
         let (ok, _, err) = vox(
             &host,
             &as_node(
@@ -1654,7 +1655,7 @@ fn stage_hosted_nodes(
         let room = vox_core::node::link::b32_encode(&room_id_as(
             &host,
             maker,
-            maker.expect("APPARATUS: room maker"),
+            maker_name,
             &room_selector,
         ));
         let (ok, link, err) = vox(&host, &as_node(&["room", "link", &room], maker), None);
