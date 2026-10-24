@@ -86,17 +86,6 @@ impl Transport {
     }
 
     /// The caller supplies its remaining response credit including the four-byte prefix.
-    /// Reserve before reading even that prefix: Busy never leaves a partially consumed frame.
-    pub(super) async fn read(&mut self, remaining_wire: usize) -> Result<Read> {
-        self.read_bounded(
-            remaining_wire,
-            DECODE_ENVELOPE,
-            None,
-            ReadAdmission::Optional,
-        )
-        .await
-    }
-
     /// An owned operation retains its exact capacity cause before consuming any prefix bytes.
     pub(super) async fn read_required(&mut self, remaining_wire: usize) -> Result<Read> {
         self.read_bounded(
