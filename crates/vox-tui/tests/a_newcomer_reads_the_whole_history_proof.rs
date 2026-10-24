@@ -1561,6 +1561,11 @@ fn stage_hosted_nodes(
     }
     if let Some(path) = live_hold_text.as_deref() {
         env.push(("VOX_TEST_HOLD_LIVE_JOB_FILE", path));
+        // The full-pool fixture accepts either actual foreground lane. The strict one-job wake
+        // fixture must keep Control free so its requested Live worker can reach this barrier.
+        if !single_foreground_job {
+            env.push(("VOX_TEST_HOLD_CONTROL_JOB_FILE", path));
+        }
     }
     if let Some(path) = archive_hold_text.as_deref() {
         env.push(("VOX_TEST_HOLD_ARCHIVE_JOB_FILE", path));
@@ -2122,6 +2127,94 @@ fn charged_flow_hold_entries(hold: &Path) -> Vec<(u64, String, std::path::PathBu
             Some((actor, node.to_owned(), entry.path()))
         })
         .collect()
+}
+
+#[cfg(feature = "optional-proofs")]
+type HeldFlowOwners = BTreeMap<(u64, String, String, String), usize>;
+
+#[cfg(feature = "optional-proofs")]
+fn charged_flow_hold_owners(hold: &Path) -> HeldFlowOwners {
+    let mut owners = BTreeMap::new();
+    for (actor, node, marker) in charged_flow_hold_entries(hold) {
+        let identity = std::fs::read_to_string(&marker).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not read flow-state hold marker {}: {error}",
+                marker.display()
+            )
+        });
+        let room = identity
+            .lines()
+            .find_map(|line| line.strip_prefix("room="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "APPARATUS: flow-state hold marker omitted its room: {}",
+                    marker.display()
+                )
+            });
+        let peer = identity
+            .lines()
+            .find_map(|line| line.strip_prefix("peer="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "APPARATUS: flow-state hold marker omitted its peer: {}",
+                    marker.display()
+                )
+            });
+        *owners
+            .entry((actor, node, room.to_owned(), peer.to_owned()))
+            .or_insert(0) += 1;
+    }
+    owners
+}
+
+#[cfg(feature = "optional-proofs")]
+fn running_flow_owners(status: &serde_json::Value) -> HeldFlowOwners {
+    let running = status["lanes"]["budget"]["flow_state"]["running"]
+        .as_array()
+        .expect("PRODUCT: flow-state running owners were not an array");
+    let mut owners = BTreeMap::new();
+    for owner in running {
+        let actor = owner["actor"]
+            .as_u64()
+            .expect("PRODUCT: running flow-state owner omitted actor");
+        let field = |name| {
+            owner[name]
+                .as_str()
+                .unwrap_or_else(|| panic!("PRODUCT: running flow-state owner omitted {name}"))
+                .to_owned()
+        };
+        *owners
+            .entry((actor, field("node"), field("room"), field("peer")))
+            .or_insert(0) += 1;
+    }
+    owners
+}
+
+#[cfg(feature = "optional-proofs")]
+fn all_flow_state_charges_held(
+    status: &serde_json::Value,
+    shared_hold: &Path,
+    archive_hold: &Path,
+    scoped_room: Option<&str>,
+) -> Option<HeldFlowOwners> {
+    let shared = charged_flow_hold_owners(shared_hold);
+    if let Some(room) = scoped_room {
+        assert!(
+            shared.keys().all(|(_, _, held_room, _)| held_room == room),
+            "APPARATUS: scoped Control/Live barrier captured work outside pressure room {room}: \
+             {shared:?}"
+        );
+    }
+    let archive = charged_flow_hold_owners(archive_hold);
+    if archive.values().sum::<usize>() != vox_core::node::history_budget::ARCHIVE_JOBS {
+        return None;
+    }
+    let mut held = shared;
+    for (owner, count) in archive {
+        *held.entry(owner).or_insert(0) += count;
+    }
+    let running = running_flow_owners(status);
+    (running == held).then_some(running)
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -3029,6 +3122,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     test_knobs::require(&[
         "VOX_TEST_FOREGROUND_JOBS",
         "VOX_TEST_HOLD_LIVE_JOB_FILE",
+        "VOX_TEST_HOLD_CONTROL_JOB_FILE",
         "VOX_TEST_HOLD_ARCHIVE_JOB_FILE",
         "VOX_TEST_HOLD_FLOW_RELEASE_FILE",
         "VOX_TEST_FLOW_STATE_FLOOR_FILE",
@@ -3104,8 +3198,10 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     // they cannot finish before live pressure reaches the seventeenth reservation. A fresh
     // Content post by the peer then makes one live round eligible on every hosted node. Body
     // size does not choose the lane; these barriers stage running flow-state ownership.
-    // The barriers hold already-admitted jobs. A feature-gated apparatus file temporarily asks
-    // the pool to use its own source-defined floor: fifteen live plus the daemon's two
+    // The barriers hold already-admitted jobs. Control and Live share one canonical-room selector:
+    // a foreground/hint Flow may truthfully choose either lane, and every actual charge must stay
+    // held until the one deliberate release. A feature-gated apparatus file temporarily asks
+    // the pool to use its own source-defined floor: fourteen foreground plus the daemon's two
     // source-owned archive jobs then reaches the otherwise impossible retained path without a
     // copied count. Two pressure-only readers compensate for the two Archive reader actors whose
     // local foreground slots can remain occupied by their Archive room's continuations. They
@@ -3156,8 +3252,25 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         .live_hold
         .as_ref()
         .expect("APPARATUS: flow-state pressure hold path was not staged");
-    std::fs::File::create(hold)
-        .unwrap_or_else(|error| panic!("APPARATUS: could not create {}: {error}", hold.display()));
+    let pressure_selector = format!("room={pressure_room_id}\n");
+    let scoped_hold = hold.with_extension("pressure-room");
+    std::fs::write(&scoped_hold, pressure_selector.as_bytes()).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not write scoped Control/Live hold {}: {error}",
+            scoped_hold.display()
+        )
+    });
+    std::fs::rename(&scoped_hold, hold).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: could not publish scoped Control/Live hold {}: {error}",
+            hold.display()
+        )
+    });
+    assert_eq!(
+        std::fs::read_to_string(hold).expect("APPARATUS: read pressure-room hold selector"),
+        pressure_selector,
+        "APPARATUS: pressure-room hold selector bytes changed"
+    );
     stage_post(
         pressure_dir,
         *pressure_node,
@@ -3175,6 +3288,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
     );
     let mut pool_full_seen = false;
     let mut live_pool_full: Option<PressureContinuation> = None;
+    let mut frozen_running: Option<HeldFlowOwners> = None;
     let mut most_pressure = 0;
     let mut pressure_staged = false;
     let observed = 'pressure: loop {
@@ -3261,6 +3375,28 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 );
                 assert!(room_health_messages(&v, unrelated).iter().all(|message| !message.contains("flow-state pool")),
                     "PRODUCT: shipped health blamed unrelated held room {unrelated} for flow-state pool: {}", v["unhealthy"]);
+                assert_eq!(
+                    pool["promised"], 0,
+                    "APPARATUS: a release promise existed before the controlled release stage: \
+                     {pool}"
+                );
+                assert_eq!(
+                    pool["in_use"], pool["limit"],
+                    "APPARATUS: the source-defined floor was not held entirely by running rounds: \
+                     {pool}"
+                );
+                let Some(held) =
+                    all_flow_state_charges_held(&v, hold, archive_hold, Some(&pressure_room_id))
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    held.values().sum::<usize>(),
+                    vox_core::node::history_budget::FLOW_STATE_CAPACITY,
+                    "APPARATUS: the exact held owner multiset did not fill the source-defined pool: \
+                     {held:?}"
+                );
+                frozen_running = Some(held);
                 eprintln!(
                     "[proof] exact foreground PoolFull owner={} root={} identity={}",
                     owner.name, owner.root, owner.identity
@@ -3407,6 +3543,27 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     let final_pool = &final_status["lanes"]["budget"]["flow_state"];
                     assert_eq!(final_pool["occupied"], final_pool["limit"],
                         "PRODUCT: final selected PoolFull admission reports free capacity: {final_pool}");
+                    assert_eq!(
+                        final_pool["promised"], 0,
+                        "APPARATUS: a real release preceded final owner binding: {final_pool}"
+                    );
+                    let final_running = all_flow_state_charges_held(
+                        &final_status,
+                        hold,
+                        archive_hold,
+                        Some(&pressure_room_id),
+                    )
+                    .expect(
+                        "APPARATUS: a running charge escaped its exact proof barrier before final \
+                         owner binding",
+                    );
+                    assert_eq!(
+                        frozen_running
+                            .as_ref()
+                            .expect("APPARATUS: initial held owner multiset was not captured"),
+                        &final_running,
+                        "APPARATUS: a running charge changed before final release-owner binding"
+                    );
                     assert!(
                         final_status["lanes"]["ports"]
                             .as_array()
@@ -3427,6 +3584,30 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             }
             std::thread::yield_now();
         };
+    }
+    // U5's pressure-room and unrelated-room health assertions are complete. While the exact
+    // source-defined pool is still full and every charge is held, atomically widen the SAME
+    // Control/Live barrier. After dynamic resize, fresh work in another room may reserve newly
+    // exposed capacity; it must not finish and impersonate the later deliberate release.
+    if live_pool_full.is_some() {
+        let all_rooms_hold = hold.with_extension("all-rooms");
+        std::fs::write(&all_rooms_hold, b"all\n").unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not write all-room Control/Live hold {}: {error}",
+                all_rooms_hold.display()
+            )
+        });
+        std::fs::rename(&all_rooms_hold, hold).unwrap_or_else(|error| {
+            panic!(
+                "APPARATUS: could not widen Control/Live hold {}: {error}",
+                hold.display()
+            )
+        });
+        assert_eq!(
+            std::fs::read_to_string(hold).expect("APPARATUS: read all-room hold selector"),
+            "all\n",
+            "APPARATUS: all-room Control/Live hold bytes changed"
+        );
     }
     if let Some(retained_owner) = &live_pool_full {
         let owner = &retained_owner.name;
@@ -3451,14 +3632,17 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         // It is not a running-round release and therefore cannot grant this retained Flow.
         unlock(&staged.host, resize_probe);
         attached_as(&staged.host, "host", Some(resize_probe));
-        let observer = FX35_HOSTED
-            .iter()
-            .copied()
-            .find(|candidate| candidate != owner)
-            .expect("APPARATUS: no unrelated hosted observer");
-        let resized = fx35_synced(&staged.host, Some(observer));
-        let resized: serde_json::Value = serde_json::from_str(&resized.status)
-            .expect("PRODUCT: post-resize status was not JSON");
+        // This roomless actor cannot own a release continuation of its own. A pressure actor could
+        // receive another grant and block inside the proof release barrier before answering Status.
+        let (resized, resized_running) = loop {
+            let shown = fx35_synced(&staged.host, Some(resize_probe));
+            let status: serde_json::Value = serde_json::from_str(&shown.status)
+                .expect("PRODUCT: post-resize status was not JSON");
+            if let Some(held) = all_flow_state_charges_held(&status, hold, archive_hold, None) {
+                break (status, held);
+            }
+            std::thread::yield_now();
+        };
         let retained = resized["lanes"]["budget"]["flow_state"]["waiting"]
             .as_array()
             .into_iter()
@@ -3479,18 +3663,32 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             resized["lanes"]
         );
         let resized_pool = &resized["lanes"]["budget"]["flow_state"];
+        assert_eq!(
+            resized_pool["promised"], 0,
+            "PRODUCT: resize exposed a release promise without any running-round release: \
+             {resized_pool}"
+        );
+        let frozen = frozen_running
+            .as_ref()
+            .expect("APPARATUS: initial held owner multiset was not captured");
+        assert!(
+            frozen
+                .iter()
+                .all(|(owner, count)| resized_running.get(owner).is_some_and(|now| now >= count)),
+            "APPARATUS: an original held flow-state owner disappeared during resize"
+        );
+        let newly_held = resized_running
+            .iter()
+            .any(|(owner, count)| *count > frozen.get(owner).copied().unwrap_or(0));
         assert!(
             resized_pool["occupied"]
                 .as_u64()
                 .zip(resized_pool["limit"].as_u64())
-                .is_some_and(|(occupied, limit)| occupied < limit),
-            "PRODUCT: the unrelated registration did not expose unused dynamically resized \
-             capacity while the retained continuation stayed ungranted: {resized_pool}"
-        );
-        let (ok, out, err) = vox(&staged.host, &["node", "lock", resize_probe], None);
-        assert!(
-            ok,
-            "APPARATUS: could not lock unrelated resize probe: {out}{err}"
+                .is_some_and(|(occupied, limit)| occupied < limit)
+                || newly_held,
+            "PRODUCT: the unrelated registration neither exposed unused capacity nor admitted \
+             new marker-held work while retained continuation {wait_order} stayed ungranted: \
+             {resized_pool}"
         );
         eprintln!("[proof] FX-35 resize assertions completed: owner={owner} order={wait_order} remained ungranted");
     }
@@ -3503,7 +3701,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
         )
     });
     eprintln!(
-        "[proof] FX-35 Live and Archive hold files removed; awaiting the exact release grant"
+        "[proof] FX-35 Control/Live and Archive hold files removed; awaiting the exact release grant"
     );
     if pool_full_seen {
         let retained_owner = live_pool_full
@@ -3518,12 +3716,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .iter()
             .find(|(_, _, candidate, _)| *candidate == name)
             .expect("APPARATUS: PoolFull owner disappeared from staged nodes");
-        let observer = pressure_members
-            .iter()
-            .find(|(_, _, candidate, _)| *candidate != name)
-            .expect("APPARATUS: no unrelated hosted observer for promised capacity");
         loop {
-            let promised = fx35_synced(&observer.0, observer.1);
+            let promised = fx35_synced(&staged.host, Some(resize_probe));
             let promised: serde_json::Value = serde_json::from_str(&promised.status)
                 .expect("PRODUCT: granted-but-unconsumed status was not JSON");
             let pool = &promised["lanes"]["budget"]["flow_state"];
@@ -3565,6 +3759,11 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             .expect("APPARATUS: PoolFull node lost its pre-attached observer")
             .wait_for_after(&pressure_target, name, true, Some(observed_at));
         eprintln!("[proof] FX-35 selected user target observed in its preattached tail: owner={name} order={wait_order} target={pressure_target:?}");
+        let (ok, out, err) = vox(&staged.host, &["node", "lock", resize_probe], None);
+        assert!(
+            ok,
+            "APPARATUS: could not lock unrelated resize probe: {out}{err}"
+        );
     }
     drop(pressure_tails);
     loop {
