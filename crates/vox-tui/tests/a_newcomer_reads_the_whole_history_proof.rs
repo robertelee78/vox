@@ -3559,9 +3559,49 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 );
                 unlock(waiter_dir, waiter_name);
                 attached_as(waiter_dir, "directed-waiter", *waiter_node);
-                let shown = fx35_synced(waiter_dir, *waiter_node);
-                let shown: serde_json::Value = serde_json::from_str(&shown.status)
-                    .expect("APPARATUS: reopened directed waiter status was not JSON");
+                // Ready owns the node before its remembered rooms finish reopening. Follow
+                // only those exact source-owned public preparations; absence without one is
+                // a staging fault, not permission to poll until some desired shape appears.
+                let isolated = unrelated_rooms
+                    .get(waiter_name)
+                    .expect("APPARATUS: waiter isolated room missing");
+                let expected = BTreeSet::from([pressure_room_id.as_str(), isolated.as_str()]);
+                let shown = loop {
+                    let shown = fx35_synced(waiter_dir, *waiter_node);
+                    let shown: serde_json::Value = serde_json::from_str(&shown.status)
+                        .expect("APPARATUS: reopened directed waiter status was not JSON");
+                    assert!(
+                        shown["status"] == "Ready" && shown["identity"] == *waiter_fp,
+                        "APPARATUS: reopened waiter identity/state changed: {shown}"
+                    );
+                    let present: BTreeSet<_> = shown["rooms"]
+                        .as_array()
+                        .expect("APPARATUS: reopened waiter rooms missing")
+                        .iter()
+                        .map(|room| {
+                            room["id"]
+                                .as_str()
+                                .expect("APPARATUS: open room id missing")
+                        })
+                        .collect();
+                    let preparing: BTreeSet<_> = shown["preparing"]
+                        .as_array()
+                        .expect("APPARATUS: reopened waiter preparing list missing")
+                        .iter()
+                        .map(|room| {
+                            room["id"]
+                                .as_str()
+                                .expect("APPARATUS: preparing room id missing")
+                        })
+                        .collect();
+                    assert!(present.is_subset(&expected) && preparing.is_subset(&expected)
+                        && expected.iter().all(|id| present.contains(id) || preparing.contains(id)),
+                        "APPARATUS: expected directed rooms missing without exact preparation, or an extra room appeared: {shown}");
+                    if preparing.is_empty() {
+                        break shown;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
                 assert_directed_waiter_topology(
                     &shown,
                     &pressure_room_id,
