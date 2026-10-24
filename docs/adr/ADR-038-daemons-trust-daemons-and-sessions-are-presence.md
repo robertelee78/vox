@@ -16,7 +16,8 @@
   pairing requests, observation deadlines that do not discard valid work, and the rendezvous
   registration handoff); amended 2026-10-23 (FX-35: the decider approved exact running capacity
   per active-or-retiring hosted identity, with no fixed floor); amended 2026-10-24 (FX-35:
-  resource ownership, fair admission selection, Busy attempt credit and legal proof staging)
+  resource ownership, fair admission selection, Busy attempt credit, legal proof staging and
+  exact accepted Resume capacity ownership)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -742,6 +743,20 @@ lessons. It changes neither this record's decision status nor any requirement or
   capacity and use `SessionBusy`, not misreport a transport failure. Protocol, storage, epoch
   and authority failures retain their own fences and outcomes; this is not a retry-everything
   rule. These changes do not alter the approved two-position capacity or receipt semantics.
+
+  An accepted explicit Resume that lacks local preparation buffer capacity MUST retain its
+  exact request, room, instance and fenced dependency generation behind a typed byte-release
+  dependency, rather than end as evidence-unavailable. A bounded inspection MAY classify the
+  saved request only to select its actual preparation peak; that scalar grants no authority,
+  and all inspection resources MUST be dropped before atomically admitting the complete peak.
+  A byte waiter MUST retain no worker, Context, secret lease, room lock or byte allocation.
+  The real byte release permits fresh fair worker admission and fresh checks of the exact saved
+  request, bounds and authority; Status and unrelated scheduling MUST NOT bypass that dependency.
+  A replacement of this retained Resume owner MUST retire it only after acceptance, while
+  Cancel and queued wakeups MUST match the exact owner and fenced generation. A successful activation commit MUST
+  NOT be rewritten as failure by a later clock or cancellation observation; current authority
+  and lifecycle still fence dispatch, and genuine storage or authority failures retain their own
+  outcomes.
 
   The same composed journey first exposed a late completion reservation that poisoned an
   ordinary room read, an announcement that needed a new retained position while all existing
