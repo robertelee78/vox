@@ -15,7 +15,8 @@
   amended 2026-10-23 (FX-28: atomic node application, durable room-admission rollback, fresh
   pairing requests, observation deadlines that do not discard valid work, and the rendezvous
   registration handoff); amended 2026-10-23 (FX-35: the decider approved exact running capacity
-  per active-or-retiring hosted identity, with no fixed floor)
+  per active-or-retiring hosted identity, with no fixed floor); amended 2026-10-24 (FX-35:
+  resource ownership, fair admission selection, Busy attempt credit and legal proof staging)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -757,6 +758,33 @@ The decider then answered twelve questions, one at a time. His answers are the d
   replace both oversized fixtures without changing its release/read assertions. This is not a
   completed journey or a byte-pressure mutant result. Independent peer-source comparison and
   the detailed ownership/runtime RCA are recorded on [#1028](https://github.com/robertelee78/vox/issues/1028#issuecomment-6377582483).
+
+
+  A subsequent `8c9832ab3` run accepted the same 32 posts but did not complete delivery before
+  the lead stopped it on diagnosed product smoke. Two public observations showed no change in
+  completed rounds, body/history work or either room's readable rows while 819 additional
+  SessionBusy failures accumulated. Workers were briefly active between observations; the
+  samples do not establish a permanently empty worker pool. The admission number in status is
+  a wake token, not the fair ticket's sequence, and is not evidence of ticket grants or FIFO
+  head progress.
+
+  The retained Control admission could name a different port than the locally selected ready
+  Flow. A candidate could queue or consume a worker before discovering its local live lane was
+  occupied. Selection is to make that exact retained owner runnable first, preserving the whole
+  displaced Flow, or withdraw only its own unusable resource ticket while retaining its logical
+  request/hint. Read-only readiness observation is to preserve the documented first-gate reason;
+  only real admission grants capacity. A diagnostic root label can change from inventory to hint
+  while waiting and MUST NOT replace the actual ticket identity of room, peer and lane.
+
+  Independently, Busy bypass used semantic completion to detect a fresh published generation.
+  A refused attempt correctly completes nothing, so an unchanged unfinished generation could
+  bypass the existing Busy policy repeatedly. Actual foreground attempts are to consume separate
+  scheduler-only generation credit at launch. A newer generation arriving during the attempt
+  retains fresh credit; no request, peer receipt or semantic completion is manufactured. An
+  archive-only Page, private pull or incoming attempt does not spend live foreground credit;
+  a normal legacy full-sync attempt does, regardless of its resource lane. This changes no
+  retry duration or running-capacity policy. The [follow-up RCA](https://github.com/robertelee78/vox/issues/1028#issuecomment-6378076112)
+  distinguishes measured observations, source causes and the still-required working journey.
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
