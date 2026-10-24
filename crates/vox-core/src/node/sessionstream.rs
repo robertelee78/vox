@@ -27,6 +27,10 @@ pub(crate) const MAX_PAGE: usize = 1024 * 1024;
 pub(crate) const PAGE_OVERHEAD: usize = 4096;
 /// Wire, decoder copies, one parsed record and encoder/sealing scratch remain charged together.
 pub(crate) const PAGE_ENVELOPE: usize = 4 * MAX_PAGE;
+/// A current private pull must retain its page while applying it under a second room/store
+/// working envelope. Admit both halves together so a set of received pages cannot fill the
+/// shared foreground reservation and then all fail to acquire the work needed to finish.
+pub(crate) const CURRENT_PAGE_ENVELOPE: usize = 2 * PAGE_ENVELOPE;
 
 pub(crate) struct Record {
     pub room: Digest32,
@@ -383,6 +387,16 @@ pub(crate) async fn pull(conn: &VoxConnection, ask: Ask, job: Job) -> Result<Pag
     let charge = job
         .reserve(PAGE_ENVELOPE)
         .ok_or(Error::StreamRefused("private Session transfer busy"))?;
+    pull_precharged(conn, ask, charge).await
+}
+
+/// Pull one page using capacity the current-delivery owner admitted together with its later
+/// room/store application work. Explicit history keeps using [`pull`]'s independent envelope.
+pub(crate) async fn pull_precharged(
+    conn: &VoxConnection,
+    ask: Ask,
+    charge: BufferCharge,
+) -> Result<Page> {
     let (mut send, mut recv) = open_typed(conn, StreamKind::Session).await?;
     write_frame(&mut send, &ask.wire()?).await?;
     send.finish()

@@ -8,7 +8,7 @@ use crate::node::api::{
 };
 use crate::node::channel::legacy_provisional::LegacyProvisionalOwner;
 use crate::node::channel::{entry_store::sparse::ObjectKind, ChannelState};
-use crate::node::history_budget::{Job, Lane};
+use crate::node::history_budget::{Job, Lane, Ticket};
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
 use crate::node::history_stream::{self as stream, Query, RequestId, Staging};
 use crate::node::store::Store;
@@ -83,7 +83,6 @@ enum PreparationOrigin {
     Explicit,
     Observation,
 }
-
 struct Running {
     request: RequestId,
     generation: Digest32,
@@ -91,6 +90,19 @@ struct Running {
     cancellation: demand::Cancellation,
     /// The page this quantum fetches (head, lo, hi), when it is a page.
     page: Option<(Digest32, u64, u64)>,
+}
+
+/// One exact durable archive request whose stale running generation has been retired but whose
+/// replacement preparation has not yet been installed. The fair Control ticket and its wake
+/// task are retained here, so a busy admission edge cannot turn a saved Resume into an
+/// unowned paused status. Once `preparing`, `running` or `ready` owns the request, this owner is
+/// removed.
+struct ResumeOwed {
+    room: Digest32,
+    instance: [u8; 16],
+    request: RequestId,
+    ticket: Option<Ticket>,
+    wake_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 fn page_of(query: &Query) -> Option<(Digest32, u64, u64)> {
@@ -117,8 +129,55 @@ pub(super) struct Controller {
     /// a refreshable Unavailable/Paused observation starts another storage read.
     observation_unread: bool,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
+    resume_owed: Option<ResumeOwed>,
 }
 impl Controller {
+    fn clear_resume_owed(&mut self) {
+        if let Some(mut owed) = self.resume_owed.take() {
+            if let Some(task) = owed.wake_task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    pub(super) fn owe_resume(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX29_MUTANT").as_deref() == Ok("drop-resume-owed") {
+            return;
+        }
+        if self.resume_owed.as_ref().is_some_and(|owed| {
+            owed.room == room && owed.instance == instance && owed.request == request
+        }) {
+            return;
+        }
+        self.clear_resume_owed();
+        self.resume_owed = Some(ResumeOwed {
+            room,
+            instance,
+            request,
+            ticket: None,
+            wake_task: None,
+        });
+    }
+
+    pub(super) fn resume_wake_matches(&self, room: Digest32, request: RequestId) -> bool {
+        self.resume_owed
+            .as_ref()
+            .is_some_and(|owed| owed.room == room && owed.request == request)
+    }
+
+    fn resume_owed_matches(&self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
+        self.resume_owed.as_ref().is_some_and(|owed| {
+            owed.room == room && owed.instance == instance && owed.request == request
+        })
+    }
+
+    pub(super) fn clear_resume_wake(&mut self) {
+        if let Some(owed) = self.resume_owed.as_mut() {
+            owed.wake_task = None;
+        }
+    }
+
     pub(super) fn ready_binding(
         &self,
         room: Digest32,
@@ -160,6 +219,36 @@ impl Controller {
             self.owner_status = Some(status);
         }
     }
+
+    /// Install a durable result only for the exact operation still owned by this controller.
+    /// A late Flow from a cancelled request, replaced room or retired node cannot complete the
+    /// replacement merely because it reused the same actor.
+    pub(super) fn completed_current(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        generation: Digest32,
+        status: Status,
+    ) -> bool {
+        if !self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.request == request && running.generation == generation)
+            || !self.owner_status.as_ref().is_some_and(|current| {
+                current.room == room
+                    && current.instance == instance
+                    && current.request == Some(request)
+            })
+            || status.room != room
+            || status.instance != instance
+            || status.request != Some(request)
+        {
+            return false;
+        }
+        self.completed(request, generation, status);
+        true
+    }
     /// A failed quantum leaves its durable request available for an explicit resume.
     pub(super) fn failed(&mut self, request: RequestId, generation: Digest32, detail: &str) {
         if !self
@@ -183,6 +272,36 @@ impl Controller {
             status.detail = detail.chars().take(128).collect();
         }
     }
+
+    /// Settle only the exact public archive owner named by a returned bounded Flow.
+    ///
+    /// A cancelled/replaced request, a retired room or node, and a later generation have already
+    /// moved `running` or `owner_status`; an old worker must not pause or recreate any of them.
+    /// The caller receives whether this Flow still owned the operation, so it can distinguish a
+    /// truthful saved Pause from disposal of an already superseded capability.
+    pub(super) fn failed_current(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        generation: Digest32,
+        detail: &str,
+    ) -> bool {
+        if !self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.request == request && running.generation == generation)
+            || !self.owner_status.as_ref().is_some_and(|status| {
+                status.room == room
+                    && status.instance == instance
+                    && status.request == Some(request)
+            })
+        {
+            return false;
+        }
+        self.failed(request, generation, detail);
+        true
+    }
     fn stop_request(&mut self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
         if !self
             .owner_status
@@ -199,31 +318,14 @@ impl Controller {
         }
         true
     }
-    /// The daemon's bounded archive queue could not retain this request. Keep its durable
-    /// identity available for an explicit retry, but report the capacity refusal honestly.
-    pub(super) fn busy(&mut self, request: RequestId, generation: Digest32, detail: &str) {
-        if !self
-            .running
-            .as_ref()
-            .is_some_and(|r| r.request == request && r.generation == generation)
-        {
-            return;
-        }
-        if let Some(running) = self.running.take() {
-            running.fence.retire();
-            running.cancellation.cancel();
-        }
-        self.ready = None;
-        if let Some(status) = self
-            .owner_status
-            .as_mut()
-            .filter(|s| s.request == Some(request))
-        {
-            status.phase = Phase::Busy;
-            status.detail = detail.chars().take(128).collect();
-        }
-    }
     pub(super) fn retire_room(&mut self, room: Digest32) {
+        if self
+            .resume_owed
+            .as_ref()
+            .is_some_and(|owed| owed.room == room)
+        {
+            self.clear_resume_owed();
+        }
         let owner_matches = self
             .owner_status
             .as_ref()
@@ -289,6 +391,7 @@ impl Controller {
 
     /// Called before lock/shutdown reports completion. No queued event owns a secret context.
     pub(super) async fn retire(&mut self) {
+        self.clear_resume_owed();
         if let Some(running) = self.running.take() {
             running.fence.retire();
             running.cancellation.cancel();
@@ -415,6 +518,41 @@ impl Node {
         instance: [u8; 16],
         action: Action,
     ) -> Result<Status, String> {
+        let retained_resume = match &action {
+            Action::Resume { request } => self
+                .history_demand
+                .resume_owed_matches(room, instance, *request),
+            _ => false,
+        };
+        if retained_resume {
+            // The command names the already-retained exact owner. Advance that owner rather
+            // than canceling its fair ticket and creating a second admission attempt.
+            self.retry_owed_history_resume();
+            return Ok(self.history_demand.owner_status.clone().unwrap_or_else(|| {
+                status(
+                    room,
+                    instance,
+                    Phase::Busy,
+                    "The exact saved history resume is retained locally.",
+                )
+            }));
+        }
+        if !matches!(&action, Action::Status | Action::Cancel { .. }) {
+            // A person's newer explicit action owns its own result. It cancels an internal
+            // re-arm of the older stale generation rather than leaving two Resume owners.
+            // Cancel defers this destructive step until its complete local admission succeeds.
+            self.history_demand.clear_resume_owed();
+        }
+        self.begin_history_demand_with_job(room, instance, action, None)
+    }
+
+    fn begin_history_demand_with_job(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        action: Action,
+        admitted: Option<Job>,
+    ) -> Result<Status, String> {
         self.accept_history_demand();
         if matches!(action, Action::Status) {
             if let Some(current) = self
@@ -467,6 +605,19 @@ impl Node {
             {
                 return Err(
                     "The active history request belongs to a different room, instance or request."
+                        .into(),
+                );
+            }
+            if self
+                .history_demand
+                .resume_owed
+                .as_ref()
+                .is_some_and(|owed| {
+                    owed.room != room || owed.instance != instance || owed.request != request
+                })
+            {
+                return Err(
+                    "The retained history request belongs to a different room, instance or request."
                         .into(),
                 );
             }
@@ -557,29 +708,39 @@ impl Node {
         );
         let context = Arc::new(Context::unlocked(profile, secret_work).map_err(|e| e.to_string())?);
         let store = profile.store_handle();
-        let Some(job) = self.history_budget.try_start(node, Lane::Control) else {
-            return Ok(status(
-                room,
-                instance,
-                Phase::Busy,
-                "History preparation is busy; cached messages remain available.",
-            ));
+        let job = match admitted {
+            Some(job) => job,
+            None => {
+                let Some(job) = self.history_budget.try_start(node, Lane::Control) else {
+                    return Ok(status(
+                        room,
+                        instance,
+                        Phase::Busy,
+                        "History preparation is busy; cached messages remain available.",
+                    ));
+                };
+                job
+            }
         };
         let local_admission = match action {
-            Action::Status => Ok(demand::LocalAdmission::status(&job)),
-            Action::Cancel { .. } => demand::LocalAdmission::cancel(&job),
+            Action::Status => demand::LocalAdmission::status(&job).map(Some),
+            Action::Cancel { .. } => demand::LocalAdmission::cancel(&job).map(Some),
             _ => Ok(None),
-        }
-        .map_err(|error| error.to_string())?;
-        if local_only && local_admission.is_none() {
-            return Ok(status(
-                room,
-                instance,
-                Phase::Busy,
-                "History preparation buffers are busy; cached messages remain available.",
-            ));
-        }
+        };
+        let local_admission = match local_admission {
+            Ok(admission) => admission,
+            Err(crate::error::Error::HistoryCapacity(_)) => {
+                return Ok(status(
+                    room,
+                    instance,
+                    Phase::Busy,
+                    "History preparation buffers are busy; cached messages remain available.",
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let prior_private = if let Some(request) = cancel_request {
+            self.history_demand.clear_resume_owed();
             if self.history_demand.stop_request(room, instance, request) {
                 self.bounded_sync.cancel_archive(room, instance, request);
             }
@@ -699,6 +860,82 @@ impl Node {
             task,
         });
         Ok(pending)
+    }
+
+    /// Attempt the one retained archive Resume owner once. A busy Control lane keeps its fair
+    /// ticket and receives the exact capacity-release wake; local/profile preflight failures keep
+    /// the durable owner but do not self-wake or spin. Any later actor event may try that owner
+    /// again, while a successful preparation atomically replaces it as the request's owner.
+    pub(super) fn retry_owed_history_resume(&mut self) {
+        let Some(mut owed) = self.history_demand.resume_owed.take() else {
+            return;
+        };
+        if self.history_demand.preparing.is_some()
+            || self.history_demand.running.is_some()
+            || self.history_demand.ready.is_some()
+            || self.history_demand.private_work.is_some()
+        {
+            self.history_demand.resume_owed = Some(owed);
+            return;
+        }
+        let Some(node) = self.profile.as_ref().map(|profile| profile.fingerprint()) else {
+            self.history_demand.resume_owed = Some(owed);
+            return;
+        };
+        if owed.ticket.is_none() {
+            owed.ticket = Some(self.history_budget.enqueue(node, Lane::Control));
+        }
+        let Some(ticket) = owed.ticket.as_mut() else {
+            self.history_demand.resume_owed = Some(owed);
+            return;
+        };
+        // Subscribe before the attempt so a release between the failed admission and task spawn
+        // cannot be lost. Keeping the Ticket in `ResumeOwed` preserves FIFO position.
+        let wake = ticket.wake();
+        if let Some(job) = ticket.try_admit() {
+            owed.ticket = None;
+            if let Some(task) = owed.wake_task.take() {
+                task.abort();
+            }
+            let result = self.begin_history_demand_with_job(
+                owed.room,
+                owed.instance,
+                Action::Resume {
+                    request: owed.request,
+                },
+                Some(job),
+            );
+            if self.history_demand.preparing.is_none() {
+                if let Err(error) = result {
+                    if let Some(status) = self
+                        .history_demand
+                        .owner_status
+                        .as_mut()
+                        .filter(|status| status.request == Some(owed.request))
+                    {
+                        status.phase = Phase::Paused;
+                        status.detail = format!(
+                            "Authorization changed; exact history resume is retained locally: {}",
+                            error.chars().take(96).collect::<String>()
+                        );
+                    }
+                }
+                self.history_demand.resume_owed = Some(owed);
+            }
+            return;
+        }
+        if owed.wake_task.is_none() {
+            let tx = self.net_tx.clone();
+            let room = owed.room;
+            let request = owed.request;
+            owed.wake_task = Some(tokio::spawn(async move {
+                wake.await;
+                let _ = tx
+                    .send(NetEvent::HistoryResumeReady { room, request })
+                    .await;
+            }));
+        }
+        self.history_demand.resume_owed = Some(owed);
     }
 
     fn start_private_history(&mut self, dispatch: PrivateDispatch) {
@@ -1003,9 +1240,10 @@ impl Node {
                         cancellation: dispatch.staging.context.cancellation(),
                         page: page_of(&dispatch.query),
                     });
-                    if let Some(port) = self.ports.get_mut(&(dispatch.room, dispatch.peer)) {
-                        port.raise();
-                    }
+                    // The page is a want of its own on its port (`port_eligible` reads
+                    // `ready_binding`), served on its own stream (#996). Raising the port here
+                    // outlived the page: the archive round consumed no request, so every page a
+                    // reader asked for ran a live inventory round after it that fetched nothing.
                     self.sched_rooms.insert(dispatch.room);
                     self.history_demand.ready = Some(dispatch);
                 }
@@ -1085,6 +1323,16 @@ pub(super) struct CurrentPrivateGuard {
     pub(super) nonce: Option<[u8; crate::atrest::sek::NONCE_LEN]>,
     deadline: tokio::time::Instant,
 }
+
+#[derive(Clone, Copy)]
+pub(super) enum CurrentPrivateBoundary {
+    /// A page or request intent has not committed local semantic work. It may leave this worker
+    /// only if the same authority and observation deadline still hold after preparation.
+    Observing,
+    /// The callback performs its own captured-authority check inside each durable transaction.
+    /// Its committed result is not replaced by a later observation of elapsed time.
+    Applying,
+}
 impl Node {
     pub(super) fn current_private_context(&self) -> Option<(Arc<Store>, CurrentPrivateGuard)> {
         let profile = self.profile.as_ref().filter(|p| p.is_unlocked())?;
@@ -1108,21 +1356,17 @@ impl Node {
 pub(super) async fn current_private_room<T: Send + 'static>(
     room: Arc<Mutex<ChannelState>>,
     store: Arc<Store>,
-    job: Job,
+    charge: crate::node::history_budget::BufferCharge,
     guard: CurrentPrivateGuard,
+    boundary: CurrentPrivateBoundary,
     work: impl FnOnce(&mut ChannelState, &Store) -> crate::error::Result<T> + Send + 'static,
-) -> crate::error::Result<T> {
+) -> crate::error::Result<(crate::node::history_budget::BufferCharge, T)> {
     use crate::error::Error;
-    let charge = job
-        .reserve(4 * 1024 * 1024)
-        .ok_or(Error::StreamRefused("private disk buffers are busy"))?;
     let mut room = tokio::time::timeout_at(guard.deadline, room.lock_owned())
         .await
         .map_err(|_| Error::StreamRefused("private room lock deadline elapsed"))?;
     tokio::task::spawn_blocking(move || {
         let _lease = guard.lease;
-        let _job = job;
-        let _charge = charge;
         if tokio::time::Instant::now() >= guard.deadline
             || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
                 crate::node::trust::TRUST_META_KEY,
@@ -1133,16 +1377,20 @@ pub(super) async fn current_private_room<T: Send + 'static>(
             ));
         }
         let result = work(&mut room, &store)?;
-        if tokio::time::Instant::now() >= guard.deadline
-            || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
-                crate::node::trust::TRUST_META_KEY,
-            )? != guard.nonce
+        if matches!(boundary, CurrentPrivateBoundary::Observing)
+            && (tokio::time::Instant::now() >= guard.deadline
+                || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                    crate::node::trust::TRUST_META_KEY,
+                )? != guard.nonce)
         {
             return Err(Error::StreamRefused(
                 "private authority changed or request expired",
             ));
         }
-        Ok(result)
+        // Applying callbacks own their durable result. finish_private_pull checks the captured
+        // trust nonce inside every record/cursor Batch before commit; a later observation cannot
+        // truthfully replace that committed outcome with a refusal.
+        Ok((charge, result))
     })
     .await
     .map_err(|_| Error::StreamRefused("private disk worker stopped"))?
@@ -1187,7 +1435,7 @@ fn cancel_owned_precharged(
         return Err("History cleanup was cancelled before it committed.".into());
     }
     let committed = match demand::cancel_owned_precharged(context, request, charge)
-        .map_err(|error| error.to_string())?
+        .map_err(|e| e.to_string())?
     {
         demand::LocalCancelOutcome::NewlyCancelled(committed)
         | demand::LocalCancelOutcome::AlreadyCancelled(committed) => committed,
@@ -1238,9 +1486,7 @@ fn prepare_local(
         local_boundary: LocalBoundary::Observed,
         selection_after: None,
     };
-    let (saved, mutation) = admission
-        .inspect(&context)
-        .map_err(|error| error.to_string())?;
+    let (saved, mutation) = admission.inspect(&context).map_err(|e| e.to_string())?;
     let Some(saved) = saved else {
         return Ok(answer);
     };
@@ -1425,7 +1671,29 @@ fn prepare(
             fence,
         );
     }
-    let (bounds, author, query, active, remaining) = if let Action::Resume { request } = action {
+    // This immutable room snapshot determines whether activation must be followed by
+    // a durable pause. Reserve that follow-up before start/resume can commit an Active;
+    // cached/no-selection paths never acquire an unnecessary pause credit.
+    enum PeerAdmission {
+        Available(Digest32),
+        Unavailable(demand::AdmissionCharge),
+    }
+    let peer = peers
+        .into_iter()
+        .find(|peer| room.is_member(peer) && !room.has_left(peer));
+    let admit_peer = || {
+        peer.map_or_else(
+            || {
+                demand::AdmissionCharge::reserve(job)
+                    .map(PeerAdmission::Unavailable)
+                    .map_err(|e| e.to_string())
+            },
+            |peer| Ok(PeerAdmission::Available(peer)),
+        )
+    };
+    let (bounds, author, query, active, remaining, peer) = if let Action::Resume { request } =
+        action
+    {
         let Some(saved) = saved.as_ref() else {
             answer.status.phase = Phase::Unavailable;
             answer.status.detail = "No history request is saved to resume.".into();
@@ -1470,6 +1738,7 @@ fn prepare(
                 wire_bytes: 1024 * 1024,
             }
         };
+        let peer = admit_peer()?;
         let active = demand::resume(&context, request, binding, job).map_err(|e| e.to_string())?;
         (
             state.bounds,
@@ -1477,6 +1746,7 @@ fn prepare(
             query,
             active,
             state.remaining,
+            peer,
         )
     } else {
         // An explicit new ask is the person's newer intent: it ends a paused earlier quantum
@@ -1510,6 +1780,7 @@ fn prepare(
             return Ok(answer);
         };
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
+        let peer = admit_peer()?;
         let active =
             demand::start(&context, request, binding, bounds, job).map_err(|e| e.to_string())?;
         let query = Query::Page {
@@ -1519,26 +1790,26 @@ fn prepare(
             entries: bounds.entries,
             wire_bytes: 1024 * 1024,
         };
-        (bounds, author, query, active, bounds.entries)
+        (bounds, author, query, active, bounds.entries, peer)
     };
     let request = active.request();
-    let Some(peer) = peers
-        .into_iter()
-        .find(|peer| room.is_member(peer) && !room.has_left(peer))
-    else {
-        let mut active = active;
-        demand::pause(&context, &mut active, job).map_err(|e| e.to_string())?;
-        answer.status = status(
-            id,
-            instance,
-            Phase::Unavailable,
-            "No trusted room peer is available; this request is saved and paused.",
-        );
-        answer.status.request = Some(request);
-        answer.status.head = Some(bounds.head);
-        answer.status.author = Some(author);
-        answer.status.remaining = remaining;
-        return Ok(answer);
+    let peer = match peer {
+        PeerAdmission::Available(peer) => peer,
+        PeerAdmission::Unavailable(credit) => {
+            let mut active = active;
+            demand::pause_precharged(&context, &mut active, &credit).map_err(|e| e.to_string())?;
+            answer.status = status(
+                id,
+                instance,
+                Phase::Unavailable,
+                "No trusted room peer is available; this request is saved and paused.",
+            );
+            answer.status.request = Some(request);
+            answer.status.head = Some(bounds.head);
+            answer.status.author = Some(author);
+            answer.status.remaining = remaining;
+            return Ok(answer);
+        }
     };
     answer.status = status(
         id,
@@ -1613,7 +1884,21 @@ fn prepare_private(
         audience: peer,
         grant: answer.generation,
     };
-    let (bounds, plan, mut active) = if let Action::Resume { request } = action {
+    let donor_unavailable = !peers.contains(&peer) || peer == node;
+    let admit_followup = || {
+        // Preserve the fresh durable status read after activation, without allowing its
+        // byte reservation (or an unavailable donor's pause) to hide that committed result.
+        let inspect_credit = demand::AdmissionCharge::reserve(job).map_err(|e| e.to_string())?;
+        let pause_credit = donor_unavailable
+            .then(|| demand::AdmissionCharge::reserve(job))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        Ok::<_, String>((inspect_credit, pause_credit))
+    };
+    let (bounds, plan, mut active, inspect_credit, pause_credit) = if let Action::Resume {
+        request,
+    } = action
+    {
         let state = saved.ok_or("No saved private history request.")?;
         let plan = state
             .private
@@ -1628,8 +1913,9 @@ fn prepare_private(
                     .into(),
             );
         }
+        let (inspect_credit, pause_credit) = admit_followup()?;
         let active = demand::resume(&context, request, binding, job).map_err(|e| e.to_string())?;
-        (state.bounds, plan, active)
+        (state.bounds, plan, active, inspect_credit, pause_credit)
     } else {
         if let Some(state) = saved.filter(|s| {
             !matches!(
@@ -1672,16 +1958,17 @@ fn prepare_private(
             positions: Vec::new(),
         };
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
+        let (inspect_credit, pause_credit) = admit_followup()?;
         let active = demand::start_private(&context, request, binding, bounds, plan.clone(), job)
             .map_err(|e| e.to_string())?;
-        (bounds, plan, active)
+        (bounds, plan, active, inspect_credit, pause_credit)
     };
-    let snapshot = demand::inspect(&context, job)
+    let snapshot = demand::inspect_precharged(&context, inspect_credit)
         .map_err(|e| e.to_string())?
         .ok_or("Private history state disappeared.")?;
     answer.status = saved_status(snapshot.state(), None, Some(&active));
-    if !peers.contains(&peer) || peer == node {
-        demand::pause(&context, &mut active, job).map_err(|e| e.to_string())?;
+    if let Some(credit) = pause_credit {
+        demand::pause_precharged(&context, &mut active, &credit).map_err(|e| e.to_string())?;
         answer.status.phase = Phase::Paused;
         answer.status.detail =
             "The selected private donor is unavailable; resume explicitly after it reconnects."
@@ -1860,4 +2147,141 @@ fn select(
         after: next,
         more: next.is_some(),
     })
+}
+
+impl Controller {
+    /// The history request as it stands, for `vox status --json` (`lanes.history`).
+    pub(super) fn lanes_json(&self) -> String {
+        use crate::node::link::b32_encode;
+        fn js(s: &str) -> String {
+            let mut o = String::from("\"");
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o.push('"');
+            o
+        }
+        let preparation_status = self.preparing.as_ref().and_then(|preparation| {
+            let status = match preparation.origin {
+                PreparationOrigin::Explicit => self.owner_status.as_ref(),
+                PreparationOrigin::Observation => self.observation.as_ref(),
+            }?;
+            (status.room == preparation.room && status.instance == preparation.instance)
+                .then_some(status)
+        });
+        let operation_active = self.private_work.is_some()
+            || self.running.is_some()
+            || self.ready.is_some()
+            || self.resume_owed.is_some();
+        let shown_status = if self.preparing.is_some() {
+            preparation_status
+        } else if operation_active {
+            self.owner_status.as_ref()
+        } else {
+            self.owner_status.as_ref().or(self.observation.as_ref())
+        };
+        let (phase, detail) = shown_status.map_or_else(
+            || ("null".to_owned(), "null".to_owned()),
+            |s| (js(&format!("{:?}", s.phase)), js(&s.detail)),
+        );
+        let active_stage = if self.preparing.is_some() {
+            Some("preparing")
+        } else if self.private_work.is_some() {
+            Some("private_work")
+        } else if self.running.is_some() {
+            Some("running")
+        } else if self.ready.is_some() {
+            Some("ready")
+        } else {
+            None
+        };
+        let render_owner = |status: &Status, stage: &str| {
+            let peer = if stage == "preparing" {
+                status.private_peer
+            } else {
+                self.ready
+                    .as_ref()
+                    .map(|dispatch| dispatch.peer)
+                    .or(status.private_peer)
+            }
+            .map_or_else(
+                || "null".to_owned(),
+                |peer| format!("\"{}\"", b32_encode(&peer)),
+            );
+            let request = status.request.map_or_else(
+                || "null".to_owned(),
+                |request| {
+                    format!(
+                        "\"{}\"",
+                        request
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    )
+                },
+            );
+            let instance = status
+                .instance
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                "{{\"stage\":\"{stage}\",\"room\":\"{}\",\"peer\":{peer},\"request\":{request},\"instance\":\"{instance}\"}}",
+                b32_encode(&status.room)
+            )
+        };
+        let owner = if self.preparing.is_some() {
+            preparation_status.map_or_else(
+                || "null".to_owned(),
+                |status| render_owner(status, "preparing"),
+            )
+        } else if let Some(owed) = self.resume_owed.as_ref() {
+            let peer = self
+                .owner_status
+                .as_ref()
+                .filter(|status| status.request == Some(owed.request))
+                .and_then(|status| status.private_peer)
+                .map_or_else(
+                    || "null".to_owned(),
+                    |peer| format!("\"{}\"", b32_encode(&peer)),
+                );
+            let request = owed
+                .request
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let instance = owed
+                .instance
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let ticket = owed
+                .ticket
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), |ticket| ticket.sequence().to_string());
+            format!(
+                "{{\"stage\":\"resume_owed\",\"room\":\"{}\",\"peer\":{peer},\"request\":\"{request}\",\"instance\":\"{instance}\",\"ticket\":{ticket},\"wake\":{}}}",
+                b32_encode(&owed.room),
+                owed.wake_task.is_some()
+            )
+        } else {
+            self.owner_status.as_ref().zip(active_stage).map_or_else(
+                || "null".to_owned(),
+                |(status, stage)| render_owner(status, stage),
+            )
+        };
+        format!(
+            "{{\"phase\":{phase},\"detail\":{detail},\"owner\":{owner},\"preparing\":{},\"ready\":{},\"running\":{},\"private_work\":{}}}",
+            self.preparing.is_some(),
+            self.ready.is_some(),
+            self.running.is_some(),
+            self.private_work.is_some()
+        )
+    }
 }

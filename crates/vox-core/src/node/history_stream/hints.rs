@@ -1,11 +1,12 @@
-//! One charged, node-owned inventory of pending scalar head hints. Hints carry no authority.
+//! One node-owned inventory of pending scalar head hints. Hints carry no authority or charge.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::log::history::MAX_CONTEXT_AUTHORS;
-use crate::node::history_budget::{BufferCharge, Job};
+use crate::node::history_budget::Job;
 
 use super::HeadHint;
 
@@ -18,9 +19,10 @@ struct Pending {
 }
 #[derive(Default)]
 struct State {
-    generation: u64,
+    /// Retirement belongs to one room/peer lane. A stopped room or peer must not invalidate an
+    /// unrelated worker that happened to read inventory concurrently.
+    generations: BTreeMap<(Digest32, Digest32), u64>,
     pending: Vec<Pending>,
-    charge: Option<BufferCharge>,
 }
 #[derive(Default)]
 pub(crate) struct HintInbox(Mutex<State>);
@@ -28,27 +30,24 @@ pub(crate) struct HintInbox(Mutex<State>);
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Offer {
     pub(crate) added: usize,
+    /// Durable exact refusal relationships invalidated before these hints became eligible.
+    pub(crate) rearmed: usize,
     pub(crate) full: bool,
-    /// The largest size the peer advertised for this node's own feed with a head this node
-    /// holds and accepted: the peer's word that it holds the feed through there.
-    pub(crate) mine_held: Option<u64>,
 }
 
 impl HintInbox {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
-    pub(crate) fn generation(&self) -> u64 {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .generation
+    pub(crate) fn generation(&self, room: Digest32, peer: Digest32) -> u64 {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *state.generations.entry((room, peer)).or_default()
     }
     /// Capture generation before any worker read. A lock/retirement clears it atomically,
     /// so a late, otherwise valid read cannot repopulate the newly empty inventory.
     pub(crate) fn offer(
         &self,
-        job: &Job,
+        _job: &Job,
         generation: u64,
         room: Digest32,
         peer: Digest32,
@@ -58,7 +57,9 @@ impl HintInbox {
             return Err(Error::SizeLimitExceeded("inventory insertion slice"));
         }
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if generation == u64::MAX || generation != state.generation {
+        if generation == u64::MAX
+            || generation != *state.generations.entry((room, peer)).or_default()
+        {
             return Err(Error::Unreachable("history inventory retired"));
         }
         let mut outcome = Offer::default();
@@ -93,19 +94,20 @@ impl HintInbox {
                     || pending.in_flight
                     || pending.hint.size >= hint.size
             });
-            if state.pending.len() == MAX_CONTEXT_AUTHORS {
+            // The inventory bound belongs to this exact port. A busy or hostile room must not
+            // consume a node-wide scalar-hint quota and refuse unrelated rooms. Pending scalar
+            // values are parked scheduler input, not an admitted lane buffer: retaining the
+            // Job (through BufferCharge) here kept its worker, byte reservation and lane slot
+            // until every port's hint was gone, contrary to ADR-038 FX-35.
+            if state
+                .pending
+                .iter()
+                .filter(|pending| pending.room == room && pending.peer == peer)
+                .count()
+                == MAX_CONTEXT_AUTHORS
+            {
                 outcome.full = true;
                 break;
-            }
-            if state.charge.is_none() {
-                let Some(charge) =
-                    job.reserve(MAX_CONTEXT_AUTHORS * std::mem::size_of::<Pending>())
-                else {
-                    outcome.full = true;
-                    break;
-                };
-                state.pending = Vec::with_capacity(MAX_CONTEXT_AUTHORS);
-                state.charge = Some(charge);
             }
             state.pending.push(Pending {
                 room,
@@ -213,33 +215,41 @@ impl HintInbox {
             pending.in_flight = false;
         }
     }
-    pub(crate) fn retire_peer(&self, room: Digest32, peer: Digest32) {
+    /// Retire work bound to a port incarnation. Refusals describe the member's advertised
+    /// inventory, not its socket or port: an ordinary reconnect does not make the bodies exist.
+    pub(crate) fn retire_port(&self, room: Digest32, peer: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         // MAX is a permanently retired generation: offer refuses it rather than wrapping.
-        state.generation = state.generation.saturating_add(1);
+        let generation = state.generations.entry((room, peer)).or_default();
+        *generation = generation.saturating_add(1);
         state.pending.retain(|p| p.room != room || p.peer != peer);
         Self::release_empty(&mut state);
     }
     pub(crate) fn retire_room(&self, room: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        // Retire workers that could still return hints for the removed room. Other retained
-        // hints remain useful; their next worker captures the new inventory generation.
+        // Retire workers that could still return hints for the removed room. Other lanes keep
+        // their exact generation and remain valid.
         // MAX is a permanently retired generation: offer refuses it rather than wrapping.
-        state.generation = state.generation.saturating_add(1);
+        for ((candidate, _), generation) in &mut state.generations {
+            if *candidate == room {
+                *generation = generation.saturating_add(1);
+            }
+        }
         state.pending.retain(|p| p.room != room);
         Self::release_empty(&mut state);
     }
     pub(crate) fn clear(&self) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        // MAX is a permanently retired generation: offer refuses it rather than wrapping.
-        state.generation = state.generation.saturating_add(1);
+        // Every captured scope has an entry because `generation` registers it before a worker
+        // starts. Retire those exact workers without a global scalar that can alias after clear.
+        for generation in state.generations.values_mut() {
+            *generation = generation.saturating_add(1);
+        }
         state.pending = Vec::new();
-        state.charge = None;
     }
     fn release_empty(state: &mut State) {
         if state.pending.is_empty() {
             state.pending = Vec::new();
-            state.charge = None;
         }
     }
 }

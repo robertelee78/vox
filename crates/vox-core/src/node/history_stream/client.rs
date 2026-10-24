@@ -13,13 +13,41 @@ use crate::wire::WireError;
 
 use super::admission::{self, Advanced, Staged};
 use super::credit::Response;
-use super::source::{Lookup, Source};
+use super::source::{Lookup, PreparedRead, Source};
 use super::transport::{Read, Transport};
 use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
 
 const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024;
+const RECORD_METADATA_WORK: usize = 64 * 1024;
+const ENTRY_VALIDATION_WORK: usize = 512 * 1024;
 // One atomic metadata object, or one selected staged body, per receiver handoff.
 const MAX_NEEDS: usize = 1;
+
+fn fresh_worker_peak(job: &crate::node::history_budget::Job, bytes: usize) -> Result<usize> {
+    bytes
+        .checked_add(
+            if job.lane() == crate::node::history_budget::Lane::Control {
+                crate::node::history_budget::FLOW_STATE_BYTES
+            } else {
+                0
+            },
+        )
+        .ok_or(Error::SizeLimitExceeded(
+            "history record reconstruction envelope",
+        ))
+}
+
+/// Proof-only interruption point after a hostile nonrecipient body has been refused and the
+/// archive cursor is durably parked on its authenticated header, but before semantic settlement.
+/// The trigger is renamed with `.engaged`; removing that engaged marker releases the worker.
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_ROLE_SETTLEMENT_ENV: &str = "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE";
+
+/// Proof-only interruption after a body which its authenticated header says belongs to another
+/// member is nevertheless durably appended by a mutant. The marker's exact 32 bytes are the entry
+/// hash; removing it releases the worker.
+#[cfg(feature = "test-knobs")]
+pub const TEST_BODY_DURABLE_ENV: &str = "VOX_TEST_HISTORY_BODY_DURABLE_FILE";
 
 /// Owned activation supplied by the actor after explicit archive demand or current live/control
 /// scheduling. Constructing a receiver never starts, resumes or replaces that activation.
@@ -50,10 +78,16 @@ pub(crate) struct Received {
     pub(crate) needs: Vec<Query>,
     pub(crate) verifiers: Vec<CursorBinding>,
     pub(crate) body_ready: Option<Digest32>,
+    /// Exact authenticated header whose private body this node's role must not receive. Its
+    /// inclusion and semantic settlement still have to complete before the archive can advance.
+    pub(crate) role_ready: Option<(Digest32, u64, Digest32)>,
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
     pub(crate) heads: Vec<super::HeadHint>,
     pub(crate) departure_receipt: Option<super::HeadHint>,
+    /// The exchange fetched an object this node did not hold (a head, header, context or
+    /// proof it saved): what makes a round not `empty` in `vox status --json` (ADR-038 FX-29).
+    pub(crate) brought: bool,
 }
 impl Received {
     fn pending(status: Status) -> Self {
@@ -63,10 +97,12 @@ impl Received {
             needs: Vec::new(),
             verifiers: Vec::new(),
             body_ready: None,
+            role_ready: None,
             body_progress: false,
             inventory: None,
             heads: Vec::new(),
             departure_receipt: None,
+            brought: false,
         }
     }
     fn need(&mut self, query: Query) -> Result<()> {
@@ -94,9 +130,19 @@ impl Receiver {
         historical: bool,
         fence: Arc<crate::transport::stream_transport::Fence>,
         deadline: tokio::time::Instant,
+        work_committed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
-            source: Source::new(room, store, epoch, peer, fence, deadline),
+            source: Source::new(
+                room,
+                store,
+                epoch,
+                peer,
+                fence,
+                deadline,
+                Some((node, generation)),
+                work_committed,
+            ),
             generation,
             node,
             staging,
@@ -123,7 +169,7 @@ impl Receiver {
         // Head, proof construction and verifier staging temporarily overlap. Admit that bounded
         // envelope on the existing large-control lane instead of repeatedly exhausting the
         // ordinary 8-MiB control slice before admission can persist the verifier.
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(LocalProof::Busy);
         };
         let Query::Proof {
@@ -163,11 +209,13 @@ impl Receiver {
             Lookup::Missing => return Ok(LocalProof::Missing),
         };
         let generation = self.generation;
+        let committed = self.source.commit_ledger();
         let staged = self
             .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                 admission::stage(
                     room,
                     store,
+                    &committed,
                     request,
                     generation,
                     &query,
@@ -178,7 +226,10 @@ impl Receiver {
             .await?;
         Ok(match staged {
             Lookup::Found(staged) => match staged.value {
-                Staged::Verifier(binding) => LocalProof::Verified(binding),
+                Staged::Verifier(binding) => {
+                    self.source.note_work_committed();
+                    LocalProof::Verified(binding)
+                }
                 Staged::Busy => LocalProof::Busy,
                 _ => {
                     return Err(Error::MalformedAtRest(
@@ -202,8 +253,10 @@ impl Receiver {
         let mut credit = Response::new(request, query.clone())?;
         credit.charge_handshake(handshake_bytes)?;
         let mut result = Received::pending(Status::ControlPending);
+        #[cfg(feature = "test-knobs")]
+        let mut unexpected_body = None;
         loop {
-            let incoming = match io.read(credit.remaining_wire()).await? {
+            let incoming = match io.read_required(credit.remaining_wire()).await? {
                 Read::Frame(frame) => frame,
                 Read::Busy => {
                     io.abort(WireError::SessionBusy);
@@ -216,7 +269,64 @@ impl Receiver {
             // blocking worker. Its second decode never overlaps this first allocation.
             let action = {
                 let frame = incoming.frame()?;
-                credit.accept(&frame, incoming.wire_len())?;
+                if let Err(error) = credit.accept(&frame, incoming.wire_len()) {
+                    // A hostile authenticated source can send the private bytes which its own
+                    // signed header says belong to somebody else. Refuse those bytes, but do not
+                    // discard the already authenticated header handoff. Its inclusion/effect
+                    // work remains queued locally and the archive resumes below it only after
+                    // that durable settlement. Any other malformed frame still fails the peer.
+                    let refused_exact_role_body = matches!(
+                        (&result.role_ready, &frame),
+                        (
+                            Some((_, _, expected)),
+                            Frame::Chunk {
+                                request: chunk_request,
+                                entry,
+                                offset: 0,
+                                bytes,
+                            }
+                        ) if *chunk_request == request && entry == expected && !bytes.is_empty()
+                    );
+                    if refused_exact_role_body {
+                        let Some((_, seq, _)) = result.role_ready else {
+                            unreachable!()
+                        };
+                        let Query::Page {
+                            head,
+                            lo,
+                            hi,
+                            entries,
+                            ..
+                        } = &query
+                        else {
+                            return Err(error);
+                        };
+                        let continuation = Continuation {
+                            query_kind: 4,
+                            head: *head,
+                            lo: *lo,
+                            hi: *hi,
+                            next_seq: seq,
+                            entry: None,
+                            offset: 0,
+                            entries_remaining: *entries,
+                        };
+                        result.continuation = self
+                            .checkpoint_response(
+                                io.job(),
+                                request,
+                                &query,
+                                Status::More,
+                                Some(continuation),
+                            )
+                            .await?;
+                        io.abort(WireError::ProtocolLimits);
+                        self.hold_role_settlement().await?;
+                        result.status = Status::ControlPending;
+                        return Ok(result);
+                    }
+                    return Err(error);
+                }
                 match frame {
                     Frame::Meta { .. } => Action::Meta,
                     Frame::Have(hints) => Action::Inventory(hints),
@@ -239,14 +349,9 @@ impl Receiver {
             };
             match action {
                 Action::Inventory(hints) => {
-                    let Some(charge) = io
-                        .job()
-                        .reserve(hints.capacity() * std::mem::size_of::<super::HeadHint>())
-                    else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
+                    let charge = io.job().reserve_or_pressure(
+                        hints.capacity() * std::mem::size_of::<super::HeadHint>(),
+                    )?;
                     result.inventory = Some(Inventory {
                         hints,
                         _charge: charge,
@@ -256,18 +361,22 @@ impl Receiver {
                 Action::Meta => {
                     let generation = self.generation;
                     let selected = query.clone();
-                    let Some(work_job) = io.job().record_job(12 * 1024 * 1024) else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
+                    let committed = self.source.commit_ledger();
+                    // The decoded frame still owns its admitted foreground worker. Reuse that
+                    // exact worker for the dependent room read: asking the original Control job
+                    // for a second foreground worker while retaining `incoming` can deadlock the
+                    // bounded worker pool. Its charges still account the complete overlapping
+                    // frame, directory and verifier peak on one owner.
+                    let work_job = incoming.job();
                     let staged = self
                         .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                             let Frame::Meta { object, .. } = incoming.frame()? else {
                                 return Err(Error::MalformedBundle("metadata frame changed"));
                             };
-                            admission::stage(room, store, request, generation, &selected, object)
-                                .map(Some)
+                            admission::stage(
+                                room, store, &committed, request, generation, &selected, object,
+                            )
+                            .map(Some)
                         })
                         .await?;
                     let Lookup::Found(staged) = staged else {
@@ -276,7 +385,7 @@ impl Receiver {
                         return Ok(result);
                     };
                     match &staged.value {
-                        Staged::Object => {}
+                        Staged::Object { brought } => result.brought |= *brought,
                         Staged::Busy => {
                             io.abort(WireError::SessionBusy);
                             result.status = Status::Busy;
@@ -287,10 +396,13 @@ impl Receiver {
                             tail,
                             author,
                             departure_receipt,
+                            held,
+                            brought,
                         } => {
                             if result.heads.len() >= MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history head result bound"));
                             }
+                            result.brought |= *brought;
                             result.heads.push(super::HeadHint {
                                 author: *author,
                                 head: *head,
@@ -302,6 +414,12 @@ impl Receiver {
                                     head: *head,
                                     size: *tail,
                                 });
+                            } else if *held {
+                                // Already in the author's accepted chain: its tail header,
+                                // inclusion proof and promotion are done. Fetching and
+                                // verifying them again every period wrote a cursor, a
+                                // context per join and a receipt for nothing (ADR-038
+                                // FX-29); the window below resumes from what is held.
                             } else if *tail == 0 {
                                 // The canonical empty head has no position-zero header. Its
                                 // ordinary empty consistency proof is the complete promotion
@@ -323,9 +441,16 @@ impl Receiver {
                             if result.verifiers.len() == MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history verifier handoff"));
                             }
+                            result.brought = true;
                             result.verifiers.push(*binding);
                         }
-                        Staged::Header { entry, head } => {
+                        Staged::Header {
+                            entry,
+                            head,
+                            body_allowed,
+                            brought,
+                        } => {
+                            result.brought |= *brought;
                             let seq = entry.skeleton.seq;
                             result.need(Query::Proof {
                                 head: *head,
@@ -334,6 +459,27 @@ impl Receiver {
                                 to: seq,
                             })?;
                             if matches!(query, Query::Header { .. }) {
+                                continue;
+                            }
+                            // The authenticated header says this private package belongs to a
+                            // different member.  Do not create a body staging target or grant
+                            // chunk credit.  An honest peer completes the role-visible entry
+                            // header-only; an unexpected body frame is refused by credit.accept
+                            // before Action::Chunk can persist a byte.
+                            #[cfg(feature = "test-knobs")]
+                            if !body_allowed {
+                                unexpected_body = Some(entry.entry_hash());
+                            }
+                            if !body_allowed {
+                                if result
+                                    .role_ready
+                                    .replace((*head, seq, entry.entry_hash()))
+                                    .is_some()
+                                {
+                                    return Err(Error::SizeLimitExceeded(
+                                        "history role-complete header handoff",
+                                    ));
+                                }
                                 continue;
                             }
                             let Some(staging) = &self.staging else {
@@ -391,7 +537,6 @@ impl Receiver {
                                     &header,
                                     &job,
                                 )?;
-                                current(&fence, deadline)?;
                                 Ok(expected_offset)
                             })
                             .await
@@ -418,10 +563,38 @@ impl Receiver {
                     let Some(staging) = &self.staging else {
                         return Err(Error::Profile("history chunk has no activation"));
                     };
+                    // The decoded chunk remains live through its durable append. Pre-admit the
+                    // mandatory post-append authority read on that exact foreground worker;
+                    // asking the original Control job for another worker while retaining this
+                    // one recreates the same bounded-pool ownership cycle as metadata staging.
+                    let work_job = incoming.job();
+                    let final_chunk = credit.pending_ack_completes(request, entry, next)?;
+                    let ack = Frame::Ack {
+                        request,
+                        entry,
+                        next_offset: next,
+                    };
+                    let encoded = ack.encode_required(io.job())?;
+                    credit.charge_overhead(encoded.as_slice().len() + 4)?;
+                    let Some(authority) = self.source.prepare_committed_read(&work_job).await?
+                    else {
+                        io.abort(WireError::SessionBusy);
+                        result.status = Status::Busy;
+                        return Ok(result);
+                    };
+                    let checkpoint = final_chunk
+                        .then(|| {
+                            Ok::<_, Error>((
+                                demand::AdmissionCharge::reserve(io.job())?,
+                                demand::AdmissionCharge::reserve(io.job())?,
+                            ))
+                        })
+                        .transpose()?;
                     let staging = staging.clone();
                     let job = io.job().clone();
                     let fence = self.source.fence.clone();
                     let deadline = self.source.deadline;
+                    let committed = self.source.commit_ledger();
                     let (persisted, complete) = tokio::task::spawn_blocking(move || {
                         current(&fence, deadline)?;
                         let Frame::Chunk {
@@ -437,7 +610,7 @@ impl Receiver {
                             .active
                             .lock()
                             .map_err(|_| Error::Profile("history activation lock failed"))?;
-                        let persisted = demand::append(
+                        let progress = demand::append(
                             &staging.context,
                             &mut active,
                             exact,
@@ -445,59 +618,52 @@ impl Receiver {
                             bytes,
                             &job,
                         )?;
-                        let snapshot = demand::inspect(&staging.context, &job)?
-                            .ok_or(Error::Profile("history body disappeared"))?;
-                        let complete =
-                            snapshot.state().body.as_ref().is_some_and(|body| {
-                                body.entry == exact && body.offset == body.length
-                            });
-                        current(&fence, deadline)?;
-                        Ok((persisted, complete))
+                        // Keep the successful persisted append visible even if this exchange is
+                        // cancelled before later metadata or ACK handling can report its work.
+                        committed.store(true, std::sync::atomic::Ordering::Release);
+                        Ok(progress)
                     })
                     .await
                     .map_err(|_| Error::Unreachable("history chunk persistence stopped"))??;
                     if persisted != next {
                         return Err(Error::MalformedAtRest("history persisted offset differs"));
                     }
-                    // Durable nonempty chunk progress remains progress even if later metadata
-                    // or ACK allocation is Busy within this same bounded response.
-                    result.body_progress = true;
-                    // Current room access is checked again after durable storage and before ACK.
-                    if !self.authorize(io.job()).await? {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
+                    if complete != final_chunk {
+                        return Err(Error::MalformedAtRest(
+                            "history completed body differs from ACK credit",
+                        ));
                     }
+                    #[cfg(feature = "test-knobs")]
+                    if complete && unexpected_body == Some(entry) {
+                        self.hold_unexpected_body_durable(&entry).await?;
+                    }
+                    // Durable nonempty chunk progress remains progress even if later metadata
+                    // or wire delivery fails within this same bounded response.
+                    result.body_progress = true;
+                    // The prepared read owns every byte needed for this exact post-commit
+                    // authority check. Elapsed observation time cannot replace the durable
+                    // append, while lifecycle and the captured grant remain exact fences.
+                    self.authorize_committed(authority).await?;
                     credit.acknowledge(request, entry, persisted)?;
-                    let ack = Frame::Ack {
-                        request,
-                        entry,
-                        next_offset: persisted,
-                    };
-                    let Some(encoded) = ack.encode(io.job())? else {
-                        io.abort(WireError::SessionBusy);
-                        result.status = Status::Busy;
-                        return Ok(result);
-                    };
-                    credit.charge_overhead(encoded.as_slice().len() + 4)?;
                     io.write_encoded(&encoded).await?;
                     if complete {
                         result.body_ready = Some(entry);
+                        // Queue the final ACK and FIN before any local metadata operation. The
+                        // transport remembers this success, so a later local failure cannot reset
+                        // and discard the sender's causal Live-grant release.
+                        io.finish()?;
+                        let checkpoint = checkpoint
+                            .ok_or(Error::Profile("completed body has no prepaid checkpoint"))?;
                         result.continuation = self
-                            .checkpoint_response(
+                            .checkpoint_response_precharged(
                                 io.job(),
                                 request,
                                 &query,
                                 Status::ControlPending,
                                 None,
+                                checkpoint,
                             )
                             .await?;
-                        // The ACK must reach the source so it can release this completed Live
-                        // grant. Gracefully finish the send direction; resetting it here can
-                        // discard the buffered ACK. The actor still owns the provisional body's
-                        // opaque inclusion/control/authority admission, and this stream accepts
-                        // no additional entry.
-                        io.finish()?;
                         result.status = Status::ControlPending;
                         return Ok(result);
                     }
@@ -515,6 +681,48 @@ impl Receiver {
         }
     }
 
+    async fn hold_role_settlement(&self) -> Result<()> {
+        #[cfg(feature = "test-knobs")]
+        {
+            let Some(trigger) = std::env::var_os(TEST_HOLD_ROLE_SETTLEMENT_ENV)
+                .filter(|path| !path.is_empty())
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_file())
+            else {
+                return Ok(());
+            };
+            let mut engaged = trigger.as_os_str().to_os_string();
+            engaged.push(".engaged");
+            let engaged: std::path::PathBuf = engaged.into();
+            std::fs::rename(&trigger, &engaged).map_err(|_| {
+                Error::Profile("test role-settlement marker could not record engagement")
+            })?;
+            while engaged.is_file() {
+                current(&self.source.fence, self.source.deadline)?;
+                // Apparatus polling only: removing the marker is the causal release; elapsed
+                // time never changes product state or makes the proof pass.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-knobs")]
+    async fn hold_unexpected_body_durable(&self, entry: &Digest32) -> Result<()> {
+        if let Some(path) = std::env::var_os(TEST_BODY_DURABLE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+        {
+            std::fs::write(&path, entry)
+                .map_err(|_| Error::Profile("test durable-body marker could not be written"))?;
+            while path.is_file() {
+                current(&self.source.fence, self.source.deadline)?;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
+    }
+
     /// One persisted verifier slice. This cannot send a request or follow a missing context.
     pub(super) async fn advance(
         &self,
@@ -524,16 +732,19 @@ impl Receiver {
         if binding.generation != self.generation || binding.room == [0; 32] {
             return Err(Error::Profile("history verifier activation changed"));
         }
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Lookup::Busy);
         };
-        self.read(&work_job, VERIFY_ENVELOPE, move |room, store| {
-            if room.channel_id() != binding.room {
-                return Err(Error::Profile("history verifier room changed"));
-            }
-            admission::advance(room, store, &binding).map(Some)
-        })
-        .await
+        let commit_ledger = self.source.commit_ledger();
+        let advanced = self
+            .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
+                if room.channel_id() != binding.room {
+                    return Err(Error::Profile("history verifier room changed"));
+                }
+                admission::advance(room, store, &commit_ledger, &binding).map(Some)
+            })
+            .await?;
+        Ok(advanced)
     }
 }
 
@@ -550,12 +761,20 @@ pub(crate) struct Record {
     pub(crate) entry: crate::log::entry::Entry,
     job: crate::node::history_budget::Job,
     _charge: crate::node::history_budget::BufferCharge,
-    staged: Option<(RequestId, Digest32)>,
+    admission: Option<demand::AdmissionCharge>,
+    staged: Option<(RequestId, Digest32, StagedAdmission)>,
+}
+
+#[derive(Clone, Copy)]
+enum StagedAdmission {
+    Body,
+    RoleHeader,
 }
 pub(crate) enum Assembly {
     Ready(Arc<Record>),
     Pending,
     Busy,
+    BytePressure(crate::node::history_budget::BytePressure),
 }
 
 impl Receiver {
@@ -564,6 +783,7 @@ impl Receiver {
     pub(crate) async fn assemble(
         &self,
         job: &crate::node::history_budget::Job,
+        completion: bool,
     ) -> Result<Assembly> {
         let Some(staging) = &self.staging else {
             return Ok(Assembly::Pending);
@@ -591,14 +811,33 @@ impl Receiver {
             if body.offset != body.length {
                 return Ok(Assembly::Pending);
             }
-            let envelope = 5 * (body.length as usize + crate::log::history::MAX_HEADER_BYTES + 9)
+            let record_envelope = 5
+                * (body.length as usize + crate::log::history::MAX_HEADER_BYTES + 9)
                 + VERIFY_ENVELOPE;
-            let Some(record_job) = job.record_job(envelope) else {
+            let envelope = if completion {
+                demand::AdmissionCharge::total(record_envelope)?
+            } else {
+                record_envelope
+            };
+            let Some(record_job) =
+                tokio::runtime::Handle::current().block_on(job.record_job(envelope))
+            else {
                 return Ok(Assembly::Busy);
             };
-            let Some(charge) = record_job.reserve(envelope) else {
-                return Ok(Assembly::Busy);
+            let peak = fresh_worker_peak(
+                &record_job,
+                demand::AdmissionCharge::reconstruction_peak(
+                    envelope,
+                    job.lane() == record_job.lane(),
+                )?,
+            )?;
+            let pressure = record_job.byte_pressure(peak)?;
+            let Some(mut charge) = record_job.reserve(envelope) else {
+                return Ok(Assembly::BytePressure(pressure));
             };
+            let admission = completion
+                .then(|| demand::AdmissionCharge::split_from(&mut charge))
+                .transpose()?;
             let mut entry = crate::log::entry::Entry::from_wire(&body.header)?;
             let mut payload = Vec::with_capacity(body.length as usize);
             for page in 1..=body
@@ -619,7 +858,8 @@ impl Receiver {
                 entry,
                 job: record_job,
                 _charge: charge,
-                staged: Some((active.request(), generation)),
+                admission,
+                staged: Some((active.request(), generation, StagedAdmission::Body)),
             })))
         })
         .await
@@ -636,11 +876,13 @@ impl Receiver {
     ) -> Result<Lookup<(Arc<Record>, admission::EntryStart)>> {
         let generation = self.generation;
         let job = record.job.clone();
+        let committed = self.source.commit_ledger();
         // The record already owns the complete verification/parse envelope.
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             admission::start_entry(
                 room,
                 store,
+                &committed,
                 request,
                 generation,
                 head,
@@ -662,17 +904,23 @@ impl Receiver {
             return Err(Error::Profile("history entry activation changed"));
         }
         let job = record.job.clone();
-        self.read_precharged(&job, 512 * 1024, record, move |room, store, record| {
-            if record.entry.skeleton.author_id != binding.author
-                || record.entry.skeleton.seq != binding.from
-            {
-                return Err(Error::Profile("history entry record changed"));
-            }
-            if room.channel_id() != binding.room {
-                return Err(Error::Profile("history entry room changed"));
-            }
-            admission::advance_entry(room, store, binding).map(Some)
-        })
+        let committed = self.source.commit_ledger();
+        self.read_precharged(
+            &job,
+            ENTRY_VALIDATION_WORK,
+            record,
+            move |room, store, record| {
+                if record.entry.skeleton.author_id != binding.author
+                    || record.entry.skeleton.seq != binding.from
+                {
+                    return Err(Error::Profile("history entry record changed"));
+                }
+                if room.channel_id() != binding.room {
+                    return Err(Error::Profile("history entry room changed"));
+                }
+                admission::advance_entry(room, store, &committed, binding).map(Some)
+            },
+        )
         .await
     }
 }
@@ -701,6 +949,34 @@ impl Receiver {
         status: Status,
         hint: Option<Continuation>,
     ) -> Result<Option<Continuation>> {
+        self.checkpoint_response_inner(job, request, query, status, hint, None)
+            .await
+    }
+
+    async fn checkpoint_response_precharged(
+        &self,
+        job: &crate::node::history_budget::Job,
+        request: RequestId,
+        query: &Query,
+        status: Status,
+        hint: Option<Continuation>,
+        admission: (demand::AdmissionCharge, demand::AdmissionCharge),
+    ) -> Result<Option<Continuation>> {
+        // The job is unused on the prepaid branch; retain the common helper's exact state and
+        // cursor checks without permitting it to allocate after the durable append.
+        self.checkpoint_response_inner(job, request, query, status, hint, Some(admission))
+            .await
+    }
+
+    async fn checkpoint_response_inner(
+        &self,
+        job: &crate::node::history_budget::Job,
+        request: RequestId,
+        query: &Query,
+        status: Status,
+        hint: Option<Continuation>,
+        admission: Option<(demand::AdmissionCharge, demand::AdmissionCharge)>,
+    ) -> Result<Option<Continuation>> {
         if !matches!(query, Query::Entry { .. } | Query::Page { .. }) {
             return Ok(hint);
         }
@@ -711,24 +987,49 @@ impl Receiver {
         let fence = self.source.fence.clone();
         let deadline = self.source.deadline;
         let job = job.clone();
+        let requested_zero_entry = match query {
+            Query::Entry {
+                head,
+                seq,
+                offset: 0,
+            } => Some((*head, *seq)),
+            _ => None,
+        };
         tokio::task::spawn_blocking(move || {
-            current(&fence, deadline)?;
+            let committed = admission.is_some();
+            if !committed {
+                current(&fence, deadline)?;
+            }
             let mut active = staging
                 .active
                 .lock()
                 .map_err(|_| Error::Profile("history activation lock failed"))?;
-            let snapshot = demand::inspect(&staging.context, &job)?
-                .ok_or(Error::Profile("history activation disappeared"))?;
+            let (snapshot, write) = match admission {
+                Some((inspect, write)) => (
+                    demand::inspect_precharged(&staging.context, inspect)?,
+                    Some(write),
+                ),
+                None => (demand::inspect(&staging.context, &job)?, None),
+            };
+            let snapshot = snapshot.ok_or(Error::Profile("history activation disappeared"))?;
             let state = snapshot.state();
             if !active.matches(state) || active.request() != request {
                 return Err(Error::Profile("history response activation changed"));
             }
             let normalized = if let Some(body) = &state.body {
                 if hint.as_ref().is_some_and(|cursor| {
+                    // An honest Busy before the header carries no new body hash. A prior
+                    // response may already have persisted this exact header at offset zero;
+                    // preserve that durable knowledge rather than treating absence as conflict.
+                    let busy_before_header = status == Status::Busy
+                        && requested_zero_entry == Some((state.bounds.head, body.seq))
+                        && body.offset == 0
+                        && cursor.entry.is_none()
+                        && cursor.offset == 0;
                     cursor.head != state.bounds.head
-                        || cursor.entry != Some(body.entry)
                         || cursor.next_seq != body.seq
-                        || cursor.offset != body.offset
+                        || (!busy_before_header
+                            && (cursor.entry != Some(body.entry) || cursor.offset != body.offset))
                 }) {
                     return Err(Error::MalformedBundle(
                         "history body hint differs from storage",
@@ -770,14 +1071,23 @@ impl Receiver {
                 _ => demand::Progress::Pending,
             };
             drop(snapshot);
-            demand::checkpoint(
-                &staging.context,
-                &mut active,
-                progress,
-                normalized.as_ref(),
-                &job,
-            )?;
-            current(&fence, deadline)?;
+            if let Some(write) = write.as_ref() {
+                demand::checkpoint_precharged(
+                    &staging.context,
+                    &mut active,
+                    progress,
+                    normalized.as_ref(),
+                    write,
+                )?;
+            } else {
+                demand::checkpoint(
+                    &staging.context,
+                    &mut active,
+                    progress,
+                    normalized.as_ref(),
+                    &job,
+                )?;
+            }
             Ok(normalized)
         })
         .await
@@ -791,12 +1101,14 @@ impl Receiver {
         job: &crate::node::history_budget::Job,
         head: Digest32,
         seq: u64,
+        completion: bool,
+        local_work: usize,
     ) -> Result<Assembly> {
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(Assembly::Busy);
         };
         let header = self
-            .read(&work_job, 64 * 1024, move |room, store| {
+            .read(&work_job, RECORD_METADATA_WORK, move |room, store| {
                 let input = room.history_read(store)?;
                 input.history_pending_header(&head, seq)
             })
@@ -807,24 +1119,42 @@ impl Receiver {
                 _ => Assembly::Pending,
             });
         };
-        let envelope = 5
+        let record_envelope = 5
             * (header.value.skeleton.payload_len as usize
                 + crate::log::history::MAX_HEADER_BYTES
                 + 9)
             + VERIFY_ENVELOPE;
-        // Release the metadata job before attempting a large body job. The small header itself
-        // stays charged until its replacement reservation has been acquired.
-        let Some(record_job) = job.record_job(envelope) else {
-            return Ok(Assembly::Busy);
+        let envelope = if completion {
+            demand::AdmissionCharge::total(record_envelope)?
+        } else {
+            record_envelope
         };
-        let Some(charge) = record_job.reserve(envelope) else {
-            return Ok(Assembly::Busy);
+        // The returned header retains the metadata worker which admitted it. Reuse that exact
+        // worker for reconstruction while the header remains live. Asking the original Control
+        // job for another foreground worker would retain one scarce owner while waiting for a
+        // second owner from the same bounded pool.
+        let record_job = header.job();
+        let peak = fresh_worker_peak(
+            &record_job,
+            envelope
+                .checked_add(local_work.max(RECORD_METADATA_WORK))
+                .ok_or(Error::SizeLimitExceeded(
+                    "history record reconstruction envelope",
+                ))?,
+        )?;
+        let pressure = record_job.byte_pressure(peak)?;
+        let Some(mut charge) = record_job.reserve(envelope) else {
+            return Ok(Assembly::BytePressure(pressure));
         };
+        let admission = completion
+            .then(|| demand::AdmissionCharge::split_from(&mut charge))
+            .transpose()?;
         let entry = header.value;
         Ok(Assembly::Ready(Arc::new(Record {
             entry,
             job: record_job,
             _charge: charge,
+            admission,
             staged: None,
         })))
     }
@@ -835,8 +1165,10 @@ impl Receiver {
         record: Arc<Record>,
     ) -> Result<Lookup<(Arc<Record>, bool)>> {
         let job = record.job.clone();
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, _| {
-            room.advance_history_source(store).map(Some)
+            let advanced = room.advance_history_source(store, &committed)?;
+            Ok(Some(advanced))
         })
         .await
     }
@@ -852,6 +1184,7 @@ impl Receiver {
         }
         let job = record.job.clone();
         let grant = self.grant();
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             if binding.room != room.channel_id()
                 || binding.author != record.entry.skeleton.author_id
@@ -862,7 +1195,7 @@ impl Receiver {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
-            room.commit_history_source(store, &record.entry, now, |batch| {
+            room.commit_history_source(store, &committed, &record.entry, now, |batch| {
                 grant.check_batch(batch, room_id, instance, epoch)
             })?;
             // Publication is now Switched, not Idle. Keep the exact verifier until the
@@ -881,6 +1214,7 @@ impl Receiver {
             return Err(Error::Profile("history cleanup activation changed"));
         }
         let job = record.job.clone();
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             if binding.room != room.channel_id()
                 || binding.author != record.entry.skeleton.author_id
@@ -898,12 +1232,14 @@ impl Receiver {
                 return Err(Error::Profile("history cleanup head/entry changed"));
             }
             drop(input);
-            let done = room.cleanup_history_source(store)?;
+            let done = room.cleanup_history_source(store, &committed)?;
             if done {
                 // The same room lock spans cleanup's transition to Idle and this exact
                 // cursor retirement. A crash between them leaves only a resumable cursor;
                 // the accepted source is already durable and is never rolled back here.
-                room.history_write(store, |index| index.finish_history_verifier_cursor(binding))?;
+                room.history_write_tracked(store, &committed, |index| {
+                    index.finish_history_verifier_cursor(binding)
+                })?;
             }
             Ok(Some(done))
         })
@@ -930,6 +1266,7 @@ impl Receiver {
         let staging = self.staging.clone();
         let grant = self.grant();
         let historical = self.historical;
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
@@ -937,6 +1274,7 @@ impl Receiver {
             let body_expected = record.staged.is_some();
             let outcome = room.advance_history_effect(
                 store,
+                &committed,
                 &mut cursor,
                 now,
                 body_expected,
@@ -960,6 +1298,7 @@ impl Receiver {
         let staging = self.staging.clone();
         let grant = self.grant();
         let historical = self.historical;
+        let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
             use crate::node::channel::governance::{PayloadValidation, TypedSparseBody};
             let key = room
@@ -976,16 +1315,17 @@ impl Receiver {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
-            room.refill_history_body(
+            let progress = room.refill_history_body(
                 store,
+                &committed,
                 &record.entry,
                 &body,
                 now,
                 historical,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
-            )
-            .map(Some)
+            )?;
+            Ok(Some(progress))
         })
         .await
     }
@@ -997,9 +1337,13 @@ fn complete_staged(
     record: &Record,
     hash: Digest32,
 ) -> Result<()> {
-    let Some((request, generation)) = record.staged else {
+    let Some((request, generation, admission)) = record.staged else {
         return Ok(());
     };
+    let admission_charge = record
+        .admission
+        .as_ref()
+        .ok_or(Error::Profile("history completion admission missing"))?;
     if hash != record.entry.entry_hash() {
         return Err(Error::MalformedAtRest("history completion entry changed"));
     }
@@ -1011,7 +1355,18 @@ fn complete_staged(
     if active.request() != request || active.binding().grant != generation {
         return Err(Error::Profile("history completion activation changed"));
     }
-    demand::entry_admitted(batch, &staging.context, &active, hash, &record.job)
+    match admission {
+        StagedAdmission::Body => {
+            demand::entry_admitted(batch, &staging.context, &active, hash, admission_charge)
+        }
+        StagedAdmission::RoleHeader => demand::role_header_admitted(
+            batch,
+            &staging.context,
+            &active,
+            record.entry.skeleton.seq,
+            admission_charge,
+        ),
+    }
 }
 
 /// Small scheduling state only. Bodies and context maps never survive a local-step return.
@@ -1023,6 +1378,7 @@ pub(crate) enum LocalStep {
         head: Digest32,
         seq: u64,
         body: bool,
+        role_header: bool,
         phase: EntryPhase,
     },
     Control {
@@ -1067,6 +1423,7 @@ pub(crate) struct LocalResult {
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
     pub(crate) busy: bool,
+    pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
 }
 impl LocalResult {
     fn next(step: LocalStep) -> Self {
@@ -1077,6 +1434,7 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: false,
+            byte_pressure: None,
         }
     }
     fn done() -> Self {
@@ -1087,6 +1445,7 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: false,
+            byte_pressure: None,
         }
     }
     fn wait(step: LocalStep, need: LocalNeed) -> Self {
@@ -1097,6 +1456,7 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: false,
+            byte_pressure: None,
         }
     }
     fn busy(step: LocalStep) -> Self {
@@ -1107,6 +1467,14 @@ impl LocalResult {
             rendered: false,
             governance: false,
             busy: true,
+            byte_pressure: None,
+        }
+    }
+
+    fn byte_pressure(step: LocalStep, pressure: crate::node::history_budget::BytePressure) -> Self {
+        Self {
+            byte_pressure: Some(pressure),
+            ..Self::next(step)
         }
     }
 }
@@ -1150,6 +1518,7 @@ impl Receiver {
             head,
             seq,
             body,
+            role_header,
             phase,
         } = step
         else {
@@ -1164,14 +1533,25 @@ impl Receiver {
                     | EntryPhase::Refill
                     | EntryPhase::Effect(_)
             );
+        let completion =
+            matches!(phase, EntryPhase::Refill | EntryPhase::Effect(_)) && (body || role_header);
         let assembly = if full {
-            self.assemble(job).await?
+            self.assemble(job, completion).await?
         } else {
-            self.header_record(job, head, seq).await?
+            let local_work = if matches!(phase, EntryPhase::Validate(_)) {
+                ENTRY_VALIDATION_WORK
+            } else {
+                RECORD_METADATA_WORK
+            };
+            self.header_record(job, head, seq, completion, local_work)
+                .await?
         };
         let mut record = match assembly {
             Assembly::Ready(record) => record,
             Assembly::Busy => return Ok(LocalResult::busy(step)),
+            Assembly::BytePressure(pressure) => {
+                return Ok(LocalResult::byte_pressure(step, pressure));
+            }
             Assembly::Pending => {
                 return Ok(if full {
                     LocalResult::wait(step, LocalNeed::StagedBody)
@@ -1183,10 +1563,19 @@ impl Receiver {
         if record.entry.skeleton.seq != seq {
             return Err(Error::Profile("history local step entry changed"));
         }
-        if body && !full {
+        if (body && !full) || role_header {
+            let staged = Some((
+                request,
+                self.generation,
+                if role_header {
+                    StagedAdmission::RoleHeader
+                } else {
+                    StagedAdmission::Body
+                },
+            ));
             Arc::get_mut(&mut record)
                 .ok_or(Error::Profile("history header record is shared"))?
-                .staged = Some((request, self.generation));
+                .staged = staged;
         }
         let hash = record.entry.entry_hash();
         let record_author = record.entry.skeleton.author_id;
@@ -1195,14 +1584,26 @@ impl Receiver {
             head,
             seq,
             body,
+            role_header,
             phase,
         };
-        let is_governance = record
-            .entry
-            .skeleton
-            .v2
-            .as_ref()
-            .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Governance);
+        let is_governance = record.entry.skeleton.v2.as_ref().map_or_else(
+            || {
+                record.entry.payload.as_deref().is_some_and(|payload| {
+                    matches!(
+                        crate::node::channel::classify_payload(payload),
+                        Ok(crate::log::entry::EntryKind::Governance)
+                    ) || crate::governance::step_policy::is_step_policy(payload)
+                })
+            },
+            |v2| {
+                matches!(
+                    v2.kind,
+                    crate::log::history::SignedEntryKind::Governance
+                        | crate::log::history::SignedEntryKind::StepPolicy
+                )
+            },
+        );
         let effect_result = |progress| -> LocalResult {
             match progress {
                 Effect::Progress => LocalResult::next(step),
@@ -1236,6 +1637,7 @@ impl Receiver {
                     rendered,
                     governance: is_governance,
                     busy: false,
+                    byte_pressure: None,
                 },
             }
         };
@@ -1266,6 +1668,7 @@ impl Receiver {
                             head,
                             seq,
                             body: true,
+                            role_header: false,
                             phase: EntryPhase::Body,
                         })
                     }
@@ -1282,6 +1685,7 @@ impl Receiver {
                                 head,
                                 seq,
                                 body: true,
+                                role_header: false,
                                 phase,
                             }
                         } else {
@@ -1355,10 +1759,11 @@ impl Receiver {
             }
             EntryPhase::Begin(binding) => {
                 let job = record.job.clone();
+                let committed = self.source.commit_ledger();
                 let value = self
                     .read_precharged(&job, 64 * 1024, record, move |room, store, record| {
                         let admission::EntryAdvanced::Validated(validated) =
-                            admission::advance_entry(room, store, binding)?
+                            admission::advance_entry(room, store, &committed, binding)?
                         else {
                             return Err(Error::Profile(
                                 "completed history validation requires renewed evidence",
@@ -1366,13 +1771,14 @@ impl Receiver {
                         };
                         let started = room.begin_history_source(
                             store,
+                            &committed,
                             request,
                             &record.entry,
                             &validated,
                             now,
                         )?;
                         if matches!(started, Start::Duplicate) {
-                            room.history_write(store, |index| {
+                            room.history_write_tracked(store, &committed, |index| {
                                 index.finish_history_verifier_cursor(binding)
                             })?;
                         }
@@ -1466,9 +1872,10 @@ impl Receiver {
         effects: bool,
     ) -> Result<LocalResult> {
         use crate::node::channel::entry_store::sparse::SourceProgress;
-        let Some(work_job) = job.record_job(12 * 1024 * 1024) else {
+        let Some(work_job) = job.record_job(12 * 1024 * 1024).await else {
             return Ok(LocalResult::busy(step));
         };
+        let committed = self.source.commit_ledger();
         let value = self
             .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                 let input = room.history_read(store)?;
@@ -1502,7 +1909,7 @@ impl Receiver {
                     }
                 }
                 drop(input);
-                let progress = room.history_write(store, |index| {
+                let progress = room.history_write_tracked(store, &committed, |index| {
                     if effects {
                         index.advance_control_effects(&head, through)
                     } else {
@@ -1663,11 +2070,21 @@ impl Receiver {
             })
             .await
     }
-    async fn authorize(&self, job: &crate::node::history_budget::Job) -> Result<bool> {
-        Ok(matches!(
-            self.read(job, 0, |_, _| Ok(Some(()))).await?,
-            Lookup::Found(_)
-        ))
+    async fn authorize_committed(&self, admission: PreparedRead) -> Result<()> {
+        let grant = self.grant();
+        match self
+            .source
+            .read_committed(admission, move |room, store| {
+                grant.check(room, store)?;
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            Lookup::Busy | Lookup::Missing => Err(Error::Profile(
+                "committed history authority read disappeared",
+            )),
+        }
     }
 }
 

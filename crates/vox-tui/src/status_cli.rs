@@ -60,7 +60,58 @@ pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
     }
     let v: Value = serde_json::from_str(&report)
         .map_err(|e| AppError::Usage(format!("the node's report did not parse: {e}")))?;
-    print!("{}", render(&v));
+    validate_governance_status(&v)?;
+    print!("{}", render(&v)?);
+    Ok(())
+}
+
+/// The human renderer must not silently turn a missing or wrong-typed governance answer into
+/// revision zero or an idle backfill. JSON and human status are the same shipped contract.
+fn validate_governance_status(v: &Value) -> Result<(), AppError> {
+    if v.get("governance_pending")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Err(AppError::Usage(
+            "the node's report has no boolean governance_pending".into(),
+        ));
+    }
+    let rooms = v
+        .get("rooms")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AppError::Usage("the node's report has no rooms array".into()))?;
+    for (index, room) in rooms.iter().enumerate() {
+        if room
+            .get("governance_revision")
+            .and_then(Value::as_u64)
+            .is_none()
+        {
+            return Err(AppError::Usage(format!(
+                "the node's report room {index} has no numeric governance_revision"
+            )));
+        }
+        for (member_index, member) in room["members"].as_array().into_iter().flatten().enumerate() {
+            if member
+                .get("key_delivery_pending")
+                .and_then(Value::as_bool)
+                .is_none()
+            {
+                return Err(AppError::Usage(format!(
+                    "the node's report room {index} member {member_index} has no boolean \
+                     key_delivery_pending"
+                )));
+            }
+        }
+        if room
+            .get("render_backfill_pending")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
+            return Err(AppError::Usage(format!(
+                "the node's report room {index} has no boolean render_backfill_pending"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -123,7 +174,7 @@ fn render_anchors(v: &Value) -> String {
 }
 
 /// The report for a person.
-fn render(v: &Value) -> String {
+fn render(v: &Value) -> Result<String, AppError> {
     use std::fmt::Write as _;
     let now = v.get("now_ms").and_then(Value::as_u64).unwrap_or(0);
     let mut o = String::new();
@@ -144,6 +195,15 @@ fn render(v: &Value) -> String {
     if let Some(path) = v.get("log_path").and_then(Value::as_str) {
         let _ = writeln!(o, "daemon log: {path}");
     }
+    let _ = writeln!(
+        o,
+        "governance work: {}",
+        if v.get("governance_pending").and_then(Value::as_bool) == Some(true) {
+            "pending"
+        } else {
+            "idle"
+        }
+    );
     let empty = Vec::new();
     let arr = |k: &str| v.get(k).and_then(Value::as_array).unwrap_or(&empty);
     o.push_str(&render_anchors(v));
@@ -194,10 +254,20 @@ fn render(v: &Value) -> String {
         }
     }
     let _ = writeln!(o, "\nrooms");
-    for r in arr("rooms") {
+    for (index, r) in arr("rooms").iter().enumerate() {
+        let governance_revision = r["governance_revision"].as_u64().ok_or_else(|| {
+            AppError::Usage(format!(
+                "the node's report room {index} has no numeric governance_revision"
+            ))
+        })?;
+        let render_backfill_pending = r["render_backfill_pending"].as_bool().ok_or_else(|| {
+            AppError::Usage(format!(
+                "the node's report room {index} has no boolean render_backfill_pending"
+            ))
+        })?;
         let _ = writeln!(
             o,
-            "  {} {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}",
+            "  {} {}  epoch {}  last sync {}  rows {}  log entries {}  sender keys held {}, received {}; governance revision {}, render backfill {}",
             short(s(r, "id")),
             s(r, "name"),
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
@@ -209,7 +279,13 @@ fn render(v: &Value) -> String {
                 .unwrap_or(0),
             r.get("received_key_generations")
                 .and_then(Value::as_u64)
-                .unwrap_or(0)
+                .unwrap_or(0),
+            governance_revision,
+            if render_backfill_pending {
+                "pending"
+            } else {
+                "idle"
+            }
         );
         let _ = writeln!(
             o,
@@ -260,6 +336,18 @@ fn render(v: &Value) -> String {
             );
             if let Some(said) = m.get("key_waits").and_then(Value::as_str) {
                 let _ = writeln!(o, "      {said}");
+            }
+            if let Some(through) = m.get("held_through").and_then(Value::as_u64) {
+                let _ = writeln!(o, "      holds this node's room feed through {through}");
+            }
+            if let Some(through) = m.get("holds_through").and_then(Value::as_u64) {
+                let _ = writeln!(o, "      this node holds their room feed through {through}");
+            }
+            if flag("key_delivery_pending") {
+                let _ = writeln!(
+                    o,
+                    "      is still owed one or more of your sender keys here"
+                );
             }
         }
     }
@@ -388,13 +476,14 @@ fn render(v: &Value) -> String {
     for r in sync {
         let _ = write!(
             o,
-            "  room {} peer {}: opened {} admitted {} completed {} partial {} failed {} busy-refused {} \
-             stale {} refused {} skipped {} queued {}",
+            "  room {} peer {}: opened {} admitted {} completed {} empty {} partial {} failed {} \
+             busy-refused {} stale {} refused {} skipped {} queued {}",
             short(s(r, "room")),
             short(s(r, "peer")),
             n(r, "opened"),
             n(r, "admitted"),
             n(r, "completed"),
+            n(r, "empty"),
             n(r, "partial"),
             n(r, "failed"),
             n(r, "busy_refused"),
@@ -403,6 +492,21 @@ fn render(v: &Value) -> String {
             n(r, "skipped_at_cap"),
             n(r, "queued"),
         );
+        // Why each completed round ran (ADR-038 FX-15, #996): a round with no need a person
+        // can read here is the defect, not the load.
+        if let Some(why) = r.get("reasons").filter(|w| w.is_object()) {
+            let _ = write!(
+                o,
+                "; why: offer {} hint {} announce {} periodic {} page {} request {} served {}",
+                n(why, "offer"),
+                n(why, "hint"),
+                n(why, "announce"),
+                n(why, "periodic"),
+                n(why, "page"),
+                n(why, "request"),
+                n(why, "served"),
+            );
+        }
         if let Some(b) = r.get("backoff").filter(|b| !b.is_null()) {
             let _ = write!(
                 o,
@@ -438,7 +542,7 @@ fn render(v: &Value) -> String {
         }
         o.push('\n');
     }
-    o
+    Ok(o)
 }
 
 /// One line per live tunnel (V210-81): who, which service, which way, how long it has been open

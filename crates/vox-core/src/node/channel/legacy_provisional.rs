@@ -48,7 +48,11 @@ impl ChannelState {
         if self.legacy_preparation == entry_store::Preparation::Ready {
             return Ok(true);
         }
+        let was_blocking = self.legacy_preparation == entry_store::Preparation::CleanupPending;
         self.legacy_preparation = self.cleanup_legacy_orphan(store)?;
+        if was_blocking && self.legacy_preparation != entry_store::Preparation::CleanupPending {
+            self.history_publication_changed.notify_waiters();
+        }
         Ok(self.legacy_preparation != entry_store::Preparation::CleanupPending)
     }
 
@@ -165,8 +169,13 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure());
         }
-        self.entries
-            .cleanup_legacy_provisional(store, &self.sek, &self.channel_id, owner)
+        let done =
+            self.entries
+                .cleanup_legacy_provisional(store, &self.sek, &self.channel_id, owner)?;
+        if done {
+            self.history_publication_changed.notify_waiters();
+        }
+        Ok(done)
     }
     pub(crate) fn legacy_publication_progress(
         &self,
@@ -188,8 +197,13 @@ impl ChannelState {
         if self.poisoned {
             return Err(self.save_failure());
         }
-        self.entries
-            .cleanup_legacy_publication(store, &self.sek, &self.channel_id, owner)
+        let done =
+            self.entries
+                .cleanup_legacy_publication(store, &self.sek, &self.channel_id, owner)?;
+        if done {
+            self.history_publication_changed.notify_waiters();
+        }
+        Ok(done)
     }
     /// Caller verified the witness and feed linkage. This stores the existing publication
     /// cursor only; a later explicit Resume advances one copy/order quantum.

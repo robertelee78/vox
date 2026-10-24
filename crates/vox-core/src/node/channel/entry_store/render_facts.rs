@@ -1176,7 +1176,13 @@ impl EntryIndex {
         let mut batch = store.batch()?;
         let mut writer = self.write(&mut batch, sek, channel)?;
         if writer.directory.phase == Phase::Building {
-            return Ok(true);
+            // The exact history flow that owns the unpublished promotion drives its next
+            // preparation or retirement slice and wakes governance when the room changes.
+            // Reporting view work here makes the actor's always-ready maintenance branch
+            // rescan the same immutable roots until that separate owner runs. Under a busy
+            // multi-node daemon this consumed whole cores and could starve the owner's cleanup,
+            // leaving ordinary posts refused as "still being applied" until restart.
+            return Ok(false);
         }
         let mut roots = writer.render_roots()?;
         match Source::Batch(writer.batch).number(
@@ -1715,13 +1721,23 @@ impl Write<'_, '_> {
         )?;
         self.set_render_roots(roots)
     }
-    pub(crate) fn next_backfill(&self) -> Result<Option<(Digest32, u64)>> {
+    pub(crate) fn next_backfill_after(
+        &self,
+        after: Option<Digest32>,
+    ) -> Result<Option<(Digest32, u64)>> {
+        let key = match after {
+            None => [0; 64],
+            Some(author) => match successor(hashed(&author)) {
+                Some(key) => key,
+                None => return Ok(None),
+            },
+        };
         Source::Batch(self.batch)
             .first(
                 self.sek,
                 self.channel,
                 self.render_roots()?.rendered.backfill,
-                &[0; 64],
+                &key,
                 0,
             )?
             .map(|(key, value)| match value {

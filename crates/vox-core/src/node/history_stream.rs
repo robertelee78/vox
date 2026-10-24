@@ -111,12 +111,25 @@ pub(crate) async fn serve(
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
     inbox: std::sync::Arc<HintInbox>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> (Result<Status>, bool) {
+) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let source = source::Source::new(room, store, preamble.epoch, peer, fence.clone(), deadline);
+    let source = source::Source::new(
+        room,
+        store,
+        preamble.epoch,
+        peer,
+        fence.clone(),
+        deadline,
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
-    let generation = inbox.generation();
+    let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
+    // Whether the round moved anything: an inventory exchange that added no hint on this side
+    // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
+    // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
+    let mut served_object = false;
     let result = serve_request(
         &source,
         &mut io,
@@ -124,11 +137,13 @@ pub(crate) async fn serve(
         &inbox,
         generation,
         &mut inventory_added,
+        &mut served_object,
         &departure_receipt,
     )
     .await;
     if let Err(error) = &result {
         let code = match error {
+            Error::HistoryCapacity(_) => crate::wire::WireError::SessionBusy,
             Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
                 crate::wire::WireError::ProtocolLimits
             }
@@ -136,9 +151,10 @@ pub(crate) async fn serve(
         };
         io.abort(code);
     }
-    (result, inventory_added)
+    (result, inventory_added, inventory_added || served_object)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_request(
     source: &source::Source,
     io: &mut transport::Transport,
@@ -146,6 +162,7 @@ async fn serve_request(
     inbox: &HintInbox,
     inbox_generation: u64,
     inventory_added: &mut bool,
+    served_object: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
     let first = match io.read_hello().await? {
@@ -210,6 +227,7 @@ async fn serve_request(
         inbox,
         inbox_generation,
         inventory_added,
+        served_object,
     )
     .await
 }
@@ -620,6 +638,22 @@ impl<'a> Frame<'a> {
     /// The caller already owns the independently charged source objects. Lack of room is a
     /// local busy/yield result; it is not malformed peer input.
     pub fn encode(&self, job: &Job) -> Result<Option<Encoded>> {
+        let (maximum, envelope) = self.encoding_envelope()?;
+        let Some(charge) = job.reserve(envelope) else {
+            return Ok(None);
+        };
+        self.encode_precharged(maximum, charge).map(Some)
+    }
+
+    /// An owned client continuation must acquire its encoding before committing the work
+    /// that requires this frame. Refusal carries the exact capacity dependency to that owner.
+    pub(super) fn encode_required(&self, job: &Job) -> Result<Encoded> {
+        let (maximum, envelope) = self.encoding_envelope()?;
+        let charge = job.reserve_or_pressure(envelope)?;
+        self.encode_precharged(maximum, charge)
+    }
+
+    fn encoding_envelope(&self) -> Result<(usize, usize)> {
         let maximum = match self {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
@@ -648,9 +682,15 @@ impl<'a> Frame<'a> {
                 ..
             } => MAX_FRAME_BYTES,
         };
-        let Some(charge) = job.reserve(4 * maximum) else {
-            return Ok(None);
-        };
+        let envelope = maximum
+            .checked_mul(4)
+            .ok_or(Error::SizeLimitExceeded("history encoded frame"))?;
+        Ok((maximum, envelope))
+    }
+
+    // One encoder and validation path for both optional server output and required client ACKs.
+    // The owned reservation covers the same nested proof and final-frame copies in either case.
+    fn encode_precharged(&self, maximum: usize, charge: BufferCharge) -> Result<Encoded> {
         let mut e = Encoder::new();
         let mut tail = None;
         let id = match self {
@@ -785,10 +825,10 @@ impl<'a> Frame<'a> {
         if let Some(tail) = tail {
             bytes.extend_from_slice(&tail);
         }
-        Ok(Some(Encoded {
+        Ok(Encoded {
             bytes,
             _charge: charge,
-        }))
+        })
     }
 
     pub fn decode(bytes: &'a [u8]) -> Result<Self> {
