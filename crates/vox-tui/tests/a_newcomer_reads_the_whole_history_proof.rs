@@ -2820,7 +2820,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 .as_str();
             if let Some(owner) = pressure_continuation(
                 &v,
-                *name,
+                name,
                 fingerprint,
                 &pressure_room_id,
                 &staged.everyone[staged.hosted].3,
@@ -2923,7 +2923,7 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     .3
                     .as_str();
                 if let Some(reconnected) =
-                    pressure_continuation(&status, *name, fp, &pressure_room_id, &disconnected_peer)
+                    pressure_continuation(&status, name, fp, &pressure_room_id, &disconnected_peer)
                 {
                     if reconnected.name != owner {
                         continue;
