@@ -715,6 +715,48 @@ The decider then answered twelve questions, one at a time. His answers are the d
   > `Flow` but no worker, byte charge, outbound slot or flow-state charge. This replaces the
   > earlier `max(16, 2 × hosted identities)` formula; the causal release and retention requirements
   > above remain. Historical 16-of-16 measurements describe the defect, not the capacity policy.
+
+
+  Implementation RCA, 2026-10-24. Running capacity is not the only resource dependency. A
+  Control history request could retain a foreground worker through an `Incoming` or `Held`
+  buffer, then ask its original Control-job alias for another foreground worker. Inventory,
+  metadata verification, header reconstruction, Entry, Proof and Chunk-authority paths shared
+  this pattern.
+  Thirty-two Entry requests could retain two 128-KiB metadata workers each, occupying all 64
+  foreground positions with only 8 MiB of metadata, then all wait for a third worker. This is
+  a source-reachable cycle, not the cause established by the sampled 16-node journey. The
+  operation is to carry its actual admitted worker through overlapping reads and account their
+  full simultaneous byte peak; dropping a job variable does not release a worker still owned
+  by a charged buffer. Increasing a cap or waiting longer does not repair this dependency.
+
+  Local capacity, peer Busy and transport failure have different owners. For an owned outgoing
+  Flow, local capacity is to retain the exact operation behind the real local release; `SessionBusy` or `NotYetMember`
+  from a peer is to retain the exact wire continuation under the existing Busy policy, with
+  no invented cross-host release event. A fresh wire attempt does not discard verified partial
+  reception. Required capacity refusal before I/O is to reach the first reset owner as typed
+  capacity and use `SessionBusy`, not misreport a transport failure. Protocol, storage, epoch
+  and authority failures retain their own fences and outcomes; this is not a retry-everything
+  rule. These changes do not alter the approved two-position capacity or receipt semantics.
+
+  The same composed journey first exposed a late completion reservation that poisoned an
+  ordinary room read, an announcement that needed a new retained position while all existing
+  positions were occupied, and private requesters that could consume capacity needed by their
+  responders. The candidate is
+  to prepay record/completion and ACK resources before semantic mutation, keep announcement
+  priority separate from the original Flow's ownership, and reserve the full private Page/apply
+  peak with its derived serving dependency inside the existing total. An identical validated
+  checkpoint has no new fact to seal or commit. Retirement is to distinguish actual progress,
+  byte/publication dependencies and failed storage, join real workers, and erase the exact old
+  secret-bearing capabilities; a timer or unrelated node's recovery cannot manufacture cleanup.
+
+  Evidence remains separate from these source corrections. The `3c15d2174` journey accepted all
+  32 initial posts and completed all 480 cross-member read observations, then ended APPARATUS
+  during archive setup: its fixture derived roughly 16 MiB of room text from the generic log
+  payload bound, while Content text is limited to 64 KiB and the IPC frame to 256 KiB. Real job
+  barriers, not body size, establish that proof's flow-state pressure; legal short posts are to
+  replace both oversized fixtures without changing its release/read assertions. This is not a
+  completed journey or a byte-pressure mutant result. Independent peer-source comparison and
+  the detailed ownership/runtime RCA are recorded on [#1028](https://github.com/robertelee78/vox/issues/1028#issuecomment-6377582483).
 - **FX-37.** A software root signer MUST retain the ML-DSA signing key constructed from its
   seed and MUST reuse that key's cached public and expanded signing material. Asking the signer
   for its public key or a signature MUST NOT reconstruct the signing key from its seed. The
