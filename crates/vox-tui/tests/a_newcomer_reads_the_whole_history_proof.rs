@@ -3165,8 +3165,8 @@ fn assert_pressure_identity(record: &serde_json::Value, owner: &PressureContinua
 /// first-cause assertion PRODUCT-red. Concurrent same-profile generations and NodeBusy
 /// remain source-reviewed; this journey does not claim to run them.
 /// removing the retained-room health attribution makes that exact room's shipped diagnosis
-/// PRODUCT-red; attributing every open room to the flow-state pool makes the simultaneous
-/// unrelated-room negative diagnosis PRODUCT-red; removing the PoolFull port reason makes the
+/// PRODUCT-red; unrelated-room exclusion requires the separate real-other-member spike.
+/// Removing the PoolFull port reason makes the
 /// full-pool admission's first-gate assertion PRODUCT-red; removing the
 /// post-quiet need re-arm leaves the waiting node short of the named `re-armed` posts.
 #[cfg(feature = "optional-proofs")]
@@ -3572,9 +3572,6 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                 &pressure_room_id,
                 &staged.everyone[staged.hosted].3,
             ) {
-                let unrelated = unrelated_rooms
-                    .get(name)
-                    .expect("APPARATUS: no real unrelated room");
                 assert!(
                     room_health_messages(&v, &pressure_room_id)
                         .iter()
@@ -3582,8 +3579,9 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
                     "PRODUCT: retained pressure room has no exact flow-state pool health: {}",
                     v["unhealthy"]
                 );
-                assert!(room_health_messages(&v, unrelated).iter().all(|message| !message.contains("flow-state pool")),
-                    "PRODUCT: shipped health blamed unrelated held room {unrelated} for flow-state pool: {}", v["unhealthy"]);
+                // The own-only isolated room is skipped by StatusReport::diagnose.
+                // Its empty messages do not prove unrelated-room pool attribution;
+                // that user claim is to be measured by the separate external-member spike.
                 assert_eq!(
                     pool["promised"], 0,
                     "APPARATUS: a release promise existed before the controlled release stage: \
@@ -3826,7 +3824,8 @@ fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
             std::thread::yield_now();
         };
     }
-    // U5's pressure-room and unrelated-room health assertions are complete. While the exact
+    // The exact pressure-room health assertion is complete. Unrelated-room exclusion
+    // requires the focused external-member spike. While the exact
     // source-defined pool is still full and every charge is held, atomically widen the SAME
     // Control/Live barrier. After dynamic resize, fresh work in another room may reserve newly
     // exposed capacity; it must not finish and impersonate the later deliberate release.
