@@ -706,9 +706,9 @@ fn room_id_as(
     let id = value["rooms"]
         .as_array()
         .and_then(|rooms| {
-            rooms
-                .iter()
-                .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))
+            rooms.iter().find(|row| {
+                row["id"].as_str().is_some_and(|id| id.starts_with(room)) || row["name"] == room
+            })
         })
         .and_then(|row| row["id"].as_str())
         .unwrap_or_else(|| panic!("PRODUCT: {reader}'s status omitted room {room}: {out}"));
@@ -1311,12 +1311,14 @@ fn stage_two_archive_jobs(staged: &Staged) -> ArchiveStage {
         "APPARATUS: archive-pressure room creation failed: {err}"
     );
     let listed = attached_as(peer_dir, "peer", *peer_node);
-    let room = listed
+    let room_selector = listed
         .lines()
         .find(|line| line.contains("pool-archive"))
         .and_then(|line| line.split_whitespace().next())
         .unwrap_or_else(|| panic!("APPARATUS: archive-pressure room is not listed: {listed}"))
         .to_owned();
+    let room_id = room_id_as(peer_dir, *peer_node, peer_name, &room_selector);
+    let room = vox_core::node::link::b32_encode(&room_id);
 
     // More rows than the live window leaves a real older page. Derive the record count from
     // the product's live window and archive-job count; large bodies are not this pressure stage.
@@ -1433,8 +1435,6 @@ fn stage_two_archive_jobs(staged: &Staged) -> ArchiveStage {
     // Bind the later forced-disconnect verdict to the two exact public operations accepted above.
     // This observation happens before the connection is stopped and before either held worker is
     // released; it cannot repair the later missing-owner defect.
-    let room_id = vox_core::node::link::b32_decode(&room, "archive-pressure room")
-        .expect("APPARATUS: archive-pressure room id");
     let mut owners = BTreeMap::new();
     for (dir, node, name, _) in &staged.everyone[..vox_core::node::history_budget::ARCHIVE_JOBS] {
         loop {
@@ -1623,12 +1623,14 @@ fn stage_hosted_nodes(
         );
         assert!(ok, "APPARATUS: staging room {name} failed: {err}");
         let listed = attached_as(&host, "host", maker);
-        let room = listed
+        let room_selector = listed
             .lines()
             .find(|l| l.contains(name))
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or_else(|| panic!("APPARATUS: staged room {name} is not listed: {listed}"))
             .to_owned();
+        let room =
+            vox_core::node::link::b32_encode(&room_id_as(&host, maker, hosted[0], &room_selector));
         let (ok, link, err) = vox(&host, &as_node(&["room", "link", &room], maker), None);
         assert!(ok, "APPARATUS: staging room link failed: {err}");
         let link = link
