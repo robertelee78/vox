@@ -57,7 +57,15 @@ struct Prepared {
     legacy: Option<LegacyDispatch>,
     legacy_cancelled: Option<LegacyProvisionalOwner>,
     local_only: bool,
+    local_boundary: LocalBoundary,
     selection_after: Option<Option<Digest32>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalBoundary {
+    Observed,
+    Durable,
+    Superseded,
 }
 pub(super) struct Preparation {
     pub(super) token: u64,
@@ -451,20 +459,18 @@ impl Node {
                 "A local history request is being prepared.",
             ));
         }
-        if let Action::Cancel { request } = action {
-            if self.history_demand.running.is_some()
+        let cancel_request = if let Action::Cancel { request } = action {
+            if (self.history_demand.running.is_some() || self.history_demand.private_work.is_some())
                 && !self.history_demand.owner_status.as_ref().is_some_and(|s| {
                     s.room == room && s.instance == instance && s.request == Some(request)
                 })
             {
                 return Err(
-                    "The running history request belongs to a different room, instance or request."
+                    "The active history request belongs to a different room, instance or request."
                         .into(),
                 );
             }
-            if self.history_demand.stop_request(room, instance, request) {
-                self.bounded_sync.cancel_archive(room, instance, request);
-            }
+            Some(request)
         } else if self.history_demand.running.is_some() {
             // An explicit new page ask is the person's newer intent: it ends the quantum still
             // running for an earlier ask (what it published stays) and takes its place. Status
@@ -512,27 +518,25 @@ impl Node {
                         )
                     }));
             }
-        }
-        let prior_private = if matches!(action, Action::Cancel { .. }) {
-            self.history_demand.private_work.take()
+            None
         } else {
-            if self.history_demand.private_work.is_some() {
-                return Ok(self
-                    .history_demand
-                    .owner_status
-                    .clone()
-                    .filter(|status| status.room == room && status.instance == instance)
-                    .unwrap_or_else(|| {
-                        status(
-                            room,
-                            instance,
-                            Phase::Busy,
-                            "Private history work is settling.",
-                        )
-                    }));
-            }
             None
         };
+        if cancel_request.is_none() && self.history_demand.private_work.is_some() {
+            return Ok(self
+                .history_demand
+                .owner_status
+                .clone()
+                .filter(|status| status.room == room && status.instance == instance)
+                .unwrap_or_else(|| {
+                    status(
+                        room,
+                        instance,
+                        Phase::Busy,
+                        "Private history work is settling.",
+                    )
+                }));
+        }
         let profile = self.profile.as_ref().ok_or("node is locked")?;
         let node = profile.fingerprint();
         let local_only = matches!(action, Action::Status | Action::Cancel { .. });
@@ -561,6 +565,28 @@ impl Node {
                 "History preparation is busy; cached messages remain available.",
             ));
         };
+        let local_admission = match action {
+            Action::Status => Ok(demand::LocalAdmission::status(&job)),
+            Action::Cancel { .. } => demand::LocalAdmission::cancel(&job),
+            _ => Ok(None),
+        }
+        .map_err(|error| error.to_string())?;
+        if local_only && local_admission.is_none() {
+            return Ok(status(
+                room,
+                instance,
+                Phase::Busy,
+                "History preparation buffers are busy; cached messages remain available.",
+            ));
+        }
+        let prior_private = if let Some(request) = cancel_request {
+            if self.history_demand.stop_request(room, instance, request) {
+                self.bounded_sync.cancel_archive(room, instance, request);
+            }
+            self.history_demand.private_work.take()
+        } else {
+            None
+        };
         let peers: Vec<_> = self
             .ports
             .keys()
@@ -581,10 +607,16 @@ impl Node {
         let tx = self.net_tx.clone();
         let weak = shared.as_ref().map(Arc::downgrade).unwrap_or_default();
         let now = self.now_ms().get();
+        let local_cancel = matches!(action, Action::Cancel { .. });
         let task = tokio::spawn(async move {
             let work = async {
                 if let Some(prior) = prior_private { let _ = prior.task.await; }
-                let Some(charge) = job.reserve(5 * 1024 * 1024) else { return Err("history preparation buffers are busy".into()); };
+                let charge = if local_admission.is_some() {
+                    None
+                } else {
+                    let Some(charge) = job.reserve(5 * 1024 * 1024) else { return Err("history preparation buffers are busy".into()); };
+                    Some(charge)
+                };
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 let room_guard = if local_only { None } else {
                     let shared = shared.ok_or("room is not open")?;
@@ -598,12 +630,32 @@ impl Node {
                 // Do not detach this read on cancellation: retire() awaits its bounded completion.
                 tokio::task::spawn_blocking(move || {
                     let _charge = charge;
-                    if read_fence.is_retired() || tokio::time::Instant::now() >= deadline { return Err("history preparation cancelled or expired".into()); }
+                    if read_fence.is_retired()
+                        || (!local_cancel && tokio::time::Instant::now() >= deadline)
+                    {
+                        return Err("history preparation cancelled or expired".into());
+                    }
                     let answer = match room_guard {
                         Some(guard) => prepare(&guard, &store, node, instance, action, context, &job, peers, weak, read_fence.clone(), now, deadline, selection_after),
-                        None => prepare_local(node, room, instance, action, context, &job, &read_fence, deadline),
+                        None => prepare_local(
+                            node,
+                            room,
+                            instance,
+                            action,
+                            context,
+                            local_admission.ok_or("local history admission is missing")?,
+                            &read_fence,
+                        ),
                     };
-                    if read_fence.is_retired() || tokio::time::Instant::now() >= deadline { return Err("history preparation cancelled or expired".into()); }
+                    let durable = answer.as_ref().is_ok_and(|prepared| {
+                        prepared.local_boundary != LocalBoundary::Observed
+                    });
+                    if !durable
+                        && (read_fence.is_retired()
+                            || tokio::time::Instant::now() >= deadline)
+                    {
+                        return Err("history preparation cancelled or expired".into());
+                    }
                     answer
                 }).await.map_err(|_| "history preparation worker stopped".to_owned())?
             }.await;
@@ -782,6 +834,7 @@ impl Node {
         let origin = preparation.origin;
         let target_room = preparation.room;
         let target_instance = preparation.instance;
+        let retired = preparation.fence.is_retired();
         let Ok(mut result) = preparation.result.try_lock() else {
             return false;
         };
@@ -789,6 +842,32 @@ impl Node {
             return false;
         };
         if let Ok(prepared) = ready {
+            let local_boundary = prepared.local_boundary;
+            if local_boundary == LocalBoundary::Superseded
+                || (local_boundary == LocalBoundary::Durable && retired)
+            {
+                let completed = result.take();
+                drop(result);
+                self.history_demand.preparing = None;
+                if let Some(Ok(prepared)) = completed {
+                    if let Some(owner) = prepared.legacy_cancelled {
+                        self.history_demand.cancelled_legacy = Some((prepared.status.room, owner));
+                    }
+                }
+                if local_boundary == LocalBoundary::Superseded
+                    && !retired
+                    && self
+                        .history_demand
+                        .owner_status
+                        .as_ref()
+                        .is_some_and(|status| {
+                            status.room == target_room && status.instance == target_instance
+                        })
+                {
+                    self.history_demand.owner_status = None;
+                }
+                return true;
+            }
             let target_matches =
                 prepared.status.room == target_room && prepared.status.instance == target_instance;
             let current = self
@@ -1091,6 +1170,45 @@ fn cancel_exact(
     Ok(())
 }
 
+enum CancelCompletion {
+    Cancelled,
+    CleanupPending(String),
+    Complete,
+    Superseded,
+}
+
+fn cancel_owned_precharged(
+    context: &Context,
+    request: RequestId,
+    charge: &demand::AdmissionCharge,
+    fence: &Fence,
+) -> Result<CancelCompletion, String> {
+    if fence.is_retired() {
+        return Err("History cleanup was cancelled before it committed.".into());
+    }
+    let committed = match demand::cancel_owned_precharged(context, request, charge)
+        .map_err(|error| error.to_string())?
+    {
+        demand::LocalCancelOutcome::NewlyCancelled(committed)
+        | demand::LocalCancelOutcome::AlreadyCancelled(committed) => committed,
+        demand::LocalCancelOutcome::AlreadyComplete => return Ok(CancelCompletion::Complete),
+    };
+    loop {
+        match demand::reclaim_committed(context, committed.as_ref(), charge) {
+            Ok(demand::CommittedReclaim::More) => std::thread::yield_now(),
+            Ok(demand::CommittedReclaim::Complete) => {
+                return Ok(CancelCompletion::Cancelled);
+            }
+            Ok(demand::CommittedReclaim::Superseded) => {
+                return Ok(CancelCompletion::Superseded);
+            }
+            Err(error) => {
+                return Ok(CancelCompletion::CleanupPending(error.to_string()));
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // One exact locally authorized cleanup/status operation.
 fn prepare_local(
     node: Digest32,
@@ -1098,9 +1216,8 @@ fn prepare_local(
     instance: [u8; 16],
     action: Action,
     context: Arc<Context>,
-    job: &Job,
+    admission: demand::LocalAdmission,
     fence: &Fence,
-    deadline: tokio::time::Instant,
 ) -> Result<Prepared, String> {
     let mut answer = Prepared {
         node,
@@ -1118,9 +1235,12 @@ fn prepare_local(
         legacy: None,
         legacy_cancelled: None,
         local_only: true,
+        local_boundary: LocalBoundary::Observed,
         selection_after: None,
     };
-    let saved = demand::inspect(&context, job).map_err(|e| e.to_string())?;
+    let (saved, mutation) = admission
+        .inspect(&context)
+        .map_err(|error| error.to_string())?;
     let Some(saved) = saved else {
         return Ok(answer);
     };
@@ -1142,16 +1262,41 @@ fn prepare_local(
     match action {
         Action::Status => {}
         Action::Cancel { request } if request == state.request => {
-            if let Some(plan) = &state.legacy {
-                answer.legacy_cancelled = Some(LegacyProvisionalOwner {
-                    request,
-                    instance,
-                    author: plan.author,
-                });
+            let legacy_cancelled = state.legacy.as_ref().map(|plan| LegacyProvisionalOwner {
+                request,
+                instance,
+                author: plan.author,
+            });
+            let mutation = mutation
+                .as_ref()
+                .ok_or("local history cancellation admission is missing")?;
+            match cancel_owned_precharged(&context, request, mutation, fence)? {
+                CancelCompletion::Cancelled => {
+                    answer.legacy_cancelled = legacy_cancelled;
+                    answer.local_boundary = LocalBoundary::Durable;
+                    answer.status.phase = Phase::Cancelled;
+                    answer.status.detail =
+                        "History request cancelled; provisional bytes reclaimed.".into();
+                }
+                CancelCompletion::CleanupPending(error) => {
+                    answer.legacy_cancelled = legacy_cancelled;
+                    answer.local_boundary = LocalBoundary::Durable;
+                    answer.status.phase = Phase::Cancelled;
+                    answer.status.detail = format!(
+                        "History request cancelled; provisional cleanup remains: {}",
+                        error.chars().take(72).collect::<String>()
+                    );
+                }
+                CancelCompletion::Complete => {
+                    answer.local_boundary = LocalBoundary::Durable;
+                    answer.status.phase = Phase::Complete;
+                    answer.status.detail =
+                        "History request was already complete; there is nothing to cancel.".into();
+                }
+                CancelCompletion::Superseded => {
+                    answer.local_boundary = LocalBoundary::Superseded;
+                }
             }
-            cancel_exact(&context, request, job, fence, deadline)?;
-            answer.status.phase = Phase::Cancelled;
-            answer.status.detail = "History request cancelled; provisional bytes reclaimed.".into();
         }
         Action::Cancel { .. } => {
             answer.status.phase = Phase::Unavailable;
@@ -1207,6 +1352,7 @@ fn prepare(
         legacy: None,
         legacy_cancelled: None,
         local_only: false,
+        local_boundary: LocalBoundary::Observed,
         selection_after: None,
     };
     let mut saved = demand::inspect(&context, job).map_err(|e| e.to_string())?;

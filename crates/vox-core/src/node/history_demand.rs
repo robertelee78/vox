@@ -414,6 +414,84 @@ fn charge(job: &Job, bytes: usize) -> Result<BufferCharge> {
     job.reserve(bytes)
         .ok_or_else(|| invalid("history demand buffer budget is busy"))
 }
+
+/// One exact demand-state workspace. Its allocation credit remains attached to the decrypted
+/// state or local mutation that owns it.
+pub(crate) struct AdmissionCharge {
+    _charge: BufferCharge,
+}
+
+impl AdmissionCharge {
+    fn reserve(job: &Job) -> Result<Self> {
+        charge(job, STATE_WORK).map(|charge| Self { _charge: charge })
+    }
+
+    fn split_from(combined: &mut BufferCharge) -> Result<Self> {
+        let charge = combined
+            .split_off(STATE_WORK)
+            .ok_or(Error::SizeLimitExceeded("local history operation envelope"))?;
+        Ok(Self { _charge: charge })
+    }
+}
+
+/// Complete memory admission for one local Status or Cancel. The actor obtains this before any
+/// accepted-action side effect; the worker then consumes these exact credits without reserving.
+pub(crate) struct LocalAdmission {
+    inspect: AdmissionCharge,
+    mutation: Option<AdmissionCharge>,
+}
+
+impl LocalAdmission {
+    pub(crate) fn status(job: &Job) -> Option<Self> {
+        job.reserve(STATE_WORK).map(|charge| Self {
+            inspect: AdmissionCharge { _charge: charge },
+            mutation: None,
+        })
+    }
+
+    pub(crate) fn cancel(job: &Job) -> Result<Option<Self>> {
+        let peak = STATE_WORK
+            .checked_mul(2)
+            .ok_or(Error::SizeLimitExceeded("local history operation envelope"))?;
+        let Some(mut combined) = job.reserve(peak) else {
+            return Ok(None);
+        };
+        let inspect = AdmissionCharge::split_from(&mut combined)?;
+        Ok(Some(Self {
+            inspect,
+            mutation: Some(AdmissionCharge { _charge: combined }),
+        }))
+    }
+
+    pub(crate) fn inspect(
+        self,
+        context: &Context,
+    ) -> Result<(Option<Snapshot>, Option<AdmissionCharge>)> {
+        let snapshot = inspect_precharged(context, self.inspect)?;
+        Ok((snapshot, self.mutation))
+    }
+}
+
+/// Exact durable terminal state returned to the one accepted local Cancel owner.
+pub(crate) enum LocalCancelOutcome {
+    NewlyCancelled(Box<CommittedCancel>),
+    AlreadyCancelled(Box<CommittedCancel>),
+    AlreadyComplete,
+}
+
+/// Capability to reclaim only the exact request whose Cancelled fence is already durable.
+pub(crate) struct CommittedCancel {
+    node: Digest32,
+    scope: Digest32,
+    request: RequestId,
+    binding: Binding,
+}
+
+pub(crate) enum CommittedReclaim {
+    More,
+    Complete,
+    Superseded,
+}
 fn key(context: &Context) -> Result<&Sek> {
     context.check()?;
     Ok(&context.key)
@@ -553,7 +631,10 @@ fn next_serial(serial: u64) -> Result<u64> {
 
 /// Local status/cache inspection only; does not create an Active handle or request peer work.
 pub fn inspect(context: &Context, job: &Job) -> Result<Option<Snapshot>> {
-    let charge = charge(job, STATE_WORK)?;
+    inspect_precharged(context, AdmissionCharge::reserve(job)?)
+}
+
+fn inspect_precharged(context: &Context, charge: AdmissionCharge) -> Result<Option<Snapshot>> {
     let key = key(context)?;
     let scope = scope(context);
     context
@@ -563,7 +644,7 @@ pub fn inspect(context: &Context, job: &Job) -> Result<Option<Snapshot>> {
         .map(|segment| {
             Ok(Snapshot {
                 state: decode(key, &scope, &segment)?,
-                _charge: charge,
+                _charge: charge._charge,
             })
         })
         .transpose()
@@ -1117,7 +1198,16 @@ pub fn pause(context: &Context, active: &mut Active, job: &Job) -> Result<()> {
 
 /// First fence demand atomically; bounded reclamation is separate and never starts peer traffic.
 pub fn cancel(context: &Context, request: RequestId, job: &Job) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    cancel_precharged(context, request, &charge)
+}
+
+/// Cancel using an already-accounted state workspace; no allocation admission occurs here.
+fn cancel_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<()> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
@@ -1135,10 +1225,98 @@ pub fn cancel(context: &Context, request: RequestId, job: &Job) -> Result<()> {
     commit_context(batch, context)
 }
 
+/// Commit the exact local cancellation and return capability-bound cleanup ownership. Lifecycle
+/// cancellation immediately before commit still refuses; cancellation observed after a successful
+/// commit cannot change the durable outcome into an error.
+pub(crate) fn cancel_owned_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<LocalCancelOutcome> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
+    if state.request != request {
+        return Err(invalid("history request ID changed"));
+    }
+    let binding = state.binding;
+    let committed = || CommittedCancel {
+        node: context.node,
+        scope,
+        request,
+        binding,
+    };
+    match state.progress {
+        Progress::Cancelled => {
+            return Ok(LocalCancelOutcome::AlreadyCancelled(Box::new(committed())));
+        }
+        Progress::Complete => return Ok(LocalCancelOutcome::AlreadyComplete),
+        _ => {}
+    }
+    state.serial = next_serial(state.serial)?;
+    state.progress = Progress::Cancelled;
+    schedule_cleanup(&mut state);
+    put(&mut batch, key, &scope, &state)?;
+    // Keep the lifecycle fence through the commit's linearization point. A later observation
+    // cannot truthfully deny the already-committed result.
+    context.check()?;
+    batch.commit()?;
+    Ok(LocalCancelOutcome::NewlyCancelled(Box::new(committed())))
+}
+
+/// Reclaim one bounded slice owned by an exact durable Cancelled capability. The retained Context
+/// keeps its key and secret-work lease alive, but missing or replaced state is never recreated.
+pub(crate) fn reclaim_committed(
+    context: &Context,
+    committed: &CommittedCancel,
+    _charge: &AdmissionCharge,
+) -> Result<CommittedReclaim> {
+    if context.node != committed.node || context.scope != committed.scope {
+        return Err(invalid("history cancellation owner changed"));
+    }
+    let key = &context.key;
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, key, &committed.scope)? else {
+        return Ok(CommittedReclaim::Superseded);
+    };
+    if state.request != committed.request
+        || state.binding != committed.binding
+        || state.progress != Progress::Cancelled
+    {
+        return Ok(CommittedReclaim::Superseded);
+    }
+    let Some(mut cleanup) = state.cleanup else {
+        return Ok(CommittedReclaim::Complete);
+    };
+    let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+    for page in cleanup.next..=end {
+        batch.delete_segment(&committed.scope, KIND, page)?;
+    }
+    cleanup.next = end + 1;
+    state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    put(&mut batch, key, &committed.scope, &state)?;
+    batch.commit()?;
+    Ok(if state.cleanup.is_none() {
+        CommittedReclaim::Complete
+    } else {
+        CommittedReclaim::More
+    })
+}
+
 /// At most 14 page deletes plus one header write (also <=1 MiB). New start waits for true.
 /// Safe after restart for cancelled/completed staging: reclamation does not authorize any sync.
 pub fn reclaim(context: &Context, request: RequestId, job: &Job) -> Result<bool> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    reclaim_precharged(context, request, &charge)
+}
+
+/// Reclaim one bounded slice using an already-accounted state workspace.
+fn reclaim_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<bool> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
