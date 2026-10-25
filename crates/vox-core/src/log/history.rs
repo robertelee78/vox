@@ -1524,7 +1524,9 @@ impl ConsistencyVerifier {
         if next != 0 {
             ranges.push((start, acc));
         }
-        ranges.push((1, head.head().root));
+        if head.head().root.leaves != 0 {
+            ranges.push((1, head.head().root));
+        }
         Ok(Self {
             head,
             prefix,
