@@ -4967,6 +4967,32 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     while member_connected(&alice, &room, &fps[2]).is_none() {
         std::thread::yield_now();
     }
+    // Room-list output intentionally abbreviates the original command argument. Resolve
+    // its unique actual canonical ID once; every protocol-scope observation below stays exact.
+    let control_room = {
+        let (ok, raw, err) = vox(&bob, &["status", "--json"], None);
+        assert!(ok, "PRODUCT: Bob's canonical room status failed: {err}");
+        let status: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("APPARATUS: Bob status JSON: {error}: {raw}"));
+        let matches: Vec<_> = status["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["id"].as_str())
+            .filter(|id| id.starts_with(&room))
+            .collect();
+        assert_eq!(matches.len(), 1,
+            "APPARATUS: abbreviated room {room:?} does not resolve uniquely in Bob's actual status: {raw}");
+        let canonical = matches[0].to_owned();
+        let decoded = vox_core::node::link::b32_decode(&canonical, "quiet control-stage room")
+            .expect("APPARATUS: Bob's actual room ID is not canonical");
+        assert_eq!(
+            vox_core::node::link::b32_encode(&decoded),
+            canonical,
+            "APPARATUS: Bob's actual room ID is not canonical"
+        );
+        canonical
+    };
     // Both readers acquire the SAME current Bob commitment before its author goes offline.
     // This proves local role satisfaction, not a promise that Alice can export all proofs.
     // A completed first root alone is insufficient: require its current resolved facts,
@@ -4979,20 +5005,20 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         let status: serde_json::Value = serde_json::from_str(&raw)
             .unwrap_or_else(|error| panic!("APPARATUS: Bob status JSON: {error}: {raw}"));
-        let room_status = pub_probe_room(&status, &room);
+        let room_status = pub_probe_room(&status, &control_room);
         let cut = room_status["own_feed_through"].as_u64();
-        let captured = pub_current_own_probe(&status, &room, &fps[0])
+        let captured = pub_current_own_probe(&status, &control_room, &fps[0])
             .map(|probe| probe["local_head"].clone())
             .unwrap_or(serde_json::Value::Null);
         let resolved = |peer: &str| {
-            if !pub_has_resolved_own_probe(&status, &room, peer) {
+            if !pub_has_resolved_own_probe(&status, &control_room, peer) {
                 return false;
             }
             let Some(port) = status["lanes"]["ports"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .find(|port| port["room"] == room && port["peer"] == peer)
+                .find(|port| port["room"] == control_room && port["peer"] == peer)
             else {
                 return false;
             };
@@ -5043,14 +5069,14 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
                     serde_json::from_str(&raw).unwrap_or_else(|error| {
                         panic!("APPARATUS: {name} status JSON: {error}: {raw}")
                     });
-                let holds = pub_probe_room(&direct, &room)["members"]
+                let holds = pub_probe_room(&direct, &control_room)["members"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .find(|member| member["id"] == fps[1])
                     .and_then(|member| member["holds_through"].as_u64());
                 let completed = direct["sync"].as_array().into_iter().flatten().any(|lane| {
-                    lane["room"] == room
+                    lane["room"] == control_room
                         && lane["peer"] == fps[1]
                         && lane["fetched_completed"]
                             .as_u64()
