@@ -175,6 +175,8 @@ struct PendingInventory {
     hints: Vec<super::HeadHint>,
     next: usize,
     generation: u64,
+    observation: super::OwnObservation,
+    observation_applied: bool,
     active_charge: Option<crate::node::history_budget::BufferCharge>,
 }
 
@@ -218,6 +220,14 @@ pub(crate) struct Flow {
     /// (ADR-028 R-6). The actor records it, and the settlement tick stops offering the own
     /// head to a peer that holds it (ADR-038 FX-15).
     pub(crate) mine_held: Option<u64>,
+    pub(crate) mine_role: Option<super::RolePosition>,
+    pub(crate) mine_role_context: Option<super::OwnProbeContext>,
+    pub(crate) receipt_scope: Option<super::OwnProbePort>,
+    pub(crate) mine_role_scope: Option<super::OwnProbePort>,
+    pub(crate) mine_role_request: Option<RequestId>,
+    role_handoff: Arc<StdMutex<Option<super::client::ValidatedRole>>>,
+    pub(crate) announced: Option<super::AnnouncementSnapshot>,
+    pub(crate) announced_connection: Option<u64>,
     pub(crate) own_probe: Option<super::OwnProbeClaim>,
     pub(crate) own_probe_scope: Option<super::OwnProbePort>,
     pub(crate) own_probe_answer: Option<super::OwnProbeAnswer>,
@@ -303,6 +313,8 @@ pub(crate) struct Flow {
     /// port cadence.
     publication_owner_wait: Option<RequestId>,
     governance_cycles: u8,
+    #[cfg(feature = "test-knobs")]
+    proof_hold_elapsed: std::time::Duration,
     last_head: Option<super::HeadHint>,
     /// Immutable identity of this cleanup obligation. `request` changes as continuations are
     /// derived; retirement ownership must not.
@@ -338,7 +350,10 @@ pub(crate) struct Flow {
 // room for the one-object receiver handoff and small staging handles. Received inventory has
 // a separate capacity-derived active charge; dependency depth cannot multiply either Vec.
 const _: () = assert!(
-    std::mem::size_of::<Flow>() + MAX_TASKS * std::mem::size_of::<Task>() + 4096
+    std::mem::size_of::<Flow>() + MAX_TASKS * std::mem::size_of::<Task>()
+        + std::mem::size_of::<StdMutex<Option<super::client::ValidatedRole>>>()
+        + 2 * std::mem::size_of::<usize>() // Arc strong/weak counters for the ONE slot
+        + 4096
         <= crate::node::history_budget::FLOW_STATE_BYTES
 );
 /// What [`Flow::resume`] came to (ADR-038 FX-35).
@@ -372,6 +387,13 @@ impl Flow {
         } else {
             "required"
         }
+    }
+
+    pub(crate) fn take_validated_role(&self) -> Option<super::client::ValidatedRole> {
+        self.role_handoff
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     pub(crate) fn retirement_request(&self) -> RequestId {
@@ -419,6 +441,14 @@ impl Flow {
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            mine_role: None,
+            mine_role_context: None,
+            receipt_scope: None,
+            mine_role_scope: None,
+            mine_role_request: None,
+            role_handoff: Arc::new(StdMutex::new(None)),
+            announced: None,
+            announced_connection: None,
             own_probe: None,
             own_probe_scope: None,
             own_probe_answer: None,
@@ -461,6 +491,8 @@ impl Flow {
             publication_dependency: None,
             publication_owner_wait: None,
             governance_cycles: 0,
+            #[cfg(feature = "test-knobs")]
+            proof_hold_elapsed: std::time::Duration::ZERO,
             last_head: None,
             retirement_request: request,
             request,
@@ -557,6 +589,14 @@ impl Flow {
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            mine_role: None,
+            mine_role_context: None,
+            receipt_scope: None,
+            mine_role_scope: None,
+            mine_role_request: None,
+            role_handoff: Arc::new(StdMutex::new(None)),
+            announced: None,
+            announced_connection: None,
             own_probe: None,
             own_probe_scope: None,
             own_probe_answer: None,
@@ -591,6 +631,8 @@ impl Flow {
             publication_dependency: None,
             publication_owner_wait: None,
             governance_cycles: 0,
+            #[cfg(feature = "test-knobs")]
+            proof_hold_elapsed: std::time::Duration::ZERO,
             last_head: None,
             retirement_request: request,
             request,
@@ -810,6 +852,9 @@ impl Flow {
                     .hints
                     .capacity()
                     .checked_mul(std::mem::size_of::<super::HeadHint>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(std::mem::size_of::<super::OwnObservation>())
+                    })
             })?;
         job.reserve(crate::node::history_budget::FLOW_STATE_BYTES.checked_add(retained)?)
     }
@@ -1446,6 +1491,10 @@ impl Flow {
         self.body_progress = false;
         self.governance_wait = false;
         self.governance_cycles = 0;
+        #[cfg(feature = "test-knobs")]
+        {
+            self.proof_hold_elapsed = std::time::Duration::ZERO;
+        }
         self.external = None;
         self.announcement_error = false;
         self.announcement_active = false;
@@ -1458,13 +1507,14 @@ impl Flow {
         let mut quantum_started = tokio::time::Instant::now();
         let mut slices = 0u32;
         let result = loop {
+            let adjusted_deadline = self.proof_deadline(deadline);
             let result = self
                 .turn_inner(
                     store.clone(),
                     conn,
                     job,
                     fence.clone(),
-                    deadline,
+                    adjusted_deadline,
                     inbox,
                     inbox_generation,
                     now,
@@ -1495,7 +1545,7 @@ impl Flow {
                 || (!publication_active
                     && (slices >= LOCAL_SLICES_PER_TURN
                         || quantum_started.elapsed() >= LOCAL_TURN_BUDGET
-                        || tokio::time::Instant::now() >= deadline))
+                        || tokio::time::Instant::now() >= self.proof_deadline(deadline)))
                 || !self.next_slice_is_local()
             {
                 break result;
@@ -1531,6 +1581,15 @@ impl Flow {
         // dispose its root; the semantic response/progress edge is the only thing that advances
         // it, while the actor's named Busy backoff prevents spinning between those edges.
         result
+    }
+
+    #[cfg(feature = "test-knobs")]
+    fn proof_deadline(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
+        deadline + self.proof_hold_elapsed
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    fn proof_deadline(&self, deadline: tokio::time::Instant) -> tokio::time::Instant {
+        deadline
     }
 
     // One bounded turn uses the same stream, job, hint inbox and deadline throughout.
@@ -1658,6 +1717,8 @@ impl Flow {
                     announcement.prior_request
                 })
         });
+        #[cfg(feature = "test-knobs")]
+        let source_hold_elapsed = Arc::clone(&source.proof_hold_elapsed);
         let result = self
             .execute_task(
                 task,
@@ -1674,6 +1735,12 @@ impl Flow {
                 &mut retry_task,
             )
             .await;
+        #[cfg(feature = "test-knobs")]
+        {
+            self.proof_hold_elapsed += *source_hold_elapsed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
         if let Some(request) = ordinary_request {
             self.request = request;
         }
@@ -1765,6 +1832,8 @@ impl Flow {
             hints: inventory.hints,
             next: 0,
             generation,
+            observation: inventory.observation,
+            observation_applied: false,
             active_charge: Some(inventory._charge),
         });
         Ok(())
@@ -1777,20 +1846,33 @@ impl Flow {
         inbox: &Arc<super::HintInbox>,
     ) -> Result<bool> {
         if let Some(inventory) = self.pending_inventory.as_ref() {
-            if inventory.next == inventory.hints.len() {
+            if inventory.observation_applied && inventory.next == inventory.hints.len() {
                 self.pending_inventory = None;
                 return Ok(true);
             }
+            let scalar_step = !inventory.observation_applied;
             let end = inventory.next.saturating_add(64).min(inventory.hints.len());
-            let offered = source
-                .offer_inventory(
-                    job,
-                    inbox,
-                    inventory.generation,
-                    self.room,
-                    &inventory.hints[inventory.next..end],
-                )
-                .await?;
+            let offered = if scalar_step {
+                source
+                    .offer_observation(
+                        job,
+                        inbox,
+                        inventory.generation,
+                        self.room,
+                        inventory.observation,
+                    )
+                    .await?
+            } else {
+                source
+                    .offer_inventory(
+                        job,
+                        inbox,
+                        inventory.generation,
+                        self.room,
+                        &inventory.hints[inventory.next..end],
+                    )
+                    .await?
+            };
             let offered = match offered {
                 super::source::InventoryOffer::Publication(wait) => {
                     self.publication_owner_wait = wait.owner;
@@ -1808,10 +1890,11 @@ impl Flow {
             };
             self.offered = self.offered.saturating_add(offered.added as u64);
             self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
-            if offered.added != 0 {
+            // A canonical own-Head question is scheduling work, not fetched history.
+            // Ordinary missing-author hints retain their existing useful-admission credit;
+            // only the owning store transaction may mark the durable commit ledger.
+            if !scalar_step && offered.added != 0 {
                 self.brought = true;
-                self.work_committed
-                    .store(true, std::sync::atomic::Ordering::Release);
             }
             // full is the existing per-port Inbox quota: only added is admitted; its
             // rejected gossip suffix gains no owner. This is not publication suspension or
@@ -1821,8 +1904,12 @@ impl Flow {
                 .pending_inventory
                 .as_mut()
                 .ok_or(Error::Profile("history inventory owner missing"))?;
-            inventory.next = end;
-            let done = inventory.next == inventory.hints.len();
+            if scalar_step {
+                inventory.observation_applied = true;
+            } else {
+                inventory.next = end;
+            }
+            let done = inventory.observation_applied && inventory.next == inventory.hints.len();
             if done {
                 self.pending_inventory = None;
             }
@@ -1831,6 +1918,194 @@ impl Flow {
             return Ok(done);
         }
         Ok(true)
+    }
+
+    /// Observe only actual receipt-time scalars for the selected real Live refusal. The
+    /// public last-saved record may name its captured hint after the selected-window refusal;
+    /// neither target may be inferred from a later mutable window or assumed equal.
+    #[cfg(feature = "test-knobs")]
+    fn observe_refusal_for_proof(
+        &self,
+        request: RequestId,
+        purpose: Purpose,
+        response: &LocalRefusal,
+        continuation: Option<&super::Continuation>,
+    ) {
+        if purpose != Purpose::Live || response.status != Status::BodyNotHeld {
+            return;
+        }
+        let Query::Entry { head, seq, offset } = response.query else {
+            return;
+        };
+        let Some(path) = std::env::var_os("VOX_TEST_HOLD_HISTORY_DECLINE_FILE") else {
+            return;
+        };
+        let Ok(selector) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Some([peer, author]) = super::source::proof_selector(&selector, ["peer", "author"])
+        else {
+            return;
+        };
+        if peer != self.peer || response.live_author != Some(author) {
+            return;
+        }
+        let at = std::path::PathBuf::from(format!(
+            "{}.response",
+            std::path::Path::new(&path).display()
+        ));
+        if at.exists() {
+            return;
+        }
+        let hint_author = response.hint.map_or_else(
+            || "null".to_owned(),
+            |hint| crate::node::link::b32_encode(&hint.author),
+        );
+        let hint_head = response.hint.map_or_else(
+            || "null".to_owned(),
+            |hint| crate::node::link::b32_encode(&hint.head),
+        );
+        let response_entry = continuation.and_then(|cursor| cursor.entry).map_or_else(
+            || "null".to_owned(),
+            |entry| crate::node::link::b32_encode(&entry),
+        );
+        let identity = format!(
+            "node={} room={} peer={} instance={} generation={} root={} request={} status=body_not_held live_author={} selected_head={} hint_author={} hint_head={} query_head={} query_seq={} query_offset={} response_entry={}\n",
+            crate::node::link::b32_encode(&self.node),
+            crate::node::link::b32_encode(&self.room),
+            crate::node::link::b32_encode(&self.peer),
+            super::source::request_text(&self.instance),
+            crate::node::link::b32_encode(&self.generation),
+            super::source::request_text(&self.retirement_request),
+            super::source::request_text(&request),
+            crate::node::link::b32_encode(&author),
+            crate::node::link::b32_encode(&head),
+            hint_author,
+            hint_head,
+            crate::node::link::b32_encode(&head),
+            seq,
+            offset,
+            response_entry,
+        );
+        let temporary = std::path::PathBuf::from(format!(
+            "{}.tmp-{}-{}",
+            at.display(),
+            std::process::id(),
+            super::source::request_text(&request)
+        ));
+        // Same-directory hard-link publication never replaces the first real response marker.
+        let published = std::fs::write(&temporary, &identity)
+            .and_then(|()| std::fs::hard_link(&temporary, &at));
+        let _ = std::fs::remove_file(&temporary);
+        match published {
+            Ok(()) => eprintln!("[proof] received refusal: {}", identity.trim_end()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                eprintln!("APPARATUS: could not publish received refusal witness: {error}")
+            }
+        }
+    }
+
+    /// Apparatus only: hold a genuine committed Building publication after the joined local
+    /// callback and all Record/Batch/room temporaries have ended. This is an already admitted
+    /// Archive producer; its actual worker/state/outbound ownership remains held, exactly like
+    /// the existing job barrier. No production gate, phase, wake or admission is changed.
+    #[cfg(feature = "test-knobs")]
+    async fn hold_publication_for_proof(
+        &self,
+        entry_hash: Digest32,
+        next: LocalStep,
+        fence: &Arc<Fence>,
+        job: &Job,
+    ) -> std::time::Duration {
+        if !self.archive {
+            return std::time::Duration::ZERO;
+        }
+        let LocalStep::Entry {
+            request,
+            phase: EntryPhase::Prepare(_),
+            ..
+        } = next
+        else {
+            return std::time::Duration::ZERO;
+        };
+        let Some(base) = std::env::var_os("VOX_TEST_HOLD_HISTORY_DECLINE_FILE") else {
+            return std::time::Duration::ZERO;
+        };
+        let path = std::path::PathBuf::from(format!(
+            "{}.publication",
+            std::path::Path::new(&base).display()
+        ));
+        let selector = match std::fs::read_to_string(&path) {
+            Ok(selector) => selector,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return std::time::Duration::ZERO
+            }
+            Err(error) => {
+                eprintln!("APPARATUS: could not read publication hold selector: {error}");
+                return std::time::Duration::ZERO;
+            }
+        };
+        let Some([node, room, peer, entry]) =
+            super::source::proof_selector(&selector, ["node", "room", "peer", "entry"])
+        else {
+            eprintln!("APPARATUS: publication hold selector is not canonical");
+            return std::time::Duration::ZERO;
+        };
+        if (node, room, peer, entry) != (self.node, self.room, self.peer, entry_hash) {
+            return std::time::Duration::ZERO;
+        }
+        if !self.has_publication_producer(request) {
+            eprintln!("APPARATUS: committed publication successor was not retained");
+            return std::time::Duration::ZERO;
+        }
+        let entered = std::path::PathBuf::from(format!("{}.entered", path.display()));
+        let temporary = std::path::PathBuf::from(format!(
+            "{}.tmp-{}-{}",
+            entered.display(),
+            std::process::id(),
+            super::source::request_text(&request)
+        ));
+        let lane = match job.lane() {
+            crate::node::history_budget::Lane::Control => "control",
+            crate::node::history_budget::Lane::LargeControl => "large_control",
+            crate::node::history_budget::Lane::Live => "live",
+            crate::node::history_budget::Lane::Archive => "archive",
+        };
+        let identity = format!(
+            "phase=building node={} room={} peer={} instance={} root={} request={} generation={} entry={} logical_archive=true worker_lane={}\n",
+            crate::node::link::b32_encode(&self.node),
+            crate::node::link::b32_encode(&self.room),
+            crate::node::link::b32_encode(&self.peer),
+            super::source::request_text(&self.instance),
+            super::source::request_text(&self.retirement_request),
+            super::source::request_text(&request),
+            crate::node::link::b32_encode(&self.generation),
+            crate::node::link::b32_encode(&entry_hash),
+            lane,
+        );
+        if let Err(error) = std::fs::write(&temporary, &identity)
+            .and_then(|()| std::fs::rename(&temporary, &entered))
+        {
+            let _ = std::fs::remove_file(&temporary);
+            eprintln!("APPARATUS: could not publish committed publication hold marker: {error}");
+            return std::time::Duration::ZERO;
+        }
+        eprintln!(
+            "[proof] committed publication held: {}",
+            identity.trim_end()
+        );
+        let mut held_from = None;
+        while path.exists() {
+            held_from.get_or_insert_with(tokio::time::Instant::now);
+            tokio::select! {
+                () = fence.retired() => break,
+                () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {},
+            }
+        }
+        let elapsed = held_from.map_or(std::time::Duration::ZERO, |started| started.elapsed());
+        let _ = std::fs::remove_file(entered);
+        elapsed
     }
 
     fn received_refusal(&self, query: Query, status: Status) -> Operation {
@@ -2675,7 +2950,19 @@ impl Flow {
                         query = Query::Entry { head, seq, offset };
                     }
                 }
-                let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
+                let receiver = self
+                    .receiver(store.clone(), task.purpose, fence.clone(), deadline)
+                    .with_role_handoff(
+                        Arc::clone(&self.role_handoff),
+                        super::OwnProbeContext {
+                            node: self.node,
+                            instance: self.instance,
+                            epoch: self.epoch,
+                            authorization: self.generation,
+                            connection: conn.serial(),
+                        },
+                        self.receipt_scope,
+                    );
                 let wire_request = if body {
                     self.stage(task.purpose)
                         .map(|s| {
@@ -2704,6 +2991,10 @@ impl Flow {
                     deadline,
                 )
                 .await?;
+                if let Some(snapshot) = result.announced {
+                    self.announced = Some(snapshot);
+                    self.announced_connection = Some(conn.serial());
+                }
                 self.body_progress |= result.body_progress;
                 let brought_now = result.brought || result.body_progress;
                 self.brought |= brought_now;
@@ -2766,19 +3057,34 @@ impl Flow {
                 // unfinished window while live-eligible; aging retires demand, never saved
                 // evidence. No hint retargets an in-progress entry dependency or proof.
                 if let Query::Head(author) = query {
+                    if author == self.node {
+                        if result.status == Status::Complete
+                            && !announcement_task
+                            && !self.departure_probe
+                        {
+                            if let Some(snapshot) = result.own_observation {
+                                self.own_probe_answer =
+                                    Some(super::OwnProbeAnswer::Snapshot(snapshot));
+                            }
+                        }
+                        if let Some(role) = result.accepted_role {
+                            // Only the separately authenticated, exact accepted OWN-chain word
+                            // grants read-by. SignedHead.size is independent knowledge.
+                            self.mine_held = Some(role.through);
+                            self.mine_role = Some(role);
+                            self.mine_role_scope = self.receipt_scope;
+                            self.mine_role_request = Some(wire_request);
+                            self.mine_role_context = Some(super::OwnProbeContext {
+                                node: self.node,
+                                instance: self.instance,
+                                epoch: self.epoch,
+                                authorization: self.generation,
+                                connection: conn.serial(),
+                            });
+                        }
+                    }
                     for head in &result.heads {
                         if head.author == author {
-                            if author == self.node {
-                                if result.status == Status::Complete
-                                    && !announcement_task
-                                    && !self.departure_probe
-                                {
-                                    self.own_probe_answer =
-                                        Some(super::OwnProbeAnswer::Complete(*head));
-                                }
-                                self.mine_held =
-                                    Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
-                            }
                             // A repeated signed head remains the peer's exact current answer.
                             // Busy handling below retains the dependency and applies the named
                             // port backoff; no count of identical answers may dispose its root.
@@ -2822,6 +3128,15 @@ impl Flow {
                     || (result.status == Status::EvidenceUnavailable && !self.archive)
                 {
                     let operation = self.received_refusal(query, result.status);
+                    #[cfg(feature = "test-knobs")]
+                    if let Operation::Refusal(response) = &operation {
+                        self.observe_refusal_for_proof(
+                            task.request,
+                            task.purpose,
+                            response,
+                            result.continuation.as_ref(),
+                        );
+                    }
                     if let Operation::Refusal(response) = &operation {
                         if response.status == Status::EvidenceUnavailable
                             && response.initial_hint
@@ -3010,6 +3325,13 @@ impl Flow {
                     } else {
                         self.push(continuation)?;
                     }
+                }
+                #[cfg(feature = "test-knobs")]
+                if let (Some(entry_hash), Some(next)) = (result.publication_started, result.next) {
+                    let elapsed = self
+                        .hold_publication_for_proof(entry_hash, next, &fence, job)
+                        .await;
+                    self.proof_hold_elapsed += elapsed;
                 }
                 if let Some(pressure) = result.byte_pressure {
                     // The exact local continuation was retained above. Its worker and temporary

@@ -242,6 +242,14 @@ pub struct Port {
     /// Wire/history format of this room instance. The sparse marker is immutable after creation;
     /// keeping it with the port removes room-lock acquisition from the scheduler's start path.
     pub sparse: bool,
+    pub(crate) observation_signal: Arc<crate::node::history_stream::ObservationSignal>,
+    pub(crate) observation_instance: [u8; 16],
+    /// Latest current semantic snapshot and exactly the snapshot carried by a completed
+    /// HAVE exchange. An in-flight announcement never consumes a newer desired value.
+    pub(crate) observation_initialized: bool,
+    pub(crate) observation_connection: Option<u64>,
+    pub(crate) observation_desired: Option<crate::node::history_stream::AnnouncementSnapshot>,
+    pub(crate) observation_sent: Option<crate::node::history_stream::AnnouncementSnapshot>,
     /// At most one outbound attempt.
     pub out: Option<Attempt>,
     /// Up to [`INBOUND_PER_PORT`] inbound attempts.
@@ -289,12 +297,25 @@ pub struct Port {
 impl Port {
     /// A fresh port for `room`, with a request raised: a new port syncs at once.
     #[must_use]
-    pub fn new(room: RoomRef, gen: Arc<AtomicU64>, epoch: u64, sparse: bool) -> Self {
+    pub(crate) fn new(
+        room: RoomRef,
+        gen: Arc<AtomicU64>,
+        epoch: u64,
+        sparse: bool,
+        observation_signal: Arc<crate::node::history_stream::ObservationSignal>,
+        observation_instance: [u8; 16],
+    ) -> Self {
         Self {
             room,
             gen,
             epoch,
             sparse,
+            observation_signal,
+            observation_instance,
+            observation_initialized: false,
+            observation_connection: None,
+            observation_desired: None,
+            observation_sent: None,
             out: None,
             inbound: BTreeMap::new(),
             queued: false,
@@ -320,7 +341,15 @@ impl Port {
     /// peer; a hinted drain of the peer's backlog must not hold that announcement back.
     #[must_use]
     pub fn announce_owed(&self) -> bool {
-        self.own_seq > self.announced_seq
+        if self.sparse {
+            // Missing metadata owns a local refresh, never repeat wire work.
+            self.observation_initialized
+                && self
+                    .observation_desired
+                    .is_some_and(|desired| self.observation_sent != Some(desired))
+        } else {
+            self.own_seq > self.announced_seq
+        }
     }
 
     /// Whether the port needs a session (ADR-025 D1).

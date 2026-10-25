@@ -37,15 +37,21 @@ const MAX_HELLO_FRAME_BYTES: usize = 3;
 // Tag + outer pair + request ID + the largest canonical Query (Page). Query's bounded u64 and
 // digest fields make this an exact structural maximum, independent of peer input.
 const MAX_WANT_FRAME_BYTES: usize = 80;
-// Tag and a conservatively maximal CBOR array header. Each locally materialized HAVE hint is an
-// array header, two 32-byte byte strings (each with a maximal CBOR length header), and one u64.
+// One canonical fixed pair is an array header, a maximal u64 and a 32-byte byte string.
+// Null is smaller than a populated pair. The observation contains exactly two such options.
+const POSITION_PAIR_MAX_BYTES: usize = 1 + 9 + 2 + 32;
+const OWN_OBSERVATION_MAX_BYTES: usize = 1 + 2 * POSITION_PAIR_MAX_BYTES;
+// Tag, outer pair, conservatively maximal hint-array header, and the one fixed sidecar.
 // The decoder still reserves the full attacker-sized envelope before reading any variable frame;
 // this bound sizes only an encoder whose exact local hint count is already known.
-const HAVE_FRAME_FIXED_BYTES: usize = 1 + 9;
-const HAVE_HINT_MAX_BYTES: usize = 9 + 2 * (9 + 32) + 9;
+const HAVE_FRAME_FIXED_BYTES: usize = 1 + 1 + 9 + OWN_OBSERVATION_MAX_BYTES;
+const HAVE_HINT_MAX_BYTES: usize = 1 + 2 * (2 + 32) + 9;
 // Conservative tag/CBOR overhead for a locally sourced byte-string frame. The peer-facing
 // decoder still reserves the full attacker-sized frame and decode envelope before its prefix.
 const LOCAL_BYTES_FRAME_FIXED_BYTES: usize = 128;
+// Tag, Meta triple, 16-byte request, object tag, payload pair, maximal Head byte-string
+// length header and the optional role pair. Head bytes are borrowed and counted separately.
+const OWN_HEAD_FRAME_FIXED_BYTES: usize = 1 + 1 + (1 + 16) + 1 + 1 + 9 + POSITION_PAIR_MAX_BYTES;
 const CANCEL_FRAME_MAX_BYTES: usize = 64;
 const ACK_FRAME_MAX_BYTES: usize = 128;
 
@@ -128,10 +134,10 @@ pub(crate) async fn serve(
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
-    // Whether the round moved anything: an inventory exchange that added no hint on this side
-    // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
-    // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
-    let mut served_object = false;
+    // Queueing a canonical own-Head question must still wake its owner, but is not data
+    // moved. Ordinary missing-history admission, actual store commits and sent objects keep
+    // their existing nonempty credit (ADR-038 FX-29).
+    let mut data_moved = false;
     let mut local_inventory_busy = false;
     let result = serve_request(
         &source,
@@ -140,7 +146,7 @@ pub(crate) async fn serve(
         &inbox,
         generation,
         &mut inventory_added,
-        &mut served_object,
+        &mut data_moved,
         &mut local_inventory_busy,
         &departure_receipt,
     )
@@ -167,7 +173,10 @@ pub(crate) async fn serve(
         }
         result => result,
     };
-    (result, inventory_added, inventory_added || served_object)
+    let committed = source
+        .commit_ledger()
+        .load(std::sync::atomic::Ordering::Acquire);
+    (result, inventory_added, data_moved || committed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -178,7 +187,7 @@ async fn serve_request(
     inbox: &std::sync::Arc<HintInbox>,
     inbox_generation: u64,
     inventory_added: &mut bool,
-    served_object: &mut bool,
+    data_moved: &mut bool,
     local_inventory_busy: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
@@ -229,7 +238,8 @@ async fn serve_request(
     drop(next);
     // Parsed and request-bound before publication. If the peer's departure is applied while
     // this response is in flight, lifecycle cleanup may retain only this exact query. The server
-    // and Source still restrict the response to the peer's own settled, included head.
+    // and Source restrict this exception to that peer's own observation. Signed Head
+    // knowledge and its separately validated role position remain distinct.
     if preamble.purpose == Purpose::Control
         && matches!(&query, Query::Head(author) if *author == source.peer)
     {
@@ -244,7 +254,7 @@ async fn serve_request(
         inbox,
         inbox_generation,
         inventory_added,
-        served_object,
+        data_moved,
         local_inventory_busy,
     )
     .await
@@ -270,7 +280,7 @@ impl Preamble {
     pub fn encode(self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(6)
-            .uint(2)
+            .uint(3)
             .bytes(&self.room)
             .uint(self.epoch)
             .uint(0)
@@ -283,7 +293,7 @@ impl Preamble {
         bound(bytes, MAX_PREAMBLE)?;
         let mut d = Decoder::new(bytes);
         arity(&mut d, 6)?;
-        if d.uint()? != 2 {
+        if d.uint()? != 3 {
             return Err(invalid("history preamble version"));
         }
         let room = digest(&mut d)?;
@@ -593,6 +603,190 @@ pub struct HeadHint {
     pub head: Digest32,
 }
 
+/// A retained recheck predicate, not a work queue or a receipt. The actor installs its
+/// existing bounded-completion wake when it opens the first port for this room.
+#[derive(Debug)]
+pub(crate) struct ObservationSignal {
+    dirty: std::sync::atomic::AtomicBool,
+    wake: std::sync::Mutex<std::sync::Weak<tokio::sync::Notify>>,
+}
+
+impl Default for ObservationSignal {
+    fn default() -> Self {
+        Self {
+            // A new/reopened room has never announced its current snapshot.
+            dirty: std::sync::atomic::AtomicBool::new(true),
+            wake: std::sync::Mutex::new(std::sync::Weak::new()),
+        }
+    }
+}
+
+impl ObservationSignal {
+    pub(crate) fn bind(&self, wake: &std::sync::Arc<tokio::sync::Notify>) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::downgrade(wake);
+        self.notify_after_unlock();
+    }
+
+    /// Called only after a durable change to accepted Head knowledge or role prefix.
+    pub(crate) fn changed(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn dirty(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Transfer this recheck to every existing actor-owned room Port BEFORE selecting a
+    /// snapshot task. A task/result never clears a later producer's dirty bit.
+    pub(crate) fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn notify_after_unlock(&self) {
+        if self.dirty() {
+            if let Some(wake) = self
+                .wake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .upgrade()
+            {
+                wake.notify_one();
+            }
+        }
+    }
+}
+
+/// Declare this before the local owned room guard so success, error, cancellation and
+/// unwind release the guard first. It holds neither a Store nor a secret capability.
+pub(crate) struct ObservationAfterUnlock(pub(crate) std::sync::Arc<ObservationSignal>);
+
+impl Drop for ObservationAfterUnlock {
+    fn drop(&mut self) {
+        self.0.notify_after_unlock();
+    }
+}
+
+/// An authenticated responder's role-satisfied position. The requester credits it only
+/// after matching this exact position/hash against its accepted own chain. A head hint
+/// alone, including the leaf count of a signed Head, never supplies this receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RolePosition {
+    pub through: u64,
+    pub entry_hash: Digest32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoleKnowledge {
+    Known,
+    Missing,
+    Conflict,
+}
+
+/// The sender's observation of the authenticated receiver's feed. This fixed sidecar
+/// travels once per HAVE, independently of ordinary author hints (including an empty
+/// author list). It is scheduling information, not permission to apply a role receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedHead {
+    pub size: u64,
+    pub head: Digest32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnObservation {
+    pub known_head: Option<ObservedHead>,
+    pub role: Option<RolePosition>,
+}
+
+/// The exact scalar facts carried by one locally encoded HAVE. Completion may confirm
+/// only this capture; later committed facts remain an independently owed successor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnnouncementSnapshot {
+    pub(crate) own_head: Option<ObservedHead>,
+    pub(crate) peer: OwnObservation,
+}
+
+impl RolePosition {
+    fn encode(self, encoder: &mut Encoder) -> Result<()> {
+        position(self.through)?;
+        encoder.array(2).uint(self.through).bytes(&self.entry_hash);
+        Ok(())
+    }
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
+        arity(decoder, 2)?;
+        let through = decoder.uint()?;
+        position(through)?;
+        Ok(Self {
+            through,
+            entry_hash: digest(decoder)?,
+        })
+    }
+}
+
+impl OwnObservation {
+    fn validate(self) -> Result<()> {
+        if self.known_head.is_some_and(|head| head.size > MAX_SEQ) {
+            return Err(invalid("history observation head size"));
+        }
+        if let Some(role) = self.role {
+            position(role.through)?;
+        }
+        Ok(())
+    }
+
+    fn encode(self, encoder: &mut Encoder) -> Result<()> {
+        self.validate()?;
+        encoder.array(2);
+        if let Some(head) = self.known_head {
+            encoder.array(2).uint(head.size).bytes(&head.head);
+        } else {
+            encoder.null();
+        }
+        encode_role(self.role, encoder)
+    }
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
+        arity(decoder, 2)?;
+        let known_head = if decoder.null()? {
+            None
+        } else {
+            arity(decoder, 2)?;
+            let size = decoder.uint()?;
+            if size > MAX_SEQ {
+                return Err(invalid("history observation head size"));
+            }
+            Some(ObservedHead {
+                size,
+                head: digest(decoder)?,
+            })
+        };
+        Ok(Self {
+            known_head,
+            role: decode_role(decoder)?,
+        })
+    }
+}
+
+fn encode_role(role: Option<RolePosition>, encoder: &mut Encoder) -> Result<()> {
+    if let Some(role) = role {
+        role.encode(encoder)?;
+    } else {
+        encoder.null();
+    }
+    Ok(())
+}
+
+fn decode_role(decoder: &mut Decoder<'_>) -> Result<Option<RolePosition>> {
+    if decoder.null()? {
+        Ok(None)
+    } else {
+        RolePosition::decode(decoder).map(Some)
+    }
+}
+
 pub enum Proof {
     Inclusion(InclusionProof),
     Consistency {
@@ -607,11 +801,18 @@ pub enum Object<'a> {
     Context(&'a [u8]),
     Proof(Proof),
     Header(&'a [u8]),
+    OwnHead {
+        head: Option<&'a [u8]>,
+        role: Option<RolePosition>,
+    },
 }
 
 pub enum Frame<'a> {
     Hello(u8),
-    Have(Vec<HeadHint>),
+    Have {
+        hints: Vec<HeadHint>,
+        observation: OwnObservation,
+    },
     Want {
         request: RequestId,
         query: Query,
@@ -675,15 +876,36 @@ impl<'a> Frame<'a> {
         let maximum = match self {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
-            Self::Have(hints) => HAVE_FRAME_FIXED_BYTES
-                .checked_add(
-                    hints
-                        .len()
-                        .checked_mul(HAVE_HINT_MAX_BYTES)
-                        .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
-                )
-                .filter(|bound| *bound <= MAX_FRAME_BYTES)
-                .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+            Self::Have { hints, observation } => {
+                if hints.len() > MAX_CONTEXT_AUTHORS {
+                    return Err(invalid("history have authors"));
+                }
+                observation.validate()?;
+                HAVE_FRAME_FIXED_BYTES
+                    .checked_add(
+                        hints
+                            .len()
+                            .checked_mul(HAVE_HINT_MAX_BYTES)
+                            .ok_or(Error::SizeLimitExceeded("history encoded frame"))?,
+                    )
+                    .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                    .ok_or(Error::SizeLimitExceeded("history encoded frame"))?
+            }
+            Self::Meta {
+                object: Object::OwnHead { head, role },
+                ..
+            } => {
+                if let Some(head) = head {
+                    bound(head, MAX_HEADER_BYTES)?;
+                }
+                if let Some(role) = role {
+                    position(role.through)?;
+                }
+                OWN_HEAD_FRAME_FIXED_BYTES
+                    .checked_add(head.map_or(0, |head| head.len()))
+                    .filter(|bound| *bound <= MAX_FRAME_BYTES)
+                    .ok_or(Error::SizeLimitExceeded("history encoded observation"))?
+            }
             Self::Meta {
                 object: Object::Head(bytes) | Object::Context(bytes) | Object::Header(bytes),
                 ..
@@ -716,11 +938,11 @@ impl<'a> Frame<'a> {
                 e.uint(u64::from(*bitmap));
                 0x01
             }
-            Self::Have(hints) => {
+            Self::Have { hints, observation } => {
                 if hints.len() > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
                 }
-                e.array(hints.len());
+                e.array(2).array(hints.len());
                 let mut previous = None;
                 for hint in hints {
                     if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
@@ -732,6 +954,7 @@ impl<'a> Frame<'a> {
                         .uint(hint.size)
                         .bytes(&hint.head);
                 }
+                observation.encode(&mut e)?;
                 0x02
             }
             Self::Want { request, query } => {
@@ -777,6 +1000,16 @@ impl<'a> Frame<'a> {
                     Object::Header(bytes) => {
                         bound(bytes, MAX_HEADER_BYTES)?;
                         e.uint(3).bytes(bytes);
+                    }
+                    Object::OwnHead { head, role } => {
+                        e.uint(4).array(2);
+                        if let Some(head) = head {
+                            bound(head, MAX_HEADER_BYTES)?;
+                            e.bytes(head);
+                        } else {
+                            e.null();
+                        }
+                        encode_role(*role, &mut e)?;
                     }
                 }
                 0x06
@@ -858,6 +1091,7 @@ impl<'a> Frame<'a> {
                 Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
             }
             0x02 => {
+                arity(&mut d, 2)?;
                 let count = d.array()?;
                 if count > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
@@ -878,7 +1112,10 @@ impl<'a> Frame<'a> {
                         head: digest(&mut d)?,
                     });
                 }
-                Self::Have(hints)
+                Self::Have {
+                    hints,
+                    observation: OwnObservation::decode(&mut d)?,
+                }
             }
             0x03 => {
                 arity(&mut d, 2)?;
@@ -924,6 +1161,18 @@ impl<'a> Frame<'a> {
                         });
                     }
                     3 => Object::Header(bounded_bytes(&mut d, MAX_HEADER_BYTES)?),
+                    4 => {
+                        arity(&mut d, 2)?;
+                        let head = if d.null()? {
+                            None
+                        } else {
+                            Some(bounded_bytes(&mut d, MAX_HEADER_BYTES)?)
+                        };
+                        Object::OwnHead {
+                            head,
+                            role: decode_role(&mut d)?,
+                        }
+                    }
                     _ => return Err(invalid("history metadata kind")),
                 };
                 Self::Meta { request, object }

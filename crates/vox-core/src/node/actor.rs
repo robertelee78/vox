@@ -796,6 +796,43 @@ fn net_event_name(e: &NetEvent) -> &'static str {
 /// its body's future in its own frame and boxes it, so its callers hold a pointer instead.
 type Boxed<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+/// One independently polled, supervised metadata dependency. The result contains only
+/// fixed scalar facts; no room guard, Store, admitted Job or decoded buffer reaches the actor.
+struct ObservationRefresh {
+    room: Digest32,
+    peer: Digest32,
+    reference: crate::node::ports::RoomRef,
+    epoch: u64,
+    instance: [u8; 16],
+    connection: u64,
+    pending_role: Option<(
+        crate::node::history_stream::OwnProbeClaim,
+        crate::node::history_stream::RolePosition,
+    )>,
+    store: std::sync::Weak<crate::node::store::Store>,
+    result: oneshot::Receiver<crate::error::Result<ObservationCapture>>,
+    abort: tokio::task::AbortHandle,
+    phase: Arc<std::sync::atomic::AtomicU8>,
+}
+
+struct ObservationCapture {
+    instance: [u8; 16],
+    epoch: u64,
+    authorization: Digest32,
+    snapshot: Option<crate::node::history_stream::AnnouncementSnapshot>,
+    pending_role: Option<(
+        crate::node::history_stream::OwnProbeClaim,
+        crate::node::history_stream::RolePosition,
+        crate::node::history_stream::RoleKnowledge,
+    )>,
+}
+
+impl Drop for ObservationRefresh {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
 /// Bound on the internal network→actor queue. Inbound streams are back-pressured
 /// rather than dropped: a full queue slows the accept loop, it never loses work.
 const NET_QUEUE: usize = 64;
@@ -5352,6 +5389,14 @@ struct HeldNote {
     room: Digest32,
     peer: Digest32,
     seq: Option<u64>,
+    role: Option<crate::node::history_stream::RolePosition>,
+    role_context: Option<crate::node::history_stream::OwnProbeContext>,
+    role_scope: Option<crate::node::history_stream::OwnProbePort>,
+    wire_request: Option<crate::node::history_stream::RequestId>,
+    pending_validation: Option<(
+        crate::node::history_stream::OwnProbeClaim,
+        crate::node::history_stream::RolePosition,
+    )>,
     request: crate::node::history_stream::RequestId,
     complete: bool,
     probe: Option<(
@@ -5372,6 +5417,8 @@ pub struct Node {
     /// Stable across lock/unlock controller replacement, so every generation's completion wakes
     /// the one actor select that audits its durable result slots.
     bounded_completion_wake: Arc<tokio::sync::Notify>,
+    observation_refresh: Option<ObservationRefresh>,
+    observation_after: Option<(Digest32, Digest32)>,
     /// Exact retirement ownership and failures live on the daemon budget, so they survive both
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
@@ -6235,6 +6282,8 @@ impl Node {
             history_demand: history_demand::Controller::default(),
             bounded_sync,
             bounded_completion_wake,
+            observation_refresh: None,
+            observation_after: None,
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             held_notes: Vec::new(),
@@ -6629,6 +6678,7 @@ impl Node {
         // ready classes; each retains its own room cursor and yields after one bounded turn.
         let mut maintenance_next = 0u8;
         loop {
+            self.prepare_observation_refresh();
             let governance_delay = self.governance_work.next_deadline().map(|deadline| {
                 Duration::from_millis(deadline.saturating_sub(self.now_ms().get()))
             });
@@ -6640,6 +6690,21 @@ impl Node {
             };
             tokio::pin!(governance_deadline);
             tokio::select! {
+                capture = async {
+                    match self.observation_refresh.as_mut() {
+                        Some(refresh) => (&mut refresh.result).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(refresh) = self.observation_refresh.take() {
+                        let capture = capture.unwrap_or_else(|_| Err(Error::Profile(
+                            "history observation metadata task ended without its result",
+                        )));
+                        self.install_observation_refresh(&refresh, capture);
+                    }
+                    self.publish().await;
+                    self.schedule().await;
+                }
                 () = &mut governance_deadline => {
                     // Certificate expiry is its own causal wake. A quiet room does not wait for
                     // the one-second actor tick, a command, or network traffic to invalidate it.
@@ -11563,7 +11628,7 @@ impl Node {
                     .is_some_and(|attempt| attempt.is_departure_receipt());
                 // Count the actual user-visible transfer edge even if the round later ends
                 // partial, fails, or its actor attempt has already retired. A sent history
-                // object, or a newly accepted symmetric inventory hint, did happen and must not
+                // object, or a newly accepted ordinary missing-history hint, did happen and must not
                 // disappear from the lane's account because terminal DONE did not arrive.
                 if moved {
                     crate::node::status::SyncBook::with(
@@ -15861,6 +15926,8 @@ impl Node {
         Arc<std::sync::atomic::AtomicU64>,
         u64,
         bool,
+        Arc<crate::node::history_stream::ObservationSignal>,
+        [u8; 16],
     )> {
         use crate::node::ports::RoomRef;
         let store = self.log_store()?;
@@ -15869,9 +15936,325 @@ impl Node {
             let gen = channel.generation();
             let epoch = channel.epoch();
             let sparse = channel.uses_sparse_history(&store).ok()?;
-            return Some((RoomRef::Channel(Arc::downgrade(shared)), gen, epoch, sparse));
+            let observation = channel.history_observation_signal();
+            let instance = channel.history_instance(&store).ok()?;
+            observation.bind(&self.bounded_completion_wake);
+            return Some((
+                RoomRef::Channel(Arc::downgrade(shared)),
+                gen,
+                epoch,
+                sparse,
+                observation,
+                instance,
+            ));
         }
         None
+    }
+
+    fn cancel_observation_refresh(&mut self, room: &Digest32) {
+        if self
+            .observation_refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.room == *room)
+        {
+            self.observation_refresh = None;
+        }
+    }
+
+    fn prepare_observation_refresh(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.observation_refresh.is_some() {
+            return;
+        }
+        let Some(store) = self.log_store() else {
+            return;
+        };
+        let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
+            return;
+        };
+        // Consuming a dirty bit transfers ownership to EVERY existing room port, before
+        // selecting the one bounded task. A task/result never clears a later producer's bit.
+        let dirty_rooms: std::collections::BTreeSet<_> = self
+            .ports
+            .iter()
+            .filter(|(_, port)| port.observation_signal.take_dirty())
+            .map(|((room, _), _)| *room)
+            .collect();
+        for ((room, _), port) in &mut self.ports {
+            if dirty_rooms.contains(room) {
+                port.observation_initialized = false;
+            }
+        }
+        let eligible = |(key, port): &(&(Digest32, Digest32), &crate::node::ports::Port)| {
+            !port.poisoned
+                && port.sparse
+                && self
+                    .net
+                    .as_ref()
+                    .and_then(|net| net.manager().existing(&key.1))
+                    .is_some_and(|connection| {
+                        !port.observation_initialized
+                            || port.observation_connection != Some(connection.serial())
+                    })
+                && self
+                    .current_room(&key.0)
+                    .is_some_and(|current| port.room.is(&current))
+        };
+        let selected = self
+            .ports
+            .iter()
+            .filter(eligible)
+            .find(|(key, _)| self.observation_after.is_none_or(|after| **key > after))
+            .or_else(|| self.ports.iter().find(eligible));
+        let Some(((room, peer), port)) = selected else {
+            return;
+        };
+        let Some(shared) = self.channels.get(room).map(Arc::clone) else {
+            return;
+        };
+        let (room_id, peer_id, epoch, instance) =
+            (*room, *peer, port.epoch, port.observation_instance);
+        let reference = port.room.clone();
+        let pending_role = port
+            .own_probe
+            .and_then(|scope| self.history_hints.pending_role(scope));
+        let Some(connection) = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(peer))
+            .map(|conn| conn.serial())
+        else {
+            return;
+        };
+        let weak_store = Arc::downgrade(&store);
+        let budget = Arc::clone(&self.history_budget);
+        let secret_work = Arc::clone(&self.secret_work);
+        let wake = Arc::clone(&self.bounded_completion_wake);
+        let phase = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let task_phase = Arc::clone(&phase);
+        let (send, result) = oneshot::channel();
+        self.reap_join_tasks();
+        let abort = self.join_tasks.spawn(async move {
+            let held = secret_work.read_owned().await;
+            let mut ticket: Option<crate::node::history_budget::Ticket> = None;
+            let answer = loop {
+                let guard = if let Some(waiting) = ticket.as_ref() {
+                    let capacity = waiting.wake();
+                    if !waiting.would_admit() {
+                        task_phase.store(0, Ordering::Release);
+                        capacity.await;
+                        continue;
+                    }
+                    match Arc::clone(&shared).try_lock_owned() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            // A parked room cannot occupy the runnable Control FIFO head.
+                            drop(ticket.take());
+                            task_phase.store(1, Ordering::Release);
+                            Arc::clone(&shared).lock_owned().await
+                        }
+                    }
+                } else {
+                    task_phase.store(1, Ordering::Release);
+                    Arc::clone(&shared).lock_owned().await
+                };
+                let waiting = ticket.get_or_insert_with(|| {
+                    budget.enqueue(node, crate::node::history_budget::Lane::Control)
+                });
+                let capacity = waiting.wake();
+                let Some(job) = waiting.try_admit() else {
+                    // This ticket now waits ONLY for capacity, never for a mutex. When
+                    // capacity wakes it, try_lock above either admits or gives up FIFO.
+                    drop(guard);
+                    task_phase.store(0, Ordering::Release);
+                    capacity.await;
+                    continue;
+                };
+                drop(ticket.take());
+                // Same pinned-directory/Head decoding peak as the existing source read;
+                // one fixed scalar result, no peer Vec or second unreserved allocation.
+                let admission = job.reserve_or_pressure(4 * 1024 * 1024 + 128 * 1024);
+                let charge = match admission {
+                    Ok(charge) => charge,
+                    Err(Error::HistoryCapacity(pressure)) => {
+                        drop(guard);
+                        drop(job);
+                        task_phase.store(2, Ordering::Release); // actual byte dependency
+                        pressure.released().await;
+                        continue;
+                    }
+                    Err(error) => {
+                        drop(guard);
+                        drop(job);
+                        break Err(error);
+                    }
+                };
+                task_phase.store(3, Ordering::Release); // active bounded metadata read
+                let worker = tokio::task::spawn_blocking(move || {
+                    let _held = held;
+                    let _charge = charge;
+                    let _job = job;
+                    let room = guard;
+                    if room.epoch() != epoch || room.history_retirement_locked() {
+                        return Err(Error::Unreachable("history observation room changed"));
+                    }
+                    let current_instance = room.history_instance(&store)?;
+                    if current_instance != instance {
+                        return Err(Error::Unreachable("history observation instance changed"));
+                    }
+                    let authorization = crate::node::history_stream::authorization_generation(
+                        &store, node, room_id, instance, epoch,
+                    )?;
+                    let snapshot = if room.is_member(&peer_id) {
+                        Some(room.history_inventory_snapshot(&store, &peer_id)?)
+                    } else {
+                        None
+                    };
+                    let pending_role = pending_role
+                        .filter(|(claim, _)| {
+                            claim.context.node == node
+                                && claim.context.instance == instance
+                                && claim.context.epoch == epoch
+                                && claim.context.authorization == authorization
+                                && claim.context.connection == connection
+                        })
+                        .map(|(claim, role)| {
+                            room.history_own_role_knowledge(&store, role)
+                                .map(|known| (claim, role, known))
+                        })
+                        .transpose()?;
+                    Ok(ObservationCapture {
+                        instance,
+                        epoch,
+                        authorization,
+                        snapshot,
+                        pending_role,
+                    })
+                    // room/Store/Job/charge and secret-work guard drop before handoff.
+                });
+                break worker.await.unwrap_or_else(|_| {
+                    Err(Error::Profile(
+                        "history observation metadata reader stopped",
+                    ))
+                });
+            };
+            task_phase.store(4, Ordering::Release); // bounded scalar result ready
+            let _ = send.send(answer);
+            wake.notify_one();
+        });
+        self.observation_refresh = Some(ObservationRefresh {
+            room: room_id,
+            peer: peer_id,
+            reference,
+            epoch,
+            instance,
+            connection,
+            pending_role,
+            store: weak_store,
+            result,
+            abort,
+            phase,
+        });
+        self.observation_after = Some((room_id, peer_id));
+    }
+
+    fn install_observation_refresh(
+        &mut self,
+        refresh: &ObservationRefresh,
+        capture: crate::error::Result<ObservationCapture>,
+    ) {
+        let Some(store) = self.log_store() else {
+            return;
+        };
+        if !refresh
+            .store
+            .upgrade()
+            .is_some_and(|prior| Arc::ptr_eq(&prior, &store))
+            || !self
+                .current_room(&refresh.room)
+                .is_some_and(|current| refresh.reference.is(&current))
+            || !self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(&refresh.peer))
+                .is_some_and(|connection| connection.serial() == refresh.connection)
+        {
+            return;
+        }
+        let accepted = capture.and_then(|capture| {
+            let current = crate::node::history_stream::authorization_generation(
+                &store,
+                self.profile
+                    .as_ref()
+                    .ok_or(Error::Profile("identity locked"))?
+                    .fingerprint(),
+                refresh.room,
+                capture.instance,
+                capture.epoch,
+            )?;
+            if capture.instance != refresh.instance
+                || capture.epoch != refresh.epoch
+                || capture.authorization != current
+            {
+                return Err(Error::Unreachable("history observation authority changed"));
+            }
+            Ok(capture)
+        });
+        let Some(port) = self.ports.get_mut(&(refresh.room, refresh.peer)) else {
+            return;
+        };
+        match accepted {
+            Ok(capture) => {
+                if let Some((claim, role, known)) = capture.pending_role {
+                    match known {
+                        crate::node::history_stream::RoleKnowledge::Known => {
+                            self.held_notes.push(HeldNote {
+                                room: refresh.room,
+                                peer: refresh.peer,
+                                seq: None,
+                                role: Some(role),
+                                role_context: Some(claim.context),
+                                role_scope: Some(claim.port),
+                                wire_request: Some(claim.request),
+                                request: claim.request,
+                                complete: false,
+                                probe: None,
+                                rearm: None,
+                                pending_validation: Some((claim, role)),
+                            })
+                        }
+                        crate::node::history_stream::RoleKnowledge::Conflict => {
+                            self.history_hints.reject_pending_role(claim, role);
+                            eprintln!("vox: peer role receipt conflicts with accepted own chain");
+                        }
+                        crate::node::history_stream::RoleKnowledge::Missing => {}
+                    }
+                }
+                // An older task cannot consume the check owed by a newly installed word.
+                port.observation_initialized = port
+                    .own_probe
+                    .and_then(|scope| self.history_hints.pending_role(scope))
+                    == refresh.pending_role;
+                if port.observation_connection != Some(refresh.connection) {
+                    port.observation_sent = None;
+                    port.observation_connection = Some(refresh.connection);
+                }
+                let changed = port.observation_desired != capture.snapshot;
+                port.observation_desired = capture.snapshot;
+                if changed || port.announce_owed() {
+                    port.raise();
+                    self.sched_rooms.insert(refresh.room);
+                }
+            }
+            Err(Error::Unreachable(_)) => {
+                // Current owner retains its due scalar; normal connection/authority handling
+                // supplies the fresh scope. Do not label an obsolete read as completion.
+            }
+            Err(error) => {
+                port.poisoned = true;
+                eprintln!("vox: history observation could not be refreshed: {error}");
+            }
+        }
     }
 
     /// The room instance `channel_id` names now, without its lock.
@@ -15916,12 +16299,14 @@ impl Node {
         if !self.shares_room(channel_id, peer).await {
             return false;
         }
-        let Some((room, gen, epoch, sparse)) = self.room_ref(channel_id).await else {
+        let Some((room, gen, epoch, sparse, observation, instance)) =
+            self.room_ref(channel_id).await
+        else {
             return false;
         };
         self.ports.insert(
             (*channel_id, *peer),
-            crate::node::ports::Port::new(room, gen, epoch, sparse),
+            crate::node::ports::Port::new(room, gen, epoch, sparse, observation, instance),
         );
         let scope = self.history_hints.port_scope(*channel_id, *peer);
         if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
@@ -15933,6 +16318,13 @@ impl Node {
 
     /// Retire a port's attempts and forget it (its room is gone or held again).
     fn drop_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        if self
+            .observation_refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.room == *channel_id)
+        {
+            self.observation_refresh = None;
+        }
         if let Some((request, generation)) = self.bounded_sync.archive_for_port(*channel_id, *peer)
         {
             self.history_demand.failed(
@@ -15958,6 +16350,9 @@ impl Node {
 
     /// Retire every attempt and forget every port (ADR-025 D1a: the node shuts down or locks).
     fn retire_all_ports(&mut self) {
+        // Cancel a queued acquisition before erasing room keys or waiting physical close.
+        self.observation_refresh = None;
+        self.observation_after = None;
         let keys: Vec<(Digest32, Digest32)> = self.ports.keys().copied().collect();
         for (room, peer) in keys {
             self.drop_port(&room, &peer);
@@ -16403,6 +16798,66 @@ impl Node {
     /// lane still is otherwise invisible, and a person then cannot tell a quiet room from a
     /// stuck one. The pool is read from `b`, the one budget snapshot the whole status document
     /// is built from (ADR-038 FX-35).
+    fn observation_status(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        port: &crate::node::ports::Port,
+    ) -> serde_json::Value {
+        use crate::node::history_stream::{AnnouncementSnapshot, ObservedHead, RolePosition};
+        let head = |value: ObservedHead| serde_json::json!({"size":value.size,"head":crate::node::link::b32_encode(&value.head)});
+        let role = |value: RolePosition| serde_json::json!({"through":value.through,"entry_hash":crate::node::link::b32_encode(&value.entry_hash)});
+        let snapshot = |value: AnnouncementSnapshot| {
+            serde_json::json!({
+                "own_head":value.own_head.map(head),
+                "peer":{"known_head":value.peer.known_head.map(head),"role":value.peer.role.map(role)},
+            })
+        };
+        let dirty = port.observation_signal.dirty();
+        let refreshing = self
+            .observation_refresh
+            .as_ref()
+            .filter(|refresh| refresh.room == room && refresh.peer == peer);
+        let refresh = refreshing.map(|refresh| {
+            match refresh.phase.load(std::sync::atomic::Ordering::Acquire) {
+                0 => "control-admission",
+                1 => "room-lock",
+                2 => "bytes",
+                3 => "reading",
+                _ => "result-ready",
+            }
+        });
+        let owed = port.observation_initialized
+            && port
+                .observation_desired
+                .is_some_and(|desired| port.observation_sent != Some(desired));
+        let owner = if port.poisoned {
+            "local-fault"
+        } else if refresh.is_some() {
+            "metadata-refresh"
+        } else if dirty || !port.observation_initialized {
+            "metadata-due"
+        } else if owed && port.out.is_some() {
+            "outbound-round"
+        } else if owed && port.backoff.is_some() {
+            "peer-backoff"
+        } else if owed && port.queued {
+            "queued-port"
+        } else if owed {
+            "port-request"
+        } else {
+            "settled"
+        };
+        serde_json::json!({
+            "instance":port.observation_instance.iter().map(|byte|format!("{byte:02x}")).collect::<String>(),
+            "epoch":port.epoch,"connection":port.observation_connection,
+            "dirty":dirty,"initialized":port.observation_initialized,
+            "desired":port.observation_desired.map(snapshot),"sent":port.observation_sent.map(snapshot),
+            "announcement_owed":owed,"owner":owner,"refresh":refresh,
+            "snapshot_kind":"last-validated-room-capture",
+        })
+    }
+
     fn lanes_json(&self, b: &crate::node::history_budget::BudgetSnapshot) -> String {
         use crate::node::link::b32_encode;
         let now = std::time::Instant::now();
@@ -16458,7 +16913,7 @@ impl Node {
                         .collect::<Vec<_>>()
                 });
                 format!(
-                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],\"own_head_probe\":{},{}}}",
+                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],\"own_head_probe\":{},\"observation\":{},{}}}",
                     b32_encode(room),
                     b32_encode(peer),
                     port.needs(),
@@ -16473,6 +16928,7 @@ impl Node {
                     !round_owners.is_empty(),
                     round_owners.join(","),
                     port.own_probe.map_or(serde_json::Value::Null, |scope| self.history_hints.probe_status(scope)),
+                    self.observation_status(*room, *peer, port),
                     last
                 )
             })
@@ -17450,10 +17906,12 @@ impl Node {
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
         if departure_receipt {
-            if let Some((room, gen, epoch, sparse)) = self.room_ref(&channel_id).await {
-                self.ports
-                    .entry((channel_id, peer))
-                    .or_insert_with(|| crate::node::ports::Port::new(room, gen, epoch, sparse));
+            if let Some((room, gen, epoch, sparse, observation, instance)) =
+                self.room_ref(&channel_id).await
+            {
+                self.ports.entry((channel_id, peer)).or_insert_with(|| {
+                    crate::node::ports::Port::new(room, gen, epoch, sparse, observation, instance)
+                });
             }
         }
         if !self.ensure_port(&channel_id, &peer).await {
@@ -19629,6 +20087,7 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        self.observation_refresh = None;
         let retirement_node = self.profile.as_ref().map(Profile::fingerprint);
         let mut bounded_sync = std::mem::take(&mut self.bounded_sync);
         self.bounded_sync
@@ -20471,6 +20930,7 @@ impl Node {
     }
 
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
+        self.cancel_observation_refresh(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
@@ -21405,6 +21865,7 @@ impl Node {
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
+        self.cancel_observation_refresh(channel_id);
         let outcome = match self.channels.remove(channel_id) {
             Some(shared) => {
                 shared.lock().await.lock_now();
@@ -22036,6 +22497,7 @@ impl Node {
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
         self.governance_work.set_deadline(*channel_id, None);
+        self.cancel_observation_refresh(channel_id);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
             name = crate::node::resolver::room_shown(ch.name(), channel_id);
@@ -22361,6 +22823,59 @@ impl Node {
     /// Record what lane rounds learned about how far each peer holds this node's own feed
     /// (ADR-028 R-6): the evidence that lets the settlement tick stop asking a peer that
     /// already holds the own head (ADR-038 FX-15).
+    fn own_receipt_context_current(
+        &self,
+        room: &ChannelState,
+        store: &crate::node::store::Store,
+        peer: &Digest32,
+        context: crate::node::history_stream::OwnProbeContext,
+    ) -> crate::error::Result<bool> {
+        if room.me() != context.node
+            || room.epoch() != context.epoch
+            || !self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(peer))
+                .is_some_and(|conn| conn.serial() == context.connection)
+        {
+            return Ok(false);
+        }
+        let instance = room.history_instance(store)?;
+        let authorization = crate::node::history_stream::authorization_generation(
+            store,
+            room.me(),
+            room.channel_id(),
+            instance,
+            room.epoch(),
+        )?;
+        Ok(instance == context.instance && authorization == context.authorization)
+    }
+
+    /// Keep public held_through in both read-your-write views coherent BEFORE stamping a
+    /// completed canonical observation. Only an actual accepted peer word calls this.
+    fn publish_peer_held(&mut self, channel: &ChannelState, peer: &Digest32) {
+        let through = channel.held_through(peer);
+        let patch = |held: &mut Vec<(Digest32, u64)>| {
+            held.retain(|(member, _)| member != peer);
+            if let Some(through) = through {
+                held.push((*peer, through));
+                held.sort_unstable_by_key(|(member, _)| *member);
+            }
+        };
+        if let Some((_, detail)) = self.fresh_details.get_mut(&channel.channel_id()) {
+            patch(&mut detail.held_through);
+        }
+        self.view_tx.send_modify(|view| {
+            if let Some(detail) = view
+                .open_channels
+                .iter_mut()
+                .find(|detail| detail.channel_id == channel.channel_id())
+            {
+                patch(&mut detail.held_through);
+            }
+        });
+    }
+
     async fn apply_held_notes(&mut self) {
         if self.held_notes.is_empty() {
             return;
@@ -22379,56 +22894,96 @@ impl Node {
                 self.rearm_own_probe_locked(&mut room, scope, target);
                 continue;
             }
-            if let Some((claim, answer)) = note.probe {
-                let current_scope = room.history_instance(&store).and_then(|instance| {
-                    crate::node::history_stream::authorization_generation(
-                        &store,
-                        room.me(),
-                        note.room,
-                        instance,
-                        room.epoch(),
-                    )
-                    .map(|authorization| (instance, authorization))
-                });
-                let (current_instance, current_authorization) = match current_scope {
-                    Ok(current) => current,
+            if let Some((claim, role)) = note.pending_validation {
+                match self.own_receipt_context_current(&room, &store, &note.peer, claim.context) {
+                    Ok(true) if self.history_hints.accept_pending_role(claim, role) => {
+                        // The independently admitted metadata task validated this exact word
+                        // against monotone accepted OWN-chain evidence. It never grants a
+                        // receipt until these current actor/context fences and exact-slot take.
+                        let before = room.held_through(&note.peer);
+                        room.note_held(&store, note.peer, role.through);
+                        self.publish_peer_held(&room, &note.peer);
+                        if before != room.held_through(&note.peer) {
+                            touched.insert(note.room);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        room.poison(&error);
+                        eprintln!("vox: retained peer role scope could not be read: {error}");
+                    }
+                }
+                continue;
+            }
+            let context = note
+                .probe
+                .map(|(claim, _)| claim.context)
+                .or(note.role_context);
+            if let Some(context) = context {
+                match self.own_receipt_context_current(&room, &store, &note.peer, context) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Some((claim, _)) = note.probe {
+                            self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                        }
+                        continue;
+                    }
                     Err(error) => {
                         room.poison(&error);
                         eprintln!("vox: own-history receipt scope could not be read: {error}");
-                        self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                        if let Some((claim, _)) = note.probe {
+                            self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                        }
                         continue;
                     }
-                };
-                let current = self
-                    .ports
+                }
+            }
+            let exact_scope = note.probe.map(|(claim, _)| claim.port).or(note.role_scope);
+            if exact_scope.is_some_and(|scope| {
+                self.ports
                     .get(&(note.room, note.peer))
-                    .is_some_and(|port| port.own_probe == Some(claim.port))
-                    && self
-                        .net
-                        .as_ref()
-                        .and_then(|net| net.manager().existing(&note.peer))
-                        .is_some_and(|conn| conn.serial() == claim.context.connection)
-                    && room.me() == claim.context.node
-                    && room.epoch() == claim.context.epoch
-                    && current_instance == claim.context.instance
-                    && current_authorization == claim.context.authorization;
-                if !current {
-                    self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
-                    continue;
-                }
-                let before = room.held_through(&note.peer);
-                if let (Some(_), crate::node::history_stream::OwnProbeAnswer::Complete(head)) =
-                    (note.seq, answer)
+                    .is_none_or(|port| port.own_probe != Some(scope))
+            }) {
+                continue;
+            }
+            let before = room.held_through(&note.peer);
+            let accepted = match (note.seq, note.role) {
+                (Some(seq), Some(role))
+                    if note.role_context.is_some()
+                        && note.role_scope.is_some()
+                        && note.wire_request.is_some()
+                        && seq == role.through =>
                 {
-                    room.note_held(&store, note.peer, head.size);
+                    room.note_held(&store, note.peer, seq);
+                    self.publish_peer_held(&room, &note.peer);
+                    Some(role)
                 }
-                // This SAME real answer joins its facts atomically. Only here, after
-                // fresh actor fences, may full completion stamp and clear canonical aliases.
-                match self.history_hints.observed(claim, answer, note.complete) {
+                (Some(seq), None) => {
+                    // Legacy session words retain their existing independent contract.
+                    room.note_held(&store, note.peer, seq);
+                    self.publish_peer_held(&room, &note.peer);
+                    None
+                }
+                _ => None, // cached query metadata/None is never a fresh read-by word
+            };
+            if let Some((claim, answer)) = note.probe {
+                match self
+                    .history_hints
+                    .observed(claim, answer, accepted, note.complete)
+                {
                     Ok(Some(updated)) if !note.complete => {
-                        self.bounded_sync.rebase_own_probe(claim, updated);
+                        self.bounded_sync.rebase_own_probe(claim, updated)
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(_)) => {
+                        if note.complete && self.history_hints.pending_role(claim.port).is_some() {
+                            // The needed header may have committed BEFORE full completion
+                            // installed this word. Own one local metadata check now as well
+                            // as later real-chain transition wakes; never repull the wire.
+                            if let Some(port) = self.ports.get_mut(&(note.room, note.peer)) {
+                                port.observation_initialized = false;
+                            }
+                        }
+                    }
                     Ok(None) => {
                         let after = room.held_through(&note.peer);
                         if before != after {
@@ -22448,30 +23003,40 @@ impl Node {
                         self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
                     }
                 }
-                if before != room.held_through(&note.peer) {
-                    touched.insert(note.room);
-                }
-            } else if let Some(seq) = note.seq {
-                let before = room.held_through(&note.peer);
-                room.note_held(&store, note.peer, seq);
-                let after = room.held_through(&note.peer);
-                if before != after {
-                    if let Some(scope) = self
-                        .ports
-                        .get(&(note.room, note.peer))
-                        .and_then(|port| port.own_probe)
-                    {
-                        if let Err(error) =
-                            self.history_hints
-                                .receipt_changed(scope, note.request, before, after)
-                        {
-                            eprintln!(
-                                "vox: own-history receipt change could not be retained: {error}"
-                            );
-                        }
+            } else if let (Some(role), Some(scope)) = (accepted, note.role_scope) {
+                match self.history_hints.record_role(
+                    scope,
+                    note.request,
+                    role,
+                    before,
+                    room.held_through(&note.peer),
+                ) {
+                    Ok(Some((prior, current))) => {
+                        self.bounded_sync.rebase_own_probe(prior, current)
                     }
-                    touched.insert(note.room);
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("vox: own-history receipt change could not be retained: {error}")
+                    }
                 }
+            } else if before != room.held_through(&note.peer) {
+                if let Some(scope) = self
+                    .ports
+                    .get(&(note.room, note.peer))
+                    .and_then(|port| port.own_probe)
+                {
+                    if let Err(error) = self.history_hints.receipt_changed(
+                        scope,
+                        note.request,
+                        before,
+                        room.held_through(&note.peer),
+                    ) {
+                        eprintln!("vox: own-history receipt change could not be retained: {error}");
+                    }
+                }
+            }
+            if before != room.held_through(&note.peer) {
+                touched.insert(note.room);
             }
         }
         for room in touched {

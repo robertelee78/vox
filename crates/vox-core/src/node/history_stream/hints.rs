@@ -42,7 +42,7 @@ struct CompletedProbe {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnProbeAnswer {
-    Complete(HeadHint),
+    Snapshot(super::OwnObservation),
     /// The peer's actual terminal wire answer, never an acknowledgement or a fake head.
     Unavailable,
 }
@@ -50,6 +50,7 @@ pub(crate) enum OwnProbeAnswer {
 enum ProbeCause {
     Scope,
     Advertisement(HeadHint),
+    Observation(super::OwnObservation),
     Answer {
         request: RequestId,
         answer: OwnProbeAnswer,
@@ -64,7 +65,11 @@ struct OwnProbe {
     context: OwnProbeContext,
     local: Option<HeadHint>,
     advertised: Option<HeadHint>,
+    observation_advertised: Option<super::OwnObservation>,
     receipt: Option<OwnProbeAnswer>,
+    accepted_role: Option<super::RolePosition>,
+    pending_role: Option<(OwnProbeClaim, super::RolePosition)>,
+    role_error: Option<&'static str>,
     /// Changes only with a real scoped fact, including A -> B -> A. Not an attempt counter.
     facts: RequestId,
     cause: ProbeCause,
@@ -77,18 +82,31 @@ impl OwnProbe {
             context,
             local,
             advertised: None,
+            observation_advertised: None,
             receipt: None,
+            accepted_role: None,
+            pending_role: None,
+            role_error: None,
             facts: crate::identity::rng::random_array()?,
             cause: ProbeCause::Scope,
             completed: None,
             started: None,
         })
     }
+    fn refresh_local(&mut self, local: Option<HeadHint>) -> Result<()> {
+        if self.local != local {
+            self.invalidate()?;
+            self.local = local;
+        }
+        Ok(())
+    }
+
     fn invalidate(&mut self) -> Result<()> {
         let facts = crate::identity::rng::random_array()?;
         self.facts = facts;
         self.completed = None;
         self.started = None;
+        self.role_error = None;
         Ok(())
     }
 }
@@ -105,6 +123,7 @@ struct Pending {
     peer: Digest32,
     hint: HeadHint,
     in_flight: bool,
+    probe_facts: Option<RequestId>,
 }
 #[derive(Default)]
 struct State {
@@ -166,13 +185,10 @@ impl HintInbox {
         if scope.generation != port.generation || scope.connection != Some(context.connection) {
             return Ok(false);
         }
-        if scope
-            .own
-            .as_ref()
-            .is_none_or(|own| own.context != context || own.local != local)
-        {
-            scope.own = None;
+        if scope.own.as_ref().is_none_or(|own| own.context != context) {
             scope.own = Some(Box::new(OwnProbe::new(context, local)?));
+        } else if let Some(own) = scope.own.as_mut() {
+            own.refresh_local(local)?;
         }
         Ok(true)
     }
@@ -212,6 +228,79 @@ impl HintInbox {
             Some((context, local, true)),
         )
     }
+    pub(crate) fn peer_observation(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        generation: u64,
+        context: OwnProbeContext,
+    ) -> Option<super::OwnObservation> {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let scope = state.generations.get(&(room, peer))?;
+        if scope.generation != generation || scope.connection != Some(context.connection) {
+            return None;
+        }
+        let own = scope.own.as_ref().filter(|own| own.context == context)?;
+        own.observation_advertised
+    }
+
+    /// One requester-specific sidecar, applied under the SAME room snapshot guard as
+    /// the caller's metadata checks. It changes a canonical question, never a receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn offer_peer_observation(
+        &self,
+        job: &Job,
+        generation: u64,
+        room: Digest32,
+        peer: Digest32,
+        context: OwnProbeContext,
+        local: Option<HeadHint>,
+        observation: super::OwnObservation,
+    ) -> Result<Offer> {
+        {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let scope = state
+                .generations
+                .get_mut(&(room, peer))
+                .ok_or(Error::Profile("history observation scope missing"))?;
+            if scope.generation != generation || scope.connection != Some(context.connection) {
+                return Err(Error::Profile(OWN_PROBE_CONNECTION_CHANGED));
+            }
+            if scope.own.as_ref().is_none_or(|own| own.context != context) {
+                scope.own = Some(Box::new(OwnProbe::new(context, local)?));
+            } else if let Some(own) = scope.own.as_mut() {
+                own.refresh_local(local)?;
+            }
+            let own = scope
+                .own
+                .as_mut()
+                .ok_or(Error::Profile("history observation owner missing"))?;
+            if own.observation_advertised != Some(observation) {
+                own.invalidate()?;
+                own.observation_advertised = Some(observation);
+                own.cause = ProbeCause::Observation(observation);
+            }
+        }
+        let target = local.or_else(|| {
+            observation.known_head.map(|head| HeadHint {
+                author: context.node,
+                size: head.size,
+                head: head.head,
+            })
+        });
+        match target {
+            Some(target) => self.offer_scoped(
+                job,
+                generation,
+                room,
+                peer,
+                &[target],
+                Some((context, local, false)),
+            ),
+            None => Ok(Offer::default()),
+        }
+    }
+
     /// Completed observations survive an empty pending queue, but never the exact
     /// Port/room/connection/authority lifetime. Both producers use this ONE gate.
     #[allow(clippy::too_many_arguments)]
@@ -245,15 +334,12 @@ impl HintInbox {
                 .ok_or(Error::Profile("history inventory scope missing"))?;
             // Only the actor binds the filed connection. A late retired stream cannot
             // replace that owner; its ordinary non-own hints remain unauthoritative input.
-            if scope.connection == Some(context.connection)
-                && scope
-                    .own
-                    .as_ref()
-                    .is_none_or(|own| own.context != context || own.local != local)
-            {
-                // Retire the old completion before any fallible fresh-identity allocation.
-                scope.own = None;
-                scope.own = Some(Box::new(OwnProbe::new(context, local)?));
+            if scope.connection == Some(context.connection) {
+                if scope.own.as_ref().is_none_or(|own| own.context != context) {
+                    scope.own = Some(Box::new(OwnProbe::new(context, local)?));
+                } else if let Some(own) = scope.own.as_mut() {
+                    own.refresh_local(local)?;
+                }
             }
         }
         let mut outcome = Offer::default();
@@ -296,13 +382,33 @@ impl HintInbox {
                     }
                 }
             }
+            let probe_facts = probe.and_then(|(context, _, _)| {
+                (hint.author == context.node)
+                    .then(|| {
+                        state
+                            .generations
+                            .get(&(room, peer))
+                            .and_then(|scope| scope.own.as_ref())
+                            .map(|own| own.facts)
+                    })
+                    .flatten()
+            });
             if state.pending.iter().any(|p| {
                 p.room == room
                     && p.peer == peer
                     && p.hint.author == hint.author
                     && p.hint.head == hint.head
+                    && p.probe_facts == probe_facts
             }) {
                 continue;
+            }
+            if probe_facts.is_some() {
+                state.pending.retain(|pending| {
+                    pending.room != room
+                        || pending.peer != peer
+                        || pending.hint.author != hint.author
+                        || pending.in_flight
+                });
             }
             // Inventory heads are scalar successors, not a work log. Keep an owner already in
             // flight immutable, but collapse strictly older queued versions for this source and
@@ -346,6 +452,7 @@ impl HintInbox {
                 peer,
                 hint: *hint,
                 in_flight: false,
+                probe_facts,
             });
             outcome.added += 1;
         }
@@ -385,6 +492,7 @@ impl HintInbox {
         &self,
         claim: OwnProbeClaim,
         answer: OwnProbeAnswer,
+        accepted_role: Option<super::RolePosition>,
         complete: bool,
     ) -> Result<Option<OwnProbeClaim>> {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -404,7 +512,6 @@ impl HintInbox {
         };
         if own.context != claim.context
             || own.facts != claim.facts
-            || matches!(answer, OwnProbeAnswer::Complete(head) if head.author != claim.context.node)
             || (!complete && answer == OwnProbeAnswer::Unavailable)
         {
             return Ok(None);
@@ -428,7 +535,17 @@ impl HintInbox {
             facts: own.facts,
             ..claim
         };
+        if let Some(role) = accepted_role {
+            own.accepted_role = Some(role);
+        }
         if complete {
+            if let OwnProbeAnswer::Snapshot(snapshot) = answer {
+                if let Some(role) = snapshot.role {
+                    own.pending_role = (own.accepted_role != Some(role)).then_some((claim, role));
+                }
+                // No role assertion is not a new zero/decrease and does not erase a
+                // genuine earlier unvalidated word in this same authorized context.
+            }
             if own.completed.is_none() {
                 own.completed = Some(CompletedProbe { claim, answer });
             }
@@ -445,6 +562,52 @@ impl HintInbox {
         }
         Ok(Some(claim))
     }
+    /// A real partial word can precede a Complete snapshot (for example DONE Busy).
+    /// Join it without inventing completion and rebase only the SAME actual started root.
+    pub(crate) fn record_role(
+        &self,
+        port: OwnProbePort,
+        request: RequestId,
+        role: super::RolePosition,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> Result<Option<(OwnProbeClaim, OwnProbeClaim)>> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(scope) = state.generations.get_mut(&(port.room, port.peer)) else {
+            return Ok(None);
+        };
+        if scope.generation != port.generation {
+            return Ok(None);
+        }
+        let Some(own) = scope.own.as_mut() else {
+            return Ok(None);
+        };
+        own.accepted_role = Some(role);
+        own.pending_role = None;
+        if before == after {
+            return Ok(None);
+        }
+        let started = own
+            .started
+            .filter(|claim| claim.request == request && claim.facts == own.facts);
+        own.invalidate()?;
+        own.started = started;
+        own.cause = ProbeCause::Receipt {
+            request,
+            before,
+            after,
+        };
+        Ok(started.map(|prior| {
+            (
+                prior,
+                OwnProbeClaim {
+                    facts: own.facts,
+                    ..prior
+                },
+            )
+        }))
+    }
+
     pub(crate) fn receipt_changed(
         &self,
         port: OwnProbePort,
@@ -476,6 +639,67 @@ impl HintInbox {
         }
         Ok(())
     }
+    pub(crate) fn pending_role(
+        &self,
+        port: OwnProbePort,
+    ) -> Option<(OwnProbeClaim, super::RolePosition)> {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let scope = state.generations.get(&(port.room, port.peer))?;
+        (scope.generation == port.generation).then_some(())?;
+        scope.own.as_ref()?.pending_role
+    }
+
+    /// Consume this exact latest word after current actor fences and own-chain validation;
+    /// never consume a different query's successor or manufacture full-root completion.
+    pub(crate) fn accept_pending_role(
+        &self,
+        claim: OwnProbeClaim,
+        role: super::RolePosition,
+    ) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(scope) = state
+            .generations
+            .get_mut(&(claim.port.room, claim.port.peer))
+        else {
+            return false;
+        };
+        if scope.generation != claim.port.generation
+            || scope.connection != Some(claim.context.connection)
+        {
+            return false;
+        }
+        let Some(own) = scope.own.as_mut() else {
+            return false;
+        };
+        if own.context != claim.context || own.pending_role != Some((claim, role)) {
+            return false;
+        }
+        own.accepted_role = Some(role);
+        own.pending_role = None;
+        true
+    }
+
+    pub(crate) fn reject_pending_role(&self, claim: OwnProbeClaim, role: super::RolePosition) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(scope) = state
+            .generations
+            .get_mut(&(claim.port.room, claim.port.peer))
+        else {
+            return;
+        };
+        if scope.generation != claim.port.generation
+            || scope.connection != Some(claim.context.connection)
+        {
+            return;
+        }
+        if let Some(own) = scope.own.as_mut() {
+            if own.context == claim.context && own.pending_role == Some((claim, role)) {
+                own.pending_role = None;
+                own.role_error = Some("peer role receipt conflicts with accepted own chain");
+            }
+        }
+    }
+
     pub(crate) fn probe_status(&self, port: OwnProbePort) -> serde_json::Value {
         let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(scope) = state.generations.get(&(port.room, port.peer)) else {
@@ -491,11 +715,14 @@ impl HintInbox {
         let request =
             |value: RequestId| value.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let head = |hint: HeadHint| serde_json::json!({"author":digest(&hint.author),"head":digest(&hint.head),"size":hint.size});
-        let claim = |value: OwnProbeClaim| serde_json::json!({"request":request(value.request),"facts":request(value.facts),"target":head(value.target)});
-        let answer_head = |answer: OwnProbeAnswer| match answer {
-            OwnProbeAnswer::Complete(value) => Some(value),
-            OwnProbeAnswer::Unavailable => None,
+        let role = |value: super::RolePosition| serde_json::json!({"through":value.through,"entry_hash":digest(&value.entry_hash)});
+        let observation = |value: super::OwnObservation| {
+            serde_json::json!({
+                "known_head":value.known_head.map(|head|serde_json::json!({"head":digest(&head.head),"size":head.size})),
+                "role":value.role.map(role),
+            })
         };
+        let claim = |value: OwnProbeClaim| serde_json::json!({"request":request(value.request),"facts":request(value.facts),"target":head(value.target)});
         let cause = match own.cause {
             ProbeCause::Scope => {
                 serde_json::json!({"kind":"current-room-head-authority-connection"})
@@ -503,12 +730,15 @@ impl HintInbox {
             ProbeCause::Advertisement(value) => {
                 serde_json::json!({"kind":"changed-peer-advertisement","advertisement":head(value)})
             }
+            ProbeCause::Observation(value) => {
+                serde_json::json!({"kind":"changed-peer-observation","observation":observation(value)})
+            }
             ProbeCause::Answer {
                 request: root,
                 answer,
             } => match answer {
-                OwnProbeAnswer::Complete(value) => {
-                    serde_json::json!({"kind":"validated-role-complete-answer","request":request(root),"answer":head(value)})
+                OwnProbeAnswer::Snapshot(value) => {
+                    serde_json::json!({"kind":"validated-own-head-snapshot","request":request(root),"observation":observation(value)})
                 }
                 OwnProbeAnswer::Unavailable => {
                     serde_json::json!({"kind":"unavailable-own-head-answer","request":request(root)})
@@ -523,10 +753,20 @@ impl HintInbox {
             }
         };
         serde_json::json!({"node":digest(&own.context.node),"instance":request(own.context.instance),
-            "epoch":own.context.epoch,"authorization":digest(&own.context.authorization),"connection":own.context.connection,
-            "facts":request(own.facts),"port_generation":port.generation,"state":match own.completed {Some(done) if done.answer == OwnProbeAnswer::Unavailable => "unavailable",Some(_) => "observed",None => "unobserved"},"cause":cause,"local_head":own.local.map(head),"peer_advertisement":own.advertised.map(head),
-            "peer_receipt":own.receipt.and_then(answer_head).map(head),"last_started":own.started.map(claim),
-            "completed":own.completed.map(|done| serde_json::json!({"root":claim(done.claim),"disposition":if done.answer == OwnProbeAnswer::Unavailable {"unavailable"} else {"complete"},"answer":answer_head(done.answer).map(head)}))})
+        "epoch":own.context.epoch,"authorization":digest(&own.context.authorization),"connection":own.context.connection,
+        "facts":request(own.facts),"port_generation":port.generation,
+        "state":match own.completed.map(|done|done.answer) {
+            Some(OwnProbeAnswer::Snapshot(snapshot)) if snapshot.known_head.is_none()=>"missing",
+            Some(OwnProbeAnswer::Snapshot(_))=>"observed", Some(OwnProbeAnswer::Unavailable)=>"unavailable",None=>"unobserved"},
+        "cause":cause,"local_head":own.local.map(head),"peer_advertisement":own.advertised.map(head),
+        "peer_observation":own.observation_advertised.map(observation),"accepted_role":own.accepted_role.map(role),
+        "role_validation_error":own.role_error,
+        "pending_role_validation":own.pending_role.map(|(root,word)|serde_json::json!({"root":claim(root),"role":role(word)})),
+        "last_started":own.started.map(claim),
+        "completed":own.completed.map(|done| match done.answer {
+            OwnProbeAnswer::Snapshot(snapshot)=>serde_json::json!({"root":claim(done.claim),"disposition":"snapshot","observation":observation(snapshot)}),
+            OwnProbeAnswer::Unavailable=>serde_json::json!({"root":claim(done.claim),"disposition":"unavailable","observation":null}),
+        })})
     }
     pub(crate) fn pending(&self, room: Digest32, peer: Digest32) -> bool {
         self.0

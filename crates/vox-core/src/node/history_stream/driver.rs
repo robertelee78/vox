@@ -12,7 +12,7 @@ use crate::wire::WireError;
 
 use super::client::{Received, Receiver};
 use super::transport::{Read, Transport};
-use super::{Frame, Preamble, Query};
+use super::{Frame, Preamble, Query, Status};
 
 /// The caller supplies the same fixed fence/deadline used to create the receiver. It must
 /// hold its queue slot and actual buffer charges until this worker has really exited.
@@ -81,20 +81,34 @@ async fn handshake_and_pull(
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
+    let mut announced = None;
     if matches!(query, Query::Inventory) {
         let super::source::Lookup::Found(mut held) = receiver.inventory(io.job()).await? else {
             return Err(Error::Unreachable("history inventory buffers busy"));
         };
-        let frame = Frame::Have(std::mem::take(&mut held.value));
+        let snapshot = held.value.snapshot;
+        let frame = Frame::Have {
+            hints: std::mem::take(&mut held.value.hints),
+            observation: snapshot.peer,
+        };
         let encoded = frame.encode_required(io.job())?;
         overhead += encoded.as_slice().len() + 4;
         if overhead + super::DONE_RESERVE > super::MAX_RESPONSE_BYTES {
             return Err(Error::SizeLimitExceeded("inventory handshake quantum"));
         }
         io.write_encoded(&encoded).await?;
+        announced = Some(snapshot);
         drop(encoded);
         drop(frame);
         drop(held);
     }
-    receiver.pull(io, preamble.request, query, overhead).await
+    let mut received = receiver
+        .pull(io, preamble.request, query, preamble.purpose, overhead)
+        .await?;
+    // The peer processed this exact HAVE before its completed Inventory response. A failed
+    // exchange grants no announcement receipt, even if its bytes were already written.
+    if received.status == Status::Complete {
+        received.announced = announced;
+    }
+    Ok(received)
 }

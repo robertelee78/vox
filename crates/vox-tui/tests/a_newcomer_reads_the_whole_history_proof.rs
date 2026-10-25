@@ -3086,6 +3086,11 @@ fn assert_pressure_identity(record: &serde_json::Value, owner: &PressureContinua
 #[test]
 #[ignore = "two real vox daemons, one hosting more than eight nodes; optional, run it in release"]
 fn hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port() {
+    // OFF-REPOSITORY focused FX29/#1021 spike; never a new CI gate.
+    if std::env::var_os("VOX_PROOF_FX29_PUBLICATION_ONLY").is_some() {
+        pub_refusal_publication_spike();
+        return;
+    }
     test_knobs::require(&[
         "VOX_TEST_FOREGROUND_JOBS",
         "VOX_TEST_HOLD_LIVE_JOB_FILE",
@@ -9403,4 +9408,2069 @@ fn newcomer_reads_the_whole_history(
     drop(bob_daemon);
     drop(alice_daemon);
     (to_alice, to_bob)
+}
+
+// OFF-REPOSITORY FX29 publication SPIKE ONLY: the existing optional journey selects this narrow arm.
+#[cfg(feature = "optional-proofs")]
+struct PubOwnedDaemon {
+    dir: std::path::PathBuf,
+    tag: String,
+    child: std::cell::RefCell<Daemon>,
+}
+
+#[cfg(feature = "optional-proofs")]
+#[derive(Default)]
+struct PubOwnedDaemons {
+    children: Vec<PubOwnedDaemon>,
+    command: std::cell::Cell<usize>,
+}
+
+#[cfg(feature = "optional-proofs")]
+impl PubOwnedDaemons {
+    // A CLI may auto-start a daemon. Any loss of the original owned process is
+    // therefore APPARATUS before its output can supply a PRODUCT/green verdict.
+    fn check(&self) {
+        for owned in &self.children {
+            let ended = owned
+                .child
+                .borrow_mut()
+                .0
+                .try_wait()
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "APPARATUS: FX29 publication owned {} daemon wait failed: {error}",
+                        owned.tag
+                    )
+                });
+            assert!(ended.is_none(),
+                "APPARATUS: FX29 publication original owned {} daemon exited {ended:?}; no replacement credit; stderr: {}",
+                owned.tag, said(&owned.dir, &owned.tag));
+        }
+    }
+
+    fn cli(&self, dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+        self.check();
+        // FX29 publication commands use the exact owned daemon, never attach::Root's attach
+        // wrapper. The public CLI may still auto-start after a race; the final
+        // original-child check rejects all such output and root must census it.
+        let sequence = self.command.get();
+        self.command.set(sequence + 1);
+        let stem = format!("pub-cli-{sequence:04}");
+        let keychain = attach::keychain(dir);
+        let mut cmd = Command::new(VOX);
+        cmd.args(args)
+            .env("VOX_DATA_DIR", dir)
+            .env("VOX_CONFIG_DIR", dir.join("cfg"))
+            .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+            .env("VOX_TEST_KEYCHAIN", &keychain)
+            .env_remove("VOX_ROOM")
+            .env_remove("VOX_SESSION")
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let answer = if typed::is_keyring_change(args) {
+            // An inherited pty-driver safety stop is apparatus, never FX29 publication's own
+            // persistent-read discriminator or a user-visible latency claim.
+            let typed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| typed::keyring(&cmd)));
+            self.check();
+            let (ok, shown) = typed.unwrap_or_else(|_| {
+                panic!("APPARATUS: FX29 publication typed trust staging did not finish; see preceding pty diagnostic")
+            });
+            (ok, shown.clone(), shown)
+        } else {
+            let mut child = cmd.spawn().unwrap_or_else(|error| {
+                panic!("APPARATUS: FX29 publication CLI spawn {args:?}: {error}")
+            });
+            if let Some(text) = stdin {
+                if let Err(error) = child
+                    .stdin
+                    .as_mut()
+                    .expect("APPARATUS: FX29 publication piped stdin")
+                    .write_all(text.as_bytes())
+                {
+                    eprintln!("FX29 publication CLI stdin not taken: {error}");
+                }
+                drop(child.stdin.take());
+            }
+            let out = child.wait_with_output().unwrap_or_else(|error| {
+                panic!("APPARATUS: FX29 publication CLI wait {args:?}: {error}")
+            });
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        for (suffix, bytes) in [
+            (
+                "args.json",
+                serde_json::to_string(args).expect("APPARATUS: FX29 publication argv JSON"),
+            ),
+            ("out", answer.1.clone()),
+            ("err", answer.2.clone()),
+        ] {
+            std::fs::write(dir.join(format!("{stem}.{suffix}")), bytes).unwrap_or_else(|error| {
+                panic!("APPARATUS: FX29 publication CLI transcript: {error}")
+            });
+        }
+        self.check();
+        answer
+    }
+
+    fn stop(&mut self, dir: &Path) {
+        self.check();
+        let at = self
+            .children
+            .iter()
+            .position(|child| child.dir == dir)
+            .expect("APPARATUS: publication stop lacks an original owned daemon");
+        let original = self.children.remove(at);
+        eprintln!(
+            "PUBLICATION OWNED STOP: pid={} profile={} tag={}",
+            original.child.borrow().0.id(),
+            dir.display(),
+            original.tag
+        );
+        original.child.into_inner().stop();
+        self.check();
+    }
+
+    fn start(&mut self, dir: &Path, tag: &str, env: &[(&str, &str)]) {
+        self.check();
+        let child = daemon_env(dir, tag, env);
+        eprintln!(
+            "FX29 publication OWNED DAEMON: pid={} profile={} tag={tag}",
+            child.0.id(),
+            dir.display()
+        );
+        self.children.push(PubOwnedDaemon {
+            dir: dir.to_owned(),
+            tag: tag.to_owned(),
+            child: std::cell::RefCell::new(child),
+        });
+        self.check();
+        // Wait on the owned daemon's public startup line/socket, with no CLI
+        // capable of bootstrapping a replacement during initial startup.
+        loop {
+            self.check();
+            let out = std::fs::read_to_string(dir.join(format!("daemon-{tag}.out")))
+                .unwrap_or_else(|error| {
+                    panic!("APPARATUS: FX29 publication owned startup log: {error}")
+                });
+            let socket = out
+                .lines()
+                .find_map(|line| line.strip_prefix("vox daemon: control socket "));
+            let ready =
+                socket.is_some_and(|path| std::os::unix::net::UnixStream::connect(path).is_ok());
+            self.check();
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (ok, out, err) = self.cli(dir, &["room", "list"], None);
+        assert!(
+            ok,
+            "APPARATUS: FX29 publication owned startup room list refused: {out}{err}"
+        );
+        self.check();
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+#[derive(Clone)]
+struct PubContent {
+    hash: String,
+    body: String,
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_status(owned: &PubOwnedDaemons, dir: &Path) -> serde_json::Value {
+    let (ok, out, err) = owned.cli(dir, &["status", "--json"], None);
+    assert!(ok, "PRODUCT: shipped status --json refused: {out}{err}");
+    let status = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("APPARATUS: FX29 publication public status JSON: {error}: {out}")
+    });
+    // Every observation, including initial catalog catchup, checks the same-query
+    // ownership contract. A mutant must fail here rather than spin in a later drain.
+    pub_assert_no_duplicate_own_probe(&status);
+    status
+}
+
+// Composite API bound to immutable product8b167. No old Complete(Head) fallback;
+// independent source/compile/runtime review remains separate.
+#[cfg(feature = "optional-proofs")]
+fn pub_probe_hex(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        text.len() == 32
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_probe_head(value: &serde_json::Value, node: &str) -> bool {
+    value["author"] == node
+        && value["head"]
+            .as_str()
+            .is_some_and(|head| vox_core::node::link::b32_decode(head, "own-probe head").is_ok())
+        && value["size"].is_u64()
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_observed_head(value: &serde_json::Value) -> bool {
+    value["head"]
+        .as_str()
+        .is_some_and(|head| vox_core::node::link::b32_decode(head, "observed own head").is_ok())
+        && value["size"]
+            .as_u64()
+            .is_some_and(|size| size <= vox_core::log::feed::MAX_SEQ)
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_local_head(probe: &serde_json::Value, node: &str) -> serde_json::Value {
+    let local = &probe["local_head"];
+    assert!(
+        pub_probe_head(local, node),
+        "APPARATUS: local own Head schema: {probe}"
+    );
+    serde_json::json!({"head":local["head"],"size":local["size"]})
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_probe_role(value: &serde_json::Value) -> bool {
+    value.is_null()
+        || (value["through"]
+            .as_u64()
+            .is_some_and(|through| through > 0 && through <= vox_core::log::feed::MAX_SEQ)
+            && value["entry_hash"].as_str().is_some_and(|hash| {
+                vox_core::node::link::b32_decode(hash, "own-probe role").is_ok()
+            }))
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_snapshot<'a>(probe: &'a serde_json::Value, _node: &str) -> &'a serde_json::Value {
+    // Source-bound composite adapter: no old Complete(Head) fallback. A missing/empty Head
+    // and absence of a receipt are distinct; a role word never comes from Head.size.
+    let answer = &probe["completed"]["observation"];
+    assert!(
+        answer.is_object()
+            && answer.get("known_head").is_some()
+            && (answer["known_head"].is_null() || pub_observed_head(&answer["known_head"]))
+            && answer.get("role").is_some()
+            && pub_probe_role(&answer["role"]),
+        "APPARATUS: shipped composite own-probe observation schema differs: {probe}"
+    );
+    answer
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_accepted_role(probe: &serde_json::Value) -> &serde_json::Value {
+    // Source-bound composite adapter: exact accepted nonzero word, not merely an offered
+    // sidecar and not the signed Head. None must remain None, never manufactured 0.
+    let accepted = &probe["accepted_role"];
+    assert!(
+        probe.get("accepted_role").is_some() && pub_probe_role(accepted),
+        "APPARATUS: shipped accepted-role schema differs: {probe}"
+    );
+    accepted
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_port_observation<'a>(
+    status: &'a serde_json::Value,
+    room: &str,
+    peer: &str,
+) -> &'a serde_json::Value {
+    let port = status["lanes"]["ports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|port| port["room"] == room && port["peer"] == peer)
+        .expect("APPARATUS: semantic observation exact port is absent");
+    let observation = &port["observation"];
+    assert!(
+        observation["snapshot_kind"] == "last-validated-room-capture"
+            && pub_probe_hex(&observation["instance"])
+            && observation["epoch"].is_u64()
+            && (observation["connection"].is_null() || observation["connection"].is_u64())
+            && observation["dirty"].is_boolean()
+            && observation["initialized"].is_boolean()
+            && observation["announcement_owed"].is_boolean()
+            && matches!(
+                observation["owner"].as_str(),
+                Some(
+                    "local-fault"
+                        | "metadata-refresh"
+                        | "metadata-due"
+                        | "outbound-round"
+                        | "peer-backoff"
+                        | "queued-port"
+                        | "port-request"
+                        | "settled"
+                )
+            ),
+        "APPARATUS: actual operator observation dependency schema differs: {port}"
+    );
+    for key in ["desired", "sent"] {
+        let snapshot = &observation[key];
+        assert!(
+            observation.get(key).is_some(),
+            "APPARATUS: missing {key} snapshot: {port}"
+        );
+        if snapshot.is_null() {
+            continue;
+        }
+        assert!(
+            snapshot.get("own_head").is_some()
+                && (snapshot["own_head"].is_null() || pub_observed_head(&snapshot["own_head"]))
+                && snapshot["peer"].get("known_head").is_some()
+                && (snapshot["peer"]["known_head"].is_null()
+                    || pub_observed_head(&snapshot["peer"]["known_head"]))
+                && snapshot["peer"].get("role").is_some()
+                && pub_probe_role(&snapshot["peer"]["role"]),
+            "APPARATUS: exact serialized/desired snapshot schema differs: {port}"
+        );
+    }
+    // This is NOT a pinned current durable cursor and no all-absence assertion is
+    // made. dirty/refresh are real dependency observations, not elapsed verdicts.
+    observation
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_assert_no_duplicate_own_probe(status: &serde_json::Value) {
+    let ports = status["lanes"]["ports"]
+        .as_array()
+        .expect("APPARATUS: own-probe observation needs public lanes.ports");
+    for port in ports {
+        let probe = &port["own_head_probe"];
+        if probe.is_null() {
+            continue;
+        }
+        let node = probe["node"]
+            .as_str()
+            .expect("APPARATUS: own-probe node schema");
+        assert!(
+            vox_core::node::link::b32_decode(node, "own-probe node").is_ok()
+                && port["room"].is_string()
+                && port["peer"].is_string()
+                && pub_probe_hex(&probe["instance"])
+                && pub_probe_hex(&probe["facts"])
+                && probe["authorization"].is_string()
+                && probe["epoch"].is_u64()
+                && probe["connection"].is_u64()
+                && probe["port_generation"].is_u64(),
+            "APPARATUS: own-probe public context schema differs: {port}"
+        );
+        let done = &probe["completed"];
+        if done.is_null() {
+            assert!(
+                probe["state"] == "unobserved",
+                "APPARATUS: uncompleted own probe claimed observed: {port}"
+            );
+            continue;
+        }
+        let first = &done["root"];
+        assert!(
+            pub_probe_hex(&first["request"])
+                && pub_probe_hex(&first["facts"])
+                && pub_probe_head(&first["target"], node)
+                && probe["facts"] == first["facts"],
+            "APPARATUS: first resolved own-probe root schema differs: {port}"
+        );
+        let _ = pub_accepted_role(probe);
+        match done["disposition"].as_str() {
+            Some("snapshot") => {
+                let observation = pub_snapshot(probe, node);
+                let expected_state = if observation["known_head"].is_null() {
+                    "missing"
+                } else {
+                    "observed"
+                };
+                assert_eq!(
+                    probe["state"], expected_state,
+                    "APPARATUS: snapshot known/missing Head state differs: {port}"
+                );
+            }
+            Some("unavailable") => {
+                assert!(
+                    done["observation"].is_null() && probe["state"] == "unavailable",
+                    "APPARATUS: actual typed Unavailable changed into a snapshot: {port}"
+                );
+            }
+            _ => panic!("APPARATUS: final typed observation disposition differs: {port}"),
+        }
+        let started = &probe["last_started"];
+        assert!(
+            pub_probe_hex(&started["request"])
+                && pub_probe_hex(&started["facts"])
+                && pub_probe_head(&started["target"], node),
+            "APPARATUS: first resolved own-probe root lacks actual admission: {port}"
+        );
+        assert!(started["facts"] != probe["facts"] || started["request"] == first["request"],
+            "PRODUCT [FX29 own-head coalescing]: shipped status shows a second admitted own-head query after an already resolved same-author/same-facts query; exact_port={port}");
+    }
+    // No all-empty/lost-notify assertion: old room view + actor lanes are not an
+    // atomic semantic-obligation snapshot. Bind only if final real API provides it.
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_has_resolved_own_probe(status: &serde_json::Value, room: &str, peer: &str) -> bool {
+    status["lanes"]["ports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|port| {
+            let probe = &port["own_head_probe"];
+            port["room"] == room
+                && port["peer"] == peer
+                && port["connected"] == true
+                && matches!(
+                    probe["state"].as_str(),
+                    Some("observed" | "missing" | "unavailable")
+                )
+                && !probe["completed"].is_null()
+                && probe["facts"] == probe["completed"]["root"]["facts"]
+        })
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_hex(value: &[u8]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_history(
+    owned: &PubOwnedDaemons,
+    dir: &Path,
+    room: &str,
+    action: &str,
+    retained: Option<(&str, &str)>,
+) -> HistoryDemandReply {
+    use vox_core::node::api::HistoryDemandPhase as Phase;
+    let mut args = vec!["room", "read", room, "--history", action, "--json"];
+    if let Some((instance, request)) = retained {
+        args.extend(["--history-instance", instance]);
+        if action == "resume" {
+            args.extend(["--history-request", request]);
+        }
+    }
+    let (ok, out, err) = owned.cli(dir, &args, None);
+    assert!(
+        ok,
+        "APPARATUS: FX29 publication exact history {action} refused: {out}{err}"
+    );
+    let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("APPARATUS: FX29 publication typed history JSON: {error}: {out}")
+    });
+    let room_id = vox_core::node::link::b32_decode(room, "FX29 publication exact room")
+        .expect("APPARATUS: FX29 publication canonical room id");
+    assert!(
+        reply.schema == "vox.room.history/1"
+            && reply.status.room == room_id
+            && reply.instance == pub_hex(&reply.status.instance)
+            && reply.request == reply.status.request.as_ref().map(|id| pub_hex(id))
+            && reply.status.private_peer.is_none(),
+        "APPARATUS: FX29 publication typed reply changed room, instance, request or public type: {out}"
+    );
+    if let Some((instance, request)) = retained {
+        assert!(
+            reply.instance == instance
+                && (reply.request.as_deref() == Some(request)
+                    || (reply.status.phase == Phase::Preparing && reply.request.is_none())),
+            "APPARATUS: FX29 publication retained identity changed; no fresh Older is permitted: {out}"
+        );
+    }
+    reply
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_content(row: &serde_json::Value, post: &PubContent, room: &str, author: &str) -> bool {
+    row["schema"] == "vox.room.row/1"
+        && row["room"] == room
+        && row["entry_hash"] == post.hash
+        && row["author"] == author
+        && row["owed"] == false
+        && row["envelope"]["v"] == 1
+        && row["envelope"]["type"] == "say"
+        && row["envelope"]["body"] == post.body
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_rows(
+    owned: &PubOwnedDaemons,
+    dir: &Path,
+    room: &str,
+    before: Option<&str>,
+) -> Vec<serde_json::Value> {
+    let limit = vox_core::log::history::MAX_PAGE_ENTRIES.to_string();
+    let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
+    if let Some(before) = before {
+        args.extend(["--before", before]);
+    }
+    let (ok, out, err) = owned.cli(dir, &args, None);
+    assert!(
+        ok,
+        "PRODUCT: shipped ordinary room read refused: {out}{err}"
+    );
+    out.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("APPARATUS: FX29 publication staging row JSON: {error}: {line}")
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_pace() {
+    // Apparatus polling pace, never a product deadline or pass/fail threshold.
+    std::thread::sleep(Duration::from_millis(20));
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_fields(path: &Path) -> BTreeMap<String, String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| {
+            panic!("APPARATUS: publication witness {}: {error}", path.display())
+        })
+        .split_whitespace()
+        .map(|field| {
+            let (key, value) = field
+                .split_once('=')
+                .expect("APPARATUS: publication witness field is not key=value");
+            (key.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_select(path: &Path, bindings: &[(&str, &str)]) {
+    let mut canonical = String::new();
+    for (at, (key, value)) in bindings.iter().enumerate() {
+        let raw = vox_core::node::link::b32_decode(value, "publication selector")
+            .expect("APPARATUS: selector identity is not full base32");
+        assert_eq!(
+            vox_core::node::link::b32_encode(&raw),
+            *value,
+            "APPARATUS: selector identity is not canonical"
+        );
+        if at != 0 {
+            canonical.push(' ');
+        }
+        canonical.push_str(key);
+        canonical.push('=');
+        canonical.push_str(value);
+    }
+    canonical.push('\n');
+    let temporary = path.with_extension(format!("selector-tmp-{}", std::process::id()));
+    std::fs::write(&temporary, &canonical).expect("APPARATUS: selector temporary write");
+    std::fs::rename(&temporary, path).expect("APPARATUS: selector atomic publication");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("APPARATUS: selector readback"),
+        canonical,
+        "APPARATUS: selector bytes changed before trigger"
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_post(owned: &PubOwnedDaemons, dir: &Path, room: &str, body: &str) -> PubContent {
+    // --json is the existing structured SAY input mode, paired with the exact SAY row below.
+    let (ok, out, err) = owned.cli(dir, &["room", "post", room, "--json", "-"], Some(body));
+    assert!(
+        ok,
+        "APPARATUS: publication fixture post refused: {out}{err}"
+    );
+    let accepted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("APPARATUS: publication accepted post JSON: {error}: {out}")
+    });
+    PubContent {
+        hash: accepted["entry_hash"]
+            .as_str()
+            .expect("APPARATUS: publication accepted post has no hash")
+            .to_owned(),
+        body: body.to_owned(),
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_seen(
+    owned: &PubOwnedDaemons,
+    dir: &Path,
+    room: &str,
+    author: &str,
+    post: &PubContent,
+) -> bool {
+    pub_rows(owned, dir, room, None)
+        .iter()
+        .any(|row| pub_content(row, post, room, author))
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_lane<'a>(status: &'a serde_json::Value, room: &str, peer: &str) -> &'a serde_json::Value {
+    status["sync"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["room"] == room && row["peer"] == peer)
+        .unwrap_or_else(|| panic!("APPARATUS: publication exact public lane missing: {status}"))
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_no_false_malformed(owned: &PubOwnedDaemons, reader: &Path, tag: &str, offset: usize) {
+    owned.check();
+    let diagnostic = said(reader, tag);
+    let fresh = diagnostic
+        .get(offset..)
+        .expect("APPARATUS: selected daemon log was truncated/replaced");
+    assert!(!fresh.contains("local history refusal was not durably recorded: malformed at-rest artifact: sparse mutation during publication"),
+        "PRODUCT [FX29 refusal publication]: actual committed publication made the shipped product falsely report a malformed at-rest refusal: {diagnostic}");
+}
+
+// ONLY the deliberate Bob-pruning precondition permits this exact in-progress reply.
+// A retry is not an empty page or evidence that the known body has disappeared.
+#[cfg(feature = "optional-proofs")]
+fn pub_pruning_observation(
+    owned: &PubOwnedDaemons,
+    dir: &Path,
+    room: &str,
+    author: &str,
+    post: &PubContent,
+) -> Option<bool> {
+    let limit = vox_core::log::history::MAX_PAGE_ENTRIES.to_string();
+    let (ok, out, err) = owned.cli(
+        dir,
+        &["room", "read", room, "--json", "--limit", &limit],
+        None,
+    );
+    if !ok
+        && out.is_empty()
+        && matches!(
+            err.trim(),
+            "vox: the room is removing expired saved history; retry"
+                | "vox: the room is refreshing saved history; retry"
+        )
+    {
+        eprintln!("PUBLICATION PRUNE STAGING: exact in-progress retention/projection reply; absence NOT established");
+        return None;
+    }
+    assert!(
+        ok,
+        "PRODUCT: shipped Bob-pruning staging read refused: {out}{err}"
+    );
+    let rows: Vec<serde_json::Value> = out
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("APPARATUS: FX29 publication prune-staging row JSON: {error}: {line}")
+            })
+        })
+        .collect();
+    Some(rows.iter().any(|row| pub_content(row, post, room, author)))
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_retention(owned: &PubOwnedDaemons, dir: &Path, room: &str, duration: &str) {
+    std::fs::write(dir.join("cfg/retention"), format!("default {duration}\n"))
+        .expect("APPARATUS: publication fixture retention file");
+    let (ok, out, err) = owned.cli(dir, &["room", "retention", room, "--steps", "7d"], None);
+    assert!(
+        ok,
+        "APPARATUS: publication fixture retention reload: {out}{err}"
+    );
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_wait_room(owned: &PubOwnedDaemons, dir: &Path, room: &str) {
+    loop {
+        let status = pub_status(owned, dir);
+        if status["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|r| r["id"] == room)
+        {
+            return;
+        }
+        assert!(
+            status["preparing"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|r| r["id"] == room),
+            "APPARATUS: accepted publication room lacks open/preparing owner: {status}"
+        );
+        pub_pace();
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_quiescent(owned: &PubOwnedDaemons, dir: &Path, room: &str, peer: Option<&str>) {
+    pub_quiescent_observed(owned, dir, room, peer, false);
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_quiescent_observed(
+    owned: &PubOwnedDaemons,
+    dir: &Path,
+    room: &str,
+    peer: Option<&str>,
+    require_resolved_own_probe: bool,
+) {
+    loop {
+        let status = pub_status(owned, dir);
+        let matches = |row: &serde_json::Value| {
+            row["room"] == room && peer.is_none_or(|peer| row["peer"] == peer)
+        };
+        let retained = ["running", "ready", "deferred", "admissions"]
+            .into_iter()
+            .any(|kind| {
+                status["lanes"]["bounded"][kind]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(matches)
+            });
+        let busy = status["lanes"]["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|port| {
+                matches(port)
+                    && (port["needs"] == true
+                        || port["queued"] == true
+                        || port["round_running"] == true
+                        || port["inbound"].as_u64().is_some_and(|count| count != 0)
+                        || port["publishing"] == true
+                        || !port["out_age_ms"].is_null())
+            });
+        if !retained && !busy {
+            if require_resolved_own_probe {
+                let peer = peer.expect("APPARATUS: exact own-probe peer required");
+                assert!(pub_has_resolved_own_probe(&status, room, peer),
+                    "APPARATUS: publication settled but a current resolved first own-head probe was not staged; no quiet/coalescing credit: {status}");
+                eprintln!("PUBLICATION RESOLVED OWN PROBE BEFORE QUIET: room={room} peer={peer} status={status}");
+            }
+            return;
+        }
+        pub_pace();
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_connected(owned: &PubOwnedDaemons, reader: &Path, room: &str, peer: &str, connected: bool) {
+    loop {
+        let status = pub_status(owned, reader);
+        if status["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["id"] == room)
+            .flat_map(|r| r["members"].as_array().into_iter().flatten())
+            .any(|m| m["id"] == peer && m["trusted"] == true && m["connected"] == connected)
+        {
+            return;
+        }
+        pub_pace();
+    }
+}
+
+/// Off-repository extension of the existing declined-refusal journey. No new test or CI gate.
+#[cfg(feature = "optional-proofs")]
+fn pub_refusal_publication_spike() {
+    use vox_core::node::api::HistoryDemandPhase as Phase;
+    eprintln!("FX29 PUBLICATION ONLY: full_story_pass=false; FX35/480/pool/generation/strict NOT EXECUTED; lifecycle-lock branch NOT EXECUTED");
+    test_knobs::require(&[
+        "VOX_TEST_DISABLE_TICK_SCHEDULE",
+        "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
+        "VOX_TEST_HOLD_CONTROL_JOB_FILE",
+    ]);
+    let mut temp = tempfile::tempdir().expect("APPARATUS: publication scratch");
+    temp.disable_cleanup(true);
+    let root = temp.path();
+    eprintln!("PUBLICATION RETAINED SCRATCH: {}", root.display());
+    let mut owned = PubOwnedDaemons::default();
+    let mut identities = Vec::new();
+    for n in 0..3 {
+        let dir = root.join(format!("identity-{n}"));
+        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: publication scratch config");
+        let (ok, out, err) = owned.cli(&dir, &["id"], None);
+        assert!(ok, "APPARATUS: publication identity refused: {out}{err}");
+        let text = out.trim().to_owned();
+        let raw = vox_core::node::link::b32_decode(&text, "publication role")
+            .expect("APPARATUS: publication canonical identity");
+        assert_eq!(
+            vox_core::node::link::b32_encode(&raw),
+            text,
+            "APPARATUS: noncanonical identity"
+        );
+        identities.push((raw, text, dir));
+    }
+    // Real source rule: BTreeMap port keys, then public Older picks first trusted member.
+    // Assign generated identities once, rather than retrying requests or forcing a peer.
+    identities.sort_by_key(|identity| identity.0);
+    let (p_key, p_id, publisher) = &identities[0];
+    let (_, bob_id, bob) = &identities[1];
+    let (_, reader_id, reader) = &identities[2];
+    assert!(
+        p_key < &identities[1].0,
+        "APPARATUS: publication donor order is not strict"
+    );
+    let decline = root.join("hold-decline");
+    let publication = root.join("hold-decline.publication");
+    let decline_text = decline.to_string_lossy().into_owned();
+    let reader_env = [
+        ("VOX_TEST_DISABLE_TICK_SCHEDULE", "1"),
+        ("VOX_TEST_HOLD_HISTORY_DECLINE_FILE", decline_text.as_str()),
+    ];
+    for (dir, tag) in [
+        (publisher.as_path(), "publisher"),
+        (bob.as_path(), "refuser"),
+        (reader.as_path(), "reader-initial"),
+    ] {
+        let keychain = attach::keychain(dir).to_string_lossy().into_owned();
+        let mut env = vec![
+            ("VOX_TEST_DISABLE_TICK_SCHEDULE", "1"),
+            ("VOX_TEST_KEYCHAIN", keychain.as_str()),
+        ];
+        if dir == reader.as_path() {
+            env.push(("VOX_TEST_HOLD_HISTORY_DECLINE_FILE", decline_text.as_str()));
+        }
+        owned.start(dir, tag, &env);
+    }
+    for (dir, me) in [(publisher, p_id), (bob, bob_id), (reader, reader_id)] {
+        for (peer_index, (_, other, _)) in identities.iter().enumerate() {
+            if other != me {
+                let name = format!("peer-{peer_index}");
+                let (ok, out, err) =
+                    owned.cli(dir, &["trust", "add", other, "--name", &name], None);
+                assert!(
+                    ok,
+                    "APPARATUS: publication mutual trust refused: {out}{err}"
+                );
+            }
+        }
+    }
+    let (ok, out, err) = owned.cli(
+        publisher,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "publication",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "APPARATUS: publication room create refused: {out}{err}");
+    let status = pub_status(&owned, publisher);
+    let rooms = status["rooms"].as_array().expect("APPARATUS: source rooms");
+    assert_eq!(rooms.len(), 1, "APPARATUS: source must have one room");
+    let room = rooms[0]["id"]
+        .as_str()
+        .expect("APPARATUS: canonical room")
+        .to_owned();
+    let (ok, out, err) = owned.cli(publisher, &["room", "link", &room], None);
+    assert!(ok, "APPARATUS: publication link refused: {out}{err}");
+    let links: Vec<_> = out.lines().filter(|s| s.starts_with("vox://")).collect();
+    assert_eq!(links.len(), 1, "APPARATUS: source needs one link");
+    let link = links[0].to_owned();
+    let join = |owned: &PubOwnedDaemons, dir: &Path| {
+        let (ok, out, err) = owned.cli(
+            dir,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(&format!("{ROOMPASS}\n")),
+        );
+        assert!(ok, "APPARATUS: publication join refused: {out}{err}");
+        pub_wait_room(owned, dir, &room);
+    };
+    join(&owned, bob);
+    // Derive enough known Content from the existing live-window bound; no invented threshold.
+    let catalog: Vec<_> = (0..vox_core::log::history::MAX_PAGE_ENTRIES + 2)
+        .map(|n| {
+            pub_post(
+                &owned,
+                publisher,
+                &room,
+                &format!("publication-catalog-{n}"),
+            )
+        })
+        .collect();
+    join(&owned, reader);
+    let rows = loop {
+        let status = pub_status(&owned, reader);
+        let member_ids: BTreeSet<_> = status["rooms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["id"] == room)
+            .flat_map(|r| r["members"].as_array().into_iter().flatten())
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        let expected: BTreeSet<_> = [p_id.as_str(), bob_id.as_str(), reader_id.as_str()]
+            .into_iter()
+            .collect();
+        assert!(
+            member_ids.is_subset(&expected),
+            "APPARATUS: another publication source/member exists"
+        );
+        let busy = ["running", "ready", "deferred"].into_iter().any(|kind| {
+            status["lanes"]["bounded"][kind]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|f| f["room"] == room)
+        });
+        let needs = status["lanes"]["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| {
+                p["room"] == room
+                    && (p["needs"] == true
+                        || p["queued"] == true
+                        || p["round_running"] == true
+                        || !p["out_age_ms"].is_null())
+            });
+        if member_ids == expected
+            && !busy
+            && !needs
+            && pub_seen(&owned, reader, &room, p_id, catalog.last().unwrap())
+        {
+            break pub_rows(&owned, reader, &room, None);
+        }
+        pub_pace();
+    };
+    let first = catalog
+        .iter()
+        .position(|post| rows.iter().any(|r| pub_content(r, post, &room, p_id)))
+        .expect("APPARATUS: settled publisher catalog has no cached Content boundary");
+    assert!(
+        first > 0,
+        "APPARATUS: no genuine older missing publisher Content exists"
+    );
+    let boundary = &catalog[first];
+    let target = &catalog[first - 1];
+    assert!(
+        pub_rows(&owned, publisher, &room, Some(&boundary.hash))
+            .iter()
+            .any(|row| pub_content(row, target, &room, p_id)),
+        "APPARATUS: chosen Older donor lacks preceding exact Content"
+    );
+    assert!(
+        !pub_rows(&owned, reader, &room, Some(&boundary.hash))
+            .iter()
+            .any(|row| pub_content(row, target, &room, p_id)),
+        "APPARATUS: chosen older Content is already cached"
+    );
+    while !pub_seen(&owned, bob, &room, p_id, catalog.last().unwrap()) {
+        pub_pace();
+    }
+    pub_quiescent(&owned, bob, &room, None);
+    pub_quiescent(&owned, publisher, &room, None);
+    pub_quiescent(&owned, reader, &room, None);
+    pub_static_gap_observation(
+        &owned,
+        (publisher, p_id),
+        (reader, reader_id),
+        &room,
+        (boundary, target),
+    );
+    // Stop the already-converged reader before the fresh refusal body exists. Preserve its
+    // canonical room instance/cached cursor and all trust; no grant edit races the response.
+    owned.stop(reader);
+    owned.stop(publisher);
+    // P stays forever: shortening P here would destroy the archive target. P and reader are
+    // physically offline before this fresh body exists, so Bob is its only possible holder.
+    let refused = pub_post(&owned, bob, &room, "publication-refusal-body");
+    assert!(
+        pub_seen(&owned, bob, &room, bob_id, &refused),
+        "APPARATUS: Bob accepted body was not readable at source"
+    );
+    pub_retention(&owned, bob, &room, "1");
+    loop {
+        if pub_pruning_observation(&owned, bob, &room, bob_id, &refused) == Some(false) {
+            break;
+        }
+        pub_pace();
+    }
+    pub_retention(&owned, bob, &room, "forever");
+    let p_keychain = attach::keychain(publisher).to_string_lossy().into_owned();
+    owned.start(
+        publisher,
+        "publisher-returned",
+        &[
+            ("VOX_TEST_DISABLE_TICK_SCHEDULE", "1"),
+            ("VOX_TEST_KEYCHAIN", p_keychain.as_str()),
+        ],
+    );
+    pub_wait_room(&owned, publisher, &room);
+    assert!(
+        pub_rows(&owned, publisher, &room, Some(&boundary.hash))
+            .iter()
+            .any(|row| pub_content(row, target, &room, p_id)),
+        "APPARATUS: returning publisher lost the exact archive target"
+    );
+    assert!(
+        !pub_seen(&owned, publisher, &room, bob_id, &refused)
+            && !pub_seen(&owned, bob, &room, bob_id, &refused),
+        "APPARATUS: Bob pruned body unexpectedly has an online holder"
+    );
+    // Exact canonical selector skips other peers' legitimate writes; legacy hold-all is unchanged.
+    pub_select(&decline, &[("peer", bob_id), ("author", bob_id)]);
+    let keychain = attach::keychain(reader).to_string_lossy().into_owned();
+    let mut env = reader_env.to_vec();
+    env.push(("VOX_TEST_KEYCHAIN", keychain.as_str()));
+    let tag = "reader-overlap";
+    owned.start(reader, tag, &env);
+    pub_wait_room(&owned, reader, &room);
+    let entered = root.join("hold-decline.entered");
+    let (response, root_flow) = loop {
+        owned.check();
+        if entered.is_file() {
+            let fields = pub_fields(&entered);
+            assert!(
+                fields.get("peer") == Some(bob_id) && fields.get("author") == Some(bob_id),
+                "APPARATUS: selected refusal is not Bob's own actual response: {fields:?}"
+            );
+            let status = pub_status(&owned, reader);
+            let actual = status["lanes"]["bounded"]["running"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|f| {
+                    f["room"] == room
+                        && f["peer"] == *bob_id
+                        && f["archive"] == false
+                        && f["finished"] == false
+                })
+                .cloned();
+            if let Some(flow) = actual {
+                break (fields, flow);
+            }
+        }
+        pub_pace();
+    };
+    eprintln!("PUBLICATION RECEIVED REFUSAL: fields={response:?} physical_root={root_flow}");
+    let receipt_path = root.join("hold-decline.response");
+    assert!(
+        receipt_path.is_file(),
+        "APPARATUS: no actual receipt-time response witness"
+    );
+    let receipt = pub_fields(&receipt_path);
+    assert!(
+        receipt["node"] == *reader_id
+            && receipt["room"] == room
+            && receipt["peer"] == *bob_id
+            && receipt["request"] == response["request"]
+            && root_flow["request"].as_str() == Some(receipt["root"].as_str())
+            && root_flow["instance"].as_str() == Some(receipt["instance"].as_str())
+            && receipt["generation"] == response["captured"]
+            && receipt["status"] == "body_not_held"
+            && receipt["live_author"] == *bob_id
+            && receipt["selected_head"] == response["head"]
+            && receipt["query_head"] == response["head"]
+            && receipt["query_seq"].parse::<u64>().is_ok_and(|seq| seq > 0)
+            && receipt["query_offset"] == "0"
+            && receipt["response_entry"] == refused.hash,
+        "APPARATUS: held transaction is not the same actual received response: {receipt:?}"
+    );
+    let (saved_author, saved_head) = if receipt["hint_head"] != "null" {
+        assert_ne!(
+            receipt["hint_author"], "null",
+            "APPARATUS: head without captured author"
+        );
+        (&receipt["hint_author"], &receipt["hint_head"])
+    } else {
+        (&receipt["live_author"], &receipt["selected_head"])
+    };
+    eprintln!("PUBLICATION RECEIPT TARGETS: {receipt:?}");
+    assert_eq!(
+        root_flow["generation"], response["captured"],
+        "APPARATUS: held refusal generation differs from actual Flow"
+    );
+    pub_connected(&owned, reader, &room, p_id, true);
+    let donor_status = pub_status(&owned, reader);
+    let actual_ports: BTreeSet<_> = donor_status["lanes"]["ports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|port| port["room"] == room)
+        .filter_map(|port| port["peer"].as_str())
+        .collect();
+    let expected_ports: BTreeSet<_> = [p_id.as_str(), bob_id.as_str()].into_iter().collect();
+    assert_eq!(
+        actual_ports, expected_ports,
+        "APPARATUS: exact public source ports not staged in the known BTree order: {donor_status}"
+    );
+    // The original static-gap assertion preceded the required Publisher lifecycle.
+    // Start a SEPARATE same-Head claim from actual post-restart facts, BEFORE Older.
+    // Bob's real refusal is held here, so Reader-wide quiescence is not a prerequisite.
+    let role_baseline =
+        pub_pre_older_role_baseline(&owned, (publisher, p_id), (reader, reader_id), &room);
+    pub_select(
+        &publication,
+        &[
+            ("node", reader_id),
+            ("room", &room),
+            ("peer", p_id),
+            ("entry", &target.hash),
+        ],
+    );
+    // Exactly ONE explicit Older; its source follows the actual public BTree port policy.
+    let (ok, out, err) = owned.cli(
+        reader,
+        &[
+            "room",
+            "read",
+            &room,
+            "--history",
+            "older",
+            "--before",
+            &boundary.hash,
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "APPARATUS: one public Older could not be staged: {out}{err}"
+    );
+    let archived = loop {
+        let reply = pub_history(&owned, reader, &room, "status", None);
+        if reply.status.phase != Phase::Preparing {
+            break reply;
+        }
+        pub_pace();
+    };
+    assert!(
+        archived.status.phase == Phase::Pending
+            && archived.status.author.as_ref() == Some(p_key)
+            && archived.request.is_some(),
+        "APPARATUS: one exact public archive action was not accepted for P"
+    );
+    assert_eq!(
+        Some(archived.instance.as_str()),
+        root_flow["instance"].as_str(),
+        "APPARATUS: public Older and received refusal belong to different room instances"
+    );
+    let pub_entered = root.join("hold-decline.publication.entered");
+    let publisher_fields = loop {
+        owned.check();
+        if pub_entered.is_file() {
+            break pub_fields(&pub_entered);
+        }
+        let observed = pub_history(
+            &owned,
+            reader,
+            &room,
+            "status",
+            Some((&archived.instance, archived.request.as_deref().unwrap())),
+        );
+        assert!(matches!(observed.status.phase, Phase::Preparing | Phase::Pending),
+            "APPARATUS: accepted Older reached {:?} before exact selected Content ever started Building; no new Older/retry", observed.status.phase);
+        pub_pace();
+    };
+    assert!(publisher_fields["node"] == *reader_id && publisher_fields["room"] == room
+        && publisher_fields["peer"] == *p_id && publisher_fields["entry"] == target.hash
+        && publisher_fields["phase"] == "building" && publisher_fields["instance"] == archived.instance
+        && publisher_fields["root"] == archived.request.as_deref().unwrap()
+        && root_flow["generation"].as_str() == Some(publisher_fields["generation"].as_str())
+        && publisher_fields["logical_archive"] == "true",
+        "APPARATUS: no exact real committed publisher owns the selected entry: {publisher_fields:?}");
+    let frozen = std::fs::read(&pub_entered).expect("APPARATUS: publication entered bytes");
+    eprintln!(
+        "PUBLICATION COMMITTED BUILDING: {publisher_fields:?}; older_root={:?}",
+        archived.request
+    );
+    let prior_diagnostic = said(reader, tag);
+    assert!(!prior_diagnostic.contains("local history refusal was not durably recorded: malformed at-rest artifact: sparse mutation during publication"),
+        "APPARATUS: false malformed diagnostic predates the bound publication/consumer-release stage; no own-mutant attribution: {prior_diagnostic}");
+    let diagnostic_offset = prior_diagnostic.len();
+    std::fs::remove_file(&decline).expect("APPARATUS: one decline release");
+    loop {
+        pub_no_false_malformed(&owned, reader, tag, diagnostic_offset);
+        let status = pub_status(&owned, reader);
+        let waiter = ["ready", "deferred"]
+            .into_iter()
+            .flat_map(|kind| {
+                status["lanes"]["bounded"][kind]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .find(|f| {
+                f["actor"] == root_flow["actor"]
+                    && f["room"] == room
+                    && f["peer"] == *bob_id
+                    && f["request"] == root_flow["request"]
+                    && f["instance"] == root_flow["instance"]
+                    && f["generation"] == root_flow["generation"]
+                    && f["publication_owner"] == publisher_fields["request"]
+                    && f["publication_admission"].is_u64()
+            });
+        if let Some(waiter) = waiter {
+            let token = waiter["publication_admission"].as_u64().unwrap();
+            let admitted = status["lanes"]["bounded"]["admissions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|a| {
+                    a["gate"] == "publication"
+                        && a["admission"] == token
+                        && a["room"] == room
+                        && a["peer"] == *bob_id
+                        && a["request"] == root_flow["request"]
+                });
+            let producer = status["lanes"]["bounded"]["running"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|f| {
+                    f["room"] == room
+                        && f["peer"] == *p_id
+                        && f["archive"] == true
+                        && f["instance"] == archived.instance
+                        && f["request"] == archived.request.as_deref().unwrap()
+                        && f["finished"] == false
+                });
+            let bob_running = status["lanes"]["bounded"]["running"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|f| f["room"] == room && f["peer"] == *bob_id);
+            let pool = &status["lanes"]["budget"]["flow_state"];
+            let owners = pool["running"]
+                .as_array()
+                .expect("PRODUCT: shipped flow-state owners missing");
+            let p_charge = owners
+                .iter()
+                .filter(|owner| {
+                    owner["node"] == *reader_id
+                        && owner["actor"] == root_flow["actor"]
+                        && owner["room"] == room
+                        && owner["peer"] == *p_id
+                        && owner["request"] == archived.request.as_deref().unwrap()
+                        && owner["instance"] == archived.instance
+                })
+                .count();
+            let bob_charge = owners.iter().any(|owner| {
+                owner["node"] == *reader_id
+                    && owner["room"] == room
+                    && owner["peer"] == *bob_id
+                    && owner["request"] == root_flow["request"]
+                    && owner["instance"] == root_flow["instance"]
+            });
+            assert!(p_charge == 1 && !bob_charge,
+                "APPARATUS: actual admitted publisher/parked waiter pool ownership was not staged: {status}");
+            assert!(admitted && producer && !bob_running, "APPARATUS: exact waiter/actual independently running publisher not established: {status}");
+            assert_eq!(
+                std::fs::read(&pub_entered).unwrap(),
+                frozen,
+                "APPARATUS: publication witness changed"
+            );
+            assert!(
+                publication.is_file(),
+                "APPARATUS: publication released before the causal edge"
+            );
+            eprintln!("PUBLICATION EXACT PARKED LOCAL RESPONSE: {status}");
+            break;
+        }
+        pub_pace();
+    }
+    std::fs::remove_file(&publication).expect("APPARATUS: one actual publisher release");
+    loop {
+        pub_no_false_malformed(&owned, reader, tag, diagnostic_offset);
+        let status = pub_status(&owned, reader);
+        let saved = &pub_lane(&status, &room, bob_id)["history_refusal_saved"];
+        if saved["peer"] == *bob_id
+            && saved["author"] == *saved_author
+            && saved["request"] == response["request"]
+            && saved["head"] == *saved_head
+            && saved["captured_generation"] == response["captured"]
+            && saved["current_generation"] == response["captured"]
+            && saved["remembered"].is_boolean()
+            && pub_rows(&owned, reader, &room, Some(&boundary.hash))
+                .iter()
+                .any(|row| pub_content(row, target, &room, p_id))
+        {
+            assert!(!pub_seen(&owned, reader, &room, bob_id, &refused), "PRODUCT [FX29 refusal publication]: pruned Bob body became visible without a holder");
+            eprintln!(
+                "PUBLICATION SAME RESPONSE SETTLED: saved={saved} target_hash={}",
+                target.hash
+            );
+            break;
+        }
+        pub_pace();
+    }
+    pub_same_head_role_progress(
+        &owned,
+        (publisher, p_id),
+        (reader, reader_id),
+        &room,
+        (boundary, target),
+        &role_baseline,
+        &archived,
+    );
+    // Saved diagnostics can precede remaining local header/effect slices. Drain that retained
+    // work before disconnect so reconnect is not blamed for finishing an earlier root.
+    pub_quiescent_observed(&owned, reader, &room, Some(bob_id), true);
+    // This outcome concerns Reader's FETCH direction for the saved refusal.
+    // A fresh connection can legitimately SERVE its peer a current own-head snapshot.
+    let prior_status = pub_status(&owned, reader);
+    let prior_probe = pub_current_own_probe(&prior_status, &room, bob_id)
+        .expect("APPARATUS: reconnect baseline lacks Reader's own probe");
+    assert!(
+        pub_has_resolved_own_probe(&prior_status, &room, bob_id),
+        "APPARATUS: reconnect baseline lacks a current resolved own-probe root"
+    );
+    let prior_connection = prior_probe["connection"].clone();
+    let prior_root = prior_probe["completed"]["root"]["request"].clone();
+    let prior_context =
+        ["node", "instance", "epoch", "authorization"].map(|key| (key, prior_probe[key].clone()));
+    assert!(
+        prior_connection.is_u64()
+            && prior_root.is_string()
+            && prior_probe["completed"]["disposition"] == "snapshot",
+        "APPARATUS: reconnect baseline did not resolve an actual typed own-head snapshot"
+    );
+    let prior_answer = pub_snapshot(prior_probe, reader_id).clone();
+    let prior_capture = pub_port_observation(&prior_status, &room, bob_id);
+    assert!(
+        prior_capture["initialized"] == true
+            && prior_capture["dirty"] == false
+            && prior_capture["desired"] == prior_capture["sent"]
+            && ["connection", "instance", "epoch"]
+                .iter()
+                .all(|key| prior_probe[*key] == prior_capture[*key]),
+        "APPARATUS: reconnect baseline has an unannounced semantic tuple: {prior_status}"
+    );
+    let unchanged = prior_capture["desired"].clone();
+    assert!(
+        unchanged["own_head"] == pub_local_head(prior_probe, reader_id)
+            && unchanged["own_head"]["size"]
+                == pub_probe_room(&prior_status, &room)["own_feed_through"],
+        "APPARATUS: reconnect baseline's own Head is not current: {prior_status}"
+    );
+    let original_saved = pub_lane(&prior_status, &room, bob_id)["history_refusal_saved"].clone();
+    assert!(original_saved["request"].as_str() == Some(receipt["request"].as_str())
+        && original_saved["peer"] == *bob_id
+        && original_saved["author"].as_str() == Some(saved_author.as_str())
+        && original_saved["head"].as_str() == Some(saved_head.as_str()),
+        "PRODUCT [FX29 refusal publication]: settled refusal was replaced before unchanged reconnect: {original_saved}");
+    // One real connection lifecycle is the causal fence; no elapsed absence is a verdict.
+    owned.stop(bob);
+    pub_connected(&owned, reader, &room, bob_id, false);
+    let before_status = pub_status(&owned, reader);
+    let before = quiet_lanes(&before_status.to_string())[&(room.clone(), bob_id.clone())];
+    let before_lane = pub_lane(&before_status, &room, bob_id);
+    let fetched_before = before_lane["fetched_completed"]
+        .as_u64()
+        .expect("APPARATUS: fetched completion schema");
+    let fetched_empty_before = before_lane["fetched_empty"]
+        .as_u64()
+        .expect("APPARATUS: fetched-empty completion schema");
+    let keychain = attach::keychain(bob).to_string_lossy().into_owned();
+    owned.start(
+        bob,
+        "refuser-reconnected",
+        &[
+            ("VOX_TEST_DISABLE_TICK_SCHEDULE", "1"),
+            ("VOX_TEST_KEYCHAIN", keychain.as_str()),
+        ],
+    );
+    pub_connected(&owned, reader, &room, bob_id, true);
+    loop {
+        let status = pub_status(&owned, reader);
+        let capture = pub_port_observation(&status, &room, bob_id);
+        if capture["initialized"] != true
+            || capture["dirty"] != false
+            || capture["desired"] != capture["sent"]
+        {
+            pub_pace();
+            continue;
+        }
+        assert!(capture["desired"] == unchanged
+            && pub_probe_room(&status, &room)["own_feed_through"] == unchanged["own_head"]["size"],
+            "APPARATUS: reconnect changed the actual own/peer Head or control word; no unchanged-refusal credit: {status}");
+        let Some(probe) = pub_current_own_probe(&status, &room, bob_id) else {
+            pub_pace();
+            continue;
+        };
+        if !["connection", "instance", "epoch"]
+            .iter()
+            .all(|key| probe[*key] == capture[*key])
+        {
+            pub_pace();
+            continue;
+        }
+        assert!(
+            prior_context
+                .iter()
+                .all(|(key, value)| probe[*key] == *value),
+            "APPARATUS: reconnect changed room/authorization context: {status}"
+        );
+        if !pub_has_resolved_own_probe(&status, &room, bob_id)
+            || probe["connection"] == prior_connection
+            || probe["completed"]["root"]["request"] == prior_root
+        {
+            pub_pace();
+            continue;
+        }
+        assert!(probe["completed"]["disposition"] == "snapshot",
+            "APPARATUS: new connection did not resolve the required typed own-head snapshot: {status}");
+        assert!(pub_snapshot(probe, reader_id) == &prior_answer
+            && pub_local_head(probe, reader_id) == unchanged["own_head"],
+            "APPARATUS: new connection resolved a different actual own-head/role observation: {status}");
+        let lane = pub_lane(&status, &room, bob_id);
+        let fetched = lane["fetched_completed"]
+            .as_u64()
+            .and_then(|value| value.checked_sub(fetched_before))
+            .expect("APPARATUS: fetched completions reset across retained Reader");
+        let fetched_empty = lane["fetched_empty"]
+            .as_u64()
+            .and_then(|value| value.checked_sub(fetched_empty_before))
+            .expect("APPARATUS: fetched-empty completions reset across retained Reader");
+        if fetched == 0 {
+            pub_pace();
+            continue;
+        }
+        let grown = quiet_lanes(&status.to_string())[&(room.clone(), bob_id.clone())].since(before);
+        assert!(fetched == fetched_empty && grown.history_fetched == 0
+            && grown.history_declined == 0 && grown.history_rearmed == 0
+            && lane["history_refusal_saved"] == original_saved,
+            "PRODUCT [FX29 refusal publication]: unchanged Bob reconnect refetched/redeclined the settled response in Reader's fetch direction: fetched={fetched} empty={fetched_empty} delta={grown:?} saved={}", lane["history_refusal_saved"]);
+        eprintln!("PUBLICATION RECONNECT FETCH DIRECTION SETTLED: fetched={fetched} empty={fetched_empty} delta={grown:?} saved={original_saved} own_probe={} status={status}", probe["completed"]);
+        break;
+    }
+    pub_quiescent(&owned, bob, &room, None);
+    let successor = pub_post(&owned, bob, &room, "publication-successor-after-refusal");
+    loop {
+        let status = pub_status(&owned, reader);
+        if pub_seen(&owned, reader, &room, bob_id, &successor) {
+            assert!(
+                !pub_seen(&owned, reader, &room, bob_id, &refused),
+                "PRODUCT [FX29 refusal publication]: successor resurrected previously pruned body"
+            );
+            eprintln!(
+                "PUBLICATION SUCCESSOR READ: hash={} status={status}",
+                successor.hash
+            );
+            break;
+        }
+        pub_pace();
+    }
+    pub_own_probe_quiet_spike(
+        &mut owned,
+        root,
+        &room,
+        (reader, reader_id),
+        (bob, bob_id),
+        &refused,
+    );
+    owned.check();
+    eprintln!("FX29 PUBLICATION ONLY COMPLETE: exact refusal saved after actual publisher release; selected Older Content and fresh successor readable; Reader reconnect fetch direction empty; full_story_pass=false");
+}
+
+// The static catalog gap is an on-demand archive gap, not a promise of a live
+// role producer. This stage adds no post/Older/reconnect/sync action.
+#[cfg(feature = "optional-proofs")]
+#[derive(Clone)]
+struct PubRoleBaseline {
+    known_head: serde_json::Value,
+    role: serde_json::Value,
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_static_gap_observation(
+    owned: &PubOwnedDaemons,
+    publisher: (&Path, &str),
+    reader: (&Path, &str),
+    room: &str,
+    selection: (&PubContent, &PubContent),
+) -> PubRoleBaseline {
+    use vox_core::node::api::HistoryDemandPhase;
+    let (publisher, publisher_id) = publisher;
+    let (reader, reader_id) = reader;
+    let (boundary, target) = selection;
+    let baseline = loop {
+        let status = pub_status(owned, publisher);
+        if let Some(probe) = pub_current_own_probe(&status, room, reader_id) {
+            if probe["completed"].is_null() || probe["completed"]["disposition"] != "snapshot" {
+                pub_pace();
+                continue;
+            }
+            let observation = pub_snapshot(probe, publisher_id);
+            let role = pub_accepted_role(probe);
+            let head = &observation["known_head"];
+            if pub_observed_head(head)
+                && head == &pub_local_head(probe, publisher_id)
+                && observation["role"] == *role
+                && probe["pending_role_validation"].is_null()
+                && role["through"]
+                    .as_u64()
+                    .is_some_and(|through| through < head["size"].as_u64().unwrap())
+            {
+                // Actual actor handoff must publish both ReadBy caches BEFORE
+                // this current completed-root stamp; no extra poll is a barrier.
+                assert_eq!(pub_probe_receipt(&status, room, reader_id), role["through"].as_u64(),
+                    "PRODUCT [FX29 truthful role receipt]: shipped ReadBy credited signed Head knowledge instead of the actual partial authenticated role receipt; status={status}");
+                break PubRoleBaseline {
+                    known_head: head.clone(),
+                    role: role.clone(),
+                };
+            }
+        }
+        pub_pace();
+    };
+    pub_quiescent(owned, publisher, room, Some(reader_id));
+    pub_quiescent(owned, reader, room, None);
+    // Product8b167 patches accepted ReadBy into BOTH fresh_details/view_tx before
+    // stamping completion. No poll-count barrier or later generic publish is used.
+    let reader_status = pub_status(owned, reader);
+    let local_capture = pub_port_observation(&reader_status, room, publisher_id);
+    assert!(local_capture["initialized"] == true
+        && local_capture["desired"]["peer"]["known_head"] == baseline.known_head
+        && local_capture["desired"]["peer"]["role"] == baseline.role,
+        "APPARATUS: static partial snapshot was not independently bound to Reader's actual last validated role capture: {reader_status}");
+    let status = pub_status(owned, publisher);
+    let probe = pub_current_own_probe(&status, room, reader_id)
+        .expect("APPARATUS: static partial observation disappeared");
+    let actual = pub_snapshot(probe, publisher_id);
+    assert!(
+        actual["known_head"] == baseline.known_head && actual["role"] == baseline.role,
+        "APPARATUS: real static gap facts changed before observation: {status}"
+    );
+    // Status itself prepares a bounded LOCAL saved-request observation. Preparing
+    // with request=None is not an Older action; wait for THIS exact observation,
+    // never issue Older/Resume or interpret transient preparation as product work.
+    let mut observation_instance = None;
+    loop {
+        let history = pub_history(owned, reader, room, "status", None);
+        match &observation_instance {
+            Some(instance) => assert_eq!(&history.instance, instance,
+                "APPARATUS: local history Status changed room instance before its saved-request observation completed"),
+            None => observation_instance = Some(history.instance.clone()),
+        }
+        assert!(history.request.is_none() && history.status.request.is_none(),
+            "PRODUCT [FX29 truthful role receipt]: ordinary newest-window catchup retained an unrequested saved Older identity; actual_request={:?}; status={:?}",
+            history.request, history.status);
+        if matches!(
+            history.status.phase,
+            HistoryDemandPhase::Preparing | HistoryDemandPhase::Busy
+        ) {
+            pub_pace();
+            continue;
+        }
+        assert!(history.status.phase == HistoryDemandPhase::Idle,
+            "APPARATUS: local history Status did not establish absence of a saved request; no Older/no-request credit: {:?}", history.status);
+        break;
+    }
+    assert!(
+        !pub_rows(owned, reader, room, Some(&boundary.hash))
+            .iter()
+            .any(|row| pub_content(row, target, room, publisher_id)),
+        "APPARATUS: selected genuine older gap was filled before explicit Older"
+    );
+    let accepted = baseline.role["through"].as_u64().unwrap();
+    assert_eq!(pub_probe_receipt(&status, room, reader_id), Some(accepted),
+        "PRODUCT [FX29 truthful role receipt]: shipped ReadBy credited signed Head knowledge instead of the actual partial authenticated role receipt; status={status}");
+    eprintln!(
+        "PUBLICATION STATIC GAP RESOLVED PARTIAL: head={} accepted_role={} status={status}",
+        baseline.known_head, baseline.role
+    );
+    baseline
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_pre_older_role_baseline(
+    owned: &PubOwnedDaemons,
+    publisher: (&Path, &str),
+    reader: (&Path, &str),
+    room: &str,
+) -> PubRoleBaseline {
+    let (publisher, publisher_id) = publisher;
+    let (reader, reader_id) = reader;
+    loop {
+        let status = pub_status(owned, publisher);
+        if let Some(probe) = pub_current_own_probe(&status, room, reader_id) {
+            if !probe["completed"].is_null() && probe["completed"]["disposition"] == "snapshot" {
+                let observation = pub_snapshot(probe, publisher_id);
+                let role = pub_accepted_role(probe);
+                let head = &observation["known_head"];
+                if pub_observed_head(head)
+                    && head == &pub_local_head(probe, publisher_id)
+                    && observation["role"] == *role
+                    && probe["pending_role_validation"].is_null()
+                    && role["through"]
+                        .as_u64()
+                        .is_some_and(|through| through < head["size"].as_u64().unwrap())
+                {
+                    let reader_status = pub_status(owned, reader);
+                    let capture = pub_port_observation(&reader_status, room, publisher_id);
+                    if capture["initialized"] == true
+                        && capture["desired"]["peer"] == *observation
+                        && capture["sent"]["peer"] == *observation
+                        && capture["dirty"] == false
+                    {
+                        assert_eq!(pub_probe_receipt(&status, room, reader_id), role["through"].as_u64(),
+                            "PRODUCT [FX29 truthful role receipt]: shipped ReadBy credited signed Head knowledge instead of the actual partial authenticated role receipt; status={status}");
+                        eprintln!("PUBLICATION PRE OLDER SAME HEAD BASELINE: head={head} accepted_role={role} publisher={status} reader={reader_status}");
+                        return PubRoleBaseline {
+                            known_head: head.clone(),
+                            role: role.clone(),
+                        };
+                    }
+                }
+            }
+        }
+        pub_pace();
+    }
+}
+
+// This exact operational status comes from saved_status(state.reclaiming()),
+// installed only when the admitted Flow ended. A zero remaining count is NOT
+// evidence of completed bodies/effects; this is the owed cleanup it abandoned.
+#[cfg(feature = "optional-proofs")]
+fn pub_assert_no_abandoned_admitted_cleanup(history: &HistoryDemandReply) {
+    if history.status.phase == vox_core::node::api::HistoryDemandPhase::Paused
+        && history.status.remaining == 0
+        && history.status.detail == "Provisional history cleanup is pending."
+    {
+        panic!("PRODUCT [FX29 admitted history completion]: explicit Older abandoned admitted-body cleanup before completing its bounded page; instance={} request={:?} history={:?}",
+            history.instance, history.request, history.status);
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_same_head_role_progress(
+    owned: &PubOwnedDaemons,
+    publisher: (&Path, &str),
+    reader: (&Path, &str),
+    room: &str,
+    selection: (&PubContent, &PubContent),
+    baseline: &PubRoleBaseline,
+    archive: &HistoryDemandReply,
+) {
+    use vox_core::node::api::HistoryDemandPhase as Phase;
+    let (publisher, publisher_id) = publisher;
+    let (reader, reader_id) = reader;
+    let (boundary, target) = selection;
+    let head_size = baseline.known_head["size"].as_u64().unwrap();
+    let prior = baseline.role["through"].as_u64().unwrap();
+    // Only the SAME accepted Older is observed. Its row alone cannot prove that
+    // all missing headers/effects/owed bodies from the first gap are satisfied.
+    let resolved = loop {
+        let reader_status = pub_status(owned, reader);
+        let local_capture = pub_port_observation(&reader_status, room, publisher_id);
+        let captured_full_role = local_capture["initialized"] == true
+            && local_capture["desired"]["peer"]["known_head"] == baseline.known_head
+            && local_capture["desired"]["peer"]["role"]["through"].as_u64() == Some(head_size);
+        let status = pub_status(owned, publisher);
+        if let Some(probe) = pub_current_own_probe(&status, room, reader_id) {
+            if !probe["completed"].is_null() && probe["completed"]["disposition"] == "snapshot" {
+                let observation = pub_snapshot(probe, publisher_id);
+                assert_eq!(observation["known_head"], baseline.known_head,
+                    "APPARATUS: real Publisher signed Head changed; no same-Head role-progress credit: {status}");
+                if captured_full_role
+                    && observation["role"]["through"].as_u64() == Some(head_size)
+                    && observation["role"] == local_capture["desired"]["peer"]["role"]
+                    && observation["role"] == *pub_accepted_role(probe)
+                    && probe["pending_role_validation"].is_null()
+                {
+                    assert!(
+                        head_size > prior,
+                        "APPARATUS: role progression did not advance"
+                    );
+                    assert!(pub_rows(owned, reader, room, Some(&boundary.hash)).iter()
+                        .any(|row| pub_content(row, target, room, publisher_id)),
+                        "PRODUCT [FX29 role progress]: full contiguous role receipt completed but the explicitly requested preceding Content is absent");
+                    // Immediate narrower receipt-APPLICATION verdict after the
+                    // actual completed root, not an absent-notification timeout.
+                    assert_eq!(pub_probe_receipt(&status, room, reader_id), Some(head_size),
+                        "PRODUCT [FX29 same-Head role receipt]: shipped ReadBy failed to apply the actual newly validated role receipt after explicit Older at the same signed Head; status={status}");
+                    eprintln!("PUBLICATION SAME HEAD ROLE OBSERVED: before={} after={} head={} status={status}",
+                        baseline.role, observation["role"], baseline.known_head);
+                    break observation["role"].clone();
+                }
+            }
+        }
+        let history = pub_history(
+            owned,
+            reader,
+            room,
+            "status",
+            Some((&archive.instance, archive.request.as_deref().unwrap())),
+        );
+        pub_assert_no_abandoned_admitted_cleanup(&history);
+        match history.status.phase {
+            Phase::Preparing | Phase::Pending | Phase::Busy | Phase::Complete => {}
+            Phase::More | Phase::Paused | Phase::Unavailable => {
+                panic!("APPARATUS: same accepted Older did not complete the required contiguous role progress; no Resume or second request: history={:?}; reader={reader_status}; publisher={status}", history.status);
+            }
+            Phase::Idle | Phase::Cached | Phase::Cancelled => {
+                panic!("APPARATUS: accepted Older changed its operation state before the same-Head outcome: history={:?}", history.status);
+            }
+        }
+        // More/Complete plus old peer observation is NOT an ownership-loss verdict.
+        // The operator snapshot is explicitly LAST validated room capture. An old
+        // role word here does not prove a current durable gap or a lost notification.
+        // Only a positive full-prefix capture above qualifies this stage; no clock,
+        // count, second Older or all-absence assertion manufactures progress/credit.
+        // If the original selection cannot reach it, retain real diagnostics and the
+        // exact R/I for root adjudication; no lost-wake mutant credit is claimed.
+        pub_pace();
+    };
+    // Role receipt and archive cleanup are separate user outcomes. Observe ONLY
+    // the same saved operation until its actual Complete status certifies that no
+    // body/cursor/provisional cleanup remains; remaining==0 alone cannot do so.
+    let completed_history = loop {
+        let history = pub_history(
+            owned,
+            reader,
+            room,
+            "status",
+            Some((&archive.instance, archive.request.as_deref().unwrap())),
+        );
+        pub_assert_no_abandoned_admitted_cleanup(&history);
+        match history.status.phase {
+            Phase::Complete => {
+                assert!(history.status.remaining == 0
+                    && history.status.detail != "Provisional history cleanup is pending.",
+                    "PRODUCT [FX29 admitted history completion]: shipped Complete retained unfinished selected history or provisional cleanup; history={:?}", history.status);
+                break history;
+            }
+            Phase::Preparing | Phase::Pending | Phase::Busy => pub_pace(),
+            Phase::More
+            | Phase::Paused
+            | Phase::Unavailable
+            | Phase::Idle
+            | Phase::Cached
+            | Phase::Cancelled => {
+                panic!("APPARATUS: same original Older did not establish completed cleanup; no Resume or second request: history={:?}", history.status);
+            }
+        }
+    };
+    eprintln!(
+        "PUBLICATION ADMITTED HISTORY CLEANUP COMPLETE: instance={} request={:?} history={:?}",
+        completed_history.instance, completed_history.request, completed_history.status
+    );
+    pub_quiescent(owned, publisher, room, Some(reader_id));
+    let status = pub_status(owned, publisher);
+    let probe = pub_current_own_probe(&status, room, reader_id)
+        .expect("APPARATUS: completed same-Head observation disappeared");
+    let observation = pub_snapshot(probe, publisher_id);
+    assert!(
+        observation["known_head"] == baseline.known_head && observation["role"] == resolved,
+        "APPARATUS: same-Head completed observation changed at the publication boundary: {status}"
+    );
+    // This is the narrower role APPLICATION oracle, after an actual completed
+    // response. It does not prove that an absent automatic notification was owned.
+    assert_eq!(pub_probe_receipt(&status, room, reader_id), Some(head_size),
+        "PRODUCT [FX29 same-Head role receipt]: shipped ReadBy failed to apply the actual newly validated role receipt after explicit Older at the same signed Head; status={status}");
+    eprintln!(
+        "PUBLICATION SAME HEAD ROLE READBY: old_role={} actual_role={} head={} status={status}",
+        baseline.role, resolved, baseline.known_head
+    );
+}
+
+// A returned signed Head can be older than our local feed without being a false ACK.
+// Hold the real fetch producer so that fact remains deliberate throughout the existing
+// quiet-minute feature measurement. No actual P6 returned Head is inferred here.
+#[cfg(feature = "optional-proofs")]
+fn pub_probe_room<'a>(status: &'a serde_json::Value, room: &str) -> &'a serde_json::Value {
+    status["rooms"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|shown| shown["id"] == room)
+        .expect("APPARATUS: own-probe room missing from exact shipped status")
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_probe_receipt(status: &serde_json::Value, room: &str, peer: &str) -> Option<u64> {
+    let row = pub_probe_room(status, room)["members"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|member| member["id"] == peer)
+        .expect("APPARATUS: own-probe peer missing from exact shipped room");
+    assert!(
+        row["held_through"].is_null() || row["held_through"].is_u64(),
+        "APPARATUS: own-probe read-by receipt schema: {row}"
+    );
+    row["held_through"].as_u64()
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_current_own_probe<'a>(
+    status: &'a serde_json::Value,
+    room: &str,
+    peer: &str,
+) -> Option<&'a serde_json::Value> {
+    status["lanes"]["ports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|port| port["room"] == room && port["peer"] == peer)
+        .map(|port| &port["own_head_probe"])
+        .filter(|probe| !probe.is_null())
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_held_control_owner(
+    status: &serde_json::Value,
+    hold: &Path,
+    room: &str,
+    node: &str,
+    selected: Option<&Path>,
+) -> Option<(std::path::PathBuf, Vec<u8>, serde_json::Value)> {
+    assert!(
+        hold.is_file(),
+        "APPARATUS: own-probe fetch hold released early"
+    );
+    let prefix = format!("{}.entered.", hold.file_name()?.to_str()?);
+    for entry in std::fs::read_dir(hold.parent()?).expect("APPARATUS: own-probe hold directory") {
+        let entry = entry.expect("APPARATUS: own-probe hold entry");
+        if selected.is_some_and(|selected| entry.path() != selected) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(tail) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some((actor, job)) = tail.split_once('.') else {
+            continue;
+        };
+        let (Ok(actor), Ok(_job)) = (actor.parse::<u64>(), job.parse::<usize>()) else {
+            continue;
+        };
+        let bytes = std::fs::read(entry.path()).expect("APPARATUS: own-probe held marker read");
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<_> = text.lines().collect();
+        if lines.len() != 3 || lines[0] != node || lines[1] != format!("room={room}") {
+            continue;
+        }
+        let Some(peer) = lines[2].strip_prefix("peer=") else {
+            continue;
+        };
+        let Some(running) = status["lanes"]["bounded"]["running"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|flow| {
+                flow["actor"] == actor
+                    && flow["room"] == room
+                    && flow["peer"] == peer
+                    && flow["lane"] == "control"
+                    && flow["archive"] == false
+                    && flow["finished"] == false
+            })
+        else {
+            continue;
+        };
+        let physical = status["lanes"]["budget"]["flow_state"]["running"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|owner| {
+                owner["node"] == node
+                    && owner["actor"] == actor
+                    && owner["room"] == room
+                    && owner["peer"] == peer
+                    && owner["request"] == running["request"]
+                    && owner["instance"] == running["instance"]
+            })
+            .count();
+        assert_eq!(physical, 1,
+            "APPARATUS: own-probe actual Control marker lacks its one exact physical owner: {status}");
+        // Only the immutable physical identity belongs in retained apparatus state.
+        // In particular, elapsed age_ms must change while the same worker stays held.
+        let mut identity = serde_json::Map::new();
+        for key in [
+            "actor",
+            "request",
+            "instance",
+            "generation",
+            "room",
+            "peer",
+            "token",
+            "archive",
+            "lane",
+        ] {
+            identity.insert(key.to_owned(), running[key].clone());
+        }
+        return Some((entry.path(), bytes, serde_json::Value::Object(identity)));
+    }
+    None
+}
+
+#[cfg(feature = "optional-proofs")]
+fn pub_own_probe_quiet_spike(
+    owned: &mut PubOwnedDaemons,
+    root: &Path,
+    room: &str,
+    reader: (&Path, &str),
+    bob: (&Path, &str),
+    refused: &PubContent,
+) {
+    let (reader, reader_id) = reader;
+    let (bob, bob_id) = bob;
+    // This is a staging witness, not the later original post whose ReadBy is judged.
+    let baseline = pub_post(owned, reader, room, "own-probe-known-reader-baseline");
+    let baseline_status = pub_status(owned, reader);
+    let baseline_position = pub_probe_room(&baseline_status, room)["own_feed_through"]
+        .as_u64()
+        .expect("APPARATUS: baseline Reader feed position");
+    let old_head = loop {
+        let status = pub_status(owned, reader);
+        if let Some(probe) = pub_current_own_probe(&status, room, bob_id) {
+            if probe["completed"].is_null() || probe["completed"]["disposition"] != "snapshot" {
+                pub_pace();
+                continue;
+            }
+            let answer = pub_snapshot(probe, reader_id);
+            let role = pub_accepted_role(probe);
+            if !answer["known_head"].is_null()
+                && answer["known_head"]["size"]
+                    .as_u64()
+                    .is_some_and(|size| size >= baseline_position)
+                && role["through"].as_u64() == answer["known_head"]["size"].as_u64()
+                && probe["pending_role_validation"].is_null()
+                && pub_probe_receipt(&status, room, bob_id)
+                    .is_some_and(|size| size >= baseline_position)
+                && pub_seen(owned, bob, room, reader_id, &baseline)
+            {
+                eprintln!("PUBLICATION OWN PROBE KNOWN BASELINE: post={} position={} answer={} status={status}",
+                    baseline.hash, baseline_position, answer);
+                break answer.clone();
+            }
+        }
+        pub_pace();
+    };
+    pub_quiescent(owned, reader, room, Some(bob_id));
+    pub_quiescent(owned, bob, room, None);
+    owned.stop(bob);
+    pub_connected(owned, reader, room, bob_id, false);
+    let hold = root.join("hold-own-probe-fetch");
+    assert!(!hold.exists(), "APPARATUS: own-probe hold path was reused");
+    pub_select(&hold, &[("room", room)]);
+    let hold_text = hold.to_string_lossy().into_owned();
+    let keychain = attach::keychain(bob).to_string_lossy().into_owned();
+    owned.start(
+        bob,
+        "older-head-fetch-held",
+        &[
+            ("VOX_TEST_DISABLE_TICK_SCHEDULE", "1"),
+            ("VOX_TEST_HOLD_CONTROL_JOB_FILE", hold_text.as_str()),
+            ("VOX_TEST_KEYCHAIN", keychain.as_str()),
+        ],
+    );
+    pub_connected(owned, reader, room, bob_id, true);
+    let held = loop {
+        let status = pub_status(owned, bob);
+        assert_eq!(
+            status["identity"], bob_id,
+            "APPARATUS: wrong held Bob identity"
+        );
+        if let Some(held) = pub_held_control_owner(&status, &hold, room, bob_id, None) {
+            eprintln!(
+                "PUBLICATION OWN PROBE HELD FETCH: marker={} owner={} status={status}",
+                held.0.display(),
+                held.2
+            );
+            break held;
+        }
+        pub_pace();
+    };
+    let post = pub_post(
+        owned,
+        reader,
+        room,
+        "own-probe-original-post-while-peer-fetch-held",
+    );
+    let posted_status = pub_status(owned, reader);
+    let post_position = pub_probe_room(&posted_status, room)["own_feed_through"]
+        .as_u64()
+        .expect("APPARATUS: original Reader post feed position");
+    let old_position = old_head["known_head"]["size"]
+        .as_u64()
+        .expect("APPARATUS: known older Head size");
+    assert!(
+        post_position > old_position,
+        "APPARATUS: original post did not advance beyond the independently known older Head"
+    );
+    let observed = loop {
+        let bob_status = pub_status(owned, bob);
+        let live = pub_held_control_owner(&bob_status, &hold, room, bob_id, Some(&held.0))
+            .expect("APPARATUS: original held Bob fetch owner disappeared before older answer");
+        assert!(
+            live == held,
+            "APPARATUS: held Bob producer changed before older answer"
+        );
+        let status = pub_status(owned, reader);
+        if let Some(probe) = pub_current_own_probe(&status, room, bob_id) {
+            if probe["completed"].is_null() || probe["completed"]["disposition"] != "snapshot" {
+                pub_pace();
+                continue;
+            }
+            let answer = pub_snapshot(probe, reader_id);
+            if answer == &old_head
+                && pub_accepted_role(probe)["through"].as_u64() == Some(old_position)
+                && probe["pending_role_validation"].is_null()
+                && probe["peer_observation"] == old_head
+                && probe["local_head"]["size"]
+                    .as_u64()
+                    .is_some_and(|size| size >= post_position)
+                && pub_probe_receipt(&status, room, bob_id) == Some(old_position)
+            {
+                eprintln!("PUBLICATION OWN PROBE OLDER ANSWER: original_post={} position={} old_head={old_head} status={status}",
+                    post.hash, post_position);
+                break probe.clone();
+            }
+        }
+        pub_pace();
+    };
+    // IDLE is the existing quiet-minute feature observation interval, not an operation
+    // deadline, a wedge detector, or a new scheduling/backoff/cap policy. A mutant's actual
+    // second same-facts admitted root fails in pub_status immediately; it never waits out IDLE.
+    let quiet_started = Instant::now();
+    while quiet_started.elapsed() < IDLE {
+        let status = pub_status(owned, reader);
+        let current = pub_current_own_probe(&status, room, bob_id)
+            .expect("APPARATUS: resolved own-probe scope disappeared during quiet measurement");
+        assert!(current == &observed,
+            "APPARATUS: real own-probe observation facts/root changed during the one quiet interval; no reset/retry credit: {status}");
+        let bob_status = pub_status(owned, bob);
+        let live = pub_held_control_owner(&bob_status, &hold, room, bob_id, Some(&held.0))
+            .expect("APPARATUS: held producer no longer physically owned during quiet measurement");
+        assert!(
+            live == held,
+            "APPARATUS: held producer changed during quiet measurement"
+        );
+        pub_pace();
+    }
+    eprintln!("PUBLICATION OWN PROBE QUIET MINUTE: original_post={} position={} old_head={old_head} observed={observed}; existing IDLE interval completed", post.hash, post_position);
+    std::fs::remove_file(&hold).expect("APPARATUS: sole actual own-probe fetch release");
+    loop {
+        let status = pub_status(owned, reader);
+        if pub_probe_receipt(&status, room, bob_id).is_some_and(|size| size >= post_position)
+            && pub_seen(owned, bob, room, reader_id, &post)
+        {
+            assert!(!pub_seen(owned, reader, room, bob_id, refused),
+                "PRODUCT [FX29 own-head coalescing]: receipt recovery resurrected old pruned Bob body");
+            eprintln!("PUBLICATION OWN PROBE RELEASED READBY: original_post={} position={} actual_readby={:?} status={status}",
+                post.hash, post_position, pub_probe_receipt(&status, room, bob_id));
+            break;
+        }
+        pub_pace();
+    }
 }

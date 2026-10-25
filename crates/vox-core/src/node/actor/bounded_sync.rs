@@ -2024,6 +2024,16 @@ impl Node {
                 continue;
             };
             let mut flow = flow;
+            if let Some(word) = flow.take_validated_role() {
+                // Transfer before inspecting failure/DONE. The existing one real-word
+                // HeldNote is then paired with its cached snapshot, if one completed;
+                // an error carries the word without manufacturing full completion.
+                flow.mine_held = Some(word.role.through);
+                flow.mine_role = Some(word.role);
+                flow.mine_role_context = Some(word.context);
+                flow.mine_role_scope = Some(word.scope);
+                flow.mine_role_request = Some(word.request);
+            }
             // These facts were committed by the worker before it returned. Account for them
             // before deciding whether its attempt is still current: cancellation, retirement,
             // an error after the store callback, or a newer scalar head must not turn durable
@@ -2032,6 +2042,21 @@ impl Node {
                 flow.work_committed
                     .swap(false, std::sync::atomic::Ordering::AcqRel),
             );
+            if fetched != 0
+                && self
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| profile.fingerprint() == flow.node)
+                && self
+                    .channels
+                    .get(&work.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            {
+                // A committed entry can leave bounded contiguous-successor work even
+                // after its own staging was consumed. Preserve that maintenance wake
+                // before stale-port/error handling, independently of presentation events.
+                self.governance_work.wake_maintenance_room(work.room);
+            }
             let declined = std::mem::take(&mut flow.declined);
             let offered = std::mem::take(&mut flow.offered);
             let rearmed = std::mem::take(&mut flow.rearmed);
@@ -2078,10 +2103,18 @@ impl Node {
             // otherwise discard the only hint, required root, or archive controller dispatch.
             if flow.authorization_changed || flow.local_retry.is_some() {
                 if let Some(seq) = flow.mine_held.take() {
+                    let role = flow.mine_role.take();
+                    let role_context = role.and(flow.mine_role_context.take());
+                    let role_scope = role.and(flow.mine_role_scope.take());
                     self.held_notes.push(super::HeldNote {
                         room: work.room,
                         peer: work.peer,
                         seq: Some(seq),
+                        role,
+                        role_context,
+                        role_scope,
+                        wire_request: flow.mine_role_request.take(),
+                        pending_validation: None,
                         request: flow.retirement_request(),
                         probe: None,
                         complete: false,
@@ -2232,11 +2265,59 @@ impl Node {
                 self.dispose_rearming_hint(flow);
                 continue;
             }
+            if let Some(snapshot) = flow.announced.take() {
+                if let Some(connection) = flow.announced_connection.take() {
+                    let authority = self.profile.as_ref().map(|profile| {
+                        crate::node::history_stream::authorization_generation(
+                            profile.store(),
+                            profile.fingerprint(),
+                            work.room,
+                            flow.instance,
+                            flow.epoch,
+                        )
+                        .map(|generation| {
+                            profile.fingerprint() == flow.node && generation == flow.generation
+                        })
+                    });
+                    let current_connection = self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&work.peer))
+                        .is_some_and(|current| current.serial() == connection);
+                    if current_connection && matches!(authority.as_ref(), Some(Ok(true))) {
+                        if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                            if port.epoch == flow.epoch
+                                && port.observation_instance == flow.instance
+                            {
+                                if port.observation_connection != Some(connection) {
+                                    port.observation_initialized = false;
+                                    port.observation_connection = Some(connection);
+                                }
+                                // This is the snapshot whose HAVE the peer processed, not the
+                                // port's newer desired value or the dispatch-time append count.
+                                port.observation_sent = Some(snapshot);
+                            }
+                        }
+                    } else if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        // An obsolete exchange cannot consume a replacement scope's need.
+                        // Retain a fresh metadata/announcement obligation without crediting it.
+                        port.observation_initialized = false;
+                        port.observation_sent = None;
+                        self.sched_rooms.insert(work.room);
+                        if let Some(Err(error)) = authority {
+                            port.poisoned = true;
+                            eprintln!("vox: announcement authority could not be checked: {error}");
+                        }
+                    }
+                }
+            }
             if let Some(receipt) = flow.take_announcement_receipt() {
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                    // Only this completed inventory response names what the peer actually saw.
-                    // An append racing it remains greater and owes the next announcement.
-                    port.announced_seq = port.announced_seq.max(receipt.through);
+                    // Sparse announcements use the exact serialized snapshot above. Keep
+                    // the append watermark only for the legacy announcement contract.
+                    if !port.sparse {
+                        port.announced_seq = port.announced_seq.max(receipt.through);
+                    }
                 }
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
@@ -2266,13 +2347,16 @@ impl Node {
                             && (returned.failure.is_none()
                                 || matches!(
                                     answer,
-                                    crate::node::history_stream::OwnProbeAnswer::Complete(_)
+                                    crate::node::history_stream::OwnProbeAnswer::Snapshot(_)
                                 ))
                     })
             } else {
                 None
             };
             let actual_seq = flow.mine_held.take();
+            let actual_role = flow.mine_role.take();
+            let actual_role_context = actual_role.and(flow.mine_role_context.take());
+            let actual_role_scope = actual_role.and(flow.mine_role_scope.take());
             let complete = returned.failure.is_none() && flow.done();
             if actual_seq.is_some()
                 || (complete && (probe.is_some() || flow.own_probe_scope.is_some()))
@@ -2281,6 +2365,11 @@ impl Node {
                     room: work.room,
                     peer: work.peer,
                     seq: actual_seq,
+                    role: actual_role,
+                    role_context: actual_role_context,
+                    role_scope: actual_role_scope,
+                    wire_request: flow.mine_role_request.take(),
+                    pending_validation: None,
                     request: flow.retirement_request(),
                     probe,
                     complete,
@@ -2477,6 +2566,11 @@ impl Node {
                                 room: work.room,
                                 peer: work.peer,
                                 seq: None,
+                                role: None,
+                                role_context: None,
+                                role_scope: None,
+                                wire_request: None,
+                                pending_validation: None,
                                 request: flow.retirement_request(),
                                 complete: false,
                                 probe: None,
@@ -3564,11 +3658,6 @@ impl Node {
             self.dispose_rearming_hint(flow);
             return false;
         };
-        if flow.inventory {
-            // This exchange carries every own append so far; one landing after this mark
-            // makes the port owe the peer again, and the round after announces it.
-            port.announced_seq = port.own_seq;
-        }
         let token = self.next_token;
         self.next_token += 1;
         let fence = flow
@@ -3606,6 +3695,10 @@ impl Node {
         if !flow.archive {
             port.note_foreground_attempt(generation);
         }
+        // Every actual request can return a genuine role word, including recovery,
+        // archive and departure work outside the canonical own-head probe. Capture
+        // this port lifetime independently; the receiver seals it with the word.
+        flow.receipt_scope = port.own_probe;
         let archive = flow
             .archive_request
             .map(|request| (request, flow.generation));

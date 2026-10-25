@@ -15,7 +15,7 @@ use super::admission::{self, Advanced, Staged};
 use super::credit::Response;
 use super::source::{Lookup, PreparedRead, Source};
 use super::transport::{Read, Transport};
-use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
+use super::{Continuation, Frame, Object, ProofKind, Query, RequestId, Status};
 
 const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024;
 const RECORD_METADATA_WORK: usize = 64 * 1024;
@@ -57,12 +57,28 @@ pub(crate) struct Staging {
     pub(crate) active: Arc<StdMutex<Active>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ValidatedRole {
+    pub(crate) role: super::RolePosition,
+    pub(crate) context: super::OwnProbeContext,
+    pub(crate) scope: super::OwnProbePort,
+    pub(crate) request: RequestId,
+}
+
+#[derive(Clone)]
+struct RoleHandoff {
+    slot: Arc<StdMutex<Option<ValidatedRole>>>,
+    context: super::OwnProbeContext,
+    scope: super::OwnProbePort,
+}
+
 pub(crate) struct Receiver {
     source: Source,
     generation: Digest32,
     node: Digest32,
     staging: Option<Staging>,
     historical: bool,
+    role_handoff: Option<RoleHandoff>,
 }
 
 pub(crate) enum LocalProof {
@@ -83,6 +99,9 @@ pub(crate) struct Received {
     pub(crate) role_ready: Option<(Digest32, u64, Digest32)>,
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
+    pub(crate) announced: Option<super::AnnouncementSnapshot>,
+    pub(crate) own_observation: Option<super::OwnObservation>,
+    pub(crate) accepted_role: Option<super::RolePosition>,
     pub(crate) heads: Vec<super::HeadHint>,
     pub(crate) departure_receipt: Option<super::HeadHint>,
     /// The exchange fetched an object this node did not hold (a head, header, context or
@@ -100,6 +119,9 @@ impl Received {
             role_ready: None,
             body_progress: false,
             inventory: None,
+            announced: None,
+            own_observation: None,
+            accepted_role: None,
             heads: Vec::new(),
             departure_receipt: None,
             brought: false,
@@ -147,13 +169,28 @@ impl Receiver {
             node,
             staging,
             historical,
+            role_handoff: None,
         }
+    }
+
+    pub(super) fn with_role_handoff(
+        mut self,
+        slot: Arc<StdMutex<Option<ValidatedRole>>>,
+        context: super::OwnProbeContext,
+        scope: Option<super::OwnProbePort>,
+    ) -> Self {
+        self.role_handoff = scope.map(|scope| RoleHandoff {
+            slot,
+            context,
+            scope,
+        });
+        self
     }
 
     pub(super) async fn inventory(
         &self,
         job: &crate::node::history_budget::Job,
-    ) -> Result<Lookup<Vec<super::HeadHint>>> {
+    ) -> Result<Lookup<super::source::InventoryPayload>> {
         self.source.inventory(job).await
     }
 
@@ -248,9 +285,12 @@ impl Receiver {
         io: &mut Transport,
         request: RequestId,
         query: Query,
+        purpose: super::Purpose,
         handshake_bytes: usize,
     ) -> Result<Received> {
-        let mut credit = Response::new(request, query.clone())?;
+        let own_head = purpose == super::Purpose::Control
+            && matches!(query, Query::Head(author) if author == self.node);
+        let mut credit = Response::new(request, query.clone(), own_head)?;
         credit.charge_handshake(handshake_bytes)?;
         let mut result = Received::pending(Status::ControlPending);
         #[cfg(feature = "test-knobs")]
@@ -329,7 +369,7 @@ impl Receiver {
                 }
                 match frame {
                     Frame::Meta { .. } => Action::Meta,
-                    Frame::Have(hints) => Action::Inventory(hints),
+                    Frame::Have { hints, observation } => Action::Inventory { hints, observation },
                     Frame::Chunk {
                         entry,
                         offset,
@@ -348,12 +388,18 @@ impl Receiver {
                 }
             };
             match action {
-                Action::Inventory(hints) => {
-                    let charge = io.job().reserve_or_pressure(
-                        hints.capacity() * std::mem::size_of::<super::HeadHint>(),
-                    )?;
+                Action::Inventory { hints, observation } => {
+                    let bytes = hints
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<super::HeadHint>())
+                        .and_then(|bytes| {
+                            bytes.checked_add(std::mem::size_of::<super::OwnObservation>())
+                        })
+                        .ok_or(Error::SizeLimitExceeded("inventory retained observation"))?;
+                    let charge = io.job().reserve_or_pressure(bytes)?;
                     result.inventory = Some(Inventory {
                         hints,
+                        observation,
                         _charge: charge,
                     });
                     drop(incoming);
@@ -362,6 +408,8 @@ impl Receiver {
                     let generation = self.generation;
                     let selected = query.clone();
                     let committed = self.source.commit_ledger();
+                    let node = self.node;
+                    let role_handoff = self.role_handoff.clone();
                     // The decoded frame still owns its admitted foreground worker. Reuse that
                     // exact worker for the dependent room read: asking the original Control job
                     // for a second foreground worker while retaining `incoming` can deadlock the
@@ -373,10 +421,88 @@ impl Receiver {
                             let Frame::Meta { object, .. } = incoming.frame()? else {
                                 return Err(Error::MalformedBundle("metadata frame changed"));
                             };
-                            admission::stage(
-                                room, store, &committed, request, generation, &selected, object,
-                            )
-                            .map(Some)
+                            let value = match object {
+                                Object::OwnHead { head, role } => {
+                                    if !matches!(selected, Query::Head(author) if author == node) {
+                                        return Err(Error::MalformedBundle(
+                                            "own observation author differs",
+                                        ));
+                                    }
+                                    let staged = match head {
+                                        Some(bytes) => admission::stage(
+                                            room,
+                                            store,
+                                            &committed,
+                                            request,
+                                            generation,
+                                            &selected,
+                                            Object::Head(bytes),
+                                        )?,
+                                        None => Staged::Object { brought: false },
+                                    };
+                                    let known_head = match &staged {
+                                        Staged::Head {
+                                            head, tail, author, ..
+                                        } => {
+                                            if *author != node {
+                                                return Err(Error::MalformedBundle(
+                                                    "own observation Head author differs",
+                                                ));
+                                            }
+                                            Some(super::ObservedHead {
+                                                head: *head,
+                                                size: *tail,
+                                            })
+                                        }
+                                        Staged::Object { .. } if head.is_none() => None,
+                                        Staged::Busy => return Ok(Some((staged, None, None))),
+                                        _ => {
+                                            return Err(Error::MalformedBundle(
+                                                "own observation staging differs",
+                                            ))
+                                        }
+                                    };
+                                    let accepted = match role {
+                                        Some(word)
+                                            if room.history_accepts_own_role(store, word)? =>
+                                        {
+                                            Some(word)
+                                        }
+                                        _ => None,
+                                    };
+                                    if let (Some(word), Some(handoff)) =
+                                        (accepted, role_handoff.as_ref())
+                                    {
+                                        // This real word survives any later DONE/reset/IO error
+                                        // or worker unwind. The Flow owns the fixed slot, and
+                                        // the actor still performs fresh acceptance fencing.
+                                        *handoff
+                                            .slot
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                            Some(ValidatedRole {
+                                                role: word,
+                                                context: handoff.context,
+                                                scope: handoff.scope,
+                                                request,
+                                            });
+                                    }
+                                    (
+                                        staged,
+                                        Some(super::OwnObservation { known_head, role }),
+                                        accepted,
+                                    )
+                                }
+                                object => (
+                                    admission::stage(
+                                        room, store, &committed, request, generation, &selected,
+                                        object,
+                                    )?,
+                                    None,
+                                    None,
+                                ),
+                            };
+                            Ok(Some(value))
                         })
                         .await?;
                     let Lookup::Found(staged) = staged else {
@@ -384,7 +510,9 @@ impl Receiver {
                         result.status = Status::Busy;
                         return Ok(result);
                     };
-                    match &staged.value {
+                    result.own_observation = staged.value.1;
+                    result.accepted_role = staged.value.2;
+                    match &staged.value.0 {
                         Staged::Object { brought } => result.brought |= *brought,
                         Staged::Busy => {
                             io.abort(WireError::SessionBusy);
@@ -408,7 +536,11 @@ impl Receiver {
                                 head: *head,
                                 size: *tail,
                             });
-                            if *departure_receipt {
+                            if *departure_receipt
+                                && result
+                                    .accepted_role
+                                    .is_some_and(|role| role.through >= *tail)
+                            {
                                 result.departure_receipt = Some(super::HeadHint {
                                     author: *author,
                                     head: *head,
@@ -749,9 +881,15 @@ impl Receiver {
 }
 
 enum Action {
-    Inventory(Vec<super::HeadHint>),
+    Inventory {
+        hints: Vec<super::HeadHint>,
+        observation: super::OwnObservation,
+    },
     Meta,
-    Chunk { entry: Digest32, next: u64 },
+    Chunk {
+        entry: Digest32,
+        next: u64,
+    },
     Done(Status, Option<Continuation>),
 }
 
@@ -1420,6 +1558,8 @@ pub(crate) struct LocalResult {
     pub(crate) need: Option<LocalNeed>,
     /// Semantic dispatch completed; a header-only source need not have a visible body.
     pub(crate) published: Option<Digest32>,
+    #[cfg(feature = "test-knobs")]
+    pub(super) publication_started: Option<Digest32>,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
     pub(crate) busy: bool,
@@ -1431,6 +1571,8 @@ impl LocalResult {
             next: Some(step),
             need: None,
             published: None,
+            #[cfg(feature = "test-knobs")]
+            publication_started: None,
             rendered: false,
             governance: false,
             busy: false,
@@ -1442,6 +1584,8 @@ impl LocalResult {
             next: None,
             need: None,
             published: None,
+            #[cfg(feature = "test-knobs")]
+            publication_started: None,
             rendered: false,
             governance: false,
             busy: false,
@@ -1453,6 +1597,8 @@ impl LocalResult {
             next: Some(step),
             need: Some(need),
             published: None,
+            #[cfg(feature = "test-knobs")]
+            publication_started: None,
             rendered: false,
             governance: false,
             busy: false,
@@ -1464,6 +1610,8 @@ impl LocalResult {
             next: Some(step),
             need: None,
             published: None,
+            #[cfg(feature = "test-knobs")]
+            publication_started: None,
             rendered: false,
             governance: false,
             busy: true,
@@ -1634,6 +1782,8 @@ impl Receiver {
                     next: None,
                     need: None,
                     published: Some(hash),
+                    #[cfg(feature = "test-knobs")]
+                    publication_started: None,
                     rendered,
                     governance: is_governance,
                     busy: false,
@@ -1758,6 +1908,8 @@ impl Receiver {
                 }
             }
             EntryPhase::Begin(binding) => {
+                #[cfg(feature = "test-knobs")]
+                let publication_hash = record.entry.entry_hash();
                 let job = record.job.clone();
                 let committed = self.source.commit_ledger();
                 let value = self
@@ -1789,7 +1941,15 @@ impl Receiver {
                     return Ok(LocalResult::busy(step));
                 };
                 match value.value.1 {
-                    Start::Started => LocalResult::next(next(EntryPhase::Prepare(binding))),
+                    Start::Started => {
+                        let answer = LocalResult::next(next(EntryPhase::Prepare(binding)));
+                        #[cfg(feature = "test-knobs")]
+                        let answer = LocalResult {
+                            publication_started: Some(publication_hash),
+                            ..answer
+                        };
+                        answer
+                    }
                     Start::Duplicate => LocalResult::next(next(if body {
                         EntryPhase::Refill
                     } else {
@@ -2091,5 +2251,6 @@ impl Receiver {
 /// Charged scalar hints only. They never advance a feed or authorize a body request.
 pub(crate) struct Inventory {
     pub(crate) hints: Vec<super::HeadHint>,
+    pub(crate) observation: super::OwnObservation,
     pub(super) _charge: crate::node::history_budget::BufferCharge,
 }

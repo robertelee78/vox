@@ -201,6 +201,13 @@ impl Encoder {
         self
     }
 
+    /// Encode canonical null for an explicitly nullable field.
+    pub fn null(&mut self) -> &mut Self {
+        self.room(1);
+        self.out.push(0xf6);
+        self
+    }
+
     /// Finish, returning the canonical bytes.
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
@@ -332,6 +339,18 @@ impl<'a> Decoder<'a> {
         let len = self.expect_head(MAJOR_ARRAY)?;
         self.checked_len(len)?;
         Ok(len as usize)
+    }
+
+    /// Consume canonical null, or leave a non-null field untouched for its typed reader.
+    /// End of input is an error, never an absent optional field.
+    pub fn null(&mut self) -> Result<bool, CborError> {
+        let next = self.buf.get(self.pos).ok_or(CborError::UnexpectedEof)?;
+        if *next == 0xf6 {
+            self.pos += 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // NOTE: there is deliberately no low-level `map()` reader. Every *signed*

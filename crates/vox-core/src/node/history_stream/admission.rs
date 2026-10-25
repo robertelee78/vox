@@ -408,11 +408,19 @@ pub(super) fn advance(
     match result {
         ResultStep::Missing(hash) => Ok(Advanced::MissingContext(hash)),
         ResultStep::Included(included) => {
+            let own_progress = binding.author == room.me()
+                && room
+                    .history_read(store)?
+                    .history_inclusion_receipt(&binding.head, &binding.author, binding.from)?
+                    .is_none();
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 index.keep_history_inclusion_receipt(&included)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
+            if own_progress {
+                room.history_observation_signal().changed();
+            }
             combine_parent(
                 room,
                 store,
@@ -424,11 +432,19 @@ pub(super) fn advance(
             promote_head(room, store, committed, binding.head)
         }
         ResultStep::Prefix(prefix) => {
+            let own_progress = binding.author == room.me()
+                && room
+                    .history_read(store)?
+                    .history_prefix_receipt(&binding.head, &binding.author, prefix.prefix().leaves)?
+                    .is_none();
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
                 index.keep_history_prefix_receipt(&prefix)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
+            if own_progress {
+                room.history_observation_signal().changed();
+            }
             combine_parent(
                 room,
                 store,
@@ -582,9 +598,14 @@ pub(super) fn promote_head(
         return Ok(Advanced::Busy);
     };
     drop(input);
-    let conflict = room.history_write_tracked(store, committed, |index| {
-        index.commit_history_head(&verified, &prefix)
+    let (conflict, changed) = room.history_write_tracked(store, committed, |index| {
+        index.commit_history_head_observation(&verified, &prefix)
     })?;
+    // Publication succeeded before any later reporting/conflict error. The Source
+    // callback's post-guard notifier transfers this retained predicate to the actor.
+    if changed {
+        room.history_observation_signal().changed();
+    }
     if conflict {
         return Err(invalid("conflicting authenticated heads retained"));
     }

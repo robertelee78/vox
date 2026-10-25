@@ -118,6 +118,12 @@ impl Maintenance {
     /// do not invalidate an already checked governance fold.
     pub(super) fn wake_room(&mut self, room: Digest32) {
         self.settled.remove(&room);
+        self.wake_maintenance_room(room);
+    }
+
+    /// Retain bounded room maintenance without invalidating its checked governance fold.
+    /// A commit behind the active sweep's cursor must survive that sweep's final handoff.
+    pub(super) fn wake_maintenance_room(&mut self, room: Digest32) {
         // If the active ordered sweep has already visited this room, its completion replaces
         // `pending` with `again`. Carry the wake across that boundary instead of losing it.
         if self.after.is_some_and(|after| room <= after) {

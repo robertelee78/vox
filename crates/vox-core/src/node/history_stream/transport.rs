@@ -17,7 +17,7 @@ use crate::wire::WireError;
 
 // Covers a parsed HAVE vector or all bounded proof tokens/headers beside the raw input.
 // The separate verification slice owns context maps and verifier outputs, not this decoder.
-const DECODE_ENVELOPE: usize = 1024 * 1024;
+const DECODE_ENVELOPE: usize = 1024 * 1024 + std::mem::size_of::<super::OwnObservation>();
 
 pub(super) struct Incoming {
     bytes: Vec<u8>,

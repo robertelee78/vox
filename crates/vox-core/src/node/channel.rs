@@ -1284,6 +1284,7 @@ pub struct ChannelState {
     local_history: Option<local_history::Prepared>,
     /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
     history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
+    history_observation: Arc<crate::node::history_stream::ObservationSignal>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
     /// profile is new — and its earlier entries are with the other members. Writing before they
@@ -2101,6 +2102,7 @@ impl ChannelState {
             local_content_header: None,
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            history_observation: Arc::new(crate::node::history_stream::ObservationSignal::default()),
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2811,6 +2813,7 @@ impl ChannelState {
             local_content_header: None,
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            history_observation: Arc::new(crate::node::history_stream::ObservationSignal::default()),
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3077,6 +3080,7 @@ impl ChannelState {
             local_content_header: None,
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            history_observation: Arc::new(crate::node::history_stream::ObservationSignal::default()),
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3944,6 +3948,7 @@ impl ChannelState {
         // Remote effects advance this cache in `advance_history_effect`; advance the authored
         // path from the exact verified header too, before optional cleanup can return early.
         if let Some((author, seq)) = local_applied {
+            self.history_observation.changed();
             debug_assert_eq!(author, self.me());
             self.sparse_applied_tips
                 .entry(author)
@@ -10330,6 +10335,12 @@ impl ChannelState {
     #[must_use]
     pub fn entry_count(&self) -> usize {
         self.dag.len()
+    }
+
+    pub(crate) fn history_observation_signal(
+        &self,
+    ) -> Arc<crate::node::history_stream::ObservationSignal> {
+        Arc::clone(&self.history_observation)
     }
 
     /// The room's generation counter (ADR-025 D1), shared.

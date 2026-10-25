@@ -21,6 +21,8 @@ pub(crate) struct HistoryHeadPage {
     pub next: Option<Digest32>,
 }
 
+use crate::node::history_stream::RoleKnowledge;
+
 /// A missing local body is not an authenticated expiry claim.
 pub(crate) enum HistoryPayload {
     Missing,
@@ -418,6 +420,173 @@ impl ChannelState {
         } else {
             Ok(None)
         }
+    }
+
+    /// One pinned view of accepted Head knowledge and the independently satisfied role
+    /// prefix. The caller supplies the authenticated peer whose feed this describes.
+    pub(crate) fn history_head_observation(
+        &self,
+        store: &Store,
+        author: &Digest32,
+    ) -> Result<(
+        Option<SignedHead>,
+        Option<crate::node::history_stream::RolePosition>,
+    )> {
+        let read = self.history_read(store)?;
+        self.history_head_observation_in(&read, author)
+    }
+
+    fn history_head_observation_in(
+        &self,
+        read: &entry_store::Read<'_>,
+        author: &Digest32,
+    ) -> Result<(
+        Option<SignedHead>,
+        Option<crate::node::history_stream::RolePosition>,
+    )> {
+        use crate::node::history_stream::RolePosition;
+        let known_head = read
+            .sparse_author(author, LogScope::Public)?
+            .and_then(|state| state.committed)
+            .map(|id| {
+                let head = read
+                    .history_head(&id)?
+                    .ok_or(Error::MalformedAtRest("committed observation Head missing"))?;
+                if head.binding.room != self.channel_id
+                    || head.binding.author != *author
+                    || head.binding.scope != LogScope::Public
+                    || !read.history_head_committed(&id, head.binding)?
+                {
+                    return Err(Error::MalformedAtRest("observation Head binding"));
+                }
+                Ok(head)
+            })
+            .transpose()?;
+        let role = read
+            .history_held_through(author)
+            .filter(|(through, _)| *through != 0)
+            .map(|(through, entry_hash)| RolePosition {
+                through,
+                entry_hash,
+            });
+        Ok((known_head, role))
+    }
+
+    /// The source encoder and actor metadata worker use this SAME snapshot shape.
+    /// It describes the actual own Head announced plus this node's observation of peer.
+    pub(crate) fn history_inventory_snapshot(
+        &self,
+        store: &Store,
+        peer: &Digest32,
+    ) -> Result<crate::node::history_stream::AnnouncementSnapshot> {
+        use crate::node::history_stream::{AnnouncementSnapshot, ObservedHead, OwnObservation};
+        let read = self.history_read(store)?;
+        let (own, _) = self.history_head_observation_in(&read, &self.me())?;
+        let (peer_head, role) = self.history_head_observation_in(&read, peer)?;
+        let compact = |head: SignedHead| ObservedHead {
+            size: head.root.leaves,
+            head: head.id(),
+        };
+        Ok(AnnouncementSnapshot {
+            own_head: own.map(compact),
+            peer: OwnObservation {
+                known_head: peer_head.map(compact),
+                role,
+            },
+        })
+    }
+
+    /// Only a proven older same-chain snapshot is dominated. Unknown/conflicting signed
+    /// identities and unvalidated role hashes retain their ordinary bounded probe need.
+    pub(crate) fn history_observation_dominates(
+        &self,
+        store: &Store,
+        retained: crate::node::history_stream::OwnObservation,
+        incoming: crate::node::history_stream::OwnObservation,
+    ) -> Result<bool> {
+        let read = self.history_read(store)?;
+        let known = |value: crate::node::history_stream::ObservedHead| -> Result<bool> {
+            let Some(head) = read.history_head(&value.head)? else {
+                return Ok(false);
+            };
+            Ok(head.binding.author == self.me()
+                && head.binding.room == self.channel_id
+                && head.binding.scope == LogScope::Public
+                && head.root.leaves == value.size
+                && read.history_head_accepted(&value.head, head.binding)?)
+        };
+        let head_dominated = match (retained.known_head, incoming.known_head) {
+            (_, None) => true,
+            (Some(old), Some(new)) if old == new => true,
+            (Some(old), Some(new)) if old.size > new.size => known(old)? && known(new)?,
+            _ => false,
+        };
+        let role_dominated = match (retained.role, incoming.role) {
+            (_, None) => true,
+            (Some(old), Some(new)) if old == new => true,
+            (Some(old), Some(new)) if old.through > new.through => {
+                matches!(
+                    self.history_own_role_knowledge(store, old)?,
+                    RoleKnowledge::Known
+                ) && matches!(
+                    self.history_own_role_knowledge(store, new)?,
+                    RoleKnowledge::Known
+                )
+            }
+            _ => false,
+        };
+        Ok(head_dominated && role_dominated)
+    }
+
+    /// Validate only the peer's named position in this node's already accepted OWN chain.
+    /// Unknown metadata is not absence and must never authorize ReadBy or a wire retry.
+    pub(crate) fn history_accepts_own_role(
+        &self,
+        store: &Store,
+        role: crate::node::history_stream::RolePosition,
+    ) -> Result<bool> {
+        match self.history_own_role_knowledge(store, role)? {
+            RoleKnowledge::Known => Ok(true),
+            RoleKnowledge::Missing => Ok(false),
+            RoleKnowledge::Conflict => Err(Error::MalformedBundle(
+                "peer role receipt conflicts with own position",
+            )),
+        }
+    }
+
+    pub(crate) fn history_own_role_knowledge(
+        &self,
+        store: &Store,
+        role: crate::node::history_stream::RolePosition,
+    ) -> Result<RoleKnowledge> {
+        let read = self.history_read(store)?;
+        let own = self.me();
+        if let Some((head_id, entry)) = read.history_validated_header(&own, role.through)? {
+            if entry.entry_hash() != role.entry_hash {
+                return Ok(RoleKnowledge::Conflict);
+            }
+            let head = read
+                .history_head(&head_id)?
+                .ok_or(Error::MalformedAtRest("own receipt source Head missing"))?;
+            if read.history_head_committed(&head_id, head.binding)? {
+                return Ok(RoleKnowledge::Known);
+            }
+        }
+        if let Some(id) = read
+            .sparse_author(&own, LogScope::Public)?
+            .and_then(|state| state.committed)
+        {
+            if let Some(included) = read.history_inclusion_receipt(&id, &own, role.through)? {
+                return Ok(
+                    if included.header().entry().entry_hash() == role.entry_hash {
+                        RoleKnowledge::Known
+                    } else {
+                        RoleKnowledge::Conflict
+                    },
+                );
+            }
+        }
+        Ok(RoleKnowledge::Missing)
     }
 
     /// One bounded page of commitments. No scan or signed-head vector survives this read.
@@ -1012,17 +1181,17 @@ impl ChannelState {
                 check_binding(&batch)?;
                 on_admitted(&mut batch, *hash)?;
                 batch.commit()?;
+                committed.store(true, std::sync::atomic::Ordering::Release);
             }
-            // Feed restoration is local accepted-header maintenance. Advance at most one
-            // successor in this bounded turn, including while the exact staged body continues
+            // Feed restoration is local accepted-header maintenance. Advance one bounded
+            // successor page in this turn, including while the exact staged body continues
             // through refill below.
-            let contiguous_pending = self.advance_history_contiguous(store, committed, &author)?;
+            self.advance_history_contiguous(store, committed, &author)?;
             if refill_pending {
                 return Ok(HistoryEffectProgress::RefillPending { governance: false });
             }
-            if contiguous_pending {
-                return Ok(HistoryEffectProgress::Progress);
-            }
+            // This entry's callback consumed its staged body. Any settled suffix is now
+            // owned by sparse_contiguous_pending, not another assembly of this entry.
             return Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
             });
@@ -1229,6 +1398,9 @@ impl ChannelState {
             batch.commit()?;
             committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
+            if contiguous.state.is_some() {
+                self.history_observation.changed();
+            }
             // The settled-tip index and presence update are now durable in the same Batch.
             // A source-only entry cannot change membership, and a late earlier effect must
             // not move the applied tail backward past a later return/content statement.
@@ -1271,7 +1443,6 @@ impl ChannelState {
                     return Err(error);
                 }
             };
-        let contiguous_more = contiguous.more;
         if let Err(error) = self.note_contiguous_advance(entry.skeleton.author_id, contiguous) {
             self.poison(&error);
             return Err(error);
@@ -1292,9 +1463,8 @@ impl ChannelState {
                 governance: projection_deferred,
             });
         }
-        if contiguous_more {
-            return Ok(HistoryEffectProgress::Progress);
-        }
+        // Semantic admission of this entry is complete. Bounded successor maintenance
+        // retains its own author cursor; replaying this body would reuse consumed staging.
         Ok(HistoryEffectProgress::Complete {
             rendered: cursor.rendered,
         })
@@ -1330,6 +1500,9 @@ impl ChannelState {
         batch.commit()?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         self.entries.committed();
+        if progress.state.is_some() {
+            self.history_observation.changed();
+        }
         let more = progress.more;
         self.note_contiguous_advance(*author, progress)?;
         Ok(more)
@@ -1512,6 +1685,12 @@ impl ChannelState {
             batch.commit()?;
             committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
+            if contiguous
+                .as_ref()
+                .is_some_and(|progress| progress.state.is_some())
+            {
+                self.history_observation.changed();
+            }
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
                 self.key_packages.published(self.next_log_id);
@@ -1520,7 +1699,6 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
-            let contiguous_more = contiguous.as_ref().is_some_and(|progress| progress.more);
             if let Some(progress) = contiguous {
                 self.note_contiguous_advance(entry.skeleton.author_id, progress)?;
             }
@@ -1532,8 +1710,6 @@ impl ChannelState {
                 HistoryEffectProgress::BodyUnavailable
             } else if deferred {
                 HistoryEffectProgress::RefillPending { governance: true }
-            } else if contiguous_more {
-                HistoryEffectProgress::Progress
             } else if settled {
                 HistoryEffectProgress::Complete { rendered }
             } else {

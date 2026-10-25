@@ -46,8 +46,10 @@ fn test_private_body_marker() -> Option<(std::path::PathBuf, std::path::PathBuf)
 #[allow(clippy::large_enum_variant)]
 enum ServedHead {
     Missing,
-    RolePending,
-    Unavailable,
+    Observation {
+        head: Option<crate::log::history::SignedHead>,
+        role: Option<super::RolePosition>,
+    },
     Ready(crate::log::history::SignedHead),
 }
 
@@ -74,7 +76,7 @@ pub(super) async fn answer(
     inbox: &Arc<super::HintInbox>,
     inbox_generation: u64,
     inventory_added: &mut bool,
-    served_object: &mut bool,
+    data_moved: &mut bool,
     local_inventory_busy: &mut bool,
 ) -> Result<Status> {
     let receipt_source;
@@ -95,7 +97,9 @@ pub(super) async fn answer(
             "archive page requires history reservation",
         ));
     }
-    let mut credit = Response::new(request, query.clone())?;
+    let own_head = preamble.purpose == Purpose::Control
+        && matches!(query, Query::Head(author) if author == source.peer);
+    let mut credit = Response::new(request, query.clone(), own_head)?;
     credit.charge_handshake(handshake_bytes)?;
     if matches!(query, Query::Inventory) {
         // Inventory is symmetric: the requester sends its one HAVE before receiving ours.
@@ -107,10 +111,34 @@ pub(super) async fn answer(
             Read::End => return Err(Error::MalformedBundle("inventory closed before HAVE")),
         };
         credit.charge_overhead(incoming.wire_len())?;
-        let Frame::Have(hints) = incoming.frame()? else {
+        let Frame::Have { hints, observation } = incoming.frame()? else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
         };
         let work_job = incoming.job();
+        // This scalar belongs to the authenticated request direction, not an author-list
+        // slice. Process it once even when no ordinary hint names the requester's author.
+        let offered = match source
+            .offer_observation(
+                &work_job,
+                inbox,
+                inbox_generation,
+                preamble.room,
+                observation,
+            )
+            .await?
+        {
+            super::source::InventoryOffer::Offered(offered) => offered,
+            super::source::InventoryOffer::Publication(_)
+            | super::source::InventoryOffer::Unavailable
+            | super::source::InventoryOffer::ConnectionChanged => {
+                *local_inventory_busy = true;
+                return Err(Error::PeerRefused(crate::wire::WireError::SessionBusy));
+            }
+        };
+        *inventory_added |= offered.added != 0;
+        if offered.full {
+            return Err(Error::Unreachable("inventory observation capacity busy"));
+        }
         for slice in hints.chunks(64) {
             let offered = match source
                 .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
@@ -127,6 +155,7 @@ pub(super) async fn answer(
                 }
             };
             *inventory_added |= offered.added != 0;
+            *data_moved |= offered.added != 0;
             if offered.full {
                 return Err(Error::Unreachable("inventory pending capacity busy"));
             }
@@ -137,7 +166,7 @@ pub(super) async fn answer(
     let (status, continuation) = if credit.remaining_wire() < super::DONE_RESERVE {
         (Status::Busy, None)
     } else {
-        respond(source, io, preamble, &query, &mut credit, served_object).await?
+        respond(source, io, preamble, &query, &mut credit, data_moved).await?
     };
     // Source objects and their envelopes have been dropped before the terminal allocation.
     let done = Frame::Done {
@@ -182,11 +211,11 @@ async fn send_object(
     credit: &mut Response,
     frame: Frame<'_>,
     credit_reply_reserve: usize,
-    served_object: &mut bool,
+    data_moved: &mut bool,
 ) -> Result<Sent> {
     let sent = send(source, io, credit, frame, credit_reply_reserve).await?;
     if matches!(sent, Sent::Yes) {
-        *served_object = true;
+        *data_moved = true;
     }
     Ok(sent)
 }
@@ -197,7 +226,7 @@ async fn respond(
     preamble: Preamble,
     query: &Query,
     credit: &mut Response,
-    served_object: &mut bool,
+    data_moved: &mut bool,
 ) -> Result<(Status, Option<Continuation>)> {
     let job = io.job().clone();
     let request = preamble.request;
@@ -206,52 +235,28 @@ async fn respond(
             let Lookup::Found(inventory) = source.inventory(&job).await? else {
                 return Ok((Status::Busy, None));
             };
-            let status = match send(source, io, credit, Frame::Have(inventory.value), 0).await? {
+            let frame = Frame::Have {
+                hints: inventory.value.hints,
+                observation: inventory.value.snapshot.peer,
+            };
+            let status = match send(source, io, credit, frame, 0).await? {
                 Sent::Yes => Status::Complete,
                 Sent::Busy | Sent::Full => Status::Busy,
             };
             Ok((status, None))
         }
         Query::Head(author) => {
-            let receipt = author == source.peer;
+            let own_head = preamble.purpose == Purpose::Control && author == source.peer;
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
-                    let Some(head) = room.history_head(store, &author)? else {
-                        return Ok(Some(ServedHead::Missing));
-                    };
-                    if receipt {
-                        // A receipt names the last authenticated feed position whose source and
-                        // semantic effect are complete for this node's role. The durable restart
-                        // prefix cannot jump across an entry this role still owes. In particular,
-                        // another member's key-package is complete here after its authenticated
-                        // header is dispatched; its private body is never requested or claimed.
-                        let read = room.history_read(store)?;
-                        if head.root.leaves != 0 {
-                            let Some((through, hash)) = read.history_held_through(&author) else {
-                                return Ok(Some(ServedHead::RolePending));
-                            };
-                            if through < head.root.leaves {
-                                return Ok(Some(ServedHead::RolePending));
-                            }
-                            if through > head.root.leaves {
-                                // A later restart prefix is not ordinary progress toward this
-                                // selected head. Preserve unavailable rather than fake Busy.
-                                return Ok(Some(ServedHead::Unavailable));
-                            }
-                            let Some(included) = read.history_inclusion_receipt(
-                                &head.id(),
-                                &author,
-                                head.root.leaves,
-                            )?
-                            else {
-                                return Ok(Some(ServedHead::RolePending));
-                            };
-                            if hash != included.header().entry().entry_hash() {
-                                return Ok(Some(ServedHead::Unavailable));
-                            }
-                        }
+                    if own_head {
+                        let (head, role) = room.history_head_observation(store, &author)?;
+                        return Ok(Some(ServedHead::Observation { head, role }));
                     }
-                    Ok(Some(ServedHead::Ready(head)))
+                    Ok(Some(match room.history_head(store, &author)? {
+                        Some(head) => ServedHead::Ready(head),
+                        None => ServedHead::Missing,
+                    }))
                 })
                 .await?;
             let held = match found {
@@ -259,24 +264,33 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let head = match held.value {
-                ServedHead::Ready(head) => head,
-                ServedHead::RolePending => return Ok((Status::Busy, None)),
-                ServedHead::Missing | ServedHead::Unavailable => {
-                    return Ok((Status::EvidenceUnavailable, None))
+            // The snapshot is complete even when its honest role prefix is behind the
+            // known Head. Old unrequested history is not a transient serving dependency.
+            let (wire, role, observation) = match &held.value {
+                ServedHead::Observation { head, role } => {
+                    (head.as_ref().map(|head| head.to_wire()), *role, true)
                 }
+                ServedHead::Ready(head) => (Some(head.to_wire()), None, false),
+                ServedHead::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let wire = head.to_wire();
+            let object = if observation {
+                Object::OwnHead {
+                    head: wire.as_deref(),
+                    role,
+                }
+            } else {
+                Object::Head(
+                    wire.as_deref()
+                        .ok_or(Error::Profile("served Head missing"))?,
+                )
+            };
             let status = match send_object(
                 source,
                 io,
                 credit,
-                Frame::Meta {
-                    request,
-                    object: Object::Head(&wire),
-                },
+                Frame::Meta { request, object },
                 0,
-                served_object,
+                data_moved,
             )
             .await?
             {
@@ -306,7 +320,7 @@ async fn respond(
                     object: Object::Context(&wire),
                 },
                 0,
-                served_object,
+                data_moved,
             )
             .await?
             {
@@ -341,7 +355,7 @@ async fn respond(
                     object: Object::Header(&held.value.wire),
                 },
                 0,
-                served_object,
+                data_moved,
             )
             .await?
             {
@@ -392,24 +406,14 @@ async fn respond(
                 request,
                 object: Object::Proof(held_proof.value),
             };
-            match send_object(source, io, credit, frame, 0, served_object).await? {
+            match send_object(source, io, credit, frame, 0, data_moved).await? {
                 Sent::Yes if continuation.is_some() => Ok((Status::More, continuation)),
                 Sent::Yes => Ok((Status::Complete, None)),
                 Sent::Busy | Sent::Full => Ok((Status::Busy, None)),
             }
         }
         Query::Entry { head, seq, offset } => {
-            let result = entry(
-                source,
-                io,
-                preamble,
-                credit,
-                head,
-                seq,
-                offset,
-                served_object,
-            )
-            .await?;
+            let result = entry(source, io, preamble, credit, head, seq, offset, data_moved).await?;
             let cursor = (result.status != Status::Complete
                 && (result.hash.is_some() || result.offset == 0))
                 .then_some(Continuation {
@@ -431,8 +435,7 @@ async fn respond(
             // reader's next ask cut short left rendered rows below unrendered ones; nothing
             // refilled the hole, and the ask below the bottom row found nothing to fetch.
             for seq in (lo..=hi).rev() {
-                let result =
-                    entry(source, io, preamble, credit, head, seq, 0, served_object).await?;
+                let result = entry(source, io, preamble, credit, head, seq, 0, data_moved).await?;
                 if result.status != Status::Complete {
                     return Ok((
                         result.status,
@@ -489,7 +492,7 @@ async fn entry(
     head: Digest32,
     seq: u64,
     offset: u64,
-    served_object: &mut bool,
+    data_moved: &mut bool,
 ) -> Result<EntryResult> {
     let job = io.job().clone();
     let request = preamble.request;
@@ -656,7 +659,7 @@ async fn entry(
             object: Object::Header(&header.value.wire),
         },
         0,
-        served_object,
+        data_moved,
     )
     .await?
     {
@@ -723,7 +726,7 @@ async fn entry(
                 bytes: &bytes[start..start + take],
             },
             ACK_RESERVE,
-            served_object,
+            data_moved,
         )
         .await?
         {

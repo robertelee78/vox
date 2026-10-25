@@ -17,7 +17,8 @@
   registration handoff); amended 2026-10-23 (FX-35: the decider approved exact running capacity
   per active-or-retiring hosted identity, with no fixed floor); amended 2026-10-24 (FX-35:
   resource ownership, fair admission selection, Busy attempt credit, legal proof staging and
-  exact accepted Resume capacity ownership)
+  exact accepted Resume capacity ownership); amended 2026-10-25 (FX-29: signed Head knowledge,
+  role receipts and retained semantic progress have distinct contracts)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -568,11 +569,12 @@ lessons. It changes neither this record's decision status nor any requirement or
   producing completed empty `offer` rounds without a new head, acknowledgement or periodic need.
   The candidate is to retain one exact observation in the existing per-port hint scope, shared
   by local and incoming inventory admission. Its original target, room instance, authority,
-  connection and changed peer-information witness are separate from the actual role-complete
-  Head the peer returned; observing position four never acknowledges a requested position five.
-  Only a fully completed, current, validated own-head query is to record that observation.
-  An initial own-head query answered unavailable is to retain a distinct terminal observation
-  in that same scope, with no head or acknowledgement. A locally generated target is not a
+  connection and changed peer-information witness are separate from the signed Head and actual
+  role position the peer returned; observing position four never acknowledges position five.
+  A completed current request is to record its validated Head snapshot separately from any
+  role word awaiting local validation; an unvalidated word grants no acknowledgement. An actual
+  terminal unavailable response and a completed snapshot with no known Head remain distinct
+  outcomes in that same scope. Neither fabricates a receipt. A locally generated target is not a
   head the peer advertised and is not to become a durable advertised-head refusal: the peer's
   first real advertisement of that same head must reach the shared admission decision.
   Other-author, body and archive refusals keep their existing durable relationship. Both
@@ -583,11 +585,11 @@ lessons. It changes neither this record's decision status nor any requirement or
   rearm only already retained work in the current port generation, never recreate a retired
   owner or depend on an unrelated timer for its next attempt.
   Identical completion, advertisement and periodic arrival cannot invalidate it; real head,
-  receipt, authority and connection changes can, including a lower or zero receipt, without
-  hiding higher or conflicting own-head evidence from rollback detection. A known current head
-  whose role receipt is still pending is to answer Busy under the existing peer-Busy policy,
-  rather than durably claim that the evidence is unavailable; missing or contradictory evidence,
-  storage and authority errors keep their distinct outcomes. The exact departure acknowledgement
+  receipt, authority and connection changes can, including an actual lower authenticated role
+  word, without hiding higher or conflicting own-head evidence from rollback detection. An
+  absent role word is not position zero. The dated correction below supersedes the earlier
+  candidate's blanket pending-role Busy rule; missing or contradictory evidence, storage and
+  authority errors keep their distinct outcomes. The exact departure acknowledgement
   remains independently owned. Shipped status is to name the scoped target, actual first
   completed observation and actual last started request, so another request for an unchanged
   completed need is visible without a new timing threshold or test-only counter. This is an
@@ -597,6 +599,71 @@ lessons. It changes neither this record's decision status nor any requirement or
   Head response that explains that difference. The peer-held status alone does not establish
   which Head or role-completion answer the peer returned; that cause remains an explicit
   diagnostic question, not a key-delivery assumption or evidence of a fabricated receipt.
+  Further RCA, 2026-10-25 (#1021;
+  [recovered-snapshot record](https://github.com/robertelee78/vox/issues/1021#issuecomment-6392875845)):
+  candidate `e6d4ee6e` made every role prefix below the known signed Head answer Busy. The
+  stopped Reader's separately recovered last committed snapshot held signed Head 137 and a
+  completed live window 10–137, but its contiguous role receipt was 5: header 6 was absent
+  below that window. The missing header's kind and body are unknown. Explicit redb-only recovery
+  on a new disposable copy retained the original selected application data root; all original
+  and evidence profiles remained unchanged. This establishes the candidate's source condition,
+  not an unrecorded historical wire reply or a passed user journey. A completed live window
+  does not produce an unrequested older predecessor. The preceding prospective blanket
+  pending-role Busy rule is therefore superseded by this implementation correction.
+
+  Selected-entry completion correction, 2026-10-25 (#1021): the P004 candidate consumed an
+  admitted archive body's staging in its semantic-effect transaction, then returned bounded
+  `Progress` because already-settled successors still needed contiguous receipt maintenance.
+  The next slice attempted to assemble the consumed body and paused the same request with
+  provisional cleanup pending. A selected entry's semantic admission is to complete its own
+  effect and reclamation handoff; it must not replay consumed staging to advance later entries.
+  The existing per-author contiguous-maintenance cursor is to retain that separate bounded
+  suffix. Actual committed work is to wake actor maintenance before stale-port or error
+  disposal, under the current room identity, without relying on a presentation event or a
+  second Older/Resume. This does not acknowledge the suffix before its real effects and owed
+  bodies complete, or add a timer, automatic old-history demand or a new requirement.
+
+  Scheduling/data accounting correction, 2026-10-25 (#1021): P007's first reconnect inventory
+  admitted one canonical local own-Head question on the new connection; the following query
+  completed without fetching history. The unchanged saved refusal was not fetched again.
+  The candidate nevertheless reported fetched history and committed work for that in-memory
+  admission. Own-question insertion is to retain its offered tally and wake, in both inventory
+  directions, without data-transfer or durable-commit credit. Ordinary missing-history hints
+  retain their existing useful-admission credit; actual sent metadata and owning store commits,
+  including changed-refusal removal, remain nonempty. Only real committed work is to trigger
+  committed-work maintenance. This corrects accounting without suppressing the fresh connection
+  probe, changing its receipt, or weakening the unchanged-history outcome.
+
+  Signed Head knowledge, actual role satisfaction and admitted transient serving work are to
+  remain distinct. A completed own-Head snapshot is to return the authenticated signed Head
+  independently of an optional exact nonzero role position and entry hash. Only a role word
+  matching the requester's accepted own chain may credit ReadBy; absent role is not position
+  zero and does not reduce or grant a receipt. A higher or conflicting valid own Head must
+  still enter R5's write refusal even with a smaller or absent receipt. Unknown role metadata
+  grants nothing and is not an active retry when no authentic metadata producer can resolve it.
+  Busy is to describe a real serving dependency, never a static prefix gap. R1's Older demand
+  remains the only reason to acquire ordinary older history; no bulk fetch is manufactured
+  merely to make an acknowledgement true.
+
+  Actual committed Head or contiguous-role changes are to retain one semantic announcement in
+  the existing scoped owner. One fixed requester-specific HAVE sidecar is to convey that
+  observation independently of the ordinary author slice, including an empty slice; it remains
+  a hint, never a receipt. An immutable active claim and one coalesced successor are to preserve
+  real same-Head progress without admitting another query for repeated identical information.
+  The dirty-room refresh is to use one supervised independently polled metadata reader while
+  other actor work remains selectable. A retained actor-local mutex future can reserve the
+  room ahead of another branch in that same actor and deadlock it; that proposal is rejected.
+  No queued global admission ticket is to wait on a busy room, and no active worker or bytes
+  are to remain charged across a lock or capacity wait. Capture/install and completion are to
+  use the actual serialized snapshot under fresh room, authority and connection fences;
+  dispatch cannot clear a newer change. Failure and retirement must not lose or resurrect it.
+
+  The [peer implementation review](../design/vox-peer-implementation-review.md) provides the
+  relevant separation: Syncthing's authenticated remote metadata, owned block work and completed
+  local publication have different owners; Iroh keeps state-change notification and actor
+  progress selectable. These are design references, not imported timers, queue sizes or Vox
+  proof results. The corrective implementation, shipped-binary journey and each claim's own
+  broken control remain separate acceptance obligations; no new unit test or CI gate follows.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
   power loss: a node's own entries, consent, trust, keys, Session records and the format marker
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person

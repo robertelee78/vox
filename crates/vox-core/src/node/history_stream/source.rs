@@ -45,13 +45,37 @@ pub(super) enum DeclineResult {
 }
 
 #[cfg(feature = "test-knobs")]
-fn request_text(request: &RequestId) -> String {
+pub(super) fn request_text(request: &RequestId) -> String {
     use std::fmt::Write as _;
     let mut text = String::with_capacity(request.len() * 2);
     for byte in request {
         let _ = write!(text, "{byte:02x}");
     }
     text
+}
+
+/// Canonical public-identity selectors for the isolated overlap spike only. Unknown legacy
+/// decline-file contents retain their prior hold-all behavior at the caller.
+#[cfg(feature = "test-knobs")]
+pub(super) fn proof_selector<const N: usize>(text: &str, keys: [&str; N]) -> Option<[Digest32; N]> {
+    use std::fmt::Write as _;
+    let mut words = text.split_whitespace();
+    let mut values = [[0; 32]; N];
+    let mut canonical = String::new();
+    for (index, key) in keys.into_iter().enumerate() {
+        let value = words.next()?.strip_prefix(key)?.strip_prefix('=')?;
+        let digest = crate::node::link::b32_decode(value, "publication proof selector").ok()?;
+        if crate::node::link::b32_encode(&digest) != value {
+            return None;
+        }
+        if index != 0 {
+            canonical.push(' ');
+        }
+        write!(&mut canonical, "{key}={value}").ok()?;
+        values[index] = digest;
+    }
+    canonical.push('\n');
+    (words.next().is_none() && text == canonical).then_some(values)
 }
 
 // Directory plaintext is capped at 1 MiB before copy/decrypt. This also covers its sealed
@@ -63,6 +87,11 @@ const DIRECTORY_ENVELOPE: usize = 4 * 1024 * 1024;
 pub(super) struct Held<T> {
     pub(super) value: T,
     _charge: BufferCharge,
+}
+
+pub(super) struct InventoryPayload {
+    pub(super) hints: Vec<super::HeadHint>,
+    pub(super) snapshot: super::AnnouncementSnapshot,
 }
 
 impl<T> Held<T> {
@@ -106,6 +135,8 @@ pub(super) struct Source {
     own_head_receipt: bool,
     connection: Option<u64>,
     work_committed: Arc<AtomicBool>,
+    #[cfg(feature = "test-knobs")]
+    pub(super) proof_hold_elapsed: Arc<std::sync::Mutex<std::time::Duration>>,
 }
 
 impl Source {
@@ -118,6 +149,19 @@ impl Source {
         if !std::path::Path::new(&path).exists() {
             return;
         }
+        let selector = match std::fs::read_to_string(&path) {
+            Ok(selector) => selector,
+            Err(error) => {
+                eprintln!("APPARATUS: could not read decline hold selector: {error}");
+                return;
+            }
+        };
+        if let Some([peer, selected_author]) = proof_selector(&selector, ["peer", "author"]) {
+            if peer != self.peer || selected_author != author {
+                return;
+            }
+        }
+        // Empty and all unrecognized legacy contents still hold every real refusal.
         let entered =
             std::path::PathBuf::from(format!("{}.entered", std::path::Path::new(&path).display()));
         let Some((_, captured)) = self.authorization else {
@@ -131,11 +175,29 @@ impl Source {
             request_text(&request),
             crate::node::link::b32_encode(&captured),
         );
-        if std::fs::write(&entered, identity).is_err() {
+        let temporary = std::path::PathBuf::from(format!(
+            "{}.tmp-{}-{}",
+            entered.display(),
+            std::process::id(),
+            request_text(&request)
+        ));
+        if let Err(error) = std::fs::write(&temporary, identity)
+            .and_then(|()| std::fs::rename(&temporary, &entered))
+        {
+            let _ = std::fs::remove_file(&temporary);
+            eprintln!("APPARATUS: could not publish decline hold marker: {error}");
             return;
         }
+        let mut held_from = None;
         while std::path::Path::new(&path).exists() {
+            held_from.get_or_insert_with(Instant::now);
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if let Some(started) = held_from {
+            *self
+                .proof_hold_elapsed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += started.elapsed();
         }
         let _ = std::fs::remove_file(entered);
     }
@@ -226,6 +288,8 @@ impl Source {
             own_head_receipt: false,
             connection: None,
             work_committed,
+            #[cfg(feature = "test-knobs")]
+            proof_hold_elapsed: Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
         }
     }
 
@@ -258,7 +322,15 @@ impl Source {
         if self.fence.is_retired() {
             return Err(Error::Unreachable("history request cancelled"));
         }
-        if matches!(boundary, ReadBoundary::Observing) && Instant::now() >= self.deadline {
+        #[cfg(not(feature = "test-knobs"))]
+        let deadline = self.deadline;
+        #[cfg(feature = "test-knobs")]
+        let deadline = self.deadline
+            + *self
+                .proof_hold_elapsed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(boundary, ReadBoundary::Observing) && Instant::now() >= deadline {
             return Err(Error::Unreachable("history request deadline elapsed"));
         }
         Ok(())
@@ -400,7 +472,7 @@ impl Source {
         // The mutex release is the causal wake for this bounded operation; wall-clock expiry is
         // neither evidence that the room is wedged nor permission to abandon a publication that
         // this request may already own. Cancellation remains exact through the attempt fence.
-        let mut room = tokio::select! {
+        let room = tokio::select! {
             biased;
             () = self.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
             room = self.room.clone().lock_owned() => room,
@@ -410,6 +482,10 @@ impl Source {
         // Once dispatched, the closure owns both charges and the room guard. Dropping the
         // async waiter detaches it; credit cannot be reused while the disk read still runs.
         let task = tokio::task::spawn_blocking(move || {
+            let _notify = super::ObservationAfterUnlock(room.history_observation_signal());
+            // Local declaration order makes the room guard drop before _notify, including
+            // a callback error or unwind after its durable commit.
+            let mut room = room;
             source.current_at(boundary)?;
             let departed_receipt = source.own_head_receipt
                 && room.is_author(&source.peer)
@@ -634,12 +710,15 @@ impl Source {
 impl Source {
     /// One bounded, charged scalar inventory. Every page rechecks current room access;
     /// the compact index is read without touching content bodies or walking the archive.
-    pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
-        let charge = job.reserve_or_pressure(
-            crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
-        )?;
+    pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<InventoryPayload>> {
+        let output_envelope = crate::log::history::MAX_CONTEXT_AUTHORS
+            .checked_mul(std::mem::size_of::<super::HeadHint>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<super::AnnouncementSnapshot>()))
+            .ok_or(Error::SizeLimitExceeded("inventory output envelope"))?;
+        let charge = job.reserve_or_pressure(output_envelope)?;
         let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
         let mut after = None;
+        let mut complete = false;
         for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {
             self.current()?;
             let page = self
@@ -661,15 +740,147 @@ impl Source {
             match page.value.next {
                 Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
                 None => {
-                    return Ok(Lookup::Found(Held {
-                        value: hints,
-                        _charge: charge,
-                    }))
+                    complete = true;
+                    break;
                 }
                 _ => return Err(Error::MalformedAtRest("inventory cursor did not advance")),
             }
         }
-        Err(Error::SizeLimitExceeded("inventory index slice bound"))
+        if !complete {
+            return Err(Error::SizeLimitExceeded("inventory index slice bound"));
+        }
+        // Ordinary gossip keeps its existing bounded pages. The two author facts used by
+        // the announcement ledger and sidecar come from ONE final pinned index view.
+        let peer = self.peer;
+        let captured_authorization = self.authorization;
+        let captured = self
+            .read(job, 128 * 1024, move |room, store| {
+                if let Some((node, expected)) = captured_authorization {
+                    let current = super::authorization_generation(
+                        store,
+                        room.me(),
+                        room.channel_id(),
+                        room.history_instance(store)?,
+                        room.epoch(),
+                    )?;
+                    if node != room.me() || expected != current {
+                        return Err(Error::Profile("history authorization changed"));
+                    }
+                }
+                Ok(Some((
+                    room.me(),
+                    room.history_inventory_snapshot(store, &peer)?,
+                )))
+            })
+            .await?;
+        let Lookup::Found(captured) = captured else {
+            return Ok(Lookup::Busy);
+        };
+        let (node, snapshot) = captured.value;
+        drop(captured);
+        set_inventory_head(&mut hints, node, snapshot.own_head)?;
+        set_inventory_head(&mut hints, peer, snapshot.peer.known_head)?;
+        self.current()?;
+        Ok(Lookup::Found(Held {
+            value: InventoryPayload { hints, snapshot },
+            _charge: charge,
+        }))
+    }
+
+    /// One mandatory requester-specific scalar, independent of the ordinary author slices.
+    /// It supplies a scheduling fact only; no inventory field applies a role receipt.
+    pub(super) async fn offer_observation(
+        &self,
+        job: &Job,
+        inbox: &Arc<super::HintInbox>,
+        generation: u64,
+        room_id: Digest32,
+        observation: super::OwnObservation,
+    ) -> Result<InventoryOffer> {
+        let peer = self.peer;
+        let captured_authorization = self.authorization;
+        let connection = self
+            .connection
+            .ok_or(Error::Profile("inventory observation connection missing"))?;
+        let inbox = Arc::clone(inbox);
+        let offer_job = job.clone();
+        let envelope = 128 * 1024
+            + std::mem::size_of::<super::OwnProbeContext>()
+            + std::mem::size_of::<super::OwnObservation>();
+        let offered = self
+            .read(job, envelope, move |room, store| {
+                if room.channel_id() != room_id {
+                    return Err(Error::MalformedBundle("inventory observation room binding"));
+                }
+                let instance = room.history_instance(store)?;
+                let authorization = super::authorization_generation(
+                    store,
+                    room.me(),
+                    room_id,
+                    instance,
+                    room.epoch(),
+                )?;
+                if captured_authorization
+                    .is_some_and(|(node, expected)| node != room.me() || expected != authorization)
+                {
+                    return Err(Error::Profile("history authorization changed"));
+                }
+                if room.history_publication_busy(store)? {
+                    return Ok(Some(InventoryOffer::Publication(
+                        crate::node::channel::HistoryPublicationWait {
+                            owner: room.history_publication_request(store)?,
+                            wake: room.history_publication_wake(),
+                        },
+                    )));
+                }
+                let context = super::OwnProbeContext {
+                    node: room.me(),
+                    instance,
+                    epoch: room.epoch(),
+                    authorization,
+                    connection,
+                };
+                let local = room
+                    .history_head(store, &room.me())?
+                    .map(|head| super::HeadHint {
+                        author: head.binding.author,
+                        head: head.id(),
+                        size: head.root.leaves,
+                    });
+                let observation = match inbox.peer_observation(room_id, peer, generation, context) {
+                    Some(retained)
+                        if room.history_observation_dominates(store, retained, observation)? =>
+                    {
+                        retained
+                    }
+                    _ => observation,
+                };
+                let offer = match inbox.offer_peer_observation(
+                    &offer_job,
+                    generation,
+                    room_id,
+                    peer,
+                    context,
+                    local,
+                    observation,
+                ) {
+                    Err(Error::Profile(super::hints::OWN_PROBE_CONNECTION_CHANGED)) => {
+                        return Ok(Some(InventoryOffer::ConnectionChanged));
+                    }
+                    result => result?,
+                };
+                Ok(Some(InventoryOffer::Offered(offer)))
+            })
+            .await?;
+        match offered {
+            Lookup::Found(offered) => Ok(offered.value),
+            Lookup::Busy | Lookup::Missing if self.authorization.is_none() => {
+                Ok(InventoryOffer::Unavailable)
+            }
+            Lookup::Busy | Lookup::Missing => Err(Error::Profile(
+                "owned inventory observation was not admitted",
+            )),
+        }
     }
 
     /// Filter at most 64 already decoded hints using exact accepted/settled local facts.
@@ -752,10 +963,9 @@ impl Source {
                 let mut changed = Vec::new();
                 for hint in slice {
                     if hint.author == room.me() {
-                        // An own HEAD observation is scoped by the canonical Port record,
-                        // never a durable refusal of a locally generated trigger. Observe the
-                        // first real advertisement even if an older candidate declined it.
-                        missing.push(hint);
+                        // V3's mandatory sidecar is the sole own-author advertisement.
+                        // Replaying its ordinary alias here would invalidate the same
+                        // canonical facts twice, depending on author-slice scheduling.
                         continue;
                     }
                     if let Some((declined, authorization, peer_incarnation, author_incarnation)) =
@@ -825,11 +1035,7 @@ impl Source {
                     } else {
                         false
                     };
-                    if !held
-                        || retry_missing
-                        || (hint.author == room.me()
-                            && room.history_departure_matches(store, hint)?)
-                    {
+                    if !held || retry_missing {
                         // Keep this hint as a bounded signed-head receipt probe. It is not
                         // itself acknowledgement and grants no source or authority.
                         missing.push(hint);
@@ -878,4 +1084,43 @@ impl Source {
             }
         }
     }
+}
+
+/// Replace only the exact captured author while preserving HAVE's strict order and cap.
+/// An absent Head is absence, not a synthetic empty Head or a stale page's advertisement.
+fn set_inventory_head(
+    hints: &mut Vec<super::HeadHint>,
+    author: Digest32,
+    head: Option<super::ObservedHead>,
+) -> Result<()> {
+    match (
+        hints.binary_search_by_key(&author, |hint| hint.author),
+        head,
+    ) {
+        (Ok(at), Some(head)) => {
+            hints[at] = super::HeadHint {
+                author,
+                size: head.size,
+                head: head.head,
+            };
+        }
+        (Ok(at), None) => {
+            hints.remove(at);
+        }
+        (Err(at), Some(head)) => {
+            if hints.len() >= crate::log::history::MAX_CONTEXT_AUTHORS {
+                return Err(Error::SizeLimitExceeded("inventory captured author bound"));
+            }
+            hints.insert(
+                at,
+                super::HeadHint {
+                    author,
+                    size: head.size,
+                    head: head.head,
+                },
+            );
+        }
+        (Err(_), None) => {}
+    }
+    Ok(())
 }

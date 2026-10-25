@@ -17,6 +17,7 @@ pub(super) struct Response {
     body: Option<BodyCredit>,
     done: bool,
     inventory_seen: bool,
+    own_head: bool,
 }
 
 struct BodyCredit {
@@ -27,8 +28,13 @@ struct BodyCredit {
 }
 
 impl Response {
-    pub(super) fn new(request: RequestId, query: Query) -> Result<Self> {
+    /// `own_head` is selected by the caller's authenticated direction and Control purpose.
+    /// It selects the legal response shape only; it cannot grant receipt or author authority.
+    pub(super) fn new(request: RequestId, query: Query, own_head: bool) -> Result<Self> {
         query.validate()?;
+        if own_head && !matches!(query, Query::Head(_)) {
+            return Err(invalid("history own observation query"));
+        }
         let (wire_limit, headers_left) = match query {
             Query::Page {
                 wire_bytes,
@@ -53,6 +59,7 @@ impl Response {
             body: None,
             done: false,
             inventory_seen: false,
+            own_head,
         })
     }
 
@@ -147,10 +154,15 @@ impl Response {
             return Err(Error::SizeLimitExceeded("history response quantum"));
         }
         match frame {
-            Frame::Have(_) if matches!(self.query, Query::Inventory) && !self.inventory_seen => {
+            Frame::Have { .. }
+                if matches!(self.query, Query::Inventory) && !self.inventory_seen =>
+            {
                 self.inventory_seen = true;
             }
             Frame::Meta { request, object } if *request == self.request => {
+                if matches!(object, Object::OwnHead { .. }) != self.own_head {
+                    return Err(invalid("history own observation metadata"));
+                }
                 // Atomic object queries have exactly one metadata result. Keep reading
                 // DONE (including its status/continuation), but reject duplicate objects
                 // before they can multiply verifier/dependency handoffs. Page headers
@@ -207,6 +219,12 @@ impl Response {
                     && !self.inventory_seen
                 {
                     return Err(invalid("inventory completed without HAVE"));
+                }
+                if *status == Status::Complete
+                    && matches!(self.query, Query::Head(_))
+                    && self.metadata_left != 0
+                {
+                    return Err(invalid("history Head completed without observation"));
                 }
                 if self
                     .body

@@ -146,9 +146,9 @@ pub(super) struct PrivateSessions {
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
     revision: u64,
-    // A capability record is live traffic, not history: a member admitted after the previous
-    // record cannot learn it. Set on every admission and open, and clear only after the current
-    // node has appended a fresh authenticated announcement.
+    // Admission and open retain a capability recheck. Activated sparse history delivers an
+    // existing statement through its authenticated controls, so this bit cannot force a second
+    // publication. The legacy path retains its existing live reannouncement behavior (#986).
     support_owed: bool,
 }
 
@@ -1219,7 +1219,13 @@ impl ChannelState {
         if !self.settled || self.poisoned || self.has_left(&me) {
             return Ok(());
         }
-        if !self.private_sessions.support_owed && self.supports_private(profile.store(), &me)? {
+        // Sparse control coverage includes the existing public support statement even when
+        // it predates a member's admission. Reopening or replaying a grant only rechecks it;
+        // incomplete controls return their actual wait instead of authorizing another append.
+        if (!self.private_sessions.support_owed || self.uses_sparse_history(profile.store())?)
+            && self.supports_private(profile.store(), &me)?
+        {
+            self.private_sessions.support_owed = false;
             return Ok(());
         }
         self.append_control_kind(
@@ -1250,8 +1256,8 @@ impl ChannelState {
         self.private_sessions.pending_active = state.pending;
         self.private_sessions.pending_after = state.pending_after;
         self.private_sessions.pending_through = state.pending_through;
-        // A restart may follow an admission that committed just before its capability
-        // announcement. Repeating this one small signed fact is bounded to one per open.
+        // A restart may follow admission but precede the first capability announcement.
+        // Retain its recheck; sparse history consults durable support before appending.
         self.private_sessions.support_owed = true;
         self.restore_private_pulls(store)?;
         Ok(())

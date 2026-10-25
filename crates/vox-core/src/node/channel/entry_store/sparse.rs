@@ -2059,6 +2059,17 @@ impl Write<'_, '_> {
         verified: &VerifiedHead,
         proof: &ConsistentPrefix,
     ) -> Result<bool> {
+        self.commit_history_head_observation(verified, proof)
+            .map(|(conflict, _changed)| conflict)
+    }
+
+    /// The owning transaction reports whether its actual accepted commitment changed.
+    /// An already accepted old target is a no-op, never a semantic progress producer.
+    pub(crate) fn commit_history_head_observation(
+        &mut self,
+        verified: &VerifiedHead,
+        proof: &ConsistentPrefix,
+    ) -> Result<(bool, bool)> {
         self.require_sparse_idle()?;
         let head = verified.head();
         if proof.head_id() != head.id()
@@ -2112,7 +2123,7 @@ impl Write<'_, '_> {
         {
             // Reusing an older accepted target finishes its outstanding work; it must not
             // roll back the current head or create a cycle in prior-head receipts.
-            return Ok(state.observed_conflict.is_some());
+            return Ok((state.observed_conflict.is_some(), false));
         }
         let prior_id = state.committed;
         let prior = if let Some(id) = state.committed {
@@ -2183,7 +2194,7 @@ impl Write<'_, '_> {
         // Previously ready evidence remains exact to its older head; it is not upgraded by
         // commitment alone. Readers must compare that ID with their requested target.
         self.save_sparse_author(head.binding, state)?;
-        Ok(state.observed_conflict.is_some())
+        Ok((state.observed_conflict.is_some(), true))
     }
     /// Remember cryptographically complete coverage, not semantic control readiness. Bodies,
     /// parent receipts and authority evaluation remain durable obligations owned by admission.
