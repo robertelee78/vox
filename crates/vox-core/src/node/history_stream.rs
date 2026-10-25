@@ -742,7 +742,7 @@ impl KeyBodyScope {
 pub(crate) enum KeyBodyScan {
     Page {
         after: Option<[u8; 64]>,
-        need: Option<KeyBodyNeed>,
+        need: Option<Box<KeyBodyNeed>>,
     },
     Publication(crate::node::channel::HistoryPublicationWait),
 }

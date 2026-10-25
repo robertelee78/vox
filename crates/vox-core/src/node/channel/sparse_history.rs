@@ -816,7 +816,7 @@ impl ChannelState {
         }
         Ok(KeyBodyScan::Page {
             after: next,
-            need: Some(crate::node::history_stream::KeyBodyNeed {
+            need: Some(Box::new(crate::node::history_stream::KeyBodyNeed {
                 head: source_head,
                 seq: debt.from,
                 hash: debt.object,
@@ -826,7 +826,7 @@ impl ChannelState {
                     head: target.id(),
                     size: target.root.leaves,
                 },
-            }),
+            })),
         })
     }
 

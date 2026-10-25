@@ -818,7 +818,7 @@ struct ObservationRefresh {
 /// A blocked read carries only the existing publication owner/wake. Its disk worker
 /// drops all guards, keys and charges before the independently polled task awaits it.
 enum ObservationRead {
-    Capture(ObservationCapture),
+    Capture(Box<ObservationCapture>),
     Publication(crate::node::channel::HistoryPublicationWait),
 }
 
@@ -16210,7 +16210,7 @@ impl Node {
                             {
                                 crate::node::history_stream::KeyBodyScan::Page {
                                     after: None,
-                                    need: key_body,
+                                    need: key_body.map(Box::new),
                                 }
                             } else if room.is_member(&peer_id) {
                                 // Head growth during a pass cannot reset finite scan progress.
@@ -16228,7 +16228,7 @@ impl Node {
                             };
                             let (key_body_after, key_body) = match scan {
                                 crate::node::history_stream::KeyBodyScan::Page { after, need } => {
-                                    (after, need)
+                                    (after, need.map(|need| *need))
                                 }
                                 crate::node::history_stream::KeyBodyScan::Publication(wait) => {
                                     return Ok(ObservationRead::Publication(wait));
@@ -16247,7 +16247,7 @@ impl Node {
                                         .map(|known| (claim, role, known))
                                 })
                                 .transpose()?;
-                            Ok(ObservationRead::Capture(ObservationCapture {
+                            Ok(ObservationRead::Capture(Box::new(ObservationCapture {
                                 key_body,
                                 key_body_after,
                                 key_body_scope,
@@ -16256,7 +16256,7 @@ impl Node {
                                 authorization,
                                 snapshot,
                                 pending_role,
-                            }))
+                            })))
                             // room/Store/Job/charge and secret-work guard drop before handoff.
                         });
                         // Only the dispatched, barrier-protected worker retains strong room/
@@ -16271,7 +16271,7 @@ impl Node {
                     }
                 };
                 match read {
-                    Ok(ObservationRead::Capture(capture)) => break Ok(capture),
+                    Ok(ObservationRead::Capture(capture)) => break Ok(*capture),
                     Ok(ObservationRead::Publication(wait)) => {
                         // The joined reader has released its Job, bytes, room guard and
                         // secret-work lease. Preserve the scalar scan cursor and wait only

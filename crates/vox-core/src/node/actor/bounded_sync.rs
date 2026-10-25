@@ -2356,13 +2356,11 @@ impl Node {
                     .channels
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
-            if valid && index == 0 {
-                if flow.key_body_root.is_none() {
-                    self.bounded_sync.note_public_quantum(work.room, work.peer);
-                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                        if port.key_body.is_some() {
-                            port.key_body_turn_due = true;
-                        }
+            if valid && index == 0 && flow.key_body_root.is_none() {
+                self.bounded_sync.note_public_quantum(work.room, work.peer);
+                if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    if port.key_body.is_some() {
+                        port.key_body_turn_due = true;
                     }
                 }
             }
