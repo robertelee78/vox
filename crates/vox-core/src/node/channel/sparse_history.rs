@@ -713,6 +713,85 @@ impl ChannelState {
             .publication_busy())
     }
 
+    /// One bounded page of local key-delivery debt for the actual author's port. Public
+    /// metadata and role receipts remain independent of this recipient-only work.
+    pub(crate) fn history_key_body_page(
+        &self,
+        store: &Store,
+        author: Digest32,
+        authorization: Digest32,
+        after: Option<[u8; 64]>,
+    ) -> Result<(
+        Option<[u8; 64]>,
+        Option<crate::node::history_stream::KeyBodyNeed>,
+    )> {
+        let read = self.history_read(store)?;
+        if read.publication_busy() {
+            // Cleanup completion produces another retained metadata wake.
+            return Ok((None, None));
+        }
+        let Some(state) = read.sparse_author(&author, crate::log::history::LogScope::Public)?
+        else {
+            return Ok((None, None));
+        };
+        if state.observed_conflict.is_some() {
+            return Ok((None, None));
+        }
+        let Some(target_id) = state.committed else {
+            return Ok((None, None));
+        };
+        let Some(target) = read.history_head(&target_id)? else {
+            return Ok((None, None));
+        };
+        if let Some((declined, scope, peer_i, author_i)) =
+            read.history_declined_head(&author, &author)?
+        {
+            if declined == target.id()
+                && scope == authorization
+                && self
+                    .history_inventory_incarnation(&author)
+                    .zip(self.history_author_inventory_incarnation(&author))
+                    == Some((peer_i, author_i))
+            {
+                return Ok((None, None));
+            }
+        }
+        let (next, debt) = read.history_key_body_page(author, after)?;
+        let Some(debt) = debt else {
+            return Ok((next, None));
+        };
+        let (source_head, entry) = read
+            .history_validated_header(&author, debt.from)?
+            .ok_or(Error::MalformedAtRest("key-body source missing"))?;
+        if debt.from != debt.through
+            || source_head != debt.head
+            || entry.entry_hash() != debt.object
+            || !entry.skeleton.v2.as_ref().is_some_and(|v| {
+                v.kind == crate::log::history::SignedEntryKind::KeyPackage
+                    && v.recipient == Some(self.me())
+            })
+            || !read.history_head_accepted(&source_head, target.binding)?
+            || !read.history_head_accepted(&target.id(), target.binding)?
+            || debt.from > target.root.leaves
+        {
+            return Err(Error::MalformedAtRest("key-body source binding"));
+        }
+        Ok((
+            next,
+            Some(crate::node::history_stream::KeyBodyNeed {
+                head: source_head,
+                seq: debt.from,
+                hash: debt.object,
+                authorization,
+                target: crate::node::history_stream::HeadHint {
+                    author,
+                    head: target.id(),
+                    size: target.root.leaves,
+                },
+            }),
+        ))
+    }
+
     /// Source validation has already consumed the shared verifier envelope. This checks the
     /// current room/admission boundary again before starting one unpublished index operation.
     pub(crate) fn begin_history_source(
@@ -872,6 +951,14 @@ impl ChannelState {
         )?;
         batch.commit()?;
         committed.store(true, std::sync::atomic::Ordering::Release);
+        if entry.skeleton.v2.as_ref().is_some_and(|v| {
+            v.kind == crate::log::history::SignedEntryKind::KeyPackage
+                && v.recipient == Some(self.me())
+                && entry.payload.is_none()
+        }) {
+            // Retained dirty ownership survives cancellation/error before the Flow returns.
+            self.history_observation.changed();
+        }
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
         // publication paths, a sparse history caller does not poison the room on commit failure.
         if accepted.current_advanced {
@@ -895,6 +982,8 @@ impl ChannelState {
             .cleanup_publication(store, &self.sek, &self.channel_id)?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         if done {
+            // A body debt committed before cancellation remains discoverable after cleanup.
+            self.history_observation.changed();
             self.history_publication_changed.notify_waiters();
             let read = self.history_read(store)?;
             self.dag.set_order_revision(
@@ -1682,6 +1771,7 @@ impl ChannelState {
             }
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
+                self.history_observation.changed();
                 self.key_packages.published(self.next_log_id);
                 self.key_packages.note(entry.skeleton.author_id, log)?;
             }

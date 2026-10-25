@@ -440,6 +440,8 @@ pub(crate) struct Obligation {
     pub from: u64,
     pub through: u64,
 }
+pub(crate) type KeyBodyPage = (Option<[u8; 64]>, Option<Obligation>);
+
 impl Obligation {
     fn authority(head: Digest32, entry: &Entry) -> Self {
         Self {
@@ -777,6 +779,92 @@ impl Read<'_> {
             return Err(invalid("settled sparse tip binding"));
         }
         Ok(Some(header))
+    }
+    /// Recheck one captured local obligation before body staging or transport admission.
+    pub(crate) fn history_key_body_owed(
+        &self,
+        need: crate::node::history_stream::KeyBodyNeed,
+        local: Digest32,
+    ) -> Result<bool> {
+        let obligation = Obligation {
+            head: need.head,
+            kind: ObligationKind::KeyBody,
+            object: need.hash,
+            author: need.target.author,
+            from: need.seq,
+            through: need.seq,
+        };
+        if self
+            .source()
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.obligations,
+                &obligation.key()?,
+            )?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let Some((head, header)) = self.history_validated_header(&need.target.author, need.seq)?
+        else {
+            return Err(invalid("key-body captured source missing"));
+        };
+        if head != need.head
+            || header.entry_hash() != need.hash
+            || !header.skeleton.v2.as_ref().is_some_and(|v| {
+                v.kind == crate::log::history::SignedEntryKind::KeyPackage
+                    && v.recipient == Some(local)
+            })
+        {
+            return Err(invalid("key-body captured source changed"));
+        }
+        self.missing_contains(&need.target.author, need.seq)
+    }
+    /// Sixteen fixed pending-work records per read. The key is source-Head scoped, not
+    /// author scoped, so callers retain the scalar continuation across released read guards.
+    pub(crate) fn history_key_body_page(
+        &self,
+        author: Digest32,
+        mut after: Option<[u8; 64]>,
+    ) -> Result<KeyBodyPage> {
+        for _ in 0..16 {
+            let seek = match after {
+                Some(key) => match dag_facts::successor(key) {
+                    Some(next) => next,
+                    None => return Ok((None, None)),
+                },
+                None => [0; 64],
+            };
+            let source = self.source();
+            let Some((key, value)) = source.first(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.obligations,
+                &seek,
+                0,
+            )?
+            else {
+                return Ok((None, None));
+            };
+            let Value::Number(id) = value else {
+                return Err(invalid("key-body obligation locator"));
+            };
+            let obligation = Obligation::parse(&source.sparse_record(
+                self.sek,
+                self.channel,
+                id,
+                STATE_BYTES,
+            )?)?;
+            if obligation.key()? != key {
+                return Err(invalid("key-body obligation binding"));
+            }
+            after = Some(key);
+            if obligation.kind == ObligationKind::KeyBody && obligation.author == author {
+                return Ok((after, Some(obligation)));
+            }
+        }
+        Ok((after, None))
     }
     pub(crate) fn history_effect_finished(&self, hash: &Digest32) -> Result<bool> {
         Ok(self.source().find_value(

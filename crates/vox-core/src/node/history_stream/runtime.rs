@@ -209,6 +209,8 @@ pub(crate) struct Flow {
     /// Exact required control root removed from the actor queue when this foreground flow was
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
+    pub(crate) key_body_root: Option<super::KeyBodyNeed>,
+    key_body_checked: bool,
     pub(crate) hint: Option<super::HeadHint>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
@@ -436,6 +438,8 @@ impl Flow {
             departure_probe,
             archive_request: None,
             required_root: required,
+            key_body_root: None,
+            key_body_checked: false,
             state_charge: None,
             hint,
             hint_peer: peer,
@@ -584,6 +588,8 @@ impl Flow {
             departure_probe: false,
             archive_request: Some(request),
             required_root: None,
+            key_body_root: None,
+            key_body_checked: false,
             state_charge: None,
             hint: None,
             hint_peer: peer,
@@ -670,6 +676,30 @@ impl Flow {
             control_head: None,
         }
     }
+    /// Claim only this author's local recipient debt. This is not an inventory claim and
+    /// cannot consume/retry another author's hint or hold its public admission hostage.
+    pub(crate) fn with_key_body(mut self, need: super::KeyBodyNeed, instance: [u8; 16]) -> Self {
+        self.tasks.clear();
+        self.tasks.push(Task {
+            request: self.request,
+            purpose: Purpose::Control,
+            operation: Operation::Local(LocalStep::Entry {
+                request: self.request,
+                head: need.head,
+                seq: need.seq,
+                body: true,
+                role_header: false,
+                phase: EntryPhase::Start,
+            }),
+        });
+        self.inventory = false;
+        self.initialized = true;
+        self.instance = instance;
+        self.generation = need.authorization;
+        self.key_body_root = Some(need);
+        self
+    }
+
     fn push(&mut self, task: Task) -> Result<()> {
         if self.tasks.len() >= MAX_TASKS {
             return Err(Error::SizeLimitExceeded("history dependency stack"));
@@ -1668,6 +1698,43 @@ impl Flow {
                 }
             }
         }
+        if let Some(need) = self.key_body_root.filter(|_| !self.key_body_checked) {
+            let found = source
+                .read(job, 64 * 1024, move |room, store| {
+                    let read = room.history_read(store)?;
+                    if read.publication_busy() {
+                        return Ok(Some((
+                            true,
+                            Some(crate::node::channel::HistoryPublicationWait {
+                                owner: room.history_publication_request(store)?,
+                                wake: room.history_publication_wake(),
+                            }),
+                        )));
+                    }
+                    Ok(Some((read.history_key_body_owed(need, room.me())?, None)))
+                })
+                .await?;
+            let Lookup::Found(owed) = found else {
+                self.waiting = true;
+                return Ok(());
+            };
+            let (owed, publication) = owed.value;
+            if let Some(wait) = publication {
+                self.publication_owner_wait = wait.owner;
+                self.publication_dependency = Some(wait);
+                self.publication_wait = true;
+                self.waiting = true;
+                return Ok(());
+            }
+            if !owed {
+                // A lawful refill retired this exact obligation after metadata capture.
+                // This stale capture is cleanup-only, never another body transfer.
+                self.tasks.clear();
+                self.replay = None;
+                return Ok(());
+            }
+            self.key_body_checked = true;
+        }
         if self.tasks.is_empty() {
             if let Some(root) = self.replay.take() {
                 self.tasks.push(root);
@@ -2164,6 +2231,23 @@ impl Flow {
         let query = response.query.clone();
         let status = response.status;
         let body = matches!(query, Query::Entry { .. } | Query::Page { .. });
+        if status == Status::BodyNotHeld {
+            if let Some(debt) = self.key_body_root.filter(|debt| {
+                matches!(query, Query::Entry { head, seq, .. } if head == debt.head && seq == debt.seq)
+            }) {
+                // Save both the exact old source and this author's captured current hint.
+                // The durable KeyBody is NOT retired; this source cannot fill it unchanged.
+                if !self.decline(source, job, inbox, debt.target.author, debt.head).await? {
+                    return Ok(());
+                }
+                if debt.target.head != debt.head
+                    && !self.decline(source, job, inbox, debt.target.author, debt.target.head).await?
+                { return Ok(()); }
+                self.tasks.clear();
+                self.replay = None;
+                return Ok(());
+            }
+        }
         if status == Status::BodyNotHeld && task.purpose == Purpose::Live {
             let Query::Entry { head, seq, .. } = query else {
                 return Err(Error::MalformedBundle(
@@ -2573,8 +2657,7 @@ impl Flow {
                         // missing-position fact until normal body admission fills that fact.
                         // Retain it below the exact-head control work on this LIFO stack: omitted
                         // ordinary bodies are best-effort live recovery and cannot delay Session
-                        // authorization. Any addressed key-package in the same window is a
-                        // control dependency and is fetched by that work before the retry begins.
+                        // authorization. Recipient KeyBody debt has an independent author owner.
                         self.push(Task {
                             operation: Operation::LiveRetry {
                                 author,
@@ -2595,8 +2678,8 @@ impl Flow {
                 }
                 // Head commitment independently authorizes bounded control closure. Run it above
                 // the ordinary-body work just retained on this LIFO stack, so governance,
-                // Session floors/support and addressed key delivery do not wait for 128 unrelated
-                // Content bodies. Collapsed proof ranges fetch none of those omitted bodies.
+                // Session floors/support do not wait for 128 unrelated Content bodies.
+                // Recipient key delivery has its own local debt owner. Collapsed proof ranges fetch none of those omitted bodies.
                 self.push_control_closure(&task, window)?;
             }
             Operation::LiveRetry { author, window } => {
@@ -2718,11 +2801,14 @@ impl Flow {
                             && content
                             && input.missing_contains(&author, window.next)?;
                         let finished = input.history_effect_finished(&hash)?;
-                        let body = !content
+                        // This is the public live-window task, not recipient receipt credit.
+                        // Missing addressed bodies remain in KeyBody/missing_positions and
+                        // are consumed independently by their actual author's port.
+                        let public_window_ready = !content
                             || input.retention(&hash)?.is_some()
                             || channel
                                 .body_expired(header.skeleton.claimed_ms, crate::time::Ms(now));
-                        if !(missing || finished && body) {
+                        if !(missing || finished && public_window_ready) {
                             return Err(Error::MalformedAtRest(
                                 "live window position is not complete or explicitly missing",
                             ));
@@ -2791,6 +2877,8 @@ impl Flow {
                         let content = v2.kind == crate::log::history::SignedEntryKind::Content;
                         let expired = content
                             && room.body_expired(entry.skeleton.claimed_ms, crate::time::Ms(now));
+                        // KeyBody owns recipient delivery separately; this predicate only
+                        // decides whether this public tail operation needs source/effect work.
                         let held = input.history_effect_finished(&entry.entry_hash())?
                             && (!content
                                 || input.retention(&entry.entry_hash())?.is_some()
@@ -3285,6 +3373,15 @@ impl Flow {
             }
             Operation::Local(step) => {
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
+                if let Some(debt) = self.key_body_root {
+                    if matches!(step, LocalStep::Entry { head, seq, .. } if head == debt.head && seq == debt.seq)
+                        && result.published.is_some_and(|hash| hash != debt.hash)
+                    {
+                        return Err(Error::MalformedAtRest(
+                            "recipient body completion changed entry",
+                        ));
+                    }
+                }
                 // The returned next/need now owns the continuation. Archive finalization
                 // installs its own retry instead of duplicating a next phase pushed below.
                 *retry_task = None;

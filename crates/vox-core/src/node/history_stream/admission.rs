@@ -792,15 +792,11 @@ pub(super) fn start_entry(
     if !context_ready {
         return Ok(EntryStart::Preflight);
     }
-    // A key-package body is private to its named recipient, but for that recipient it is the
-    // delivered key, not optional history. Upgrade every route that encounters this exact
-    // entry (live tail, parent or control dependency) before source/effect publication. Other
-    // members retain only its authenticated public header.
-    let addressed_key = v2.kind == crate::log::history::SignedEntryKind::KeyPackage
-        && v2.recipient == Some(room.me());
+    // Public source/control admission is independent of recipient key delivery. A bodyless
+    // package records durable KeyBody debt; explicit body work still requires the real body.
     let private_for_another = v2.kind == crate::log::history::SignedEntryKind::KeyPackage
         && v2.recipient != Some(room.me());
-    if (addressed_key || (require_body && !private_for_another)) && entry.payload.is_none() {
+    if require_body && !private_for_another && entry.payload.is_none() {
         return Ok(EntryStart::BodyNeeded);
     }
     let body = match governance::TypedSparseBody::verify(entry, &key, &mut WorkBudget::default())? {

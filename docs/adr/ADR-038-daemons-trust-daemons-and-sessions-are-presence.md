@@ -1091,3 +1091,27 @@ its stories are extracted.
   ADR-031 (agent nodes join by themselves), ADR-033 (the repo room), ADR-034 (true health),
   ADR-035 (computer trust), ADR-036 (live messages and requested history), ADR-037 (convergence).
 - Release milestone v0.4.7 (#14) and the following small releases.
+
+### FX-29 RCA: recipient key delivery is not a public parent dependency
+
+A later shipped-binary diagnostic reached the real Carol135 body after the retained-proof
+repair. Bob repeatedly selected Alice139, validated its public parent/control metadata, then
+upgraded Carol135 from a header-only dependency into a recipient body request. Alice truthfully
+answered `BodyNotHeld`. The same Alice139 root was recreated because the refusal named Carol's
+body, while Alice's public control closure remained unfinished. This is distinct from the
+earlier missing Inclusion135 relay descriptor. The header-only upgrade was introduced by
+57926b34d74f9922873958ab4eed722609da239f for #934; applying it to every public parent/control
+route coupled unrelated public readiness to private delivery, contrary to ADR-036 H-2.
+
+Public metadata admission must retain the existing authenticated `KeyPackagePending` source
+and durable recipient `KeyBody` obligation, while allowing the public position/hash effect to
+complete. The recipient's contiguous role receipt still stops at its missing body. A durable
+publication wakes the existing bounded metadata owner, which discovers pending key work in
+sixteen-record index pages and transfers one exact local need to the actual author's Port.
+That author's separate bounded body operation uses the ordinary body verifier, refill, current
+trust and namespace checks. A source refusal retains the debt and suppresses only that source's
+unchanged author work; it cannot suppress or recreate Alice's unrelated public dependency.
+Restart, publication cleanup and actual trust/prekey changes recheck the durable index. No
+private body is invented at a nonrecipient relay, no missing recipient position is acknowledged,
+and no private key or Session body becomes public proof material. This reconciles existing
+#1021 and #934 obligations; it introduces no new story, phase or acceptance claim.

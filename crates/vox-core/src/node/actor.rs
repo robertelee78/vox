@@ -816,6 +816,8 @@ struct ObservationRefresh {
 }
 
 struct ObservationCapture {
+    key_body: Option<crate::node::history_stream::KeyBodyNeed>,
+    key_body_after: Option<[u8; 64]>,
     instance: [u8; 16],
     epoch: u64,
     authorization: Digest32,
@@ -15983,6 +15985,8 @@ impl Node {
         for ((room, _), port) in &mut self.ports {
             if dirty_rooms.contains(room) {
                 port.observation_initialized = false;
+                port.key_body_initialized = false;
+                port.key_body_after = None;
             }
         }
         let eligible = |(key, port): &(&(Digest32, Digest32), &crate::node::ports::Port)| {
@@ -15994,6 +15998,7 @@ impl Node {
                     .and_then(|net| net.manager().existing(&key.1))
                     .is_some_and(|connection| {
                         !port.observation_initialized
+                            || !port.key_body_initialized
                             || port.observation_connection != Some(connection.serial())
                     })
                 && self
@@ -16015,6 +16020,9 @@ impl Node {
         let (room_id, peer_id, epoch, instance) =
             (*room, *peer, port.epoch, port.observation_instance);
         let reference = port.room.clone();
+        let key_body_after = port.key_body_after;
+        let key_body_initialized = port.key_body_initialized;
+        let key_body = port.key_body;
         let pending_role = port
             .own_probe
             .and_then(|scope| self.history_hints.pending_role(scope));
@@ -16110,6 +16118,15 @@ impl Node {
                     } else {
                         None
                     };
+                    let (key_body_after, key_body) = if key_body_initialized
+                        && key_body.is_none_or(|need| need.authorization == authorization)
+                    {
+                        (None, key_body)
+                    } else if room.is_member(&peer_id) {
+                        room.history_key_body_page(&store, peer_id, authorization, key_body_after)?
+                    } else {
+                        (None, None)
+                    };
                     let pending_role = pending_role
                         .filter(|(claim, _)| {
                             claim.context.node == node
@@ -16124,6 +16141,8 @@ impl Node {
                         })
                         .transpose()?;
                     Ok(ObservationCapture {
+                        key_body,
+                        key_body_after,
                         instance,
                         epoch,
                         authorization,
@@ -16205,6 +16224,10 @@ impl Node {
         };
         match accepted {
             Ok(capture) => {
+                port.key_body_after = capture.key_body_after;
+                port.key_body_initialized =
+                    capture.key_body.is_some() || capture.key_body_after.is_none();
+                port.key_body = capture.key_body;
                 if let Some((claim, role, known)) = capture.pending_role {
                     match known {
                         crate::node::history_stream::RoleKnowledge::Known => {
@@ -16241,7 +16264,7 @@ impl Node {
                 }
                 let changed = port.observation_desired != capture.snapshot;
                 port.observation_desired = capture.snapshot;
-                if changed || port.announce_owed() {
+                if changed || port.announce_owed() || port.key_body.is_some() {
                     port.raise();
                     self.sched_rooms.insert(refresh.room);
                 }

@@ -700,8 +700,20 @@ pub struct OwnObservation {
     pub role: Option<RolePosition>,
 }
 
-/// The exact scalar facts carried by one locally encoded HAVE. Completion may confirm
-/// only this capture; later committed facts remain an independently owed successor.
+/// Local durable recipient work, never a peer advertisement or acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyBodyNeed {
+    pub(crate) head: Digest32,
+    pub(crate) seq: u64,
+    pub(crate) hash: Digest32,
+    pub(crate) target: HeadHint,
+    pub(crate) authorization: Digest32,
+}
+
+pub(crate) type KeyBodyScan = (Option<[u8; 64]>, Option<KeyBodyNeed>);
+
+/// The exact scalar facts carried by one locally encoded HAVE. Completion confirms only
+/// this capture; later committed facts remain an independently owed successor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AnnouncementSnapshot {
     pub(crate) own_head: Option<ObservedHead>,

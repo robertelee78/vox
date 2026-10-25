@@ -3830,6 +3830,8 @@ impl ChannelState {
     /// A trust or prekey change retries retained packages from disk without retaining bodies.
     pub fn release_held_packages(&mut self) {
         self.key_packages.retry_retained();
+        // The same real trust/prekey transition also rechecks missing recipient bodies.
+        self.history_observation.changed();
     }
 
     /// Validate and prepare unpublished entry/DAG roots before opening the effects Batch.

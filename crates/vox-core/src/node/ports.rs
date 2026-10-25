@@ -250,6 +250,10 @@ pub struct Port {
     pub(crate) observation_connection: Option<u64>,
     pub(crate) observation_desired: Option<crate::node::history_stream::AnnouncementSnapshot>,
     pub(crate) observation_sent: Option<crate::node::history_stream::AnnouncementSnapshot>,
+    /// Independent local recipient debt; no inbox slot or public receipt is borrowed.
+    pub(crate) key_body: Option<crate::node::history_stream::KeyBodyNeed>,
+    pub(crate) key_body_after: Option<[u8; 64]>,
+    pub(crate) key_body_initialized: bool,
     /// At most one outbound attempt.
     pub out: Option<Attempt>,
     /// Up to [`INBOUND_PER_PORT`] inbound attempts.
@@ -316,6 +320,9 @@ impl Port {
             observation_connection: None,
             observation_desired: None,
             observation_sent: None,
+            key_body: None,
+            key_body_after: None,
+            key_body_initialized: false,
             out: None,
             inbound: BTreeMap::new(),
             queued: false,
@@ -363,7 +370,8 @@ impl Port {
             && (self.gen.load(Ordering::Relaxed)
                 > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
                 || self.req_gen > self.req_done
-                || self.announce_owed())
+                || self.announce_owed()
+                || self.key_body.is_some())
     }
 
     /// Raise a request (ADR-025 D2).

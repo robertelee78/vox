@@ -2119,6 +2119,19 @@ impl Node {
                 .get_mut(&(work.room, work.peer))
                 .and_then(|port| port.take(work.token))
                 .is_some();
+            if current
+                && flow.key_body_root.is_some()
+                && (returned.failure.is_some() || flow.done() || flow.authorization_changed)
+            {
+                if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    // Retire the capture, not its durable debt. Revalidation observes real
+                    // refill completion or the exact saved refusal before selecting another.
+                    port.key_body = None;
+                    port.key_body_initialized = false;
+                    port.key_body_after = None;
+                }
+                self.bounded_completion_wake.notify_one();
+            }
             let valid = current
                 && !work.fence.is_retired()
                 && self
@@ -3414,7 +3427,15 @@ impl Node {
                         let required = required_at
                             .and_then(|at| self.bounded_sync.required.get(at))
                             .map(|required| (required.head, required.seq));
-                        let hint = if announce_first || required.is_some() {
+                        let key_body =
+                            (!announce_first && required.is_none() && departure_hint.is_none())
+                                .then(|| {
+                                    self.ports.get(&(room, peer)).and_then(|port| {
+                                        port.key_body.map(|debt| (debt, port.observation_instance))
+                                    })
+                                })
+                                .flatten();
+                        let hint = if announce_first || required.is_some() || key_body.is_some() {
                             None
                         } else {
                             departure_hint.or_else(|| self.history_hints.take(room, peer, node))
@@ -3443,6 +3464,9 @@ impl Node {
                             actor_incarnation,
                         ) {
                             Ok(mut flow) => {
+                                if let Some((debt, instance)) = key_body {
+                                    flow = flow.with_key_body(debt, instance);
+                                }
                                 flow.reason = reason;
                                 if let Some(at) = required_at {
                                     let _ = self.bounded_sync.required.remove(at);
@@ -3484,7 +3508,15 @@ impl Node {
                     let required = required_at
                         .and_then(|at| self.bounded_sync.required.get(at))
                         .map(|required| (required.head, required.seq));
-                    let hint = if announce_first || required.is_some() {
+                    let key_body =
+                        (!announce_first && required.is_none() && departure_hint.is_none())
+                            .then(|| {
+                                self.ports.get(&(room, peer)).and_then(|port| {
+                                    port.key_body.map(|debt| (debt, port.observation_instance))
+                                })
+                            })
+                            .flatten();
+                    let hint = if announce_first || required.is_some() || key_body.is_some() {
                         None
                     } else {
                         departure_hint.or_else(|| self.history_hints.take(room, peer, node))
@@ -3513,6 +3545,9 @@ impl Node {
                         actor_incarnation,
                     ) {
                         Ok(mut flow) => {
+                            if let Some((debt, instance)) = key_body {
+                                flow = flow.with_key_body(debt, instance);
+                            }
                             flow.reason = reason;
                             if let Some(at) = required_at {
                                 let _ = self.bounded_sync.required.remove(at);
