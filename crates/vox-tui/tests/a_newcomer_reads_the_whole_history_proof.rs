@@ -4936,12 +4936,14 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         said(&bob, "bob"),
         said(&alice, "alice")
     );
-    // Bob is now a real returning member, but is offline while two authors build suffixes.  That
-    // makes his next Page settle newer positions before the older private-package header closes
-    // Alice's gap, and gives the durable continuation scheduler two authors to rotate.
-    bob_daemon.stop();
-
     // ---- a private package Carol is owed is a header-only, role-complete row on Bob --------
+    // Carol first joins through the still-online author whose public control context Alice's
+    // later entries may name. A relay's role receipt does not promise every exportable proof.
+    // Legal room membership permits this public sync; Bob still does not trust Carol or
+    // release a sender key to her. His later explicit trust change remains a real grant edit.
+    let (ok, bob_link, err) = vox(&bob, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: Bob's authoritative room link failed: {err}");
+    let bob_link = bob_link.trim().to_owned();
     let hold = root.join("hold-carol-packages");
     let hold_path = hold
         .to_str()
@@ -4952,7 +4954,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     attached(&carol, "carol");
     let (ok, _, err) = vox(
         &carol,
-        &["room", "join", "--passphrase-file", "-", &link],
+        &["room", "join", "--passphrase-file", "-", &bob_link],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: carol's `vox room join` was refused: {err}");
@@ -4965,6 +4967,110 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     while member_connected(&alice, &room, &fps[2]).is_none() {
         std::thread::yield_now();
     }
+    // Both readers acquire the SAME current Bob commitment before its author goes offline.
+    // This proves local role satisfaction, not a promise that Alice can export all proofs.
+    // A completed first root alone is insufficient: require its current resolved facts,
+    // actual admitted request/target and exact snapshot, in each current connection scope.
+    loop {
+        let (ok, raw, err) = vox(&bob, &["status", "--json"], None);
+        assert!(
+            ok,
+            "PRODUCT: Bob's public control-stage status failed: {err}"
+        );
+        let status: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("APPARATUS: Bob status JSON: {error}: {raw}"));
+        let room_status = pub_probe_room(&status, &room);
+        let cut = room_status["own_feed_through"].as_u64();
+        let captured = pub_current_own_probe(&status, &room, &fps[0])
+            .map(|probe| probe["local_head"].clone())
+            .unwrap_or(serde_json::Value::Null);
+        let resolved = |peer: &str| {
+            if !pub_has_resolved_own_probe(&status, &room, peer) {
+                return false;
+            }
+            let Some(port) = status["lanes"]["ports"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|port| port["room"] == room && port["peer"] == peer)
+            else {
+                return false;
+            };
+            let probe = &port["own_head_probe"];
+            let done = &probe["completed"];
+            let root = &done["root"];
+            let started = &probe["last_started"];
+            let observation = &done["observation"];
+            cut.is_some_and(|cut| {
+                cut != 0
+                && pub_probe_head(&captured, &fps[1])
+                && captured["size"].as_u64() == Some(cut)
+                && probe["node"] == fps[1]
+                && probe["state"] == "observed"
+                && done["disposition"] == "snapshot"
+                && probe["local_head"] == captured
+                && root["target"] == captured
+                && started["target"] == captured
+                && pub_probe_hex(&root["request"])
+                && pub_probe_hex(&root["facts"])
+                && pub_probe_hex(&started["facts"])
+                && started["request"] == root["request"]
+                && root["facts"] == probe["facts"]
+                // Admission's input facts may differ from the reply's resulting facts.
+                && observation["known_head"]["size"].as_u64() == Some(cut)
+                && observation["known_head"]["head"] == captured["head"]
+                && observation["role"]["through"].as_u64().is_some_and(|role| role >= cut)
+                && probe["accepted_role"] == observation["role"]
+                && probe["pending_role_validation"].is_null()
+                && probe["role_validation_error"].is_null()
+                && probe["epoch"] == room_status["epoch"]
+                && probe["epoch"] == port["observation"]["epoch"]
+                && probe["instance"] == port["observation"]["instance"]
+                && probe["connection"].is_u64()
+                && probe["connection"] == port["observation"]["connection"]
+                && probe["authorization"].is_string()
+            })
+        };
+        if resolved(&fps[0]) && resolved(&fps[2]) {
+            let mut readers = Vec::new();
+            for (dir, name) in [(&alice, "Alice"), (&carol, "Carol")] {
+                let (ok, raw, err) = vox(dir, &["status", "--json"], None);
+                assert!(
+                    ok,
+                    "PRODUCT: {name}'s direct control-stage status failed: {err}"
+                );
+                let direct: serde_json::Value =
+                    serde_json::from_str(&raw).unwrap_or_else(|error| {
+                        panic!("APPARATUS: {name} status JSON: {error}: {raw}")
+                    });
+                let holds = pub_probe_room(&direct, &room)["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|member| member["id"] == fps[1])
+                    .and_then(|member| member["holds_through"].as_u64());
+                let completed = direct["sync"].as_array().into_iter().flatten().any(|lane| {
+                    lane["room"] == room
+                        && lane["peer"] == fps[1]
+                        && lane["fetched_completed"]
+                            .as_u64()
+                            .is_some_and(|rounds| rounds != 0)
+                });
+                readers.push((
+                    holds.zip(cut).is_some_and(|(held, cut)| held >= cut) && completed,
+                    direct,
+                ));
+            }
+            if readers.iter().all(|(ready, _)| *ready) {
+                eprintln!("[proof] APPARATUS same authored public control acquired before Bob offline: captured={captured} Bob={status} Alice={} Carol={}", readers[0].1, readers[1].1);
+                break;
+            }
+        }
+        std::thread::yield_now();
+    }
+    // Bob is offline BEFORE Alice's boundary row, private package, consent, and both long
+    // suffixes. His later header-only/private-body and fair-resume claims are unchanged.
+    bob_daemon.stop();
 
     // Alice cannot release her sender key to Carol before Alice trusts her. Therefore Carol
     // cannot possibly acknowledge an Alice row before this trust decision, even though Carol
