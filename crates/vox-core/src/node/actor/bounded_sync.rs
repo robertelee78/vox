@@ -610,6 +610,25 @@ impl Drop for Controller {
 }
 
 impl Controller {
+    /// Only this exact retained root may learn the metadata fence produced by its
+    /// same accepted answer. No unrelated ready/deferred owner is exposed or rebound.
+    pub(super) fn rebase_own_probe(
+        &mut self,
+        previous: crate::node::history_stream::OwnProbeClaim,
+        updated: crate::node::history_stream::OwnProbeClaim,
+    ) {
+        for flow in self
+            .ready
+            .iter_mut()
+            .flatten()
+            .chain(self.deferred.iter_mut())
+        {
+            if flow.own_probe == Some(previous) && flow.retirement_request() == previous.request {
+                flow.own_probe = Some(updated);
+            }
+        }
+    }
+
     pub(super) fn set_completion_wake(&mut self, wake: Arc<tokio::sync::Notify>) {
         self.completion_wake = wake;
     }

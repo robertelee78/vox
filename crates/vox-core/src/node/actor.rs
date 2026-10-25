@@ -22417,26 +22417,16 @@ impl Node {
                     continue;
                 }
                 let before = room.held_through(&note.peer);
-                if let crate::node::history_stream::OwnProbeAnswer::Complete(head) = answer {
+                if let (Some(_), crate::node::history_stream::OwnProbeAnswer::Complete(head)) =
+                    (note.seq, answer)
+                {
                     room.note_held(&store, note.peer, head.size);
                 }
                 // This SAME real answer joins its facts atomically. Only here, after
                 // fresh actor fences, may full completion stamp and clear canonical aliases.
                 match self.history_hints.observed(claim, answer, note.complete) {
                     Ok(Some(updated)) if !note.complete => {
-                        let controller = &mut self.bounded_sync;
-                        for flow in controller
-                            .ready
-                            .iter_mut()
-                            .flatten()
-                            .chain(controller.deferred.iter_mut())
-                        {
-                            if flow.own_probe == Some(claim)
-                                && flow.retirement_request() == claim.request
-                            {
-                                flow.own_probe = Some(updated);
-                            }
-                        }
+                        self.bounded_sync.rebase_own_probe(claim, updated);
                     }
                     Ok(Some(_)) => {}
                     Ok(None) => {
@@ -22505,11 +22495,15 @@ impl Node {
         {
             return;
         }
-        self.offer_own_head_locked(&scope.room, room);
+        // A local storage fault retains this input and its need, but may not authorize
+        // another immediate execution. Reopen/recovery owns that fault, as for local_retry.
+        let refreshed = !room.is_poisoned() && self.offer_own_head_locked(&scope.room, room);
         if let Some(port) = self.ports.get_mut(&(scope.room, scope.peer)) {
             port.raise();
         }
-        self.sched_rooms.insert(scope.room);
+        if refreshed {
+            self.sched_rooms.insert(scope.room);
+        }
     }
 
     /// Offer this node's own committed head to every connected peer, so the next round fetches
@@ -22517,12 +22511,12 @@ impl Node {
     /// bookkeeping, and the evidence the own-history conflict detector reads.
     /// Read the post-settlement facts and admit their metadata while the SAME room
     /// guard is still held. No old local snapshot may overwrite a newer Source observation.
-    fn offer_own_head_locked(&mut self, channel_id: &Digest32, ch: &mut ChannelState) {
+    fn offer_own_head_locked(&mut self, channel_id: &Digest32, ch: &mut ChannelState) -> bool {
         let Some(profile) = self.profile.as_ref() else {
-            return;
+            return false;
         };
         if !ch.uses_sparse_history(profile.store()).unwrap_or(true) {
-            return;
+            return false;
         }
         let (local, context) = match ch.history_head(profile.store(), &ch.me()).and_then(|head| {
             let local = head.map(|head| crate::node::history_stream::HeadHint {
@@ -22553,7 +22547,7 @@ impl Node {
             Err(error) => {
                 ch.poison(&error);
                 eprintln!("vox: own-history observation scope could not be read: {error}");
-                return;
+                return false;
             }
         };
         let target =
@@ -22615,9 +22609,11 @@ impl Node {
                     reason: format!("local own-history observation admission failed: {error}"),
                 });
                 eprintln!("vox: local own-history observation admission failed: {error}");
+                return false;
             }
         }
         self.sched_rooms.insert(*channel_id);
+        true
     }
 
     /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). Offering needs no
