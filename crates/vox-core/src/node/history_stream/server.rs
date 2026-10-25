@@ -116,7 +116,8 @@ pub(super) async fn answer(
             {
                 super::source::InventoryOffer::Offered(offered) => offered,
                 super::source::InventoryOffer::Publication(_)
-                | super::source::InventoryOffer::Unavailable => {
+                | super::source::InventoryOffer::Unavailable
+                | super::source::InventoryOffer::ConnectionChanged => {
                     // This serving stream has no retained outgoing Flow. Return the
                     // existing coded serving Busy and release its HAVE and worker.
                     *local_inventory_busy = true;

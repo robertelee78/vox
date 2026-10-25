@@ -26,6 +26,7 @@ use super::{Proof, ProofKind, RequestId};
 pub(super) enum InventoryOffer {
     /// A serving read could not be admitted; no inventory filter callback ran.
     Unavailable,
+    ConnectionChanged,
     Offered(super::hints::Offer),
     Publication(crate::node::channel::HistoryPublicationWait),
 }
@@ -777,28 +778,10 @@ impl Source {
                         }
                     }
                     if hint.author == room.me() {
-                        // Inventory is only an unauthoritative scalar hint. Even when its
-                        // signed head is already accepted locally, it does not prove the peer
-                        // completed every effect it owes through that position. Keep the hint
-                        // until Query::Head asks the peer for the authenticated role-complete
-                        // receipt. A previously recorded later receipt makes an older echo
-                        // redundant; no scalar echo itself may advance held_through.
-                        let known = match read.history_head(&hint.head)? {
-                            Some(head)
-                                if head.binding.author == hint.author
-                                    && head.binding.scope
-                                        == crate::log::history::LogScope::Public
-                                    && head.root.leaves == hint.size =>
-                            {
-                                read.history_head_accepted(&hint.head, head.binding)?
-                            }
-                            _ => false,
-                        };
-                        // A size-only echo must not hide an unknown or same-size
-                        // conflicting own head from authenticated rollback detection.
-                        if !known || room.held_through(&peer).is_none_or(|held| held < hint.size) {
-                            missing.push(hint);
-                        }
+                        // Every actual own-author advertisement reaches the same scoped gate.
+                        // Size-only or known-head shortcuts would hide a 4 -> 5 -> 4 peer
+                        // change or an unknown/conflicting hash before it could be validated.
+                        missing.push(hint);
                         continue;
                     }
                     let state =
@@ -890,9 +873,14 @@ impl Source {
                         return Ok(InventoryOffer::Publication(wait))
                     }
                 };
-                let mut offer = inbox.offer_peer_inventory(
+                let mut offer = match inbox.offer_peer_inventory(
                     job, generation, room_id, self.peer, &missing, context, local,
-                )?;
+                ) {
+                    Err(Error::Profile(super::hints::OWN_PROBE_CONNECTION_CHANGED)) => {
+                        return Ok(InventoryOffer::ConnectionChanged)
+                    }
+                    result => result?,
+                };
                 offer.rearmed = rearmed;
                 Ok(InventoryOffer::Offered(offer))
             }

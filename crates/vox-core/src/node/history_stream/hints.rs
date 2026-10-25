@@ -10,6 +10,8 @@ use crate::node::history_budget::Job;
 
 use super::{HeadHint, RequestId};
 
+pub(super) const OWN_PROBE_CONNECTION_CHANGED: &str = "own-history observation connection changed";
+
 /// Actor-owned lifetime handle into this inbox's existing per-port scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OwnProbePort {
@@ -88,7 +90,7 @@ impl OwnProbe {
 struct PortScope {
     generation: u64,
     connection: Option<u64>,
-    own: Option<OwnProbe>,
+    own: Option<Box<OwnProbe>>,
 }
 
 #[derive(Clone, Copy)]
@@ -218,7 +220,9 @@ impl HintInbox {
                     .as_ref()
                     .is_none_or(|own| own.context != context || own.local != local)
             {
-                scope.own = Some(OwnProbe::new(context, local)?);
+                // Retire the old completion before any fallible fresh-identity allocation.
+                scope.own = None;
+                scope.own = Some(Box::new(OwnProbe::new(context, local)?));
             }
         }
         let mut outcome = Offer::default();
@@ -230,7 +234,9 @@ impl HintInbox {
                         .get_mut(&(room, peer))
                         .expect("registered scope");
                     if scope.connection != Some(context.connection) {
-                        continue;
+                        // The caller retains/refuses this exact input as local scope Busy;
+                        // an old stream cannot silently Complete-drop a higher own head.
+                        return Err(Error::Profile(OWN_PROBE_CONNECTION_CHANGED));
                     }
                     let Some(own) = scope.own.as_mut() else {
                         continue;
@@ -239,7 +245,10 @@ impl HintInbox {
                         continue;
                     }
                     if from_peer && own.advertised != Some(*hint) {
-                        own.invalidate()?;
+                        if let Err(error) = own.invalidate() {
+                            scope.own = None;
+                            return Err(error);
+                        }
                         own.advertised = Some(*hint);
                         own.cause = ProbeCause::Advertisement(*hint);
                     }
@@ -338,48 +347,42 @@ impl HintInbox {
         own.started = Some(claim);
         Some(claim)
     }
-    pub(crate) fn probe_current(&self, claim: OwnProbeClaim) -> bool {
-        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        state
-            .generations
-            .get(&(claim.port.room, claim.port.peer))
-            .is_some_and(|scope| {
-                scope.generation == claim.port.generation
-                    && scope.connection == Some(claim.context.connection)
-                    && scope
-                        .own
-                        .as_ref()
-                        .is_some_and(|own| own.context == claim.context && own.facts == claim.facts)
-            })
-    }
     /// Actor has validated the full current root and applied this SAME real receipt. Its
     /// observation of a changed answer is folded into the resulting completion atomically,
     /// not used as a self-trigger. Old facts cannot complete a replacement need.
-    pub(crate) fn completed(&self, claim: OwnProbeClaim, answer: HeadHint) -> Result<()> {
+    pub(crate) fn observed(
+        &self,
+        claim: OwnProbeClaim,
+        answer: HeadHint,
+        complete: bool,
+    ) -> Result<Option<OwnProbeClaim>> {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(scope) = state
             .generations
             .get_mut(&(claim.port.room, claim.port.peer))
         else {
-            return Ok(());
+            return Ok(None);
         };
         if scope.generation != claim.port.generation
             || scope.connection != Some(claim.context.connection)
         {
-            return Ok(());
+            return Ok(None);
         }
         let Some(own) = scope.own.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         if own.context != claim.context
             || own.facts != claim.facts
             || answer.author != claim.context.node
         {
-            return Ok(());
+            return Ok(None);
         }
         if own.receipt != Some(answer) {
             let started = own.started;
-            own.invalidate()?;
+            if let Err(error) = own.invalidate() {
+                scope.own = None;
+                return Err(error);
+            }
             // last_started remains the ACTUAL admission's input fence. The completed
             // observation below names the resulting facts after this same reply.
             own.started = started;
@@ -393,10 +396,10 @@ impl HintInbox {
             facts: own.facts,
             ..claim
         };
-        if own.completed.is_none() {
+        if complete && own.completed.is_none() {
             own.completed = Some(CompletedProbe { claim, answer });
         }
-        Ok(())
+        Ok(Some(claim))
     }
     pub(crate) fn receipt_changed(
         &self,
@@ -414,7 +417,10 @@ impl HintInbox {
                 if let Some(own) = scope.own.as_mut() {
                     // Fresh identity plus the real transition witness fences A -> B -> A;
                     // the same retained root may legitimately report more than one change.
-                    own.invalidate()?;
+                    if let Err(error) = own.invalidate() {
+                        scope.own = None;
+                        return Err(error);
+                    }
                     own.receipt = None;
                     own.cause = ProbeCause::Receipt {
                         request,
@@ -531,6 +537,48 @@ impl HintInbox {
     /// Release that exact hint for a new flow bound to the current authorization generation.
     pub(crate) fn retry(&self, room: Digest32, peer: Digest32, author: Digest32, head: Digest32) {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::retry_locked(&mut state, room, peer, author, head);
+    }
+    /// Completing an old observation and admitting a changed peer fact are serialized by
+    /// the SAME inbox mutex. A new same-head fact cannot disappear behind an in-flight
+    /// duplicate and then be deleted by the old root's finish.
+    pub(crate) fn finish_probe(&self, claim: OwnProbeClaim) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(scope) = state.generations.get(&(claim.port.room, claim.port.peer)) else {
+            return;
+        };
+        if scope.generation != claim.port.generation {
+            return;
+        }
+        let changed = scope
+            .own
+            .as_ref()
+            .is_none_or(|own| own.facts != claim.facts);
+        if changed {
+            Self::retry_locked(
+                &mut state,
+                claim.port.room,
+                claim.port.peer,
+                claim.target.author,
+                claim.target.head,
+            );
+        } else {
+            state.pending.retain(|pending| {
+                pending.room != claim.port.room
+                    || pending.peer != claim.port.peer
+                    || pending.hint.author != claim.target.author
+                    || pending.hint.head != claim.target.head
+            });
+            Self::release_empty(&mut state);
+        }
+    }
+    fn retry_locked(
+        state: &mut State,
+        room: Digest32,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+    ) {
         let Some(owner) = state.pending.iter().find(|pending| {
             pending.room == room
                 && pending.peer == peer
@@ -555,7 +603,7 @@ impl HintInbox {
                     || pending.hint.author != author
                     || pending.hint.head != head
             });
-            Self::release_empty(&mut state);
+            Self::release_empty(state);
         } else if let Some(pending) = state.pending.iter_mut().find(|pending| {
             pending.room == room
                 && pending.peer == peer

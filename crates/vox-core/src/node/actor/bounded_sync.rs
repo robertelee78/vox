@@ -2061,6 +2061,7 @@ impl Node {
                         seq,
                         request: flow.retirement_request(),
                         probe: None,
+                        complete: false,
                     });
                 }
                 if flow.admitted_authors > 0 {
@@ -2223,34 +2224,28 @@ impl Node {
                 );
                 self.note_lane_sync(work.room, work.peer);
             }
+            let probe = if returned.failure.is_none() && flow.route_origin.is_none() {
+                flow.own_probe
+                    .zip(flow.own_probe_answer)
+                    .filter(|(claim, _)| {
+                        claim.context.instance == flow.instance
+                            && claim.context.authorization == flow.generation
+                            && claim.request == flow.retirement_request()
+                    })
+            } else {
+                None
+            };
+            let actual_seq = flow.mine_held.take();
             if let Some(seq) =
-                if flow.own_probe.is_some() && returned.failure.is_none() && !flow.done() {
-                    None
-                } else {
-                    flow.mine_held.take()
-                }
+                actual_seq.or_else(|| probe.filter(|_| flow.done()).map(|(_, answer)| answer.size))
             {
-                // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
-                // on the actor's next turn; the settlement tick then stops offering the own
-                // head to that peer (ADR-038 FX-15).
-                let probe =
-                    if returned.failure.is_none() && flow.done() && flow.route_origin.is_none() {
-                        flow.own_probe
-                            .zip(flow.own_probe_answer)
-                            .filter(|(claim, _)| {
-                                claim.context.instance == flow.instance
-                                    && claim.context.authorization == flow.generation
-                                    && claim.request == flow.retirement_request()
-                            })
-                    } else {
-                        None
-                    };
                 self.held_notes.push(super::HeldNote {
                     room: work.room,
                     peer: work.peer,
                     seq,
                     request: flow.retirement_request(),
                     probe,
+                    complete: flow.done(),
                 });
             }
             if flow.admitted_authors > 0 {
@@ -2675,8 +2670,16 @@ impl Node {
                     }
                 }
                 if let Some(hint) = flow.hint {
-                    self.history_hints
-                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
+                    if let Some(claim) = flow.own_probe {
+                        self.history_hints.finish_probe(claim);
+                    } else {
+                        self.history_hints.finish(
+                            work.room,
+                            flow.hint_peer,
+                            hint.author,
+                            hint.head,
+                        );
+                    }
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
@@ -2804,6 +2807,14 @@ impl Node {
         conn: Arc<VoxConnection>,
     ) -> bool {
         self.accept_bounded_sync();
+        if !self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer))
+            .is_some_and(|current| current.serial() == conn.serial())
+        {
+            return false;
+        }
         if let Some(scope) = self
             .ports
             .get(&(room, peer))

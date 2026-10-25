@@ -1794,6 +1794,9 @@ impl Flow {
                     self.waiting = true;
                     return Ok(false);
                 }
+                super::source::InventoryOffer::ConnectionChanged => {
+                    return Err(Error::Profile(demand::CANCELLED));
+                }
                 super::source::InventoryOffer::Unavailable => {
                     return Err(Error::Profile("owned inventory filter was not admitted"));
                 }

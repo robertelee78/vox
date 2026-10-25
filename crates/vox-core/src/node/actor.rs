@@ -5353,6 +5353,7 @@ struct HeldNote {
     peer: Digest32,
     seq: u64,
     request: crate::node::history_stream::RequestId,
+    complete: bool,
     probe: Option<(
         crate::node::history_stream::OwnProbeClaim,
         crate::node::history_stream::HeadHint,
@@ -11674,28 +11675,7 @@ impl Node {
                     self.channels.get(&channel_id).map(Arc::clone),
                     self.profile.as_ref().map(Profile::store_handle),
                 ) {
-                    let mut room = shared.lock().await;
-                    let before = room.held_through(&peer);
-                    room.note_held(&store, peer, seq);
-                    let after = room.held_through(&peer);
-                    if before != after {
-                        if let Some(scope) = self
-                            .ports
-                            .get(&(channel_id, peer))
-                            .and_then(|port| port.own_probe)
-                        {
-                            // The actual legacy attempt token witnesses this transition;
-                            // it is metadata only and cannot grant receipt of another seq.
-                            let mut witness = [0; 16];
-                            witness[..8].copy_from_slice(&token.to_be_bytes());
-                            if let Err(error) = self
-                                .history_hints
-                                .receipt_changed(scope, witness, before, after)
-                            {
-                                eprintln!("vox: own-history receipt change could not be retained: {error}");
-                            }
-                        }
-                    }
+                    shared.lock().await.note_held(&store, peer, seq);
                 }
                 self.refresh_network_view().await;
                 if report.fail.is_none() {
@@ -22326,9 +22306,8 @@ impl Node {
             } else {
                 None
             };
-            let probe_context = ch
-                .history_instance(profile.store())
-                .and_then(|instance| {
+            let probe_context = if sparse {
+                match ch.history_instance(profile.store()).and_then(|instance| {
                     crate::node::history_stream::authorization_generation(
                         profile.store(),
                         ch.me(),
@@ -22345,8 +22324,17 @@ impl Node {
                             connection: 0,
                         }
                     })
-                })
-                .ok();
+                }) {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        ch.poison(&error);
+                        eprintln!("vox: own-history observation scope could not be read: {error}");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             // Only a peer that has not said it holds the own head is asked (ADR-038 FX-15):
             // asked of every connected peer on every tick, a quiet room ran a round per
             // peer per second that fetched nothing (the decider's daemon at 50–67% CPU).
@@ -22355,26 +22343,33 @@ impl Node {
             // 2026-10-20 on two shipped daemons: a member fetching 200 rows over 45 s drew two
             // offers in 80 s; the serving lane's 953 "rounds" were the requests it answered,
             // about six per row fetched, which `vox status` now counts as `served`).
-            let own_targets: Vec<Digest32> = match own_hint {
-                Some((author, head, size)) => self
-                    .connected_peers()
-                    .into_iter()
-                    .filter(|peer| ch.held_through(peer).is_none_or(|held| held < size))
-                    .filter(|peer| {
-                        probe_context.is_some_and(|context| {
-                            ch.history_probe_declined(
-                                profile.store(),
+            let mut own_targets = Vec::new();
+            if let (Some((author, head, size)), Some(context)) = (own_hint, probe_context) {
+                for peer in self.connected_peers() {
+                    if ch.held_through(&peer).is_some_and(|held| held >= size) {
+                        continue;
+                    }
+                    match ch.history_probe_declined(
+                        profile.store(),
+                        &peer,
+                        &author,
+                        &head,
+                        context.authorization,
+                    ) {
+                        Ok(false) => own_targets.push(peer),
+                        Ok(true) => {}
+                        Err(error) => {
+                            ch.poison(&error);
+                            let _ = self.event_tx.send(NodeEvent::SyncFailed {
+                                channel_id: *channel_id,
                                 peer,
-                                &author,
-                                &head,
-                                context.authorization,
-                            )
-                            .is_ok_and(|declined| !declined)
-                        })
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
+                                reason: format!("local own-history refusal lookup failed: {error}"),
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
             if sparse
                 && !ch.is_settled()
                 && !ch
@@ -22445,6 +22440,25 @@ impl Node {
             if let Some(shared) = self.channels.get(&note.room).map(Arc::clone) {
                 let mut room = shared.lock().await;
                 if let Some((claim, answer)) = note.probe {
+                    let (current_instance, current_authorization) = match room
+                        .history_instance(&store)
+                        .and_then(|instance| {
+                            crate::node::history_stream::authorization_generation(
+                                &store,
+                                room.me(),
+                                note.room,
+                                instance,
+                                room.epoch(),
+                            )
+                            .map(|authorization| (instance, authorization))
+                        }) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            room.poison(&error);
+                            eprintln!("vox: own-history receipt scope could not be read: {error}");
+                            continue;
+                        }
+                    };
                     let current = self
                         .ports
                         .get(&(note.room, note.peer))
@@ -22455,17 +22469,8 @@ impl Node {
                             .and_then(|net| net.manager().existing(&note.peer))
                             .is_some_and(|conn| conn.serial() == claim.context.connection)
                         && room.epoch() == claim.context.epoch
-                        && room.history_instance(&store).ok() == Some(claim.context.instance)
-                        && crate::node::history_stream::authorization_generation(
-                            &store,
-                            room.me(),
-                            note.room,
-                            claim.context.instance,
-                            room.epoch(),
-                        )
-                        .ok()
-                            == Some(claim.context.authorization)
-                        && self.history_hints.probe_current(claim);
+                        && current_instance == claim.context.instance
+                        && current_authorization == claim.context.authorization;
                     if !current {
                         continue;
                     }
@@ -22473,8 +22478,43 @@ impl Node {
                     room.note_held(&store, note.peer, answer.size);
                     // This answer establishes the observation; do not invalidate it with
                     // its own receipt transition and immediately manufacture another need.
-                    if let Err(error) = self.history_hints.completed(claim, answer) {
-                        eprintln!("vox: own-history observation could not be retained: {error}");
+                    match self.history_hints.observed(claim, answer, note.complete) {
+                        Ok(Some(updated)) if !note.complete => {
+                            // Only this exact parked root learns the metadata fence caused
+                            // by its SAME actual answer, before any next scheduling turn.
+                            let controller = &mut self.bounded_sync;
+                            for flow in controller
+                                .ready
+                                .iter_mut()
+                                .flatten()
+                                .chain(controller.deferred.iter_mut())
+                            {
+                                if flow.own_probe == Some(claim)
+                                    && flow.retirement_request() == claim.request
+                                {
+                                    flow.own_probe = Some(updated);
+                                }
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            let after = room.held_through(&note.peer);
+                            if before != after {
+                                if let Err(error) = self.history_hints.receipt_changed(
+                                    claim.port,
+                                    note.request,
+                                    before,
+                                    after,
+                                ) {
+                                    eprintln!("vox: own-history receipt change could not be retained: {error}");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "vox: own-history observation could not be retained: {error}"
+                            );
+                        }
                     }
                     if before != room.held_through(&note.peer) {
                         touched.insert(note.room);
@@ -22552,7 +22592,7 @@ impl Node {
                     continue;
                 };
                 self.history_hints.bind_connection(scope, connection);
-                let _ = self.history_hints.offer_local_own(
+                if let Err(error) = self.history_hints.offer_local_own(
                     &job,
                     scope,
                     crate::node::history_stream::OwnProbeContext {
@@ -22560,7 +22600,14 @@ impl Node {
                         ..context
                     },
                     hint,
-                );
+                ) {
+                    let _ = self.event_tx.send(NodeEvent::SyncFailed {
+                        channel_id: *channel_id,
+                        peer,
+                        reason: format!("local own-history observation admission failed: {error}"),
+                    });
+                    eprintln!("vox: local own-history observation admission failed: {error}");
+                }
             }
         }
         self.sched_rooms.insert(*channel_id);
