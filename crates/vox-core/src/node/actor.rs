@@ -22566,53 +22566,55 @@ impl Node {
                     },
                 );
         let targets = self.connected_peers();
-        if let Some(job) = self.history_budget.try_start(
-            profile.fingerprint(),
-            crate::node::history_budget::Lane::Control,
-        ) {
-            for peer in targets {
-                let Some(connection) = self
-                    .net
-                    .as_ref()
-                    .and_then(|net| net.manager().existing(&peer))
-                    .map(|conn| conn.serial())
-                else {
-                    continue;
-                };
-                let Some(scope) = self
-                    .ports
-                    .get(&(*channel_id, peer))
-                    .and_then(|port| port.own_probe)
-                else {
-                    continue;
-                };
-                self.history_hints.bind_connection(scope, connection);
-                let current = crate::node::history_stream::OwnProbeContext {
-                    connection,
-                    ..context
-                };
-                let offer = self
-                    .history_hints
-                    .refresh_own_scope(scope, current, local)
-                    .and_then(|valid| {
-                        if valid {
-                            if let Some(hint) = target.filter(|hint| {
-                                ch.held_through(&peer).is_none_or(|held| held < hint.size)
-                            }) {
+        for peer in targets {
+            let Some(connection) = self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(&peer))
+                .map(|conn| conn.serial())
+            else {
+                continue;
+            };
+            let Some(scope) = self
+                .ports
+                .get(&(*channel_id, peer))
+                .and_then(|port| port.own_probe)
+            else {
+                continue;
+            };
+            // Metadata refresh needs no worker grant. In particular a rejected root
+            // cannot depend on spare Control capacity to restore its current scope.
+            self.history_hints.bind_connection(scope, connection);
+            let current = crate::node::history_stream::OwnProbeContext {
+                connection,
+                ..context
+            };
+            let offer = self
+                .history_hints
+                .refresh_own_scope(scope, current, local)
+                .and_then(|valid| {
+                    if valid {
+                        if let Some(hint) = target.filter(|hint| {
+                            ch.held_through(&peer).is_none_or(|held| held < hint.size)
+                        }) {
+                            if let Some(job) = self.history_budget.try_start(
+                                profile.fingerprint(),
+                                crate::node::history_budget::Lane::Control,
+                            ) {
                                 self.history_hints
                                     .offer_local_own(&job, scope, current, hint)?;
                             }
                         }
-                        Ok(())
-                    });
-                if let Err(error) = offer {
-                    let _ = self.event_tx.send(NodeEvent::SyncFailed {
-                        channel_id: *channel_id,
-                        peer,
-                        reason: format!("local own-history observation admission failed: {error}"),
-                    });
-                    eprintln!("vox: local own-history observation admission failed: {error}");
-                }
+                    }
+                    Ok(())
+                });
+            if let Err(error) = offer {
+                let _ = self.event_tx.send(NodeEvent::SyncFailed {
+                    channel_id: *channel_id,
+                    peer,
+                    reason: format!("local own-history observation admission failed: {error}"),
+                });
+                eprintln!("vox: local own-history observation admission failed: {error}");
             }
         }
         self.sched_rooms.insert(*channel_id);
