@@ -347,9 +347,9 @@ impl HintInbox {
         own.started = Some(claim);
         Some(claim)
     }
-    /// Actor has validated the full current root and applied this SAME real receipt. Its
-    /// observation of a changed answer is folded into the resulting completion atomically,
-    /// not used as a self-trigger. Old facts cannot complete a replacement need.
+    /// Actor has validated the current root and applies this SAME real receipt immediately.
+    /// A changed answer joins the resulting facts atomically, not as a self-trigger; only a
+    /// fully completed root records completion. Old facts cannot complete a replacement need.
     pub(crate) fn observed(
         &self,
         claim: OwnProbeClaim,
@@ -396,8 +396,20 @@ impl HintInbox {
             facts: own.facts,
             ..claim
         };
-        if complete && own.completed.is_none() {
-            own.completed = Some(CompletedProbe { claim, answer });
+        if complete {
+            if own.completed.is_none() {
+                own.completed = Some(CompletedProbe { claim, answer });
+            }
+            // Every queued own-author trigger asks the SAME canonical Head(author)
+            // question under these facts, including equal-size conflicting hints. None
+            // may bypass the offer gate after this completion. A later real fact change
+            // is serialized by this mutex and can enqueue its new observation normally.
+            state.pending.retain(|pending| {
+                pending.room != claim.port.room
+                    || pending.peer != claim.port.peer
+                    || pending.hint.author != claim.context.node
+            });
+            Self::release_empty(&mut state);
         }
         Ok(Some(claim))
     }
