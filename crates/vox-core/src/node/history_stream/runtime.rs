@@ -219,7 +219,8 @@ pub(crate) struct Flow {
     /// head to a peer that holds it (ADR-038 FX-15).
     pub(crate) mine_held: Option<u64>,
     pub(crate) own_probe: Option<super::OwnProbeClaim>,
-    pub(crate) own_probe_answer: Option<super::HeadHint>,
+    pub(crate) own_probe_scope: Option<super::OwnProbePort>,
+    pub(crate) own_probe_answer: Option<super::OwnProbeAnswer>,
     /// Why this flow's rounds run (ADR-038 FX-15, #996), set when the actor selects it and
     /// kept across its slices; counted on the lane when a round completes.
     pub(crate) reason: crate::node::status::RoundReason,
@@ -419,6 +420,7 @@ impl Flow {
             authenticated_head: None,
             mine_held: None,
             own_probe: None,
+            own_probe_scope: None,
             own_probe_answer: None,
             reason: crate::node::status::RoundReason::Request,
             waiting: false,
@@ -556,6 +558,7 @@ impl Flow {
             authenticated_head: None,
             mine_held: None,
             own_probe: None,
+            own_probe_scope: None,
             own_probe_answer: None,
             reason: crate::node::status::RoundReason::Page,
             waiting: false,
@@ -725,7 +728,7 @@ impl Flow {
 
     pub(crate) fn start_own_probe(
         &mut self,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
         port: super::OwnProbePort,
         connection: u64,
     ) {
@@ -738,6 +741,7 @@ impl Flow {
         }
         if self.own_probe.is_none() && !self.archive && !self.departure_probe {
             if let Some(hint) = self.hint.filter(|hint| hint.author == self.node) {
+                self.own_probe_scope = Some(port);
                 self.own_probe = inbox.started(port, hint, self.retirement_request());
             }
         }
@@ -1430,7 +1434,7 @@ impl Flow {
         job: &Job,
         fence: Arc<Fence>,
         deadline: tokio::time::Instant,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
         inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
@@ -1538,7 +1542,7 @@ impl Flow {
         job: &Job,
         fence: Arc<Fence>,
         deadline: tokio::time::Instant,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
         inbox_generation: u64,
         now: u64,
     ) -> Result<()> {
@@ -1770,7 +1774,7 @@ impl Flow {
         &mut self,
         source: &Source,
         job: &Job,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
     ) -> Result<bool> {
         if let Some(inventory) = self.pending_inventory.as_ref() {
             if inventory.next == inventory.hints.len() {
@@ -1879,7 +1883,7 @@ impl Flow {
         mut response: LocalRefusal,
         source: &Source,
         job: &Job,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
         retry_task: &mut Option<Task>,
     ) -> Result<()> {
         let query = response.query.clone();
@@ -2101,7 +2105,7 @@ impl Flow {
         job: &Job,
         fence: Arc<Fence>,
         deadline: tokio::time::Instant,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
         inbox_generation: u64,
         now: u64,
         announcement_task: bool,
@@ -2769,7 +2773,8 @@ impl Flow {
                                     && !announcement_task
                                     && !self.departure_probe
                                 {
-                                    self.own_probe_answer = Some(*head);
+                                    self.own_probe_answer =
+                                        Some(super::OwnProbeAnswer::Complete(*head));
                                 }
                                 self.mine_held =
                                     Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
@@ -2817,6 +2822,24 @@ impl Flow {
                     || (result.status == Status::EvidenceUnavailable && !self.archive)
                 {
                     let operation = self.received_refusal(query, result.status);
+                    if let Operation::Refusal(response) = &operation {
+                        if response.status == Status::EvidenceUnavailable
+                            && response.initial_hint
+                            && self.route_origin.is_none()
+                            && matches!(response.query, Query::Head(author) if author == self.node)
+                        {
+                            // A local own-head trigger is not a peer advertisement. Retain
+                            // the actual negative answer in its existing canonical owner;
+                            // never durably decline the unadvertised local target head.
+                            if self.own_probe.is_none() {
+                                return Err(Error::Profile(demand::CANCELLED));
+                            }
+                            self.own_probe_answer = Some(super::OwnProbeAnswer::Unavailable);
+                            self.tasks.clear();
+                            *retry_task = None;
+                            return Ok(());
+                        }
+                    }
                     self.push(Task { operation, ..task })?;
                     *retry_task = None;
                     return Ok(());

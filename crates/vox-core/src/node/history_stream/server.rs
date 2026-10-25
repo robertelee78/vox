@@ -1,6 +1,8 @@
 //! One explicitly authorized response quantum. Continuations describe remaining work and never
 //! schedule it. The caller owns admission, stream lifetime and daemon-wide worker reservation.
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::log::entry::Entry;
@@ -69,7 +71,7 @@ pub(super) async fn answer(
     preamble: Preamble,
     query: Query,
     handshake_bytes: usize,
-    inbox: &super::HintInbox,
+    inbox: &Arc<super::HintInbox>,
     inbox_generation: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,

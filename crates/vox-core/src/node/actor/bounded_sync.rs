@@ -1898,8 +1898,12 @@ impl Node {
     /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
     fn dispose_rearming_hint(&mut self, mut flow: Flow) {
         if let Some(hint) = flow.hint.take() {
-            self.history_hints
-                .retry(flow.room, flow.hint_peer, hint.author, hint.head);
+            if let Some(scope) = flow.own_probe_scope {
+                self.history_hints.retry_probe(scope, hint);
+            } else {
+                self.history_hints
+                    .retry(flow.room, flow.hint_peer, hint.author, hint.head);
+            }
         }
         self.bounded_sync.dispose(flow);
     }
@@ -2058,10 +2062,11 @@ impl Node {
                     self.held_notes.push(super::HeldNote {
                         room: work.room,
                         peer: work.peer,
-                        seq,
+                        seq: Some(seq),
                         request: flow.retirement_request(),
                         probe: None,
                         complete: false,
+                        rearm: None,
                     });
                 }
                 if flow.admitted_authors > 0 {
@@ -2113,8 +2118,12 @@ impl Node {
                     (request, flow.instance)
                 });
                 if let Some(hint) = flow.hint {
-                    self.history_hints
-                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
+                    if let Some(scope) = flow.own_probe_scope {
+                        self.history_hints.retry_probe(scope, hint);
+                    } else {
+                        self.history_hints
+                            .retry(work.room, flow.hint_peer, hint.author, hint.head);
+                    }
                 }
                 if let Some((head, seq)) = flow.required_root {
                     let need = RequiredOwner {
@@ -2156,8 +2165,12 @@ impl Node {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
                 self.settle_archive_exit(&mut flow, &error);
                 if let Some(hint) = flow.hint {
-                    self.history_hints
-                        .retry(work.room, flow.hint_peer, hint.author, hint.head);
+                    if let Some(scope) = flow.own_probe_scope {
+                        self.history_hints.retry_probe(scope, hint);
+                    } else {
+                        self.history_hints
+                            .retry(work.room, flow.hint_peer, hint.author, hint.head);
+                    }
                 }
                 if let Some((head, seq)) = flow.required_root {
                     let need = RequiredOwner {
@@ -2224,28 +2237,39 @@ impl Node {
                 );
                 self.note_lane_sync(work.room, work.peer);
             }
-            let probe = if returned.failure.is_none() && flow.route_origin.is_none() {
+            let probe = if flow.route_origin.is_none() {
                 flow.own_probe
                     .zip(flow.own_probe_answer)
-                    .filter(|(claim, _)| {
+                    .filter(|(claim, answer)| {
                         claim.context.instance == flow.instance
                             && claim.context.authorization == flow.generation
                             && claim.request == flow.retirement_request()
+                            && (returned.failure.is_none()
+                                || matches!(
+                                    answer,
+                                    crate::node::history_stream::OwnProbeAnswer::Complete(_)
+                                ))
                     })
             } else {
                 None
             };
             let actual_seq = flow.mine_held.take();
-            if let Some(seq) =
-                actual_seq.or_else(|| probe.filter(|_| flow.done()).map(|(_, answer)| answer.size))
+            let complete = returned.failure.is_none() && flow.done();
+            if actual_seq.is_some()
+                || (complete && (probe.is_some() || flow.own_probe_scope.is_some()))
             {
                 self.held_notes.push(super::HeldNote {
                     room: work.room,
                     peer: work.peer,
-                    seq,
+                    seq: actual_seq,
                     request: flow.retirement_request(),
                     probe,
-                    complete: flow.done(),
+                    complete,
+                    rearm: if probe.is_none() && complete {
+                        flow.own_probe_scope.zip(flow.hint)
+                    } else {
+                        None
+                    },
                 });
             }
             if flow.admitted_authors > 0 {
@@ -2428,8 +2452,24 @@ impl Node {
                 }
 
                 if let Some(hint) = flow.hint {
-                    self.history_hints
-                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
+                    if let Some(scope) = flow.own_probe_scope.filter(|_| cancelled) {
+                        self.held_notes.push(super::HeldNote {
+                            room: work.room,
+                            peer: work.peer,
+                            seq: None,
+                            request: flow.retirement_request(),
+                            complete: false,
+                            probe: None,
+                            rearm: Some((scope, hint)),
+                        });
+                    } else {
+                        self.history_hints.finish(
+                            work.room,
+                            flow.hint_peer,
+                            hint.author,
+                            hint.head,
+                        );
+                    }
                 }
                 self.bounded_sync.dispose(flow);
                 if cancelled {
@@ -2670,9 +2710,7 @@ impl Node {
                     }
                 }
                 if let Some(hint) = flow.hint {
-                    if let Some(claim) = flow.own_probe {
-                        self.history_hints.finish_probe(claim);
-                    } else {
+                    if flow.own_probe_scope.is_none() {
                         self.history_hints.finish(
                             work.room,
                             flow.hint_peer,
@@ -2680,6 +2718,8 @@ impl Node {
                             hint.head,
                         );
                     }
+                    // An own-head result retains its in-flight scalar until fresh actor
+                    // acceptance stamps completion and clears aliases under the Inbox lock.
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {

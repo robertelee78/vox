@@ -16,7 +16,7 @@ mod transport;
 
 pub(crate) use client::{EntryPhase, LocalNeed, LocalProof, LocalStep, Receiver, Staging};
 pub(crate) use driver::exchange;
-pub(crate) use hints::{HintInbox, OwnProbeClaim, OwnProbeContext, OwnProbePort};
+pub(crate) use hints::{HintInbox, OwnProbeAnswer, OwnProbeClaim, OwnProbeContext, OwnProbePort};
 
 use super::history_budget::{BufferCharge, Job};
 use crate::cbor::{Decoder, Encoder};
@@ -175,7 +175,7 @@ async fn serve_request(
     source: &source::Source,
     io: &mut transport::Transport,
     preamble: Preamble,
-    inbox: &HintInbox,
+    inbox: &std::sync::Arc<HintInbox>,
     inbox_generation: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,

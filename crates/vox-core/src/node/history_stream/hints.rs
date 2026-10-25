@@ -38,7 +38,13 @@ pub(crate) struct OwnProbeClaim {
 #[derive(Clone, Copy)]
 struct CompletedProbe {
     claim: OwnProbeClaim,
-    answer: HeadHint,
+    answer: OwnProbeAnswer,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnProbeAnswer {
+    Complete(HeadHint),
+    /// The peer's actual terminal wire answer, never an acknowledgement or a fake head.
+    Unavailable,
 }
 #[derive(Clone, Copy)]
 enum ProbeCause {
@@ -46,7 +52,7 @@ enum ProbeCause {
     Advertisement(HeadHint),
     Answer {
         request: RequestId,
-        answer: HeadHint,
+        answer: OwnProbeAnswer,
     },
     Receipt {
         request: RequestId,
@@ -58,7 +64,7 @@ struct OwnProbe {
     context: OwnProbeContext,
     local: Option<HeadHint>,
     advertised: Option<HeadHint>,
-    receipt: Option<HeadHint>,
+    receipt: Option<OwnProbeAnswer>,
     /// Changes only with a real scoped fact, including A -> B -> A. Not an attempt counter.
     facts: RequestId,
     cause: ProbeCause,
@@ -144,6 +150,31 @@ impl HintInbox {
             scope.connection = Some(connection);
             scope.own = None;
         }
+    }
+    /// Called under the current room guard, after store IO, by the actor rearming an
+    /// existing scalar. This supplies no hint/advertisement and cannot replace a connection.
+    pub(crate) fn refresh_own_scope(
+        &self,
+        port: OwnProbePort,
+        context: OwnProbeContext,
+        local: Option<HeadHint>,
+    ) -> Result<bool> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(scope) = state.generations.get_mut(&(port.room, port.peer)) else {
+            return Ok(false);
+        };
+        if scope.generation != port.generation || scope.connection != Some(context.connection) {
+            return Ok(false);
+        }
+        if scope
+            .own
+            .as_ref()
+            .is_none_or(|own| own.context != context || own.local != local)
+        {
+            scope.own = None;
+            scope.own = Some(Box::new(OwnProbe::new(context, local)?));
+        }
+        Ok(true)
     }
     pub(crate) fn offer_local_own(
         &self,
@@ -353,7 +384,7 @@ impl HintInbox {
     pub(crate) fn observed(
         &self,
         claim: OwnProbeClaim,
-        answer: HeadHint,
+        answer: OwnProbeAnswer,
         complete: bool,
     ) -> Result<Option<OwnProbeClaim>> {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -373,7 +404,8 @@ impl HintInbox {
         };
         if own.context != claim.context
             || own.facts != claim.facts
-            || answer.author != claim.context.node
+            || matches!(answer, OwnProbeAnswer::Complete(head) if head.author != claim.context.node)
+            || (!complete && answer == OwnProbeAnswer::Unavailable)
         {
             return Ok(None);
         }
@@ -460,6 +492,10 @@ impl HintInbox {
             |value: RequestId| value.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let head = |hint: HeadHint| serde_json::json!({"author":digest(&hint.author),"head":digest(&hint.head),"size":hint.size});
         let claim = |value: OwnProbeClaim| serde_json::json!({"request":request(value.request),"facts":request(value.facts),"target":head(value.target)});
+        let answer_head = |answer: OwnProbeAnswer| match answer {
+            OwnProbeAnswer::Complete(value) => Some(value),
+            OwnProbeAnswer::Unavailable => None,
+        };
         let cause = match own.cause {
             ProbeCause::Scope => {
                 serde_json::json!({"kind":"current-room-head-authority-connection"})
@@ -470,9 +506,14 @@ impl HintInbox {
             ProbeCause::Answer {
                 request: root,
                 answer,
-            } => {
-                serde_json::json!({"kind":"validated-role-complete-answer","request":request(root),"answer":head(answer)})
-            }
+            } => match answer {
+                OwnProbeAnswer::Complete(value) => {
+                    serde_json::json!({"kind":"validated-role-complete-answer","request":request(root),"answer":head(value)})
+                }
+                OwnProbeAnswer::Unavailable => {
+                    serde_json::json!({"kind":"unavailable-own-head-answer","request":request(root)})
+                }
+            },
             ProbeCause::Receipt {
                 request: root,
                 before,
@@ -483,9 +524,9 @@ impl HintInbox {
         };
         serde_json::json!({"node":digest(&own.context.node),"instance":request(own.context.instance),
             "epoch":own.context.epoch,"authorization":digest(&own.context.authorization),"connection":own.context.connection,
-            "facts":request(own.facts),"port_generation":port.generation,"state":if own.completed.is_some() { "observed" } else { "unobserved" },"cause":cause,"local_head":own.local.map(head),"peer_advertisement":own.advertised.map(head),
-            "peer_receipt":own.receipt.map(head),"last_started":own.started.map(claim),
-            "completed":own.completed.map(|done| serde_json::json!({"root":claim(done.claim),"answer":head(done.answer)}))})
+            "facts":request(own.facts),"port_generation":port.generation,"state":match own.completed {Some(done) if done.answer == OwnProbeAnswer::Unavailable => "unavailable",Some(_) => "observed",None => "unobserved"},"cause":cause,"local_head":own.local.map(head),"peer_advertisement":own.advertised.map(head),
+            "peer_receipt":own.receipt.and_then(answer_head).map(head),"last_started":own.started.map(claim),
+            "completed":own.completed.map(|done| serde_json::json!({"root":claim(done.claim),"disposition":if done.answer == OwnProbeAnswer::Unavailable {"unavailable"} else {"complete"},"answer":answer_head(done.answer).map(head)}))})
     }
     pub(crate) fn pending(&self, room: Digest32, peer: Digest32) -> bool {
         self.0
@@ -551,38 +592,22 @@ impl HintInbox {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         Self::retry_locked(&mut state, room, peer, author, head);
     }
-    /// Completing an old observation and admitting a changed peer fact are serialized by
-    /// the SAME inbox mutex. A new same-head fact cannot disappear behind an in-flight
-    /// duplicate and then be deleted by the old root's finish.
-    pub(crate) fn finish_probe(&self, claim: OwnProbeClaim) {
+    /// Release only a scalar already owned by this still-current Port generation. Never
+    /// recreate work erased by room/peer retirement or stamp a rejected completion.
+    pub(crate) fn retry_probe(&self, port: OwnProbePort, target: HeadHint) -> bool {
         let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(scope) = state.generations.get(&(claim.port.room, claim.port.peer)) else {
-            return;
-        };
-        if scope.generation != claim.port.generation {
-            return;
+        if !state
+            .generations
+            .get(&(port.room, port.peer))
+            .is_some_and(|scope| scope.generation == port.generation)
+            || !state.pending.iter().any(|pending| {
+                pending.room == port.room && pending.peer == port.peer && pending.hint == target
+            })
+        {
+            return false;
         }
-        let changed = scope
-            .own
-            .as_ref()
-            .is_none_or(|own| own.facts != claim.facts);
-        if changed {
-            Self::retry_locked(
-                &mut state,
-                claim.port.room,
-                claim.port.peer,
-                claim.target.author,
-                claim.target.head,
-            );
-        } else {
-            state.pending.retain(|pending| {
-                pending.room != claim.port.room
-                    || pending.peer != claim.port.peer
-                    || pending.hint.author != claim.target.author
-                    || pending.hint.head != claim.target.head
-            });
-            Self::release_empty(&mut state);
-        }
+        Self::retry_locked(&mut state, port.room, port.peer, target.author, target.head);
+        true
     }
     fn retry_locked(
         state: &mut State,

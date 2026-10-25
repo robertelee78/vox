@@ -164,30 +164,6 @@ impl ChannelState {
         })
     }
 
-    /// Actor-generated own probes obey the same exact durable refusal relationship as
-    /// received inventory. A local maintenance callback cannot bypass an unavailable answer.
-    pub(crate) fn history_probe_declined(
-        &self,
-        store: &Store,
-        peer: &Digest32,
-        author: &Digest32,
-        head: &Digest32,
-        authorization: Digest32,
-    ) -> Result<bool> {
-        let read = self.history_read(store)?;
-        let Some((declined, captured, peer_incarnation, author_incarnation)) =
-            read.history_declined_head(peer, author)?
-        else {
-            return Ok(false);
-        };
-        Ok(declined == *head
-            && captured == authorization
-            && self
-                .history_inventory_incarnation(peer)
-                .zip(self.history_author_inventory_incarnation(author))
-                == Some((peer_incarnation, author_incarnation)))
-    }
-
     /// A relevant advertised successor or changed membership incarnation removes the durable
     /// refusal. The inbox holds only charge-free pending scalar hints; this indexed record is the
     /// sole refusal state.

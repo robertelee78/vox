@@ -5351,11 +5351,15 @@ struct PrivatePullOwner {
 struct HeldNote {
     room: Digest32,
     peer: Digest32,
-    seq: u64,
+    seq: Option<u64>,
     request: crate::node::history_stream::RequestId,
     complete: bool,
     probe: Option<(
         crate::node::history_stream::OwnProbeClaim,
+        crate::node::history_stream::OwnProbeAnswer,
+    )>,
+    rearm: Option<(
+        crate::node::history_stream::OwnProbePort,
         crate::node::history_stream::HeadHint,
     )>,
 }
@@ -22288,7 +22292,7 @@ impl Node {
             return;
         };
         let now_ms = self.now_ms();
-        let (back, own_hint, own_targets, probe_context) = {
+        let back = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
@@ -22301,83 +22305,13 @@ impl Node {
             // conflict detector reads: a member holding more of this feed than this node does
             // means a restored older profile, and that stops writes here instead of risking an
             // equivocation. No other sync event fetches a node's own head back.
-            let own_hint = if sparse {
-                ch.sparse_settlement_pending_own_head(profile.store())
-            } else {
-                None
-            };
-            let probe_context = if sparse {
-                match ch.history_instance(profile.store()).and_then(|instance| {
-                    crate::node::history_stream::authorization_generation(
-                        profile.store(),
-                        ch.me(),
-                        *channel_id,
-                        instance,
-                        ch.epoch(),
-                    )
-                    .map(|authorization| {
-                        crate::node::history_stream::OwnProbeContext {
-                            node: ch.me(),
-                            instance,
-                            epoch: ch.epoch(),
-                            authorization,
-                            connection: 0,
-                        }
-                    })
-                }) {
-                    Ok(context) => Some(context),
-                    Err(error) => {
-                        ch.poison(&error);
-                        eprintln!("vox: own-history observation scope could not be read: {error}");
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            // Only a peer that has not said it holds the own head is asked (ADR-038 FX-15):
-            // asked of every connected peer on every tick, a quiet room ran a round per
-            // peer per second that fetched nothing (the decider's daemon at 50–67% CPU).
-            // A member catching up on a backlog is not behind for more than a tick: its word
-            // is its committed window head, selected before the bodies arrive (#996, measured
-            // 2026-10-20 on two shipped daemons: a member fetching 200 rows over 45 s drew two
-            // offers in 80 s; the serving lane's 953 "rounds" were the requests it answered,
-            // about six per row fetched, which `vox status` now counts as `served`).
-            let mut own_targets = Vec::new();
-            if let (Some((author, head, size)), Some(context)) = (own_hint, probe_context) {
-                for peer in self.connected_peers() {
-                    if ch.held_through(&peer).is_some_and(|held| held >= size) {
-                        continue;
-                    }
-                    match ch.history_probe_declined(
-                        profile.store(),
-                        &peer,
-                        &author,
-                        &head,
-                        context.authorization,
-                    ) {
-                        Ok(false) => own_targets.push(peer),
-                        Ok(true) => {}
-                        Err(error) => {
-                            ch.poison(&error);
-                            let _ = self.event_tx.send(NodeEvent::SyncFailed {
-                                channel_id: *channel_id,
-                                peer,
-                                reason: format!("local own-history refusal lookup failed: {error}"),
-                            });
-                            return;
-                        }
-                    }
-                }
-            }
             if sparse
                 && !ch.is_settled()
                 && !ch
                     .sparse_settlement_local_ready(profile.store(), now_ms)
                     .unwrap_or(false)
             {
-                drop(ch);
-                self.offer_own_head(channel_id, own_hint, own_targets, probe_context);
+                self.offer_own_head_locked(channel_id, &mut ch);
                 return;
             }
             let settlement = self.with_current_computer_authority(|| {
@@ -22407,7 +22341,8 @@ impl Node {
             let Some(back) = settlement else {
                 return;
             };
-            (back, own_hint, own_targets, probe_context)
+            self.offer_own_head_locked(channel_id, &mut ch);
+            back
         };
         match back {
             Ok(true) => self.note_local_governance_append(channel_id),
@@ -22421,7 +22356,6 @@ impl Node {
                 });
             }
         }
-        self.offer_own_head(channel_id, own_hint, own_targets, probe_context);
     }
 
     /// Record what lane rounds learned about how far each peer holds this node's own feed
@@ -22437,100 +22371,79 @@ impl Node {
         };
         let mut touched = std::collections::BTreeSet::new();
         for note in std::mem::take(&mut self.held_notes) {
-            if let Some(shared) = self.channels.get(&note.room).map(Arc::clone) {
-                let mut room = shared.lock().await;
-                if let Some((claim, answer)) = note.probe {
-                    let (current_instance, current_authorization) = match room
-                        .history_instance(&store)
-                        .and_then(|instance| {
-                            crate::node::history_stream::authorization_generation(
-                                &store,
-                                room.me(),
-                                note.room,
-                                instance,
-                                room.epoch(),
-                            )
-                            .map(|authorization| (instance, authorization))
-                        }) {
-                        Ok(current) => current,
-                        Err(error) => {
-                            room.poison(&error);
-                            eprintln!("vox: own-history receipt scope could not be read: {error}");
-                            continue;
-                        }
-                    };
-                    let current = self
-                        .ports
-                        .get(&(note.room, note.peer))
-                        .is_some_and(|port| port.own_probe == Some(claim.port))
-                        && self
-                            .net
-                            .as_ref()
-                            .and_then(|net| net.manager().existing(&note.peer))
-                            .is_some_and(|conn| conn.serial() == claim.context.connection)
-                        && room.epoch() == claim.context.epoch
-                        && current_instance == claim.context.instance
-                        && current_authorization == claim.context.authorization;
-                    if !current {
+            let Some(shared) = self.channels.get(&note.room).map(Arc::clone) else {
+                continue;
+            };
+            let mut room = shared.lock().await;
+            if let Some((scope, target)) = note.rearm {
+                self.rearm_own_probe_locked(&mut room, scope, target);
+                continue;
+            }
+            if let Some((claim, answer)) = note.probe {
+                let current_scope = room.history_instance(&store).and_then(|instance| {
+                    crate::node::history_stream::authorization_generation(
+                        &store,
+                        room.me(),
+                        note.room,
+                        instance,
+                        room.epoch(),
+                    )
+                    .map(|authorization| (instance, authorization))
+                });
+                let (current_instance, current_authorization) = match current_scope {
+                    Ok(current) => current,
+                    Err(error) => {
+                        room.poison(&error);
+                        eprintln!("vox: own-history receipt scope could not be read: {error}");
+                        self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
                         continue;
                     }
-                    let before = room.held_through(&note.peer);
-                    room.note_held(&store, note.peer, answer.size);
-                    // This answer establishes the observation; do not invalidate it with
-                    // its own receipt transition and immediately manufacture another need.
-                    match self.history_hints.observed(claim, answer, note.complete) {
-                        Ok(Some(updated)) if !note.complete => {
-                            // Only this exact parked root learns the metadata fence caused
-                            // by its SAME actual answer, before any next scheduling turn.
-                            let controller = &mut self.bounded_sync;
-                            for flow in controller
-                                .ready
-                                .iter_mut()
-                                .flatten()
-                                .chain(controller.deferred.iter_mut())
-                            {
-                                if flow.own_probe == Some(claim)
-                                    && flow.retirement_request() == claim.request
-                                {
-                                    flow.own_probe = Some(updated);
-                                }
-                            }
-                        }
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            let after = room.held_through(&note.peer);
-                            if before != after {
-                                if let Err(error) = self.history_hints.receipt_changed(
-                                    claim.port,
-                                    note.request,
-                                    before,
-                                    after,
-                                ) {
-                                    eprintln!("vox: own-history receipt change could not be retained: {error}");
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "vox: own-history observation could not be retained: {error}"
-                            );
-                        }
-                    }
-                    if before != room.held_through(&note.peer) {
-                        touched.insert(note.room);
-                    }
-                } else {
-                    let before = room.held_through(&note.peer);
-                    room.note_held(&store, note.peer, note.seq);
-                    let after = room.held_through(&note.peer);
-                    if before != after {
-                        if let Some(scope) = self
-                            .ports
-                            .get(&(note.room, note.peer))
-                            .and_then(|port| port.own_probe)
+                };
+                let current = self
+                    .ports
+                    .get(&(note.room, note.peer))
+                    .is_some_and(|port| port.own_probe == Some(claim.port))
+                    && self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&note.peer))
+                        .is_some_and(|conn| conn.serial() == claim.context.connection)
+                    && room.me() == claim.context.node
+                    && room.epoch() == claim.context.epoch
+                    && current_instance == claim.context.instance
+                    && current_authorization == claim.context.authorization;
+                if !current {
+                    self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                    continue;
+                }
+                let before = room.held_through(&note.peer);
+                if let crate::node::history_stream::OwnProbeAnswer::Complete(head) = answer {
+                    room.note_held(&store, note.peer, head.size);
+                }
+                // This SAME real answer joins its facts atomically. Only here, after
+                // fresh actor fences, may full completion stamp and clear canonical aliases.
+                match self.history_hints.observed(claim, answer, note.complete) {
+                    Ok(Some(updated)) if !note.complete => {
+                        let controller = &mut self.bounded_sync;
+                        for flow in controller
+                            .ready
+                            .iter_mut()
+                            .flatten()
+                            .chain(controller.deferred.iter_mut())
                         {
+                            if flow.own_probe == Some(claim)
+                                && flow.retirement_request() == claim.request
+                            {
+                                flow.own_probe = Some(updated);
+                            }
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let after = room.held_through(&note.peer);
+                        if before != after {
                             if let Err(error) = self.history_hints.receipt_changed(
-                                scope,
+                                claim.port,
                                 note.request,
                                 before,
                                 after,
@@ -22538,39 +22451,121 @@ impl Node {
                                 eprintln!("vox: own-history receipt change could not be retained: {error}");
                             }
                         }
-                        touched.insert(note.room);
+                        self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
                     }
+                    Err(error) => {
+                        eprintln!("vox: own-history observation could not be retained: {error}");
+                        self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                    }
+                }
+                if before != room.held_through(&note.peer) {
+                    touched.insert(note.room);
+                }
+            } else if let Some(seq) = note.seq {
+                let before = room.held_through(&note.peer);
+                room.note_held(&store, note.peer, seq);
+                let after = room.held_through(&note.peer);
+                if before != after {
+                    if let Some(scope) = self
+                        .ports
+                        .get(&(note.room, note.peer))
+                        .and_then(|port| port.own_probe)
+                    {
+                        if let Err(error) =
+                            self.history_hints
+                                .receipt_changed(scope, note.request, before, after)
+                        {
+                            eprintln!(
+                                "vox: own-history receipt change could not be retained: {error}"
+                            );
+                        }
+                    }
+                    touched.insert(note.room);
                 }
             }
         }
-        // The bounded result that carried the acknowledgement owns the next settlement attempt.
-        // This is both the write-unblock edge and, while another peer still owes the head, the
-        // edge that offers it there. Neither correctness transition waits for actor maintenance.
         for room in touched {
             self.settle_room(&room).await;
         }
     }
 
+    /// Rejection releases existing input only, never a retired old owner's entry. The
+    /// current room snapshot configures its canonical scope before any new attempt.
+    fn rearm_own_probe_locked(
+        &mut self,
+        room: &mut ChannelState,
+        scope: crate::node::history_stream::OwnProbePort,
+        target: crate::node::history_stream::HeadHint,
+    ) {
+        if !self
+            .ports
+            .get(&(scope.room, scope.peer))
+            .is_some_and(|port| port.own_probe == Some(scope))
+            || !self.history_hints.retry_probe(scope, target)
+        {
+            return;
+        }
+        self.offer_own_head_locked(&scope.room, room);
+        if let Some(port) = self.ports.get_mut(&(scope.room, scope.peer)) {
+            port.raise();
+        }
+        self.sched_rooms.insert(scope.room);
+    }
+
     /// Offer this node's own committed head to every connected peer, so the next round fetches
     /// the own live window back (ADR-037 R5): the acknowledgement that settles the own feed's
     /// bookkeeping, and the evidence the own-history conflict detector reads.
-    fn offer_own_head(
-        &mut self,
-        channel_id: &Digest32,
-        hint: Option<(Digest32, Digest32, u64)>,
-        targets: Vec<Digest32>,
-        context: Option<crate::node::history_stream::OwnProbeContext>,
-    ) {
-        let (Some((author, head, size)), Some(context)) = (hint, context) else {
-            return;
-        };
-        if targets.is_empty() {
-            return;
-        }
+    /// Read the post-settlement facts and admit their metadata while the SAME room
+    /// guard is still held. No old local snapshot may overwrite a newer Source observation.
+    fn offer_own_head_locked(&mut self, channel_id: &Digest32, ch: &mut ChannelState) {
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
-        let hint = crate::node::history_stream::HeadHint { author, size, head };
+        if !ch.uses_sparse_history(profile.store()).unwrap_or(true) {
+            return;
+        }
+        let (local, context) = match ch.history_head(profile.store(), &ch.me()).and_then(|head| {
+            let local = head.map(|head| crate::node::history_stream::HeadHint {
+                author: head.binding.author,
+                size: head.root.leaves,
+                head: head.id(),
+            });
+            let instance = ch.history_instance(profile.store())?;
+            let authorization = crate::node::history_stream::authorization_generation(
+                profile.store(),
+                ch.me(),
+                *channel_id,
+                instance,
+                ch.epoch(),
+            )?;
+            Ok((
+                local,
+                crate::node::history_stream::OwnProbeContext {
+                    node: ch.me(),
+                    instance,
+                    epoch: ch.epoch(),
+                    authorization,
+                    connection: 0,
+                },
+            ))
+        }) {
+            Ok(current) => current,
+            Err(error) => {
+                ch.poison(&error);
+                eprintln!("vox: own-history observation scope could not be read: {error}");
+                return;
+            }
+        };
+        let target =
+            ch.sparse_settlement_pending_own_head(profile.store())
+                .map(
+                    |(author, head, size)| crate::node::history_stream::HeadHint {
+                        author,
+                        head,
+                        size,
+                    },
+                );
+        let targets = self.connected_peers();
         if let Some(job) = self.history_budget.try_start(
             profile.fingerprint(),
             crate::node::history_budget::Lane::Control,
@@ -22592,15 +22587,25 @@ impl Node {
                     continue;
                 };
                 self.history_hints.bind_connection(scope, connection);
-                if let Err(error) = self.history_hints.offer_local_own(
-                    &job,
-                    scope,
-                    crate::node::history_stream::OwnProbeContext {
-                        connection,
-                        ..context
-                    },
-                    hint,
-                ) {
+                let current = crate::node::history_stream::OwnProbeContext {
+                    connection,
+                    ..context
+                };
+                let offer = self
+                    .history_hints
+                    .refresh_own_scope(scope, current, local)
+                    .and_then(|valid| {
+                        if valid {
+                            if let Some(hint) = target.filter(|hint| {
+                                ch.held_through(&peer).is_none_or(|held| held < hint.size)
+                            }) {
+                                self.history_hints
+                                    .offer_local_own(&job, scope, current, hint)?;
+                            }
+                        }
+                        Ok(())
+                    });
+                if let Err(error) = offer {
                     let _ = self.event_tx.send(NodeEvent::SyncFailed {
                         channel_id: *channel_id,
                         peer,

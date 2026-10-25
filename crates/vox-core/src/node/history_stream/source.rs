@@ -31,16 +31,6 @@ pub(super) enum InventoryOffer {
     Publication(crate::node::channel::HistoryPublicationWait),
 }
 
-enum FilteredInventory {
-    Ready(
-        Vec<super::HeadHint>,
-        usize,
-        super::OwnProbeContext,
-        Option<super::HeadHint>,
-    ),
-    Publication(crate::node::channel::HistoryPublicationWait),
-}
-
 pub(super) enum DeclineResult {
     Publication(crate::node::channel::HistoryPublicationWait),
     Stored {
@@ -691,7 +681,7 @@ impl Source {
     pub(super) async fn offer_inventory(
         &self,
         job: &Job,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
         generation: u64,
         room_id: Digest32,
         hints: &[super::HeadHint],
@@ -715,6 +705,8 @@ impl Source {
             .ok_or(Error::Profile("inventory connection scope missing"))?;
         let slice = hints.to_vec();
         let committed = Arc::clone(&self.work_committed);
+        let inbox = Arc::clone(inbox);
+        let offer_job = job.clone();
         let output_envelope = 64
             * (std::mem::size_of::<super::HeadHint>()
                 + std::mem::size_of::<(Digest32, Digest32)>()
@@ -759,6 +751,13 @@ impl Source {
                 let mut missing = Vec::with_capacity(slice.len());
                 let mut changed = Vec::new();
                 for hint in slice {
+                    if hint.author == room.me() {
+                        // An own HEAD observation is scoped by the canonical Port record,
+                        // never a durable refusal of a locally generated trigger. Observe the
+                        // first real advertisement even if an older candidate declined it.
+                        missing.push(hint);
+                        continue;
+                    }
                     if let Some((declined, authorization, peer_incarnation, author_incarnation)) =
                         read.history_declined_head(&peer, &hint.author)?
                     {
@@ -776,13 +775,6 @@ impl Source {
                         } else {
                             changed.push(hint.author);
                         }
-                    }
-                    if hint.author == room.me() {
-                        // Every actual own-author advertisement reaches the same scoped gate.
-                        // Size-only or known-head shortcuts would hide a 4 -> 5 -> 4 peer
-                        // change or an unknown/conflicting hash before it could be validated.
-                        missing.push(hint);
-                        continue;
                     }
                     let state =
                         read.sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
@@ -847,7 +839,7 @@ impl Source {
                 changed.sort_unstable();
                 changed.dedup();
                 if !changed.is_empty() && room.history_publication_busy(store)? {
-                    return Ok(Some(FilteredInventory::Publication(
+                    return Ok(Some(InventoryOffer::Publication(
                         crate::node::channel::HistoryPublicationWait {
                             owner: room.history_publication_request(store)?,
                             wake: publication_wake,
@@ -858,32 +850,23 @@ impl Source {
                 for author in changed {
                     room.forget_history_decline(store, peer, author, &committed)?;
                 }
-                Ok(Some(FilteredInventory::Ready(
-                    missing, rearmed, context, local,
-                )))
-            })
-            .await?;
-        match filtered {
-            Lookup::Found(filtered) => {
-                let (missing, rearmed, context, local) = match filtered.value {
-                    FilteredInventory::Ready(missing, rearmed, context, local) => {
-                        (missing, rearmed, context, local)
-                    }
-                    FilteredInventory::Publication(wait) => {
-                        return Ok(InventoryOffer::Publication(wait))
-                    }
-                };
+                // Filtering, current room/auth/head snapshot and metadata admission share
+                // this SAME room guard. No delayed old callback can reset a newer record.
+                // All index reads/transactions are gone before taking the short Inbox lock.
                 let mut offer = match inbox.offer_peer_inventory(
-                    job, generation, room_id, self.peer, &missing, context, local,
+                    &offer_job, generation, room_id, peer, &missing, context, local,
                 ) {
                     Err(Error::Profile(super::hints::OWN_PROBE_CONNECTION_CHANGED)) => {
-                        return Ok(InventoryOffer::ConnectionChanged)
+                        return Ok(Some(InventoryOffer::ConnectionChanged));
                     }
                     result => result?,
                 };
                 offer.rearmed = rearmed;
-                Ok(InventoryOffer::Offered(offer))
-            }
+                Ok(Some(InventoryOffer::Offered(offer)))
+            })
+            .await?;
+        match filtered {
+            Lookup::Found(filtered) => Ok(filtered.value),
             Lookup::Busy | Lookup::Missing if self.authorization.is_none() => {
                 Ok(InventoryOffer::Unavailable)
             }
