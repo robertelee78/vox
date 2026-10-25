@@ -2055,7 +2055,13 @@ impl Node {
             // otherwise discard the only hint, required root, or archive controller dispatch.
             if flow.authorization_changed || flow.local_retry.is_some() {
                 if let Some(seq) = flow.mine_held.take() {
-                    self.held_notes.push((work.room, work.peer, seq));
+                    self.held_notes.push(super::HeldNote {
+                        room: work.room,
+                        peer: work.peer,
+                        seq,
+                        request: flow.retirement_request(),
+                        probe: None,
+                    });
                 }
                 if flow.admitted_authors > 0 {
                     flow.admitted_authors = 0;
@@ -2217,11 +2223,35 @@ impl Node {
                 );
                 self.note_lane_sync(work.room, work.peer);
             }
-            if let Some(seq) = flow.mine_held.take() {
+            if let Some(seq) =
+                if flow.own_probe.is_some() && returned.failure.is_none() && !flow.done() {
+                    None
+                } else {
+                    flow.mine_held.take()
+                }
+            {
                 // The peer's word on how far it holds this node's feed (ADR-028 R-6), recorded
                 // on the actor's next turn; the settlement tick then stops offering the own
                 // head to that peer (ADR-038 FX-15).
-                self.held_notes.push((work.room, work.peer, seq));
+                let probe =
+                    if returned.failure.is_none() && flow.done() && flow.route_origin.is_none() {
+                        flow.own_probe
+                            .zip(flow.own_probe_answer)
+                            .filter(|(claim, _)| {
+                                claim.context.instance == flow.instance
+                                    && claim.context.authorization == flow.generation
+                                    && claim.request == flow.retirement_request()
+                            })
+                    } else {
+                        None
+                    };
+                self.held_notes.push(super::HeldNote {
+                    room: work.room,
+                    peer: work.peer,
+                    seq,
+                    request: flow.retirement_request(),
+                    probe,
+                });
             }
             if flow.admitted_authors > 0 {
                 flow.admitted_authors = 0;
@@ -2774,6 +2804,13 @@ impl Node {
         conn: Arc<VoxConnection>,
     ) -> bool {
         self.accept_bounded_sync();
+        if let Some(scope) = self
+            .ports
+            .get(&(room, peer))
+            .and_then(|port| port.own_probe)
+        {
+            self.history_hints.bind_connection(scope, conn.serial());
+        }
         if let Some((flow, ended_request)) =
             self.bounded_sync
                 .take_superseded_byte_hint(room, peer, &self.history_hints)
@@ -3495,6 +3532,11 @@ impl Node {
         let archive = flow
             .archive_request
             .map(|request| (request, flow.generation));
+        if !announcement {
+            if let Some(scope) = port.own_probe {
+                flow.start_own_probe(&self.history_hints, scope, conn.serial());
+            }
+        }
         let running_retirement_key = retirement_key(&flow);
         // A key to this peer waiting on its bundle makes this round read the peer's board,
         // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.

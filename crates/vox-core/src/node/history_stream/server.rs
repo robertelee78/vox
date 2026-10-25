@@ -40,6 +40,15 @@ fn test_private_body_marker() -> Option<(std::path::PathBuf, std::path::PathBuf)
     None
 }
 
+// Carry the already charged returned Head directly; no extra boxed wrapper allocation.
+#[allow(clippy::large_enum_variant)]
+enum ServedHead {
+    Missing,
+    RolePending,
+    Unavailable,
+    Ready(crate::log::history::SignedHead),
+}
+
 enum Sent {
     Yes,
     Full,
@@ -205,7 +214,7 @@ async fn respond(
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
                     let Some(head) = room.history_head(store, &author)? else {
-                        return Ok(None);
+                        return Ok(Some(ServedHead::Missing));
                     };
                     if receipt {
                         // A receipt names the last authenticated feed position whose source and
@@ -216,24 +225,30 @@ async fn respond(
                         let read = room.history_read(store)?;
                         if head.root.leaves != 0 {
                             let Some((through, hash)) = read.history_held_through(&author) else {
-                                return Ok(None);
+                                return Ok(Some(ServedHead::RolePending));
                             };
+                            if through < head.root.leaves {
+                                return Ok(Some(ServedHead::RolePending));
+                            }
+                            if through > head.root.leaves {
+                                // A later restart prefix is not ordinary progress toward this
+                                // selected head. Preserve unavailable rather than fake Busy.
+                                return Ok(Some(ServedHead::Unavailable));
+                            }
                             let Some(included) = read.history_inclusion_receipt(
                                 &head.id(),
                                 &author,
                                 head.root.leaves,
                             )?
                             else {
-                                return Ok(None);
+                                return Ok(Some(ServedHead::RolePending));
                             };
-                            if through != head.root.leaves
-                                || hash != included.header().entry().entry_hash()
-                            {
-                                return Ok(None);
+                            if hash != included.header().entry().entry_hash() {
+                                return Ok(Some(ServedHead::Unavailable));
                             }
                         }
                     }
-                    Ok(Some(head))
+                    Ok(Some(ServedHead::Ready(head)))
                 })
                 .await?;
             let held = match found {
@@ -241,7 +256,14 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let wire = held.value.to_wire();
+            let head = match held.value {
+                ServedHead::Ready(head) => head,
+                ServedHead::RolePending => return Ok((Status::Busy, None)),
+                ServedHead::Missing | ServedHead::Unavailable => {
+                    return Ok((Status::EvidenceUnavailable, None))
+                }
+            };
+            let wire = head.to_wire();
             let status = match send_object(
                 source,
                 io,

@@ -16,7 +16,7 @@ mod transport;
 
 pub(crate) use client::{EntryPhase, LocalNeed, LocalProof, LocalStep, Receiver, Staging};
 pub(crate) use driver::exchange;
-pub(crate) use hints::HintInbox;
+pub(crate) use hints::{HintInbox, OwnProbeClaim, OwnProbeContext, OwnProbePort};
 
 use super::history_budget::{BufferCharge, Job};
 use crate::cbor::{Decoder, Encoder};
@@ -111,6 +111,7 @@ pub(crate) async fn serve(
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
     inbox: std::sync::Arc<HintInbox>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    connection: u64,
 ) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(
@@ -122,7 +123,8 @@ pub(crate) async fn serve(
         deadline,
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    );
+    )
+    .on_connection(connection);
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;

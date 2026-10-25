@@ -218,6 +218,8 @@ pub(crate) struct Flow {
     /// (ADR-028 R-6). The actor records it, and the settlement tick stops offering the own
     /// head to a peer that holds it (ADR-038 FX-15).
     pub(crate) mine_held: Option<u64>,
+    pub(crate) own_probe: Option<super::OwnProbeClaim>,
+    pub(crate) own_probe_answer: Option<super::HeadHint>,
     /// Why this flow's rounds run (ADR-038 FX-15, #996), set when the actor selects it and
     /// kept across its slices; counted on the lane when a round completes.
     pub(crate) reason: crate::node::status::RoundReason,
@@ -416,6 +418,8 @@ impl Flow {
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            own_probe: None,
+            own_probe_answer: None,
             reason: crate::node::status::RoundReason::Request,
             waiting: false,
             byte_pressure: None,
@@ -551,6 +555,8 @@ impl Flow {
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            own_probe: None,
+            own_probe_answer: None,
             reason: crate::node::status::RoundReason::Page,
             waiting: false,
             byte_pressure: None,
@@ -717,6 +723,25 @@ impl Flow {
         self.publication_owner_wait
     }
 
+    pub(crate) fn start_own_probe(
+        &mut self,
+        inbox: &super::HintInbox,
+        port: super::OwnProbePort,
+        connection: u64,
+    ) {
+        if self
+            .own_probe
+            .is_some_and(|claim| claim.context.connection != connection)
+        {
+            self.own_probe = None;
+            self.own_probe_answer = None;
+        }
+        if self.own_probe.is_none() && !self.archive && !self.departure_probe {
+            if let Some(hint) = self.hint.filter(|hint| hint.author == self.node) {
+                self.own_probe = inbox.started(port, hint, self.retirement_request());
+            }
+        }
+    }
     pub(crate) fn owns_request(&self, request: RequestId) -> bool {
         self.has_publication_producer(request)
             || self.request == request
@@ -1526,7 +1551,8 @@ impl Flow {
             deadline,
             Some((self.node, self.generation)),
             Arc::clone(&self.work_committed),
-        );
+        )
+        .on_connection(conn.serial());
         if !self.initialized {
             let room = self.room;
             let node = self.node;
@@ -2736,6 +2762,12 @@ impl Flow {
                     for head in &result.heads {
                         if head.author == author {
                             if author == self.node {
+                                if result.status == Status::Complete
+                                    && !announcement_task
+                                    && !self.departure_probe
+                                {
+                                    self.own_probe_answer = Some(*head);
+                                }
                                 self.mine_held =
                                     Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
                             }

@@ -31,7 +31,12 @@ pub(super) enum InventoryOffer {
 }
 
 enum FilteredInventory {
-    Ready(Vec<super::HeadHint>, usize),
+    Ready(
+        Vec<super::HeadHint>,
+        usize,
+        super::OwnProbeContext,
+        Option<super::HeadHint>,
+    ),
     Publication(crate::node::channel::HistoryPublicationWait),
 }
 
@@ -108,6 +113,7 @@ pub(super) struct Source {
     authorization: Option<(Digest32, Digest32)>,
     // Only a server clone bound to Control/Head(peer) may return a departed peer receipt.
     own_head_receipt: bool,
+    connection: Option<u64>,
     work_committed: Arc<AtomicBool>,
 }
 
@@ -227,8 +233,14 @@ impl Source {
             deadline,
             authorization,
             own_head_receipt: false,
+            connection: None,
             work_committed,
         }
+    }
+
+    pub(super) fn on_connection(mut self, serial: u64) -> Self {
+        self.connection = Some(serial);
+        self
     }
 
     /// Record user-visible history work at the commit edge, independently of whether the
@@ -697,13 +709,18 @@ impl Source {
             };
         let peer = self.peer;
         let captured_authorization = self.authorization;
+        let connection = self
+            .connection
+            .ok_or(Error::Profile("inventory connection scope missing"))?;
         let slice = hints.to_vec();
         let committed = Arc::clone(&self.work_committed);
         let output_envelope = 64
             * (std::mem::size_of::<super::HeadHint>()
                 + std::mem::size_of::<(Digest32, Digest32)>()
                 + std::mem::size_of::<Digest32>())
-            + std::mem::size_of::<usize>();
+            + std::mem::size_of::<usize>()
+            + std::mem::size_of::<super::OwnProbeContext>()
+            + std::mem::size_of::<Option<super::HeadHint>>();
         let filtered = self
             .read(job, output_envelope, move |room, store| {
                 let _input_charge = input_charge;
@@ -722,6 +739,20 @@ impl Source {
                 }) {
                     return Err(Error::Profile("history authorization changed"));
                 }
+                let context = super::OwnProbeContext {
+                    node: room.me(),
+                    instance: room.history_instance(store)?,
+                    epoch: room.epoch(),
+                    authorization: current_authorization,
+                    connection,
+                };
+                let local = room
+                    .history_head(store, &room.me())?
+                    .map(|head| super::HeadHint {
+                        author: head.binding.author,
+                        head: head.id(),
+                        size: head.root.leaves,
+                    });
                 let publication_wake = room.history_publication_wake();
                 let read = room.history_read(store)?;
                 let mut missing = Vec::with_capacity(slice.len());
@@ -752,7 +783,20 @@ impl Source {
                         // until Query::Head asks the peer for the authenticated role-complete
                         // receipt. A previously recorded later receipt makes an older echo
                         // redundant; no scalar echo itself may advance held_through.
-                        if room.held_through(&peer).is_none_or(|held| held < hint.size) {
+                        let known = match read.history_head(&hint.head)? {
+                            Some(head)
+                                if head.binding.author == hint.author
+                                    && head.binding.scope
+                                        == crate::log::history::LogScope::Public
+                                    && head.root.leaves == hint.size =>
+                            {
+                                read.history_head_accepted(&hint.head, head.binding)?
+                            }
+                            _ => false,
+                        };
+                        // A size-only echo must not hide an unknown or same-size
+                        // conflicting own head from authenticated rollback detection.
+                        if !known || room.held_through(&peer).is_none_or(|held| held < hint.size) {
                             missing.push(hint);
                         }
                         continue;
@@ -831,18 +875,24 @@ impl Source {
                 for author in changed {
                     room.forget_history_decline(store, peer, author, &committed)?;
                 }
-                Ok(Some(FilteredInventory::Ready(missing, rearmed)))
+                Ok(Some(FilteredInventory::Ready(
+                    missing, rearmed, context, local,
+                )))
             })
             .await?;
         match filtered {
             Lookup::Found(filtered) => {
-                let (missing, rearmed) = match filtered.value {
-                    FilteredInventory::Ready(missing, rearmed) => (missing, rearmed),
+                let (missing, rearmed, context, local) = match filtered.value {
+                    FilteredInventory::Ready(missing, rearmed, context, local) => {
+                        (missing, rearmed, context, local)
+                    }
                     FilteredInventory::Publication(wait) => {
                         return Ok(InventoryOffer::Publication(wait))
                     }
                 };
-                let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
+                let mut offer = inbox.offer_peer_inventory(
+                    job, generation, room_id, self.peer, &missing, context, local,
+                )?;
                 offer.rearmed = rearmed;
                 Ok(InventoryOffer::Offered(offer))
             }
