@@ -559,7 +559,13 @@ impl Source {
         let cursor_bytes = task_capacity * std::mem::size_of::<RangeTask>()
             + value_capacity * std::mem::size_of::<Descriptor>()
             + crate::log::history::MAX_HEADER_BYTES;
-        let _cursor_charge = job.reserve_or_pressure(cursor_bytes)?;
+        let _cursor_charge = match job.reserve_or_pressure(cursor_bytes) {
+            Ok(charge) => charge,
+            Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
+                return Ok(Lookup::Busy);
+            }
+            Err(error) => return Err(error),
+        };
         let mut tasks = Vec::with_capacity(task_capacity);
         let mut values = Vec::with_capacity(value_capacity);
         tasks.push(RangeTask::Visit { start, leaves });
