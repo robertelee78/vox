@@ -3022,6 +3022,31 @@ impl Node {
             return false;
         };
         let node = profile.fingerprint();
+        // A retained dependency routed to an offline author is still owned work, but
+        // cannot own this node's one foreground selection position while another peer
+        // is reachable. Keep the entire parked Flow (including its exact continuation
+        // and origin) in the existing bounded deque. Its real reconnect makes its port
+        // eligible and the ordinary matching-port selection below resumes that owner.
+        if self.bounded_sync.running[0].is_none()
+            && self.bounded_sync.ready[0].as_ref().is_some_and(|flow| {
+                self.net
+                    .as_ref()
+                    .and_then(|net| net.manager().existing(&flow.peer))
+                    .is_none_or(|conn| conn.quinn().close_reason().is_some())
+            })
+        {
+            if let Some(flow) = self.bounded_sync.ready[0].take() {
+                // Only this now-unusable port's queued resource claims are withdrawn;
+                // its logical work and unrelated ports' fair positions stay intact.
+                self.bounded_sync
+                    .cancel_foreground_port(flow.room, flow.peer);
+                self.bounded_sync
+                    .cancel_pool_admission(flow.room, flow.peer);
+                // It was the selected owner: preserve its precedence over later
+                // continuations of this port. Other peers select only their own work.
+                self.bounded_sync.deferred.push_front(flow);
+            }
+        }
         let pending_work = self.bounded_pending_identity(room, peer);
         self.bounded_sync
             .prioritize_control_admission_owner(room, peer);
