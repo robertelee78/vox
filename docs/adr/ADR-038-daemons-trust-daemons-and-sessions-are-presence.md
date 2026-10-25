@@ -662,6 +662,33 @@ lessons. It changes neither this record's decision status nor any requirement or
   attempts is not a Vox resource policy. The P006 intervention and
   later fixture prerequisites remain diagnostic evidence, not an unchanged normal proof pass.
 
+  Retained-proof export RCA, 2026-10-25 (#1021): P009's current Alice Head 139 depended
+  on Carol's signed Head 135. Bob's exact current Flow received `EvidenceUnavailable` from
+  connected Alice for **inclusion at Carol position 135 under that same Head**, then retained
+  that query and moved to offline Carol. Alice's shipped local role prefix was 135 and named
+  that same signed Head; Bob still held Alice through 6 and Carol through 4. The exact absent
+  server artifact was not read from the database: the inclusion path needs canonical ranges
+  `(133, 2)`, `(129, 4)` and `(1, 128)`, and imported proof completion retained compact local
+  receipts but discarded supplied and reconstructed non-prefix nodes. A local semantic receipt
+  does not itself certify relay proof export, and absent-author pending is not a waiver for
+  evidence an available member can derive from its already authenticated retained history.
+  The implementation correction is to retain bounded positioned inclusion, consistency and
+  control-proof nodes only after complete verification and exact accepted-chain confirmation,
+  with generated contexts and the terminal receipt in the existing transaction. A new signed
+  but unaccepted Head must keep its head-scoped receipt/proof for promotion without poisoning
+  the coordinate-keyed range index. Already-retained current-version history is to heal on
+  a genuine proof request by reconstructing missing canonical metadata from accepted indexed
+  headers and checked contexts, never private bodies. Each completed child/context is to be
+  conflict-checked and memoized in the existing index under the same request's actual authority
+  and commit accounting, so an existing wire deadline does not erase all progress. Disk slices
+  are bounded, release the room before yielding and retain only charged scalar depth state;
+  total reconstruction work can be linear in the missing subtree, not just the wire proof.
+  Cache hits are read-only. No profile reset, automatic old-body demand, new queue, timer or
+  receipt credit is introduced. New-import retention and old-profile healing require separate
+  user evidence; the diagnostic stop itself is no normal pass or mutant red. P008's borrowed
+  ten-second pre-Older marker deadline remains an apparatus correction, independently of this
+  product repair.
+
   Signed Head knowledge, actual role satisfaction and admitted transient serving work are to
   remain distinct. A completed own-Head snapshot is to return the authenticated signed Head
   independently of an optional exact nonzero role position and entry hash. Only a role word

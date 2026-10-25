@@ -37,6 +37,13 @@ pub const MAX_CONTROL_HEADERS: usize = 8;
 /// Maximum tree depth from the existing 2^48 sequence bound.
 pub const MAX_TREE_DEPTH: usize = 48;
 
+// Two journals can overlap while a sealed checkpoint is decoded and restarted. This
+// supplements the existing verifier envelope, including actual reserved stack/vector bounds.
+pub(crate) const VERIFIED_RANGE_ENVELOPE: usize = 2
+    * MAX_PROOF_TOKENS
+    * std::mem::size_of::<(u64, Descriptor)>()
+    + 2 * (MAX_TREE_DEPTH + 1) * (std::mem::size_of::<u64>() + std::mem::size_of::<TreeRange>());
+
 /// Audience binding of the public log; private streams do not share its proof namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -1260,6 +1267,9 @@ pub struct InclusionVerifier {
     index: u64,
     last: u64,
     current: Option<Descriptor>,
+    start: u64,
+    ranges: Vec<(u64, Descriptor)>,
+    restored_complete: bool,
 }
 impl InclusionVerifier {
     /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
@@ -1282,6 +1292,7 @@ impl InclusionVerifier {
         if proof.position == proof.size && header.entry().skeleton.epoch != head.head().tail_epoch {
             return Err(Error::MalformedBundle("head terminal epoch mismatch"));
         }
+        let start = proof.position;
         Ok(Self {
             index: proof.position - 1,
             last: proof.size - 1,
@@ -1290,6 +1301,9 @@ impl InclusionVerifier {
             proof,
             next: 0,
             current: None,
+            start,
+            ranges: Vec::with_capacity(2 * MAX_TREE_DEPTH + 1),
+            restored_complete: false,
         })
     }
     /// Advance bounded work; persist generated context and cursor before another slice.
@@ -1303,6 +1317,7 @@ impl InclusionVerifier {
             return match leaf_descriptor(binding, self.header.entry(), source, budget)? {
                 HistoryStep::Complete((descriptor, context)) => {
                     self.current = Some(descriptor);
+                    self.ranges.push((self.start, descriptor));
                     Ok(HistoryStep::Progress(context))
                 }
                 HistoryStep::MissingContext(hash) => Ok(HistoryStep::MissingContext(hash)),
@@ -1332,6 +1347,18 @@ impl InclusionVerifier {
         };
         match join_descriptors(binding, left, right, source, budget)? {
             HistoryStep::Complete((descriptor, context)) => {
+                let sibling_start = if sibling_left {
+                    self.start
+                        .checked_sub(sibling.leaves)
+                        .ok_or(Error::MalformedBundle("inclusion range start"))?
+                } else {
+                    self.start
+                        .checked_add(current.leaves)
+                        .ok_or(Error::SizeLimitExceeded("inclusion range start"))?
+                };
+                self.ranges.push((sibling_start, sibling));
+                self.start = self.start.min(sibling_start);
+                self.ranges.push((self.start, descriptor));
                 self.current = Some(descriptor);
                 self.next += 1;
                 if sibling_left {
@@ -1443,6 +1470,11 @@ pub struct ConsistencyVerifier {
     old_acc: Descriptor,
     new_acc: Descriptor,
     old_joined: bool,
+    old_start: u64,
+    new_start: u64,
+    positions: Vec<TreeRange>,
+    ranges: Vec<(u64, Descriptor)>,
+    restored_complete: bool,
 }
 impl ConsistencyVerifier {
     /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
@@ -1483,6 +1515,16 @@ impl ConsistencyVerifier {
         if proof.from > 0 && proof.from < proof.to && proof.nodes.is_empty() {
             return Err(Error::MalformedBundle("empty advancing consistency proof"));
         }
+        let positions = consistency_ranges(proof.from, proof.to)?;
+        let start = if next == 0 { 1 } else { positions[0].start };
+        let mut ranges = Vec::with_capacity(4 * (MAX_TREE_DEPTH + 1) + 3);
+        if prefix.leaves != 0 {
+            ranges.push((1, prefix));
+        }
+        if next != 0 {
+            ranges.push((start, acc));
+        }
+        ranges.push((1, head.head().root));
         Ok(Self {
             head,
             prefix,
@@ -1493,6 +1535,11 @@ impl ConsistencyVerifier {
             old_acc: acc,
             new_acc: acc,
             old_joined: false,
+            old_start: start,
+            new_start: start,
+            positions,
+            ranges,
+            restored_complete: false,
         })
     }
     /// Advance bounded work; persist generated context and cursor before another slice.
@@ -1545,10 +1592,22 @@ impl ConsistencyVerifier {
         };
         match join_descriptors(binding, left, right, source, budget)? {
             HistoryStep::Complete((descriptor, context)) => {
+                let at = self
+                    .positions
+                    .get(self.next)
+                    .ok_or(Error::MalformedBundle("consistency range position"))?;
+                if at.leaves != node.leaves {
+                    return Err(Error::MalformedBundle("consistency range length"));
+                }
+                self.ranges.push((at.start, node));
                 if update_old {
+                    self.old_start = self.old_start.min(at.start);
+                    self.ranges.push((self.old_start, descriptor));
                     self.old_acc = descriptor;
                     self.old_joined = true;
                 } else {
+                    self.new_start = self.new_start.min(at.start);
+                    self.ranges.push((self.new_start, descriptor));
                     self.new_acc = descriptor;
                     self.old_joined = false;
                     self.next += 1;
@@ -1748,6 +1807,9 @@ pub struct ControlRangeVerifier {
     next: usize,
     signed_leaf: Option<usize>,
     headers: Vec<VerifiedHeader>,
+    starts: Vec<u64>,
+    ranges: Vec<(u64, Descriptor)>,
+    restored_complete: bool,
 }
 impl ControlRangeVerifier {
     /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
@@ -1778,6 +1840,9 @@ impl ControlRangeVerifier {
             next: 0,
             signed_leaf: None,
             headers: Vec::new(),
+            starts: Vec::with_capacity(MAX_TREE_DEPTH + 1),
+            ranges: Vec::with_capacity(MAX_PROOF_TOKENS),
+            restored_complete: false,
         })
     }
     /// Advance bounded work; persist generated context and cursor before another slice.
@@ -1822,6 +1887,13 @@ impl ControlRangeVerifier {
                         budget,
                     )? {
                         HistoryStep::Complete((descriptor, context)) => {
+                            let start = *self
+                                .starts
+                                .get(n - 2)
+                                .ok_or(Error::MalformedBundle("control range start"))?;
+                            self.starts.truncate(n - 2);
+                            self.starts.push(start);
+                            self.ranges.push((start, descriptor));
                             self.values.truncate(n - 2);
                             self.values.push(descriptor);
                             self.tasks.pop();
@@ -1857,6 +1929,8 @@ impl ControlRangeVerifier {
                                 ));
                             }
                             self.values.push(*descriptor);
+                            self.starts.push(start);
+                            self.ranges.push((start, *descriptor));
                             self.tasks.pop();
                             self.next += 1;
                         }
@@ -1910,6 +1984,8 @@ impl ControlRangeVerifier {
                             match leaf_descriptor(binding, entry, source, budget)? {
                                 HistoryStep::Complete((descriptor, context)) => {
                                     self.values.push(descriptor);
+                                    self.starts.push(start);
+                                    self.ranges.push((start, descriptor));
                                     self.tasks.pop();
                                     self.headers.push(VerifiedHeader((**entry).clone()));
                                     self.next += 1;
@@ -2120,6 +2196,59 @@ fn bounded_proof(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+// These journals are transient proof results, not new receipt/checkpoint formats. A caller
+// must additionally establish the exact Head is on its accepted chain before indexing them.
+impl InclusionVerifier {
+    pub(crate) fn restored_complete(&self) -> bool {
+        self.restored_complete
+    }
+    pub(crate) fn verified_ranges(&self) -> Result<&[(u64, Descriptor)]> {
+        if self.last != 0
+            || self.next != self.proof.siblings.len()
+            || self.current != Some(self.head.head().root)
+        {
+            return Err(Error::MalformedAtRest(
+                "inclusion range result is incomplete",
+            ));
+        }
+        Ok(&self.ranges)
+    }
+}
+impl ConsistencyVerifier {
+    pub(crate) fn restored_complete(&self) -> bool {
+        self.restored_complete
+    }
+    pub(crate) fn verified_ranges(&self) -> Result<&[(u64, Descriptor)]> {
+        if self.proof.from != 0
+            && self.proof.from != self.proof.to
+            && (self.old_joined
+                || self.last != 0
+                || self.next != self.proof.nodes.len()
+                || self.old_acc != self.prefix
+                || self.new_acc != self.head.head().root)
+        {
+            return Err(Error::MalformedAtRest(
+                "consistency range result is incomplete",
+            ));
+        }
+        Ok(&self.ranges)
+    }
+}
+impl ControlRangeVerifier {
+    pub(crate) fn restored_complete(&self) -> bool {
+        self.restored_complete
+    }
+    pub(crate) fn verified_ranges(&self) -> Result<&[(u64, Descriptor)]> {
+        if !self.tasks.is_empty()
+            || self.next != self.proof.tokens.len()
+            || self.values.as_slice() != [self.head.head().root]
+        {
+            return Err(Error::MalformedAtRest("control range result is incomplete"));
+        }
+        Ok(&self.ranges)
+    }
+}
+
 // These checkpoints are accepted only from the node's authenticated sealed local state. They are
 // deliberately crate-private: a peer's proof bytes must take the signature-checking constructors.
 const MAX_CHECKPOINT_BYTES: usize = MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES;
@@ -2170,7 +2299,12 @@ impl InclusionVerifier {
             return Err(Error::MalformedAtRest("inclusion checkpoint traversal"));
         }
         d.finish()?;
-        Ok(verifier)
+        let complete = verifier.last == 0
+            && verifier.next == verifier.proof.siblings.len()
+            && verifier.current == Some(verifier.head.head().root);
+        let mut restarted = Self::new(verifier.head, verifier.header, verifier.proof)?;
+        restarted.restored_complete = complete;
+        Ok(restarted)
     }
 }
 impl ConsistencyVerifier {
@@ -2217,7 +2351,16 @@ impl ConsistencyVerifier {
             return Err(Error::MalformedAtRest("consistency checkpoint traversal"));
         }
         d.finish()?;
-        Ok(verifier)
+        let complete = verifier.proof.from == 0
+            || verifier.proof.from == verifier.proof.to
+            || (!verifier.old_joined
+                && verifier.last == 0
+                && verifier.next == verifier.proof.nodes.len()
+                && verifier.old_acc == verifier.prefix
+                && verifier.new_acc == verifier.head.head().root);
+        let mut restarted = Self::new(verifier.head, verifier.prefix, verifier.proof)?;
+        restarted.restored_complete = complete;
+        Ok(restarted)
     }
 }
 impl ControlRangeVerifier {
@@ -2322,7 +2465,12 @@ impl ControlRangeVerifier {
             verifier.headers.push(local_header(&mut d)?);
         }
         d.finish()?;
-        Ok(verifier)
+        let complete = verifier.tasks.is_empty()
+            && verifier.next == verifier.proof.tokens.len()
+            && verifier.values.as_slice() == [verifier.head.head().root];
+        let mut restarted = Self::new(verifier.head, verifier.proof)?;
+        restarted.restored_complete = complete;
+        Ok(restarted)
     }
 }
 fn checkpoint_bytes(e: Encoder) -> Result<Vec<u8>> {

@@ -202,6 +202,19 @@ impl ObjectKind {
         }
     }
 }
+/// One new canonical node reconstructed solely from already accepted indexed positions.
+/// The serving request supplies its current nonce fence; this grants no body/role authority.
+pub(crate) struct RangeMemo {
+    pub node: Digest32,
+    pub instance: [u8; 16],
+    pub epoch: u64,
+    pub generation: Digest32,
+    pub binding: TreeBinding,
+    pub start: u64,
+    pub descriptor: Descriptor,
+    pub context: ControlContext,
+}
+
 fn object_key(kind: ObjectKind, hash: &Digest32) -> Key {
     let mut key = hashed(hash);
     key[32] = kind as u8;
@@ -1849,6 +1862,30 @@ impl Write<'_, '_> {
         self.save_history_object(ObjectKind::Header, hash, &entry.header_wire())?;
         Ok(hash)
     }
+    pub(crate) fn keep_derived_history_range(&mut self, memo: RangeMemo) -> Result<()> {
+        if crate::node::history_stream::authorization_generation_in(
+            self.batch,
+            memo.node,
+            *self.channel,
+            memo.instance,
+            memo.epoch,
+        )? != memo.generation
+        {
+            return Err(Error::Profile(
+                "history range authorization changed before memo",
+            ));
+        }
+        if memo.binding.room != *self.channel
+            || memo.context.room != *self.channel
+            || memo.context.scope != memo.binding.scope
+            || memo.context.hash() != memo.descriptor.frontier
+        {
+            return Err(invalid("derived history range context binding"));
+        }
+        self.keep_history_context(&memo.context)?;
+        self.keep_history_range(memo.binding, memo.start, memo.descriptor)
+    }
+
     /// A previously reconstructed tree node, retained for bounded proof serving. The
     /// descriptor does not mark an interval as admitted or control-ready.
     pub(crate) fn keep_history_range(
@@ -2864,6 +2901,22 @@ pub(crate) enum HistoryVerifier {
     Validation(super::super::governance::SparseValidation),
 }
 impl HistoryVerifier {
+    pub(crate) fn restored_complete(&self) -> bool {
+        match self {
+            Self::Inclusion(v) => v.restored_complete(),
+            Self::Consistency(v) => v.restored_complete(),
+            Self::ControlRange(v) => v.restored_complete(),
+            Self::Validation(_) => false,
+        }
+    }
+    pub(crate) fn verified_ranges(&self) -> Result<&[(u64, Descriptor)]> {
+        match self {
+            Self::Inclusion(v) => v.verified_ranges(),
+            Self::Consistency(v) => v.verified_ranges(),
+            Self::ControlRange(v) => v.verified_ranges(),
+            Self::Validation(_) => Err(invalid("entry validation is not a tree proof")),
+        }
+    }
     fn checkpoint(&self, binding: CursorBinding) -> Result<Vec<u8>> {
         let (kind, target, bytes) = match self {
             Self::Inclusion(v) => (0, v.checkpoint_target(), v.checkpoint()?),
@@ -3265,9 +3318,6 @@ impl Write<'_, '_> {
             &receipt.binding().author,
             receipt.prefix().leaves,
         );
-        if receipt.prefix().leaves != 0 {
-            self.keep_history_range(receipt.binding(), 1, receipt.prefix())?;
-        }
         self.save_history_object(ObjectKind::PrefixReceipt, key, &receipt.local_receipt()?)
     }
 }

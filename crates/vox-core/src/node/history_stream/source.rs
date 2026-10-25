@@ -12,9 +12,9 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::log::entry::Entry;
 use crate::log::history::{
-    consistency_ranges, inclusion_ranges, split, ConsistencyProof, ControlRangeProof, ControlToken,
-    Descriptor, InclusionProof, SignedHead, TreeBinding, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS,
-    MAX_TREE_DEPTH,
+    consistency_ranges, inclusion_ranges, join_descriptors, leaf_descriptor, split,
+    ConsistencyProof, ControlRangeProof, ControlToken, Descriptor, HistoryStep, InclusionProof,
+    LogScope, SignedHead, WorkBudget, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS, MAX_TREE_DEPTH,
 };
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::{BufferCharge, Job};
@@ -111,6 +111,24 @@ pub(super) enum Lookup<T> {
 pub(super) struct PreparedRead {
     charge: BufferCharge,
     scratch: BufferCharge,
+}
+
+#[derive(Clone, Copy)]
+enum RangeTask {
+    Visit {
+        start: u64,
+        leaves: u64,
+    },
+    Join {
+        start: u64,
+        left: Descriptor,
+        right: Descriptor,
+    },
+}
+enum RangeStep {
+    Found(Descriptor),
+    Split,
+    Busy,
 }
 
 #[derive(Clone, Copy)]
@@ -528,17 +546,204 @@ impl Source {
     async fn range(
         &self,
         job: &Job,
-        binding: TreeBinding,
+        head: &SignedHead,
         start: u64,
         leaves: u64,
     ) -> Result<Lookup<Descriptor>> {
-        self.read(job, 64 * 1024, move |room, store| {
-            room.history_tree_range(store, binding, start, leaves)
-        })
-        .await
+        // An old completed receipt may have discarded its proof nodes. Reconstruct only
+        // missing canonical metadata from accepted indexed positions, never bodies. Each
+        // completed child is durably memoized, so an existing wire deadline/cancellation
+        // cannot force a later attempt to redo an arbitrarily large subtree from scratch.
+        let task_capacity = 2 * MAX_TREE_DEPTH + 1;
+        let value_capacity = MAX_TREE_DEPTH + 1;
+        let cursor_bytes = task_capacity * std::mem::size_of::<RangeTask>()
+            + value_capacity * std::mem::size_of::<Descriptor>()
+            + crate::log::history::MAX_HEADER_BYTES;
+        let _cursor_charge = job.reserve_or_pressure(cursor_bytes)?;
+        let mut tasks = Vec::with_capacity(task_capacity);
+        let mut values = Vec::with_capacity(value_capacity);
+        tasks.push(RangeTask::Visit { start, leaves });
+        while let Some(task) = tasks.last().copied() {
+            self.current()?;
+            let target = head.clone();
+            let source = self.clone();
+            let step = self
+                .read(job, 64 * 1024, move |room, store| {
+                    use crate::node::channel::entry_store::sparse::RangeMemo;
+                    let input = room.history_read(store)?;
+                    let binding = target.binding;
+                    let (at, length) = match task {
+                        RangeTask::Visit { start, leaves } => (start, leaves),
+                        RangeTask::Join { start, left, right } => (
+                            start,
+                            left.leaves
+                                .checked_add(right.leaves)
+                                .ok_or(Error::SizeLimitExceeded("derived range length"))?,
+                        ),
+                    };
+                    if let Some(descriptor) = input.history_range(binding, at, length)? {
+                        return Ok(Some(RangeStep::Found(descriptor)));
+                    }
+                    if room.is_poisoned() || room.history_retirement_locked() {
+                        return Err(Error::Profile("history range room is unavailable"));
+                    }
+                    if room.history_publication_busy(store)? {
+                        return Ok(Some(RangeStep::Busy));
+                    }
+                    if binding.scope != LogScope::Public
+                        || !input.history_head_accepted(&target.id(), binding)?
+                    {
+                        return Ok(None);
+                    }
+                    if input
+                        .sparse_author(&binding.author, binding.scope)?
+                        .is_some_and(|state| state.observed_conflict.is_some())
+                    {
+                        return Err(Error::MalformedBundle(
+                            "history range author has conflicting heads",
+                        ));
+                    }
+                    // Exactly one leaf/join primitive per guarded slice. WorkBudget is NEVER
+                    // replenished under this guard; exhausted work returns Busy, not absence.
+                    let mut work = WorkBudget::default();
+                    let built = match task {
+                        RangeTask::Visit { leaves, .. } if leaves > 1 => {
+                            return Ok(Some(RangeStep::Split));
+                        }
+                        RangeTask::Visit { start, .. } => {
+                            let Some((source_head, header)) =
+                                input.history_validated_header(&binding.author, start)?
+                            else {
+                                return Ok(None);
+                            };
+                            if header.skeleton.seq != start
+                                || !input.history_head_accepted(&source_head, binding)?
+                            {
+                                return Ok(None);
+                            }
+                            binding.matches_entry(&header)?;
+                            leaf_descriptor(binding, &header, &input, &mut work)?
+                        }
+                        RangeTask::Join { left, right, .. } => {
+                            join_descriptors(binding, left, right, &input, &mut work)?
+                        }
+                    };
+                    let (descriptor, context) = match built {
+                        HistoryStep::Complete(value) => value,
+                        HistoryStep::MissingContext(_) => return Ok(None),
+                        HistoryStep::Yielded | HistoryStep::Progress(_) => {
+                            return Ok(Some(RangeStep::Busy))
+                        }
+                    };
+                    if descriptor.leaves != length {
+                        return Err(Error::MalformedAtRest("derived range length differs"));
+                    }
+                    let node = room.me();
+                    let instance = room.history_instance(store)?;
+                    let epoch = room.epoch();
+                    let generation = super::authorization_generation(
+                        store,
+                        node,
+                        binding.room,
+                        instance,
+                        epoch,
+                    )?;
+                    if source.authorization.is_some_and(|(expected, captured)| {
+                        expected != node || captured != generation
+                    }) {
+                        return Err(Error::Profile("history range authorization changed"));
+                    }
+                    drop(input);
+                    source.current()?;
+                    room.history_write_tracked(store, &source.work_committed, |index| {
+                        index.keep_derived_history_range(RangeMemo {
+                            node,
+                            instance,
+                            epoch,
+                            generation,
+                            binding,
+                            start: at,
+                            descriptor,
+                            context,
+                        })
+                    })?;
+                    Ok(Some(RangeStep::Found(descriptor)))
+                })
+                .await?;
+            let held = match step {
+                Lookup::Found(held) => held,
+                Lookup::Busy => return Ok(Lookup::Busy),
+                Lookup::Missing => return Ok(Lookup::Missing),
+            };
+            match held.value {
+                RangeStep::Busy => return Ok(Lookup::Busy),
+                RangeStep::Split => {
+                    let RangeTask::Visit { start, leaves } = task else {
+                        return Err(Error::MalformedAtRest("range join cannot split"));
+                    };
+                    let left = split(leaves)?;
+                    if tasks.len().saturating_add(2) > task_capacity {
+                        return Err(Error::SizeLimitExceeded("history range task depth"));
+                    }
+                    tasks.pop();
+                    // Join's scalar operands are installed after its two children finish.
+                    tasks.push(RangeTask::Join {
+                        start,
+                        left: Descriptor::empty(head.binding),
+                        right: Descriptor::empty(head.binding),
+                    });
+                    tasks.push(RangeTask::Visit {
+                        start: start + left,
+                        leaves: leaves - left,
+                    });
+                    tasks.push(RangeTask::Visit {
+                        start,
+                        leaves: left,
+                    });
+                }
+                RangeStep::Found(descriptor) => {
+                    tasks.pop();
+                    if values.len() == value_capacity {
+                        return Err(Error::SizeLimitExceeded("history range value depth"));
+                    }
+                    values.push(descriptor);
+                    if tasks.is_empty() {
+                        if values.len() != 1 {
+                            return Err(Error::MalformedAtRest("history range extra operands"));
+                        }
+                        return Ok(Lookup::Found(Held {
+                            value: descriptor,
+                            _charge: held._charge,
+                        }));
+                    }
+                }
+            }
+            // Once both child visits have returned, bind this exact canonical join.
+            if let Some(RangeTask::Join { left, right, .. }) = tasks.last_mut() {
+                if left.leaves == 0 && right.leaves == 0 && values.len() >= 2 {
+                    let n = values.len();
+                    *left = values[n - 2];
+                    *right = values[n - 1];
+                    values.truncate(n - 2);
+                }
+            }
+            if tasks.len() > task_capacity || values.len() > value_capacity {
+                return Err(Error::SizeLimitExceeded(
+                    "history range reconstruction depth",
+                ));
+            }
+            // No room guard, pinned read, context map or batch survives this yield. The
+            // scalar cursor remains prepaid by THIS Source Job; no second owner is queued.
+            self.current()?;
+            tokio::task::yield_now().await;
+        }
+        Err(Error::MalformedAtRest(
+            "history range reconstruction ended without root",
+        ))
     }
 
-    /// Proof construction reads only indexed canonical ranges, never a content archive. The
+    /// Proof construction uses indexed ranges or bounded, memoized authenticated header
+    /// reconstruction for earlier receipts. It never scans or fetches content bodies. The
     /// response owns the output envelope and each disk reader separately owns its temporary
     /// envelope. Verification and authority still belong to the receiving admission path.
     pub(super) async fn proof(
@@ -579,10 +784,7 @@ impl Source {
             let mut descriptors = Vec::with_capacity(ranges.len());
             for range in ranges {
                 self.current()?;
-                match self
-                    .range(job, head.binding, range.start, range.leaves)
-                    .await?
-                {
+                match self.range(job, head, range.start, range.leaves).await? {
                     Lookup::Found(found) => descriptors.push(found.value),
                     Lookup::Busy => return Ok(Lookup::Busy),
                     Lookup::Missing => return Ok(Lookup::Missing),
@@ -600,7 +802,7 @@ impl Source {
                     let prefix = if from == 0 {
                         Descriptor::empty(head.binding)
                     } else {
-                        match self.range(job, head.binding, 1, from).await? {
+                        match self.range(job, head, 1, from).await? {
                             Lookup::Found(found) => found.value,
                             Lookup::Busy => return Ok(Lookup::Busy),
                             Lookup::Missing => return Ok(Lookup::Missing),
@@ -645,7 +847,7 @@ impl Source {
                 if pending.len() > MAX_TREE_DEPTH || tokens.len() >= MAX_PROOF_TOKENS {
                     return Err(Error::SizeLimitExceeded("served control proof"));
                 }
-                let descriptor = match self.range(job, head.binding, start, leaves).await? {
+                let descriptor = match self.range(job, head, start, leaves).await? {
                     Lookup::Found(found) => found.value,
                     Lookup::Busy => return Ok(Lookup::Busy),
                     Lookup::Missing => return Ok(Lookup::Missing),

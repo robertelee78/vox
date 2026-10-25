@@ -398,6 +398,23 @@ pub(super) fn advance(
         overlay.generated.borrow_mut().push((step.hash(), step));
     };
     let generated = overlay.generated.into_inner();
+    let accepted = input
+        .history_head(&binding.head)?
+        .map(|head| input.history_head_accepted(&binding.head, head.binding))
+        .transpose()?
+        .unwrap_or(false);
+    // Empty/equal-size consistency proofs are terminal even in their initial checkpoint.
+    // Do not mistake that for the atomic receipt/context save having happened already.
+    let saved_receipt = match &result {
+        ResultStep::Included(_) => input
+            .history_inclusion_receipt(&binding.head, &binding.author, binding.from)?
+            .is_some(),
+        ResultStep::Prefix(prefix) => input
+            .history_prefix_receipt(&binding.head, &binding.author, prefix.prefix().leaves)?
+            .is_some(),
+        ResultStep::Controls(_) => true,
+        ResultStep::Missing(_) => false,
+    };
     drop(input);
     let keep_generated = |index: &mut entry_store::Write<'_, '_>| -> Result<()> {
         for (_, context) in &generated {
@@ -405,16 +422,55 @@ pub(super) fn advance(
         }
         Ok(())
     };
+    // Receipt availability may be needed to prove this new Head's consistency. Keep it
+    // head-scoped while promotion is pending; only an accepted chain may populate the
+    // coordinate-keyed range index. The original completed proof remains owned/restartable.
+    if !accepted && !matches!(result, ResultStep::Missing(_)) {
+        if !cursor.restored_complete() || !saved_receipt {
+            room.history_write_tracked(store, committed, |index| {
+                keep_generated(index)?;
+                match &result {
+                    ResultStep::Included(included) => {
+                        index.keep_history_inclusion_receipt(included)?
+                    }
+                    ResultStep::Prefix(prefix) => index.keep_history_prefix_receipt(prefix)?,
+                    ResultStep::Controls(_) => {}
+                    ResultStep::Missing(_) => return Err(invalid("missing proof cannot complete")),
+                }
+                if !index.keep_history_verifier_cursor(*binding, &cursor)? {
+                    return Err(invalid("existing verifier capacity vanished"));
+                }
+                Ok(())
+            })?;
+        }
+        return Ok(match promote_head(room, store, committed, binding.head)? {
+            Advanced::Complete => Advanced::Progress,
+            other => other,
+        });
+    }
+    let tree_binding = crate::log::history::TreeBinding {
+        room: binding.room,
+        scope: crate::log::history::LogScope::Public,
+        author: binding.author,
+    };
+    let keep_ranges = |index: &mut entry_store::Write<'_, '_>| -> Result<()> {
+        for (start, descriptor) in cursor.verified_ranges()? {
+            index.keep_history_range(tree_binding, *start, *descriptor)?;
+        }
+        Ok(())
+    };
     match result {
         ResultStep::Missing(hash) => Ok(Advanced::MissingContext(hash)),
         ResultStep::Included(included) => {
             let own_progress = binding.author == room.me()
-                && room
+                && (room
                     .history_read(store)?
                     .history_inclusion_receipt(&binding.head, &binding.author, binding.from)?
-                    .is_none();
+                    .is_none()
+                    || cursor.restored_complete());
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
+                keep_ranges(index)?;
                 index.keep_history_inclusion_receipt(&included)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
@@ -433,12 +489,14 @@ pub(super) fn advance(
         }
         ResultStep::Prefix(prefix) => {
             let own_progress = binding.author == room.me()
-                && room
+                && (room
                     .history_read(store)?
                     .history_prefix_receipt(&binding.head, &binding.author, prefix.prefix().leaves)?
-                    .is_none();
+                    .is_none()
+                    || cursor.restored_complete());
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
+                keep_ranges(index)?;
                 index.keep_history_prefix_receipt(&prefix)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
@@ -456,37 +514,9 @@ pub(super) fn advance(
             promote_head(room, store, committed, binding.head)
         }
         ResultStep::Controls(controls) => {
-            let input = room.history_read(store)?;
-            // Accepted, not merely committed: a control range is frequently about an
-            // earlier head of the author's chain — the head the join's control records
-            // were sealed under — and an earlier head is proven on the committed chain,
-            // never itself the committed head. Gating on `committed` alone meant such a
-            // range could never complete: the promotion below proved the head on the
-            // chain and returned Complete without committing it, this step re-ran, the
-            // gate was still false, and the verify/proof fetches looped for the whole
-            // window while every read refused. `history_head_accepted` is the same
-            // predicate for the committed head and additionally accepts an earlier head
-            // whose prefix range — persisted by the consistency receipt the promotion
-            // fetched — matches its own root.
-            let accepted = input.history_head_accepted(&controls.head_id(), controls.binding())?;
-            drop(input);
-            if !accepted {
-                // The finished cursor is kept with what it generated: the next turn, after
-                // the promotion, completes at once instead of verifying the range again.
-                room.history_write_tracked(store, committed, |index| {
-                    keep_generated(index)?;
-                    if !index.keep_history_verifier_cursor(*binding, &cursor)? {
-                        return Err(invalid("existing verifier capacity vanished"));
-                    }
-                    Ok(())
-                })?;
-                return Ok(match promote_head(room, store, committed, binding.head)? {
-                    Advanced::Complete => Advanced::Progress,
-                    other => other,
-                });
-            }
             room.history_write_tracked(store, committed, |index| {
                 keep_generated(index)?;
+                keep_ranges(index)?;
                 if index.keep_control_coverage(&controls, 0)?.is_some() {
                     return Err(invalid("bounded control coverage unexpectedly incomplete"));
                 }
