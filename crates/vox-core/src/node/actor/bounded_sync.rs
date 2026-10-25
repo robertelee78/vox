@@ -2132,7 +2132,7 @@ impl Node {
             || self
                 .ports
                 .get(&(room, peer))
-                .is_some_and(crate::node::ports::Port::announce_owed)
+                .is_some_and(|port| port.announce_owed() || port.req_gen > port.req_done)
             || self.history_demand.ready_binding(room, peer).is_some()
     }
     pub(super) fn key_body_busy_bypass(&self, room: Digest32, peer: Digest32) -> bool {
@@ -2364,8 +2364,6 @@ impl Node {
                             port.key_body_turn_due = true;
                         }
                     }
-                } else if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                    port.req_done = port.req_done.max(work.request);
                 }
             }
             // Authorization and local-durability exits carry ownership themselves. Handle them
@@ -3732,7 +3730,7 @@ impl Node {
                             && required.is_none()
                             && departure_hint.is_none()
                             && self.key_namespace_available()
-                            && (!self.history_hints.pending(room, peer)
+                            && (!self.actual_public_work(room, peer)
                                 || self
                                     .ports
                                     .get(&(room, peer))
@@ -3853,7 +3851,7 @@ impl Node {
                         && required.is_none()
                         && departure_hint.is_none()
                         && self.key_namespace_available()
-                        && (!self.history_hints.pending(room, peer)
+                        && (!self.actual_public_work(room, peer)
                             || self
                                 .ports
                                 .get(&(room, peer))
