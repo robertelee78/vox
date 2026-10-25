@@ -815,6 +815,13 @@ struct ObservationRefresh {
     phase: Arc<std::sync::atomic::AtomicU8>,
 }
 
+/// A blocked read carries only the existing publication owner/wake. Its disk worker
+/// drops all guards, keys and charges before the independently polled task awaits it.
+enum ObservationRead {
+    Capture(ObservationCapture),
+    Publication(crate::node::channel::HistoryPublicationWait),
+}
+
 struct ObservationCapture {
     key_body: Option<crate::node::history_stream::KeyBodyNeed>,
     key_body_after: Option<[u8; 64]>,
@@ -16096,135 +16103,185 @@ impl Node {
         let task_phase = Arc::clone(&phase);
         let (send, result) = oneshot::channel();
         self.reap_join_tasks();
+        let weak_metadata_room = Arc::downgrade(&shared);
+        let weak_metadata_store = Arc::downgrade(&store);
         let abort = self.join_tasks.spawn(async move {
-            let held = secret_work.read_owned().await;
-            let mut ticket: Option<crate::node::history_budget::Ticket> = None;
-            let answer = loop {
-                let guard = if let Some(waiting) = ticket.as_ref() {
-                    let capacity = waiting.wake();
-                    if !waiting.would_admit() {
-                        task_phase.store(0, Ordering::Release);
-                        capacity.await;
-                        continue;
-                    }
-                    match Arc::clone(&shared).try_lock_owned() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            // A parked room cannot occupy the runnable Control FIFO head.
-                            drop(ticket.take());
+            let answer = 'capture: loop {
+                let read = {
+                    let held = Arc::clone(&secret_work).read_owned().await;
+                    let Some(shared) = weak_metadata_room.upgrade() else {
+                        break 'capture Err(Error::Unreachable("history observation room retired"));
+                    };
+                    let Some(store) = weak_metadata_store.upgrade() else {
+                        break 'capture Err(Error::Unreachable(
+                            "history observation store retired",
+                        ));
+                    };
+                    let mut ticket: Option<crate::node::history_budget::Ticket> = None;
+                    loop {
+                        let guard = if let Some(waiting) = ticket.as_ref() {
+                            let capacity = waiting.wake();
+                            if !waiting.would_admit() {
+                                task_phase.store(0, Ordering::Release);
+                                capacity.await;
+                                continue;
+                            }
+                            match Arc::clone(&shared).try_lock_owned() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    // A parked room cannot occupy the runnable Control FIFO head.
+                                    drop(ticket.take());
+                                    task_phase.store(1, Ordering::Release);
+                                    Arc::clone(&shared).lock_owned().await
+                                }
+                            }
+                        } else {
                             task_phase.store(1, Ordering::Release);
                             Arc::clone(&shared).lock_owned().await
-                        }
-                    }
-                } else {
-                    task_phase.store(1, Ordering::Release);
-                    Arc::clone(&shared).lock_owned().await
-                };
-                let waiting = ticket.get_or_insert_with(|| {
-                    budget.enqueue(node, crate::node::history_budget::Lane::Control)
-                });
-                let capacity = waiting.wake();
-                let Some(job) = waiting.try_admit() else {
-                    // This ticket now waits ONLY for capacity, never for a mutex. When
-                    // capacity wakes it, try_lock above either admits or gives up FIFO.
-                    drop(guard);
-                    task_phase.store(0, Ordering::Release);
-                    capacity.await;
-                    continue;
-                };
-                drop(ticket.take());
-                // Same pinned-directory/Head decoding peak as the existing source read;
-                // one fixed scalar result, no peer Vec or second unreserved allocation.
-                let admission = job.reserve_or_pressure(4 * 1024 * 1024 + 128 * 1024);
-                let charge = match admission {
-                    Ok(charge) => charge,
-                    Err(Error::HistoryCapacity(pressure)) => {
-                        drop(guard);
-                        drop(job);
-                        task_phase.store(2, Ordering::Release); // actual byte dependency
-                        pressure.released().await;
-                        continue;
-                    }
-                    Err(error) => {
-                        drop(guard);
-                        drop(job);
-                        break Err(error);
-                    }
-                };
-                task_phase.store(3, Ordering::Release); // active bounded metadata read
-                let worker = tokio::task::spawn_blocking(move || {
-                    let _held = held;
-                    let _charge = charge;
-                    let _job = job;
-                    let room = guard;
-                    if room.epoch() != epoch || room.history_retirement_locked() {
-                        return Err(Error::Unreachable("history observation room changed"));
-                    }
-                    let current_instance = room.history_instance(&store)?;
-                    if current_instance != instance {
-                        return Err(Error::Unreachable("history observation instance changed"));
-                    }
-                    let authorization = crate::node::history_stream::authorization_generation(
-                        &store, node, room_id, instance, epoch,
-                    )?;
-                    let snapshot = if room.is_member(&peer_id) {
-                        Some(room.history_inventory_snapshot(&store, &peer_id)?)
-                    } else {
-                        None
-                    };
-                    let key_body_scope = crate::node::history_stream::KeyBodyScope {
-                        authorization,
-                        head: snapshot.and_then(|value| value.peer.known_head),
-                        peer_incarnation: room.history_inventory_incarnation(&peer_id),
-                        author_incarnation: room.history_author_inventory_incarnation(&peer_id),
-                    };
-                    let same_lifetime = previous_key_body_scope
-                        .is_some_and(|prior| prior.same_lifetime(key_body_scope));
-                    let (key_body_after, key_body) = if key_body_initialized
-                        && previous_key_body_scope == Some(key_body_scope)
-                    {
-                        (None, key_body)
-                    } else if room.is_member(&peer_id) {
-                        // Head growth during a pass cannot reset finite scan progress.
-                        let after = if same_lifetime && !key_body_initialized {
-                            key_body_after
-                        } else {
-                            None
                         };
-                        room.history_key_body_page(&store, peer_id, authorization, after)?
-                    } else {
-                        (None, None)
-                    };
-                    let pending_role = pending_role
-                        .filter(|(claim, _)| {
-                            claim.context.node == node
-                                && claim.context.instance == instance
-                                && claim.context.epoch == epoch
-                                && claim.context.authorization == authorization
-                                && claim.context.connection == connection
-                        })
-                        .map(|(claim, role)| {
-                            room.history_own_role_knowledge(&store, role)
-                                .map(|known| (claim, role, known))
-                        })
-                        .transpose()?;
-                    Ok(ObservationCapture {
-                        key_body,
-                        key_body_after,
-                        key_body_scope,
-                        instance,
-                        epoch,
-                        authorization,
-                        snapshot,
-                        pending_role,
-                    })
-                    // room/Store/Job/charge and secret-work guard drop before handoff.
-                });
-                break worker.await.unwrap_or_else(|_| {
-                    Err(Error::Profile(
-                        "history observation metadata reader stopped",
-                    ))
-                });
+                        let waiting = ticket.get_or_insert_with(|| {
+                            budget.enqueue(node, crate::node::history_budget::Lane::Control)
+                        });
+                        let capacity = waiting.wake();
+                        let Some(job) = waiting.try_admit() else {
+                            // This ticket now waits ONLY for capacity, never for a mutex. When
+                            // capacity wakes it, try_lock above either admits or gives up FIFO.
+                            drop(guard);
+                            task_phase.store(0, Ordering::Release);
+                            capacity.await;
+                            continue;
+                        };
+                        drop(ticket.take());
+                        // Same pinned-directory/Head decoding peak as the existing source read;
+                        // one fixed scalar result, no peer Vec or second unreserved allocation.
+                        let admission = job.reserve_or_pressure(4 * 1024 * 1024 + 128 * 1024);
+                        let charge = match admission {
+                            Ok(charge) => charge,
+                            Err(Error::HistoryCapacity(pressure)) => {
+                                drop(guard);
+                                drop(job);
+                                task_phase.store(2, Ordering::Release); // actual byte dependency
+                                pressure.released().await;
+                                continue;
+                            }
+                            Err(error) => {
+                                drop(guard);
+                                drop(job);
+                                break Err(error);
+                            }
+                        };
+                        task_phase.store(3, Ordering::Release); // active bounded metadata read
+                        let worker_store = Arc::clone(&store);
+                        let worker = tokio::task::spawn_blocking(move || {
+                            let _held = held;
+                            let store = worker_store;
+                            let _charge = charge;
+                            let _job = job;
+                            let room = guard;
+                            if room.epoch() != epoch || room.history_retirement_locked() {
+                                return Err(Error::Unreachable("history observation room changed"));
+                            }
+                            let current_instance = room.history_instance(&store)?;
+                            if current_instance != instance {
+                                return Err(Error::Unreachable(
+                                    "history observation instance changed",
+                                ));
+                            }
+                            let authorization =
+                                crate::node::history_stream::authorization_generation(
+                                    &store, node, room_id, instance, epoch,
+                                )?;
+                            let snapshot = if room.is_member(&peer_id) {
+                                Some(room.history_inventory_snapshot(&store, &peer_id)?)
+                            } else {
+                                None
+                            };
+                            let key_body_scope = crate::node::history_stream::KeyBodyScope {
+                                authorization,
+                                head: snapshot.and_then(|value| value.peer.known_head),
+                                peer_incarnation: room.history_inventory_incarnation(&peer_id),
+                                author_incarnation: room
+                                    .history_author_inventory_incarnation(&peer_id),
+                            };
+                            let same_lifetime = previous_key_body_scope
+                                .is_some_and(|prior| prior.same_lifetime(key_body_scope));
+                            let scan = if key_body_initialized
+                                && previous_key_body_scope == Some(key_body_scope)
+                            {
+                                crate::node::history_stream::KeyBodyScan::Page {
+                                    after: None,
+                                    need: key_body,
+                                }
+                            } else if room.is_member(&peer_id) {
+                                // Head growth during a pass cannot reset finite scan progress.
+                                let after = if same_lifetime && !key_body_initialized {
+                                    key_body_after
+                                } else {
+                                    None
+                                };
+                                room.history_key_body_page(&store, peer_id, authorization, after)?
+                            } else {
+                                crate::node::history_stream::KeyBodyScan::Page {
+                                    after: None,
+                                    need: None,
+                                }
+                            };
+                            let (key_body_after, key_body) = match scan {
+                                crate::node::history_stream::KeyBodyScan::Page { after, need } => {
+                                    (after, need)
+                                }
+                                crate::node::history_stream::KeyBodyScan::Publication(wait) => {
+                                    return Ok(ObservationRead::Publication(wait));
+                                }
+                            };
+                            let pending_role = pending_role
+                                .filter(|(claim, _)| {
+                                    claim.context.node == node
+                                        && claim.context.instance == instance
+                                        && claim.context.epoch == epoch
+                                        && claim.context.authorization == authorization
+                                        && claim.context.connection == connection
+                                })
+                                .map(|(claim, role)| {
+                                    room.history_own_role_knowledge(&store, role)
+                                        .map(|known| (claim, role, known))
+                                })
+                                .transpose()?;
+                            Ok(ObservationRead::Capture(ObservationCapture {
+                                key_body,
+                                key_body_after,
+                                key_body_scope,
+                                instance,
+                                epoch,
+                                authorization,
+                                snapshot,
+                                pending_role,
+                            }))
+                            // room/Store/Job/charge and secret-work guard drop before handoff.
+                        });
+                        // Only the dispatched, barrier-protected worker retains strong room/
+                        // Store references. Even a detached outer task cannot retain them.
+                        drop(shared);
+                        drop(store);
+                        break worker.await.unwrap_or_else(|_| {
+                            Err(Error::Profile(
+                                "history observation metadata reader stopped",
+                            ))
+                        });
+                    }
+                };
+                match read {
+                    Ok(ObservationRead::Capture(capture)) => break Ok(capture),
+                    Ok(ObservationRead::Publication(wait)) => {
+                        // The joined reader has released its Job, bytes, room guard and
+                        // secret-work lease. Preserve the scalar scan cursor and wait only
+                        // for the subscribed local publication release; no timer or spin.
+                        task_phase.store(5, Ordering::Release);
+                        wait.wake.await;
+                        continue 'capture;
+                    }
+                    Err(error) => break Err(error),
+                }
             };
             task_phase.store(4, Ordering::Release); // bounded scalar result ready
             let _ = send.send(answer);
@@ -16945,6 +17002,7 @@ impl Node {
                 1 => "room-lock",
                 2 => "bytes",
                 3 => "reading",
+                5 => "publication",
                 _ => "result-ready",
             }
         });

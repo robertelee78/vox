@@ -739,7 +739,13 @@ impl KeyBodyScope {
     }
 }
 
-pub(crate) type KeyBodyScan = (Option<[u8; 64]>, Option<KeyBodyNeed>);
+pub(crate) enum KeyBodyScan {
+    Page {
+        after: Option<[u8; 64]>,
+        need: Option<KeyBodyNeed>,
+    },
+    Publication(crate::node::channel::HistoryPublicationWait),
+}
 
 /// The exact scalar facts carried by one locally encoded HAVE. Completion confirms only
 /// this capture; later committed facts remain an independently owed successor.

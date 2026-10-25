@@ -749,23 +749,40 @@ impl ChannelState {
         authorization: Digest32,
         after: Option<[u8; 64]>,
     ) -> Result<crate::node::history_stream::KeyBodyScan> {
+        use crate::node::history_stream::KeyBodyScan;
         let read = self.history_read(store)?;
         if read.publication_busy() {
-            // Cleanup completion produces another retained metadata wake.
-            return Ok((None, None));
+            // Subscribe and inspect the exact owner under this same room guard. This is
+            // a retained discovery dependency, never a completed absence result.
+            return Ok(KeyBodyScan::Publication(HistoryPublicationWait {
+                owner: self.history_publication_request(store)?,
+                wake: self.history_publication_wake(),
+            }));
         }
         let Some(state) = read.sparse_author(&author, crate::log::history::LogScope::Public)?
         else {
-            return Ok((None, None));
+            return Ok(KeyBodyScan::Page {
+                after: None,
+                need: None,
+            });
         };
         if state.observed_conflict.is_some() {
-            return Ok((None, None));
+            return Ok(KeyBodyScan::Page {
+                after: None,
+                need: None,
+            });
         }
         let Some(target_id) = state.committed else {
-            return Ok((None, None));
+            return Ok(KeyBodyScan::Page {
+                after: None,
+                need: None,
+            });
         };
         let Some(target) = read.history_head(&target_id)? else {
-            return Ok((None, None));
+            return Ok(KeyBodyScan::Page {
+                after: None,
+                need: None,
+            });
         };
         let (next, debt) = read.history_key_body_page(
             author,
@@ -776,7 +793,10 @@ impl ChannelState {
                 .zip(self.history_author_inventory_incarnation(&author)),
         )?;
         let Some(debt) = debt else {
-            return Ok((next, None));
+            return Ok(KeyBodyScan::Page {
+                after: next,
+                need: None,
+            });
         };
         let (source_head, entry) = read
             .history_validated_header(&author, debt.from)?
@@ -794,9 +814,9 @@ impl ChannelState {
         {
             return Err(Error::MalformedAtRest("key-body source binding"));
         }
-        Ok((
-            next,
-            Some(crate::node::history_stream::KeyBodyNeed {
+        Ok(KeyBodyScan::Page {
+            after: next,
+            need: Some(crate::node::history_stream::KeyBodyNeed {
                 head: source_head,
                 seq: debt.from,
                 hash: debt.object,
@@ -807,7 +827,7 @@ impl ChannelState {
                     size: target.root.leaves,
                 },
             }),
-        ))
+        })
     }
 
     /// Source validation has already consumed the shared verifier envelope. This checks the

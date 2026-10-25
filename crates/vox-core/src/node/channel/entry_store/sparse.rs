@@ -830,7 +830,12 @@ impl Read<'_> {
         {
             return Err(invalid("key-body captured source changed"));
         }
-        self.missing_contains(&need.target.author, need.seq)
+        if !self.missing_contains(&need.target.author, need.seq)? {
+            // A verified refill retires both facts in one Batch. A surviving obligation
+            // without its missing position is an at-rest fault, not stale success.
+            return Err(invalid("key-body obligation has no missing position"));
+        }
+        Ok(true)
     }
     /// Sixteen fixed pending-work records per read. The key is source-Head scoped, not
     /// author scoped, so callers retain the scalar continuation across released read guards.
@@ -875,6 +880,11 @@ impl Read<'_> {
             }
             after = Some(key);
             if obligation.kind == ObligationKind::KeyBody && obligation.author == author {
+                // Check before refusal filtering, so even a suppressed source cannot hide
+                // this local fault. Metadata discovery reports it through its poison owner.
+                if !self.missing_contains(&author, obligation.from)? {
+                    return Err(invalid("key-body obligation has no missing position"));
+                }
                 if let Some((head, scope, peer_i, author_i)) = self.history_declined_head(
                     &author,
                     &key_body_decline_key(&author, &obligation.object),
