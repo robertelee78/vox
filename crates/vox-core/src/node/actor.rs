@@ -16173,11 +16173,11 @@ impl Node {
             || !self
                 .current_room(&refresh.room)
                 .is_some_and(|current| refresh.reference.is(&current))
-            || !self
+            || self
                 .net
                 .as_ref()
                 .and_then(|net| net.manager().existing(&refresh.peer))
-                .is_some_and(|connection| connection.serial() == refresh.connection)
+                .is_none_or(|connection| connection.serial() != refresh.connection)
         {
             return;
         }
@@ -22832,11 +22832,11 @@ impl Node {
     ) -> crate::error::Result<bool> {
         if room.me() != context.node
             || room.epoch() != context.epoch
-            || !self
+            || self
                 .net
                 .as_ref()
                 .and_then(|net| net.manager().existing(peer))
-                .is_some_and(|conn| conn.serial() == context.connection)
+                .is_none_or(|conn| conn.serial() != context.connection)
         {
             return Ok(false);
         }
