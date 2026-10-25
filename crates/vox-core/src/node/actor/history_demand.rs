@@ -45,6 +45,11 @@ struct ProviderKey {
     epoch: u64,
     facts: Digest32,
 }
+type ProviderInputs = (
+    ProviderKey,
+    crate::node::ports::RoomRef,
+    Vec<(Digest32, u64)>,
+);
 // One metadata dependency owned by the one public ready Dispatch, never a physical Flow.
 struct ProviderCheck {
     key: ProviderKey,
@@ -1563,15 +1568,7 @@ impl Node {
 }
 
 impl Node {
-    fn history_provider_inputs(
-        &self,
-    ) -> crate::error::Result<
-        Option<(
-            ProviderKey,
-            crate::node::ports::RoomRef,
-            Vec<(Digest32, u64)>,
-        )>,
-    > {
+    fn history_provider_inputs(&self) -> crate::error::Result<Option<ProviderInputs>> {
         use sha2::{Digest, Sha256};
         let Some(scope) = self.history_demand.provider_scope() else {
             return Ok(None);
