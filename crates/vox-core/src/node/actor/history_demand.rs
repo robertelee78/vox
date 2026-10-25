@@ -30,6 +30,47 @@ pub(super) struct Dispatch {
     pub fence: Arc<Fence>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProviderScope {
+    room: Digest32,
+    instance: [u8; 16],
+    request: RequestId,
+    generation: Digest32,
+    peer: Digest32,
+    author: Digest32,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProviderKey {
+    scope: ProviderScope,
+    epoch: u64,
+    facts: Digest32,
+}
+// One metadata dependency owned by the one public ready Dispatch, never a physical Flow.
+struct ProviderCheck {
+    key: ProviderKey,
+    reference: crate::node::ports::RoomRef,
+    store: Weak<Store>,
+    result: tokio::sync::oneshot::Receiver<crate::error::Result<ProviderAnswer>>,
+    retirement: Arc<Fence>,
+    retired: bool,
+}
+struct ProviderValidation {
+    key: ProviderKey,
+    serial: u64,
+    reference: crate::node::ports::RoomRef,
+    store: Weak<Store>,
+}
+enum ProviderAnswer {
+    Current(Option<(Digest32, u64)>),
+    AuthorizationChanged,
+    RoomChanged,
+}
+impl Drop for ProviderCheck {
+    fn drop(&mut self) {
+        self.retirement.retire();
+    }
+}
+
 struct PrivateDispatch {
     room: Digest32,
     instance: [u8; 16],
@@ -146,6 +187,9 @@ pub(super) struct Controller {
     next: u64,
     pub(super) preparing: Option<Preparation>,
     ready: Option<Dispatch>,
+    provider_check: Option<ProviderCheck>,
+    provider_checked: Option<ProviderKey>,
+    provider_validated: Option<ProviderValidation>,
     running: Option<Running>,
     private_work: Option<PrivateWork>,
     cancelled_legacy: Option<(Digest32, LegacyProvisionalOwner)>,
@@ -162,6 +206,44 @@ pub(super) struct Controller {
     resume_owed: Option<ResumeOwed>,
 }
 impl Controller {
+    fn clear_provider_check(&mut self) {
+        // Retire delivery immediately; keep the physical reader/result slot until
+        // its supervisor has joined any blocking child.
+        if let Some(check) = self.provider_check.as_mut() {
+            check.retired = true;
+            check.retirement.retire();
+        }
+        self.provider_checked = None;
+        self.provider_validated = None;
+    }
+    fn provider_scope(&self) -> Option<ProviderScope> {
+        let dispatch = self.ready.as_ref()?;
+        let running = self.running.as_ref()?;
+        let status = self.owner_status.as_ref()?;
+        let head = match &dispatch.query {
+            Query::Page { head, .. } | Query::Entry { head, .. } => *head,
+            _ => return None,
+        };
+        if dispatch.fence.is_retired()
+            || running.request != dispatch.request
+            || running.generation != dispatch.generation
+            || !Arc::ptr_eq(&running.fence, &dispatch.fence)
+            || status.room != dispatch.room
+            || status.instance != dispatch.instance
+            || status.request != Some(dispatch.request)
+            || status.head != Some(head)
+        {
+            return None;
+        }
+        Some(ProviderScope {
+            room: dispatch.room,
+            instance: dispatch.instance,
+            request: dispatch.request,
+            generation: dispatch.generation,
+            peer: dispatch.peer,
+            author: status.author?,
+        })
+    }
     fn clear_resume_owed(&mut self) {
         if let Some(mut owed) = self.resume_owed.take() {
             if let Some(task) = owed.wake_task.take() {
@@ -239,6 +321,30 @@ impl Controller {
             .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
     }
 
+    /// Reject obsolete public admission without discarding the person's saved selection.
+    pub(super) fn accept_provider_authority(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        authority: crate::error::Result<bool>,
+    ) -> bool {
+        if matches!(authority, Ok(true)) {
+            return true;
+        }
+        let Some((request, generation, instance)) = self.ready_binding(room, peer) else {
+            return false;
+        };
+        match authority {
+            Ok(_) => {
+                self.failed(request, generation,
+                    "History authority changed before provider admission; the same request is being resumed.");
+                self.owe_resume(room, instance, request);
+            }
+            Err(error) => self.failed(request, generation, &error.to_string()),
+        }
+        false
+    }
+
     pub(super) fn take_legacy_cleanup(&mut self) -> Option<(Digest32, LegacyProvisionalOwner)> {
         self.cancelled_legacy.take()
     }
@@ -248,6 +354,7 @@ impl Controller {
             .as_ref()
             .is_some_and(|d| d.room == room && d.peer == peer && !d.fence.is_retired())
         {
+            self.clear_provider_check();
             self.ready.take()
         } else {
             None
@@ -263,6 +370,7 @@ impl Controller {
             && status.request == Some(request)
         {
             self.running = None;
+            self.clear_provider_check();
             self.ready = None;
             self.owner_status = Some(status);
         }
@@ -310,6 +418,7 @@ impl Controller {
             running.fence.retire();
             running.cancellation.cancel();
         }
+        self.clear_provider_check();
         self.ready = None;
         if let Some(status) = self
             .owner_status
@@ -362,6 +471,7 @@ impl Controller {
             running.fence.retire();
             running.cancellation.cancel();
             self.running = None;
+            self.clear_provider_check();
             self.ready = None;
         }
         true
@@ -405,6 +515,7 @@ impl Controller {
                 running.cancellation.cancel();
             }
             self.running = None;
+            self.clear_provider_check();
             self.ready = None;
         }
         if let Some(status) = self
@@ -427,6 +538,9 @@ impl Controller {
 
     /// Stop admission synchronously; the lock settling task then owns and retires this controller.
     pub(super) fn fence(&self) {
+        if let Some(check) = self.provider_check.as_ref() {
+            check.retirement.retire();
+        }
         if let Some(fence) = self
             .resume_owed
             .as_ref()
@@ -451,7 +565,11 @@ impl Controller {
             running.fence.retire();
             running.cancellation.cancel();
         }
+        self.clear_provider_check();
         self.ready = None;
+        if let Some(mut check) = self.provider_check.take() {
+            let _ = (&mut check.result).await;
+        }
         if let Some(preparing) = self.preparing.take() {
             preparing.fence.retire();
             preparing.cancellation.cancel();
@@ -842,6 +960,11 @@ impl Node {
         } else {
             None
         };
+        let availability = self
+            .net
+            .as_ref()
+            .map(|net| Arc::downgrade(net.manager()))
+            .unwrap_or_default();
         let peers: Vec<_> = self
             .ports
             .keys()
@@ -886,7 +1009,7 @@ impl Node {
                     }
                     let answer = match (room_guard, resume_inspect) {
                         (_, Some(credit)) => classify_resume(node, room, instance, action, context, credit),
-                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, weak, read_fence.clone(), now, deadline, selection_after, resume_admission),
+                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, availability, weak, read_fence.clone(), now, deadline, selection_after, resume_admission),
                         (None, None) => prepare_local(
                             node,
                             room,
@@ -1430,11 +1553,494 @@ impl Node {
                     // outlived the page: the archive round consumed no request, so every page a
                     // reader asked for ran a live inventory round after it that fetched nothing.
                     self.sched_rooms.insert(dispatch.room);
+                    self.history_demand.clear_provider_check();
                     self.history_demand.ready = Some(dispatch);
                 }
             }
         }
         true
+    }
+}
+
+impl Node {
+    fn history_provider_inputs(
+        &self,
+    ) -> crate::error::Result<
+        Option<(
+            ProviderKey,
+            crate::node::ports::RoomRef,
+            Vec<(Digest32, u64)>,
+        )>,
+    > {
+        use sha2::{Digest, Sha256};
+        let Some(scope) = self.history_demand.provider_scope() else {
+            return Ok(None);
+        };
+        let Some(reference) = self.current_room(&scope.room) else {
+            return Ok(None);
+        };
+        // The old provider's Port may have retired; another current same-instance Port
+        // supplies the room mirror while the original demand stays unchanged.
+        let Some(old) = self
+            .ports
+            .get(&(scope.room, scope.peer))
+            .filter(|port| port.observation_instance == scope.instance && port.room.is(&reference))
+            .or_else(|| {
+                self.ports
+                    .iter()
+                    .find(|((room, _), port)| {
+                        *room == scope.room
+                            && port.observation_instance == scope.instance
+                            && port.room.is(&reference)
+                    })
+                    .map(|(_, port)| port)
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(net) = self.net.as_ref() else {
+            return Ok(None);
+        };
+        let manager = net.manager();
+        let mut candidates = Vec::new();
+        for ((room, peer), port) in &self.ports {
+            if *room != scope.room
+                || port.poisoned
+                || !port.sparse
+                || port.observation_instance != scope.instance
+                || !port.room.is(&reference)
+                || port.epoch != old.epoch
+                || !self.trust.is_trusted(peer)
+            {
+                continue;
+            }
+            let Some(connection) = manager
+                .existing(peer)
+                .filter(|connection| connection.quinn().close_reason().is_none())
+            else {
+                continue;
+            };
+            // A same-current-room Port belongs to one retained proved/adopted author
+            // (including the departed-author exception). Use that membership bound,
+            // not the independent signed ControlContext vector bound.
+            if candidates.len() == crate::node::channel::AUTHORS_HARD_LIMIT {
+                return Err(crate::error::Error::SizeLimitExceeded(
+                    "history provider candidates",
+                ));
+            }
+            candidates.push((*peer, connection.serial()));
+        }
+        candidates.sort_unstable_by_key(|(peer, _)| (*peer != scope.author, *peer));
+        let mut hash = Sha256::new();
+        hash.update(b"vox/public-history/provider-input/v1");
+        hash.update([u8::from(self.computer_authority_current())]);
+        hash.update(
+            old.gen
+                .load(std::sync::atomic::Ordering::Acquire)
+                .to_be_bytes(),
+        );
+        for (peer, serial) in &candidates {
+            hash.update(peer);
+            hash.update(serial.to_be_bytes());
+        }
+        Ok(Some((
+            ProviderKey {
+                scope,
+                epoch: old.epoch,
+                facts: hash.finalize().into(),
+            },
+            reference,
+            candidates,
+        )))
+    }
+
+    /// A public ready Dispatch needs the same metadata validation whether its donor is
+    /// retained or replaced. This is an actor-only mirror/connection check; membership and
+    /// authorization were read by the owned metadata worker before granting this exact key.
+    pub(super) fn history_provider_admissible(&self, room: Digest32, peer: Digest32) -> bool {
+        if self.history_demand.ready_binding(room, peer).is_none() {
+            return true; // Private/legacy dispatches retain their existing admission paths.
+        }
+        let Some(scope) = self.history_demand.provider_scope() else {
+            return false;
+        };
+        if scope.room != room || scope.peer != peer {
+            return false;
+        }
+        let Some(validated) = self.history_demand.provider_validated.as_ref() else {
+            return false;
+        };
+        let Some(store) = self.log_store() else {
+            return false;
+        };
+        self.history_provider_inputs().is_ok_and(|inputs| {
+            inputs.is_some_and(|(key, reference, candidates)| {
+                key == validated.key
+                    && validated.reference.is(&reference)
+                    && Weak::ptr_eq(&validated.store, &Arc::downgrade(&store))
+                    && candidates.contains(&(peer, validated.serial))
+            })
+        })
+    }
+
+    /// A durable trust edit can change this nonce without changing any candidate Port.
+    /// Re-read the fixed TRUST_META prefix at archive admission, never infer current
+    /// authorization from cached candidate/connection facts.
+    pub(super) fn history_provider_authority_current(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+    ) -> crate::error::Result<bool> {
+        if self.history_demand.ready_binding(room, peer).is_none() {
+            return Ok(true);
+        }
+        let Some(scope) = self.history_demand.provider_scope() else {
+            return Ok(false);
+        };
+        let Some(store) = self.log_store() else {
+            return Err(crate::error::Error::Profile(
+                "history provider Store missing",
+            ));
+        };
+        let Some(node) = self.profile.as_ref().map(|profile| profile.fingerprint()) else {
+            return Err(crate::error::Error::Profile(
+                "history provider node missing",
+            ));
+        };
+        let Some(validated) = self.history_demand.provider_validated.as_ref() else {
+            return Ok(false);
+        };
+        stream::authorization_generation(&store, node, room, scope.instance, validated.key.epoch)
+            .map(|generation| generation == scope.generation)
+    }
+
+    /// Recheck one public ready provider without acquiring a room mutex on the actor.
+    /// Logical demand remains in ready until ordinary admission takes the same Dispatch.
+    pub(super) fn refresh_history_provider(&mut self) {
+        let completed = self
+            .history_demand
+            .provider_check
+            .as_mut()
+            .and_then(|check| {
+                let answer = match check.result.try_recv() {
+                    Ok(answer) => answer,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Err(
+                        crate::error::Error::Profile("history provider metadata reader stopped"),
+                    ),
+                };
+                Some((
+                    check.key,
+                    check.reference.clone(),
+                    check.store.clone(),
+                    check.retired || check.retirement.is_retired(),
+                    answer,
+                ))
+            });
+        if completed.is_some() {
+            self.history_demand.provider_check = None;
+        }
+        // An invalidated read is physical cleanup only, even if a new request is current.
+        let completed = completed.filter(|(_, _, _, retired, _)| !*retired);
+        let inputs = match self.history_provider_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                if let Some(scope) = self.history_demand.provider_scope() {
+                    self.history_demand
+                        .failed(scope.request, scope.generation, &error.to_string());
+                }
+                return;
+            }
+        };
+        let Some((key, reference, candidates)) = inputs else {
+            self.history_demand.clear_provider_check();
+            return;
+        };
+        let Some(store) = self.log_store() else {
+            return;
+        };
+        let Some(node) = self.profile.as_ref().map(|profile| profile.fingerprint()) else {
+            return;
+        };
+        let usable = |peer: &Digest32| {
+            self.net
+                .as_ref()
+                .and_then(|net| net.manager().existing(peer))
+                .is_some_and(|connection| connection.quinn().close_reason().is_none())
+        };
+        if self
+            .history_demand
+            .provider_validated
+            .as_ref()
+            .is_some_and(|validated| {
+                validated.key == key
+                    && validated.reference.is(&reference)
+                    && Weak::ptr_eq(&validated.store, &Arc::downgrade(&store))
+                    && candidates.contains(&(key.scope.peer, validated.serial))
+            })
+        {
+            return;
+        }
+        self.history_demand.provider_validated = None;
+        // Retire only this exact archive admission while its donor is unvalidated.
+        // An open connection may still serve other room work; withdraw generic queued
+        // claims only when that connection is actually unusable. Never cancel a Flow.
+        self.bounded_sync.withdraw_unavailable_history_provider(
+            key.scope.room,
+            key.scope.peer,
+            key.scope.request,
+            key.scope.generation,
+            key.scope.instance,
+            !usable(&key.scope.peer),
+        );
+        if let Some((checked, checked_reference, checked_store, _, answer)) = completed {
+            if checked == key
+                && checked_reference.is(&reference)
+                && Weak::ptr_eq(&checked_store, &Arc::downgrade(&store))
+            {
+                self.history_demand.provider_checked = Some(key);
+                match answer {
+                    Ok(ProviderAnswer::Current(Some((peer, serial)))) => {
+                        let current = self
+                            .net
+                            .as_ref()
+                            .and_then(|net| net.manager().existing(&peer))
+                            .is_some_and(|connection| {
+                                connection.serial() == serial
+                                    && connection.quinn().close_reason().is_none()
+                            });
+                        let authority = stream::authorization_generation(
+                            &store,
+                            node,
+                            key.scope.room,
+                            key.scope.instance,
+                            key.epoch,
+                        );
+                        match authority {
+                            Ok(generation) if generation == key.scope.generation => {
+                                if current
+                                    && self.computer_authority_current()
+                                    && self.trust.is_trusted(&peer)
+                                    && self.ports.get(&(key.scope.room, peer)).is_some_and(|port| {
+                                        !port.poisoned
+                                            && port.sparse
+                                            && port.epoch == key.epoch
+                                            && port.observation_instance == key.scope.instance
+                                            && port.room.is(&reference)
+                                    })
+                                    && self.history_demand.provider_scope() == Some(key.scope)
+                                {
+                                    if let Some(dispatch) = self.history_demand.ready.as_mut() {
+                                        dispatch.peer = peer;
+                                    }
+                                    let selected = ProviderKey {
+                                        scope: ProviderScope { peer, ..key.scope },
+                                        ..key
+                                    };
+                                    self.history_demand.provider_checked = Some(selected);
+                                    self.history_demand.provider_validated =
+                                        Some(ProviderValidation {
+                                            key: selected,
+                                            serial,
+                                            reference: reference.clone(),
+                                            store: Arc::downgrade(&store),
+                                        });
+                                    self.sched_rooms.insert(key.scope.room);
+                                    return;
+                                }
+                            }
+                            Ok(_) => {
+                                self.history_demand.failed(key.scope.request, key.scope.generation,
+                                    "History authority changed before provider admission; the same request is being resumed.");
+                                self.history_demand.owe_resume(
+                                    key.scope.room,
+                                    key.scope.instance,
+                                    key.scope.request,
+                                );
+                                self.bounded_completion_wake.notify_one();
+                                return;
+                            }
+                            Err(error) => {
+                                self.history_demand.failed(
+                                    key.scope.request,
+                                    key.scope.generation,
+                                    &error.to_string(),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Ok(ProviderAnswer::Current(None)) => {}
+                    Ok(ProviderAnswer::AuthorizationChanged) => {
+                        self.history_demand.failed(key.scope.request, key.scope.generation,
+                            "History authority changed before provider admission; the same request is being resumed.");
+                        self.history_demand.owe_resume(
+                            key.scope.room,
+                            key.scope.instance,
+                            key.scope.request,
+                        );
+                        self.bounded_completion_wake.notify_one();
+                        return;
+                    }
+                    Ok(ProviderAnswer::RoomChanged) => {
+                        self.history_demand.failed(
+                            key.scope.request,
+                            key.scope.generation,
+                            "History room or membership changed before provider admission.",
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        self.history_demand.failed(
+                            key.scope.request,
+                            key.scope.generation,
+                            &error.to_string(),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        // One immutable read plus current facts: a real connection/scope change gets a
+        // successor after physical completion, never a second simultaneous metadata task.
+        if self.history_demand.provider_check.is_some()
+            || self.history_demand.provider_checked == Some(key)
+        {
+            return;
+        }
+        if candidates.is_empty() {
+            self.history_demand.provider_checked = Some(key);
+            return; // The original ready Port still owns its existing direct-dial path.
+        }
+        let Some(shared) = self.channels.get(&key.scope.room).cloned() else {
+            return;
+        };
+        let manager = self
+            .net
+            .as_ref()
+            .map(|net| Arc::downgrade(net.manager()))
+            .unwrap_or_default();
+        let budget = Arc::clone(&self.history_budget);
+        let secret_work = Arc::clone(&self.secret_work);
+        let weak_store = Arc::downgrade(&store);
+        let wake = Arc::clone(&self.bounded_completion_wake);
+        let (send, result) = tokio::sync::oneshot::channel();
+        self.reap_join_tasks();
+        let retirement = Fence::new();
+        let work_retirement = Arc::clone(&retirement);
+        self.join_tasks.spawn(async move {
+            let candidate_bytes = candidates.capacity() * std::mem::size_of::<(Digest32, u64)>();
+            let mut candidates = Some(candidates);
+            // The select covers only pre-read waits. Once a blocking reader is
+            // spawned, the supervisor always awaits its physical exit.
+            let prepare_read = async {
+                let held = Arc::clone(&secret_work).read_owned().await;
+                let mut ticket: Option<Ticket> = None;
+                loop {
+                    let guard = if let Some(waiting) = ticket.as_ref() {
+                        let capacity = waiting.wake();
+                        if !waiting.would_admit() { capacity.await; continue; }
+                        match Arc::clone(&shared).try_lock_owned() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                drop(ticket.take());
+                                Arc::clone(&shared).lock_owned().await
+                            }
+                        }
+                    } else { Arc::clone(&shared).lock_owned().await };
+                    let waiting = ticket.get_or_insert_with(|| budget.enqueue(node, Lane::Control));
+                    let capacity = waiting.wake();
+                    let Some(job) = waiting.try_admit() else {
+                        drop(guard);
+                        capacity.await;
+                        continue;
+                    };
+                    drop(ticket.take());
+                    let charge = match job.reserve_or_pressure(4 * 1024 * 1024 + 128 * 1024 + candidate_bytes) {
+                        Ok(charge) => charge,
+                        Err(crate::error::Error::HistoryCapacity(pressure)) => {
+                            drop(guard); drop(job); pressure.released().await; continue;
+                        }
+                        Err(error) => { drop(guard); drop(job); return Err(error); }
+                    };
+                    return Ok((held, guard, job, charge));
+                }
+            };
+            let prepared = tokio::select! {
+                biased;
+                () = work_retirement.retired() => Err(crate::error::Error::Profile("history provider recheck retired")),
+                prepared = prepare_read => prepared,
+            };
+            let answer = match prepared {
+                Err(error) => Err(error),
+                Ok((held, guard, job, charge)) => match candidates.take() {
+                    None => {
+                        drop(guard); drop(job); drop(charge); drop(held);
+                        Err(crate::error::Error::Profile("history provider metadata input is missing"))
+                    }
+                    Some(input) => {
+                        let work_store = Arc::clone(&store);
+                        let work_manager = manager.clone();
+                        let worker = tokio::task::spawn_blocking(move || {
+                            let _held = held;
+                            let _job = job;
+                            let _charge = charge;
+                            let room = guard;
+                            if work_retirement.is_retired() {
+                                return Err(crate::error::Error::Profile("history provider recheck retired"));
+                            }
+                            if room.epoch() != key.epoch
+                                || room.history_retirement_locked()
+                                || room.history_instance(&work_store)? != key.scope.instance
+                                || !room.is_member(&node)
+                                || room.has_left(&node)
+                            {
+                                return Ok(ProviderAnswer::RoomChanged);
+                            }
+                            if stream::authorization_generation(
+                                &work_store,
+                                node,
+                                key.scope.room,
+                                key.scope.instance,
+                                key.epoch,
+                            )? != key.scope.generation
+                            {
+                                return Ok(ProviderAnswer::AuthorizationChanged);
+                            }
+                            let manager = work_manager.upgrade();
+                            let chosen = input.into_iter().find(|(peer, serial)| {
+                                room.is_member(peer)
+                                    && !room.has_left(peer)
+                                    && manager
+                                        .as_ref()
+                                        .and_then(|manager| manager.existing(peer))
+                                        .is_some_and(|connection| {
+                                            connection.serial() == *serial
+                                                && connection.quinn().close_reason().is_none()
+                                        })
+                            });
+                            Ok(ProviderAnswer::Current(chosen))
+                            // Room, Store, Job, bytes and secret-work guard drop before handoff.
+                        });
+                        worker.await.unwrap_or_else(|_|
+                            Err(crate::error::Error::Profile("history provider metadata reader stopped")))
+                    }
+                },
+            };
+            drop(candidates);
+            drop(shared);
+            drop(store);
+            let _ = send.send(answer);
+            wake.notify_one();
+        });
+        self.history_demand.provider_check = Some(ProviderCheck {
+            key,
+            reference,
+            store: weak_store,
+            result,
+            retirement,
+            retired: false,
+        });
     }
 }
 
@@ -1789,6 +2395,7 @@ fn prepare(
     context: Arc<Context>,
     job: &Job,
     peers: Vec<Digest32>,
+    availability: Weak<crate::node::net::ConnectionManager>,
     weak: Weak<Mutex<ChannelState>>,
     fence: Arc<Fence>,
     now: u64,
@@ -1919,10 +2526,19 @@ fn prepare(
         Available(Digest32),
         Unavailable(Option<demand::AdmissionCharge>),
     }
-    let peer = peers
-        .into_iter()
-        .find(|peer| room.is_member(peer) && !room.has_left(peer));
-    let admit_peer = || {
+    let manager = availability.upgrade();
+    let admit_peer = |author: Digest32| {
+        let peer = peers
+            .iter()
+            .copied()
+            .filter(|peer| room.is_member(peer) && !room.has_left(peer))
+            .min_by_key(|peer| {
+                let connected = manager
+                    .as_ref()
+                    .and_then(|manager| manager.existing(peer))
+                    .is_some_and(|connection| connection.quinn().close_reason().is_none());
+                (!connected, *peer != author, *peer)
+            });
         peer.map_or_else(
             || {
                 if resume_admission.is_some() {
@@ -1983,7 +2599,7 @@ fn prepare(
                 wire_bytes: 1024 * 1024,
             }
         };
-        let peer = admit_peer()?;
+        let peer = admit_peer(head.binding.author)?;
         let admission = resume_admission
             .as_ref()
             .ok_or("History Resume admission is missing.")?;
@@ -2029,7 +2645,7 @@ fn prepare(
             return Ok(answer);
         };
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
-        let peer = admit_peer()?;
+        let peer = admit_peer(author)?;
         let active =
             demand::start(&context, request, binding, bounds, job).map_err(|e| e.to_string())?;
         let query = Query::Page {

@@ -16450,6 +16450,7 @@ impl Node {
             return false;
         }
         self.discover().await;
+        self.refresh_history_provider();
         let all = std::mem::take(&mut self.sched_all);
         let rooms = std::mem::take(&mut self.sched_rooms);
         let now = std::time::Instant::now();
@@ -16602,7 +16603,8 @@ impl Node {
             && (port.needs()
                 || self.bounded_sync.needs_port(key.0, key.1)
                 || self.history_hints.pending(key.0, key.1)
-                || self.history_demand.ready_binding(key.0, key.1).is_some())
+                || (self.history_demand.ready_binding(key.0, key.1).is_some()
+                    && self.history_provider_admissible(key.0, key.1)))
             && (!port.backing_off(now) || port.busy_bypass(now))
             && !self.publishing.contains(key)
             && self

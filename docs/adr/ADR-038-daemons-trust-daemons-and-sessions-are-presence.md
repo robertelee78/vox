@@ -634,6 +634,34 @@ lessons. It changes neither this record's decision status nor any requirement or
   committed-work maintenance. This corrects accounting without suppressing the fresh connection
   probe, changing its receipt, or weakening the unchanged-history outcome.
 
+  Public history provider RCA, 2026-10-25 (#1021): the P006 diagnostic's one genuine Older
+  request selected an offline relay before a physical Flow existed, although its exact author
+  was connected. The original request, incarnation and two-entry interval remained owned;
+  the `running` controller label described logical ownership, not an admitted worker. Provider
+  selection is to follow that distinction: public preparation prefers a currently usable legal
+  source, with the exact author first. A provider that becomes unusable before admission is to
+  hand the same ready request to another legal current connection, preserving its Head, cut,
+  progress, staging context and authority fences. No source-specific physical Flow is rebound.
+  The actor is not to wait on the room mutex: one supervised metadata recheck is to retain this
+  dependency, release its room guard before handing over a scalar result, and revalidate current
+  scope and connection before changing only the ready provider. Logical retirement is to cancel
+  pre-read waits; a started blocking read is to keep that single slot until its supervisor joins
+  physical completion. Retired results are cleanup-only. The existing full-node secret-work
+  barrier still precedes LockSettled and a new unlock. An unavailable provider owns no
+  runnable Job, byte reservation or FIFO front while waiting; its queued port claims are to be
+  withdrawn without cancelling active work or changing other ports' fair positions. With no
+  connected source, the existing direct-dial owner remains viable. This implements ADR-036's
+  rule that an available author cannot be starved by obsolete relay work; it adds no queue,
+  timer, cap or story and changes no private or legacy donor contract. The peer comparison's
+  useful lesson is immutable demand with a separately revalidated donor:
+  [Syncthing's usable-donor selection](https://github.com/syncthing/syncthing/blob/a4a2da477f32d29eda98cc6eb08554dfe5078875/lib/model/model.go#L2884-L2902),
+  [current-connection recheck](https://github.com/syncthing/syncthing/blob/a4a2da477f32d29eda98cc6eb08554dfe5078875/lib/model/model.go#L2462-L2496)
+  and [finite same-block donor retry](https://github.com/syncthing/syncthing/blob/a4a2da477f32d29eda98cc6eb08554dfe5078875/lib/model/folder_sendrecv.go#L1640-L1700).
+  [iroh's authenticated connection identity and lifecycle](https://github.com/n0-computer/iroh/blob/cf0d2b048b625e87e9331dd3b9f921f4c0d8bf71/iroh/src/endpoint/connection.rs)
+  inform connection fencing, not donor policy. Syncthing's reservation retained across donor
+  attempts is not a Vox resource policy. The P006 intervention and
+  later fixture prerequisites remain diagnostic evidence, not an unchanged normal proof pass.
+
   Signed Head knowledge, actual role satisfaction and admitted transient serving work are to
   remain distinct. A completed own-Head snapshot is to return the authenticated signed Head
   independently of an optional exact nonzero role position and entry hash. Only a role word

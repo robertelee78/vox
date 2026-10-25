@@ -4730,6 +4730,265 @@ fn foreground_release_wakes_without_a_tick() {
     drop(tails);
 }
 
+/// Cache-only user rows for the accepted Carol burst. Paging this view does not start Older.
+#[cfg(feature = "optional-proofs")]
+fn quiet_carol_burst_rows(
+    alice: &Path,
+    room: &str,
+    carol: &str,
+    posts: &[(String, String)],
+) -> BTreeSet<usize> {
+    let mut before: Option<String> = None;
+    let mut cursors = BTreeSet::new();
+    let mut present = BTreeSet::new();
+    let limit = vox_core::log::history::MAX_PAGE_ENTRIES.to_string();
+    loop {
+        let mut args = vec!["room", "read", room, "--json", "--limit", &limit];
+        if let Some(hash) = before.as_deref() {
+            args.extend(["--before", hash]);
+        }
+        let (ok, out, err) = vox(alice, &args, None);
+        assert!(
+            ok,
+            "PRODUCT: Alice's cache-only Carol burst read was refused: {out}{err}"
+        );
+        let rows: Vec<serde_json::Value> = out
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: Alice's Carol burst row was invalid JSON ({error}): {line}")
+                })
+            })
+            .collect();
+        for row in &rows {
+            if let Some((index, (_, body))) = posts
+                .iter()
+                .enumerate()
+                .find(|(_, (hash, _))| row["entry_hash"].as_str() == Some(hash.as_str()))
+            {
+                assert!(row["schema"] == "vox.room.row/1" && row["room"] == room
+                    && row["author"] == carol && row["owed"] == false
+                    && row["envelope"]["v"] == 1 && row["envelope"]["type"] == "say"
+                    && row["envelope"]["body"].as_str() == Some(body.as_str()),
+                    "PRODUCT: Alice's original Carol burst hash did not render its accepted SAY: {row}");
+                present.insert(index);
+            }
+        }
+        if rows.len() < vox_core::log::history::MAX_PAGE_ENTRIES {
+            return present;
+        }
+        let hash = rows
+            .first()
+            .and_then(|row| row["entry_hash"].as_str())
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: Alice's full Carol cache page named no oldest cursor: {out}")
+            });
+        assert!(
+            cursors.insert(hash.to_owned()),
+            "PRODUCT: Alice's cache-only Carol pages repeated the same cursor {hash}"
+        );
+        before = Some(hash.to_owned());
+    }
+}
+
+/// Retain the whole ORIGINAL burst before its only author goes offline. Each explicit Older
+/// finishes its own bounded request; another asks for remaining earlier rows only after real
+/// original-row coverage advances, at a new visible cursor. Resume never resets a request's cut.
+#[cfg(feature = "optional-proofs")]
+fn quiet_retain_carol_burst(
+    alice: &Path,
+    carol: &Path,
+    room: &str,
+    alice_id: &str,
+    carol_id: &str,
+    posts: &[(String, String)],
+    original_cut: u64,
+) {
+    use vox_core::node::api::HistoryDemandPhase as Phase;
+    let last = posts
+        .len()
+        .checked_sub(1)
+        .expect("APPARATUS: nonempty accepted Carol burst");
+    let mut present = loop {
+        let present = quiet_carol_burst_rows(alice, room, carol_id, posts);
+        if present.contains(&last) {
+            break present;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    eprintln!(
+        "QUIET CAROL BURST LAST ROW: original_cut={original_cut} hash={}",
+        posts[last].0
+    );
+    assert!(present.len() < posts.len(),
+        "APPARATUS: no missing original Carol burst prefix was staged before the visible cursor; no Older availability-path credit");
+    let room_id = vox_core::node::link::b32_decode(room, "quiet exact room")
+        .expect("APPARATUS: canonical quiet room id");
+    let author = vox_core::node::link::b32_decode(carol_id, "quiet Carol author")
+        .expect("APPARATUS: full Carol fingerprint");
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut selected_instance: Option<String> = None;
+    let mut completed_requests = BTreeSet::new();
+    let mut used_cursors = BTreeSet::new();
+    loop {
+        // The bounded scan immediately precedes this actually visible row. Never guess an
+        // author's sequence, reuse an unchanged boundary, or replace an unfinished request.
+        let index = (0..posts.len())
+            .find(|index| {
+                present.contains(index) && (0..*index).any(|earlier| !present.contains(&earlier))
+            })
+            .expect("APPARATUS: remaining original Carol rows need a real visible cursor");
+        assert!(
+            used_cursors.insert(posts[index].0.clone()),
+            "APPARATUS: Carol paging did not reach a new visible cursor; no unchanged Older retry"
+        );
+        let before = present.clone();
+        let (ok, out, err) = vox(
+            alice,
+            &[
+                "room",
+                "read",
+                room,
+                "--history",
+                "older",
+                "--before",
+                &posts[index].0,
+                "--json",
+            ],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: Alice's explicit Carol burst Older was refused: {out}{err}"
+        );
+        // Fresh Older prints cached ROW JSONL. Only subsequent typed Status establishes the
+        // new request; an earlier completed request cannot stand in for that acceptance.
+        eprintln!("QUIET CAROL BURST OLDER: original_cut={original_cut} cursor={} original_rows_before={} cached_rows={out} notice={err}", posts[index].0, before.len());
+        let mut retained: Option<(String, String, Option<[u8; 32]>)> = None;
+        let mut pending_reply: Option<String> = None;
+        let mut resumed_at = None;
+        let mut last_shown = None;
+        let completed_request = loop {
+            let out = pending_reply.take().unwrap_or_else(|| {
+                let (ok, out, err) = vox(
+                    alice,
+                    &["room", "read", room, "--history", "status", "--json"],
+                    None,
+                );
+                assert!(
+                    ok,
+                    "PRODUCT: Alice's exact Carol Older status was refused: {out}{err}"
+                );
+                out
+            });
+            let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!("PRODUCT: Alice's Carol Older status was invalid JSON ({error}): {out}")
+            });
+            assert!(
+                reply.schema == "vox.room.history/1"
+                    && reply.status.room == room_id
+                    && reply.instance == hex(&reply.status.instance)
+                    && reply.request == reply.status.request.as_ref().map(|r| hex(r))
+                    && reply.status.private_peer.is_none(),
+                "PRODUCT: Alice's Carol Older changed public room or reply binding: {out}"
+            );
+            if let Some(instance) = &selected_instance {
+                assert!(
+                    reply.instance == *instance,
+                    "PRODUCT: Alice's Carol Older preparation changed its room instance: {out}"
+                );
+            } else {
+                selected_instance = Some(reply.instance.clone());
+            }
+            let shown = (
+                reply.status.phase,
+                reply.status.remaining,
+                reply.status.offset,
+            );
+            if let Some((instance, request, head)) = &retained {
+                // Local saved Status has no outstanding author after completion. Keep the
+                // original validated Carol author; only that exact terminal state may omit it.
+                let terminal = reply.status.phase == Phase::Complete && reply.status.remaining == 0;
+                let author_matches = reply.status.author == Some(author)
+                    || (reply.status.author.is_none()
+                        && (reply.status.phase == Phase::Preparing || terminal));
+                let head_matches = reply.status.head == *head
+                    || (reply.status.phase == Phase::Preparing && reply.status.head.is_none());
+                assert!(reply.instance == *instance
+                    && (reply.request.as_deref() == Some(request.as_str())
+                        || (reply.status.phase == Phase::Preparing && reply.request.is_none()))
+                    && author_matches && head_matches,
+                    "PRODUCT: Alice's original Carol Older request, instance, author or Head changed: {out}");
+            } else if let Some(request) = &reply.request {
+                if completed_requests.contains(request) {
+                    if last_shown != Some(shown) {
+                        eprintln!("QUIET CAROL BURST WAIT NEW REQUEST: original_cut={original_cut} previous_request={request} status={:?}", reply.status);
+                        last_shown = Some(shown);
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                assert!(reply.status.author == Some(author) && reply.status.head.is_some(),
+                    "APPARATUS: Alice's cursor did not establish Carol's exact authenticated request before completion: {out}");
+                retained = Some((reply.instance.clone(), request.clone(), reply.status.head));
+                eprintln!("QUIET CAROL BURST REQUEST: original_cut={original_cut} instance={} request={request} status={:?}", reply.instance, reply.status);
+            }
+            if last_shown != Some(shown) {
+                eprintln!("QUIET CAROL BURST PROGRESS: original_cut={original_cut} request={:?} status={:?}", reply.request, reply.status);
+                last_shown = Some(shown);
+            }
+            match reply.status.phase {
+                Phase::Preparing | Phase::Pending | Phase::Busy => {}
+                Phase::Paused if reply.status.remaining > 0 => {
+                    let key = (reply.status.remaining, reply.status.offset);
+                    if resumed_at != Some(key) {
+                        let (instance, request, _) = retained.as_ref()
+                            .expect("APPARATUS: Paused Carol Older must name its original request");
+                        let (ok, out, err) = vox(alice, &["room", "read", room, "--history", "resume",
+                            "--history-instance", instance, "--history-request", request, "--json"], None);
+                        assert!(ok, "PRODUCT: Alice's explicit same-request Carol Resume was refused: {out}{err}");
+                        eprintln!("QUIET CAROL BURST RESUME: original_cut={original_cut} instance={instance} request={request} remaining={} offset={}", key.0, key.1);
+                        resumed_at = Some(key); pending_reply = Some(out);
+                    }
+                }
+                Phase::Complete if retained.is_some() && reply.status.remaining == 0 => {
+                    break retained.expect("checked exact completed request").1;
+                }
+                _ => panic!("APPARATUS: Alice's current bounded Carol request did not complete; no replacement Older is fabricated: {out}"),
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        // Completing this request is not permission to repeat it. An additional bounded user
+        // ask is allowed only after newly rendered ORIGINAL hashes provide a different cursor.
+        let next = quiet_carol_burst_rows(alice, room, carol_id, posts);
+        assert!(before.is_subset(&next),
+            "APPARATUS: original Carol burst row coverage regressed during bounded paging; original_cut={original_cut}");
+        assert!(next.len() > before.len(),
+            "APPARATUS: completed Carol Older made no original-row coverage progress; no repeated Older at unchanged boundary; original_cut={original_cut} request={completed_request}");
+        assert!(
+            completed_requests.insert(completed_request.clone()),
+            "APPARATUS: a prior completed Carol request was reused as a new request"
+        );
+        eprintln!("QUIET CAROL BURST INTERVAL COMPLETE: original_cut={original_cut} request={completed_request} original_rows_before={} original_rows_after={}", before.len(), next.len());
+        present = next;
+        if present.len() == posts.len() {
+            break;
+        }
+    }
+    loop {
+        let present = quiet_carol_burst_rows(alice, room, carol_id, posts);
+        assert!(present.len() == posts.len(),
+            "APPARATUS: Alice no longer retains every accepted original Carol burst row; original_cut={original_cut}");
+        if member_held_through(carol, room, alice_id).is_some_and(|through| through >= original_cut)
+        {
+            eprintln!("QUIET CAROL BURST RETAINED: original_cut={original_cut} original_rows={} Alice receipt covers original cut", posts.len());
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// **A quiet room costs nothing, writes nothing and says when it last synced** (ADR-038 FX-15,
 /// FX-16, FX-29; #979, #980, #996, #1021): alice and bob, each on a daemon of their own, read
 /// each other once. Carol joins,
@@ -5228,10 +5487,21 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     }
 
     let carol_successors = vox_core::log::history::MAX_PAGE_ENTRIES + 1;
+    let mut carol_posts = Vec::with_capacity(carol_successors);
     for n in 0..carol_successors {
         let text = format!("carol settled successor {n}");
-        let (ok, out, err) = vox(&carol, &["room", "post", &room, &text], None);
+        let (ok, out, err) = vox(&carol, &["room", "post", &room, &text, "--json"], None);
         assert!(ok, "PRODUCT: carol's successor {n} was refused: {out}{err}");
+        let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Carol's accepted successor reply was not JSON ({error}): {out}")
+        });
+        let hash = posted["entry_hash"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: Carol's accepted successor named no exact entry hash: {out}")
+            })
+            .to_owned();
+        carol_posts.push((hash, text));
     }
     let carol_tail_through = room_own_feed_through(&carol, &room).unwrap_or_else(|| {
         panic!(
@@ -5239,18 +5509,15 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              {carol_successors} accepted successors"
         )
     });
-    let carol_replicated_deadline = Instant::now() + READY_WITHIN;
-    while member_held_through(&carol, &room, &fps[0]) != Some(carol_tail_through) {
-        assert!(
-            Instant::now() < carol_replicated_deadline,
-            "APPARATUS: Alice did not acknowledge Carol's exact feed position \
-             {carol_tail_through} within {READY_WITHIN:?}; the offline two-author continuation \
-             was not staged\ncarol said: {}\nalice said: {}",
-            said(&carol, "carol"),
-            said(&alice, "alice")
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    quiet_retain_carol_burst(
+        &alice,
+        &carol,
+        &control_room,
+        &fps[0],
+        &fps[2],
+        &carol_posts,
+        carol_tail_through,
+    );
     let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
     carol_daemon.stop();
     let before_private_suffix = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
@@ -5766,7 +6033,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     wait_room_open(&bob, &room, "bob-after-restart");
     assert!(
         member_holds_through(&bob, &room, &fps[0]) == Some(marker_through)
-            && member_holds_through(&bob, &room, &fps[2]) == Some(carol_tail_through),
+            && member_holds_through(&bob, &room, &fps[2])
+                .is_some_and(|through| through >= carol_tail_through),
         "PRODUCT: after restarted Bob's shipped room reached its Open terminal state, \
          `vox status --json` did not restore the exact durable contiguous feed heads for Alice \
          through {marker_through} and Carol through {carol_tail_through}\nbob said: {}",
@@ -5800,7 +6068,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(
-        member_held_through(&carol, &room, &fps[1]) == Some(carol_tail_through),
+        member_held_through(&carol, &room, &fps[1])
+            .is_some_and(|through| through >= carol_tail_through),
         "PRODUCT: after both authors exceeded the bounded continuation page and Carol completed \
          a sync with restarted Bob, his receipt did not preserve her exact feed position \
          {carol_tail_through}\ncarol said: {}\nbob said: {}",

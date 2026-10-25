@@ -757,6 +757,33 @@ impl Controller {
             }
         }
     }
+    /// Withdraw queued claims which cannot run on an unavailable provider. This never
+    /// retires a Flow, cancels a worker, or changes any other Port's FIFO position.
+    pub(super) fn withdraw_unavailable_history_provider(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        request: stream::RequestId,
+        generation: Digest32,
+        instance: [u8; 16],
+        connection_unusable: bool,
+    ) {
+        if self.archive_admission.as_ref().is_some_and(|admission| {
+            admission.room == room
+                && admission.peer == peer
+                && admission.request == request
+                && admission.generation == generation
+                && admission.instance == instance
+        }) {
+            self.cancel_archive_admission();
+        }
+        if connection_unusable {
+            self.cancel_foreground_port(room, peer);
+            self.cancel_secret_admission(room, peer);
+            self.cancel_byte_admission(room, peer);
+            self.cancel_pool_admission(room, peer);
+        }
+    }
     pub(super) fn release_foreground_admission(
         &mut self,
         token: u64,
@@ -2967,6 +2994,20 @@ impl Node {
         conn: Arc<VoxConnection>,
     ) -> bool {
         self.accept_bounded_sync();
+        // A retained donor needs the same owned metadata validation as a replacement.
+        // This gates only the public Dispatch; ordinary runnable work on this Port can
+        // still consume its own queued admission while the metadata check waits.
+        let archive_provider_ready = self.history_provider_admissible(room, peer);
+        if archive_provider_ready {
+            let authority = self.history_provider_authority_current(room, peer);
+            if !self
+                .history_demand
+                .accept_provider_authority(room, peer, authority)
+            {
+                self.bounded_completion_wake.notify_one();
+                return false;
+            }
+        }
         if self
             .net
             .as_ref()
@@ -3080,7 +3121,8 @@ impl Node {
         // page runs the page, and no live round beside it. Before this the page's dispatch
         // raised the port, and the raise outlived the page, so every page a reader asked for
         // ran an inventory exchange after it that fetched nothing.
-        let page_only = self.history_demand.ready_binding(room, peer).is_some()
+        let page_only = archive_provider_ready
+            && self.history_demand.ready_binding(room, peer).is_some()
             && !self.bounded_sync.needs_port(room, peer)
             && !self.history_hints.pending(room, peer)
             && !self
@@ -3146,7 +3188,8 @@ impl Node {
                         .cancel_matching_control_admission(room, peer);
                     return false;
                 }
-                let archive_dispatch = self.bounded_sync.ready[1].is_none()
+                let archive_dispatch = archive_provider_ready
+                    && self.bounded_sync.ready[1].is_none()
                     && self.bounded_sync.running[1].is_none()
                     && self.history_demand.ready_binding(room, peer).is_some();
                 if !archive_dispatch
@@ -3178,7 +3221,10 @@ impl Node {
                     );
                     return false;
                 }
-                if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
+                if archive_provider_ready
+                    && self.bounded_sync.ready[1].is_none()
+                    && self.bounded_sync.running[1].is_none()
+                {
                     if let Some((request, generation, instance)) =
                         self.history_demand.ready_binding(room, peer)
                     {
@@ -3291,7 +3337,39 @@ impl Node {
                     Err(_) => return false,
                 };
                 if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
-                    if let Some(dispatch) = self.history_demand.take_ready(room, peer) {
+                    // A selected connection can close after scheduler preparation. Leave the
+                    // exact Dispatch in its controller for causal provider recheck; no Flow
+                    // exists yet and these local admitted jobs drop on this immediate return.
+                    if archive_provider_ready
+                        && self.history_demand.ready_binding(room, peer).is_some()
+                        && (!self.history_provider_admissible(room, peer)
+                            || self
+                                .net
+                                .as_ref()
+                                .and_then(|net| net.manager().existing(&peer))
+                                .is_none_or(|current| {
+                                    current.serial() != conn.serial()
+                                        || current.quinn().close_reason().is_some()
+                                }))
+                    {
+                        self.sched_rooms.insert(room);
+                        self.bounded_completion_wake.notify_one();
+                        return false;
+                    }
+                    if archive_provider_ready {
+                        let authority = self.history_provider_authority_current(room, peer);
+                        if !self
+                            .history_demand
+                            .accept_provider_authority(room, peer, authority)
+                        {
+                            self.bounded_completion_wake.notify_one();
+                            return false;
+                        }
+                    }
+                    let dispatch = archive_provider_ready
+                        .then(|| self.history_demand.take_ready(room, peer))
+                        .flatten();
+                    if let Some(dispatch) = dispatch {
                         Flow::archive(
                             room,
                             peer,
