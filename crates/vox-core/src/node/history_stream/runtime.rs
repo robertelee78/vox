@@ -131,10 +131,10 @@ pub(crate) struct AnnouncementReceipt {
 /// Scalar ownership of the existing fixed body slots. A progressing transfer keeps its slot
 /// across quanta; another deferred flow may advance metadata but cannot reset that body.
 #[derive(Default)]
-pub(crate) struct BodySlots(StdMutex<[Option<RequestId>; 2]>);
+pub(crate) struct BodySlots(StdMutex<[Option<RequestId>; 3]>);
 impl BodySlots {
-    fn claim(&self, purpose: Purpose, request: RequestId) -> bool {
-        let Some(index) = body_slot(purpose) else {
+    fn claim(&self, slot: Option<usize>, request: RequestId) -> bool {
+        let Some(index) = slot else {
             return true;
         };
         let mut slots = self
@@ -147,8 +147,8 @@ impl BodySlots {
         slots[index] = Some(request);
         true
     }
-    fn release(&self, purpose: Purpose, request: RequestId) {
-        let Some(index) = body_slot(purpose) else {
+    fn release(&self, slot: Option<usize>, request: RequestId) {
+        let Some(index) = slot else {
             return;
         };
         let mut slots = self
@@ -160,12 +160,12 @@ impl BodySlots {
         }
     }
 }
-fn body_slot(purpose: Purpose) -> Option<usize> {
-    match purpose {
-        Purpose::Live => Some(0),
-        Purpose::Control => Some(1),
-        Purpose::History => None,
-    }
+/// Scheduling fairness only; no remote value or permission is derived from this state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyBodyTurn {
+    Yieldable,
+    PublicOwed,
+    PrivateDue,
 }
 
 /// One received HAVE, never cloned with Task. The original decode charge covers its first
@@ -211,6 +211,9 @@ pub(crate) struct Flow {
     pub(crate) required_root: Option<(Digest32, u64)>,
     pub(crate) key_body_root: Option<super::KeyBodyNeed>,
     key_body_checked: bool,
+    pub(crate) key_body_wire_busy: bool,
+    pub(crate) key_body_backoff: Option<crate::node::ports::Backoff>,
+    pub(crate) key_body_turn: KeyBodyTurn,
     pub(crate) hint: Option<super::HeadHint>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
@@ -297,7 +300,7 @@ pub(crate) struct Flow {
     /// ordinary continuation. The announcement scalar is deliberately separate provenance.
     peer_busy_retry: bool,
     slots: Arc<BodySlots>,
-    owners: [Option<RequestId>; 2],
+    owners: [Option<RequestId>; 3],
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
@@ -343,10 +346,12 @@ pub(crate) struct Flow {
     // Exact head whose independent control closure is already retained by this flow. A later
     // authenticated successor schedules its own closure without mutating the in-flight work.
     control_head: Option<Digest32>,
-    // Declared last: actual state/capabilities die before the shared admission is returned.
+    // Declared after state/capabilities: they die before shared admission is returned.
     // `None` while the flow is parked (ADR-038 FX-35): a flow that is not running holds no
     // daemon-wide flow state; [`Flow::resume`] reserves it again before a round.
     state_charge: Option<crate::node::history_budget::FlowStateCharge>,
+    // Context clones retain this same lease through any blocking physical tail as well.
+    key_delivery_lease: Option<Arc<crate::node::history_budget::KeyDeliveryLease>>,
 }
 // The fixed state permit includes the exact task Vec, scalar replay root, and conservative
 // room for the one-object receiver handoff and small staging handles. Received inventory has
@@ -355,6 +360,11 @@ const _: () = assert!(
     std::mem::size_of::<Flow>() + MAX_TASKS * std::mem::size_of::<Task>()
         + std::mem::size_of::<StdMutex<Option<super::client::ValidatedRole>>>()
         + 2 * std::mem::size_of::<usize>() // Arc strong/weak counters for the ONE slot
+        + std::mem::size_of::<crate::node::history_budget::KeyDeliveryLease>()
+        + 2 * std::mem::size_of::<usize>() // lease Arc counters
+        + std::mem::size_of::<std::sync::Weak<crate::node::history_budget::KeyDeliveryLease>>()
+        + std::mem::size_of::<std::sync::Weak<tokio::sync::Notify>>() // fixed PoolOwner wake
+        + 2 * std::mem::size_of::<Option<Arc<crate::node::history_budget::KeyDeliveryLease>>>()
         + 4096
         <= crate::node::history_budget::FLOW_STATE_BYTES
 );
@@ -378,6 +388,8 @@ impl Flow {
     pub(crate) fn root_name(&self) -> &'static str {
         if self.announcement_pending() && self.announcement_can_run() {
             "inventory"
+        } else if self.key_body_root.is_some() {
+            "key-body"
         } else if self.archive {
             "archive"
         } else if self.hint.is_some() {
@@ -440,6 +452,9 @@ impl Flow {
             required_root: required,
             key_body_root: None,
             key_body_checked: false,
+            key_body_wire_busy: false,
+            key_body_backoff: None,
+            key_body_turn: KeyBodyTurn::Yieldable,
             state_charge: None,
             hint,
             hint_peer: peer,
@@ -487,7 +502,7 @@ impl Flow {
             ordinary_turn_due: false,
             peer_busy_retry: false,
             slots,
-            owners: [None, None],
+            owners: [None; 3],
             body_progress: false,
             governance_wait: false,
             publication_wait: false,
@@ -516,6 +531,7 @@ impl Flow {
             live_unavailable: None,
             live_visited: false,
             control_head: None,
+            key_delivery_lease: None,
         };
         if let Some((head, seq)) = required {
             flow.push(Task {
@@ -590,6 +606,9 @@ impl Flow {
             required_root: None,
             key_body_root: None,
             key_body_checked: false,
+            key_body_wire_busy: false,
+            key_body_backoff: None,
+            key_body_turn: KeyBodyTurn::Yieldable,
             state_charge: None,
             hint: None,
             hint_peer: peer,
@@ -629,7 +648,7 @@ impl Flow {
             authorization_changed: false,
             local_retry: None,
             slots,
-            owners: [None, None],
+            owners: [None; 3],
             body_progress: false,
             governance_wait: false,
             publication_wait: false,
@@ -674,11 +693,21 @@ impl Flow {
             live_unavailable: None,
             live_visited: false,
             control_head: None,
+            key_delivery_lease: None,
         }
     }
     /// Claim only this author's local recipient debt. This is not an inventory claim and
     /// cannot consume/retry another author's hint or hold its public admission hostage.
-    pub(crate) fn with_key_body(mut self, need: super::KeyBodyNeed, instance: [u8; 16]) -> Self {
+    pub(crate) fn with_key_body(
+        mut self,
+        need: super::KeyBodyNeed,
+        instance: [u8; 16],
+        context: Arc<Context>,
+        lease: Arc<crate::node::history_budget::KeyDeliveryLease>,
+    ) -> Result<Self> {
+        if context.body_slot() != Some(2) || !self.slots.claim(Some(2), self.retirement_request) {
+            return Err(Error::Profile("key-delivery namespace owner differs"));
+        }
         self.tasks.clear();
         self.tasks.push(Task {
             request: self.request,
@@ -692,14 +721,32 @@ impl Flow {
                 phase: EntryPhase::Start,
             }),
         });
+        self.control_context = context;
+        self.key_delivery_lease = Some(lease);
         self.inventory = false;
         self.initialized = true;
         self.instance = instance;
         self.generation = need.authorization;
         self.key_body_root = Some(need);
-        self
+        Ok(self)
     }
-
+    pub(crate) fn quiescent_publication(&self) -> bool {
+        self.active_publication_owner().is_none()
+    }
+    pub(crate) fn key_body_paced(&self, now: std::time::Instant) -> bool {
+        self.key_body_backoff
+            .is_some_and(|backoff| backoff.until.is_some_and(|until| now < until))
+    }
+    fn body_slot(&self, purpose: Purpose) -> Option<usize> {
+        match purpose {
+            Purpose::Live => self
+                .live_context
+                .as_ref()
+                .and_then(|context| context.body_slot()),
+            Purpose::Control => self.control_context.body_slot(),
+            Purpose::History => None,
+        }
+    }
     fn push(&mut self, task: Task) -> Result<()> {
         if self.tasks.len() >= MAX_TASKS {
             return Err(Error::SizeLimitExceeded("history dependency stack"));
@@ -1242,14 +1289,7 @@ impl Flow {
         self.discard_received_inventory();
         for (index, owner) in self.owners.iter().enumerate() {
             if let Some(request) = owner {
-                self.slots.release(
-                    if index == 0 {
-                        Purpose::Live
-                    } else {
-                        Purpose::Control
-                    },
-                    *request,
-                );
+                self.slots.release(Some(index), *request);
             }
         }
 
@@ -1384,9 +1424,9 @@ impl Flow {
             }
             Slice::Staging(purpose, done) => {
                 if done {
-                    if let Some(index) = body_slot(purpose) {
+                    if let Some(index) = self.body_slot(purpose).filter(|index| *index != 2) {
                         if let Some(request) = self.owners[index].take() {
-                            self.slots.release(purpose, request);
+                            self.slots.release(Some(index), request);
                         }
                     }
                     match purpose {
@@ -1549,6 +1589,11 @@ impl Flow {
         self.announcement_error = false;
         self.announcement_active = false;
         self.peer_busy_retry = false;
+        self.key_body_wire_busy = false;
+        if self.key_body_root.is_some() {
+            self.key_body_turn = KeyBodyTurn::Yieldable;
+            self.key_body_backoff = None;
+        }
         // Local slices run back to back inside one turn; a slice that needs the wire, waits,
         // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
         // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
@@ -3265,6 +3310,9 @@ impl Flow {
                     return Ok(());
                 }
                 if result.status == Status::Busy {
+                    self.key_body_wire_busy = self.key_body_root.is_some_and(|need| {
+                        matches!(query, Query::Entry { head, seq, .. } if head == need.head && seq == need.seq)
+                    });
                     // Busy did not end the admitted request. Keep the exact body/page and its
                     // continuation in this Flow; the actor parks the round and the port's Busy
                     // edge retries this same owner. In particular, do not checkpoint/pause the
@@ -3653,10 +3701,16 @@ impl Flow {
         seq: u64,
         job: &Job,
     ) -> Result<bool> {
-        if !self.slots.claim(purpose, request) {
+        let slot = self.body_slot(purpose);
+        let slot_owner = if slot == Some(2) {
+            self.retirement_request
+        } else {
+            request
+        };
+        if !self.slots.claim(slot, slot_owner) {
             return Ok(false);
         }
-        if let Some(index) = body_slot(purpose) {
+        if let Some(index) = self.body_slot(purpose).filter(|index| *index != 2) {
             self.owners[index] = Some(request);
         }
         if let Some(staging) = self.stage(purpose) {
@@ -3755,9 +3809,9 @@ impl Flow {
         .await
         .map_err(|_| Error::Profile("history reclamation worker stopped"))??;
         if complete {
-            if let Some(index) = body_slot(purpose) {
+            if let Some(index) = self.body_slot(purpose).filter(|index| *index != 2) {
                 if let Some(request) = self.owners[index].take() {
-                    self.slots.release(purpose, request);
+                    self.slots.release(Some(index), request);
                 }
             }
             match purpose {
@@ -3912,6 +3966,9 @@ impl Flow {
 impl Drop for Flow {
     fn drop(&mut self) {
         self.cancel();
+        if self.key_delivery_lease.is_some() {
+            self.slots.release(Some(2), self.retirement_request);
+        }
     }
 }
 

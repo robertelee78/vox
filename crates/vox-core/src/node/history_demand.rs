@@ -6,6 +6,8 @@
 //! canonical LogDb entries. Obtain a shared Job outside actor locks before calling this module.
 //! Archive has one fixed slot per node, including paused work. Live and control each have one
 //! separate fixed slot so neither a paused archive nor a large live body blocks essential control.
+//! Recipient key delivery has its own local slot; it does not change the wire purpose or widen
+//! admission. Its physical lifetime is separately leased across actor replacement.
 //! Those slots add no workers or memory pool; their actual buffers use the shared foreground jobs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +16,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::history_budget::{BufferCharge, Job};
+use super::history_budget::{BufferCharge, Job, KeyDeliveryLease};
 use super::history_stream::{Continuation, Purpose, RequestId};
 use super::profile::Profile;
 use super::store::{Batch, Snapshot as StoreSnapshot, Store};
@@ -49,6 +51,9 @@ pub struct Context {
     cancellation: Cancellation,
     // Declared after the key: release the lock-completion barrier only after secrets drop.
     _secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    // Last: a blocking clone retains the staging namespace beyond Flow cancellation and until
+    // its actual context, secrets and lock-completion barrier have all been released.
+    _key_delivery_lease: Option<Arc<KeyDeliveryLease>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +61,7 @@ pub enum Slot {
     Archive,
     Live,
     Control,
+    KeyDelivery,
 }
 
 /// The actor retains this handle to fence a worker even when a blocking disk call cannot abort.
@@ -92,6 +98,35 @@ impl Context {
         };
         Self::with_slot(profile, slot, secret_work)
     }
+    /// Recipient-body delivery only. Its separate local slot cannot replace public control
+    /// staging. Every context clone retains the same lease, including a blocking physical tail
+    /// after its Flow is cancelled.
+    pub(crate) fn key_delivery_unlocked(
+        profile: &Profile,
+        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+        namespace: Arc<KeyDeliveryLease>,
+        actor: u64,
+    ) -> Result<Self> {
+        if namespace.node() != profile.fingerprint() || namespace.owner() != actor {
+            return Err(invalid(
+                "key delivery namespace belongs to another node or actor",
+            ));
+        }
+        let mut context = Self::with_slot(profile, Slot::KeyDelivery, secret_work)?;
+        context._key_delivery_lease = Some(namespace);
+        Ok(context)
+    }
+
+    /// The fixed in-memory body owner corresponding to this local staging namespace. Archive
+    /// owns its body within the explicit demand instead of these current-work slots.
+    pub(crate) fn body_slot(&self) -> Option<usize> {
+        match self.slot {
+            Slot::Archive => None,
+            Slot::Live => Some(0),
+            Slot::Control => Some(1),
+            Slot::KeyDelivery => Some(2),
+        }
+    }
     fn with_slot(
         profile: &Profile,
         slot: Slot,
@@ -107,6 +142,7 @@ impl Context {
             key,
             cancellation: Cancellation(Arc::new(AtomicBool::new(false))),
             _secret_work: secret_work,
+            _key_delivery_lease: None,
         })
     }
     pub fn cancellation(&self) -> Cancellation {
@@ -573,6 +609,7 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
         Slot::Archive => 0,
         Slot::Live => 1,
         Slot::Control => 2,
+        Slot::KeyDelivery => 3,
     });
     sha256(&bytes)
 }

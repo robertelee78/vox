@@ -11378,6 +11378,7 @@ impl Node {
                 peer,
                 timer,
             } => {
+                self.release_key_body_backoff(channel_id, peer, timer);
                 if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
                     if let Some(b) = port.backoff.as_mut().filter(|b| b.timer == timer) {
                         b.until = None;
@@ -16292,10 +16293,23 @@ impl Node {
         };
         match accepted {
             Ok(capture) => {
+                if !port.key_body_initialized
+                    && port.key_body_scope.is_some_and(|prior| {
+                        prior.same_lifetime(capture.key_body_scope)
+                            && prior.head != capture.key_body_scope.head
+                    })
+                {
+                    // Finish this finite pass, then revisit bodies behind its cursor whose
+                    // earlier-Head refusals no longer apply. Head growth never resets it.
+                    port.key_body_rescan = true;
+                }
                 port.key_body_after = capture.key_body_after;
                 port.key_body_scope = Some(capture.key_body_scope);
                 port.key_body_initialized =
                     capture.key_body.is_some() || capture.key_body_after.is_none();
+                if port.key_body.map(|need| need.hash) != capture.key_body.map(|need| need.hash) {
+                    port.key_body_turn_due = false;
+                }
                 port.key_body = capture.key_body;
                 if port.key_body_initialized && port.key_body.is_none() && port.key_body_rescan {
                     port.key_body_rescan = false;
@@ -16338,8 +16352,12 @@ impl Node {
                 }
                 let changed = port.observation_desired != capture.snapshot;
                 port.observation_desired = capture.snapshot;
-                if changed || port.announce_owed() || port.key_body.is_some() {
+                if changed || port.announce_owed() {
                     port.raise();
+                    self.sched_rooms.insert(refresh.room);
+                }
+                if port.key_body.is_some() {
+                    // A private need is not a public request or a synthetic public quantum.
                     self.sched_rooms.insert(refresh.room);
                 }
             }
@@ -16697,12 +16715,15 @@ impl Node {
             return false;
         };
         let eligible = port.out.is_none()
-            && (port.needs()
-                || self.bounded_sync.needs_port(key.0, key.1)
+            && (port.ordinary_needs()
+                || (port.key_body.is_some() && self.key_namespace_available())
+                || self.bounded_sync.runnable_needs_port(key.0, key.1, now)
                 || self.history_hints.pending(key.0, key.1)
                 || (self.history_demand.ready_binding(key.0, key.1).is_some()
                     && self.history_provider_admissible(key.0, key.1)))
-            && (!port.backing_off(now) || port.busy_bypass(now))
+            && (!port.backing_off(now)
+                || port.busy_bypass(now)
+                || self.key_body_busy_bypass(key.0, key.1))
             && !self.publishing.contains(key)
             && self
                 .net
@@ -16829,7 +16850,8 @@ impl Node {
         };
         let prior = port.backoff;
         let failures = prior.map_or(0, |b| b.failures).saturating_add(1);
-        let timer = prior.map_or(0, |b| b.timer).wrapping_add(1);
+        let timer = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1);
         let mut wait = crate::node::ports::backoff_wait(kind, failures);
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
             if c.consecutive_failures >= 2

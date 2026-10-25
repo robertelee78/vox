@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use tokio::sync::Notify;
 
@@ -1320,6 +1320,77 @@ struct PoolOwner {
     /// monotonic release order and causal actor handoff; they are not a daemon-wide work queue.
     continuations: BTreeMap<u64, FlowContinuation>,
     release: tokio::sync::mpsc::UnboundedSender<FlowRelease>,
+    /// One private recipient-body Flow across this fingerprint's actor generations. The weak
+    /// record stays present until the exact lease's Drop clears it, including its physical tail.
+    key_delivery: Option<Weak<KeyDeliveryLease>>,
+    /// A failed current actor's availability/admission check replaces this fixed notification
+    /// target; it retains no actor, authority, worker, work item or queue.
+    key_delivery_wake: Weak<Notify>,
+}
+
+impl PoolOwner {
+    fn retained(&self) -> bool {
+        self.registered
+            || self.charges > 0
+            || !self.continuations.is_empty()
+            || self.key_delivery.is_some()
+    }
+}
+
+/// The one recipient-body operation owned by a node, across ready/running/deferred/retiring
+/// generations. This is lifetime exclusion, not admission or authority. The Flow holds its
+/// final copy after all of its contexts and buffers, so their physical tails cannot overlap a
+/// replacement operation using the same local staging slot.
+pub(crate) struct KeyDeliveryLease {
+    budget: Arc<Budget>,
+    node: Digest32,
+    owner: u64,
+}
+
+impl KeyDeliveryLease {
+    pub(crate) fn node(&self) -> Digest32 {
+        self.node
+    }
+
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
+    }
+}
+
+impl Drop for KeyDeliveryLease {
+    fn drop(&mut self) {
+        let this = self as *const Self;
+        let mut pool = self
+            .budget
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let wake = pool.owners.get_mut(&self.owner).and_then(|owner| {
+            if owner.node != self.node
+                || owner
+                    .key_delivery
+                    .as_ref()
+                    .is_none_or(|lease| !std::ptr::eq(lease.as_ptr(), this))
+            {
+                return None;
+            }
+            owner.key_delivery = None;
+            Some(std::mem::take(&mut owner.key_delivery_wake))
+        });
+        if pool
+            .owners
+            .get(&self.owner)
+            .is_some_and(|owner| !owner.retained())
+        {
+            pool.owners.remove(&self.owner);
+        }
+        pool.resize();
+        drop(pool);
+        if let Some(wake) = wake.and_then(|wake| wake.upgrade()) {
+            // Keep one permit if the actor has not returned to its existing select yet.
+            wake.notify_one();
+        }
+    }
 }
 
 /// A charge release synchronously puts this exact retained continuation on its owning actor's
@@ -1360,7 +1431,7 @@ impl Default for Pool {
 }
 
 impl Pool {
-    /// Active registrations and a retired generation whose round is still returning both count
+    /// Active registrations and a retired generation whose round or private lease is returning count
     /// as hosted until that exact charge is gone. Distinct generations of one fingerprint never
     /// widen its two legal running slots or its contribution to the daemon limit.
     fn resize(&mut self) {
@@ -1526,9 +1597,11 @@ impl Drop for FlowReleaseTicket {
             .get_mut(&self.owner)
             .and_then(|owner| owner.continuations.remove(&self.id))
             .is_some_and(|continuation| continuation.granted);
-        if pool.owners.get(&self.owner).is_some_and(|owner| {
-            !owner.registered && owner.charges == 0 && owner.continuations.is_empty()
-        }) {
+        if pool
+            .owners
+            .get(&self.owner)
+            .is_some_and(|owner| !owner.retained())
+        {
             pool.owners.remove(&self.owner);
             pool.resize();
         }
@@ -1549,6 +1622,12 @@ pub(crate) struct FlowPoolRegistration {
     owner: u64,
 }
 
+impl FlowPoolRegistration {
+    pub(crate) fn owner(&self) -> u64 {
+        self.owner
+    }
+}
+
 impl Drop for FlowPoolRegistration {
     fn drop(&mut self) {
         let mut p = self
@@ -1564,7 +1643,7 @@ impl Drop for FlowPoolRegistration {
         }
         if p.owners
             .get(&self.owner)
-            .is_some_and(|owner| owner.charges == 0 && owner.continuations.is_empty())
+            .is_some_and(|owner| !owner.retained())
         {
             p.owners.remove(&self.owner);
         }
@@ -1618,9 +1697,10 @@ impl Drop for FlowStateCharge {
         if let Some(owner) = p.owners.get_mut(&self.owner) {
             owner.charges = owner.charges.saturating_sub(1);
         }
-        if p.owners.get(&self.owner).is_some_and(|owner| {
-            !owner.registered && owner.charges == 0 && owner.continuations.is_empty()
-        }) {
+        if p.owners
+            .get(&self.owner)
+            .is_some_and(|owner| !owner.retained())
+        {
             p.owners.remove(&self.owner);
         }
         p.resize();
@@ -1682,6 +1762,67 @@ pub type FlowContinuationSnapshot = (
 );
 
 impl Budget {
+    /// Take the one recipient-body lifetime for the current actor generation. Capacity and
+    /// room/peer authorization remain separate checks at actual dispatch.
+    pub(crate) fn try_key_delivery(
+        self: &Arc<Self>,
+        node: Digest32,
+        actor: u64,
+        wake: &Arc<Notify>,
+    ) -> Option<Arc<KeyDeliveryLease>> {
+        let mut pool = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.active.get(&node) != Some(&actor)
+            || !pool
+                .owners
+                .get(&actor)
+                .is_some_and(|owner| owner.node == node && owner.registered)
+        {
+            return None;
+        }
+        for owner in pool.owners.values_mut().filter(|owner| owner.node == node) {
+            if owner.key_delivery.is_some() {
+                owner.key_delivery_wake = Arc::downgrade(wake);
+                return None;
+            }
+        }
+        let owner = pool.owners.get_mut(&actor)?;
+        let lease = Arc::new(KeyDeliveryLease {
+            budget: Arc::clone(self),
+            node,
+            owner: actor,
+        });
+        owner.key_delivery = Some(Arc::downgrade(&lease));
+        owner.key_delivery_wake = Arc::downgrade(wake);
+        Some(lease)
+    }
+
+    /// A current actor checks this before starting private work. A retiring lease installs the
+    /// caller's existing completion notification as its sole next-wake target. No worker or
+    /// pool charge is held while waiting; callers must recheck authority on actual admission.
+    pub(crate) fn key_delivery_available(
+        &self,
+        node: Digest32,
+        actor: u64,
+        wake: &Arc<Notify>,
+    ) -> bool {
+        let mut pool = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.active.get(&node) != Some(&actor)
+            || !pool
+                .owners
+                .get(&actor)
+                .is_some_and(|owner| owner.node == node && owner.registered)
+        {
+            return false;
+        }
+        for owner in pool.owners.values_mut().filter(|owner| owner.node == node) {
+            if owner.key_delivery.is_some() {
+                owner.key_delivery_wake = Arc::downgrade(wake);
+                return false;
+            }
+        }
+        true
+    }
+
     /// A hosted node lists itself in the flow-state pool when it starts networking, at 0 until
     /// it holds one (`by_node` has one member per hosted node, ADR-038 FX-35).
     pub(crate) fn register_node(
@@ -1712,11 +1853,11 @@ impl Budget {
                 charges: 0,
                 continuations: BTreeMap::new(),
                 release,
+                key_delivery: None,
+                key_delivery_wake: Weak::new(),
             },
         );
-        p.owners.retain(|_, owner| {
-            owner.registered || owner.charges > 0 || !owner.continuations.is_empty()
-        });
+        p.owners.retain(|_, owner| owner.retained());
         p.resize();
         drop(p);
         FlowPoolRegistration {

@@ -697,6 +697,81 @@ impl Controller {
             self.cancel_foreground_admission(index);
         }
     }
+    pub(super) fn runnable_needs_port(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        now: std::time::Instant,
+    ) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .any(|flow| flow.room == room && flow.peer == peer && !flow.key_body_paced(now))
+            || self
+                .required
+                .iter()
+                .any(|need| need.room == room && need.peer == peer)
+            || self
+                .foreground_admission
+                .iter()
+                .flatten()
+                .any(|wait| wait.room == room && wait.peer == peer)
+            || self.secret_admission.contains_key(&(room, peer))
+            || self.byte_admission.contains_key(&(room, peer))
+            || self.pool_admission.contains_key(&(room, peer))
+    }
+    fn public_owner(&self, room: Digest32, peer: Digest32) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .any(|flow| {
+                flow.room == room
+                    && flow.peer == peer
+                    && !flow.archive
+                    && flow.key_body_root.is_none()
+            })
+    }
+    fn body_owns_backoff(&self, room: Digest32, peer: Digest32, timer: u64) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .any(|flow| {
+                flow.room == room
+                    && flow.peer == peer
+                    && flow.key_body_root.is_some()
+                    && flow
+                        .key_body_backoff
+                        .is_some_and(|backoff| backoff.timer == timer)
+            })
+    }
+    fn body_due(&self, room: Digest32, peer: Digest32, now: std::time::Instant) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .any(|flow| {
+                flow.room == room
+                    && flow.peer == peer
+                    && flow.key_body_root.is_some()
+                    && flow.key_body_turn == stream::runtime::KeyBodyTurn::PrivateDue
+                    && !flow.key_body_paced(now)
+            })
+    }
+    fn note_public_quantum(&mut self, room: Digest32, peer: Digest32) {
+        for flow in self
+            .ready
+            .iter_mut()
+            .flatten()
+            .chain(self.deferred.iter_mut())
+        {
+            if flow.room == room && flow.peer == peer && flow.key_body_root.is_some() {
+                flow.key_body_turn = stream::runtime::KeyBodyTurn::PrivateDue;
+            }
+        }
+    }
     fn control_would_admit(
         &self,
         budget: &crate::node::history_budget::Budget,
@@ -716,7 +791,13 @@ impl Controller {
     /// Give the daemon's retained fair-queue owner a runnable local lane before it tries to
     /// consume capacity. The displaced Flow remains whole and keeps the exact deque position
     /// this owner held; no root, cursor, context, announcement or backoff state is rebuilt.
-    fn prioritize_control_admission_owner(&mut self, room: Digest32, peer: Digest32) {
+    fn prioritize_control_admission_owner(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        public: bool,
+        now: std::time::Instant,
+    ) {
         if self.running[0].is_some() {
             return;
         }
@@ -733,11 +814,13 @@ impl Controller {
         {
             return;
         }
-        let Some(at) = self
-            .deferred
-            .iter()
-            .position(|flow| !flow.archive && flow.room == room && flow.peer == peer)
-        else {
+        let Some(at) = self.deferred.iter().position(|flow| {
+            !flow.archive
+                && flow.room == room
+                && flow.peer == peer
+                && !flow.key_body_paced(now)
+                && !(public && flow.key_body_turn == stream::runtime::KeyBodyTurn::PublicOwed)
+        }) else {
             return;
         };
         let Some(flow) = self.deferred.remove(at) else {
@@ -2026,6 +2109,139 @@ impl Node {
         self.bounded_sync.poll_cleanup();
     }
 
+    pub(super) fn key_namespace_available(&self) -> bool {
+        self.profile
+            .as_ref()
+            .zip(self.flow_pool_registration.as_ref())
+            .is_some_and(|(profile, owner)| {
+                self.history_budget.key_delivery_available(
+                    profile.fingerprint(),
+                    owner.owner(),
+                    &self.bounded_completion_wake,
+                )
+            })
+    }
+    fn actual_public_work(&self, room: Digest32, peer: Digest32) -> bool {
+        self.history_hints.pending(room, peer)
+            || self.bounded_sync.public_owner(room, peer)
+            || self
+                .bounded_sync
+                .required
+                .iter()
+                .any(|need| need.room == room && need.peer == peer)
+            || self
+                .ports
+                .get(&(room, peer))
+                .is_some_and(crate::node::ports::Port::announce_owed)
+            || self.history_demand.ready_binding(room, peer).is_some()
+    }
+    pub(super) fn key_body_busy_bypass(&self, room: Digest32, peer: Digest32) -> bool {
+        self.actual_public_work(room, peer)
+            && self.ports.get(&(room, peer)).is_some_and(|port| {
+                port.backoff.is_some_and(|backoff| {
+                    backoff.kind == crate::node::status::BackoffKind::Busy
+                        && self
+                            .bounded_sync
+                            .body_owns_backoff(room, peer, backoff.timer)
+                })
+            })
+    }
+    pub(super) fn release_key_body_backoff(&mut self, room: Digest32, peer: Digest32, timer: u64) {
+        let Some(port) = self.ports.get(&(room, peer)) else {
+            return;
+        };
+        let reference = port.room.clone();
+        let instance = port.observation_instance;
+        let epoch = port.epoch;
+        let Some(current) = self.current_room(&room) else {
+            return;
+        };
+        if port.poisoned || !reference.is(&current) {
+            return;
+        }
+        let node = self.profile.as_ref().map(Profile::fingerprint);
+        for flow in self
+            .bounded_sync
+            .ready
+            .iter_mut()
+            .flatten()
+            .chain(self.bounded_sync.deferred.iter_mut())
+        {
+            if flow.room == room
+                && flow.peer == peer
+                && Some(flow.node) == node
+                && flow.instance == instance
+                && flow.epoch == epoch
+                && crate::node::ports::RoomRef::Channel(Arc::downgrade(&flow.shared)).is(&current)
+                && flow
+                    .key_body_backoff
+                    .is_some_and(|backoff| backoff.timer == timer)
+            {
+                // This is the retained exact attempt, not a recreated debt or new wire grant.
+                flow.key_body_backoff = None;
+                self.sched_rooms.insert(room);
+            }
+        }
+    }
+    fn prepare_key_body_turn(&mut self, room: Digest32, peer: Digest32, now: std::time::Instant) {
+        use stream::runtime::KeyBodyTurn;
+        if self.bounded_sync.running[0].is_some() {
+            return;
+        }
+        let public = self.actual_public_work(room, peer);
+        if public {
+            for flow in &mut self.bounded_sync.deferred {
+                if flow.room == room
+                    && flow.peer == peer
+                    && flow.key_body_root.is_some()
+                    && flow.key_body_turn == KeyBodyTurn::Yieldable
+                    && flow.quiescent_publication()
+                {
+                    flow.key_body_turn = KeyBodyTurn::PublicOwed;
+                }
+            }
+        }
+        let fresh_due = self
+            .ports
+            .get(&(room, peer))
+            .is_some_and(|port| port.key_body.is_some() && port.key_body_turn_due)
+            && self.key_namespace_available()
+            && self.bounded_sync.flow_count() < RETAINED_FLOW_LIMIT;
+        let private_due = fresh_due || self.bounded_sync.body_due(room, peer, now);
+        let yield_current = self.bounded_sync.ready[0].as_ref().is_some_and(|flow| {
+            flow.room == room
+                && flow.peer == peer
+                && flow.quiescent_publication()
+                && if flow.key_body_root.is_some() {
+                    flow.key_body_paced(now)
+                        || (public && flow.key_body_turn != KeyBodyTurn::PrivateDue)
+                } else {
+                    private_due && !flow.archive
+                }
+        });
+        if yield_current {
+            if let Some(mut flow) = self.bounded_sync.ready[0].take() {
+                if flow.key_body_root.is_some()
+                    && public
+                    && flow.key_body_turn != KeyBodyTurn::PrivateDue
+                {
+                    flow.key_body_turn = KeyBodyTurn::PublicOwed;
+                }
+                flow.park();
+                let index = crate::node::history_budget::Lane::Control.index();
+                if self.bounded_sync.foreground_admission[index]
+                    .as_ref()
+                    .is_some_and(|wait| {
+                        wait.room == room && wait.peer == peer && wait.root == "key-body"
+                    })
+                {
+                    self.bounded_sync.cancel_foreground_admission(index);
+                }
+                self.bounded_sync.deferred.push_back(flow);
+            }
+        }
+    }
+
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
         for index in 0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS {
@@ -2130,6 +2346,7 @@ impl Node {
                     port.key_body_initialized = false;
                     port.key_body_after = None;
                     port.key_body_rescan = false;
+                    port.key_body_turn_due = false;
                 }
                 self.bounded_completion_wake.notify_one();
             }
@@ -2139,6 +2356,18 @@ impl Node {
                     .channels
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
+            if valid && index == 0 {
+                if flow.key_body_root.is_none() {
+                    self.bounded_sync.note_public_quantum(work.room, work.peer);
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        if port.key_body.is_some() {
+                            port.key_body_turn_due = true;
+                        }
+                    }
+                } else if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    port.req_done = port.req_done.max(work.request);
+                }
+            }
             // Authorization and local-durability exits carry ownership themselves. Handle them
             // even when the trust edit also retired the port/fence; generic stale disposal would
             // otherwise discard the only hint, required root, or archive controller dispatch.
@@ -2947,6 +3176,8 @@ impl Node {
             } else {
                 let waiting = flow.waiting;
                 let body_progress = flow.body_progress;
+                let key_body_busy = flow.key_body_wire_busy;
+                let key_request = flow.retirement_request();
                 let publication_owner = flow.publication_owner_wait();
                 if flow.governance_wait {
                     // The flow found the fold pending: the actor's fold hook drives it (ADR-037
@@ -2975,12 +3206,38 @@ impl Node {
                             work.peer,
                             crate::node::status::BackoffKind::Busy,
                         );
+                        if key_body_busy {
+                            let backoff = self
+                                .ports
+                                .get(&(work.room, work.peer))
+                                .and_then(|port| port.backoff);
+                            for retained in self
+                                .bounded_sync
+                                .ready
+                                .iter_mut()
+                                .flatten()
+                                .chain(self.bounded_sync.deferred.iter_mut())
+                            {
+                                if retained.retirement_request() == key_request
+                                    && retained.key_body_root.is_some()
+                                {
+                                    retained.key_body_backoff = backoff;
+                                }
+                            }
+                        }
                     }
                 } else {
                     self.sched_rooms.insert(work.room);
                 }
                 if let Some(owner) = publication_owner {
                     self.wake_publication_owner(work.room, owner);
+                }
+            }
+        }
+        if self.key_namespace_available() {
+            for ((room, _), port) in &self.ports {
+                if !port.poisoned && port.key_body.is_some() {
+                    self.sched_rooms.insert(*room);
                 }
             }
         }
@@ -3065,6 +3322,18 @@ impl Node {
             });
             self.sched_rooms.insert(room);
         }
+        let turn_now = std::time::Instant::now();
+        self.prepare_key_body_turn(room, peer, turn_now);
+        if !self.actual_public_work(room, peer)
+            && self
+                .ports
+                .get(&(room, peer))
+                .is_some_and(|port| !port.ordinary_needs() && port.key_body.is_some())
+            && !self.bounded_sync.runnable_needs_port(room, peer, turn_now)
+            && !self.key_namespace_available()
+        {
+            return false;
+        }
         // Only the exact release handoff may make an impossible-path continuation runnable.
         // Generic actor traffic still evaluates queued ports, but cannot stand in for that edge.
         if self.bounded_sync.publication_port_blocked(room, peer)
@@ -3103,12 +3372,43 @@ impl Node {
             }
         }
         let pending_work = self.bounded_pending_identity(room, peer);
+        let public_turn = self.actual_public_work(room, peer);
+        let fresh_private_due = self.key_namespace_available()
+            && self.bounded_sync.flow_count() < RETAINED_FLOW_LIMIT
+            && self
+                .ports
+                .get(&(room, peer))
+                .is_some_and(|port| port.key_body.is_some() && port.key_body_turn_due);
         self.bounded_sync
-            .prioritize_control_admission_owner(room, peer);
+            .prioritize_control_admission_owner(room, peer, public_turn, turn_now);
         if self.bounded_sync.ready[0].is_none() && self.bounded_sync.running[0].is_none() {
-            if let Some(at) = self.bounded_sync.deferred.iter().position(|flow| {
-                flow.room == room && flow.peer == peer && !flow.publication_blocked()
-            }) {
+            if let Some(at) = self
+                .bounded_sync
+                .deferred
+                .iter()
+                .position(|flow| {
+                    flow.room == room
+                        && flow.peer == peer
+                        && flow.key_body_root.is_some()
+                        && flow.key_body_turn == stream::runtime::KeyBodyTurn::PrivateDue
+                        && !flow.key_body_paced(turn_now)
+                        && !flow.publication_blocked()
+                })
+                .or_else(|| {
+                    self.bounded_sync.deferred.iter().position(|flow| {
+                        flow.room == room
+                            && flow.peer == peer
+                            && !flow.publication_blocked()
+                            && !flow.key_body_paced(turn_now)
+                            && !(fresh_private_due
+                                && flow.key_body_root.is_none()
+                                && flow.quiescent_publication())
+                            && !(public_turn
+                                && flow.key_body_root.is_some()
+                                && flow.key_body_turn == stream::runtime::KeyBodyTurn::PublicOwed)
+                    })
+                })
+            {
                 self.bounded_sync.ready[0] = self.bounded_sync.deferred.remove(at);
             }
         }
@@ -3413,7 +3713,7 @@ impl Node {
                         let live = match crate::node::history_demand::Context::current_unlocked(
                             profile,
                             Purpose::Live,
-                            lease,
+                            lease.clone(),
                         ) {
                             Ok(value) => Arc::new(value),
                             Err(_) => return false,
@@ -3428,14 +3728,21 @@ impl Node {
                         let required = required_at
                             .and_then(|at| self.bounded_sync.required.get(at))
                             .map(|required| (required.head, required.seq));
-                        let key_body =
-                            (!announce_first && required.is_none() && departure_hint.is_none())
-                                .then(|| {
-                                    self.ports.get(&(room, peer)).and_then(|port| {
-                                        port.key_body.map(|debt| (debt, port.observation_instance))
-                                    })
-                                })
-                                .flatten();
+                        let key_body = (!announce_first
+                            && required.is_none()
+                            && departure_hint.is_none()
+                            && self.key_namespace_available()
+                            && (!self.history_hints.pending(room, peer)
+                                || self
+                                    .ports
+                                    .get(&(room, peer))
+                                    .is_some_and(|port| port.key_body_turn_due)))
+                        .then(|| {
+                            self.ports.get(&(room, peer)).and_then(|port| {
+                                port.key_body.map(|debt| (debt, port.observation_instance))
+                            })
+                        })
+                        .flatten();
                         let hint = if announce_first || required.is_some() || key_body.is_some() {
                             None
                         } else {
@@ -3448,6 +3755,31 @@ impl Node {
                             announce_owed,
                             periodic_pending,
                         );
+                        let key_delivery = if key_body.is_some() {
+                            let Some(actor) = actor_incarnation else {
+                                return false;
+                            };
+                            let Some(namespace) = self.history_budget.try_key_delivery(
+                                node,
+                                actor,
+                                &self.bounded_completion_wake,
+                            ) else {
+                                return false;
+                            };
+                            let context =
+                                match crate::node::history_demand::Context::key_delivery_unlocked(
+                                    profile,
+                                    lease.clone(),
+                                    Arc::clone(&namespace),
+                                    actor,
+                                ) {
+                                    Ok(context) => Arc::new(context),
+                                    Err(_) => return false,
+                                };
+                            Some((context, namespace))
+                        } else {
+                            None
+                        };
                         match Flow::foreground(
                             room,
                             peer,
@@ -3466,7 +3798,15 @@ impl Node {
                         ) {
                             Ok(mut flow) => {
                                 if let Some((debt, instance)) = key_body {
-                                    flow = flow.with_key_body(debt, instance);
+                                    let Some((context, namespace)) = key_delivery else {
+                                        return false;
+                                    };
+                                    flow = match flow
+                                        .with_key_body(debt, instance, context, namespace)
+                                    {
+                                        Ok(flow) => flow,
+                                        Err(_) => return false,
+                                    };
                                 }
                                 flow.reason = reason;
                                 if let Some(at) = required_at {
@@ -3493,7 +3833,7 @@ impl Node {
                     let live = match crate::node::history_demand::Context::current_unlocked(
                         profile,
                         Purpose::Live,
-                        lease,
+                        lease.clone(),
                     ) {
                         Ok(value) => Arc::new(value),
                         Err(_) => return false,
@@ -3509,14 +3849,21 @@ impl Node {
                     let required = required_at
                         .and_then(|at| self.bounded_sync.required.get(at))
                         .map(|required| (required.head, required.seq));
-                    let key_body =
-                        (!announce_first && required.is_none() && departure_hint.is_none())
-                            .then(|| {
-                                self.ports.get(&(room, peer)).and_then(|port| {
-                                    port.key_body.map(|debt| (debt, port.observation_instance))
-                                })
-                            })
-                            .flatten();
+                    let key_body = (!announce_first
+                        && required.is_none()
+                        && departure_hint.is_none()
+                        && self.key_namespace_available()
+                        && (!self.history_hints.pending(room, peer)
+                            || self
+                                .ports
+                                .get(&(room, peer))
+                                .is_some_and(|port| port.key_body_turn_due)))
+                    .then(|| {
+                        self.ports.get(&(room, peer)).and_then(|port| {
+                            port.key_body.map(|debt| (debt, port.observation_instance))
+                        })
+                    })
+                    .flatten();
                     let hint = if announce_first || required.is_some() || key_body.is_some() {
                         None
                     } else {
@@ -3529,6 +3876,31 @@ impl Node {
                         announce_owed,
                         periodic_pending,
                     );
+                    let key_delivery = if key_body.is_some() {
+                        let Some(actor) = actor_incarnation else {
+                            return false;
+                        };
+                        let Some(namespace) = self.history_budget.try_key_delivery(
+                            node,
+                            actor,
+                            &self.bounded_completion_wake,
+                        ) else {
+                            return false;
+                        };
+                        let context =
+                            match crate::node::history_demand::Context::key_delivery_unlocked(
+                                profile,
+                                lease.clone(),
+                                Arc::clone(&namespace),
+                                actor,
+                            ) {
+                                Ok(context) => Arc::new(context),
+                                Err(_) => return false,
+                            };
+                        Some((context, namespace))
+                    } else {
+                        None
+                    };
                     match Flow::foreground(
                         room,
                         peer,
@@ -3547,7 +3919,14 @@ impl Node {
                     ) {
                         Ok(mut flow) => {
                             if let Some((debt, instance)) = key_body {
-                                flow = flow.with_key_body(debt, instance);
+                                let Some((context, namespace)) = key_delivery else {
+                                    return false;
+                                };
+                                flow = match flow.with_key_body(debt, instance, context, namespace)
+                                {
+                                    Ok(flow) => flow,
+                                    Err(_) => return false,
+                                };
                             }
                             flow.reason = reason;
                             if let Some(at) = required_at {

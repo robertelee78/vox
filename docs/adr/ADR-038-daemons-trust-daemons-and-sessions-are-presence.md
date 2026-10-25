@@ -1114,7 +1114,23 @@ that source's unchanged body attempt, using a domain-separated entry-hash relati
 existing refusal tree. It cannot hide a different owed package under the same Head or suppress
 or recreate Alice's unrelated public dependency. Those refusal rows retire atomically with
 their bounded KeyBody obligations after verified refill.
+Recipient delivery uses one fixed local KeyDelivery staging namespace, separate from public
+Control staging; its wire purpose and every current authorization check remain Control. One
+lease per hosted fingerprint excludes another key-body Flow across active, parked and retiring
+actor generations, including Context clones in physical blocking tails. This adds no worker,
+flow-pool capacity, unbounded wait queue or remote privilege. Quiescent exact continuations use
+the existing deferred owner: real public work gets one quantum, then an eligible private turn is
+owed. An active Begin–Cleanup publication is never displaced. An exact key-entry Busy retains
+its original existing backoff deadline; a later public operation cannot reset or consume it.
 Restart, publication cleanup and actual trust/prekey changes recheck the durable index. No
 private body is invented at a nonrecipient relay, no missing recipient position is acknowledged,
 and no private key or Session body becomes public proof material. This reconciles existing
 #1021 and #934 obligations; it introduces no new story, phase or acceptance claim.
+
+The quiescent correction does not change the physical foreground position or ADR-025's Port
+outbound cardinality. An already active private Entry wire exchange can still occupy that
+position until its existing transport deadline, delaying a later public pull. That active-wire
+scheduling defect remains REQUIRED work before v0.4.10 under ADR-036 H-2 and ADR-037 R1. The
+source correction above covers public admission with an unavailable/offline private source and
+quiescent Busy handoff; it does not claim the full public/private latency contract, waive R1,
+or replace the full user journey and its own controls.
