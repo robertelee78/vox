@@ -23,7 +23,16 @@ use crate::transport::stream_transport::Fence;
 
 use super::{Proof, ProofKind, RequestId};
 
+pub(super) enum InventoryOffer {
+    /// A serving read could not be admitted; no inventory filter callback ran.
+    Unavailable,
+    ConnectionChanged,
+    Offered(super::hints::Offer),
+    Publication(crate::node::channel::HistoryPublicationWait),
+}
+
 pub(super) enum DeclineResult {
+    Publication(crate::node::channel::HistoryPublicationWait),
     Stored {
         remembered: bool,
         captured: Digest32,
@@ -95,6 +104,7 @@ pub(super) struct Source {
     authorization: Option<(Digest32, Digest32)>,
     // Only a server clone bound to Control/Head(peer) may return a departed peer receipt.
     own_head_receipt: bool,
+    connection: Option<u64>,
     work_committed: Arc<AtomicBool>,
 }
 
@@ -170,6 +180,9 @@ impl Source {
             .await?
         {
             Lookup::Found(saved) => match saved.value {
+                crate::node::channel::HistoryDeclineResult::Publication(wait) => {
+                    Ok(DeclineResult::Publication(wait))
+                }
                 crate::node::channel::HistoryDeclineResult::Stored {
                     remembered,
                     current,
@@ -211,8 +224,14 @@ impl Source {
             deadline,
             authorization,
             own_head_receipt: false,
+            connection: None,
             work_committed,
         }
+    }
+
+    pub(super) fn on_connection(mut self, serial: u64) -> Self {
+        self.connection = Some(serial);
+        self
     }
 
     /// Record user-visible history work at the commit edge, independently of whether the
@@ -662,30 +681,39 @@ impl Source {
     pub(super) async fn offer_inventory(
         &self,
         job: &Job,
-        inbox: &super::HintInbox,
+        inbox: &Arc<super::HintInbox>,
         generation: u64,
         room_id: Digest32,
         hints: &[super::HeadHint],
-    ) -> Result<super::hints::Offer> {
+    ) -> Result<InventoryOffer> {
         if hints.len() > 64 {
             return Err(Error::SizeLimitExceeded("inventory filter slice"));
         }
         // Input copy and returned vector coexist inside this small prepaid envelope.
-        let Some(input_charge) = job.reserve(64 * std::mem::size_of::<super::HeadHint>()) else {
-            return Ok(super::hints::Offer {
-                added: 0,
-                rearmed: 0,
-                full: true,
-            });
-        };
+        let input_charge =
+            match job.reserve_or_pressure(64 * std::mem::size_of::<super::HeadHint>()) {
+                Ok(charge) => charge,
+                Err(Error::HistoryCapacity(_)) if self.authorization.is_none() => {
+                    return Ok(InventoryOffer::Unavailable);
+                }
+                Err(error) => return Err(error),
+            };
         let peer = self.peer;
+        let captured_authorization = self.authorization;
+        let connection = self
+            .connection
+            .ok_or(Error::Profile("inventory connection scope missing"))?;
         let slice = hints.to_vec();
         let committed = Arc::clone(&self.work_committed);
+        let inbox = Arc::clone(inbox);
+        let offer_job = job.clone();
         let output_envelope = 64
             * (std::mem::size_of::<super::HeadHint>()
                 + std::mem::size_of::<(Digest32, Digest32)>()
                 + std::mem::size_of::<Digest32>())
-            + std::mem::size_of::<usize>();
+            + std::mem::size_of::<usize>()
+            + std::mem::size_of::<super::OwnProbeContext>()
+            + std::mem::size_of::<Option<super::HeadHint>>();
         let filtered = self
             .read(job, output_envelope, move |room, store| {
                 let _input_charge = input_charge;
@@ -699,10 +727,37 @@ impl Source {
                     room.history_instance(store)?,
                     room.epoch(),
                 )?;
+                if captured_authorization.is_some_and(|(node, generation)| {
+                    node != room.me() || generation != current_authorization
+                }) {
+                    return Err(Error::Profile("history authorization changed"));
+                }
+                let context = super::OwnProbeContext {
+                    node: room.me(),
+                    instance: room.history_instance(store)?,
+                    epoch: room.epoch(),
+                    authorization: current_authorization,
+                    connection,
+                };
+                let local = room
+                    .history_head(store, &room.me())?
+                    .map(|head| super::HeadHint {
+                        author: head.binding.author,
+                        head: head.id(),
+                        size: head.root.leaves,
+                    });
+                let publication_wake = room.history_publication_wake();
                 let read = room.history_read(store)?;
                 let mut missing = Vec::with_capacity(slice.len());
                 let mut changed = Vec::new();
                 for hint in slice {
+                    if hint.author == room.me() {
+                        // An own HEAD observation is scoped by the canonical Port record,
+                        // never a durable refusal of a locally generated trigger. Observe the
+                        // first real advertisement even if an older candidate declined it.
+                        missing.push(hint);
+                        continue;
+                    }
                     if let Some((declined, authorization, peer_incarnation, author_incarnation)) =
                         read.history_declined_head(&peer, &hint.author)?
                     {
@@ -720,18 +775,6 @@ impl Source {
                         } else {
                             changed.push(hint.author);
                         }
-                    }
-                    if hint.author == room.me() {
-                        // Inventory is only an unauthoritative scalar hint. Even when its
-                        // signed head is already accepted locally, it does not prove the peer
-                        // completed every effect it owes through that position. Keep the hint
-                        // until Query::Head asks the peer for the authenticated role-complete
-                        // receipt. A previously recorded later receipt makes an older echo
-                        // redundant; no scalar echo itself may advance held_through.
-                        if room.held_through(&peer).is_none_or(|held| held < hint.size) {
-                            missing.push(hint);
-                        }
-                        continue;
                     }
                     let state =
                         read.sparse_author(&hint.author, crate::log::history::LogScope::Public)?;
@@ -795,26 +838,44 @@ impl Source {
                 drop(read);
                 changed.sort_unstable();
                 changed.dedup();
+                if !changed.is_empty() && room.history_publication_busy(store)? {
+                    return Ok(Some(InventoryOffer::Publication(
+                        crate::node::channel::HistoryPublicationWait {
+                            owner: room.history_publication_request(store)?,
+                            wake: publication_wake,
+                        },
+                    )));
+                }
                 let rearmed = changed.len();
                 for author in changed {
                     room.forget_history_decline(store, peer, author, &committed)?;
                 }
-                Ok(Some((missing, rearmed)))
+                // Filtering, current room/auth/head snapshot and metadata admission share
+                // this SAME room guard. No delayed old callback can reset a newer record.
+                // All index reads/transactions are gone before taking the short Inbox lock.
+                let mut offer = match inbox.offer_peer_inventory(
+                    &offer_job, generation, room_id, peer, &missing, context, local,
+                ) {
+                    Err(Error::Profile(super::hints::OWN_PROBE_CONNECTION_CHANGED)) => {
+                        return Ok(Some(InventoryOffer::ConnectionChanged));
+                    }
+                    result => result?,
+                };
+                offer.rearmed = rearmed;
+                Ok(Some(InventoryOffer::Offered(offer)))
             })
             .await?;
         match filtered {
-            Lookup::Found(filtered) => {
-                self.current()?;
-                let (missing, rearmed) = filtered.value;
-                let mut offer = inbox.offer(job, generation, room_id, self.peer, &missing)?;
-                offer.rearmed = rearmed;
-                Ok(offer)
+            Lookup::Found(filtered) => Ok(filtered.value),
+            Lookup::Busy | Lookup::Missing if self.authorization.is_none() => {
+                Ok(InventoryOffer::Unavailable)
             }
-            Lookup::Busy | Lookup::Missing => Ok(super::hints::Offer {
-                added: 0,
-                rearmed: 0,
-                full: true,
-            }),
+            // The owned callback always returns Some and record_job always admits its fixed
+            // envelope; real byte pressure was propagated above. Do not misreport a missing
+            // callback as a completed bounded Inbox insertion.
+            Lookup::Busy | Lookup::Missing => {
+                Err(Error::Profile("owned inventory filter returned no result"))
+            }
         }
     }
 }

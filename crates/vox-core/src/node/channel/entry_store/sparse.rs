@@ -1122,6 +1122,16 @@ pub(crate) enum SourceProgress {
 }
 
 impl Write<'_, '_> {
+    /// The exclusion and its producer from this transaction's directory view.
+    pub(crate) fn publication_dependency(&self) -> (bool, Option<[u8; 16]>) {
+        (
+            self.directory.phase != Phase::Idle,
+            self.directory
+                .promotion
+                .as_ref()
+                .and_then(|p| p.sparse_request),
+        )
+    }
     /// Read one refusal from this writer's transaction. This is deliberately the same batch
     /// that checks the authorization nonce and, when needed, replaces the refusal record.
     pub(crate) fn history_declined_head(

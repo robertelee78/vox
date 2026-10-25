@@ -31,7 +31,13 @@ pub(crate) enum HistoryPayload {
 /// Atomic result of persisting one advertised-head refusal. Authorization mismatch is not a
 /// storage error: it carries the fresh generation read by the same batch that fenced the flow's
 /// captured generation.
+pub(crate) struct HistoryPublicationWait {
+    pub(crate) owner: Option<[u8; 16]>,
+    pub(crate) wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+}
+
 pub(crate) enum HistoryDeclineResult {
+    Publication(HistoryPublicationWait),
     Stored { remembered: bool, current: Digest32 },
     AuthorizationChanged { current: Digest32 },
 }
@@ -110,6 +116,8 @@ impl ChannelState {
         // save commits first, this old flow is rejected here. If this transaction commits first,
         // the later trust nonce makes the recorded generation stale. Cancellation after either
         // commit cannot relabel the refusal because no current generation is read outside it.
+        // Subscribe before observing the phase, under the caller's room mutex.
+        let publication_wake = self.history_publication_wake();
         let mut batch = store.batch()?;
         let current = crate::node::history_stream::authorization_generation_in(
             &batch, node, room, instance, epoch,
@@ -130,6 +138,13 @@ impl ChannelState {
                 remembered: false,
                 current,
             });
+        }
+        let (publication_busy, publication_owner) = index.publication_dependency();
+        if publication_busy {
+            return Ok(HistoryDeclineResult::Publication(HistoryPublicationWait {
+                owner: publication_owner,
+                wake: publication_wake,
+            }));
         }
         index.keep_history_declined_head(
             peer,

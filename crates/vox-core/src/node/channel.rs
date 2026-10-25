@@ -65,7 +65,7 @@ pub(crate) mod session_projection;
 mod sparse_history;
 pub(crate) use sparse_history::{
     HistoryDeclineResult, HistoryEffectCursor, HistoryEffectProgress, HistoryPayload,
-    HistorySourceStart,
+    HistoryPublicationWait, HistorySourceStart,
 };
 
 pub use diagnostics::SetAside;

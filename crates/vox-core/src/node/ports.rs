@@ -282,6 +282,8 @@ pub struct Port {
     /// Why the last `start_outbound` for this port ended as it did, and when: what
     /// `vox status --json` names under `lanes.ports[].last_start` (ADR-038 FX-16).
     pub last_start: Option<(&'static str, Instant)>,
+    /// Lifetime handle to the one canonical own-head observation in the shared hint scope.
+    pub(crate) own_probe: Option<crate::node::history_stream::OwnProbePort>,
 }
 
 impl Port {
@@ -309,6 +311,7 @@ impl Port {
             announced_seq: 0,
             periodic_req: 0,
             last_start: None,
+            own_probe: None,
         }
     }
 

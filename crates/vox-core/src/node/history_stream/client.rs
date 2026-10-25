@@ -2091,5 +2091,5 @@ impl Receiver {
 /// Charged scalar hints only. They never advance a feed or authorize a body request.
 pub(crate) struct Inventory {
     pub(crate) hints: Vec<super::HeadHint>,
-    _charge: crate::node::history_budget::BufferCharge,
+    pub(super) _charge: crate::node::history_budget::BufferCharge,
 }

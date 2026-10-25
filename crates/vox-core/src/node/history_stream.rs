@@ -16,7 +16,7 @@ mod transport;
 
 pub(crate) use client::{EntryPhase, LocalNeed, LocalProof, LocalStep, Receiver, Staging};
 pub(crate) use driver::exchange;
-pub(crate) use hints::HintInbox;
+pub(crate) use hints::{HintInbox, OwnProbeAnswer, OwnProbeClaim, OwnProbeContext, OwnProbePort};
 
 use super::history_budget::{BufferCharge, Job};
 use crate::cbor::{Decoder, Encoder};
@@ -111,6 +111,7 @@ pub(crate) async fn serve(
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
     inbox: std::sync::Arc<HintInbox>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    connection: u64,
 ) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(
@@ -122,7 +123,8 @@ pub(crate) async fn serve(
         deadline,
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    );
+    )
+    .on_connection(connection);
     let mut io = transport::Transport::new(send, recv, job, fence, deadline);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
@@ -130,6 +132,7 @@ pub(crate) async fn serve(
     // served the peer nothing it lacked, and is an `empty` round in `vox status --json`
     // (ADR-038 FX-29); any other query is an object the peer asked for because it lacked it.
     let mut served_object = false;
+    let mut local_inventory_busy = false;
     let result = serve_request(
         &source,
         &mut io,
@@ -138,12 +141,16 @@ pub(crate) async fn serve(
         generation,
         &mut inventory_added,
         &mut served_object,
+        &mut local_inventory_busy,
         &departure_receipt,
     )
     .await;
     if let Err(error) = &result {
         let code = match error {
             Error::HistoryCapacity(_) => crate::wire::WireError::SessionBusy,
+            Error::PeerRefused(crate::wire::WireError::SessionBusy) if local_inventory_busy => {
+                crate::wire::WireError::SessionBusy
+            }
             Error::SizeLimitExceeded(_) | Error::MalformedBundle(_) => {
                 crate::wire::WireError::ProtocolLimits
             }
@@ -151,6 +158,15 @@ pub(crate) async fn serve(
         };
         io.abort(code);
     }
+    // This origin flag is set only by the local HAVE filter when publication/read admission
+    // refuses it. A remote reset carrying the same wire code is not this local outcome. The requester received SessionBusy above; locally it is a partial
+    // serving round, not a failure blamed on that requester and never a completed exchange.
+    let result = match result {
+        Err(Error::PeerRefused(crate::wire::WireError::SessionBusy)) if local_inventory_busy => {
+            Ok(Status::Busy)
+        }
+        result => result,
+    };
     (result, inventory_added, inventory_added || served_object)
 }
 
@@ -159,10 +175,11 @@ async fn serve_request(
     source: &source::Source,
     io: &mut transport::Transport,
     preamble: Preamble,
-    inbox: &HintInbox,
+    inbox: &std::sync::Arc<HintInbox>,
     inbox_generation: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,
+    local_inventory_busy: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
 ) -> Result<Status> {
     let first = match io.read_hello().await? {
@@ -228,6 +245,7 @@ async fn serve_request(
         inbox_generation,
         inventory_added,
         served_object,
+        local_inventory_busy,
     )
     .await
 }

@@ -726,6 +726,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ForegroundAdmissionReady { .. } => "starting admitted foreground work",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
+        NetEvent::BoundedPublicationReady { .. } => {
+            "continuing a received response after publication"
+        }
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
         NetEvent::SkdmRefused { .. } => "re-owing a key the recipient did not take",
         NetEvent::PublishDone { .. } => "filing what a board said to a publish",
@@ -1481,6 +1484,12 @@ enum NetEvent {
     },
     /// The exact shared byte reservation a bounded port met was released.
     BoundedBytesReady {
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+    },
+    /// The exact publication dependency of a retained Flow was released.
+    BoundedPublicationReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
@@ -5338,6 +5347,23 @@ struct PrivatePullOwner {
     task: Option<tokio::task::AbortHandle>,
 }
 
+/// Actual peer words awaiting the actor's current-room acceptance boundary.
+struct HeldNote {
+    room: Digest32,
+    peer: Digest32,
+    seq: Option<u64>,
+    request: crate::node::history_stream::RequestId,
+    complete: bool,
+    probe: Option<(
+        crate::node::history_stream::OwnProbeClaim,
+        crate::node::history_stream::OwnProbeAnswer,
+    )>,
+    rearm: Option<(
+        crate::node::history_stream::OwnProbePort,
+        crate::node::history_stream::HeadHint,
+    )>,
+}
+
 /// The node actor's state (owned by its task).
 pub struct Node {
     termination: watch::Sender<TerminationState>,
@@ -5352,7 +5378,7 @@ pub struct Node {
     history_hints: Arc<crate::node::history_stream::HintInbox>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
-    held_notes: Vec<(Digest32, Digest32, u64)>,
+    held_notes: Vec<HeldNote>,
     history_budget: Arc<crate::node::history_budget::Budget>,
     private_pulls: BTreeMap<(Digest32, Digest32), PrivatePullOwner>,
     /// Capacity ownership follows this actor through unwind. Graceful lock moves the guard to
@@ -11263,6 +11289,22 @@ impl Node {
                     }
                 }
             }
+            NetEvent::BoundedPublicationReady { token, room, peer } => {
+                if self
+                    .bounded_sync
+                    .release_publication_admission(token, room, peer)
+                {
+                    if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                        port.clear_backoff();
+                    }
+                    crate::node::status::SyncBook::with(&self.sync_book, room, peer, |counts| {
+                        counts.backoff = None;
+                    });
+                    if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+                        self.sched_rooms.insert(room);
+                    }
+                }
+            }
             NetEvent::BackoffExpired {
                 channel_id,
                 peer,
@@ -11473,11 +11515,15 @@ impl Node {
                                 None
                             }
                         };
-                        self.settle_sparse_room(&channel_id).await;
-                        // Head promotion advances the shared room generation inside the disk
-                        // worker. Touch the room here so schedule observes it immediately and
-                        // advertises the newly committed head back to its author.
-                        self.sched_rooms.insert(channel_id);
+                        if head.author
+                            != self.profile.as_ref().map_or([0; 32], Profile::fingerprint)
+                        {
+                            self.settle_sparse_room(&channel_id).await;
+                            self.sched_rooms.insert(channel_id);
+                        }
+                        // A read-only own-head observation publishes no head. Its actual
+                        // peer receipt is handled separately; the exact departure receipt
+                        // still completes its original leave owner below.
                         if let Some(sent) = acknowledged {
                             self.finish_leave_if_heard(channel_id, sent).await;
                         }
@@ -15859,6 +15905,10 @@ impl Node {
         };
         if let Some(port) = self.ports.get(&(*channel_id, *peer)) {
             if port.room.is(&current) {
+                let scope = self.history_hints.port_scope(*channel_id, *peer);
+                if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
+                    port.own_probe = Some(scope);
+                }
                 return true;
             }
             self.drop_port(channel_id, peer);
@@ -15873,6 +15923,10 @@ impl Node {
             (*channel_id, *peer),
             crate::node::ports::Port::new(room, gen, epoch, sparse),
         );
+        let scope = self.history_hints.port_scope(*channel_id, *peer);
+        if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
+            port.own_probe = Some(scope);
+        }
         self.sched_rooms.insert(*channel_id);
         true
     }
@@ -16404,7 +16458,7 @@ impl Node {
                         .collect::<Vec<_>>()
                 });
                 format!(
-                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],{}}}",
+                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],\"own_head_probe\":{},{}}}",
                     b32_encode(room),
                     b32_encode(peer),
                     port.needs(),
@@ -16418,6 +16472,7 @@ impl Node {
                     connected,
                     !round_owners.is_empty(),
                     round_owners.join(","),
+                    port.own_probe.map_or(serde_json::Value::Null, |scope| self.history_hints.probe_status(scope)),
                     last
                 )
             })
@@ -17448,6 +17503,17 @@ impl Node {
         let Some(port) = self.ports.get_mut(&(channel_id, peer)) else {
             return;
         };
+        let connection = conn.serial();
+        if self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer))
+            .is_some_and(|current| current.serial() == connection)
+        {
+            if let Some(scope) = port.own_probe {
+                self.history_hints.bind_connection(scope, connection);
+            }
+        }
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
@@ -17489,6 +17555,7 @@ impl Node {
                 fence,
                 inbox,
                 departure_receipt,
+                connection,
             )
             .await;
             let _ = tx
@@ -22225,7 +22292,7 @@ impl Node {
             return;
         };
         let now_ms = self.now_ms();
-        let (back, own_hint, own_targets) = {
+        let back = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
@@ -22238,35 +22305,13 @@ impl Node {
             // conflict detector reads: a member holding more of this feed than this node does
             // means a restored older profile, and that stops writes here instead of risking an
             // equivocation. No other sync event fetches a node's own head back.
-            let own_hint = if sparse {
-                ch.sparse_settlement_pending_own_head(profile.store())
-            } else {
-                None
-            };
-            // Only a peer that has not said it holds the own head is asked (ADR-038 FX-15):
-            // asked of every connected peer on every tick, a quiet room ran a round per
-            // peer per second that fetched nothing (the decider's daemon at 50–67% CPU).
-            // A member catching up on a backlog is not behind for more than a tick: its word
-            // is its committed window head, selected before the bodies arrive (#996, measured
-            // 2026-10-20 on two shipped daemons: a member fetching 200 rows over 45 s drew two
-            // offers in 80 s; the serving lane's 953 "rounds" were the requests it answered,
-            // about six per row fetched, which `vox status` now counts as `served`).
-            let own_targets: Vec<Digest32> = match own_hint {
-                Some((_, _, size)) => self
-                    .connected_peers()
-                    .into_iter()
-                    .filter(|peer| ch.held_through(peer).is_none_or(|held| held < size))
-                    .collect(),
-                None => Vec::new(),
-            };
             if sparse
                 && !ch.is_settled()
                 && !ch
                     .sparse_settlement_local_ready(profile.store(), now_ms)
                     .unwrap_or(false)
             {
-                drop(ch);
-                self.offer_own_head(channel_id, own_hint, own_targets);
+                self.offer_own_head_locked(channel_id, &mut ch);
                 return;
             }
             let settlement = self.with_current_computer_authority(|| {
@@ -22296,7 +22341,8 @@ impl Node {
             let Some(back) = settlement else {
                 return;
             };
-            (back, own_hint, own_targets)
+            self.offer_own_head_locked(channel_id, &mut ch);
+            back
         };
         match back {
             Ok(true) => self.note_local_governance_append(channel_id),
@@ -22310,7 +22356,6 @@ impl Node {
                 });
             }
         }
-        self.offer_own_head(channel_id, own_hint, own_targets);
     }
 
     /// Record what lane rounds learned about how far each peer holds this node's own feed
@@ -22325,51 +22370,250 @@ impl Node {
             return;
         };
         let mut touched = std::collections::BTreeSet::new();
-        for (room, peer, seq) in std::mem::take(&mut self.held_notes) {
-            if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
-                shared.lock().await.note_held(&store, peer, seq);
-                touched.insert(room);
+        for note in std::mem::take(&mut self.held_notes) {
+            let Some(shared) = self.channels.get(&note.room).map(Arc::clone) else {
+                continue;
+            };
+            let mut room = shared.lock().await;
+            if let Some((scope, target)) = note.rearm {
+                self.rearm_own_probe_locked(&mut room, scope, target);
+                continue;
+            }
+            if let Some((claim, answer)) = note.probe {
+                let current_scope = room.history_instance(&store).and_then(|instance| {
+                    crate::node::history_stream::authorization_generation(
+                        &store,
+                        room.me(),
+                        note.room,
+                        instance,
+                        room.epoch(),
+                    )
+                    .map(|authorization| (instance, authorization))
+                });
+                let (current_instance, current_authorization) = match current_scope {
+                    Ok(current) => current,
+                    Err(error) => {
+                        room.poison(&error);
+                        eprintln!("vox: own-history receipt scope could not be read: {error}");
+                        self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                        continue;
+                    }
+                };
+                let current = self
+                    .ports
+                    .get(&(note.room, note.peer))
+                    .is_some_and(|port| port.own_probe == Some(claim.port))
+                    && self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&note.peer))
+                        .is_some_and(|conn| conn.serial() == claim.context.connection)
+                    && room.me() == claim.context.node
+                    && room.epoch() == claim.context.epoch
+                    && current_instance == claim.context.instance
+                    && current_authorization == claim.context.authorization;
+                if !current {
+                    self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                    continue;
+                }
+                let before = room.held_through(&note.peer);
+                if let (Some(_), crate::node::history_stream::OwnProbeAnswer::Complete(head)) =
+                    (note.seq, answer)
+                {
+                    room.note_held(&store, note.peer, head.size);
+                }
+                // This SAME real answer joins its facts atomically. Only here, after
+                // fresh actor fences, may full completion stamp and clear canonical aliases.
+                match self.history_hints.observed(claim, answer, note.complete) {
+                    Ok(Some(updated)) if !note.complete => {
+                        self.bounded_sync.rebase_own_probe(claim, updated);
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let after = room.held_through(&note.peer);
+                        if before != after {
+                            if let Err(error) = self.history_hints.receipt_changed(
+                                claim.port,
+                                note.request,
+                                before,
+                                after,
+                            ) {
+                                eprintln!("vox: own-history receipt change could not be retained: {error}");
+                            }
+                        }
+                        self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                    }
+                    Err(error) => {
+                        eprintln!("vox: own-history observation could not be retained: {error}");
+                        self.rearm_own_probe_locked(&mut room, claim.port, claim.target);
+                    }
+                }
+                if before != room.held_through(&note.peer) {
+                    touched.insert(note.room);
+                }
+            } else if let Some(seq) = note.seq {
+                let before = room.held_through(&note.peer);
+                room.note_held(&store, note.peer, seq);
+                let after = room.held_through(&note.peer);
+                if before != after {
+                    if let Some(scope) = self
+                        .ports
+                        .get(&(note.room, note.peer))
+                        .and_then(|port| port.own_probe)
+                    {
+                        if let Err(error) =
+                            self.history_hints
+                                .receipt_changed(scope, note.request, before, after)
+                        {
+                            eprintln!(
+                                "vox: own-history receipt change could not be retained: {error}"
+                            );
+                        }
+                    }
+                    touched.insert(note.room);
+                }
             }
         }
-        // The bounded result that carried the acknowledgement owns the next settlement attempt.
-        // This is both the write-unblock edge and, while another peer still owes the head, the
-        // edge that offers it there. Neither correctness transition waits for actor maintenance.
         for room in touched {
             self.settle_room(&room).await;
+        }
+    }
+
+    /// Rejection releases existing input only, never a retired old owner's entry. The
+    /// current room snapshot configures its canonical scope before any new attempt.
+    fn rearm_own_probe_locked(
+        &mut self,
+        room: &mut ChannelState,
+        scope: crate::node::history_stream::OwnProbePort,
+        target: crate::node::history_stream::HeadHint,
+    ) {
+        if !self
+            .ports
+            .get(&(scope.room, scope.peer))
+            .is_some_and(|port| port.own_probe == Some(scope))
+            || !self.history_hints.retry_probe(scope, target)
+        {
+            return;
+        }
+        // A local storage fault retains this input and its need, but may not authorize
+        // another immediate execution. Reopen/recovery owns that fault, as for local_retry.
+        let refreshed = !room.is_poisoned() && self.offer_own_head_locked(&scope.room, room);
+        if let Some(port) = self.ports.get_mut(&(scope.room, scope.peer)) {
+            port.raise();
+        }
+        if refreshed {
+            self.sched_rooms.insert(scope.room);
         }
     }
 
     /// Offer this node's own committed head to every connected peer, so the next round fetches
     /// the own live window back (ADR-037 R5): the acknowledgement that settles the own feed's
     /// bookkeeping, and the evidence the own-history conflict detector reads.
-    fn offer_own_head(
-        &mut self,
-        channel_id: &Digest32,
-        hint: Option<(Digest32, Digest32, u64)>,
-        targets: Vec<Digest32>,
-    ) {
-        let Some((author, head, size)) = hint else {
-            return;
-        };
-        if targets.is_empty() {
-            return;
-        }
+    /// Read the post-settlement facts and admit their metadata while the SAME room
+    /// guard is still held. No old local snapshot may overwrite a newer Source observation.
+    fn offer_own_head_locked(&mut self, channel_id: &Digest32, ch: &mut ChannelState) -> bool {
         let Some(profile) = self.profile.as_ref() else {
-            return;
+            return false;
         };
-        let hint = crate::node::history_stream::HeadHint { author, size, head };
-        if let Some(job) = self.history_budget.try_start(
-            profile.fingerprint(),
-            crate::node::history_budget::Lane::Control,
-        ) {
-            for peer in targets {
-                let generation = self.history_hints.generation(*channel_id, peer);
-                let _ = self
-                    .history_hints
-                    .offer(&job, generation, *channel_id, peer, &[hint]);
+        if !ch.uses_sparse_history(profile.store()).unwrap_or(true) {
+            return false;
+        }
+        let (local, context) = match ch.history_head(profile.store(), &ch.me()).and_then(|head| {
+            let local = head.map(|head| crate::node::history_stream::HeadHint {
+                author: head.binding.author,
+                size: head.root.leaves,
+                head: head.id(),
+            });
+            let instance = ch.history_instance(profile.store())?;
+            let authorization = crate::node::history_stream::authorization_generation(
+                profile.store(),
+                ch.me(),
+                *channel_id,
+                instance,
+                ch.epoch(),
+            )?;
+            Ok((
+                local,
+                crate::node::history_stream::OwnProbeContext {
+                    node: ch.me(),
+                    instance,
+                    epoch: ch.epoch(),
+                    authorization,
+                    connection: 0,
+                },
+            ))
+        }) {
+            Ok(current) => current,
+            Err(error) => {
+                ch.poison(&error);
+                eprintln!("vox: own-history observation scope could not be read: {error}");
+                return false;
+            }
+        };
+        let target =
+            ch.sparse_settlement_pending_own_head(profile.store())
+                .map(
+                    |(author, head, size)| crate::node::history_stream::HeadHint {
+                        author,
+                        head,
+                        size,
+                    },
+                );
+        let targets = self.connected_peers();
+        for peer in targets {
+            let Some(connection) = self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(&peer))
+                .map(|conn| conn.serial())
+            else {
+                continue;
+            };
+            let Some(scope) = self
+                .ports
+                .get(&(*channel_id, peer))
+                .and_then(|port| port.own_probe)
+            else {
+                continue;
+            };
+            // Metadata refresh needs no worker grant. In particular a rejected root
+            // cannot depend on spare Control capacity to restore its current scope.
+            self.history_hints.bind_connection(scope, connection);
+            let current = crate::node::history_stream::OwnProbeContext {
+                connection,
+                ..context
+            };
+            let offer = self
+                .history_hints
+                .refresh_own_scope(scope, current, local)
+                .and_then(|valid| {
+                    if valid {
+                        if let Some(hint) = target.filter(|hint| {
+                            ch.held_through(&peer).is_none_or(|held| held < hint.size)
+                        }) {
+                            if let Some(job) = self.history_budget.try_start(
+                                profile.fingerprint(),
+                                crate::node::history_budget::Lane::Control,
+                            ) {
+                                self.history_hints
+                                    .offer_local_own(&job, scope, current, hint)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+            if let Err(error) = offer {
+                let _ = self.event_tx.send(NodeEvent::SyncFailed {
+                    channel_id: *channel_id,
+                    peer,
+                    reason: format!("local own-history observation admission failed: {error}"),
+                });
+                eprintln!("vox: local own-history observation admission failed: {error}");
+                return false;
             }
         }
         self.sched_rooms.insert(*channel_id);
+        true
     }
 
     /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). Offering needs no

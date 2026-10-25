@@ -1,6 +1,8 @@
 //! One explicitly authorized response quantum. Continuations describe remaining work and never
 //! schedule it. The caller owns admission, stream lifetime and daemon-wide worker reservation.
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::log::entry::Entry;
@@ -40,6 +42,15 @@ fn test_private_body_marker() -> Option<(std::path::PathBuf, std::path::PathBuf)
     None
 }
 
+// Carry the already charged returned Head directly; no extra boxed wrapper allocation.
+#[allow(clippy::large_enum_variant)]
+enum ServedHead {
+    Missing,
+    RolePending,
+    Unavailable,
+    Ready(crate::log::history::SignedHead),
+}
+
 enum Sent {
     Yes,
     Full,
@@ -60,10 +71,11 @@ pub(super) async fn answer(
     preamble: Preamble,
     query: Query,
     handshake_bytes: usize,
-    inbox: &super::HintInbox,
+    inbox: &Arc<super::HintInbox>,
     inbox_generation: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,
+    local_inventory_busy: &mut bool,
 ) -> Result<Status> {
     let receipt_source;
     let source = if preamble.purpose == Purpose::Control
@@ -100,9 +112,20 @@ pub(super) async fn answer(
         };
         let work_job = incoming.job();
         for slice in hints.chunks(64) {
-            let offered = source
+            let offered = match source
                 .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
-                .await?;
+                .await?
+            {
+                super::source::InventoryOffer::Offered(offered) => offered,
+                super::source::InventoryOffer::Publication(_)
+                | super::source::InventoryOffer::Unavailable
+                | super::source::InventoryOffer::ConnectionChanged => {
+                    // This serving stream has no retained outgoing Flow. Return the
+                    // existing coded serving Busy and release its HAVE and worker.
+                    *local_inventory_busy = true;
+                    return Err(Error::PeerRefused(crate::wire::WireError::SessionBusy));
+                }
+            };
             *inventory_added |= offered.added != 0;
             if offered.full {
                 return Err(Error::Unreachable("inventory pending capacity busy"));
@@ -194,7 +217,7 @@ async fn respond(
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
                     let Some(head) = room.history_head(store, &author)? else {
-                        return Ok(None);
+                        return Ok(Some(ServedHead::Missing));
                     };
                     if receipt {
                         // A receipt names the last authenticated feed position whose source and
@@ -205,24 +228,30 @@ async fn respond(
                         let read = room.history_read(store)?;
                         if head.root.leaves != 0 {
                             let Some((through, hash)) = read.history_held_through(&author) else {
-                                return Ok(None);
+                                return Ok(Some(ServedHead::RolePending));
                             };
+                            if through < head.root.leaves {
+                                return Ok(Some(ServedHead::RolePending));
+                            }
+                            if through > head.root.leaves {
+                                // A later restart prefix is not ordinary progress toward this
+                                // selected head. Preserve unavailable rather than fake Busy.
+                                return Ok(Some(ServedHead::Unavailable));
+                            }
                             let Some(included) = read.history_inclusion_receipt(
                                 &head.id(),
                                 &author,
                                 head.root.leaves,
                             )?
                             else {
-                                return Ok(None);
+                                return Ok(Some(ServedHead::RolePending));
                             };
-                            if through != head.root.leaves
-                                || hash != included.header().entry().entry_hash()
-                            {
-                                return Ok(None);
+                            if hash != included.header().entry().entry_hash() {
+                                return Ok(Some(ServedHead::Unavailable));
                             }
                         }
                     }
-                    Ok(Some(head))
+                    Ok(Some(ServedHead::Ready(head)))
                 })
                 .await?;
             let held = match found {
@@ -230,7 +259,14 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let wire = held.value.to_wire();
+            let head = match held.value {
+                ServedHead::Ready(head) => head,
+                ServedHead::RolePending => return Ok((Status::Busy, None)),
+                ServedHead::Missing | ServedHead::Unavailable => {
+                    return Ok((Status::EvidenceUnavailable, None))
+                }
+            };
+            let wire = head.to_wire();
             let status = match send_object(
                 source,
                 io,

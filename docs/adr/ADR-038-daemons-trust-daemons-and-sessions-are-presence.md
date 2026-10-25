@@ -542,6 +542,61 @@ lessons. It changes neither this record's decision status nor any requirement or
   retrying. The shipped proof binds its Content verdict to one exact accepted entry hash observed
   at Bob's effect outcome and then performs one `vox room read`; a polling read may not relabel a
   later unrelated refusal as this defect.
+  Source RCA and implementation, 2026-10-24 (#1021): the original refusal path had already
+  received and removed a wire response before recording why its peer could not supply the
+  requested history. That local write, and inventory's removal of a superseded refusal, required
+  an idle sparse publication; a legitimate concurrent publisher could therefore be reported as
+  malformed stored history, leaving FX-29's no-repeat-pull decision unsaved. The repair is to
+  retain the exact local post-response continuation, including its captured targets and
+  disposition, and subscribe to publication completion under the same room lock that checks the
+  publication phase. Its actual retained producer is to be advanced, or its completion is to
+  wake the exact waiting Flow; the waiter releases its active worker and byte reservations, and
+  a resumed turn checks current authority and publication state before continuing local
+  bookkeeping. The completed response is not fetched again merely to retry that bookkeeping, and
+  an unchanged refusal already saved remains write-free. Inbound inventory serving has a
+  different owner: when that local publication prevents processing, the serving exchange is to
+  return the existing SessionBusy response and account it as local Busy, preserving other
+  transport, storage and authority failures. This applies FX-29's existing quiet-round and
+  changed-inventory rules; it adds no timer, new queue, or promise that a remote peer's Busy is
+  a local completion event.
+
+  Follow-up RCA, 2026-10-24 (#1021/#996;
+  [full source and runtime record](https://github.com/robertelee78/vox/issues/1021#issuecomment-6392036366)):
+  a completed own-head observation was treated as a new
+  local publication, and even an unchanged peer-held note re-entered settlement. Settlement
+  could therefore offer the same own head immediately after the exact hint had finished,
+  producing completed empty `offer` rounds without a new head, acknowledgement or periodic need.
+  The candidate is to retain one exact observation in the existing per-port hint scope, shared
+  by local and incoming inventory admission. Its original target, room instance, authority,
+  connection and changed peer-information witness are separate from the actual role-complete
+  Head the peer returned; observing position four never acknowledges a requested position five.
+  Only a fully completed, current, validated own-head query is to record that observation.
+  An initial own-head query answered unavailable is to retain a distinct terminal observation
+  in that same scope, with no head or acknowledgement. A locally generated target is not a
+  head the peer advertised and is not to become a durable advertised-head refusal: the peer's
+  first real advertisement of that same head must reach the shared admission decision.
+  Other-author, body and archive refusals keep their existing durable relationship. Both
+  admission callers are to read and admit their facts under the same room guard, after local
+  settlement mutations; a delayed old snapshot cannot replace a newer observation. Successful
+  cleanup is to follow the actor's fresh room, authority and filed-connection checks and clear
+  redundant canonical hints atomically with recording completion. A rejected completion is to
+  rearm only already retained work in the current port generation, never recreate a retired
+  owner or depend on an unrelated timer for its next attempt.
+  Identical completion, advertisement and periodic arrival cannot invalidate it; real head,
+  receipt, authority and connection changes can, including a lower or zero receipt, without
+  hiding higher or conflicting own-head evidence from rollback detection. A known current head
+  whose role receipt is still pending is to answer Busy under the existing peer-Busy policy,
+  rather than durably claim that the evidence is unavailable; missing or contradictory evidence,
+  storage and authority errors keep their distinct outcomes. The exact departure acknowledgement
+  remains independently owned. Shipped status is to name the scoped target, actual first
+  completed observation and actual last started request, so another request for an unchanged
+  completed need is visible without a new timing threshold or test-only counter. This is an
+  implementation correction to FX-15 and FX-29, not a completed proof, a new cadence or a node-
+  wide acknowledgement. The smoke established the completion-to-settlement feedback and an
+  unchanged peer-held position behind the local feed, but did not capture the actual signed
+  Head response that explains that difference. The peer-held status alone does not establish
+  which Head or role-completion answer the peer returned; that cause remains an explicit
+  diagnostic question, not a key-delivery assumption or evidence of a fabricated receipt.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
   power loss: a node's own entries, consent, trust, keys, Session records and the format marker
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person
