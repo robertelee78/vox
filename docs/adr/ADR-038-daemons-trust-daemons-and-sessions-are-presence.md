@@ -1109,8 +1109,11 @@ complete. The recipient's contiguous role receipt still stops at its missing bod
 publication wakes the existing bounded metadata owner, which discovers pending key work in
 sixteen-record index pages and transfers one exact local need to the actual author's Port.
 That author's separate bounded body operation uses the ordinary body verifier, refill, current
-trust and namespace checks. A source refusal retains the debt and suppresses only that source's
-unchanged author work; it cannot suppress or recreate Alice's unrelated public dependency.
+trust and namespace checks. A source refusal retains the exact body debt and suppresses only
+that source's unchanged body attempt, using a domain-separated entry-hash relationship in the
+existing refusal tree. It cannot hide a different owed package under the same Head or suppress
+or recreate Alice's unrelated public dependency. Those refusal rows retire atomically with
+their bounded KeyBody obligations after verified refill.
 Restart, publication cleanup and actual trust/prekey changes recheck the durable index. No
 private body is invented at a nonrecipient relay, no missing recipient position is acknowledged,
 and no private key or Session body becomes public proof material. This reconciles existing

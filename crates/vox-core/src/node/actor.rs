@@ -818,6 +818,7 @@ struct ObservationRefresh {
 struct ObservationCapture {
     key_body: Option<crate::node::history_stream::KeyBodyNeed>,
     key_body_after: Option<[u8; 64]>,
+    key_body_scope: crate::node::history_stream::KeyBodyScope,
     instance: [u8; 16],
     epoch: u64,
     authorization: Digest32,
@@ -15974,6 +15975,27 @@ impl Node {
         let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
             return;
         };
+        if !self
+            .ports
+            .values()
+            .any(|port| port.sparse && !port.poisoned)
+        {
+            return;
+        }
+        // One fixed nonce-prefix read, never a room mutex/scan or queued I/O. Absence
+        // captures have the same current-authority obligation as positive captures.
+        let nonce = match store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+            crate::node::trust::TRUST_META_KEY,
+        ) {
+            Ok(nonce) => nonce,
+            Err(error) => {
+                for port in self.ports.values_mut().filter(|port| port.sparse) {
+                    port.poisoned = true;
+                }
+                eprintln!("vox: key-delivery authority could not be refreshed: {error}");
+                return;
+            }
+        };
         // Consuming a dirty bit transfers ownership to EVERY existing room port, before
         // selecting the one bounded task. A task/result never clears a later producer's bit.
         let dirty_rooms: std::collections::BTreeSet<_> = self
@@ -15982,11 +16004,41 @@ impl Node {
             .filter(|(_, port)| port.observation_signal.take_dirty())
             .map(|((room, _), _)| *room)
             .collect();
+        let key_dirty_rooms: std::collections::BTreeSet<_> = self
+            .ports
+            .iter()
+            .filter(|(_, port)| port.observation_signal.take_key_body_dirty())
+            .map(|((room, _), _)| *room)
+            .collect();
         for ((room, _), port) in &mut self.ports {
             if dirty_rooms.contains(room) {
                 port.observation_initialized = false;
+            }
+            let authorization = crate::node::history_stream::generation_from_nonce(
+                node,
+                *room,
+                port.observation_instance,
+                port.epoch,
+                nonce,
+            );
+            if port
+                .key_body_scope
+                .is_some_and(|scope| scope.authorization != authorization)
+            {
+                port.key_body = None;
                 port.key_body_initialized = false;
                 port.key_body_after = None;
+                port.key_body_scope = None;
+                port.key_body_rescan = false;
+            }
+            if key_dirty_rooms.contains(room) {
+                if port.key_body_initialized {
+                    port.key_body_initialized = false;
+                    port.key_body_after = None;
+                } else {
+                    // Preserve this finite pass; insertions behind it owe one later pass.
+                    port.key_body_rescan = true;
+                }
             }
         }
         let eligible = |(key, port): &(&(Digest32, Digest32), &crate::node::ports::Port)| {
@@ -16023,6 +16075,7 @@ impl Node {
         let key_body_after = port.key_body_after;
         let key_body_initialized = port.key_body_initialized;
         let key_body = port.key_body;
+        let previous_key_body_scope = port.key_body_scope;
         let pending_role = port
             .own_probe
             .and_then(|scope| self.history_hints.pending_role(scope));
@@ -16118,12 +16171,26 @@ impl Node {
                     } else {
                         None
                     };
+                    let key_body_scope = crate::node::history_stream::KeyBodyScope {
+                        authorization,
+                        head: snapshot.and_then(|value| value.peer.known_head),
+                        peer_incarnation: room.history_inventory_incarnation(&peer_id),
+                        author_incarnation: room.history_author_inventory_incarnation(&peer_id),
+                    };
+                    let same_lifetime = previous_key_body_scope
+                        .is_some_and(|prior| prior.same_lifetime(key_body_scope));
                     let (key_body_after, key_body) = if key_body_initialized
-                        && key_body.is_none_or(|need| need.authorization == authorization)
+                        && previous_key_body_scope == Some(key_body_scope)
                     {
                         (None, key_body)
                     } else if room.is_member(&peer_id) {
-                        room.history_key_body_page(&store, peer_id, authorization, key_body_after)?
+                        // Head growth during a pass cannot reset finite scan progress.
+                        let after = if same_lifetime && !key_body_initialized {
+                            key_body_after
+                        } else {
+                            None
+                        };
+                        room.history_key_body_page(&store, peer_id, authorization, after)?
                     } else {
                         (None, None)
                     };
@@ -16143,6 +16210,7 @@ impl Node {
                     Ok(ObservationCapture {
                         key_body,
                         key_body_after,
+                        key_body_scope,
                         instance,
                         epoch,
                         authorization,
@@ -16225,9 +16293,15 @@ impl Node {
         match accepted {
             Ok(capture) => {
                 port.key_body_after = capture.key_body_after;
+                port.key_body_scope = Some(capture.key_body_scope);
                 port.key_body_initialized =
                     capture.key_body.is_some() || capture.key_body_after.is_none();
                 port.key_body = capture.key_body;
+                if port.key_body_initialized && port.key_body.is_none() && port.key_body_rescan {
+                    port.key_body_rescan = false;
+                    port.key_body_initialized = false;
+                    port.key_body_after = None;
+                }
                 if let Some((claim, role, known)) = capture.pending_role {
                     match known {
                         crate::node::history_stream::RoleKnowledge::Known => {

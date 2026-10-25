@@ -94,10 +94,14 @@ impl ChannelState {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
-        authorization: (Digest32, Digest32),
+        authorization: (
+            Digest32,
+            Digest32,
+            Option<crate::node::history_stream::KeyBodyNeed>,
+        ),
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<HistoryDeclineResult> {
-        let (node, expected_authorization) = authorization;
+        let (node, expected_authorization, key_body) = authorization;
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
                 .ok_or(Error::MalformedGovernance(
@@ -128,7 +132,30 @@ impl ChannelState {
             return Ok(HistoryDeclineResult::AuthorizationChanged { current });
         }
         let mut index = self.entries.write(&mut batch, &self.sek, &room)?;
-        if index.history_declined_head(&peer, &author)?
+        if let Some(need) = key_body {
+            let (busy, owner) = index.publication_dependency();
+            if busy {
+                return Ok(HistoryDeclineResult::Publication(HistoryPublicationWait {
+                    owner,
+                    wake: publication_wake,
+                }));
+            }
+            if need.target.author != author || peer != author || head != need.target.head {
+                return Err(Error::Profile("key-body refusal scope differs"));
+            }
+            if !index.history_key_body_pending(need)? {
+                // A concurrent verified refill already retired this debt. Do not create an
+                // orphan refusal row after its bounded owner has disappeared.
+                return Ok(HistoryDeclineResult::Stored {
+                    remembered: false,
+                    current,
+                });
+            }
+        }
+        let relationship = key_body.map_or(author, |need| {
+            entry_store::sparse::key_body_decline_key(&author, &need.hash)
+        });
+        if index.history_declined_head(&peer, &relationship)?
             == Some((
                 head,
                 expected_authorization,
@@ -150,7 +177,7 @@ impl ChannelState {
         }
         index.keep_history_declined_head(
             peer,
-            author,
+            relationship,
             head,
             expected_authorization,
             peer_incarnation,
@@ -721,10 +748,7 @@ impl ChannelState {
         author: Digest32,
         authorization: Digest32,
         after: Option<[u8; 64]>,
-    ) -> Result<(
-        Option<[u8; 64]>,
-        Option<crate::node::history_stream::KeyBodyNeed>,
-    )> {
+    ) -> Result<crate::node::history_stream::KeyBodyScan> {
         let read = self.history_read(store)?;
         if read.publication_busy() {
             // Cleanup completion produces another retained metadata wake.
@@ -743,20 +767,14 @@ impl ChannelState {
         let Some(target) = read.history_head(&target_id)? else {
             return Ok((None, None));
         };
-        if let Some((declined, scope, peer_i, author_i)) =
-            read.history_declined_head(&author, &author)?
-        {
-            if declined == target.id()
-                && scope == authorization
-                && self
-                    .history_inventory_incarnation(&author)
-                    .zip(self.history_author_inventory_incarnation(&author))
-                    == Some((peer_i, author_i))
-            {
-                return Ok((None, None));
-            }
-        }
-        let (next, debt) = read.history_key_body_page(author, after)?;
+        let (next, debt) = read.history_key_body_page(
+            author,
+            after,
+            target.id(),
+            authorization,
+            self.history_inventory_incarnation(&author)
+                .zip(self.history_author_inventory_incarnation(&author)),
+        )?;
         let Some(debt) = debt else {
             return Ok((next, None));
         };
@@ -957,7 +975,7 @@ impl ChannelState {
                 && entry.payload.is_none()
         }) {
             // Retained dirty ownership survives cancellation/error before the Flow returns.
-            self.history_observation.changed();
+            self.history_observation.key_body_changed();
         }
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
         // publication paths, a sparse history caller does not poison the room on commit failure.
@@ -977,13 +995,32 @@ impl ChannelState {
         store: &Store,
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<bool> {
+        // Only a real recipient-key publication needs another body scan at cleanup.
+        // Header decoding is bounded; ordinary Content never resets key discovery.
+        let key_body = {
+            let read = self.history_read(store)?;
+            let header = match read.sparse_publication_source()? {
+                Some((hash, _)) => {
+                    read.history_object(entry_store::sparse::ObjectKind::Header, &hash)?
+                }
+                None => None,
+            };
+            match header {
+                Some(wire) => Entry::from_wire(&wire)?.skeleton.v2.is_some_and(|v| {
+                    v.kind == crate::log::history::SignedEntryKind::KeyPackage
+                        && v.recipient == Some(self.me())
+                }),
+                None => false,
+            }
+        };
         let done = self
             .entries
             .cleanup_publication(store, &self.sek, &self.channel_id)?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         if done {
-            // A body debt committed before cancellation remains discoverable after cleanup.
-            self.history_observation.changed();
+            if key_body {
+                self.history_observation.key_body_changed();
+            }
             self.history_publication_changed.notify_waiters();
             let read = self.history_read(store)?;
             self.dag.set_order_revision(
@@ -1704,6 +1741,10 @@ impl ChannelState {
                     from: entry.skeleton.seq,
                     through: entry.skeleton.seq,
                 })?;
+                index.forget_history_declined_head(
+                    entry.skeleton.author_id,
+                    entry_store::sparse::key_body_decline_key(&entry.skeleton.author_id, &hash),
+                )?;
             }
             index.seal()?;
             let mut expired = Vec::new();
@@ -1771,7 +1812,7 @@ impl ChannelState {
             }
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
-                self.history_observation.changed();
+                self.history_observation.key_body_changed();
                 self.key_packages.published(self.next_log_id);
                 self.key_packages.note(entry.skeleton.author_id, log)?;
             }

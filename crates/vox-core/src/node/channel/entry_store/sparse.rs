@@ -440,6 +440,17 @@ pub(crate) struct Obligation {
     pub from: u64,
     pub through: u64,
 }
+/// Recipient-body refusals share the existing relationship tree but cannot suppress an
+/// author's public hint or a different owed package. Rows retire with the capped KeyBody.
+pub(crate) fn key_body_decline_key(author: &Digest32, hash: &Digest32) -> Digest32 {
+    let mut e = Encoder::new();
+    e.array(3)
+        .bytes(b"key-body-refusal")
+        .bytes(author)
+        .bytes(hash);
+    sha256(&e.finish())
+}
+
 pub(crate) type KeyBodyPage = (Option<[u8; 64]>, Option<Obligation>);
 
 impl Obligation {
@@ -827,6 +838,9 @@ impl Read<'_> {
         &self,
         author: Digest32,
         mut after: Option<[u8; 64]>,
+        target: Digest32,
+        authorization: Digest32,
+        incarnations: Option<(u64, u64)>,
     ) -> Result<KeyBodyPage> {
         for _ in 0..16 {
             let seek = match after {
@@ -861,6 +875,17 @@ impl Read<'_> {
             }
             after = Some(key);
             if obligation.kind == ObligationKind::KeyBody && obligation.author == author {
+                if let Some((head, scope, peer_i, author_i)) = self.history_declined_head(
+                    &author,
+                    &key_body_decline_key(&author, &obligation.object),
+                )? {
+                    if head == target
+                        && scope == authorization
+                        && incarnations == Some((peer_i, author_i))
+                    {
+                        continue;
+                    }
+                }
                 return Ok((after, Some(obligation)));
             }
         }
@@ -2717,6 +2742,27 @@ impl Write<'_, '_> {
             self.save_sparse_author(head.binding, state)?;
         }
         Ok(())
+    }
+    pub(crate) fn history_key_body_pending(
+        &self,
+        need: crate::node::history_stream::KeyBodyNeed,
+    ) -> Result<bool> {
+        let obligation = Obligation {
+            head: need.head,
+            kind: ObligationKind::KeyBody,
+            object: need.hash,
+            author: need.target.author,
+            from: need.seq,
+            through: need.seq,
+        };
+        Ok(Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.obligations,
+                &obligation.key()?,
+            )?
+            .is_some())
     }
     /// Bounded durable pending work. At the cap the caller yields before staging more objects.
     pub(crate) fn keep_history_obligation(&mut self, obligation: &Obligation) -> Result<bool> {

@@ -2129,6 +2129,7 @@ impl Node {
                     port.key_body = None;
                     port.key_body_initialized = false;
                     port.key_body_after = None;
+                    port.key_body_rescan = false;
                 }
                 self.bounded_completion_wake.notify_one();
             }

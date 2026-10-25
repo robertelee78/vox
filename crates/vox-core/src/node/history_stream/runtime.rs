@@ -971,10 +971,28 @@ impl Flow {
         author: Digest32,
         head: Digest32,
     ) -> Result<bool> {
-        let remembered = match source
-            .remember_decline(job, author, head, self.request)
+        self.decline_key(source, job, inbox, author, head, None)
             .await
-        {
+    }
+    async fn decline_key(
+        &mut self,
+        source: &super::source::Source,
+        job: &Job,
+        inbox: &super::hints::HintInbox,
+        author: Digest32,
+        head: Digest32,
+        key_body: Option<super::KeyBodyNeed>,
+    ) -> Result<bool> {
+        let saved = if let Some(need) = key_body {
+            source
+                .remember_key_body_decline(job, need, self.request)
+                .await
+        } else {
+            source
+                .remember_decline(job, author, head, self.request)
+                .await
+        };
+        let remembered = match saved {
             Ok(super::source::DeclineResult::Stored {
                 remembered,
                 captured,
@@ -1020,7 +1038,9 @@ impl Flow {
                 return Ok(false);
             }
         };
-        inbox.finish(self.room, source.peer, author, head);
+        if key_body.is_none() {
+            inbox.finish(self.room, source.peer, author, head);
+        }
         self.declined = self.declined.saturating_add(u64::from(remembered));
         Ok(true)
     }
@@ -2235,14 +2255,11 @@ impl Flow {
             if let Some(debt) = self.key_body_root.filter(|debt| {
                 matches!(query, Query::Entry { head, seq, .. } if head == debt.head && seq == debt.seq)
             }) {
-                // Save both the exact old source and this author's captured current hint.
-                // The durable KeyBody is NOT retired; this source cannot fill it unchanged.
-                if !self.decline(source, job, inbox, debt.target.author, debt.head).await? {
+                // Refuse only this exact body under the captured current author scope.
+                // Other owed bodies and public hints remain runnable under the SAME Head.
+                if !self.decline_key(source, job, inbox, debt.target.author, debt.target.head, Some(debt)).await? {
                     return Ok(());
                 }
-                if debt.target.head != debt.head
-                    && !self.decline(source, job, inbox, debt.target.author, debt.target.head).await?
-                { return Ok(()); }
                 self.tasks.clear();
                 self.replay = None;
                 return Ok(());

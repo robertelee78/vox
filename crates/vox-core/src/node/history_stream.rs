@@ -84,7 +84,7 @@ pub(crate) fn authorization_generation_in(
     Ok(generation_from_nonce(node, room, instance, epoch, nonce))
 }
 
-fn generation_from_nonce(
+pub(crate) fn generation_from_nonce(
     node: Digest32,
     room: Digest32,
     instance: [u8; 16],
@@ -608,6 +608,7 @@ pub struct HeadHint {
 #[derive(Debug)]
 pub(crate) struct ObservationSignal {
     dirty: std::sync::atomic::AtomicBool,
+    key_body_dirty: std::sync::atomic::AtomicBool,
     wake: std::sync::Mutex<std::sync::Weak<tokio::sync::Notify>>,
 }
 
@@ -616,6 +617,7 @@ impl Default for ObservationSignal {
         Self {
             // A new/reopened room has never announced its current snapshot.
             dirty: std::sync::atomic::AtomicBool::new(true),
+            key_body_dirty: std::sync::atomic::AtomicBool::new(false),
             wake: std::sync::Mutex::new(std::sync::Weak::new()),
         }
     }
@@ -635,8 +637,19 @@ impl ObservationSignal {
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 
+    pub(crate) fn key_body_changed(&self) {
+        self.key_body_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn take_key_body_dirty(&self) -> bool {
+        self.key_body_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
     pub(crate) fn dirty(&self) -> bool {
         self.dirty.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .key_body_dirty
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Transfer this recheck to every existing actor-owned room Port BEFORE selecting a
@@ -708,6 +721,22 @@ pub(crate) struct KeyBodyNeed {
     pub(crate) hash: Digest32,
     pub(crate) target: HeadHint,
     pub(crate) authorization: Digest32,
+}
+
+/// Scope of a local debt scan, including a completed absence/refusal result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyBodyScope {
+    pub(crate) authorization: Digest32,
+    pub(crate) head: Option<ObservedHead>,
+    pub(crate) peer_incarnation: Option<u64>,
+    pub(crate) author_incarnation: Option<u64>,
+}
+impl KeyBodyScope {
+    pub(crate) fn same_lifetime(self, other: Self) -> bool {
+        self.authorization == other.authorization
+            && self.peer_incarnation == other.peer_incarnation
+            && self.author_incarnation == other.author_incarnation
+    }
 }
 
 pub(crate) type KeyBodyScan = (Option<[u8; 64]>, Option<KeyBodyNeed>);

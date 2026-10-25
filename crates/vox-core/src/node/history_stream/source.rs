@@ -238,6 +238,34 @@ impl Source {
         head: Digest32,
         request: RequestId,
     ) -> Result<DeclineResult> {
+        self.remember_decline_key(job, author, head, request, None)
+            .await
+    }
+
+    pub(super) async fn remember_key_body_decline(
+        &self,
+        job: &Job,
+        need: super::KeyBodyNeed,
+        request: RequestId,
+    ) -> Result<DeclineResult> {
+        self.remember_decline_key(
+            job,
+            need.target.author,
+            need.target.head,
+            request,
+            Some(need),
+        )
+        .await
+    }
+
+    async fn remember_decline_key(
+        &self,
+        job: &Job,
+        author: Digest32,
+        head: Digest32,
+        request: RequestId,
+        key_body: Option<super::KeyBodyNeed>,
+    ) -> Result<DeclineResult> {
         // The marker is apparatus only: it proves that a real shipped flow carrying its captured
         // authorization has reached the durability edge before a proof changes trust.
         self.hold_decline_for_proof(author, head, request).await;
@@ -253,7 +281,7 @@ impl Source {
                     peer,
                     author,
                     head,
-                    authorization,
+                    (authorization.0, authorization.1, key_body),
                     &committed,
                 )?))
             })

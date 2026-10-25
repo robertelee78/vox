@@ -254,6 +254,8 @@ pub struct Port {
     pub(crate) key_body: Option<crate::node::history_stream::KeyBodyNeed>,
     pub(crate) key_body_after: Option<[u8; 64]>,
     pub(crate) key_body_initialized: bool,
+    pub(crate) key_body_scope: Option<crate::node::history_stream::KeyBodyScope>,
+    pub(crate) key_body_rescan: bool,
     /// At most one outbound attempt.
     pub out: Option<Attempt>,
     /// Up to [`INBOUND_PER_PORT`] inbound attempts.
@@ -323,6 +325,8 @@ impl Port {
             key_body: None,
             key_body_after: None,
             key_body_initialized: false,
+            key_body_scope: None,
+            key_body_rescan: false,
             out: None,
             inbound: BTreeMap::new(),
             queued: false,
