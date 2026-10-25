@@ -739,7 +739,8 @@ impl Source {
                 ));
             }
             // No room guard, pinned read, context map or batch survives this yield. The
-            // scalar cursor remains prepaid by THIS Source Job; no second owner is queued.
+            // scalar cursor remains prepaid by this Source Job. Each slice uses the
+            // existing charged read/record admission; no new admission owner is introduced.
             self.current()?;
             tokio::task::yield_now().await;
         }

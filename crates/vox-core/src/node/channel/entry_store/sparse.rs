@@ -929,7 +929,20 @@ impl Read<'_> {
         } else {
             self.history_range(binding, 1, target.root.leaves)?
         };
-        Ok(prefix == Some(target.root))
+        if prefix == Some(target.root) {
+            return Ok(true);
+        }
+        // A completed, head-scoped consistency receipt can precede export of its
+        // coordinate-keyed nodes. It is already exact accepted-chain evidence; requiring
+        // that export here would cycle older-Head promotion against its terminal journal.
+        Ok(self
+            .history_prefix_receipt(&current_id, &binding.author, target.root.leaves)?
+            .is_some_and(|receipt| {
+                receipt.head_id() == current_id
+                    && receipt.binding() == binding
+                    && receipt.root() == current.root
+                    && receipt.prefix() == target.root
+            }))
     }
     /// An individually evidence-complete published source and its exact inclusion target.
     /// This does not claim that the governance evaluator has applied the source's effect.

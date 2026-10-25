@@ -2,7 +2,7 @@
 //! envelope before these methods; every pinned store read is dropped before network I/O.
 
 use super::*;
-use crate::log::history::{ControlContext, Descriptor, LogScope, SignedHead, TreeBinding};
+use crate::log::history::{ControlContext, LogScope, SignedHead};
 use crate::node::store::Batch;
 
 /// Exact signed header and the length bound governing payload continuations.
@@ -668,17 +668,6 @@ impl ChannelState {
                 })
             })
             .transpose()
-    }
-
-    pub(crate) fn history_tree_range(
-        &self,
-        store: &Store,
-        binding: TreeBinding,
-        start: u64,
-        leaves: u64,
-    ) -> Result<Option<Descriptor>> {
-        self.history_read(store)?
-            .history_range(binding, start, leaves)
     }
 
     /// Decode and authenticate one body once under the caller's large-record envelope.
