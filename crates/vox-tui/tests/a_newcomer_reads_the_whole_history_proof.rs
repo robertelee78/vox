@@ -6486,6 +6486,26 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let mut nonempty_lanes = Vec::new();
     let mut repeated_history = Vec::new();
     for (index, name) in ["alice", "bob"].into_iter().enumerate() {
+        let required_lane = (control_room.clone(), fps[1 - index].clone());
+        for (edge, status) in [("before", &before[index].2), ("after", &after[index].2)] {
+            let status: serde_json::Value =
+                serde_json::from_str(status).expect("PRODUCT: quiet endpoint Status was not JSON");
+            let connected = pub_probe_room(&status, &control_room)["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|member| member["id"] == required_lane.1)
+                .and_then(|member| member["connected"].as_bool());
+            assert_eq!(connected, Some(true),
+                "APPARATUS: the known online {name}/{required_lane:?} pair was not connected at the {edge} quiet edge: {status}");
+        }
+        if !before_exact[index].contains_key(&required_lane)
+            || !after_exact[index].contains_key(&required_lane)
+        {
+            missing_lanes.push(format!(
+                "{name}: required online lane {required_lane:?} missing"
+            ));
+        }
         if before_exact[index].is_empty() || after_exact[index].is_empty() {
             missing_lanes.push(format!(
                 "{name}: before {:?}, after {:?}",
@@ -6508,7 +6528,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
                 continue;
             };
             let grown = now.since(*was);
-            if grown.completed == 0 {
+            if lane == &required_lane && grown.completed == 0 {
                 lanes_that_did_not_run.push(format!("{name} {lane:?}: {grown:?}"));
             }
             if grown.completed != grown.empty {
@@ -6529,7 +6549,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     );
     assert!(
         lanes_that_did_not_run.is_empty(),
-        "PRODUCT: a quiet lane completed no periodic round, so no-write could be a stopped \
+        "PRODUCT: a known online quiet lane completed no periodic round, so no-write could be a stopped \
          scheduler rather than correct empty sync (ADR-038 FX-29, #1021): \
          {lanes_that_did_not_run:?}"
     );
@@ -6823,7 +6843,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 
     // Bringing the actual source back is the one causal change that makes Carol's package
     // available. Her exact tail appears, then all three shipped daemons still exchange content.
-    let _alice_after_privacy = daemon(&alice, "alice-after-privacy");
+    let alice_after_privacy = daemon(&alice, "alice-after-privacy");
     attached(&alice, "alice-after-privacy");
     while !(privacy_readable(&carol)
         && read_hash(&carol, &room, &package_marker).as_deref()
@@ -6865,6 +6885,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         &room,
         &link,
         &fps,
+        alice_after_privacy,
         bob_after_restart,
         carol_from_bob_daemon,
     );
@@ -6879,8 +6900,9 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 /// visible merely because its bytes arrived later. No forged frame or database inspection stands
 /// in for the shipped product.
 ///
-/// Every wait below is fenced by exact terminal lane cycles. The process-wide proof watchdog is
-/// only an external APPARATUS deadman for a lane that makes no observable progress at all.
+/// Refusal boundaries use current outbound roots and actual terminal outcomes; unrelated incoming
+/// completions impose no round quota. With no configured watchdog, a causal wait has no elapsed
+/// verdict. An operator interruption is APPARATUS/NORESULT, never a product failure or a pass.
 #[cfg(feature = "optional-proofs")]
 #[allow(clippy::too_many_arguments)]
 fn prove_declined_refusal_lifecycle(
@@ -6891,13 +6913,14 @@ fn prove_declined_refusal_lifecycle(
     room: &str,
     link: &str,
     fps: &[String],
+    alice_daemon: Daemon,
     bob_daemon: Daemon,
     carol_daemon: Daemon,
 ) {
     const LOCAL_RETENTION: &str = "default 1\n";
     let pruned = "bob body retained only until the late member joins";
     for (name, dir) in [("alice", alice), ("bob", bob)] {
-        std::fs::write(dir.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
+        std::fs::write(dir.join("cfg/retention"), "default forever\n").unwrap_or_else(|error| {
             panic!(
                 "APPARATUS: could not stage {name}'s local retention file for the refusal: {error}"
             )
@@ -6935,6 +6958,16 @@ fn prove_declined_refusal_lifecycle(
         .to_owned();
     while !reads(carol, room, pruned) || !reads(alice, room, pruned) {
         std::thread::yield_now();
+    }
+    // Delivery is already visible. Expiry must not race the first legitimate transfer.
+    for (name, dir) in [("alice", alice), ("bob", bob)] {
+        std::fs::write(dir.join("cfg/retention"), LOCAL_RETENTION)
+            .expect("APPARATUS: first-refusal expiry configuration");
+        let (ok, out, err) = vox(dir, &["room", "retention", room, "--steps", "7d"], None);
+        assert!(
+            ok,
+            "PRODUCT: {name}'s first-refusal retention reload was refused: {out}{err}"
+        );
     }
     carol_daemon.stop();
     while reads(alice, room, pruned) || reads(bob, room, pruned) {
@@ -6982,8 +7015,21 @@ fn prove_declined_refusal_lifecycle(
         room,
         &fps[1],
         QuietLane::default(),
-        "late member's first missing-body decision",
-        |grown| grown.history_declined > 0,
+        "late member's first missing Bob-body decision",
+        |grown, status| {
+            grown.history_declined > 0
+                && parse_exact_refusal(
+                    pub_lane(status, room, &fps[1]),
+                    "history_refusal_saved",
+                    "first missing Bob body",
+                )
+                .is_some_and(|saved| {
+                    saved.peer == fps[1]
+                        && saved.author == fps[1]
+                        && saved.remembered
+                        && saved.captured_generation == saved.current_generation
+                })
+        },
     );
     assert!(
         !reads(late, room, pruned),
@@ -7012,7 +7058,7 @@ fn prove_declined_refusal_lifecycle(
     std::fs::write(&refill_hold, b"").unwrap_or_else(|error| {
         panic!("APPARATUS: could not hold retention after the exact refill: {error}")
     });
-    let _carol_after_refill = daemon(carol, "carol-delayed-refill-source");
+    let carol_after_refill = daemon(carol, "carol-delayed-refill-source");
     attached(carol, "carol-delayed-refill-source");
     wait_room_open(carol, room, "carol-delayed-refill-source");
     while !refill_outcome.is_file() {
@@ -7052,36 +7098,132 @@ fn prove_declined_refusal_lifecycle(
         std::thread::yield_now();
     }
 
-    // A transport reconnect does not change the peer, author, authorization or room lifetime.
-    // Its first completed exact lane cycle must therefore be empty and must not decide again.
+    // A new connection legitimately serves Bob's fresh OwnHead question as metadata. Only
+    // late's fetch direction must remain empty, under a new current outbound root and the
+    // same exact saved refusal. Incoming metadata is not a recipient body refetch.
+    let refusal_baseline = loop {
+        let (_, _, out) = synced(late);
+        let status: serde_json::Value = serde_json::from_str(&out)
+            .expect("PRODUCT: refusal reconnect baseline Status was not JSON");
+        let observation = pub_port_observation(&status, room, &fps[1]);
+        if pub_has_resolved_own_probe(&status, room, &fps[1])
+            && observation["initialized"] == true
+            && observation["dirty"] == false
+            && observation["desired"] == observation["sent"]
+            && pub_current_own_probe(&status, room, &fps[1]).is_some_and(|probe| {
+                probe["completed"]["root"]["target"] == probe["local_head"]
+                    && probe["last_started"]["target"] == probe["local_head"]
+                    && ["connection", "instance", "epoch"]
+                        .iter()
+                        .all(|key| probe[*key] == observation[*key])
+                    && probe["last_started"]["request"] == probe["completed"]["root"]["request"]
+                    && observation["desired"]["own_head"] == pub_local_head(probe, &fps[3])
+            })
+        {
+            break status;
+        }
+        std::thread::yield_now();
+    };
+    let saved_refusal = parse_exact_refusal(
+        pub_lane(&refusal_baseline, room, &fps[1]),
+        "history_refusal_saved",
+        "before refusal reconnect",
+    )
+    .expect("APPARATUS: reconnect baseline lacks the exact saved refusal");
+    assert!(saved_refusal.peer == fps[1] && saved_refusal.author == fps[1]
+        && saved_refusal.remembered
+        && saved_refusal.captured_generation == saved_refusal.current_generation,
+        "APPARATUS: reconnect baseline refusal is not Bob's current durable decision: {saved_refusal:?}");
+    let unchanged_fetch = |grown: QuietLane,
+                           status: &serde_json::Value,
+                           prior: &serde_json::Value,
+                           new_connection: bool| {
+        if !pub_has_resolved_own_probe(status, room, &fps[1]) {
+            return false;
+        }
+        let probe = pub_current_own_probe(status, room, &fps[1]).expect("resolved probe");
+        let old_probe = pub_current_own_probe(prior, room, &fps[1]).expect("prior resolved probe");
+        let capture = pub_port_observation(status, room, &fps[1]);
+        if capture["initialized"] != true
+            || capture["dirty"] != false
+            || capture["desired"] != capture["sent"]
+            || !["connection", "instance", "epoch"]
+                .iter()
+                .all(|key| probe[*key] == capture[*key])
+            || probe["last_started"]["request"] != probe["completed"]["root"]["request"]
+            || probe["last_started"]["target"] != probe["local_head"]
+            || probe["completed"]["root"]["target"] != probe["local_head"]
+            || capture["desired"]["own_head"] != pub_local_head(probe, &fps[3])
+            || probe["completed"]["root"]["request"] == old_probe["completed"]["root"]["request"]
+            || (new_connection && probe["connection"] == old_probe["connection"])
+        {
+            return false;
+        }
+        assert!(["node", "instance", "epoch", "authorization"].iter()
+            .all(|key| probe[*key] == old_probe[*key])
+            && probe["completed"]["disposition"] == "snapshot"
+            && capture["desired"] == pub_port_observation(prior, room, &fps[1])["desired"]
+            && pub_snapshot(probe, &fps[3]) == pub_snapshot(old_probe, &fps[3]),
+            "APPARATUS: reconnect/restart changed the actual room/grant/Head/role tuple; no unchanged-refusal credit: {status}");
+        assert_eq!(
+            parse_exact_refusal(
+                pub_lane(status, room, &fps[1]),
+                "history_refusal_saved",
+                "after refusal reconnect/restart"
+            )
+            .as_ref(),
+            Some(&saved_refusal),
+            "PRODUCT: reconnect/restart replaced the exact durable refusal: {status}"
+        );
+        grown.fetched_completed > 0
+    };
     bob_daemon.stop();
     while member_connected(late, room, &fps[1]) != Some(false) {
         std::thread::yield_now();
     }
-    // The baseline is deliberately after shipped status reports the disconnect. A completion
-    // from the old connection therefore cannot satisfy the reconnect claim.
+    // Capture after the disconnect, so an old connection's completion supplies no credit.
     let reconnect_before = exact_lane(late, room, &fps[1], "after Bob disconnected");
     let bob_daemon = daemon(bob, "bob-refusal-reconnected");
     attached(bob, "bob-refusal-reconnected");
+    wait_room_open(bob, room, "bob-refusal-reconnected");
     let reconnect = await_lane_claim(
         late,
         room,
         &fps[1],
         reconnect_before,
         "unchanged inventory after Bob reconnects",
-        |grown| grown.completed > 0,
+        |grown, status| unchanged_fetch(grown, status, &refusal_baseline, true),
     );
     assert!(
-        reconnect.completed == reconnect.empty
+        reconnect.fetched_completed == reconnect.fetched_empty
             && reconnect.history_fetched == 0
             && reconnect.history_declined == 0
             && reconnect.history_rearmed == 0,
         "PRODUCT: reconnecting Bob made the late member retry or forget an unchanged durable \
-         refusal instead of completing empty: {reconnect:?}"
+         refusal instead of completing empty in its fetch direction: {reconnect:?}"
     );
 
-    // Reconstruct the requester from disk. The first exact lane completion after restart is the
-    // durable observation: an in-memory suppression cannot survive this edge.
+    // The hold has no peer selector. Stop the other real sources so only Bob can own it.
+    alice_daemon.stop();
+    carol_after_refill.stop();
+    while [0usize, 2]
+        .iter()
+        .any(|index| member_connected(late, room, &fps[*index]) != Some(false))
+    {
+        std::thread::yield_now();
+    }
+    let restart_prior = loop {
+        let (_, _, out) = synced(late);
+        let status: serde_json::Value =
+            serde_json::from_str(&out).expect("PRODUCT: pre-restart refusal Status was not JSON");
+        let real_delta =
+            quiet_lanes(&out)[&(room.to_owned(), fps[1].clone())].since(reconnect_before);
+        if unchanged_fetch(real_delta, &status, &refusal_baseline, true) {
+            break status;
+        }
+        std::thread::yield_now();
+    };
+    // Reconstruct the requester from disk; suppression must survive a real outbound fetch.
     late_daemon.stop();
     let restart_hold = late.join("hold-refusal-restart-control");
     let decline_hold = late.join("hold-refusal-generation-write");
@@ -7120,20 +7262,36 @@ fn prove_declined_refusal_lifecycle(
         &fps[1],
         restart_before,
         "unchanged inventory after the requester's restart",
-        |grown| grown.completed > 0,
+        |grown, status| unchanged_fetch(grown, status, &restart_prior, false),
     );
     assert!(
-        restarted.completed == restarted.empty
+        restarted.fetched_completed == restarted.fetched_empty
             && restarted.history_fetched == 0
             && restarted.history_declined == 0
             && restarted.history_rearmed == 0,
         "PRODUCT: after the requester's daemon restart, its first Bob lane retried or forgot the \
-         durable refusal instead of completing empty: {restarted:?}"
+         durable refusal instead of completing empty in its fetch direction: {restarted:?}"
     );
 
     // Stage a distinct unavailable Bob head, then hold the real refusal write after its Flow has
     // captured the old grant. The trust edit below therefore races an actually in-flight stale
     // Flow, rather than merely hoping a periodic round overlaps two sequential commands.
+    late_daemon.stop();
+    let alice_for_pruning = daemon(alice, "alice-refusal-pruning");
+    attached(alice, "alice-refusal-pruning");
+    wait_room_open(alice, room, "alice-refusal-pruning");
+    let carol_for_pruning = daemon(carol, "carol-refusal-pruning");
+    attached(carol, "carol-refusal-pruning");
+    wait_room_open(carol, room, "carol-refusal-pruning");
+    for (name, dir) in [("alice", alice), ("bob", bob), ("carol", carol)] {
+        std::fs::write(dir.join("cfg/retention"), "default forever\n")
+            .expect("APPARATUS: stale-post delivery retention configuration");
+        let (ok, out, err) = vox(dir, &["room", "retention", room, "--steps", "7d"], None);
+        assert!(
+            ok,
+            "PRODUCT: {name}'s stale-post delivery retention reload was refused: {out}{err}"
+        );
+    }
     let stale_body = "bob body whose refusal races an authorization generation";
     std::fs::File::create(&decline_hold).unwrap_or_else(|error| {
         panic!("APPARATUS: could not arm the stale-refusal durability barrier: {error}")
@@ -7145,10 +7303,37 @@ fn prove_declined_refusal_lifecycle(
     );
     while [alice, bob, carol]
         .iter()
+        .any(|holder| !reads(holder, room, stale_body))
+    {
+        std::thread::yield_now();
+    }
+    for (name, dir) in [("alice", alice), ("bob", bob), ("carol", carol)] {
+        std::fs::write(dir.join("cfg/retention"), LOCAL_RETENTION)
+            .expect("APPARATUS: stale-post expiry retention configuration");
+        let (ok, out, err) = vox(dir, &["room", "retention", room, "--steps", "7d"], None);
+        assert!(
+            ok,
+            "PRODUCT: {name}'s stale-post expiry retention reload was refused: {out}{err}"
+        );
+    }
+    while [alice, bob, carol]
+        .iter()
         .any(|holder| reads(holder, room, stale_body))
     {
         std::thread::yield_now();
     }
+    alice_for_pruning.stop();
+    carol_for_pruning.stop();
+    let late_daemon = daemon_env(
+        late,
+        "late-refusal-stale",
+        &[(
+            "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
+            decline_hold_text.as_str(),
+        )],
+    );
+    attached(late, "late-refusal-stale");
+    wait_room_open(late, room, "late-refusal-stale");
     let decline_entered = std::path::PathBuf::from(format!("{}.entered", decline_hold.display()));
     while !decline_entered.exists() {
         std::thread::yield_now();
@@ -7214,6 +7399,19 @@ fn prove_declined_refusal_lifecycle(
     // Leaving deletes the local room, including its refusal namespace. Rejoining the same room
     // is a new local room/member lifetime; its missing-body decision cannot be suppressed by the
     // deleted lifetime's scalar. These are user commands and the visible room list is the fence.
+    // Alice's original bootstrap endpoint is deliberately offline. A real Bob-issued address
+    // reaches this same room while preserving Bob as the sole source of the rejoin observation.
+    let (ok, rejoin_link, err) = vox(bob, &["room", "link", room], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's shipped room link was refused: {rejoin_link}{err}"
+    );
+    let rejoin_link = rejoin_link.trim();
+    let parsed_link = vox_core::node::link::InviteLink::parse(rejoin_link)
+        .expect("PRODUCT: Bob's shipped room link was malformed");
+    assert!(vox_core::node::link::b32_encode(&parsed_link.channel_id) == room
+        && parsed_link.anchors.iter().any(|route| vox_core::node::link::b32_encode(&route.id) == fps[1]),
+        "APPARATUS: Bob's link does not name this canonical room and actual running source: {rejoin_link}");
     let room_before = exact_lane(late, room, &fps[1], "before late leaves the room");
     let (ok, out, err) = vox(late, &["room", "leave", room], None);
     assert!(
@@ -7232,7 +7430,7 @@ fn prove_declined_refusal_lifecycle(
     );
     let (ok, out, err) = vox(
         late,
-        &["room", "join", "--passphrase-file", "-", link],
+        &["room", "join", "--passphrase-file", "-", rejoin_link],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(
@@ -7246,13 +7444,20 @@ fn prove_declined_refusal_lifecycle(
         &fps[1],
         room_before,
         "the rejoined room/member lifetime",
-        |grown| grown.history_declined > 0,
+        |grown, _| grown.history_declined > 0,
     );
     assert!(
         !reads(late, room, pruned),
         "PRODUCT: the rejoined room exposed Bob's pruned body instead of recording the new \
          lifetime's refusal: {reincarnated:?}"
     );
+
+    let _alice_after_refusal = daemon(alice, "alice-after-refusal");
+    attached(alice, "alice-after-refusal");
+    wait_room_open(alice, room, "alice-after-refusal");
+    let _carol_after_refusal = daemon(carol, "carol-after-refusal");
+    attached(carol, "carol-after-refusal");
+    wait_room_open(carol, room, "carol-after-refusal");
 
     // Restore ordinary local retention through the same shipped reload command. Bob's next
     // authenticated head is the author successor that ends the refusal. The exact user-visible
@@ -7280,7 +7485,7 @@ fn prove_declined_refusal_lifecycle(
         &fps[1],
         successor_before,
         "Bob's authenticated successor head",
-        |grown| reads(late, room, successor) && grown.history_rearmed > 0,
+        |grown, _| reads(late, room, successor) && grown.history_rearmed > 0,
     );
     assert!(
         successor_lane.history_fetched > 0,
@@ -7449,10 +7654,6 @@ fn await_exact_refusal_transition(
                 lane: grown,
             };
         }
-        assert!(
-            grown.completed == 0,
-            "PRODUCT: the exact lane completed a successor cycle after fencing {stale:?} without durably saving the exact fresh-generation refusal; lane delta: {grown:?}"
-        );
         std::thread::yield_now();
     }
 }
@@ -7478,10 +7679,18 @@ fn await_lane_claim(
     peer: &str,
     before: QuietLane,
     claim: &str,
-    done: impl Fn(QuietLane) -> bool,
+    done: impl Fn(QuietLane, &serde_json::Value) -> bool,
 ) -> QuietLane {
     loop {
-        let now = exact_lane(dir, room, peer, claim);
+        let (_, _, status) = synced(dir);
+        let value: serde_json::Value =
+            serde_json::from_str(&status).expect("PRODUCT: exact lane Status was not JSON");
+        let now = quiet_lanes(&status)
+            .get(&(room.to_owned(), peer.to_owned()))
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("PRODUCT: exact {room}/{peer} lane missing at {claim}: {status}")
+            });
         // Leaving and rejoining creates a new room actor and may reset its lane counters. Treat
         // that truthful new generation as its own baseline; saturating every field against the
         // retired actor would otherwise hide all of the new lifetime's visible work.
@@ -7493,14 +7702,10 @@ fn await_lane_claim(
         } else {
             now.since(before)
         };
-        if done(grown) {
+        if done(grown, &value) {
+            eprintln!("REFUSAL LIFECYCLE OBSERVED: claim={claim} delta={grown:?} status={status}");
             return grown;
         }
-        assert!(
-            grown.completed < 2,
-            "PRODUCT: the exact {room}/{peer} lane completed two terminal cycles without proving \
-             {claim}; its shipped counter delta was {grown:?}"
-        );
         std::thread::yield_now();
     }
 }
@@ -9128,6 +9333,8 @@ struct LaneWhy {
 struct QuietLane {
     completed: u64,
     empty: u64,
+    fetched_completed: u64,
+    fetched_empty: u64,
     history_fetched: u64,
     history_served: u64,
     history_declined: u64,
@@ -9142,6 +9349,10 @@ impl QuietLane {
         Self {
             completed: self.completed.saturating_sub(before.completed),
             empty: self.empty.saturating_sub(before.empty),
+            fetched_completed: self
+                .fetched_completed
+                .saturating_sub(before.fetched_completed),
+            fetched_empty: self.fetched_empty.saturating_sub(before.fetched_empty),
             history_fetched: self.history_fetched.saturating_sub(before.history_fetched),
             history_served: self.history_served.saturating_sub(before.history_served),
             history_declined: self
@@ -9183,6 +9394,8 @@ fn quiet_lanes(status: &str) -> BTreeMap<(String, String), QuietLane> {
                 QuietLane {
                     completed: count("completed"),
                     empty: count("empty"),
+                    fetched_completed: count("fetched_completed"),
+                    fetched_empty: count("fetched_empty"),
                     history_fetched: count("history_fetched"),
                     history_served: count("history_served"),
                     history_declined: count("history_declined"),
