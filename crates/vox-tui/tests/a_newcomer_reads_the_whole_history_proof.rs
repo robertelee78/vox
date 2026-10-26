@@ -322,6 +322,8 @@ fn fx35_synced(dir: &Path, node: Option<&str>) -> Fx35Status {
 /// Wait for the shipped room list to say `room` is open. The proof's operator-selected watchdog
 /// owns any apparatus timebox; this causal wait has no elapsed product verdict of its own.
 fn wait_room_open(dir: &Path, room: &str, who: &str) {
+    // `room list` prints room_cli::short: exactly the first 12 base32 characters.
+    let displayed_room: String = room.chars().take(12).collect();
     loop {
         let (ok, out, err) = vox(dir, &["room", "list"], None);
         assert!(
@@ -329,9 +331,15 @@ fn wait_room_open(dir: &Path, room: &str, who: &str) {
             "PRODUCT (staging): {who}'s shipped `vox room list` failed while waiting for its \
              restarted room: {err}"
         );
-        if out
+        let matching: Vec<_> = out
             .lines()
-            .any(|line| line.trim_start().starts_with(room) && !line.contains("[preparing"))
+            .filter(|line| line.split_whitespace().next() == Some(displayed_room.as_str()))
+            .collect();
+        assert!(matching.len() <= 1,
+            "APPARATUS: {who}'s human room list has an ambiguous displayed ID {displayed_room}: {out}");
+        if matching
+            .first()
+            .is_some_and(|line| !line.contains("[preparing") && !line.contains("[closed]"))
         {
             return;
         }
@@ -7097,8 +7105,11 @@ fn prove_declined_refusal_lifecycle(
     );
     let (ok, listed, err) = vox(late, &["room", "list"], None);
     assert!(ok, "PRODUCT: late's room list failed after leave: {err}");
+    let displayed_room: String = room.chars().take(12).collect();
     assert!(
-        !listed.contains(room),
+        !listed
+            .lines()
+            .any(|line| { line.split_whitespace().next() == Some(displayed_room.as_str()) }),
         "PRODUCT: `vox room leave` returned but late's shipped room list still named {room}: \
          {listed}"
     );
