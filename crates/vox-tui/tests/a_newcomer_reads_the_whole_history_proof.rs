@@ -6994,6 +6994,101 @@ fn prove_declined_refusal_lifecycle(
     assert!(vox_core::node::link::b32_encode(&parsed_link.channel_id) == room
         && parsed_link.anchors.iter().any(|route| vox_core::node::link::b32_encode(&route.id) == fps[1]),
         "APPARATUS: initial Bob link does not name this canonical room and actual running source: {initial_link}");
+    // Creator commands may append public controls after the original message cuts. Hand
+    // their final fixed prefix to the remaining source before taking Alice offline.
+    let (ok, raw, err) = vox(alice, &["status", "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's final control-cut Status was refused: {raw}{err}"
+    );
+    let final_status: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+        panic!("APPARATUS: final control-cut Status JSON ({error}): {raw}")
+    });
+    assert!(
+        final_status["identity"] == fps[0],
+        "APPARATUS: final control cut selected another Alice: {raw}"
+    );
+    let final_room = pub_probe_room(&final_status, room);
+    let final_alice_cut = final_room["own_feed_through"]
+        .as_u64()
+        .filter(|cut| *cut > 0)
+        .expect("APPARATUS: final Alice control cut is absent");
+    let final_scope = pub_port_observation(&final_status, room, &fps[1]);
+    eprintln!("QUIET FINAL ALICE CONTROL CUT: cut={final_alice_cut} status={final_status}");
+    loop {
+        let current = [(alice, &fps[0]), (bob, &fps[1])].map(|(profile, identity)| {
+            let (ok, raw, err) = vox(profile, &["status", "--json"], None);
+            assert!(
+                ok,
+                "PRODUCT: final control handoff Status was refused: {raw}{err}"
+            );
+            let status: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+                panic!("APPARATUS: control handoff Status JSON ({error}): {raw}")
+            });
+            assert!(
+                status["identity"] == *identity,
+                "APPARATUS: control handoff selected another identity: {raw}"
+            );
+            status
+        });
+        let alice_room = pub_probe_room(&current[0], room);
+        let bob_room = pub_probe_room(&current[1], room);
+        let scope = pub_port_observation(&current[0], room, &fps[1]);
+        assert!(
+            alice_room["epoch"] == final_room["epoch"]
+                && bob_room["epoch"] == final_room["epoch"]
+                && scope["instance"] == final_scope["instance"]
+                && scope["epoch"] == final_scope["epoch"],
+            "APPARATUS: Alice's final-cut room lifetime changed before source isolation: {}",
+            current[0]
+        );
+        let acknowledged = pub_has_resolved_own_probe(&current[0], room, &fps[1])
+            && pub_current_own_probe(&current[0], room, &fps[1]).is_some_and(|probe| {
+                let done = &probe["completed"];
+                if probe["state"] != "observed" || done["disposition"] != "snapshot" {
+                    return false;
+                }
+                let observed = pub_snapshot(probe, &fps[0]);
+                probe["node"] == fps[0]
+                    && ["instance", "epoch", "connection"]
+                        .iter()
+                        .all(|key| probe[*key] == scope[*key])
+                    && probe["epoch"] == alice_room["epoch"]
+                    && probe["connection"].is_u64()
+                    && pub_probe_hex(&done["root"]["request"])
+                    && pub_probe_hex(&done["root"]["facts"])
+                    && pub_probe_head(&done["root"]["target"], &fps[0])
+                    && done["root"]["target"]["size"]
+                        .as_u64()
+                        .is_some_and(|size| size >= final_alice_cut)
+                    && probe["last_started"]["request"] == done["root"]["request"]
+                    && probe["last_started"]["target"] == done["root"]["target"]
+                    && observed["known_head"]["size"]
+                        .as_u64()
+                        .is_some_and(|held| held >= final_alice_cut)
+                    && observed["role"]["through"]
+                        .as_u64()
+                        .is_some_and(|held| held >= final_alice_cut)
+                    && probe["accepted_role"] == observed["role"]
+                    && probe["pending_role_validation"].is_null()
+                    && probe["role_validation_error"].is_null()
+            });
+        let bob_holds = bob_room["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|member| member["id"] == fps[0])
+            .and_then(|member| member["holds_through"].as_u64());
+        if acknowledged
+            && bob_holds.is_some_and(|held| held >= final_alice_cut)
+            && pub_probe_receipt(&current[0], room, &fps[1])
+                .is_some_and(|held| held >= final_alice_cut)
+        {
+            eprintln!("QUIET FINAL ALICE CONTROL HANDED OFF: cut={final_alice_cut} Alice_status={} Bob_status={}", current[0], current[1]);
+            break;
+        }
+        std::thread::yield_now();
+    }
     alice_daemon.stop();
     eprintln!(
         "[proof] FX-29 refusal body staged: hash={pruned_hash} receiver keeps forever; only Bob is reachable"
