@@ -7003,10 +7003,7 @@ impl Node {
                     };
                     if let Some((room, intent)) = retention {
                         self.queue_room_publication(room, Some(reply), Outcome::Done, false,
-                            RoomPublicationKind::Settings);
-                        if let Some(waiting) = self.publish_waiters.get_mut(&room) {
-                            waiting.retention = Some(intent);
-                        }
+                            RoomPublicationKind::Settings, Some(intent));
                         continue;
                     }
                     let outcome = self.handle(command).await;
@@ -7024,7 +7021,7 @@ impl Node {
                         break;
                     }
                     if let Some((room, kind)) = local_change.filter(|_| outcome.is_done()) {
-                        self.queue_room_publication(room, Some(reply), outcome, false, kind);
+                        self.queue_room_publication(room, Some(reply), outcome, false, kind, None);
                     } else {
                         // A dropped reply receiver is the caller's choice, not an error.
                         let _ = reply.send(outcome);
@@ -8404,6 +8401,7 @@ impl Node {
                 outcome,
                 false,
                 RoomPublicationKind::Open,
+                None,
             );
             return;
         }
@@ -8418,6 +8416,7 @@ impl Node {
         outcome: Outcome,
         reopening: bool,
         kind: RoomPublicationKind,
+        retention: Option<RetentionIntent>,
     ) {
         let Some(shared) = self.channels.get(&room) else {
             if let Some(reply) = reply {
@@ -8444,7 +8443,7 @@ impl Node {
                     outcome,
                     reopening,
                     kind,
-                    retention: None,
+                    retention,
                     lock_wait: None,
                     authority: (kind == RoomPublicationKind::Open)
                         .then(|| self.room_publication_authority.remove(&room))
@@ -8454,7 +8453,10 @@ impl Node {
         }
         self.publication_pending = true;
         self.publication_again = true;
-        self.governance_work.pending = true;
+        // An unapplied intent is not a new governance input. Its exact room turn
+        // inspects readiness; seeding the global sweep here would retry a mutex
+        // whose release is already owned by its lock-edge waiter.
+        self.governance_work.pending |= retention.is_none();
     }
 
     fn retention_publication_woken(&self) -> bool {
@@ -21494,6 +21496,7 @@ impl Node {
                     Outcome::Done,
                     false,
                     RoomPublicationKind::Open,
+                    None,
                 );
             } else {
                 let _ = reply.send(Outcome::Done);
@@ -21862,6 +21865,7 @@ impl Node {
                 outcome,
                 prepared.reopening,
                 RoomPublicationKind::Open,
+                None,
             );
             return;
         }
