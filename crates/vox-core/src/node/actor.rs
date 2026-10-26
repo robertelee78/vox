@@ -5376,6 +5376,25 @@ enum RoomPublicationKind {
     Anchors,
 }
 
+/// A caller's original, not-yet-applied retention choice. The shared/local decision
+/// is made only after the room's current permission fold is readable.
+#[derive(Clone, Copy)]
+struct RetentionIntent {
+    ttl: u64,
+    steps: bool,
+}
+
+struct PublicationLockWait {
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for PublicationLockWait {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// What durable room state existed before this publication began.  Only a failed create or join
 /// owns newly-written room rows and may purge them; opening an existing room owns only its live
 /// projection and must leave the user's stored room and reopen record intact.
@@ -5395,6 +5414,8 @@ struct RoomPublication {
     reopening: bool,
     /// Settings need current local policy/configuration, not history or an anchor round.
     kind: RoomPublicationKind,
+    retention: Option<RetentionIntent>,
+    lock_wait: Option<PublicationLockWait>,
     /// The exact Computer projection which authorized creating/joining/opening this incarnation.
     authority: Option<(computer::ComputerAuthority, RoomPublicationOwnership)>,
 }
@@ -6768,7 +6789,8 @@ impl Node {
                         let turn = maintenance_next;
                         maintenance_next = (maintenance_next + 1) % 4;
                         match turn {
-                            0 if !self.preparing_rooms.is_empty() || self.publication_pending => {
+                            0 if !self.preparing_rooms.is_empty() || self.publication_pending || self.retention_publication_woken() => {
+                                self.publication_pending |= self.retention_publication_woken();
                                 self.advance_room_preparation().await;
                                 break;
                             }
@@ -6970,6 +6992,21 @@ impl Node {
                     };
                     if local_change.is_some_and(|(room, _)| self.publish_waiters.contains_key(&room)) {
                         let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                        continue;
+                    }
+                    let retention = match &command {
+                        NodeCommand::SetRetention { channel_id, ttl } =>
+                            Some((*channel_id, RetentionIntent { ttl: *ttl, steps: false })),
+                        NodeCommand::SetStepRetention { channel_id, seconds } =>
+                            Some((*channel_id, RetentionIntent { ttl: *seconds, steps: true })),
+                        _ => None,
+                    };
+                    if let Some((room, intent)) = retention {
+                        self.queue_room_publication(room, Some(reply), Outcome::Done, false,
+                            RoomPublicationKind::Settings);
+                        if let Some(waiting) = self.publish_waiters.get_mut(&room) {
+                            waiting.retention = Some(intent);
+                        }
                         continue;
                     }
                     let outcome = self.handle(command).await;
@@ -7558,13 +7595,9 @@ impl Node {
                 }
             }
             NodeCommand::Sync { channel_id } => self.sync_channel(&channel_id).await,
-            NodeCommand::SetStepRetention {
-                channel_id,
-                seconds,
-            } => self.set_step_retention(&channel_id, seconds).await,
-            NodeCommand::SetRetention { channel_id, ttl } => {
-                self.set_retention(&channel_id, ttl).await
-            }
+            NodeCommand::SetStepRetention { .. } => Outcome::Failed(Fault::Internal),
+            // The original command/reply is retained by room publication before any write.
+            NodeCommand::SetRetention { .. } => Outcome::Failed(Fault::Internal),
             // Answered by `begin_agree`: the command loop takes it before it gets here.
             NodeCommand::Agree { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::Shutdown | NodeCommand::Ping => Outcome::Done,
@@ -8411,6 +8444,8 @@ impl Node {
                     outcome,
                     reopening,
                     kind,
+                    retention: None,
+                    lock_wait: None,
                     authority: (kind == RoomPublicationKind::Open)
                         .then(|| self.room_publication_authority.remove(&room))
                         .flatten(),
@@ -8420,6 +8455,110 @@ impl Node {
         self.publication_pending = true;
         self.publication_again = true;
         self.governance_work.pending = true;
+    }
+
+    fn retention_publication_woken(&self) -> bool {
+        self.publish_waiters.values().any(|waiting| {
+            waiting.retention.is_some()
+                && (waiting
+                    .reply
+                    .as_ref()
+                    .is_some_and(oneshot::Sender::is_closed)
+                    || waiting
+                        .lock_wait
+                        .as_ref()
+                        .is_some_and(|wait| wait.ready.load(std::sync::atomic::Ordering::Acquire)))
+        })
+    }
+
+    /// Wait on the actual mutex edge off the actor, with no Store or room secret
+    /// retained outside the node erasure barrier. Cancellation drops this one async
+    /// waiter; there is no blocking child to detach.
+    fn wait_for_publication_lock(&mut self, waiting: &mut RoomPublication) {
+        let weak = waiting.instance.clone();
+        let secret_work = Arc::clone(&self.secret_work);
+        let wake = Arc::clone(&self.bounded_completion_wake);
+        let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = Arc::clone(&ready);
+        self.reap_join_tasks();
+        let task = self.join_tasks.spawn(async move {
+            let held = secret_work.read_owned().await;
+            if let Some(shared) = weak.upgrade() {
+                let guard = shared.lock_owned().await;
+                drop(guard);
+            }
+            drop(held);
+            completed.store(true, std::sync::atomic::Ordering::Release);
+            wake.notify_one();
+        });
+        waiting.lock_wait = Some(PublicationLockWait { ready, task });
+    }
+
+    /// Inspect readiness without consuming the user's intent. Only a real bounded
+    /// local fold continuation schedules another immediate turn.
+    fn prepare_retention_publication(
+        &mut self,
+        room: Digest32,
+        waiting: &mut RoomPublication,
+    ) -> crate::error::Result<bool> {
+        let shared = self
+            .channels
+            .get(&room)
+            .zip(waiting.instance.upgrade())
+            .filter(|(current, original)| Arc::ptr_eq(current, original))
+            .map(|(current, _)| Arc::clone(current))
+            .ok_or(Error::Profile("room publication instance changed"))?;
+        if waiting
+            .lock_wait
+            .as_ref()
+            .is_some_and(|wait| !wait.ready.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Ok(false);
+        }
+        waiting.lock_wait = None;
+        let Ok(mut channel) = shared.try_lock() else {
+            self.wait_for_publication_lock(waiting);
+            return Ok(false);
+        };
+        let profile = self
+            .profile
+            .as_ref()
+            .filter(|p| p.is_unlocked())
+            .ok_or(Error::AtRestLocked)?;
+        let now = self.now_ms();
+        if let Err(error) = channel.require_governance_ready(profile.store(), now) {
+            if !ChannelState::governance_refreshing(&error) {
+                return Err(error);
+            }
+            let progress = match channel.advance_governance(profile.store(), now) {
+                Ok(progress) => progress,
+                Err(error) if ChannelState::governance_refreshing(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            // Retention needs the checked permission fold, not completion of an
+            // unrelated consent/render/private projection maintained by the same turn.
+            if let Err(error) = channel.require_governance_ready(profile.store(), now) {
+                if !ChannelState::governance_refreshing(&error) {
+                    return Err(error);
+                }
+                self.publication_again |= progress.pending;
+                return Ok(false);
+            }
+        }
+        // There is no await between this last cancellation check, the fresh permission
+        // decision, and the write. A committed mutation is never replayed on publication.
+        if waiting
+            .reply
+            .as_ref()
+            .is_some_and(oneshot::Sender::is_closed)
+        {
+            return Ok(true);
+        }
+        let Some(intent) = waiting.retention.take() else {
+            return Ok(true);
+        };
+        waiting.outcome = self.apply_retention(room, intent, &mut channel, now);
+        Ok(true)
     }
 
     /// Check one completion per turn. A room's post-open narrowing writes can make
@@ -8446,6 +8585,43 @@ impl Node {
         let Some(mut waiting) = self.publish_waiters.remove(&room) else {
             return;
         };
+        if waiting.retention.is_some() {
+            if waiting
+                .reply
+                .as_ref()
+                .is_some_and(oneshot::Sender::is_closed)
+            {
+                return;
+            }
+            match self.prepare_retention_publication(room, &mut waiting) {
+                Ok(false) => {
+                    self.publish_waiters.insert(room, waiting);
+                    return;
+                }
+                Ok(true) if waiting.retention.is_some() => return, // Caller cancelled before write.
+                Ok(true) => {
+                    if !waiting.outcome.is_done() {
+                        if let Some(reply) = waiting.reply {
+                            let _ = reply.send(waiting.outcome);
+                        }
+                        return;
+                    }
+                    // The mutation's room guard has been released. Preserve the existing
+                    // retention maintenance before publishing the one successful result.
+                    self.sweep_retention().await;
+                }
+                Err(error) => {
+                    let fault =
+                        if matches!(error, Error::Profile("room publication instance changed")) {
+                            Fault::ChannelNotOpen
+                        } else {
+                            fault_of(&error)
+                        };
+                    self.fail_room_publication(room, waiting, fault);
+                    return;
+                }
+            }
+        }
         if waiting.kind != RoomPublicationKind::Open {
             match self.publish_room_settings(room, &waiting) {
                 Ok(true) => {
@@ -21425,6 +21601,7 @@ impl Node {
 
     fn room_preparation_work_ready(&self) -> bool {
         self.publication_pending
+            || self.retention_publication_woken()
             || self.preparing_rooms.values().any(|prepared| {
                 prepared
                     .legacy_cleanup_due
@@ -24320,128 +24497,77 @@ impl Node {
         Outcome::Appended(appended)
     }
 
-    /// Set the room rule when authorized; another member may shorten only its own retention.
-    async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
-        let now_ms = self.now_ms();
+    /// Called once, under the checked incarnation's guard, after local readiness.
+    /// Permission still decides whether this changes the signed room rule or only
+    /// this node's shorter preference; an unknown grant is never treated as denial.
+    fn apply_retention(
+        &mut self,
+        channel_id: Digest32,
+        intent: RetentionIntent,
+        channel: &mut ChannelState,
+        now: crate::time::Ms,
+    ) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return Outcome::Failed(Fault::ChannelNotOpen);
-        };
         let me = match profile.signer() {
-            Ok(s) => crate::identity::composite::RootSigner::fingerprint(s),
-            Err(e) => return Outcome::Failed(fault_of(&e)),
+            Ok(signer) => crate::identity::composite::RootSigner::fingerprint(signer),
+            Err(error) => return Outcome::Failed(fault_of(&error)),
         };
-        let (governs, room) = {
-            let ch = shared.lock().await;
-            (
-                ch.governs_retention(profile.store(), &me, self.now_ms()),
-                ch.room_retention(),
-            )
-        };
-        let governs = match governs {
+        let governs = match channel.governs_retention(profile.store(), &me, now) {
             Ok(governs) => governs,
             Err(error) => return Outcome::Failed(fault_of(&error)),
         };
+        let room = if intent.steps {
+            crate::node::retention::shortest(
+                channel.room_retention(),
+                channel.room_step_retention(),
+            )
+        } else {
+            channel.room_retention()
+        };
         if !governs {
-            // Longer than the room keeps is refused; `0` is forever, the longest of all.
-            if room != 0 && (ttl == 0 || ttl > room) {
+            if room != 0 && (intent.ttl == 0 || intent.ttl > room) {
                 return Outcome::Failed(Fault::AboveRoomRetention);
             }
-            // The room's own value is "follow the room": the member's line is cleared, so a later
-            // change to the room's retention reaches this node too.
-            let own = (ttl != room).then_some(ttl);
-            // Written to the node's own file (ADR-026 F-2), seeded from the account's when the
-            // node has none, so the other rooms' lines it was reading are kept.
-            let written = self
-                .paths
-                .own_config_path(crate::node::paths::RETENTION_FILE)
-                .and_then(|file| {
-                    crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
-                });
+            let own = (intent.ttl != room).then_some(intent.ttl);
+            let name = if intent.steps {
+                crate::node::paths::STEP_RETENTION_FILE
+            } else {
+                crate::node::paths::RETENTION_FILE
+            };
+            let written = self.paths.own_config_path(name).and_then(|file| {
+                crate::node::retention::RetentionConfig::write_room(&file, &channel_id, own)
+            });
             if written.is_err() {
                 return Outcome::Failed(Fault::RetentionFileUnwritable);
             }
             self.retention_read_at = 0;
-            self.refresh_node_retention(now_ms);
-            self.sweep_retention().await;
-            return Outcome::OwnRetention { own: ttl, room };
+            self.refresh_node_retention(now);
+            // The existing sweep/settings publication applies this node's exact new
+            // limits before answering, including when physical pruning is held.
+            self.retention_dirty.insert(channel_id);
+            return Outcome::OwnRetention {
+                own: intent.ttl,
+                room,
+            };
         }
-        let mut ch = shared.lock().await;
-        let retained =
-            self.with_current_computer_authority(|| ch.set_retention(profile, ttl, now_ms));
+        let retained = self.with_current_computer_authority(|| {
+            if intent.steps {
+                channel.set_step_retention(profile, intent.ttl, now)
+            } else {
+                channel.set_retention(profile, intent.ttl, now)
+            }
+        });
         let Some(retained) = retained else {
             return Outcome::Failed(Fault::ComputerPolicy);
         };
-        if let Err(e) = retained {
-            return Outcome::Failed(fault_of(&e));
+        if let Err(error) = retained {
+            return Outcome::Failed(fault_of(&error));
         }
-        self.note_local_governance_append(channel_id);
-        self.retention_read_at = 0; // re-read the node's own file too: an explicit act
-        self.sweep_retention().await;
-        Outcome::Done
-    }
-
-    async fn set_step_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
-        let now_ms = self.now_ms();
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
-            return Outcome::Failed(Fault::ChannelNotOpen);
-        };
-        let me = match profile.signer() {
-            Ok(s) => crate::identity::composite::RootSigner::fingerprint(s),
-            Err(e) => return Outcome::Failed(fault_of(&e)),
-        };
-        let (governs, room) = {
-            let ch = shared.lock().await;
-            (
-                ch.governs_retention(profile.store(), &me, self.now_ms()),
-                crate::node::retention::shortest(ch.room_retention(), ch.room_step_retention()),
-            )
-        };
-        let governs = match governs {
-            Ok(governs) => governs,
-            Err(error) => return Outcome::Failed(fault_of(&error)),
-        };
-        if !governs {
-            // Longer than the room keeps is refused; `0` is forever, the longest of all.
-            if room != 0 && (ttl == 0 || ttl > room) {
-                return Outcome::Failed(Fault::AboveRoomRetention);
-            }
-            // The room's own value is "follow the room": the member's line is cleared, so a later
-            // change to the room's retention reaches this node too.
-            let own = (ttl != room).then_some(ttl);
-            // Written to the node's own file (ADR-026 F-2), seeded from the account's when the
-            // node has none, so the other rooms' lines it was reading are kept.
-            let written = self
-                .paths
-                .own_config_path(crate::node::paths::STEP_RETENTION_FILE)
-                .and_then(|file| {
-                    crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
-                });
-            if written.is_err() {
-                return Outcome::Failed(Fault::RetentionFileUnwritable);
-            }
-            self.retention_read_at = 0;
-            self.refresh_node_retention(now_ms);
-            self.sweep_retention().await;
-            return Outcome::OwnRetention { own: ttl, room };
-        }
-        let mut ch = shared.lock().await;
-        let retained =
-            self.with_current_computer_authority(|| ch.set_step_retention(profile, ttl, now_ms));
-        let Some(retained) = retained else {
-            return Outcome::Failed(Fault::ComputerPolicy);
-        };
-        if let Err(e) = retained {
-            return Outcome::Failed(fault_of(&e));
-        }
-        self.note_local_governance_append(channel_id);
-        self.retention_read_at = 0; // re-read the node's own file too: an explicit act
-        self.sweep_retention().await;
+        self.note_local_governance_append(&channel_id);
+        self.retention_read_at = 0;
+        self.retention_dirty.insert(channel_id);
         Outcome::Done
     }
 
