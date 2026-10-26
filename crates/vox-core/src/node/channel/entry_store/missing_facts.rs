@@ -6,7 +6,7 @@ use super::*;
 
 const POSITIONS_PER_PAGE: usize = 256;
 type Position = (Digest32, u64);
-type PositionPage = (Vec<Position>, Option<Position>);
+pub(super) type PositionPage = (Vec<Position>, Option<Position>);
 
 fn contains(
     source: &Source<'_>,

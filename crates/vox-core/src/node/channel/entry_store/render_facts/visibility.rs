@@ -485,12 +485,12 @@ impl<'view> RenderView<'view> {
         &'scan self,
         filter: Option<&Filter>,
         display: bool,
-        after: Option<OrderKey>,
-        before: Option<OrderKey>,
+        bounds: (Option<OrderKey>, Option<OrderKey>),
         backwards: bool,
         count_only: bool,
         policy: ExpiryPolicy,
     ) -> Result<VisibilityScan<'scan, 'view>> {
+        let (after, before) = bounds;
         let root = self.root(filter, display)?;
         Ok(VisibilityScan {
             view: self,

@@ -1421,7 +1421,7 @@ impl RenderView<'_> {
         &self,
         after: Option<(Digest32, u64)>,
         limit: usize,
-    ) -> Result<(Vec<(Digest32, u64)>, Option<(Digest32, u64)>)> {
+    ) -> Result<missing_facts::PositionPage> {
         self.order.read.missing_page(after, limit)
     }
     pub(crate) fn entry_at_position(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {

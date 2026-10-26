@@ -6671,25 +6671,21 @@ async fn write_owned_room_page(
             return Ok(false);
         }
     };
-    let owned = match answer {
-        Ok(answer) if !matches!(answer.reply(), Reply::Older { .. }) => {
-            // The backend owns destruction of any rejected result; do not detach its
-            // erasure lease from an unexpected row-bearing Reply.
-            drop(answer);
-            OwnedRoomReply {
-                frame: Frame::Error {
-                    reason: if selected {
-                        "unexpected selected room history answer"
-                    } else {
-                        "unexpected room history answer"
-                    }
-                    .into(),
-                },
-                lease: None,
+    let answer = answer.and_then(|answer| {
+        if matches!(answer.reply(), Some(Reply::Older { .. })) {
+            answer.into_parts()
+        } else {
+            // The backend destroys an unexpected result before detaching its lease.
+            Err(if selected {
+                "unexpected selected room history answer"
+            } else {
+                "unexpected room history answer"
             }
+            .into())
         }
-        Ok(answer) => {
-            let (reply, lease) = answer.into_parts();
+    });
+    let owned = match answer {
+        Ok((reply, lease)) => {
             let frame = match reply {
                 Reply::Older {
                     rows,
@@ -6959,7 +6955,7 @@ async fn write_owned_footers(
             .await
         }
     };
-    if !matches!(answer.reply(), Reply::Footers { .. }) {
+    if !matches!(answer.reply(), Some(Reply::Footers { .. })) {
         drop(answer);
         return write_owned_room_reply(
             stream,
@@ -6981,7 +6977,9 @@ async fn write_owned_footers(
     }
     let room_lifetime = std::sync::Arc::clone(&answer.scope.lifetime);
     let node_lifetime = std::sync::Arc::clone(&answer.scope.node_lifetime);
-    let (reply, lease) = answer.into_parts();
+    let (reply, lease) = answer
+        .into_parts()
+        .map_err(|_| Error::MalformedIpc("owned footer reply missing"))?;
     let Reply::Footers { rows, tags } = reply else {
         drop(lease);
         return Err(Error::MalformedIpc("unexpected footer reply"));

@@ -168,8 +168,11 @@ pub(crate) struct Capture {
 }
 
 pub(crate) enum CapturePlan {
-    Owned(Capture),
-    Legacy { scope: Scope, leases: ReadLeases },
+    Owned(Box<Capture>),
+    Legacy {
+        scope: Box<Scope>,
+        leases: ReadLeases,
+    },
 }
 /// This wrapper is kept through current-scope publication and IPC writing. Cancelled
 /// results wipe their plaintext; a successful typed handoff explicitly takes the reply.
@@ -194,8 +197,8 @@ impl ReplyLease {
     }
 }
 impl Answer {
-    pub(crate) fn reply(&self) -> &Reply {
-        self.reply.as_ref().expect("owned page reply")
+    pub(crate) fn reply(&self) -> Option<&Reply> {
+        self.reply.as_ref()
     }
     pub(crate) fn is_retired(&self) -> bool {
         self.scope.lifetime.is_retired() || self.scope.node_lifetime.is_retired()
@@ -209,17 +212,20 @@ impl Answer {
             return Err("the room read was retired".into());
         }
         match self.reply() {
-            Reply::ArrivalHead(head) => Ok(*head),
+            Some(Reply::ArrivalHead(head)) => Ok(*head),
             _ => Err("unexpected arrival-head answer".into()),
         }
     }
-    pub(crate) fn into_parts(mut self) -> (Reply, ReplyLease) {
-        let reply = self.reply.take().expect("owned page reply");
+    pub(crate) fn into_parts(mut self) -> std::result::Result<(Reply, ReplyLease), String> {
+        // Take the lease first: on an invalid handoff the still-owned reply is
+        // scrubbed by Answer::drop before its remaining erasure guards release.
+        let leases = self.leases.take().ok_or("owned page lease missing")?;
+        let reply = self.reply.take().ok_or("owned page reply missing")?;
         let lease = ReplyLease {
             scope: self.scope.clone(),
-            _leases: self.leases.take().expect("owned page lease"),
+            _leases: leases,
         };
-        (reply, lease)
+        Ok((reply, lease))
     }
 }
 fn scrub(reply: &mut Reply) {
@@ -305,10 +311,10 @@ pub(crate) fn consume_native<T>(
     if answer.is_retired() {
         return Err("the room read was retired".into());
     }
-    if !matches!(answer.reply(), Reply::Older { .. }) {
+    if !matches!(answer.reply(), Some(Reply::Older { .. })) {
         return Err("unexpected owned page reply".into());
     }
-    let (reply, lease) = answer.into_parts();
+    let (reply, lease) = answer.into_parts()?;
     let Reply::Older {
         rows,
         older,
@@ -422,7 +428,10 @@ impl ChannelState {
         };
         if scope.legacy {
             drop(index);
-            return Ok(CapturePlan::Legacy { scope, leases });
+            return Ok(CapturePlan::Legacy {
+                scope: Box::new(scope),
+                leases,
+            });
         }
         let key = Sek::from_bytes(Zeroizing::new(
             self.sek
@@ -441,7 +450,7 @@ impl ChannelState {
             .keys()
             .map(|author| (*author, self.dag.verified_head(author)))
             .collect();
-        Ok(CapturePlan::Owned(Capture {
+        Ok(CapturePlan::Owned(Box::new(Capture {
             index,
             key,
             scope,
@@ -456,7 +465,7 @@ impl ChannelState {
                 .collect(),
             provisional: !self.governance_display_current(now),
             _leases: leases,
-        }))
+        })))
     }
 }
 
@@ -989,7 +998,7 @@ impl Capture {
         let mut budget = crate::log::history::WorkBudget::default();
         // Rendered scan is independent from owed projection membership/deadline cleanup.
         let mut scan =
-            view.visibility_scan(selected_scan, true, None, None, true, false, policy)?;
+            view.visibility_scan(selected_scan, true, (None, None), true, false, policy)?;
         while known_rendered_total != Some(0)
             && !(known_rendered_total.is_some() && spec.limit == 0)
         {
@@ -1066,8 +1075,12 @@ impl Capture {
                         {
                             return Err(Error::MalformedAtRest("rendering author differs"));
                         }
-                        let mut message =
-                            View::message(rendered.0.take().expect("validated rendering"));
+                        let mut message = View::message(
+                            rendered
+                                .0
+                                .take()
+                                .ok_or(Error::MalformedAtRest("visible render missing"))?,
+                        );
                         if !all_rendered_live {
                             message.late = late;
                         }

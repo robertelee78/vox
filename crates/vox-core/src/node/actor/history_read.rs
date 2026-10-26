@@ -312,7 +312,7 @@ impl Node {
                                 let result = guard.history_query(&work_store, work_query, crate::node::ipc::rows_budget(), now);
                                 drop(guard);
                                 let reply = result?;
-                                page_read::Answer::legacy(scope, reply, leases).map_err(|error| remember_fault(error, &work_fault))
+                                page_read::Answer::legacy(*scope, reply, leases).map_err(|error| remember_fault(error, &work_fault))
                             }
                         }
                     });
