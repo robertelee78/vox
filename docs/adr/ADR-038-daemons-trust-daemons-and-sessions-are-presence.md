@@ -1134,3 +1134,25 @@ scheduling defect remains REQUIRED work before v0.4.10 under ADR-036 H-2 and ADR
 source correction above covers public admission with an unavailable/offline private source and
 quiescent Busy handoff; it does not claim the full public/private latency contract, waive R1,
 or replace the full user journey and its own controls.
+
+### FX-29 RCA: a saved public selection is not an activation lease
+
+The 2026-10-26 shipped-binary journey retained the original public request, room incarnation,
+Head and nonterminal interval across restart. Explicit Resume nevertheless became Unavailable
+with `history demand authority changed or operation ended`. The source checks fresh authority
+successfully, then requires the entire saved binding to equal that fresh binding. Its grant
+field includes the node-wide trust-keyring nonce: the earlier unrelated trust-add changed that
+nonce even though the selected author remained trusted. The nonce mismatch is inferred from
+the actual edit and exact source path; the saved grant bytes were not separately measured.
+The empty Head/author in the failure reply came from the preparation's status envelope and is
+not evidence that the durable interval was erased.
+
+ADR-036's explicit Resume MUST recheck current authority without widening its saved operation.
+A public archive activation may renew only its trust nonce after that check, with the same
+node scope, request, room, incarnation, epoch and public audience. Its original bounds, body,
+cursor and remaining work MUST stay intact. The new binding and incremented fencing serial
+MUST commit together, so no earlier Active handle can publish through the new activation.
+Terminal work, pending cleanup, changed scope, and current authorization failures still refuse.
+Private donor/audience/grant checks and legacy recovery retain their exact-binding behavior.
+This corrects the existing same-request handoff; it adds no automatic restart traffic, retry
+timer, worker, storage format or new acceptance claim.
