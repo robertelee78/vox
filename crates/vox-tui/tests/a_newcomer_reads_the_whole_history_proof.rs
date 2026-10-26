@@ -5009,7 +5009,14 @@ fn quiet_retain_original_burst(
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
-                assert!(reply.status.author == Some(author) && reply.status.head.is_some(),
+                // The explicit cursor above is an actually matched original Source row.
+                // Its new bounded request may complete before the first typed observation;
+                // saved terminal Status then has no outstanding author.
+                let author_matches = reply.status.author == Some(author)
+                    || (reply.status.phase == Phase::Complete
+                        && reply.status.remaining == 0
+                        && reply.status.author.is_none());
+                assert!(author_matches && reply.status.head.is_some(),
                     "APPARATUS: Holder's cursor did not establish Source's exact authenticated request before completion: {out}");
                 retained = Some((reply.instance.clone(), request.clone(), reply.status.head));
                 eprintln!("QUIET ORIGINAL BURST REQUEST: original_cut={original_cut} instance={} request={request} status={:?}", reply.instance, reply.status);
