@@ -5900,9 +5900,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         .expect("PRODUCT: Alice's Status omitted Bob's null or numeric receipt");
     assert!(bob_held_before_receipt.is_none_or(|through| through < marker_through),
         "PRODUCT: Alice credited Bob through the original cut {marker_through} while an original Content row was still missing: {bob_held_before_receipt:?}");
-    // A real trust edit makes this held Content request authorization-stale. Carol's real
-    // Control work owns the sole Control job before Archive is released, so the SAME request
-    // must retain its replacement FIFO ticket/wake. No private-header callback is involved.
+    // A real trust edit makes this held Content request authorization-stale. The logical
+    // Archive also retains its Control state job until park. First retain Carol's real FIFO
+    // Control claim; release Archive before expecting that queued worker to own Control.
+    // The SAME archive request must then retain its replacement ticket/wake behind Carol.
     let archive_request = history_observation(&bob, &room)
         .request
         .unwrap_or_else(|| panic!("PRODUCT: the held archive request exposed no exact request id"));
@@ -5967,6 +5968,83 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             "PRODUCT: Carol's Control-pressure post was refused: {out}{err}"
         );
         loop {
+            let (ok, out, err) = vox(&bob, &["status", "--json"], None);
+            assert!(
+                ok,
+                "PRODUCT: Bob's queued Control-claim Status was refused: {out}{err}"
+            );
+            let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!("PRODUCT: queued Control Status was invalid ({error}): {out}")
+            });
+            assert!(
+                status["identity"] == fps[1],
+                "APPARATUS: queued Control Status selected another node: {out}"
+            );
+            let admission = status["lanes"]["bounded"]["admissions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|claim| {
+                    claim["gate"] == "foreground"
+                        && claim["lane"] == "control"
+                        && claim["room"] == control_room
+                        && claim["peer"] == fps[2]
+                        && claim["admission"].is_u64()
+                        && claim["root"].is_string()
+                });
+            let port = status["lanes"]["ports"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|port| port["room"] == control_room && port["peer"] == fps[2]);
+            let queued_port = port.is_some_and(|port| {
+                port["connected"] == true
+                    && port["needs"] == true
+                    && port["queued"] == true
+                    && port["round_running"] == false
+                    && port["start_outcome"] == "not_started"
+                    && port["start_reason"] == "control_budget_busy"
+            });
+            // ForegroundAdmission owns a real Control Ticket even though its public
+            // request/wait_order fields are null before Flow construction. Queue count
+            // alone would not identify Carol's producer or its earlier FIFO position.
+            if let Some(admission) = admission.filter(|_| queued_port) {
+                let owner = &status["lanes"]["history"]["owner"];
+                assert!(
+                    owner["room"] == control_room
+                        && owner["request"] == archive_request
+                        && owner["instance"] == archive_instance,
+                    "APPARATUS: the held archive changed before Carol's real claim queued: {out}"
+                );
+                assert!(charged_flow_hold_entries(&control_hold).iter()
+                    .all(|(_, node, _)| node != &fps[1]),
+                    "APPARATUS: a physical Control worker reached the hold before release of the old archive");
+                eprintln!("QUIET CAROL CONTROL CLAIM QUEUED: archive_request={archive_request} archive_instance={archive_instance} admission={admission} status={out}");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        println!(
+            "[proof] FX-29 archive authorization-stale queued-Control apparatus staged: room {room}, peer {}, request {archive_request}",
+            fps[0]
+        );
+        std::fs::remove_file(&archive_hold).unwrap_or_else(|error| {
+            panic!("APPARATUS: could not release the exact stale Content archive Flow: {error}")
+        });
+        loop {
+            let stale = exact_lane(
+                &bob,
+                &room,
+                &fps[0],
+                "after the held archive authorization changed",
+            )
+            .since(stale_before);
+            if stale.stale > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        loop {
             let held =
                 charged_flow_hold_entries(&control_hold)
                     .into_iter()
@@ -5986,26 +6064,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             }
             assert!(charged_flow_hold_entries(&control_hold).iter().all(|(_, node, _)| node != &fps[1]),
                 "APPARATUS: another actual Control worker reached the hold before Carol's; no Control-busy resume measurement");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        println!(
-            "[proof] FX-29 archive authorization-stale Control-busy apparatus staged: room {room}, peer {}, request {archive_request}",
-            fps[0]
-        );
-        std::fs::remove_file(&archive_hold).unwrap_or_else(|error| {
-            panic!("APPARATUS: could not release the exact stale Content archive Flow: {error}")
-        });
-        loop {
-            let stale = exact_lane(
-                &bob,
-                &room,
-                &fps[0],
-                "after the held archive authorization changed",
-            )
-            .since(stale_before);
-            if stale.stale > 0 {
-                break;
-            }
             std::thread::sleep(Duration::from_millis(50));
         }
         let (ok, status, err) = vox(&bob, &["status", "--json"], None);
