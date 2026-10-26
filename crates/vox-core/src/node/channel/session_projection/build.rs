@@ -289,54 +289,61 @@ impl Event {
 
 fn interpret(read: &Read<'_>, envelope: EnvelopeRef) -> Result<Option<Event>> {
     let mut input = EnvelopeInput::new(read, envelope);
-    if let Some(expected) = envelope.bundle {
-        let mut hash = Sha256::new();
-        let mut offset = 0;
-        let mut buffer = [0; 8192];
-        while offset < input.len() {
-            let n = input.read_at(offset, &mut buffer)?;
-            if n == 0 {
-                return Err(invalid("Session complete bundle ended early"));
+    let result = (|| {
+        if let Some(expected) = envelope.bundle {
+            let mut hash = Sha256::new();
+            let mut offset = 0;
+            let mut buffer = [0; 8192];
+            while offset < input.len() {
+                let n = input.read_at(offset, &mut buffer)?;
+                if n == 0 {
+                    return Err(invalid("Session complete bundle ended early"));
+                }
+                offset = offset
+                    .checked_add(n as u64)
+                    .ok_or_else(|| invalid("Session bundle offset exhausted"))?;
+                hash.update(&buffer[..n]);
             }
-            offset = offset
-                .checked_add(n as u64)
-                .ok_or_else(|| invalid("Session bundle offset exhausted"))?;
-            hash.update(&buffer[..n]);
+            let actual: Digest32 = hash.finalize().into();
+            if actual != expected {
+                return Ok(None);
+            }
         }
-        let actual: Digest32 = hash.finalize().into();
-        if actual != expected {
+        let Some(meta) = metadata::parse(&mut input)? else {
+            return Ok(None);
+        };
+        if meta.from.trim().is_empty() || (envelope.bundle.is_some() && meta.kind != SESSION) {
             return Ok(None);
         }
+        let kind = match meta.kind.as_str() {
+            SESSION => 1,
+            SESSION_END => 2,
+            _ => 0,
+        };
+        if kind == 0 && meta.name.is_none() {
+            return Ok(None);
+        }
+        let field = |text: StringRef| Field {
+            envelope,
+            start: text.start,
+            end: text.end,
+            bytes: text.bytes,
+            hash: text.hash,
+        };
+        Ok(Some(Event {
+            source: envelope.first,
+            kind,
+            id: meta.from,
+            name: meta.name.map(field),
+            harness: meta.harness.map(field),
+            cwd: (kind == 1).then_some(meta.cwd).flatten().map(field),
+        }))
+    })();
+    if input.retired() {
+        Ok(None)
+    } else {
+        result
     }
-    let Some(meta) = metadata::parse(&mut input)? else {
-        return Ok(None);
-    };
-    if meta.from.trim().is_empty() || (envelope.bundle.is_some() && meta.kind != SESSION) {
-        return Ok(None);
-    }
-    let kind = match meta.kind.as_str() {
-        SESSION => 1,
-        SESSION_END => 2,
-        _ => 0,
-    };
-    if kind == 0 && meta.name.is_none() {
-        return Ok(None);
-    }
-    let field = |text: StringRef| Field {
-        envelope,
-        start: text.start,
-        end: text.end,
-        bytes: text.bytes,
-        hash: text.hash,
-    };
-    Ok(Some(Event {
-        source: envelope.first,
-        kind,
-        id: meta.from,
-        name: meta.name.map(field),
-        harness: meta.harness.map(field),
-        cwd: (kind == 1).then_some(meta.cwd).flatten().map(field),
-    }))
 }
 
 fn fold(index: &mut Write<'_, '_>, event: Event) -> Result<()> {
@@ -484,14 +491,15 @@ fn advance_phase(index: &mut Write<'_, '_>, phase: u8) -> Result<()> {
 
 /// One ordinary page of work. The caller drives this from actor maintenance, not a client
 /// wait loop. A reader sees the old valid generation or an explicit refreshing refusal.
-pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
-    let public = ch
-        .entries
-        .render_view(store, &ch.sek, &ch.channel_id)?
-        .session_revision();
-    let snapshot = store.snapshot()?;
-    let header = Read::existing(&snapshot, &ch.sek, &ch.channel_id)?
-        .map(|read| read.header)
+pub(super) fn advance(ch: &ChannelState, store: &Store, now: u64) -> Result<bool> {
+    let view = ch.entries.render_view(store, &ch.sek, &ch.channel_id)?;
+    let public = view.session_revision();
+    let snapshot = view.snapshot();
+    let captured = Read::existing(snapshot, &ch.sek, &ch.channel_id)?
+        .map(|read| read.with_sources(ch, &view, now));
+    let header = captured
+        .as_ref()
+        .map(|read| read.header.clone())
         .unwrap_or_default();
     let mut batch = store.batch()?;
     let mut index = Write::open(&mut batch, &ch.sek, &ch.channel_id)?;
@@ -516,7 +524,6 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
     let mut cursor = state.cursor;
     match state.phase {
         1 => {
-            let view = ch.entries.render_view(store, &ch.sek, &ch.channel_id)?;
             for _ in 0..WORK_ROWS {
                 let after = cursor
                     .map(|key| Position::from_key(&key).map(|p| (p.created, p.order, p.hash)))
@@ -534,27 +541,32 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
                 let row = view
                     .row(&hash)?
                     .ok_or_else(|| invalid("Session public candidate missing"))?;
-                put_source(
-                    &mut index,
-                    Source {
-                        position,
-                        author: row.author,
-                        id: fact.cache,
-                    },
-                    &row.text,
-                )?;
+                let source = Source {
+                    position,
+                    author: row.author,
+                    id: fact.cache,
+                };
+                if let Some(read) = &captured {
+                    if !read.retained(source)? {
+                        cursor = Some(position.key());
+                        continue;
+                    }
+                }
+                put_source(&mut index, source, &row.text)?;
                 cursor = Some(position.key());
             }
         }
         2 => {
-            if let Some(read) = Read::existing(&snapshot, &ch.sek, &ch.channel_id)? {
+            if let Some(read) = &captured {
                 for _ in 0..WORK_ROWS {
                     let Some((key, id)) = read.next(Tree::Candidates, cursor)? else {
                         advance_phase(&mut index, 3)?;
                         break;
                     };
                     let source = source(&read.descriptor(id)?)?;
-                    put_source(&mut index, source, &read.source(source)?)?;
+                    if let Some(body) = read.source(source)? {
+                        put_source(&mut index, source, &body)?;
+                    }
                     cursor = Some(key);
                 }
             } else {
@@ -562,19 +574,25 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
             }
         }
         3 => {
-            let read = Read::open(&snapshot, &ch.sek, &ch.channel_id)?.work()?;
+            let read = Read::open(snapshot, &ch.sek, &ch.channel_id)?
+                .with_sources(ch, &view, now)
+                .work()?;
             for _ in 0..WORK_ROWS {
                 let Some((key, id)) = read.next(Tree::Gathered, cursor)? else {
                     advance_phase(&mut index, 4)?;
                     break;
                 };
                 let source = source(&read.descriptor(id)?)?;
-                assemble(&mut index, source, &read.source(source)?)?;
+                if let Some(body) = read.source(source)? {
+                    assemble(&mut index, source, &body)?;
+                }
                 cursor = Some(key);
             }
         }
         4 => {
-            let read = Read::open(&snapshot, &ch.sek, &ch.channel_id)?.work()?;
+            let read = Read::open(snapshot, &ch.sek, &ch.channel_id)?
+                .with_sources(ch, &view, now)
+                .work()?;
             // At most one metadata envelope is interpreted per turn. Its fields stream from
             // individual records; no declared part count controls a resident allocation.
             if let Some((key, id)) = read.next(Tree::Envelopes, cursor)? {
@@ -598,7 +616,13 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
                     break;
                 };
                 let event = Event::read(&index.descriptor(id)?)?;
-                fold(&mut index, event)?;
+                let retained = match &captured {
+                    Some(read) => read.retained(event.source)?,
+                    None => true,
+                };
+                if retained {
+                    fold(&mut index, event)?;
+                }
                 cursor = Some(key);
             }
         }
