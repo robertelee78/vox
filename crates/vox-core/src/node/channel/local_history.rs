@@ -100,6 +100,24 @@ impl ChannelState {
         store: &Store,
         after_departure: bool,
     ) -> Result<()> {
+        let read = self.local_append_eligible_for(store, after_departure)?;
+        if read.publication_busy()
+            || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
+        {
+            return Err(Error::Profile(
+                "room publication is busy; retry this operation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Eligibility is independent of capacity for an entry a no-op will never append.
+    /// Return the same read so actual append admission does not reopen the index.
+    pub(super) fn local_append_eligible_for<'a>(
+        &'a self,
+        store: &Store,
+        after_departure: bool,
+    ) -> Result<entry_store::Read<'a>> {
         // The departure statement must remain this author's tail until another member has
         // acknowledged it. Background key, receipt, session, or share work cannot make a node
         // appear to rejoin after the person chose Leave.
@@ -112,14 +130,7 @@ impl ChannelState {
                 "Legacy history required; resume explicit recovery before posting in this room",
             ));
         }
-        if read.publication_busy()
-            || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
-        {
-            return Err(Error::Profile(
-                "room publication is busy; retry this operation",
-            ));
-        }
-        Ok(())
+        Ok(read)
     }
 
     /// At most sixteen actual settled tips are named. Their prefixes are local cached proof
