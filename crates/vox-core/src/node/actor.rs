@@ -23320,10 +23320,11 @@ impl Node {
         let Some(retained) = retained else {
             return Outcome::Failed(Fault::ComputerPolicy);
         };
-        if let Err(e) = retained {
-            return Outcome::Failed(fault_of(&e));
+        match retained {
+            Ok(true) => self.note_local_governance_append(channel_id),
+            Ok(false) => {}
+            Err(e) => return Outcome::Failed(fault_of(&e)),
         }
-        self.note_local_governance_append(channel_id);
         self.retention_read_at = 0; // re-read the node's own file too: an explicit act
         self.sweep_retention().await;
         Outcome::Done
@@ -23382,10 +23383,11 @@ impl Node {
         let Some(retained) = retained else {
             return Outcome::Failed(Fault::ComputerPolicy);
         };
-        if let Err(e) = retained {
-            return Outcome::Failed(fault_of(&e));
+        match retained {
+            Ok(true) => self.note_local_governance_append(channel_id),
+            Ok(false) => {}
+            Err(e) => return Outcome::Failed(fault_of(&e)),
         }
-        self.note_local_governance_append(channel_id);
         self.retention_read_at = 0; // re-read the node's own file too: an explicit act
         self.sweep_retention().await;
         Outcome::Done
