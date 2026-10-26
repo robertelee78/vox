@@ -137,7 +137,15 @@ fn next_due(
         .map(Option::flatten)
 }
 fn cutoff(now: u64, ttl: u64) -> Option<u64> {
-    (ttl != 0).then(|| now.saturating_sub(ttl.saturating_mul(1_000)))
+    let duration = ttl.saturating_mul(1_000);
+    if ttl == 0 || now < duration {
+        None
+    } else if now == u64::MAX {
+        // Saturated deadlines expire at MAX too, including bases above MAX-duration.
+        Some(u64::MAX)
+    } else {
+        Some(now - duration)
+    }
 }
 #[allow(clippy::too_many_arguments)]
 fn due(

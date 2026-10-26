@@ -13,7 +13,7 @@ pub(crate) struct ExpiryPolicy {
     pub steps: u64,
 }
 impl ExpiryPolicy {
-    fn ttl(self, class: u64) -> u64 {
+    pub(super) fn ttl(self, class: u64) -> u64 {
         match class {
             0 => self.regular,
             1 => crate::node::retention::shortest(self.regular, self.steps),
@@ -21,7 +21,8 @@ impl ExpiryPolicy {
         }
     }
     fn live(self, base: u64, class: u64) -> bool {
-        !crate::node::channel::expired_at(base, self.now, self.ttl(class))
+        let ttl = self.ttl(class);
+        ttl == 0 || self.now < base.saturating_add(ttl.saturating_mul(1_000))
     }
 }
 
@@ -34,6 +35,10 @@ pub(super) struct RenderExpiry {
     class: u64, // 0 regular, 1 steps, 2 durable control
 }
 impl RenderExpiry {
+    pub(super) fn parts(self) -> (u64, u64) {
+        (self.base, self.class)
+    }
+
     pub(super) fn tracked(value: crate::node::retention::Tracked) -> Self {
         Self {
             base: value.base(),

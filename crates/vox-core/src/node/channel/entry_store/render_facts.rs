@@ -4,6 +4,7 @@
 use super::dag_facts::{order_key, ordered, predecessor, successor, OrderKey};
 use super::*;
 
+mod canonical_age;
 mod visibility;
 use visibility::{ExpiryBounds, RenderExpiry};
 pub(crate) use visibility::{
@@ -297,6 +298,11 @@ pub(crate) enum Filter {
     NoticeCandidates,
 }
 impl Filter {
+    /// The canonical General predicate, also used when its derived selector is restoring.
+    pub(crate) fn matches_general_text(text: &str) -> bool {
+        is_general_root(text)
+    }
+
     fn digest(&self) -> Digest32 {
         use crate::hash::sha256_concat;
         match self {
@@ -615,12 +621,20 @@ impl Write<'_, '_> {
         let root = Source::Batch(self.batch)
             .number(self.sek, self.channel, roots.filters, &outer)?
             .unwrap_or(0);
+        let old = if display {
+            None
+        } else {
+            Source::Batch(self.batch).render_fact(self.sek, self.channel, root, &ordered(key))?
+        };
         let changed = self.change_rendered(root, ordered(key), fact)?;
         roots.filters = self.change_value(
             roots.filters,
             outer,
             (changed != 0).then_some(Value::Number(changed)),
         )?;
+        if !display {
+            self.change_canonical_age(roots, Some(filter), key.1, old, fact)?;
+        }
         Ok(())
     }
     fn change_operation(
@@ -706,6 +720,7 @@ impl Write<'_, '_> {
             created: row.created_millis,
             expiry: self.rendered_expiry(&hash, row.created_millis, row.arrival)?,
         };
+        self.change_canonical_age(&mut roots.rendered, None, hash, None, Some(fact))?;
         roots.rendered.hash = self.change_value(
             roots.rendered.hash,
             hashed(&hash),
@@ -834,7 +849,9 @@ impl Write<'_, '_> {
             return Err(invalid("render restamp cache differs"));
         }
         row.arrival = fact.cache;
+        let old = fact;
         fact.expiry = expiry;
+        self.change_canonical_age(&mut roots.rendered, None, *hash, Some(old), Some(fact))?;
         roots.rendered.hash = self.change_value(
             roots.rendered.hash,
             hashed(hash),
@@ -903,6 +920,7 @@ impl Write<'_, '_> {
         if row.entry_hash != *hash {
             return Err(invalid("render cache hash differs"));
         }
+        self.change_canonical_age(&mut roots.rendered, None, *hash, Some(fact), None)?;
         roots.rendered.hash = self.change_value(roots.rendered.hash, hashed(hash), None)?;
         roots.rendered.arrival =
             self.change_rendered(roots.rendered.arrival, ordered((fact.cache, *hash)), None)?;
@@ -1336,6 +1354,9 @@ impl Write<'_, '_> {
         if self.directory.active.rendered != Roots::default() {
             return Err(invalid("render initialization not empty"));
         }
+        let mut roots = self.render_roots()?;
+        self.finish_canonical_ages(&mut roots.rendered)?;
+        self.set_render_roots(roots)?;
         self.directory.render_epoch = 1;
         self.directory.render_ready = true;
         self.directory.render_cursor = None;
@@ -1374,7 +1395,11 @@ impl EntryIndex {
             roots.rendered.filters,
             &general_state_key(true),
         )? {
-            Some(1) => return Ok(false),
+            Some(1) => {
+                drop(writer);
+                drop(batch);
+                return self.advance_canonical_ages(store, sek, channel);
+            }
             Some(_) => return Err(invalid("room view readiness marker")),
             None => {}
         }
@@ -1510,11 +1535,12 @@ impl EntryIndex {
                 Some(Value::Number(1)),
             )?;
         }
+        let more = pending || !writer.canonical_ages_ready(&roots.rendered)?;
         writer.set_render_roots(roots)?;
         writer.seal()?;
         batch.commit()?;
         self.committed();
-        Ok(pending)
+        Ok(more)
     }
 
     /// Only a missing derived index is rebuilt. Each transaction visits a bounded cache
