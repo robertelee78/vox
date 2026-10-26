@@ -4,6 +4,10 @@
 use super::dag_facts::{order_key, ordered, predecessor, successor, OrderKey};
 use super::*;
 
+mod visibility;
+use visibility::{ExpiryBounds, RenderExpiry};
+pub(crate) use visibility::{ExpiryPolicy, VisibilityScan, VisibilityStep};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Roots {
     hash: u64,
@@ -80,6 +84,8 @@ pub(crate) struct RenderFact {
     pub epoch: u64,
     pub shown: u64,
     pub created: u64,
+    // None is an old or not-yet-stamped fact, never evidence of freshness.
+    expiry: Option<RenderExpiry>,
 }
 
 /// An operation's earliest semantic witness and first conflicting arrival survive
@@ -116,19 +122,27 @@ impl OperationFact {
 }
 impl RenderFact {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(5)
-            .uint(3)
+        e.array(if self.expiry.is_some() { 6 } else { 5 })
+            .uint(if self.expiry.is_some() { 7 } else { 3 })
             .uint(self.cache)
             .uint(self.epoch)
             .uint(self.shown)
             .uint(self.created);
+        if self.expiry.is_some() {
+            RenderExpiry::write_option(self.expiry, e);
+        }
     }
-    pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
+    pub(super) fn read(d: &mut Decoder<'_>, with_expiry: bool) -> Result<Self> {
         let found = Self {
             cache: d.uint()?,
             epoch: d.uint()?,
             shown: d.uint()?,
             created: d.uint()?,
+            expiry: if with_expiry {
+                RenderExpiry::read_option(d)?
+            } else {
+                None
+            },
         };
         if found.cache == 0 {
             return Err(invalid("zero render cache locator"));
@@ -167,6 +181,7 @@ pub(super) struct Summary {
     count: u64,
     earliest: (u64, u64),
     newest: u64,
+    expiry: Option<ExpiryBounds>,
 }
 impl Default for Summary {
     fn default() -> Self {
@@ -174,26 +189,42 @@ impl Default for Summary {
             count: 0,
             earliest: (u64::MAX, u64::MAX),
             newest: 0,
+            expiry: Some(ExpiryBounds::default()),
         }
     }
 }
 impl Summary {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(4)
+        e.array(if self.expiry.is_some() { 5 } else { 4 })
             .uint(self.count)
             .uint(self.earliest.0)
             .uint(self.earliest.1)
             .uint(self.newest);
+        if self.expiry.is_some() {
+            ExpiryBounds::write_option(self.expiry, e);
+        }
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 4 {
+        let arity = d.array()?;
+        if !matches!(arity, 4 | 5) {
             return Err(invalid("render summary arity"));
         }
         let found = Self {
             count: d.uint()?,
             earliest: (d.uint()?, d.uint()?),
             newest: d.uint()?,
+            expiry: if arity == 5 {
+                ExpiryBounds::read_option(d)?
+            } else {
+                None
+            },
         };
+        if found
+            .expiry
+            .is_some_and(|bounds| bounds.count() != Some(found.count))
+        {
+            return Err(invalid("render expiry count differs"));
+        }
         if found.count == 0 {
             return Err(invalid("empty render branch"));
         }
@@ -206,6 +237,10 @@ impl Summary {
             .ok_or(invalid("render count overflow"))?;
         self.earliest = self.earliest.min(other.earliest);
         self.newest = self.newest.max(other.newest);
+        self.expiry = match (self.expiry, other.expiry) {
+            (Some(a), Some(b)) => Some(a.merge(b)?),
+            _ => None,
+        };
         Ok(())
     }
     fn fact(fact: RenderFact) -> Self {
@@ -213,6 +248,7 @@ impl Summary {
             count: 1,
             earliest: (fact.epoch, fact.shown),
             newest: fact.created,
+            expiry: fact.expiry.map(ExpiryBounds::one),
         }
     }
 }
@@ -438,6 +474,34 @@ impl Write<'_, '_> {
         let (key, id) = self.put_page(page)?;
         Ok((key, id, summary))
     }
+    /// Encoding, not a changed fanout knob, determines when enriched pages split.
+    fn pack_rendered(&mut self, page: Page, out: &mut Vec<(Key, u64, Summary)>) -> Result<()> {
+        let len = match &page {
+            Page::Leaf(rows) => rows.len(),
+            Page::Ranked(rows) => rows.len(),
+            Page::Branch(_) => return Err(invalid("unranked render split")),
+        };
+        if len <= PAGE_ITEMS && page.encoded().len() <= PAGE_BYTES {
+            out.push(self.put_ranked(&page)?);
+            return Ok(());
+        }
+        if len < 2 {
+            return Err(invalid("render value exceeds page bound"));
+        }
+        let (left, right) = match page {
+            Page::Leaf(mut rows) => {
+                let right = rows.split_off(len / 2);
+                (Page::Leaf(rows), Page::Leaf(right))
+            }
+            Page::Ranked(mut rows) => {
+                let right = rows.split_off(len / 2);
+                (Page::Ranked(rows), Page::Ranked(right))
+            }
+            Page::Branch(_) => unreachable!(),
+        };
+        self.pack_rendered(left, out)?;
+        self.pack_rendered(right, out)
+    }
     fn replace_rendered(
         &mut self,
         root: u64,
@@ -471,12 +535,8 @@ impl Write<'_, '_> {
                         }
                     }
                 }
-                if rows.len() > PAGE_ITEMS {
-                    let right = rows.split_off(rows.len() / 2);
-                    parts.push(self.put_ranked(&Page::Leaf(rows))?);
-                    parts.push(self.put_ranked(&Page::Leaf(right))?);
-                } else if !rows.is_empty() {
-                    parts.push(self.put_ranked(&Page::Leaf(rows))?);
+                if !rows.is_empty() {
+                    self.pack_rendered(Page::Leaf(rows), &mut parts)?;
                 }
             }
             Page::Ranked(mut rows) => {
@@ -486,12 +546,8 @@ impl Write<'_, '_> {
                     .unwrap_or(rows.len() - 1);
                 let children = self.replace_rendered(rows[at].1, key, value, depth + 1)?;
                 rows.splice(at..=at, children);
-                if rows.len() > PAGE_ITEMS {
-                    let right = rows.split_off(rows.len() / 2);
-                    parts.push(self.put_ranked(&Page::Ranked(rows))?);
-                    parts.push(self.put_ranked(&Page::Ranked(right))?);
-                } else if !rows.is_empty() {
-                    parts.push(self.put_ranked(&Page::Ranked(rows))?);
+                if !rows.is_empty() {
+                    self.pack_rendered(Page::Ranked(rows), &mut parts)?;
                 }
             }
             Page::Branch(_) => return Err(invalid("unranked render tree")),
@@ -636,6 +692,9 @@ impl Write<'_, '_> {
             epoch: self.directory.render_epoch,
             shown,
             created: row.created_millis,
+            // The caller may attach claimed time/cache retention later in this Batch.
+            // Stamping final canonical metadata is a separate, reviewed producer step.
+            expiry: None,
         };
         roots.rendered.hash = self.change_value(
             roots.rendered.hash,
@@ -1409,6 +1468,8 @@ impl Summary {
                 count: 1,
                 earliest: (u64::MAX, u64::MAX),
                 newest: fact.created,
+                // This deadline belongs to a projection policy which may still be refreshing.
+                expiry: None,
             }),
             _ => Err(invalid("ranked projection value")),
         }

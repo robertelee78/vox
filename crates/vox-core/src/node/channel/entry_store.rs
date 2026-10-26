@@ -43,7 +43,9 @@ pub(crate) mod sparse;
 pub(crate) use restart::RestartState;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
-pub(crate) use render_facts::{Filter, RenderFact, RenderView};
+pub(crate) use render_facts::{
+    ExpiryPolicy, Filter, RenderFact, RenderView, VisibilityScan, VisibilityStep,
+};
 
 fn flag(d: &mut Decoder<'_>) -> Result<bool> {
     match d.uint()? {
@@ -978,13 +980,17 @@ impl Value {
             }
             2 if d.uint()? == 1 => Ok(Self::Number(d.uint()?)),
             1 if d.uint()? == 2 => Ok(Self::Present),
-            5 if d.uint()? == 3 => Ok(Self::Rendered(RenderFact::read(d)?)),
+            5 if d.uint()? == 3 => Ok(Self::Rendered(RenderFact::read(d, false)?)),
             4 => match d.uint()? {
                 4 => Ok(Self::Owed(render_facts::OwedFact::read(d)?)),
                 6 => Ok(Self::Operation(render_facts::OperationFact::read(d)?)),
                 _ => Err(invalid("entry page value kind")),
             },
-            6 if d.uint()? == 5 => Ok(Self::Retained(retention_facts::read_fact(d)?)),
+            6 => match d.uint()? {
+                5 => Ok(Self::Retained(retention_facts::read_fact(d)?)),
+                7 => Ok(Self::Rendered(RenderFact::read(d, true)?)),
+                _ => Err(invalid("entry page value kind")),
+            },
             _ => Err(invalid("entry page value kind")),
         }
     }
@@ -1006,7 +1012,7 @@ impl Page {
         }
         .ok_or(invalid("empty entry page"))
     }
-    fn bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
+    fn encoded(&self) -> Zeroizing<Vec<u8>> {
         let mut e = Encoder::new();
         e.array(3).uint(1);
         match self {
@@ -1031,11 +1037,14 @@ impl Page {
                 }
             }
         }
-        let bytes = e.finish();
+        Zeroizing::new(e.finish())
+    }
+    fn bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let bytes = self.encoded();
         if bytes.len() > PAGE_BYTES {
             return Err(invalid("entry page exceeds bound"));
         }
-        Ok(Zeroizing::new(bytes))
+        Ok(bytes)
     }
     fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > PAGE_BYTES {
