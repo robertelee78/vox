@@ -1019,11 +1019,6 @@ fn history_observation(dir: &Path, room: &str) -> HistoryObservation {
     }
 }
 
-fn history_status(dir: &Path, room: &str) -> (String, u64) {
-    let observed = history_observation(dir, room);
-    (observed.phase, observed.remaining)
-}
-
 /// A requested page that has not arrived must still have an exact shipped owner. This detects
 /// the wedge itself: the history request is incomplete while neither its demand controller, its
 /// bounded flow nor an exact admission owns it. It does not infer failure from elapsed time,
