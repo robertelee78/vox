@@ -49,6 +49,7 @@ mod bounded_sync;
 mod computer;
 mod governance;
 mod history_demand;
+mod history_read;
 mod local_trust;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
@@ -783,6 +784,10 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::HistoryDemandPrepared { .. } => "preparing explicit room history",
         NetEvent::HistoryResumeReady { .. } => "resuming retained explicit room history",
         NetEvent::RoomHistory { .. } => "reading a page of a room's history",
+        NetEvent::OwnedRoomHistory { .. } => "owning an expiry-aware history read",
+        NetEvent::PageReadPrepare(_) => "capturing current room read authority",
+        NetEvent::PageReadPublish(_) => "publishing one coherent room read",
+        NetEvent::PageReadFault(_) => "recording a failed history read",
         NetEvent::SessionProjection { .. } => "reading bounded Session metadata",
         NetEvent::SessionFiles { .. } => "reading bounded Session file offers",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
@@ -1281,6 +1286,14 @@ enum NetEvent {
         request: crate::node::history_stream::RequestId,
         fence: Arc<crate::transport::stream_transport::Fence>,
     },
+    OwnedRoomHistory {
+        channel_id: Digest32,
+        query: crate::node::channel::history::Query,
+        reply: oneshot::Sender<Result<crate::node::channel::history::page_read::Answer, String>>,
+    },
+    PageReadPrepare(history_read::PrepareRequest),
+    PageReadPublish(history_read::PublishRequest),
+    PageReadFault(history_read::FaultRequest),
     RoomHistory {
         channel_id: Digest32,
         query: crate::node::channel::history::Query,
@@ -4716,6 +4729,22 @@ impl NodeHandle {
         query_history(&self.net_tx, channel_id, query).await
     }
 
+    pub(crate) async fn owned_room_history(
+        &self,
+        channel_id: Digest32,
+        query: crate::node::channel::history::Query,
+    ) -> Result<crate::node::channel::history::page_read::Answer, String> {
+        owned_query_history(&self.net_tx, channel_id, query).await
+    }
+
+    /// Current room/profile identity for an already-owned result; no nested read/admission.
+    pub(crate) async fn validate_owned_history(
+        &self,
+        lease: &crate::node::channel::history::page_read::ReplyLease,
+    ) -> Result<(), String> {
+        history_read::validate_reply(&self.net_tx, lease).await
+    }
+
     /// Clone one metadata projection, then classify that exact copy against durable policy. The
     /// order matters: a revocation that lands before classification suppresses its trust rows;
     /// one that lands afterward overlaps this read, which linearizes at the classification. No
@@ -5654,6 +5683,11 @@ pub struct Node {
     /// taken for writing by [`Node::lock_all`], which so waits for each to finish and wipe what
     /// it was given: an abort cannot stop a blocking thread (V210-94).
     secret_work: Arc<tokio::sync::RwLock<()>>,
+    page_reads: crate::node::channel::history::page_read::ReadOwner,
+    /// Cancellation handles only, one weak entry per open room which actually has a read.
+    /// No requests, counts, permits or authority live in this map.
+    page_read_rooms:
+        BTreeMap<Digest32, std::sync::Weak<crate::node::channel::history::page_read::ReadLifetime>>,
     /// The sync counters `vox status --json` reports (ADR-025 S0b).
     sync_book: crate::node::status::SharedSyncBook,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
@@ -6379,6 +6413,8 @@ impl Node {
             validation_seq: 0,
             seat_promises: BTreeMap::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
+            page_reads: crate::node::channel::history::page_read::ReadOwner::new(),
+            page_read_rooms: BTreeMap::new(),
             joining: std::collections::BTreeSet::new(),
             joins_answered: BTreeMap::new(),
             reopening: std::collections::BTreeSet::new(),
@@ -11955,6 +11991,16 @@ impl Node {
                     self.retry_owed_history_resume();
                 }
             }
+            NetEvent::OwnedRoomHistory {
+                channel_id,
+                query,
+                reply,
+            } => {
+                self.start_owned_page_read(channel_id, query, reply);
+            }
+            NetEvent::PageReadPrepare(request) => self.prepare_owned_page_read(request),
+            NetEvent::PageReadPublish(request) => self.publish_owned_page_read(request),
+            NetEvent::PageReadFault(request) => self.record_owned_page_fault(request),
             NetEvent::RoomHistory {
                 channel_id,
                 query,
@@ -20274,6 +20320,8 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        self.page_reads.retire();
+        self.page_read_rooms.clear();
         self.observation_refresh = None;
         let retirement_node = self.profile.as_ref().map(Profile::fingerprint);
         let mut bounded_sync = std::mem::take(&mut self.bounded_sync);
@@ -21119,6 +21167,13 @@ impl Node {
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
         self.cancel_observation_refresh(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        if let Some(lifetime) = self
+            .page_read_rooms
+            .remove(channel_id)
+            .and_then(|weak| weak.upgrade())
+        {
+            lifetime.retire();
+        }
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -22046,6 +22101,7 @@ impl Node {
                 return Outcome::Failed(fault_of(&e));
             }
         }
+        self.retire_page_reads(channel_id).await;
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
         self.governance_work.set_deadline(*channel_id, None);
@@ -22682,6 +22738,7 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::LeaveUndone));
         }
         let mut name = String::new();
+        self.retire_page_reads(channel_id).await;
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
         self.governance_work.set_deadline(*channel_id, None);
@@ -27043,11 +27100,13 @@ impl HistoryReader {
         &self,
         room: Digest32,
     ) -> std::result::Result<crate::node::api::HistoryCursor, String> {
-        use crate::node::channel::history::{Query, Reply};
-        match self.query(room, Query::ArrivalHead).await? {
-            Reply::ArrivalHead(head) => Ok(head),
-            _ => Err("unexpected arrival-head answer".into()),
-        }
+        use crate::node::channel::history::Query;
+        let tx = self
+            .tx
+            .upgrade()
+            .ok_or_else(|| "the node has stopped".to_owned())?;
+        let answer = owned_query_history(&tx, room, Query::ArrivalHead).await?;
+        answer.arrival_head()
     }
     /// Freshness for a notice count, without retaining a snapshot across client work.
     pub async fn notice_state(
@@ -27079,28 +27138,37 @@ impl HistoryReader {
         before: Option<Digest32>,
         limit: usize,
     ) -> std::result::Result<crate::node::api::HistoryPage, String> {
-        use crate::node::channel::history::{Query, Reply};
-        match self
-            .query(
-                room,
-                Query::Older {
-                    before,
-                    limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
-                },
-            )
-            .await?
-        {
-            Reply::Older {
-                rows,
-                older,
-                provisional,
-            } => Ok(crate::node::api::HistoryPage {
-                rows,
-                older,
-                provisional,
-            }),
-            _ => Err("unexpected older history answer".into()),
-        }
+        // The public native result is application-owned. Keep original worker buffers
+        // charged through this bounded copy, then erase them before handing data out.
+        self.with_older_page(room, before, limit, Clone::clone)
+            .await
+    }
+
+    /// Consume a bounded native page while its backend output/erasure leases remain held.
+    /// Native adapters use this to encode/copy their application result before returning
+    /// credits; no snapshot, room lock or uncharged worker reply crosses that handoff.
+    pub async fn with_older_page<T: Send>(
+        &self,
+        room: Digest32,
+        before: Option<Digest32>,
+        limit: usize,
+        consume: impl FnOnce(&crate::node::api::HistoryPage) -> T + Send,
+    ) -> std::result::Result<T, String> {
+        use crate::node::channel::history::Query;
+        let tx = self
+            .tx
+            .upgrade()
+            .ok_or_else(|| "the node has stopped".to_owned())?;
+        let answer = owned_query_history(
+            &tx,
+            room,
+            Query::Older {
+                before,
+                limit: limit.clamp(1, crate::node::ipc::PAGE_ENTRIES),
+            },
+        )
+        .await?;
+        crate::node::channel::history::page_read::consume_native(answer, consume)
     }
     /// Read one arrival page, resetting a cursor from a deleted/rejoined saved room.
     pub async fn arrival_page(
@@ -27196,6 +27264,23 @@ impl HistoryReader {
         }
         Ok(rows)
     }
+}
+
+async fn owned_query_history(
+    tx: &mpsc::Sender<NetEvent>,
+    channel_id: Digest32,
+    query: crate::node::channel::history::Query,
+) -> Result<crate::node::channel::history::page_read::Answer, String> {
+    let (reply, rx) = oneshot::channel();
+    tx.send(NetEvent::OwnedRoomHistory {
+        channel_id,
+        query,
+        reply,
+    })
+    .await
+    .map_err(|_| "the node has stopped".to_owned())?;
+    rx.await
+        .map_err(|_| "the node stopped before answering".to_owned())?
 }
 
 async fn query_history(

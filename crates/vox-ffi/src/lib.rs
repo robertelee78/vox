@@ -529,15 +529,14 @@ impl VoxNode {
             .transpose()?;
         let history = self.node.history_reader();
         self.on_node(async move {
-            let page = history
-                .older_page(channel_id, before, 64)
+            history
+                .with_older_page(channel_id, before, 64, |page| MessagePage {
+                    messages: page.rows.iter().map(message).collect(),
+                    older: page.older,
+                    provisional: page.provisional,
+                })
                 .await
-                .map_err(failed)?;
-            Ok(MessagePage {
-                messages: page.rows.iter().map(message).collect(),
-                older: page.older,
-                provisional: page.provisional,
-            })
+                .map_err(failed)
         })
         .await
     }

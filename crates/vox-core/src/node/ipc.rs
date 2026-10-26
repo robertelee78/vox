@@ -3569,9 +3569,16 @@ impl Frame {
                 older,
                 provisional,
             } => {
+                // Preserve the nested Rows grammar without cloning plaintext row Strings.
+                let mut inner = Encoder::new();
+                inner.array(2).uint(T_ROWS).array(rows.len());
+                for row in rows {
+                    encode_row(&mut inner, row);
+                }
+                let inner = zeroize::Zeroizing::new(inner.finish());
                 e.array(4)
                     .uint(T_ROOM_PAGE)
-                    .bytes(&Frame::Rows { rows: rows.clone() }.to_bytes())
+                    .bytes(&inner)
                     .uint(*older)
                     .uint(u64::from(*provisional));
             }
@@ -5549,13 +5556,13 @@ pub async fn read_frame(s: &mut UnixStream) -> Result<Option<Vec<u8>>> {
         }
         return Err(Error::SizeLimitExceeded("ipc frame length"));
     }
-    let mut body = vec![0u8; len];
+    // Cancellation can drop this future during read_exact, including a partial reply ACK.
+    // Keep its allocation guarded until ownership transfers synchronously to the caller.
+    let mut body = zeroize::Zeroizing::new(vec![0u8; len]);
     if s.read_exact(&mut body).await.is_err() {
-        // What did arrive may be part of a passphrase (V210-94).
-        zeroize::Zeroize::zeroize(&mut body);
         return Ok(None);
     }
-    Ok(Some(body))
+    Ok(Some(std::mem::take(&mut *body)))
 }
 
 // A collection is carried in byte pages so even a single member-written field can cross a
@@ -5580,9 +5587,12 @@ pub(crate) async fn write_reply(s: &mut UnixStream, body: &[u8]) -> Result<()> {
             .uint(start as u64)
             .uint(u64::from(more))
             .bytes(&body[start..end]);
-        write_frame(s, &e.finish()).await?;
+        let encoded = zeroize::Zeroizing::new(e.finish());
+        write_frame(s, &encoded).await?;
+        drop(encoded);
         if more {
-            let next = read_frame(s).await?.ok_or(Error::Ipc(IpcHandshake::Cut))?;
+            let next =
+                zeroize::Zeroizing::new(read_frame(s).await?.ok_or(Error::Ipc(IpcHandshake::Cut))?);
             let mut d = Decoder::new(&next);
             if !matches!((d.array(), d.uint(), d.uint()), (Ok(2), Ok(T_REPLY_NEXT), Ok(cursor)) if cursor == end as u64)
                 || d.finish().is_err()
@@ -6585,6 +6595,500 @@ async fn node_detached(detached: &mut Option<tokio::sync::watch::Receiver<bool>>
     }
 }
 
+/// The plaintext frame is destroyed before its exact read/erasure lease, including when
+/// the connection task itself is cancelled. Encoded buffers are declared after this guard.
+struct OwnedRoomReply {
+    frame: Frame,
+    // Last: frame text and every encoding must be gone before read-result ownership ends.
+    lease: Option<crate::node::channel::history::page_read::ReplyLease>,
+}
+impl OwnedRoomReply {
+    fn is_retired(&self) -> bool {
+        self.lease.as_ref().is_some_and(|lease| lease.is_retired())
+    }
+
+    async fn retired(&self) {
+        match &self.lease {
+            Some(lease) => lease.retired().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+impl Drop for OwnedRoomReply {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        match &mut self.frame {
+            Frame::RoomPage { rows, .. } => {
+                for row in rows {
+                    row.text.zeroize();
+                }
+            }
+            Frame::Error { reason } => reason.zeroize(),
+            Frame::Footers { rows, .. } => scrub_footer_rows(rows),
+            _ => {}
+        }
+    }
+}
+
+/// Called only after abandoning the old plaintext/lease and before any reply write.
+/// A scope retirement is an explicit error; only the node watch proves NodeDetached.
+async fn write_retired_room_page(
+    stream: &mut UnixStream,
+    node: &Option<crate::node::paths::NodeName>,
+    watch: &Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<bool> {
+    let detached = watch.as_ref().is_some_and(|watch| *watch.borrow());
+    let frame = match node.clone().filter(|_| detached) {
+        Some(node) => Frame::NodeDetached { node },
+        None => Frame::Error {
+            reason: "the room or node retired this history read; retry".into(),
+        },
+    };
+    let encoded = zeroize::Zeroizing::new(frame.to_bytes());
+    write_frame(stream, &encoded).await?;
+    Ok(!detached)
+}
+
+/// Only the two existing bounded room-page requests use this owned handoff. The byte
+/// paging and ACK protocol remains write_reply's, with its original frame/row limits.
+async fn write_owned_room_page(
+    stream: &mut UnixStream,
+    handle: &NodeHandle,
+    room: Digest32,
+    query: crate::node::channel::history::Query,
+    selected: bool,
+    node: &Option<crate::node::paths::NodeName>,
+    watch: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<bool> {
+    use crate::node::channel::history::Reply;
+    let answer = tokio::select! {
+        answer = handle.owned_room_history(room, query) => answer,
+        () = subscriber_gone(stream) => return Ok(false),
+        () = node_detached(watch) => {
+            if let Some(node) = node.clone() {
+                let _ = write_frame(stream, &Frame::NodeDetached { node }.to_bytes()).await;
+            }
+            return Ok(false);
+        }
+    };
+    let owned = match answer {
+        Ok(answer) if !matches!(answer.reply(), Reply::Older { .. }) => {
+            // The backend owns destruction of any rejected result; do not detach its
+            // erasure lease from an unexpected row-bearing Reply.
+            drop(answer);
+            OwnedRoomReply {
+                frame: Frame::Error {
+                    reason: if selected {
+                        "unexpected selected room history answer"
+                    } else {
+                        "unexpected room history answer"
+                    }
+                    .into(),
+                },
+                lease: None,
+            }
+        }
+        Ok(answer) => {
+            let (reply, lease) = answer.into_parts();
+            let frame = match reply {
+                Reply::Older {
+                    rows,
+                    older,
+                    provisional,
+                } => Frame::RoomPage {
+                    rows,
+                    older,
+                    provisional,
+                },
+                _ => Frame::Error {
+                    reason: if selected {
+                        "unexpected selected room history answer"
+                    } else {
+                        "unexpected room history answer"
+                    }
+                    .into(),
+                },
+            };
+            OwnedRoomReply {
+                frame,
+                lease: Some(lease),
+            }
+        }
+        Err(reason) => OwnedRoomReply {
+            frame: Frame::Error { reason },
+            lease: None,
+        },
+    };
+    write_owned_room_reply(
+        stream,
+        owned,
+        if selected { "RoomViewPage" } else { "RoomPage" },
+        node,
+        watch,
+    )
+    .await
+}
+
+/// One writer for the owned frame; Footers keep their existing single-frame fitting rule.
+async fn write_owned_room_reply(
+    stream: &mut UnixStream,
+    owned: OwnedRoomReply,
+    what: &str,
+    node: &Option<crate::node::paths::NodeName>,
+    watch: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<bool> {
+    if owned.is_retired() {
+        drop(owned);
+        return write_retired_room_page(stream, node, watch).await;
+    }
+    let collection = matches!(owned.frame, Frame::RoomPage { .. });
+    let encoded = zeroize::Zeroizing::new(if collection {
+        owned.frame.to_bytes()
+    } else {
+        fitted(&owned.frame, what)
+    });
+    let writing = std::sync::atomic::AtomicBool::new(false);
+    let mut detached = false;
+    let mut retired = false;
+    let sent = tokio::select! {
+        biased;
+        () = node_detached(watch) => {
+            detached = true;
+            Ok(false)
+        }
+        () = owned.retired() => {
+            retired = true;
+            Ok(false)
+        }
+        result = async {
+            writing.store(true, std::sync::atomic::Ordering::Relaxed);
+            if collection {
+                write_reply(stream, &encoded).await
+            } else {
+                write_frame(stream, &encoded).await
+            }
+        } => result.map(|()| true),
+    };
+    // Cancelling write_reply first drops its guarded chunk/partial ACK. Destroy the
+    // complete encoding and frame next, before releasing any room/global read lease.
+    drop(encoded);
+    drop(owned);
+    if (detached || retired) && !writing.load(std::sync::atomic::Ordering::Relaxed) {
+        return write_retired_room_page(stream, node, watch).await;
+    }
+    // Do not race subscriber_gone with write_reply: that helper consumes bytes and
+    // would steal valid T_REPLY_NEXT ACKs. Write/read EOF observes disconnect here.
+    sent
+}
+
+fn scrub_footer_rows(rows: &mut [crate::node::api::MessageFooter]) {
+    use zeroize::Zeroize;
+    for row in rows {
+        row.entry.zeroize();
+        row.read_by.zeroize();
+        row.read_after.zeroize();
+        row.pulled_by.zeroize();
+        row.pulled_after.zeroize();
+        row.present = false;
+        row.held = 0;
+        row.others = 0;
+    }
+}
+
+/// The actual shares lookup owns its scratch and output/erasure lease through every disk
+/// call. Cancellation stops BETWEEN calls; an already-entered disk call must really finish.
+struct OwnedFooterWork {
+    rows: Vec<crate::node::api::MessageFooter>,
+    tags: Vec<Option<String>>,
+    failure: Option<String>,
+    // Last, after all scoped metadata/tag scratch, including a blocking panic's unwind.
+    lease: Option<crate::node::channel::history::page_read::ReplyLease>,
+}
+impl Drop for OwnedFooterWork {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        scrub_footer_rows(&mut self.rows);
+        for tag in self.tags.iter_mut().flatten() {
+            tag.zeroize();
+        }
+        if let Some(reason) = &mut self.failure {
+            reason.zeroize();
+        }
+    }
+}
+impl OwnedFooterWork {
+    fn fill(
+        mut self,
+        shares: std::sync::Arc<crate::node::shares::Shares>,
+        room: Digest32,
+        entries: Vec<crate::node::api::FooterSelection>,
+        limit: usize,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Self {
+        use zeroize::Zeroize;
+        if self.rows.len() != self.tags.len() || self.rows.len() != entries.len() {
+            self.failure = Some("unexpected footer reply".into());
+            return self;
+        }
+        for (at, selection) in entries.into_iter().enumerate() {
+            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                || self.lease.as_ref().is_none_or(|lease| lease.is_retired())
+            {
+                break;
+            }
+            if let Some(tag) = &self.tags[at] {
+                match shares.pulled_page(
+                    room,
+                    self.rows[at].entry,
+                    tag,
+                    selection.pulled_after,
+                    limit,
+                ) {
+                    Ok((members, after)) => {
+                        self.rows[at].pulled_by.zeroize();
+                        self.rows[at].pulled_by = members;
+                        self.rows[at].pulled_after = after;
+                    }
+                    Err(reason) => {
+                        self.failure = Some(reason);
+                        return self;
+                    }
+                }
+            }
+            if cancel.load(std::sync::atomic::Ordering::Acquire)
+                || self.lease.as_ref().is_none_or(|lease| lease.is_retired())
+            {
+                break;
+            }
+        }
+        self
+    }
+
+    fn into_reply(mut self, instance: [u8; 16]) -> OwnedRoomReply {
+        let frame = match self.failure.take() {
+            Some(reason) => Frame::Error { reason },
+            None => Frame::Footers {
+                instance,
+                rows: std::mem::take(&mut self.rows),
+            },
+        };
+        OwnedRoomReply {
+            frame,
+            lease: self.lease.take(),
+        }
+    }
+}
+
+/// One result slot and an always-joining supervisor, not a second work queue. Dropping
+/// the IPC future requests cancellation; the supervisor still joins the real child and
+/// a closed receiver destroys its result (including the lease) only after that join.
+struct FooterWorkTask {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    result: tokio::sync::oneshot::Receiver<std::result::Result<OwnedFooterWork, String>>,
+}
+impl Drop for FooterWorkTask {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+impl FooterWorkTask {
+    fn start(
+        work: OwnedFooterWork,
+        shares: std::sync::Arc<crate::node::shares::Shares>,
+        room: Digest32,
+        entries: Vec<crate::node::api::FooterSelection>,
+        limit: usize,
+    ) -> Self {
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancel = std::sync::Arc::clone(&cancel);
+        let worker = tokio::task::spawn_blocking(move || {
+            work.fill(shares, room, entries, limit, &worker_cancel)
+        });
+        let (send, result) = tokio::sync::oneshot::channel();
+        let publish_cancel = std::sync::Arc::clone(&cancel);
+        tokio::spawn(async move {
+            let answer = worker.await.map_err(|error| error.to_string());
+            // The actual child has joined. Never publish cancelled or retired metadata.
+            if publish_cancel.load(std::sync::atomic::Ordering::Acquire)
+                || answer
+                    .as_ref()
+                    .is_ok_and(|work| work.lease.as_ref().is_none_or(|lease| lease.is_retired()))
+            {
+                drop(answer);
+                return;
+            }
+            let _ = send.send(answer);
+        });
+        Self { cancel, result }
+    }
+}
+
+async fn write_owned_footers(
+    stream: &mut UnixStream,
+    handle: &NodeHandle,
+    selection: (
+        Digest32,
+        [u8; 16],
+        Vec<crate::node::api::FooterSelection>,
+        usize,
+    ),
+    node: &Option<crate::node::paths::NodeName>,
+    watch: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<bool> {
+    use crate::node::channel::history::{Query, Reply};
+    let (room, instance, entries, limit) = selection;
+    let answer = tokio::select! {
+        answer = handle.owned_room_history(room, Query::Footers { instance, entries: entries.clone(), limit }) => answer,
+        () = subscriber_gone(stream) => return Ok(false),
+        () = node_detached(watch) => return write_retired_room_page(stream, node, watch).await,
+    };
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(reason) => {
+            return write_owned_room_reply(
+                stream,
+                OwnedRoomReply {
+                    frame: Frame::Error { reason },
+                    lease: None,
+                },
+                "Footers",
+                node,
+                watch,
+            )
+            .await
+        }
+    };
+    if !matches!(answer.reply(), Reply::Footers { .. }) {
+        drop(answer);
+        return write_owned_room_reply(
+            stream,
+            OwnedRoomReply {
+                frame: Frame::Error {
+                    reason: "unexpected footer reply".into(),
+                },
+                lease: None,
+            },
+            "Footers",
+            node,
+            watch,
+        )
+        .await;
+    }
+    if answer.is_retired() {
+        drop(answer);
+        return write_retired_room_page(stream, node, watch).await;
+    }
+    let room_lifetime = std::sync::Arc::clone(&answer.scope.lifetime);
+    let node_lifetime = std::sync::Arc::clone(&answer.scope.node_lifetime);
+    let (reply, lease) = answer.into_parts();
+    let Reply::Footers { rows, tags } = reply else {
+        drop(lease);
+        return Err(Error::MalformedIpc("unexpected footer reply"));
+    };
+    let work = OwnedFooterWork {
+        rows,
+        tags,
+        failure: None,
+        lease: Some(lease),
+    };
+    let mut task = FooterWorkTask::start(
+        work,
+        std::sync::Arc::clone(handle.shares()),
+        room,
+        entries,
+        limit,
+    );
+    let mut disconnected = false;
+    let received = tokio::select! {
+        answer = &mut task.result => Some(answer),
+        () = subscriber_gone(stream) => { disconnected = true; None },
+        () = node_detached(watch) => None,
+        () = async { tokio::select! { () = room_lifetime.retired() => {}, () = node_lifetime.retired() => {} } } => None,
+    };
+    let received = match received {
+        Some(received) => received,
+        None => {
+            task.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+            // Closing the result sender happens only after the actual child has joined.
+            let drained = (&mut task.result).await;
+            drop(drained);
+            drop(task);
+            if disconnected {
+                return Ok(false);
+            }
+            return write_retired_room_page(stream, node, watch).await;
+        }
+    };
+    let owned = match received {
+        Ok(Ok(work)) => work.into_reply(instance),
+        Ok(Err(reason)) => OwnedRoomReply {
+            frame: Frame::Error { reason },
+            lease: None,
+        },
+        Err(_) => return write_retired_room_page(stream, node, watch).await,
+    };
+    drop(task);
+    // The old recheck used only ArrivalHead.instance. Reuse the scalar current-scope
+    // validation; another full history admission while holding output bytes can deadlock
+    // a group of footer replies against the shared byte pool.
+    if let Some(lease) = &owned.lease {
+        let mut disconnected = false;
+        let validation = tokio::select! {
+            result = handle.validate_owned_history(lease) => Some(result),
+            () = subscriber_gone(stream) => { disconnected = true; None },
+            () = node_detached(watch) => None,
+        };
+        match validation {
+            Some(Ok(())) => {}
+            Some(Err(reason)) => {
+                drop(owned);
+                return write_owned_room_reply(
+                    stream,
+                    OwnedRoomReply {
+                        frame: Frame::Error { reason },
+                        lease: None,
+                    },
+                    "Footers",
+                    node,
+                    watch,
+                )
+                .await;
+            }
+            None => {
+                drop(owned);
+                if disconnected {
+                    return Ok(false);
+                }
+                return write_retired_room_page(stream, node, watch).await;
+            }
+        }
+    }
+    if matches!(owned.frame, Frame::Footers { .. }) {
+        let encoded = zeroize::Zeroizing::new(owned.frame.to_bytes());
+        let too_large = encoded.len() > 128 * 1024;
+        drop(encoded);
+        if too_large {
+            drop(owned);
+            return write_owned_room_reply(
+                stream,
+                OwnedRoomReply {
+                    frame: Frame::Error {
+                        reason: "message footer page exceeds 128 KiB; select fewer messages".into(),
+                    },
+                    lease: None,
+                },
+                "Footers",
+                node,
+                watch,
+            )
+            .await;
+        }
+    }
+    write_owned_room_reply(stream, owned, "Footers", node, watch).await
+}
+
 /// Serve requests, and stream once subscribed, until either side stops — or until the node
 /// detaches (`detached`, ADR-026 L-3): a request in flight then, or the next one, is answered
 /// [`Frame::NodeDetached`] and the connection ends, so a client holding a session sees its node
@@ -6853,6 +7357,93 @@ async fn serve_requests(
             }
             continue;
         }
+        let request = match request {
+            Request::Footers {
+                channel_id,
+                instance,
+                entries,
+                limit,
+            } => {
+                if !write_owned_footers(
+                    &mut stream,
+                    handle,
+                    (channel_id, instance, entries, limit),
+                    &node,
+                    &mut watch,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+            other => other,
+        };
+        let room_page = match &request {
+            Request::RoomPage {
+                channel_id,
+                before,
+                limit,
+            } => {
+                let limit = if *limit == 0 {
+                    SESSION_PAGE_ROWS
+                } else {
+                    usize::try_from(*limit)
+                        .unwrap_or(usize::MAX)
+                        .min(SESSION_PAGE_ROWS)
+                };
+                Some((
+                    *channel_id,
+                    crate::node::channel::history::Query::Older {
+                        before: *before,
+                        limit,
+                    },
+                    false,
+                ))
+            }
+            Request::RoomViewPage {
+                channel_id,
+                view,
+                instance,
+                before,
+                limit,
+            } => {
+                let limit = if *limit == 0 {
+                    SESSION_PAGE_ROWS
+                } else {
+                    usize::try_from(*limit)
+                        .unwrap_or(usize::MAX)
+                        .min(SESSION_PAGE_ROWS)
+                };
+                Some((
+                    *channel_id,
+                    crate::node::channel::history::Query::ViewPage {
+                        view: view.clone(),
+                        instance: *instance,
+                        before: *before,
+                        limit,
+                    },
+                    true,
+                ))
+            }
+            _ => None,
+        };
+        if let Some((room, query, selected)) = room_page {
+            if !write_owned_room_page(
+                &mut stream,
+                handle,
+                room,
+                query,
+                selected,
+                &node,
+                &mut watch,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            continue;
+        }
         let intent = Held::intent(&request);
         let what = request_name(&request);
         let reply = tokio::select! {
@@ -6910,9 +7501,9 @@ async fn serve_requests(
 /// `reply`'s bytes, or, when they would not fit one frame, a plain error saying so in their place
 /// (ADR-034 FR-2): the daemon never writes a frame its client would refuse.
 fn fitted(reply: &Frame, what: &str) -> Vec<u8> {
-    let bytes = reply.to_bytes();
+    let mut bytes = zeroize::Zeroizing::new(reply.to_bytes());
     if bytes.len() <= frame_limit() {
-        return bytes;
+        return std::mem::take(&mut *bytes);
     }
     Frame::Error {
         reason: format!(

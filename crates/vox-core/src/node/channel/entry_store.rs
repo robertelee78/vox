@@ -42,6 +42,7 @@ mod retention_facts;
 pub(crate) mod sparse;
 pub(crate) use restart::RestartState;
 pub(crate) mod session_tree;
+pub(crate) use dag_facts::OrderKey;
 pub use dag_facts::OrderView;
 pub(crate) use render_facts::{
     ExpiryPolicy, Filter, OwedVisibility, RenderFact, RenderView, VisibilityResolution,
@@ -1253,6 +1254,23 @@ impl Source<'_> {
     }
 }
 
+/// Canonical read identity, not a revision: ordinary appends leave this unchanged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReadIdentity {
+    instance: [u8; 16],
+    legacy: bool,
+}
+impl ReadIdentity {
+    fn of(directory: &Directory) -> Self {
+        Self {
+            instance: directory.history_instance,
+            legacy: !directory.active.sparse.enabled
+                && (directory.legacy_provisional.is_some()
+                    || !directory.legacy_required.is_empty()),
+        }
+    }
+}
+
 /// The channel owns only this small directory/cache; Store and SEK are borrowed per call.
 #[derive(Default)]
 pub(crate) struct EntryIndex {
@@ -1260,6 +1278,9 @@ pub(crate) struct EntryIndex {
     cache_revision: Cell<u64>,
     legacy_attached: Cell<Option<LegacyProvisionalOwner>>,
     provisional_hidden: Cell<bool>,
+    // Only a fresh canonical capture publishes Known. A staged semantic change can
+    // invalidate it, never publish its uncommitted value or a raw index revision.
+    read_identity: std::sync::Arc<std::sync::Mutex<Option<ReadIdentity>>>,
 }
 
 impl std::fmt::Debug for EntryIndex {
@@ -1267,6 +1288,25 @@ impl std::fmt::Debug for EntryIndex {
         f.debug_struct("EntryIndex")
             .field("cached_bytes", &self.cache.borrow().bytes)
             .finish()
+    }
+}
+
+/// One sealed root set captured while current room policy is held. It owns the redb
+/// snapshot, not a room lock or a borrowed SEK. The physical request owner must retain
+/// its erasure/byte leases until this value and the reader made from it have dropped.
+pub(crate) struct CapturedIndex {
+    snapshot: Snapshot,
+    directory: Directory,
+}
+impl CapturedIndex {
+    pub(crate) fn instance(&self) -> [u8; 16] {
+        self.directory.history_instance
+    }
+    pub(crate) fn render_epoch(&self) -> u64 {
+        self.directory.render_epoch
+    }
+    pub(crate) fn legacy_cache_only(&self) -> bool {
+        ReadIdentity::of(&self.directory).legacy
     }
 }
 
@@ -1285,6 +1325,15 @@ impl EntryIndex {
         sek: &'a Sek,
         channel: &'a Digest32,
     ) -> Result<Read<'a>> {
+        let capture = self.capture(store, sek, channel)?;
+        self.read_captured(capture, sek, channel)
+    }
+    pub(crate) fn capture(
+        &self,
+        store: &Store,
+        sek: &Sek,
+        channel: &Digest32,
+    ) -> Result<CapturedIndex> {
         let snapshot = store.snapshot()?;
         let source = Source::Snapshot(&snapshot);
         let bytes = source
@@ -1298,6 +1347,26 @@ impl EntryIndex {
         if directory.phase == Phase::Rebuilding {
             return Err(invalid("entry index publication incomplete"));
         }
+        *self
+            .read_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ReadIdentity::of(&directory));
+        Ok(CapturedIndex {
+            snapshot,
+            directory,
+        })
+    }
+    fn read_captured<'a>(
+        &'a self,
+        capture: CapturedIndex,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<Read<'a>> {
+        let CapturedIndex {
+            snapshot,
+            directory,
+        } = capture;
         if self.cache_revision.replace(directory.revision) != directory.revision {
             self.cache.borrow_mut().clear();
         }
@@ -1308,6 +1377,55 @@ impl EntryIndex {
             channel,
             directory,
         })
+    }
+}
+
+impl EntryIndex {
+    pub(crate) fn read_identity_current(&self, instance: [u8; 16], legacy: bool) -> bool {
+        *self
+            .read_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(ReadIdentity { instance, legacy })
+    }
+    pub(crate) const fn read_work_bytes() -> usize {
+        // Cipher/decode/directory maps, existing shared-bound page cache, page decode
+        // scratch and both scalar-depth selection/count stacks. No enlarged stored page.
+        4 * DIRECTORY_BYTES
+            + CACHE_BYTES
+            + 4 * PAGE_BYTES
+            + MAX_DEPTH * (3 * std::mem::size_of::<Key>())
+    }
+    pub(crate) fn render_captured<'a>(
+        &'a self,
+        capture: CapturedIndex,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<RenderView<'a>> {
+        if !capture.directory.render_ready {
+            return Err(invalid("render facts not yet rebuilt"));
+        }
+        Ok(RenderView {
+            order: OrderView {
+                read: self.read_captured(capture, sek, channel)?,
+            },
+        })
+    }
+}
+
+impl RenderView<'_> {
+    pub(crate) fn entry_log_id(&self, hash: &Digest32) -> Result<Option<u64>> {
+        self.order.read.log_id(hash)
+    }
+    pub(crate) fn missing_page(
+        &self,
+        after: Option<(Digest32, u64)>,
+        limit: usize,
+    ) -> Result<(Vec<(Digest32, u64)>, Option<(Digest32, u64)>)> {
+        self.order.read.missing_page(after, limit)
+    }
+    pub(crate) fn entry_at_position(&self, author: &Digest32, seq: u64) -> Result<Option<Entry>> {
+        self.order.read.get(author, seq)
     }
 }
 
@@ -1512,6 +1630,7 @@ pub(crate) struct Write<'a, 's> {
     channel: &'a Digest32,
     directory: Directory,
     destination: Option<u64>,
+    read_identity: Option<std::sync::Arc<std::sync::Mutex<Option<ReadIdentity>>>>,
 }
 
 impl EntryIndex {
@@ -1538,6 +1657,7 @@ impl EntryIndex {
             channel,
             directory,
             destination: None,
+            read_identity: Some(std::sync::Arc::clone(&self.read_identity)),
         })
     }
     pub(crate) fn committed(&self) {
@@ -1830,7 +1950,17 @@ impl<'s> Write<'_, 's> {
         }
         let sealed = seal_segment(self.sek, SegmentKind::EntryIndex, DIRECTORY, &bytes)?;
         self.batch
-            .put_segment(self.channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)
+            .put_segment(self.channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)?;
+        if let Some(identity) = &self.read_identity {
+            let next = ReadIdentity::of(&self.directory);
+            let mut known = identity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if known.is_some_and(|old| old != next) {
+                *known = None;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2560,6 +2690,12 @@ impl EntryIndex {
                 }
                 let sealed = seal_segment(sek, SegmentKind::EntryIndex, DIRECTORY, &fresh.bytes())?;
                 batch.put_segment(channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)?;
+                // Restore replacement is not normally reachable with published readers;
+                // never leave a previous identity certified if this path is reused.
+                *self
+                    .read_identity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 batch.commit()?;
                 if removed < PROMOTION_ENTRIES {
                     break;

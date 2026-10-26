@@ -1031,7 +1031,7 @@ type Arrived = (Digest32, Digest32, Option<Vec<u8>>, Option<u64>);
 /// Whether an entry claimed at `claimed_ms` is past `ttl` seconds of retention at `now_ms`
 /// (`ttl == 0` keeps everything), compared in milliseconds.
 fn expired_at(claimed_ms: u64, now_ms: u64, ttl: u64) -> bool {
-    ttl != 0 && claimed_ms <= now_ms.saturating_sub(ttl.saturating_mul(1_000))
+    ttl != 0 && now_ms >= claimed_ms.saturating_add(ttl.saturating_mul(1_000))
 }
 
 /// How long nothing new must have expired before an author closes a backlog smaller than
@@ -1171,6 +1171,7 @@ pub struct ChannelState {
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
     projection_state: history::State,
+    page_reads: history::page_read::ReadOwner,
     /// Constant-size display watermarks; plaintext bodies live only in the sealed cache.
     /// A late insertion or canonical move invalidates a notice scan, but an end append does not.
     display_tail: Option<(u64, Digest32)>,
@@ -2065,6 +2066,7 @@ impl ChannelState {
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
+            page_reads: history::page_read::ReadOwner::new(),
             display_tail: None,
             display_order_revision: 0,
             display_shown_at: 0,
@@ -2778,6 +2780,7 @@ impl ChannelState {
                 Some(bytes) => history::State::from_bytes(bytes)?,
                 None => history::State::default(),
             },
+            page_reads: history::page_read::ReadOwner::new(),
             display_tail: None,
             display_order_revision,
             display_shown_at: 0,
@@ -3044,6 +3047,7 @@ impl ChannelState {
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
+            page_reads: history::page_read::ReadOwner::new(),
             display_tail: None,
             display_order_revision: 0,
             display_shown_at: 0,
@@ -5297,6 +5301,7 @@ impl ChannelState {
             return;
         }
         self.poisoned = true;
+        self.page_reads.retire();
         // The original cause survives every later refusal (`save_failure`); never wrap it in
         // itself.
         if self.save_error.is_none() {
@@ -6332,7 +6337,7 @@ impl ChannelState {
         let first_seen = self
             .retention_get_in(transaction, &entry_hash)?
             .map_or(now_ms, |t| t.first_seen_ms);
-        Ok(claimed_ms.min(first_seen) <= now_ms.saturating_sub(ttl.saturating_mul(1_000)))
+        Ok(expired_at(claimed_ms.min(first_seen), now_ms, ttl))
     }
 
     /// Drop the bodies of `due`: rewrite each log page with the skeleton alone, delete its
@@ -10397,6 +10402,7 @@ impl ChannelState {
     /// App-lock this channel: wipe the SEK now. The state should be dropped
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {
+        self.page_reads.retire();
         self.sek.lock_now();
         self.history_publication_changed.notify_waiters();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel

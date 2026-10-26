@@ -928,3 +928,104 @@ impl ChannelState {
         Ok(())
     }
 }
+
+/// The bodyless-header part of legacy_is_session_current_in, on an owned read's
+/// immutable snapshot. No receiver chain/key is cloned. Format-2 signed headers
+/// are outside the legacy private namespace; old unknown evidence keeps its fence.
+pub(super) fn read_snapshot_kind(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    entry: &Entry,
+    log: u64,
+    verified: u64,
+) -> Result<bool> {
+    if entry.skeleton.channel_id != *room {
+        return Err(Error::MalformedAtRest(
+            "Session classification source unverified",
+        ));
+    }
+    if entry.skeleton.v2.is_some() {
+        return Ok(false);
+    }
+    // Past the verified prefix legacy_kind_in returns unknown. Mirror its
+    // completed-header fallback instead of making a reader wait for a peer.
+    if entry.skeleton.seq <= verified {
+        let id = page_id(log, false)?;
+        if let Some(sealed) = snapshot.get_segment(room, SegmentKind::SessionClassification, id)? {
+            if sealed.ciphertext.len() > PAGE_BYTES + crate::atrest::sek::TAG_LEN {
+                return Err(Error::MalformedAtRest("Session classification page size"));
+            }
+            return match Page::read(&open_segment(
+                sek,
+                SegmentKind::SessionClassification,
+                id,
+                &sealed,
+            )?)? {
+                Page::Target {
+                    hash,
+                    author,
+                    session,
+                } if hash == entry.entry_hash() && author == entry.skeleton.author_id => {
+                    Ok(session)
+                }
+                _ => Err(Error::MalformedAtRest(
+                    "Session classification target binding",
+                )),
+            };
+        }
+    }
+    let header = match snapshot.get_segment(room, SegmentKind::SessionClassification, HEADER)? {
+        Some(sealed) => {
+            if sealed.ciphertext.len() > 256 {
+                return Err(Error::MalformedAtRest("Session classification cursor size"));
+            }
+            Header::read(&open_segment(
+                sek,
+                SegmentKind::SessionClassification,
+                HEADER,
+                &sealed,
+            )?)?
+        }
+        None => Header::empty(
+            snapshot
+                .segment_id_after(room, SegmentKind::SessionClassification, Some(1))?
+                .is_none(),
+        ),
+    };
+    if header.active || !header.initialized {
+        Err(Error::Profile(REFRESHING))
+    } else {
+        Ok(false)
+    }
+}
+
+pub(super) fn read_snapshot_complete(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+) -> Result<()> {
+    let header = match snapshot.get_segment(room, SegmentKind::SessionClassification, HEADER)? {
+        Some(sealed) => {
+            if sealed.ciphertext.len() > 256 {
+                return Err(Error::MalformedAtRest("Session classification cursor size"));
+            }
+            Header::read(&open_segment(
+                sek,
+                SegmentKind::SessionClassification,
+                HEADER,
+                &sealed,
+            )?)?
+        }
+        None => Header::empty(
+            snapshot
+                .segment_id_after(room, SegmentKind::SessionClassification, Some(1))?
+                .is_none(),
+        ),
+    };
+    if header.active || !header.initialized {
+        Err(Error::Profile(REFRESHING))
+    } else {
+        Ok(())
+    }
+}

@@ -293,8 +293,9 @@ impl<'scan, 'view> VisibilityScan<'scan, 'view> {
         &mut self,
         budget: &mut crate::log::history::WorkBudget,
         cancel: &AtomicBool,
+        retired: impl Fn() -> bool,
     ) -> Result<VisibilityResolution> {
-        if cancel.load(Ordering::Acquire) || self.cancelled {
+        if cancel.load(Ordering::Acquire) || self.cancelled || retired() {
             self.cancelled = true;
             self.pending = None;
             self.frames.clear();
@@ -344,7 +345,7 @@ impl<'scan, 'view> VisibilityScan<'scan, 'view> {
             }
             _ => return Err(invalid("visibility candidate kind")),
         };
-        if cancel.load(Ordering::Acquire) {
+        if cancel.load(Ordering::Acquire) || retired() {
             self.cancelled = true;
             self.pending = None;
             self.frames.clear();
@@ -366,8 +367,9 @@ impl<'scan, 'view> VisibilityScan<'scan, 'view> {
         &mut self,
         budget: &mut crate::log::history::WorkBudget,
         cancel: &AtomicBool,
+        retired: impl Fn() -> bool,
     ) -> Result<VisibilityStep> {
-        if cancel.load(Ordering::Acquire) || self.cancelled {
+        if cancel.load(Ordering::Acquire) || self.cancelled || retired() {
             self.cancelled = true;
             self.pending = None;
             self.frames.clear();
@@ -380,7 +382,7 @@ impl<'scan, 'view> VisibilityScan<'scan, 'view> {
             let Some(frame) = self.frames.last_mut() else {
                 return Ok(VisibilityStep::Complete { count: self.count });
             };
-            if cancel.load(Ordering::Acquire) {
+            if cancel.load(Ordering::Acquire) || retired() {
                 self.cancelled = true;
                 self.frames.clear();
                 return Ok(VisibilityStep::Cancelled);

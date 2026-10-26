@@ -106,6 +106,7 @@ impl<'a, 's> Write<'a, 's> {
                     ..Directory::default()
                 },
                 destination: None,
+                read_identity: None,
             },
         })
     }

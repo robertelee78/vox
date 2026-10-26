@@ -4,6 +4,7 @@
 //! the same pinned sealed roots. No body mirror is retained by this query layer.
 
 pub(crate) use super::entry_store::Filter;
+pub(crate) mod page_read;
 use super::*;
 use crate::node::api::{
     HistoryCursor, MessagePage, MessageRow, NoticePage, NoticeRevision, NoticeRow, NoticeState,
