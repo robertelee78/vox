@@ -1,8 +1,9 @@
 //! Shared daemon admission and transient-buffer ownership for requested history (ADR-036 H-7).
 //!
-//! A worker owns its slot until its last charged buffer is gone, including buffers handed back
-//! to an actor. Acquire outside actor/room locks and charge before allocation. These are working
-//! buffer limits, not a claim about total process RSS or the separately bounded disk caches.
+//! Working buffers retain their worker, including actor handoffs. After physical work ends,
+//! completed output may retain only its shared byte debit while its consumer finishes. Acquire
+//! outside actor/room locks and charge before allocation. These are working buffer limits, not
+//! a claim about total process RSS or the separately bounded disk caches.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1250,6 +1251,30 @@ pub struct BufferCharge {
 }
 
 impl BufferCharge {
+    /// Transfer completed work's output to byte-only ownership without releasing its
+    /// shared debit. Call only after its physical reader and scratch have been destroyed.
+    /// Remaining Job/BufferCharge clones still retain execution until their normal drop;
+    /// a slow output consumer cannot retain an otherwise finished execution slot.
+    /// Archive has no shared byte counter and cannot use this handoff.
+    pub(crate) fn into_output(mut self) -> Result<OutputCharge, Self> {
+        let pool = match self.worker.lane {
+            Lane::Archive => return Err(self),
+            Lane::Control => OutputPool::Control,
+            Lane::LargeControl | Lane::Live => OutputPool::Foreground,
+        };
+        let output = OutputCharge {
+            budget: Arc::clone(&self.worker.budget),
+            node: self.worker.node,
+            pool,
+            bytes: self.bytes,
+        };
+        // Shared bytes have not changed. Remove only this charge's execution-local
+        // debit, then let self's Worker reference drop normally. Never recreate a Job.
+        self.worker.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.bytes = 0;
+        Ok(output)
+    }
+
     /// Reuse the worker that actually owns this allocation. A dependent operation must not
     /// request another permit from the same finite pool while this charge retains the first.
     pub(crate) fn job(&self) -> Job {
@@ -1269,12 +1294,63 @@ impl BufferCharge {
 
 impl Drop for BufferCharge {
     fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
         self.worker.bytes.fetch_sub(self.bytes, Ordering::AcqRel);
         if let Some(shared) = self.worker.shared_bytes() {
             shared.fetch_sub(self.bytes, Ordering::AcqRel);
             let index = usize::from(matches!(self.worker.lane, Lane::LargeControl | Lane::Live));
             self.worker.budget.bytes_changed[index].notify_waiters();
         }
+    }
+}
+
+#[derive(Debug)]
+enum OutputPool {
+    Control,
+    Foreground,
+}
+
+/// Completed output retains its original shared byte credit, independently of
+/// execution. This owns no worker, cannot admit work, and introduces no new allowance.
+pub(crate) struct OutputCharge {
+    budget: Arc<Budget>,
+    node: Digest32,
+    pool: OutputPool,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for OutputCharge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutputCharge")
+            .field("node", &self.node)
+            .field("pool", &self.pool)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for OutputCharge {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        let index = match self.pool {
+            OutputPool::Control => {
+                self.budget
+                    .control_bytes
+                    .fetch_sub(self.bytes, Ordering::AcqRel);
+                0
+            }
+            OutputPool::Foreground => {
+                self.budget
+                    .foreground_bytes
+                    .fetch_sub(self.bytes, Ordering::AcqRel);
+                1
+            }
+        };
+        self.budget.bytes_changed[index].notify_waiters();
     }
 }
 
