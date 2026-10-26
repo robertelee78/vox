@@ -6365,6 +6365,60 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::sleep(Duration::from_millis(200));
     }
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
+    loop {
+        let current = [(&alice, &fps[0]), (&bob, &fps[1])].map(|(profile, identity)| {
+            let (ok, out, err) = vox(profile, &["status", "--json"], None);
+            assert!(ok, "PRODUCT: quiet-entry Status was refused: {out}{err}");
+            let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+                panic!("PRODUCT: quiet-entry Status was invalid ({error}): {out}")
+            });
+            assert!(
+                status["identity"] == *identity,
+                "APPARATUS: quiet-entry Status selected another identity: {out}"
+            );
+            status
+        });
+        let rooms = current
+            .each_ref()
+            .map(|status| pub_probe_room(status, &control_room));
+        let settled = current.iter().zip(rooms).all(|(status, room)| {
+            status["governance_pending"] == false
+                && room["key_packages_pending"] == false
+                && room["render_backfill_pending"] == false
+                && room["members"].as_array().is_some_and(|members| {
+                    members
+                        .iter()
+                        .all(|member| member["key_delivery_pending"] == false)
+                })
+        });
+        let receipt = |room: &serde_json::Value, peer: &str, field: &str| {
+            room["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|member| member["id"] == peer)
+                .and_then(|member| member[field].as_u64())
+        };
+        // Delivery to the offline member can append fresh public control after the privacy
+        // post. Both actual current feeds, not only that earlier post's cut, must be held.
+        if let (Some(alice_cut), Some(bob_cut)) = (
+            rooms[0]["own_feed_through"].as_u64(),
+            rooms[1]["own_feed_through"].as_u64(),
+        ) {
+            if settled
+                && alice_cut >= privacy_cut
+                && bob_cut > 0
+                && receipt(rooms[0], &fps[1], "held_through").is_some_and(|held| held >= alice_cut)
+                && receipt(rooms[1], &fps[0], "holds_through").is_some_and(|held| held >= alice_cut)
+                && receipt(rooms[1], &fps[0], "held_through").is_some_and(|held| held >= bob_cut)
+                && receipt(rooms[0], &fps[1], "holds_through").is_some_and(|held| held >= bob_cut)
+            {
+                eprintln!("QUIET CURRENT DATA SETTLED: alice_cut={alice_cut} bob_cut={bob_cut} Alice_status={} Bob_status={}", current[0], current[1]);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     let before = [synced(&alice), synced(&bob)];
     let before_lanes = [lane_why(&before[0].2), lane_why(&before[1].2)];
     let before_exact = [quiet_lanes(&before[0].2), quiet_lanes(&before[1].2)];
@@ -6384,6 +6438,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let after_lanes = [lane_why(&after[0].2), lane_why(&after[1].2)];
     let after_exact = [quiet_lanes(&after[0].2), quiet_lanes(&after[1].2)];
     let idled = counted.elapsed();
+    eprintln!(
+        "QUIET ORIGINAL WINDOW STATUS: Alice_before={} Bob_before={} Alice_after={} Bob_after={}",
+        before[0].2, before[1].2, after[0].2, after[1].2
+    );
     let allowed = 2 * (idled.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
     let grown: Vec<u64> = (0..2)
         .map(|i| after[i].0.saturating_sub(before[i].0))
