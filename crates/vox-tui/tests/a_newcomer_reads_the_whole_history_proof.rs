@@ -5302,6 +5302,8 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         canonical
     };
+    // Normalize once: downstream exact JSON/owner keys and CLI selectors use the same full ID.
+    let room = control_room.clone();
     // Both readers acquire the SAME current Bob commitment before its author goes offline.
     // This proves local role satisfaction, not a promise that Alice can export all proofs.
     // A completed first root alone is insufficient: require its current resolved facts,
