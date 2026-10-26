@@ -6022,12 +6022,13 @@ impl ChannelState {
     /// `ttl` seconds (`0` = forever). Only a holder of the `policy` capability may — the
     /// room's admin; anyone else is refused here rather than writing an entry every other
     /// node would ignore. It applies to what is already stored, at the next sweep (R8).
+    /// Returns whether a different signed rule was appended; equal canonical rules are no-ops.
     pub fn set_retention(
         &mut self,
         profile: &Profile,
         ttl: u64,
         now: crate::time::Ms,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now_ms = now.get();
         let signer = profile.signer()?;
         let me = signer.fingerprint();
@@ -6036,23 +6037,34 @@ impl ChannelState {
                 "only the room's admin may set its retention",
             ));
         }
+        drop(self.local_append_eligible_for(profile.store(), false)?);
+        self.ensure_governance_append_eligible(profile, false)?;
+        let ttl_ms = ttl.saturating_mul(1_000);
+        // Read the checked canonical rule, not the last display or a local TTL clamp.
+        let current = self
+            .checked_governance(profile.store(), now_ms)?
+            .display(&self.genesis)?;
+        if current.policy.ttl_ms == ttl_ms {
+            return Ok(false);
+        }
         let update = crate::governance::policy::PolicyUpdate::build(
             signer,
             &self.channel_id,
             self.epoch,
-            ttl.saturating_mul(1_000),
+            ttl_ms,
         )?;
         self.append_governance(profile, &update.to_wire(), now_ms)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Set the shared Session retention without changing message retention.
+    /// Returns whether a different signed rule was appended; equal canonical rules are no-ops.
     pub fn set_step_retention(
         &mut self,
         profile: &Profile,
         ttl: u64,
         now: crate::time::Ms,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let now_ms = now.get();
         let signer = profile.signer()?;
         let me = signer.fingerprint();
@@ -6061,14 +6073,24 @@ impl ChannelState {
                 "only the room's admin may set its Session retention",
             ));
         }
+        drop(self.local_append_eligible_for(profile.store(), false)?);
+        self.ensure_governance_append_eligible(profile, false)?;
+        let ttl_ms = ttl.saturating_mul(1_000);
+        // Read the checked canonical rule, not the last display or a local TTL clamp.
+        let current = self
+            .checked_governance(profile.store(), now_ms)?
+            .display(&self.genesis)?;
+        if current.step_ttl_ms == ttl_ms {
+            return Ok(false);
+        }
         let update = crate::governance::step_policy::StepPolicyUpdate::build(
             signer,
             &self.channel_id,
             self.epoch,
-            ttl.saturating_mul(1_000),
+            ttl_ms,
         )?;
         self.append_governance(profile, &update.to_wire(), now_ms)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Prune one bounded due page, retaining signed skeletons. Repeated actor turns
@@ -6686,6 +6708,31 @@ impl ChannelState {
         self.append_governance_with_sender(profile, payload, now_ms, rows, false, None, false)
     }
 
+    /// Non-mutating command eligibility shared with same-policy no-op decisions.
+    /// Physical publication/capacity admission remains specific to an actual append.
+    fn ensure_governance_append_eligible(
+        &self,
+        profile: &Profile,
+        settle_sparse: bool,
+    ) -> Result<()> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if !self.settled && !settle_sparse {
+            return Err(Error::RoomNotSynced);
+        }
+        self.require_own_history_current()?;
+        if settle_sparse && (!self.uses_sparse_history(profile.store())? || self.settled) {
+            return Err(Error::MalformedBundle("sparse settlement state differs"));
+        }
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if !self.authors.contains_key(&me) {
+            return Err(Error::Profile("this identity is not an author of the room"));
+        }
+        Ok(())
+    }
+
     /// The sparse settlement exception is local-only and publishes presence, sender state
     /// and removal of the unsettled marker in one effects Batch. No mutable state is exposed
     /// as settled before that commit; failed preflight keeps the original sender intact.
@@ -6702,21 +6749,9 @@ impl ChannelState {
         after_departure: bool,
     ) -> Result<Digest32> {
         self.ensure_local_append_available_for(profile.store(), after_departure)?;
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        if !self.settled && !settle_sparse {
-            return Err(Error::RoomNotSynced);
-        }
-        self.require_own_history_current()?;
-        if settle_sparse && (!self.uses_sparse_history(profile.store())? || self.settled) {
-            return Err(Error::MalformedBundle("sparse settlement state differs"));
-        }
+        self.ensure_governance_append_eligible(profile, settle_sparse)?;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
-        if !self.authors.contains_key(&me) {
-            return Err(Error::Profile("this identity is not an author of the room"));
-        }
         let skeleton = self.next_skeleton(profile, &me, payload, now_ms)?;
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();

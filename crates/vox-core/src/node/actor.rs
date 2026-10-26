@@ -24566,10 +24566,11 @@ impl Node {
         let Some(retained) = retained else {
             return Outcome::Failed(Fault::ComputerPolicy);
         };
-        if let Err(error) = retained {
-            return Outcome::Failed(fault_of(&error));
+        match retained {
+            Ok(true) => self.note_local_governance_append(&channel_id),
+            Ok(false) => {}
+            Err(error) => return Outcome::Failed(fault_of(&error)),
         }
-        self.note_local_governance_append(&channel_id);
         self.retention_read_at = 0;
         self.retention_dirty.insert(channel_id);
         Outcome::Done
