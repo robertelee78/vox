@@ -831,6 +831,10 @@ pub(crate) struct RenderView<'a> {
     pub(super) order: OrderView<'a>,
 }
 impl RenderView<'_> {
+    pub(crate) fn snapshot(&self) -> &crate::node::store::Snapshot {
+        &self.order.read.snapshot
+    }
+
     fn source(&self) -> Source<'_> {
         self.order.read.source()
     }
