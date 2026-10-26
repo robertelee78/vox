@@ -6535,6 +6535,9 @@ impl ChannelState {
                 &first_seen_bytes(first_seen, steps),
             )?;
             batch.put_segment(&self.channel_id, SegmentKind::Index, log, &sealed)?;
+            let mut index = self.entries.write(batch, &self.sek, &self.channel_id)?;
+            index.invalidate_owed_expiry(&hash)?;
+            index.seal()?;
         }
         if let Some(mut tracked) = tracked {
             if tracked.first_seen_ms != first_seen || tracked.steps != steps {

@@ -6,7 +6,9 @@ use super::*;
 
 mod visibility;
 use visibility::{ExpiryBounds, RenderExpiry};
-pub(crate) use visibility::{ExpiryPolicy, VisibilityScan, VisibilityStep};
+pub(crate) use visibility::{
+    ExpiryPolicy, OwedVisibility, VisibilityResolution, VisibilityScan, VisibilityStep,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Roots {
@@ -155,24 +157,34 @@ impl RenderFact {
 pub(super) struct OwedFact {
     pub created: u64,
     pub expires: u64,
+    expiry: Option<RenderExpiry>,
 }
 impl OwedFact {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(4)
-            .uint(4)
+        e.array(if self.expiry.is_some() { 5 } else { 4 })
+            .uint(if self.expiry.is_some() { 8 } else { 4 })
             .uint(self.created)
             .uint(self.expires)
             .uint(0);
+        if self.expiry.is_some() {
+            RenderExpiry::write_option(self.expiry, e);
+        }
     }
-    pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        let fact = Self {
-            created: d.uint()?,
-            expires: d.uint()?,
-        };
+    pub(super) fn read(d: &mut Decoder<'_>, with_expiry: bool) -> Result<Self> {
+        let created = d.uint()?;
+        let expires = d.uint()?;
         if d.uint()? != 0 {
             return Err(invalid("owed fact format"));
         }
-        Ok(fact)
+        Ok(Self {
+            created,
+            expires,
+            expiry: if with_expiry {
+                RenderExpiry::read_option(d)?
+            } else {
+                None
+            },
+        })
     }
 }
 
@@ -692,9 +704,7 @@ impl Write<'_, '_> {
             epoch: self.directory.render_epoch,
             shown,
             created: row.created_millis,
-            // The caller may attach claimed time/cache retention later in this Batch.
-            // Stamping final canonical metadata is a separate, reviewed producer step.
-            expiry: None,
+            expiry: self.rendered_expiry(&hash, row.created_millis, row.arrival)?,
         };
         roots.rendered.hash = self.change_value(
             roots.rendered.hash,
@@ -752,6 +762,120 @@ impl Write<'_, '_> {
                     .ok_or(invalid("render author count overflow"))?,
             )),
         )?;
+        self.set_render_roots(roots)
+    }
+    fn rendered_expiry(
+        &self,
+        hash: &Digest32,
+        created: u64,
+        cache: u64,
+    ) -> Result<Option<RenderExpiry>> {
+        let Some(tracked) = self.retention(hash)? else {
+            return Ok(None);
+        };
+        // Body arrival may not yet have attached its decoded time/cache. UNKNOWN is safe.
+        if tracked.claimed_ms != Some(created) || tracked.cache_id != Some(cache) {
+            return Ok(None);
+        }
+        let roots = self.render_roots()?;
+        let source = Source::Batch(self.batch);
+        let at = source
+            .find(self.sek, self.channel, roots.hash, &hashed(hash))?
+            .ok_or(invalid("render retention source missing"))?;
+        if at.log != tracked.log_id {
+            return Err(invalid("render retention log differs"));
+        }
+        let entry = indexed_entry(&source, self.sek, self.channel, SegmentKind::LogDb, at)?;
+        if entry.entry_hash() != *hash {
+            return Err(invalid("render retention source differs"));
+        }
+        Ok(Some(
+            if entry
+                .payload
+                .as_deref()
+                .is_some_and(crate::node::channel::retained_control)
+            {
+                RenderExpiry::durable(tracked.base())
+            } else {
+                RenderExpiry::tracked(tracked)
+            },
+        ))
+    }
+
+    /// Restamp, in the same Batch as a canonical age/cache change, every tree containing
+    /// this fact. Preserve the row's arrival, epoch, shown time, order, counts and witnesses.
+    pub(super) fn restamp_rendered_retention(&mut self, hash: &Digest32) -> Result<()> {
+        let mut roots = self.render_roots()?;
+        let source = Source::Batch(self.batch);
+        let Some(mut fact) =
+            source.render_fact(self.sek, self.channel, roots.rendered.hash, &hashed(hash))?
+        else {
+            return Ok(());
+        };
+        let expiry = self.rendered_expiry(hash, fact.created, fact.cache)?;
+        if fact.expiry == expiry {
+            return Ok(());
+        }
+        let clock = source
+            .number(self.sek, self.channel, roots.clock, &hashed(hash))?
+            .ok_or(invalid("render restamp clock missing"))?;
+        let bytes = source
+            .open(
+                self.sek,
+                self.channel,
+                SegmentKind::PlaintextCache,
+                fact.cache,
+            )?
+            .ok_or(invalid("render restamp cache missing"))?;
+        let super::super::CacheRow::Text(mut row) = super::super::parse_cache(&bytes)? else {
+            return Err(invalid("render restamp points to nontext"));
+        };
+        if row.entry_hash != *hash || row.created_millis != fact.created {
+            return Err(invalid("render restamp cache differs"));
+        }
+        row.arrival = fact.cache;
+        fact.expiry = expiry;
+        roots.rendered.hash = self.change_value(
+            roots.rendered.hash,
+            hashed(hash),
+            Some(Value::Rendered(fact)),
+        )?;
+        roots.rendered.arrival = self.change_rendered(
+            roots.rendered.arrival,
+            ordered((fact.cache, *hash)),
+            Some(fact),
+        )?;
+        roots.rendered.display =
+            self.change_rendered(roots.rendered.display, ordered((clock, *hash)), Some(fact))?;
+        roots.rendered.created = self.change_rendered(
+            roots.rendered.created,
+            ordered((fact.created, *hash)),
+            Some(fact),
+        )?;
+        for filter in filters(&row) {
+            if matches!(filter, Filter::SessionCandidates) {
+                roots.rendered.session_candidates = self.change_rendered(
+                    roots.rendered.session_candidates,
+                    session_key((fact.created, clock, *hash)),
+                    Some(fact),
+                )?;
+            }
+            self.change_filter(
+                &mut roots.rendered,
+                &filter,
+                (fact.cache, *hash),
+                false,
+                Some(fact),
+            )?;
+            self.change_filter(
+                &mut roots.rendered,
+                &filter,
+                (clock, *hash),
+                true,
+                Some(fact),
+            )?;
+        }
+        self.change_operation(&mut roots.rendered, &row, Some(fact))?;
         self.set_render_roots(roots)
     }
     pub(crate) fn remove_rendered(&mut self, hash: &Digest32) -> Result<()> {
@@ -1476,9 +1600,33 @@ impl Summary {
     }
 }
 impl Write<'_, '_> {
+    /// A source-age/subtype mutation can precede ChannelState's exact projection pass.
+    /// Do not retain a KNOWN owed stamp across it. The effective deadline remains owned
+    /// by that projection; the visibility resolver reads canonical pinned source age.
+    pub(crate) fn invalidate_owed_expiry(&mut self, hash: &Digest32) -> Result<()> {
+        let roots = self.render_roots()?;
+        let old = Source::Batch(self.batch).find_value(
+            self.sek,
+            self.channel,
+            roots.rendered.owed_hash,
+            &hashed(hash),
+        )?;
+        match old {
+            Some(Value::Owed(fact)) if fact.expiry.is_some() => self.set_owed(
+                *hash,
+                Some(OwedVisibility {
+                    created: fact.created,
+                    expires: fact.expires,
+                    expiry: None,
+                }),
+            ),
+            Some(Value::Owed(_)) | None => Ok(()),
+            _ => Err(invalid("owed locator value")),
+        }
+    }
     /// Caller supplies authenticated classification and its effective local deadline.
     /// Removal happens before a body/cache replaces the placeholder in the same Batch.
-    pub(crate) fn set_owed(&mut self, hash: Digest32, shown: Option<(u64, u64)>) -> Result<()> {
+    pub(crate) fn set_owed(&mut self, hash: Digest32, shown: Option<OwedVisibility>) -> Result<()> {
         let mut roots = self.render_roots()?;
         let source = Source::Batch(self.batch);
         let old = match source.find_value(
@@ -1491,7 +1639,11 @@ impl Write<'_, '_> {
             None => None,
             _ => return Err(invalid("owed locator value")),
         };
-        let new = shown.map(|(created, expires)| OwedFact { created, expires });
+        let new = shown.map(|value| OwedFact {
+            created: value.created,
+            expires: value.expires,
+            expiry: value.expiry,
+        });
         if old == new {
             return Ok(());
         }

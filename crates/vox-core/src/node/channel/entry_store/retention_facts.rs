@@ -224,7 +224,9 @@ impl Write<'_, '_> {
                     self.change_value(roots.retained.steps, key, Some(Value::Retained(t)))?;
             }
         }
-        self.set_render_roots(roots)
+        self.set_render_roots(roots)?;
+        self.restamp_rendered_retention(&hash)?;
+        self.invalidate_owed_expiry(&hash)
     }
     pub(crate) fn retention_rendered(
         &mut self,

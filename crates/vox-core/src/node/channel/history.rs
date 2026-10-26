@@ -1796,7 +1796,7 @@ impl ChannelState {
         &self,
         batch: &crate::node::store::Batch<'_>,
         entry: &Entry,
-    ) -> Result<Option<(u64, u64)>> {
+    ) -> Result<Option<entry_store::OwedVisibility>> {
         let hash = entry.entry_hash();
         if entry.payload.is_some()
             || self.private_contains_in(batch, &hash)?
@@ -1805,16 +1805,35 @@ impl ChannelState {
             return Ok(None);
         }
         let created = entry.skeleton.claimed_ms;
+        // A legal bodyless header has no Tracked body record. Its authenticated source
+        // publication may instead retain first-seen/subtype beside the log. Preserve that
+        // age; missing legacy evidence stays UNKNOWN, never a fabricated fresh timestamp.
+        let base = match self.retention_get_in(Transaction::Batch(batch), &hash)? {
+            Some(tracked) => Some(tracked.base()),
+            None => match self.log_id_at(Transaction::Batch(batch), &hash)? {
+                Some(log) => batch
+                    .get_segment(&self.channel_id, SegmentKind::Index, log)?
+                    .map(|segment| {
+                        parse_first_seen(&open_segment(
+                            &self.sek,
+                            SegmentKind::Index,
+                            log,
+                            &segment,
+                        )?)
+                    })
+                    .transpose()?
+                    .map(|(seen, _)| created.min(seen)),
+                None => None,
+            },
+        };
         let ttl = self.entry_retention(Transaction::Batch(batch), entry)?;
-        if expired_at(created, self.now_hint, ttl) {
+        let steps = self.entry_steps_in(Transaction::Batch(batch), entry)?;
+        if expired_at(base.unwrap_or(created), self.now_hint, ttl) {
             return Ok(None);
         }
-        let expires = if ttl == 0 {
-            u64::MAX
-        } else {
-            created.saturating_add(ttl.saturating_mul(1_000))
-        };
-        Ok(Some((created, expires)))
+        Ok(Some(entry_store::OwedVisibility::new(
+            created, base, steps, ttl,
+        )))
     }
     /// At most 64 selected owed entries plus 64 expired visibility facts per actor turn.
     /// Exact counts never decrypt/scan the remaining history while a client waits.

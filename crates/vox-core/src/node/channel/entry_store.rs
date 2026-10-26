@@ -44,7 +44,8 @@ pub(crate) use restart::RestartState;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
 pub(crate) use render_facts::{
-    ExpiryPolicy, Filter, RenderFact, RenderView, VisibilityScan, VisibilityStep,
+    ExpiryPolicy, Filter, OwedVisibility, RenderFact, RenderView, VisibilityResolution,
+    VisibilityScan, VisibilityStep,
 };
 
 fn flag(d: &mut Decoder<'_>) -> Result<bool> {
@@ -980,9 +981,13 @@ impl Value {
             }
             2 if d.uint()? == 1 => Ok(Self::Number(d.uint()?)),
             1 if d.uint()? == 2 => Ok(Self::Present),
-            5 if d.uint()? == 3 => Ok(Self::Rendered(RenderFact::read(d, false)?)),
+            5 => match d.uint()? {
+                3 => Ok(Self::Rendered(RenderFact::read(d, false)?)),
+                8 => Ok(Self::Owed(render_facts::OwedFact::read(d, true)?)),
+                _ => Err(invalid("entry page value kind")),
+            },
             4 => match d.uint()? {
-                4 => Ok(Self::Owed(render_facts::OwedFact::read(d)?)),
+                4 => Ok(Self::Owed(render_facts::OwedFact::read(d, false)?)),
                 6 => Ok(Self::Operation(render_facts::OperationFact::read(d)?)),
                 _ => Err(invalid("entry page value kind")),
             },

@@ -34,6 +34,22 @@ pub(super) struct RenderExpiry {
     class: u64, // 0 regular, 1 steps, 2 durable control
 }
 impl RenderExpiry {
+    pub(super) fn tracked(value: crate::node::retention::Tracked) -> Self {
+        Self {
+            base: value.base(),
+            class: u64::from(value.steps),
+        }
+    }
+    pub(super) fn header(base: u64, steps: bool) -> Self {
+        Self {
+            base,
+            class: u64::from(steps),
+        }
+    }
+    pub(super) fn durable(base: u64) -> Self {
+        Self { base, class: 2 }
+    }
+
     pub(super) fn write_option(value: Option<Self>, e: &mut Encoder) {
         match value {
             Some(value) => {
@@ -58,6 +74,29 @@ impl RenderExpiry {
                 Ok(Some(value))
             }
             _ => Err(invalid("render retention arity")),
+        }
+    }
+}
+
+/// Canonical owed-header metadata. A missing legacy age remains UNKNOWN; a header
+/// need not have a retained-body record. `created` remains the displayed signed time.
+#[derive(Clone, Copy)]
+pub(crate) struct OwedVisibility {
+    pub(super) created: u64,
+    pub(super) expires: u64,
+    pub(super) expiry: Option<RenderExpiry>,
+}
+impl OwedVisibility {
+    pub(crate) fn new(created: u64, base: Option<u64>, steps: bool, ttl: u64) -> Self {
+        Self {
+            created,
+            expires: if ttl == 0 {
+                u64::MAX
+            } else {
+                base.unwrap_or(created)
+                    .saturating_add(ttl.saturating_mul(1_000))
+            },
+            expiry: base.map(|base| RenderExpiry::header(base, steps)),
         }
     }
 }
@@ -199,9 +238,21 @@ struct Frame {
     next: usize,
 }
 
+#[derive(Clone, Copy)]
+struct PendingCandidate {
+    key: OrderKey,
+    value: Value,
+}
+
+pub(crate) enum VisibilityResolution {
+    Resolved { key: OrderKey, visible: bool },
+    Yielded,
+    MissingAge { key: OrderKey },
+    Cancelled,
+}
+
 pub(crate) enum VisibilityStep {
-    /// Metadata candidate only. Caller must resolve canonical eligibility and acknowledge
-    /// it before another step. This is never permission to expose plaintext or a fake EOF.
+    /// Metadata candidate only. Call resolve_pending before another step. This is never permission to expose plaintext or a fake EOF.
     Candidate {
         key: OrderKey,
     },
@@ -224,23 +275,87 @@ pub(crate) struct VisibilityScan<'scan, 'view> {
     backwards: bool,
     count_only: bool,
     frames: Vec<Frame>,
-    pending: bool,
+    pending: Option<PendingCandidate>,
     count: u64,
     cancelled: bool,
 }
 impl<'scan, 'view> VisibilityScan<'scan, 'view> {
-    pub(crate) fn acknowledge(&mut self, visible: bool) -> Result<()> {
-        if !self.pending {
-            return Err(invalid("visibility candidate not pending"));
+    /// Resolves only THIS scan's pending candidate under its captured snapshot/policy.
+    /// No caller-provided boolean or callback can credit another key or a newer view.
+    /// This proves expiry eligibility, not a substitute for final current authorization
+    /// or the existing non-expiry projection/classification fences.
+    pub(crate) fn resolve_pending(
+        &mut self,
+        budget: &mut crate::log::history::WorkBudget,
+        cancel: &AtomicBool,
+    ) -> Result<VisibilityResolution> {
+        if cancel.load(Ordering::Acquire) || self.cancelled {
+            self.cancelled = true;
+            self.pending = None;
+            self.frames.clear();
+            return Ok(VisibilityResolution::Cancelled);
         }
-        self.pending = false;
+        let pending = self
+            .pending
+            .ok_or(invalid("visibility candidate not pending"))?;
+        if !budget.take_control_lookup() {
+            return Ok(VisibilityResolution::Yielded);
+        }
+        let hash = &pending.key.1;
+        let visible = match pending.value {
+            Value::Rendered(fact) => {
+                if self.view.fact(hash)? != Some(fact) {
+                    return Err(invalid("render candidate differs"));
+                }
+                self.view.retained_visible(hash, self.policy)?
+            }
+            Value::Owed(fact) => {
+                let current = self.view.source().find_value(
+                    self.view.order.read.sek,
+                    self.view.order.read.channel,
+                    self.view.roots().owed_hash,
+                    &hashed(hash),
+                )?;
+                if current != Some(Value::Owed(fact)) {
+                    return Err(invalid("owed candidate differs"));
+                }
+                let entry = self
+                    .view
+                    .order
+                    .entry(hash)?
+                    .ok_or(invalid("owed source missing"))?;
+                if entry.payload.is_some()
+                    || !self
+                        .view
+                        .missing_contains(&entry.skeleton.author_id, entry.skeleton.seq)?
+                {
+                    false
+                } else {
+                    let Some(expiry) = self.view.header_expiry(hash, &entry)? else {
+                        return Ok(VisibilityResolution::MissingAge { key: pending.key });
+                    };
+                    self.policy.live(expiry.base, expiry.class)
+                }
+            }
+            _ => return Err(invalid("visibility candidate kind")),
+        };
+        if cancel.load(Ordering::Acquire) {
+            self.cancelled = true;
+            self.pending = None;
+            self.frames.clear();
+            return Ok(VisibilityResolution::Cancelled);
+        }
+        self.pending = None;
         if visible {
             self.count = self
                 .count
                 .checked_add(1)
                 .ok_or(invalid("visible count overflow"))?;
         }
-        Ok(())
+        Ok(VisibilityResolution::Resolved {
+            key: pending.key,
+            visible,
+        })
     }
     pub(crate) fn step(
         &mut self,
@@ -249,12 +364,12 @@ impl<'scan, 'view> VisibilityScan<'scan, 'view> {
     ) -> Result<VisibilityStep> {
         if cancel.load(Ordering::Acquire) || self.cancelled {
             self.cancelled = true;
-            self.pending = false;
+            self.pending = None;
             self.frames.clear();
             return Ok(VisibilityStep::Cancelled);
         }
-        if self.pending {
-            return Err(invalid("visibility candidate not acknowledged"));
+        if self.pending.is_some() {
+            return Err(invalid("visibility candidate not resolved"));
         }
         loop {
             let Some(frame) = self.frames.last_mut() else {
@@ -310,10 +425,9 @@ impl<'scan, 'view> VisibilityScan<'scan, 'view> {
                     if !matches!(value, Value::Rendered(_) | Value::Owed(_)) {
                         return Err(invalid("visibility candidate kind"));
                     }
-                    self.pending = true;
-                    return Ok(VisibilityStep::Candidate {
-                        key: order_key(key)?,
-                    });
+                    let key = order_key(key)?;
+                    self.pending = Some(PendingCandidate { key, value });
+                    return Ok(VisibilityStep::Candidate { key });
                 }
                 Page::Ranked(rows) => {
                     let (max, id, summary) = rows[at];
@@ -388,22 +502,14 @@ impl<'view> RenderView<'view> {
                 }
                 frames
             },
-            pending: false,
+            pending: None,
             count: 0,
             cancelled: false,
         })
     }
 
-    /// Does not open plaintext. Caller supplies exact current entry-retention policy;
-    /// missing/corrupt source or canonical cache binding stays a storage error.
-    /// This is ONLY for a rendered body. Legal bodyless owed headers need their own
-    /// authenticated first-seen/classification path; absence of Tracked is not corruption there.
-    pub(crate) fn retained_visible(
-        &self,
-        hash: &Digest32,
-        now: u64,
-        retention: impl FnOnce(&Entry) -> Result<u64>,
-    ) -> Result<bool> {
+    /// Does not open plaintext. Only a rendered body requires Tracked/cache identity.
+    fn retained_visible(&self, hash: &Digest32, policy: ExpiryPolicy) -> Result<bool> {
         let Some(fact) = self.fact(hash)? else {
             return Ok(false);
         };
@@ -413,14 +519,44 @@ impl<'view> RenderView<'view> {
         if tracked.cache_id != Some(fact.cache) {
             return Err(invalid("rendered retention cache differs"));
         }
+        if self.order.read.log_id(hash)? != Some(tracked.log_id) {
+            return Err(invalid("rendered retention log differs"));
+        }
         let entry = self
             .order
             .entry(hash)?
             .ok_or(invalid("rendered source missing"))?;
-        Ok(!crate::node::channel::expired_at(
-            tracked.base(),
-            now,
-            retention(&entry)?,
-        ))
+        let expiry = if entry
+            .payload
+            .as_deref()
+            .is_some_and(crate::node::channel::retained_control)
+        {
+            RenderExpiry::durable(tracked.base())
+        } else {
+            RenderExpiry::tracked(tracked)
+        };
+        Ok(policy.live(expiry.base, expiry.class))
+    }
+    fn header_expiry(&self, hash: &Digest32, entry: &Entry) -> Result<Option<RenderExpiry>> {
+        if let Some(tracked) = self.retention(hash)? {
+            return Ok(Some(RenderExpiry::tracked(tracked)));
+        }
+        let Some(log) = self.order.read.log_id(hash)? else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.source().open(
+            self.order.read.sek,
+            self.order.read.channel,
+            SegmentKind::Index,
+            log,
+        )?
+        else {
+            return Ok(None);
+        };
+        let (seen, steps) = crate::node::channel::parse_first_seen(&bytes)?;
+        Ok(Some(RenderExpiry::header(
+            entry.skeleton.claimed_ms.min(seen),
+            steps,
+        )))
     }
 }

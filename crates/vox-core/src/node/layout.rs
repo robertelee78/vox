@@ -141,7 +141,11 @@ pub fn refuse_old_layout(account: &Account) -> Result<()> {
 // Format 4 is v0.4.6's shared target: accepted restart state adds EntryIndex directory version 9
 // and a durable private-session index. The existing readers retain supported older data; the
 // marker prevents a v0.4.5 helper from opening it again after this daemon has advanced its indexes.
-pub const DATA_ROOT_FORMAT: u32 = 4;
+// Format 5 is the coordinated v0.4.10 target: sealed render/owed facts and ranked
+// summaries may carry canonical expiry metadata. The daemon stamps this under the
+// account lock BEFORE opening stores; older binaries refuse before reading new pages.
+// Supported old pages remain readable as UNKNOWN and are not reset or rewritten eagerly.
+pub const DATA_ROOT_FORMAT: u32 = 5;
 
 /// Read the supported format before opening or writing anything in the data root (ADR-026 F-3).
 /// A missing marker is format 1, written by v0.4.0; an existing but unreadable marker is not.
