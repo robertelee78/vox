@@ -724,6 +724,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SlotFreed => "starting a queued sync",
         NetEvent::ArchiveAdmissionReady { .. } => "starting admitted archive work",
         NetEvent::ForegroundAdmissionReady { .. } => "starting admitted foreground work",
+        NetEvent::OwnRecoveryRoomReady { .. } => "resuming own recovery after room release",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
         NetEvent::BackoffExpired { .. } => "retrying a sync whose backoff is due",
@@ -1474,6 +1475,12 @@ enum NetEvent {
         peer: Digest32,
     },
     /// The exact identity-secret writer a bounded port met was released.
+    OwnRecoveryRoomReady {
+        token: u64,
+        room: Digest32,
+        node: Digest32,
+        instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    },
     BoundedSecretReady {
         token: u64,
         room: Digest32,
@@ -5350,6 +5357,8 @@ pub struct Node {
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
+    /// Scalar scheduling identities only. Durable targets and pages remain in the room/store.
+    own_recovery_rooms: BTreeMap<Digest32, (Digest32, u64, bool)>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -6211,6 +6220,7 @@ impl Node {
             bounded_completion_wake,
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
+            own_recovery_rooms: BTreeMap::new(),
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -11221,6 +11231,32 @@ impl Node {
                     // changed. Cancel the retained queue position; a later need queues anew.
                     self.bounded_sync
                         .release_foreground_admission(token, room, peer);
+                }
+            }
+            NetEvent::OwnRecoveryRoomReady {
+                token,
+                room,
+                node,
+                instance,
+            } => {
+                if self.bounded_sync.release_room_admission(token, room, node)
+                    && self
+                        .profile
+                        .as_ref()
+                        .is_some_and(|p| p.fingerprint() == node)
+                    && self
+                        .channels
+                        .get(&room)
+                        .zip(instance.upgrade())
+                        .is_some_and(|(now, old)| Arc::ptr_eq(now, &old))
+                {
+                    self.advance_own_recovery(room).await;
+                    for ((r, _), port) in &mut self.ports {
+                        if *r == room {
+                            port.raise();
+                        }
+                    }
+                    self.sched_rooms.insert(room);
                 }
             }
             NetEvent::BoundedSecretReady { token, room, peer } => {
@@ -20258,6 +20294,11 @@ impl Node {
                 &open.sealed(signer)?,
             )?;
         }
+        crate::node::history_demand::purge_own_recovery_in(
+            &mut batch,
+            profile.fingerprint(),
+            *room,
+        )?;
         batch.purge_channel(room)?;
         batch.commit()?;
         self.withdrawn = withdrawn;
@@ -20329,6 +20370,11 @@ impl Node {
                 &open.sealed(signer)?,
             )?;
         }
+        crate::node::history_demand::purge_own_recovery_in(
+            &mut batch,
+            profile.fingerprint(),
+            *channel_id,
+        )?;
         batch.purge_channel(channel_id)?;
         batch.commit()
     }
@@ -22327,7 +22373,18 @@ impl Node {
         let mut touched = std::collections::BTreeSet::new();
         for (room, peer, seq) in std::mem::take(&mut self.held_notes) {
             if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
-                shared.lock().await.note_held(&store, peer, seq);
+                let changed = {
+                    let mut channel = shared.lock().await;
+                    let changed = channel.held_through(&peer) != Some(seq);
+                    channel.note_held(&store, peer, seq);
+                    changed
+                };
+                if changed {
+                    if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                        port.raise();
+                    }
+                    self.sched_rooms.insert(room);
+                }
                 touched.insert(room);
             }
         }
@@ -22336,6 +22393,7 @@ impl Node {
         // edge that offers it there. Neither correctness transition waits for actor maintenance.
         for room in touched {
             self.settle_room(&room).await;
+            self.advance_own_recovery(room).await;
         }
     }
 

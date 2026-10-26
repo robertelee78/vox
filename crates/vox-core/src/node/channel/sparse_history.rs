@@ -279,37 +279,6 @@ impl ChannelState {
         Some((own, committed, head.root.leaves))
     }
 
-    /// Evidence that a member holds entries of this node's own feed that this node does not
-    /// (ADR-037 R5): a settled own tip above the local contiguous own head, an observed own
-    /// conflict, or an observed signed own head above it. A restored older profile shows
-    /// exactly this; writing on would make it an equivocator (V210-63).
-    pub(crate) fn own_history_conflict(&self, store: &Store) -> Result<bool> {
-        let read = self.history_read(store)?;
-        let own = self.me();
-        let contiguous = self.dag.verified_head(&own);
-        if read
-            .history_settled_tip(&own)?
-            .is_some_and(|tip| tip.skeleton.seq > contiguous)
-        {
-            return Ok(true);
-        }
-        let Some(state) = read.sparse_author(&own, LogScope::Public)? else {
-            return Ok(false);
-        };
-        if state.observed_conflict.is_some() {
-            return Ok(true);
-        }
-        if let Some(observed) = state.observed {
-            if read
-                .history_head(&observed)?
-                .is_some_and(|observed| observed.root.leaves > contiguous)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Settlement from this node's own durable record (ADR-037 R5): a sparse room not yet
     /// settled, no evidence that a member holds more of the own feed, and current governance.
     /// No peer acknowledgement is waited for; the detector above reads that when it comes.

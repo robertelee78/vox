@@ -147,6 +147,26 @@ fn body_slot(purpose: Purpose) -> Option<usize> {
     }
 }
 
+/// Only persisted cursor/body progress counts; activating a request or serial changes do not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnRecoveryCheckpoint {
+    remaining: usize,
+    next: u64,
+    body: Option<(u64, u64)>,
+}
+impl OwnRecoveryCheckpoint {
+    pub(crate) fn of(state: &demand::State) -> Self {
+        Self {
+            remaining: state.remaining,
+            next: state
+                .cursor
+                .as_ref()
+                .map_or(state.bounds.hi, |cursor| cursor.next_seq),
+            body: state.body.as_ref().map(|body| (body.seq, body.offset)),
+        }
+    }
+}
+
 pub(crate) struct Flow {
     pub(crate) room: Digest32,
     pub(crate) peer: Digest32,
@@ -156,6 +176,11 @@ pub(crate) struct Flow {
     pub(crate) generation: Digest32,
     pub(crate) shared: Arc<Mutex<ChannelState>>,
     pub(crate) archive: bool,
+    pub(crate) automatic_own_recovery: bool,
+    pub(crate) own_recovery_cleanup: bool,
+    pub(crate) own_recovery_trigger: Option<Digest32>,
+    pub(crate) own_recovery_checkpoint: Option<OwnRecoveryCheckpoint>,
+    pub(crate) own_recovery_progress: bool,
     pub(crate) inventory: bool,
     /// This node has a key delivery to the peer waiting on its prekey bundle (ADR-038 FX-35):
     /// the round reads the peer's board whatever kind of flow this is, until the bundle is
@@ -362,6 +387,11 @@ impl Flow {
             generation: [0; 32],
             shared,
             archive: false,
+            automatic_own_recovery: false,
+            own_recovery_cleanup: false,
+            own_recovery_trigger: None,
+            own_recovery_checkpoint: None,
+            own_recovery_progress: false,
             inventory: hint.is_none() && required.is_none(),
             wants_board: false,
             departure_probe,
@@ -494,6 +524,11 @@ impl Flow {
             generation,
             shared,
             archive: true,
+            automatic_own_recovery: false,
+            own_recovery_cleanup: false,
+            own_recovery_trigger: None,
+            own_recovery_checkpoint: None,
+            own_recovery_progress: false,
             inventory: false,
             wants_board: false,
             departure_probe: false,
@@ -926,6 +961,13 @@ impl Flow {
             _ => None,
         }
     }
+    /// Only the controller retirement owner may execute a recovered deletion capability.
+    pub(crate) fn mark_own_recovery_cleanup(&mut self) {
+        self.own_recovery_cleanup = true;
+        self.initialized = true;
+        self.tasks.clear();
+    }
+
     pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
         use crate::node::history_budget::Lane;
         match self
@@ -997,6 +1039,8 @@ impl Flow {
             self.live.clone().map(|stage| (Purpose::Live, stage))
         } else if reclaim_control && self.control.is_some() {
             self.control.clone().map(|stage| (Purpose::Control, stage))
+        } else if self.automatic_own_recovery {
+            self.history.clone().map(|stage| (Purpose::History, stage))
         } else {
             None
         };
@@ -2971,78 +3015,81 @@ impl Flow {
         };
         let job = job.clone();
         let next = self.archive_next;
-        self.archive_status = Some(
-            tokio::task::spawn_blocking(
-                move || -> Result<crate::node::api::HistoryDemandStatus> {
-                    let mut snapshot = demand::inspect(&staging.context, &job)?
-                        .ok_or(Error::Profile("archive state missing"))?;
-                    let mut active = staging
-                        .active
-                        .lock()
-                        .map_err(|_| Error::Profile("history activation lock failed"))?;
-                    if snapshot.state().request != active.request()
-                        || snapshot.state().binding != active.binding()
-                    {
-                        return Err(Error::Profile("archive finalization activation changed"));
-                    }
-                    // Role-only admission can already have completed this request. A terminal
-                    // or deliberately paused activation is a durable result, never permission
-                    // to checkpoint again through an invalid live handle.
-                    if active.matches(snapshot.state())
-                        && snapshot.state().body.is_none()
-                        && !snapshot.state().reclaiming()
-                    {
-                        if let Some(next) = next {
-                            // This branch ends More/Complete, so it never needs a subsequent
-                            // pause. Prepay only its work and single reload before the commit.
-                            let work = demand::AdmissionCharge::reserve(&job)?;
-                            let reload = demand::AdmissionCharge::reserve(&job)?;
-                            let state = snapshot.state();
-                            let cursor = (next >= state.bounds.lo && state.remaining > 0)
-                                .then_some(super::Continuation {
-                                    query_kind: 4,
-                                    head: state.bounds.head,
-                                    lo: state.bounds.lo,
-                                    hi: state.bounds.hi,
-                                    next_seq: next,
-                                    entry: None,
-                                    offset: 0,
-                                    entries_remaining: state.remaining,
-                                });
-                            demand::checkpoint_precharged(
-                                &staging.context,
-                                &mut active,
-                                if cursor.is_some() {
-                                    demand::Progress::More
-                                } else {
-                                    demand::Progress::Complete
-                                },
-                                cursor.as_ref(),
-                                &work,
-                            )?;
-                            snapshot = demand::inspect_precharged(&staging.context, reload)?
-                                .ok_or(Error::Profile("archive state missing"))?;
-                        }
-                    }
-                    if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
+        let initial = self.own_recovery_checkpoint;
+        let (status, progressed) = tokio::task::spawn_blocking(
+            move || -> Result<(crate::node::api::HistoryDemandStatus, bool)> {
+                let mut snapshot = demand::inspect(&staging.context, &job)?
+                    .ok_or(Error::Profile("archive state missing"))?;
+                let mut active = staging
+                    .active
+                    .lock()
+                    .map_err(|_| Error::Profile("history activation lock failed"))?;
+                if snapshot.state().request != active.request()
+                    || snapshot.state().binding != active.binding()
+                {
+                    return Err(Error::Profile("archive finalization activation changed"));
+                }
+                // Role-only admission can already have completed this request. A terminal
+                // or deliberately paused activation is a durable result, never permission
+                // to checkpoint again through an invalid live handle.
+                if active.matches(snapshot.state())
+                    && snapshot.state().body.is_none()
+                    && !snapshot.state().reclaiming()
+                {
+                    if let Some(next) = next {
+                        // This branch ends More/Complete, so it never needs a subsequent
+                        // pause. Prepay only its work and single reload before the commit.
                         let work = demand::AdmissionCharge::reserve(&job)?;
                         let reload = demand::AdmissionCharge::reserve(&job)?;
-                        // This explicit quantum has ended; no worker will silently retry it.
-                        // Keep its exact body/cursor and make Resume the next action.
-                        demand::pause_precharged(&staging.context, &mut active, &work)?;
+                        let state = snapshot.state();
+                        let cursor = (next >= state.bounds.lo && state.remaining > 0).then_some(
+                            super::Continuation {
+                                query_kind: 4,
+                                head: state.bounds.head,
+                                lo: state.bounds.lo,
+                                hi: state.bounds.hi,
+                                next_seq: next,
+                                entry: None,
+                                offset: 0,
+                                entries_remaining: state.remaining,
+                            },
+                        );
+                        demand::checkpoint_precharged(
+                            &staging.context,
+                            &mut active,
+                            if cursor.is_some() {
+                                demand::Progress::More
+                            } else {
+                                demand::Progress::Complete
+                            },
+                            cursor.as_ref(),
+                            &work,
+                        )?;
                         snapshot = demand::inspect_precharged(&staging.context, reload)?
                             .ok_or(Error::Profile("archive state missing"))?;
                     }
-                    Ok(crate::node::actor::saved_history_status(
-                        snapshot.state(),
-                        None,
-                        Some(&active),
-                    ))
-                },
-            )
-            .await
-            .map_err(|_| Error::Profile("history status worker stopped"))??,
-        );
+                }
+                if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
+                    let work = demand::AdmissionCharge::reserve(&job)?;
+                    let reload = demand::AdmissionCharge::reserve(&job)?;
+                    // This explicit quantum has ended; no worker will silently retry it.
+                    // Keep its exact body/cursor and make Resume the next action.
+                    demand::pause_precharged(&staging.context, &mut active, &work)?;
+                    snapshot = demand::inspect_precharged(&staging.context, reload)?
+                        .ok_or(Error::Profile("archive state missing"))?;
+                }
+                let progressed =
+                    initial.is_some_and(|old| old != OwnRecoveryCheckpoint::of(snapshot.state()));
+                Ok((
+                    crate::node::actor::saved_history_status(snapshot.state(), None, Some(&active)),
+                    progressed,
+                ))
+            },
+        )
+        .await
+        .map_err(|_| Error::Profile("history status worker stopped"))??;
+        self.archive_status = Some(status);
+        self.own_recovery_progress = progressed;
         Ok(())
     }
 }

@@ -100,13 +100,24 @@ impl ChannelState {
         store: &Store,
         after_departure: bool,
     ) -> Result<()> {
-        let read = self.local_append_eligible_for(store, after_departure)?;
+        self.ensure_local_append_available_mode(store, after_departure, false)
+    }
+
+    pub(super) fn ensure_local_append_available_mode(
+        &self,
+        store: &Store,
+        after_departure: bool,
+        recover_own: bool,
+    ) -> Result<()> {
+        let read = self.local_append_eligible_mode(store, after_departure, recover_own)?;
         if read.publication_busy()
             || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
         {
-            return Err(Error::Profile(
-                "room publication is busy; retry this operation",
-            ));
+            return Err(if recover_own {
+                Error::OwnHistoryBehind
+            } else {
+                Error::Profile("room publication is busy; retry this operation")
+            });
         }
         Ok(())
     }
@@ -117,6 +128,15 @@ impl ChannelState {
         &'a self,
         store: &Store,
         after_departure: bool,
+    ) -> Result<entry_store::Read<'a>> {
+        self.local_append_eligible_mode(store, after_departure, false)
+    }
+
+    fn local_append_eligible_mode<'a>(
+        &'a self,
+        store: &Store,
+        after_departure: bool,
+        recover_own: bool,
     ) -> Result<entry_store::Read<'a>> {
         // The departure statement must remain this author's tail until another member has
         // acknowledged it. Background key, receipt, session, or share work cannot make a node
@@ -129,6 +149,9 @@ impl ChannelState {
             return Err(Error::Profile(
                 "Legacy history required; resume explicit recovery before posting in this room",
             ));
+        }
+        if !recover_own && read.sparse_enabled() {
+            self.require_own_history_safe_in(&read)?;
         }
         Ok(read)
     }

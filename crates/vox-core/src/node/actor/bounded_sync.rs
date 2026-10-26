@@ -11,6 +11,159 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex as StdMutex;
 
+/// Prepare one immutable automatic page using the same durable admission and body machinery as
+/// a user Archive. The namespace is private to this node/room; it never replaces a user's page.
+#[allow(clippy::too_many_arguments)]
+async fn own_recovery_flow(
+    profile: &Profile,
+    room: Digest32,
+    peer: Digest32,
+    epoch: u64,
+    instance: [u8; 16],
+    page: crate::node::channel::OwnRecoveryPage,
+    shared: Arc<tokio::sync::Mutex<ChannelState>>,
+    control: Arc<crate::node::history_demand::Context>,
+    lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    slots: Arc<stream::runtime::BodySlots>,
+    store: Arc<Store>,
+    budget: Arc<crate::node::history_budget::Budget>,
+    state_job: &crate::node::history_budget::Job,
+    trigger: Digest32,
+) -> crate::error::Result<Flow> {
+    use crate::node::history_demand::{self as demand, Binding, Bounds, Progress};
+    use crate::node::history_stream::{Query, Staging};
+    let node = profile.fingerprint();
+    let generation = stream::authorization_generation(&store, node, room, instance, epoch)?;
+    let context = Arc::new(demand::Context::own_recovery_unlocked(
+        profile, room, lease,
+    )?);
+    let binding = Binding {
+        room,
+        instance,
+        epoch,
+        audience: [0; 32],
+        grant: generation,
+    };
+    let work = context.clone();
+    let job = state_job.clone();
+    let (request, query, active, checkpoint, cleanup) =
+        tokio::task::spawn_blocking(move || -> crate::error::Result<_> {
+            let snapshot = demand::inspect(&work, &job)?;
+            if let Some(snapshot) = &snapshot {
+                let state = snapshot.state();
+                // Disposal reclaims each unfinished body before this namespace may be reused.
+                // A crash during cleanup leaves exactly that bounded continuation, not permission
+                // to overwrite it with a new request.
+                if state.reclaiming()
+                    || (!matches!(
+                        state.progress(None),
+                        Progress::Complete | Progress::Cancelled
+                    ) && (state.binding.room != binding.room
+                        || state.binding.instance != binding.instance
+                        || state.binding.epoch != binding.epoch))
+                {
+                    let active = demand::own_recovery_cleanup(&work, state)?;
+                    let query = Query::Page {
+                        head: state.bounds.head,
+                        lo: state.bounds.lo,
+                        hi: state.bounds.hi,
+                        entries: state.remaining,
+                        wire_bytes: 1024 * 1024,
+                    };
+                    return Ok((
+                        state.request,
+                        query,
+                        active,
+                        stream::runtime::OwnRecoveryCheckpoint::of(state),
+                        true,
+                    ));
+                }
+                if !matches!(
+                    state.progress(None),
+                    Progress::Complete | Progress::Cancelled
+                ) {
+                    let request = state.request;
+                    let query = if let Some(body) = &state.body {
+                        Query::Entry {
+                            head: state.bounds.head,
+                            seq: body.seq,
+                            offset: body.offset,
+                        }
+                    } else {
+                        Query::Page {
+                            head: state.bounds.head,
+                            lo: state.bounds.lo,
+                            hi: state
+                                .cursor
+                                .as_ref()
+                                .map_or(state.bounds.hi, |c| c.next_seq),
+                            entries: state.remaining,
+                            wire_bytes: 1024 * 1024,
+                        }
+                    };
+                    let active = demand::resume_own_recovery(&work, request, binding, &job)?;
+                    let checkpoint = stream::runtime::OwnRecoveryCheckpoint::of(state);
+                    return Ok((request, query, active, checkpoint, false));
+                }
+            }
+            let entries = usize::try_from(page.hi - page.lo + 1)
+                .map_err(|_| Error::MalformedAtRest("own recovery page size"))?;
+            let bounds = Bounds {
+                head: page.head,
+                lo: page.lo,
+                hi: page.hi,
+                entries,
+            };
+            let request = crate::identity::rng::random_array::<16>()?;
+            let active = demand::start(&work, request, binding, bounds, &job)?;
+            let saved = demand::inspect(&work, &job)?.ok_or(Error::OwnHistoryBehind)?;
+            let checkpoint = stream::runtime::OwnRecoveryCheckpoint::of(saved.state());
+            Ok((
+                request,
+                Query::Page {
+                    head: page.head,
+                    lo: page.lo,
+                    hi: page.hi,
+                    entries,
+                    wire_bytes: 1024 * 1024,
+                },
+                active,
+                checkpoint,
+                false,
+            ))
+        })
+        .await
+        .map_err(|_| Error::Profile("own recovery preparation worker stopped"))??;
+    let mut flow = Flow::archive(
+        room,
+        peer,
+        node,
+        epoch,
+        instance,
+        generation,
+        shared,
+        control,
+        Staging {
+            context,
+            active: Arc::new(StdMutex::new(active)),
+        },
+        query,
+        request,
+        crate::transport::stream_transport::Fence::new(),
+        slots,
+        store,
+        budget,
+        state_job.flow_owner(),
+    );
+    flow.automatic_own_recovery = true;
+    flow.own_recovery_trigger = Some(trigger);
+    flow.own_recovery_checkpoint = Some(checkpoint);
+    if cleanup {
+        flow.mark_own_recovery_cleanup();
+    }
+    Ok(flow)
+}
+
 type RetirementKey = crate::node::history_budget::RetirementKey;
 type RetirementLedger = crate::node::history_budget::RetirementLedger;
 type RetirementEntry = crate::node::history_budget::RetirementEntry;
@@ -420,7 +573,13 @@ struct ForegroundAdmission {
     ticket: crate::node::history_budget::Ticket,
     task: tokio::task::JoinHandle<()>,
 }
-struct SecretAdmission {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalAdmissionKind {
+    Secret,
+    Room,
+}
+struct LocalAdmission {
+    kind: LocalAdmissionKind,
     token: u64,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
@@ -518,7 +677,7 @@ pub(super) struct Controller {
     /// One retained ticket per startable foreground lane. A release wakes the exact waiting
     /// port; the scheduler tick is neither its notifier nor a correctness fallback.
     foreground_admission: [Option<ForegroundAdmission>; 4],
-    secret_admission: BTreeMap<(Digest32, Digest32), SecretAdmission>,
+    local_admission: BTreeMap<(Digest32, Digest32), LocalAdmission>,
     byte_admission: BTreeMap<(Digest32, Digest32), ByteAdmission>,
     pool_admission: BTreeMap<(Digest32, Digest32), PoolAdmission>,
     deferred: VecDeque<Flow>,
@@ -547,7 +706,7 @@ impl Drop for Controller {
         for index in 0..self.foreground_admission.len() {
             self.cancel_foreground_admission(index);
         }
-        for (_, admission) in std::mem::take(&mut self.secret_admission) {
+        for (_, admission) in std::mem::take(&mut self.local_admission) {
             admission.task.abort();
         }
         for (_, admission) in std::mem::take(&mut self.byte_admission) {
@@ -614,6 +773,31 @@ impl Controller {
         resume_owed_retirements(&self.retirement_ledger, node);
     }
 
+    fn owns_archive_room(&self, room: Digest32) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .chain(self.retiring.iter())
+            .any(|flow| flow.archive && flow.room == room)
+            || self
+                .running
+                .iter()
+                .flatten()
+                .any(|work| work.room == room && work.archive.is_some())
+            || self
+                .cleanup
+                .as_ref()
+                .is_some_and(|work| work.key.room == room && work.key.archive)
+            || self
+                .retirement_ledger
+                .entries
+                .lock()
+                .map_or(true, |entries| {
+                    entries.keys().any(|key| key.room == room && key.archive)
+                })
+    }
+
     pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.completion_wake)
     }
@@ -639,7 +823,7 @@ impl Controller {
                 .iter()
                 .flatten()
                 .any(|admission| admission.room == room && admission.peer == peer)
-            || self.secret_admission.contains_key(&(room, peer))
+            || self.local_admission.contains_key(&(room, peer))
             || self.byte_admission.contains_key(&(room, peer))
             || self.pool_admission.contains_key(&(room, peer))
     }
@@ -748,9 +932,27 @@ impl Controller {
             }
         }
     }
-    fn cancel_secret_admission(&mut self, room: Digest32, peer: Digest32) {
-        if let Some(admission) = self.secret_admission.remove(&(room, peer)) {
+    fn cancel_local_admission(&mut self, room: Digest32, peer: Digest32) {
+        if let Some(admission) = self.local_admission.remove(&(room, peer)) {
             admission.task.abort();
+        }
+    }
+    fn release_local_admission_kind(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+        kind: LocalAdmissionKind,
+    ) -> bool {
+        if self
+            .local_admission
+            .get(&(room, peer))
+            .is_some_and(|entry| entry.token == token && entry.kind == kind)
+        {
+            self.cancel_local_admission(room, peer);
+            true
+        } else {
+            false
         }
     }
     pub(super) fn release_secret_admission(
@@ -759,17 +961,56 @@ impl Controller {
         room: Digest32,
         peer: Digest32,
     ) -> bool {
-        if self
-            .secret_admission
-            .get(&(room, peer))
-            .is_some_and(|admission| admission.token == token)
-        {
-            self.cancel_secret_admission(room, peer);
-            true
-        } else {
-            false
-        }
+        self.release_local_admission_kind(token, room, peer, LocalAdmissionKind::Secret)
     }
+    pub(super) fn release_room_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        node: Digest32,
+    ) -> bool {
+        self.release_local_admission_kind(token, room, node, LocalAdmissionKind::Room)
+    }
+    /// One actual room-lock release edge, coalesced in the existing cancellable admission
+    /// owner. The self-node key cannot collide with a remote peer's secret admission.
+    pub(super) fn wait_for_own_recovery_room(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        node: Digest32,
+        room: Digest32,
+        shared: Arc<tokio::sync::Mutex<ChannelState>>,
+    ) {
+        if self.local_admission.contains_key(&(room, node)) {
+            return;
+        }
+        let token = *next_token;
+        *next_token += 1;
+        let tx = net_tx.clone();
+        let instance = Arc::downgrade(&shared);
+        let task = tokio::spawn(async move {
+            drop(shared.lock_owned().await);
+            let _ = tx
+                .send(NetEvent::OwnRecoveryRoomReady {
+                    token,
+                    room,
+                    node,
+                    instance,
+                })
+                .await;
+        });
+        self.local_admission.insert(
+            (room, node),
+            LocalAdmission {
+                kind: LocalAdmissionKind::Room,
+                token,
+                root: "own_recovery",
+                lane: crate::node::history_budget::Lane::Control,
+                task,
+            },
+        );
+    }
+
     fn wait_for_secret(
         &mut self,
         net_tx: &mpsc::Sender<NetEvent>,
@@ -779,7 +1020,7 @@ impl Controller {
         work: AdmissionWork,
         secret_work: Arc<tokio::sync::RwLock<()>>,
     ) {
-        if self.secret_admission.contains_key(&(room, peer)) {
+        if self.local_admission.contains_key(&(room, peer)) {
             return;
         }
         let token = *next_token;
@@ -792,9 +1033,10 @@ impl Controller {
                 .send(NetEvent::BoundedSecretReady { token, room, peer })
                 .await;
         });
-        self.secret_admission.insert(
+        self.local_admission.insert(
             (room, peer),
-            SecretAdmission {
+            LocalAdmission {
+                kind: LocalAdmissionKind::Secret,
                 token,
                 root: work.root,
                 lane: work.lane,
@@ -1277,13 +1519,13 @@ impl Controller {
             }
         }
         let waiting: Vec<(Digest32, Digest32)> = self
-            .secret_admission
+            .local_admission
             .keys()
             .filter(|(waiting_room, _)| *waiting_room == room)
             .copied()
             .collect();
         for (room, peer) in waiting {
-            self.cancel_secret_admission(room, peer);
+            self.cancel_local_admission(room, peer);
         }
         let waiting: Vec<(Digest32, Digest32)> = self
             .byte_admission
@@ -1370,7 +1612,7 @@ impl Controller {
             self.cancel_archive_admission();
         }
         self.cancel_foreground_port(room, peer);
-        self.cancel_secret_admission(room, peer);
+        self.cancel_local_admission(room, peer);
         self.cancel_byte_admission(room, peer);
         self.cancel_pool_admission(room, peer);
         for slot in &mut self.ready {
@@ -1412,7 +1654,7 @@ impl Controller {
         for index in 0..self.foreground_admission.len() {
             self.cancel_foreground_admission(index);
         }
-        for (_, admission) in std::mem::take(&mut self.secret_admission) {
+        for (_, admission) in std::mem::take(&mut self.local_admission) {
             admission.task.abort();
         }
         for (_, admission) in std::mem::take(&mut self.byte_admission) {
@@ -2551,6 +2793,21 @@ impl Node {
                 );
             }
             if flow.done() {
+                if flow.automatic_own_recovery {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        port.req_done = port.req_done.max(work.request);
+                        if flow.own_recovery_progress {
+                            port.own_recovery_parked = None;
+                            port.raise();
+                        } else {
+                            port.own_recovery_parked = flow.own_recovery_trigger;
+                        }
+                    }
+                    if flow.own_recovery_progress {
+                        self.governance_work.wake_room(work.room);
+                        self.sched_rooms.insert(work.room);
+                    }
+                }
                 if !flow.archive && !flow.inventory {
                     if let Some(head) = flow.authenticated_head {
                         let event = NetEvent::BoundedHeadCompleted {
@@ -2570,10 +2827,12 @@ impl Node {
                         }
                     }
                 }
-                if let Some(status) = flow.archive_status.take() {
-                    if let Some(request) = status.request {
-                        self.history_demand
-                            .completed(request, flow.generation, status);
+                if !flow.automatic_own_recovery {
+                    if let Some(status) = flow.archive_status.take() {
+                        if let Some(request) = status.request {
+                            self.history_demand
+                                .completed(request, flow.generation, status);
+                        }
                     }
                 }
                 if let Some(hint) = flow.hint {
@@ -2846,7 +3105,8 @@ impl Node {
                 }
                 let archive_dispatch = self.bounded_sync.ready[1].is_none()
                     && self.bounded_sync.running[1].is_none()
-                    && self.history_demand.ready_binding(room, peer).is_some();
+                    && (self.history_demand.ready_binding(room, peer).is_some()
+                        || self.own_recovery_rooms.contains_key(&room));
                 if !archive_dispatch
                     && (page_only
                         || self.bounded_sync.ready[0].is_some()
@@ -2988,7 +3248,101 @@ impl Node {
                     Ok(value) => Arc::new(value),
                     Err(_) => return false,
                 };
-                if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
+                let own_page = if self.own_recovery_rooms.contains_key(&room)
+                    && !self.bounded_sync.owns_archive_room(room)
+                    && self.history_demand.ready_binding(room, peer).is_none()
+                    && self.bounded_sync.ready[1].is_none()
+                    && self.bounded_sync.running[1].is_none()
+                {
+                    let Some(_read) = state_job.reserve(4 * 1024 * 1024) else {
+                        return false;
+                    };
+                    match shared.try_lock() {
+                        Ok(channel) => match (
+                            channel.history_instance(&store),
+                            channel.own_recovery_page(&store, &peer),
+                        ) {
+                            (Ok(instance), Ok(Some(page))) => Some((instance, page)),
+                            _ => None,
+                        },
+                        Err(_) => {
+                            // Keep the producer edge through the actual release, without a
+                            // Control permit, buffers, or secret-work capture parked on it.
+                            drop(_read);
+                            drop(control);
+                            drop(lease);
+                            drop(state_job);
+                            drop(admitted_control.take());
+                            drop(admitted_archive.take());
+                            self.bounded_sync.wait_for_own_recovery_room(
+                                &self.net_tx,
+                                &mut self.next_token,
+                                node,
+                                room,
+                                shared.clone(),
+                            );
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let own_page = own_page.and_then(|(instance, page)| {
+                    let generation =
+                        match stream::authorization_generation(&store, node, room, instance, epoch)
+                        {
+                            Ok(generation) => generation,
+                            Err(_) => return None,
+                        };
+                    let mut encoded = crate::cbor::Encoder::new();
+                    encoded
+                        .array(7)
+                        .bytes(&page.head)
+                        .uint(page.lo)
+                        .uint(page.donor_through)
+                        .bytes(&generation)
+                        .bytes(&instance)
+                        .uint(epoch)
+                        .uint(conn.serial());
+                    let trigger = crate::hash::sha256(&encoded.finish());
+                    if self
+                        .ports
+                        .get(&(room, peer))
+                        .is_some_and(|port| port.own_recovery_parked == Some(trigger))
+                    {
+                        return None;
+                    }
+                    Some((instance, page, trigger))
+                });
+                if let Some((instance, page, trigger)) = own_page {
+                    match own_recovery_flow(
+                        profile,
+                        room,
+                        peer,
+                        epoch,
+                        instance,
+                        page,
+                        shared.clone(),
+                        control,
+                        lease,
+                        self.bounded_sync.body_slots.clone(),
+                        store.clone(),
+                        Arc::clone(&self.history_budget),
+                        &state_job,
+                        trigger,
+                    )
+                    .await
+                    {
+                        Ok(flow) if flow.own_recovery_cleanup => {
+                            self.bounded_sync.dispose(flow);
+                            return false;
+                        }
+                        Ok(flow) => flow,
+                        Err(_) => return false,
+                    }
+                } else if self.bounded_sync.ready[1].is_none()
+                    && self.bounded_sync.running[1].is_none()
+                {
                     if let Some(dispatch) = self.history_demand.take_ready(room, peer) {
                         Flow::archive(
                             room,
@@ -3700,9 +4054,12 @@ impl Controller {
                 None,
             )
         }));
-        admissions.extend(self.secret_admission.iter().map(|((room, peer), waiting)| {
+        admissions.extend(self.local_admission.iter().map(|((room, peer), waiting)| {
             admission(
-                "secret",
+                match waiting.kind {
+                    LocalAdmissionKind::Secret => "secret",
+                    LocalAdmissionKind::Room => "room",
+                },
                 waiting.token,
                 *room,
                 *peer,
@@ -3749,8 +4106,8 @@ impl Controller {
             admissions.join(","),
             self.archive_admission.is_some(),
             self.foreground_admission.iter().flatten().count(),
-            0,
-            self.secret_admission.len(),
+            self.local_admission.values().filter(|a| a.kind == LocalAdmissionKind::Room).count(),
+            self.local_admission.values().filter(|a| a.kind == LocalAdmissionKind::Secret).count(),
             self.byte_admission.len(),
             self.pool_admission.len(),
             cleanup,

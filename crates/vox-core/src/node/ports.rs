@@ -256,6 +256,9 @@ pub struct Port {
     pub req_gen: u64,
     /// Requests consumed by clean completions.
     pub req_done: u64,
+    /// Exact automatic-recovery trigger which returned without body/cursor progress. Equal
+    /// periodic scheduling is not a new producer; a real donor/authority/receipt change is.
+    pub(crate) own_recovery_parked: Option<Digest32>,
     /// The room generation credited to the peer: monotonic within the room instance.
     pub done_gen: u64,
     /// Scheduler-only watermark after one current-only exchange found a legacy gap.
@@ -300,6 +303,7 @@ impl Port {
             poisoned: false,
             req_gen: 1,
             req_done: 0,
+            own_recovery_parked: None,
             done_gen: 0,
             legacy_checked_gen: None,
             busy_attempt_gen: 0,

@@ -54,6 +54,7 @@ pub struct Context {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     Archive,
+    OwnRecovery,
     Live,
     Control,
 }
@@ -91,6 +92,16 @@ impl Context {
             Purpose::History => return Err(invalid("archive requires explicit local demand")),
         };
         Self::with_slot(profile, slot, secret_work)
+    }
+    /// Local durable own-feed recovery only; no public command or network request mints it.
+    pub(crate) fn own_recovery_unlocked(
+        profile: &Profile,
+        room: Digest32,
+        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Self> {
+        let mut context = Self::with_slot(profile, Slot::OwnRecovery, secret_work)?;
+        context.scope = own_recovery_scope(context.node, room);
+        Ok(context)
     }
     fn with_slot(
         profile: &Profile,
@@ -573,8 +584,26 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
         Slot::Archive => 0,
         Slot::Live => 1,
         Slot::Control => 2,
+        Slot::OwnRecovery => 3,
     });
     sha256(&bytes)
+}
+
+fn own_recovery_scope(node: Digest32, room: Digest32) -> Digest32 {
+    let mut bytes = b"vox/history-demand-own-recovery-scope/v1".to_vec();
+    bytes.extend_from_slice(&node);
+    bytes.extend_from_slice(&room);
+    sha256(&bytes)
+}
+
+/// Room retirement deletes derived staging in the same lifecycle transaction.
+pub(crate) fn purge_own_recovery_in(
+    batch: &mut Batch<'_>,
+    node: Digest32,
+    room: Digest32,
+) -> Result<()> {
+    batch.purge_channel(&own_recovery_scope(node, room))?;
+    Ok(())
 }
 
 type RetainedLegacyOwner = (Digest32, RequestId, [u8; 16], Digest32);
@@ -849,6 +878,66 @@ pub(crate) fn resume_precharged(
     batch.commit()?;
     Ok(Active {
         node: context.fingerprint(),
+        scope,
+        request,
+        serial: state.serial,
+        valid: true,
+        binding,
+        cancellation: context.cancellation(),
+    })
+}
+
+/// Reconstruct deletion ownership after a crash, never a live admission capability.
+pub(crate) fn own_recovery_cleanup(context: &Context, state: &State) -> Result<Active> {
+    if context.slot != Slot::OwnRecovery || state.scope != context.scope {
+        return Err(invalid("own recovery cleanup binding"));
+    }
+    Ok(Active {
+        node: context.node,
+        scope: context.scope,
+        request: state.request,
+        serial: state.serial,
+        valid: false,
+        binding: state.binding,
+        cancellation: context.cancellation(),
+    })
+}
+
+/// Automatic recovery rechecks current authority in this Batch while preserving its original
+/// signed interval and body cursor. A trust nonce change is not permission to replace the page.
+pub(crate) fn resume_own_recovery(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    job: &Job,
+) -> Result<Active> {
+    if context.slot != Slot::OwnRecovery {
+        return Err(invalid("own recovery context required"));
+    }
+    let _charge = charge(job, STATE_WORK)?;
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
+    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no own recovery"))?;
+    if state.request != request
+        || state.binding.room != binding.room
+        || state.binding.instance != binding.instance
+        || state.binding.epoch != binding.epoch
+        || state.binding.audience != binding.audience
+        || state.progress.terminal()
+        || state.cleanup.is_some()
+    {
+        return Err(invalid("own recovery lifetime changed"));
+    }
+    state.binding = binding;
+    state.serial = next_serial(state.serial)?;
+    state.progress = Progress::Pending;
+    put(&mut batch, key, &scope, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(Active {
+        node: context.node,
         scope,
         request,
         serial: state.serial,
