@@ -856,8 +856,10 @@ fn start_plan(
 }
 
 /// The caller prepaid this mutation and supplies freshly rechecked authority. Bounds and
-/// remaining count come only from disk. Precommit authorization/cancellation checks remain;
-/// postcommit observer cancellation cannot replace a successful activation with failure.
+/// remaining count come only from disk. Public archive demand may renew its activation's trust
+/// nonce after current authorization is checked, without changing its selected scope. Private
+/// grants and legacy recovery retain exact-binding semantics. Precommit authorization/cancellation
+/// checks remain; postcommit observer cancellation cannot replace successful activation with failure.
 pub(crate) fn resume_precharged(
     context: &Context,
     request: RequestId,
@@ -869,7 +871,22 @@ pub(crate) fn resume_precharged(
     let mut batch = context.store().batch()?;
     authorize_in(&batch, context, binding)?;
     let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
-    if state.request != request || state.binding != binding || state.progress.terminal() {
+    // A durable public selection is not an old worker's authorization lease. An unrelated trust
+    // edit fences that worker, but explicit Resume (or its retained same-quantum handoff) checks
+    // current authority above and may activate the SAME selection under the current nonce.
+    // Private audience/grant changes and legacy recovery still require the exact old binding.
+    let same_public_scope = context.slot == Slot::Archive
+        && state.private.is_none()
+        && state.legacy.is_none()
+        && binding.audience == [0; 32]
+        && state.binding.room == binding.room
+        && state.binding.instance == binding.instance
+        && state.binding.epoch == binding.epoch
+        && state.binding.audience == binding.audience;
+    if state.request != request
+        || (state.binding != binding && !same_public_scope)
+        || state.progress.terminal()
+    {
         return Err(invalid(
             "history demand authority changed or operation ended",
         ));
@@ -877,6 +894,9 @@ pub(crate) fn resume_precharged(
     if state.cleanup.is_some() {
         return Err(invalid("history staging reclamation is pending"));
     }
+    // Commit the fresh binding with the serial: no handle from the earlier activation can
+    // match this record, and the selected bounds, body, cursor and remaining work stay intact.
+    state.binding = binding;
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Pending;
     put(&mut batch, key, &scope, &state)?;
