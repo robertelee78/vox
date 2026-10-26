@@ -260,11 +260,16 @@ fn live_descriptor(read: &Read<'_>, id: u64) -> Result<Option<Descriptor>> {
     if !read.retained(row.opening)? {
         return Ok(None);
     }
+    let mut checked = (row.opening, true);
     // A later opening can remain current after an older name/harness field expires.
     // Keep the Session and the fields that remain available, not a dangling text locator.
     for field in [&mut row.name, &mut row.harness, &mut row.cwd] {
         if let Some(saved) = field {
-            if !read.retained(saved.envelope.first)? {
+            let source = saved.envelope.first;
+            if checked.0 != source {
+                checked = (source, read.retained(source)?);
+            }
+            if !checked.1 {
                 *field = None;
             }
         }
@@ -275,45 +280,40 @@ fn live_descriptor(read: &Read<'_>, id: u64) -> Result<Option<Descriptor>> {
 fn next(
     read: &Read<'_>,
     authors: &[Digest32],
-    after: u64,
+    mut after: u64,
     open_only: bool,
+    retired_remaining: &mut usize,
 ) -> Answer<Option<(u64, Descriptor)>> {
-    let mut next = None;
-    let mut inspected = 0;
-    // Current drive holders are keyring-bounded. Each lookup walks one sealed
-    // path; revoked authors' histories do not have to be scanned and discarded.
-    for author in authors {
-        let mut key = hash_key(author);
-        key[32..40].copy_from_slice(&after.to_be_bytes());
-        loop {
-            let Some((found, id)) = read.next(
+    loop {
+        let mut next = None;
+        // Choose the minimum using only locators. Metadata/body validation belongs to that
+        // one selected row, not every competing author's head for every emitted row.
+        for author in authors {
+            let mut key = hash_key(author);
+            key[32..40].copy_from_slice(&after.to_be_bytes());
+            if let Some((found, id)) = read.next(
                 if open_only {
                     Tree::OpenSessions
                 } else {
                     Tree::AuthorOpenings
                 },
                 Some(key),
-            )?
-            else {
-                break;
-            };
-            if found[..32] != author[..] {
-                break;
-            }
-            if let Some(row) = live_descriptor(read, id)? {
-                if next.as_ref().is_none_or(|(old, _)| id < *old) {
-                    next = Some((id, row));
+            )? {
+                if found[..32] == author[..] && next.is_none_or(|old| id < old) {
+                    next = Some(id);
                 }
-                break;
             }
-            inspected += 1;
-            if inspected >= PAGE_ROWS {
-                return Err(Failure::Request(REFRESHING));
-            }
-            key = found;
         }
+        let Some(id) = next else { return Ok(None) };
+        if let Some(row) = live_descriptor(read, id)? {
+            return Ok(Some((id, row)));
+        }
+        *retired_remaining = retired_remaining.saturating_sub(1);
+        if *retired_remaining == 0 {
+            return Err(Failure::Request(REFRESHING));
+        }
+        after = id;
     }
-    Ok(next)
 }
 
 impl ChannelState {
@@ -511,6 +511,7 @@ impl ChannelState {
                     Query::Summary { .. } | Query::Text { .. } => Err(Failure::Request(CHANGED)),
                 };
             };
+            let mut retired_remaining = PAGE_ROWS;
             match query {
                 Query::Summary {
                     opening,
@@ -689,7 +690,6 @@ impl ChannelState {
                     let mut rows = Vec::new();
                     let mut bytes = 0u64;
                     let mut older = false;
-                    let mut inspected = 0;
                     while let Some((key, id)) = previous_lifecycle(&read, &authors, cursor)? {
                         let time = u64::from_be_bytes(
                             key[32..40]
@@ -719,8 +719,8 @@ impl ChannelState {
                         }
                         cursor = Some((time, id, ended));
                         let Some(row) = live_descriptor(&read, id)? else {
-                            inspected += 1;
-                            if inspected >= PAGE_ROWS {
+                            retired_remaining = retired_remaining.saturating_sub(1);
+                            if retired_remaining == 0 {
                                 return Err(Failure::Request(REFRESHING));
                             }
                             continue;
@@ -748,7 +748,7 @@ impl ChannelState {
                     if node != me {
                         readable(&node)?;
                     }
-                    let open = next(&read, &[node], 0, true)?.is_some();
+                    let open = next(&read, &[node], 0, true, &mut retired_remaining)?.is_some();
                     if node != me {
                         proven(open)?;
                     }
@@ -760,7 +760,7 @@ impl ChannelState {
                     // member whose controls are refreshing, or whose opening a provisional
                     // fold does not hold yet, is told to retry rather than "none".
                     let row = if (authors.contains(&node) || node == me) && self.is_member(&node) {
-                        next(&read, &[node], 0, true)?.map(|(_, row)| row)
+                        next(&read, &[node], 0, true, &mut retired_remaining)?.map(|(_, row)| row)
                     } else {
                         None
                     };
@@ -833,7 +833,8 @@ impl ChannelState {
                     };
                     let mut rows = Vec::new();
                     let mut bytes = 0u64;
-                    let mut candidate = next(&read, &listed, cursor, open_only)?;
+                    let mut candidate =
+                        next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
                     while let Some((id, row)) = candidate {
                         let cost = 256u64
                             .saturating_add(row.name.map_or(0, |f| f.bytes))
@@ -852,7 +853,8 @@ impl ChannelState {
                         bytes = bytes.saturating_add(cost);
                         cursor = id;
                         rows.push(Row::from(row));
-                        candidate = next(&read, &listed, cursor, open_only)?;
+                        candidate =
+                            next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
                     }
                     Ok(Reply::Page {
                         rows,
