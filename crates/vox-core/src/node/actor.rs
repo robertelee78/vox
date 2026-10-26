@@ -382,6 +382,7 @@ fn over_of(ch: &ChannelState) -> Option<String> {
 fn detail_of(
     ch: &ChannelState,
     store: &crate::node::store::Store,
+    trusted: &crate::node::trust::Keyring,
     prev: Option<&ChannelDetail>,
     now: crate::time::Ms,
     sequence: &std::sync::atomic::AtomicU64,
@@ -471,8 +472,14 @@ fn detail_of(
         .filter_map(|member| ch.holds_through(member).map(|seq| (*member, seq)))
         .collect();
     let mut key_delivery_pending = Vec::new();
-    for target in &member_consent {
-        if ch.key_delivery_pending(store, target)? {
+    for target in &members {
+        let consented = member_consent.binary_search(target).is_ok();
+        // First consent, including consent renewed after rotation, owes a key before it can
+        // appear in the current consent set. Recheck local trust even when room facts were
+        // reused: a keyring edit need not change the room's governance revision.
+        let owes_consent =
+            ch.is_settled() && *target != ch.me() && trusted.is_trusted(target) && !consented;
+        if owes_consent || (consented && ch.key_delivery_pending(store, target)?) {
             key_delivery_pending.push(*target);
         }
     }
@@ -8463,6 +8470,7 @@ impl Node {
             match detail_of(
                 &channel,
                 profile.store(),
+                &self.trust,
                 previous,
                 self.now_ms(),
                 &self.display_sequence,
@@ -22139,6 +22147,7 @@ impl Node {
                 match detail_of(
                     &ch,
                     profile.store(),
+                    &self.trust,
                     None,
                     self.now_ms(),
                     &self.display_sequence,
@@ -25807,6 +25816,7 @@ impl Node {
             detail_of(
                 &ch,
                 profile.store(),
+                &self.trust,
                 published
                     .open_channels
                     .iter()
@@ -26179,6 +26189,7 @@ impl Node {
                     detail_of(
                         &ch,
                         profile.store(),
+                        &self.trust,
                         self.fresh_details
                             .get(id)
                             .map(|(_, detail)| detail)
