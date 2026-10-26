@@ -135,10 +135,26 @@ async fn write_frame(send: &mut SendStream, body: &[u8]) -> Result<()> {
 
 /// Read a length-delimited control frame, bounding the declared length.
 async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
+    read_frame_inner(recv, false).await
+}
+
+/// Only the dialer's status read interprets an intentional admission reset as a refusal.
+/// `open_tunnel` must not retry the host's decision as though its path had failed.
+async fn read_frame_inner(recv: &mut RecvStream, status: bool) -> Result<Vec<u8>> {
+    let failed = |error, reason| match error {
+        quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code))
+            if status
+                && (code == quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE)
+                    || code == quinn::VarInt::from_u32(TUNNEL_CLOSED_CODE)) =>
+        {
+            Error::TunnelDenied("dial refused")
+        }
+        _ => Error::MalformedTunnel(reason),
+    };
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
-        .map_err(|_| Error::MalformedTunnel("tunnel control read len"))?;
+        .map_err(|error| failed(error, "tunnel control read len"))?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_CONTROL_FRAME {
         return Err(Error::MalformedTunnel("tunnel control frame too long"));
@@ -146,7 +162,7 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body)
         .await
-        .map_err(|_| Error::MalformedTunnel("tunnel control read body"))?;
+        .map_err(|error| failed(error, "tunnel control read body"))?;
     Ok(body)
 }
 
@@ -195,7 +211,7 @@ pub async fn request(
         service_tag: service_tag.to_owned(),
     };
     write_frame(send, &req.to_bytes()).await?;
-    let status_frame = read_frame(recv).await?;
+    let status_frame = read_frame_inner(recv, true).await?;
     match status_frame.as_slice() {
         [b] => match TunnelStatus::from_byte(*b)? {
             TunnelStatus::Accepted => Ok(()),
@@ -426,10 +442,38 @@ where
         return accept_udp(send, recv, udp, client_id, target, &tag, cut).await;
     }
 
-    let tcp = match TcpStream::connect(target).await {
+    // These are the same cancellation owners through connect, status publication and splice.
+    // In particular, do not recreate a close waiter after it may have acquired Notify's permit.
+    let cut = withdrawn(
+        Arc::clone(&reachers),
+        Arc::clone(&offered),
+        *client_id,
+        tag.clone(),
+    );
+    let asked_watch = watch.clone();
+    let asked = async move {
+        match asked_watch {
+            Some(w) => w.close_asked().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cut, asked);
+    let connected = tokio::select! {
+        biased;
+        () = &mut cut => return Err(stop_pending(&mut send, &mut recv, None)),
+        why = &mut asked => return Err(stop_pending(&mut send, &mut recv, Some(why))),
+        connected = TcpStream::connect(target) => connected,
+    };
+    let tcp = match connected {
         Ok(t) => t,
         Err(_) => {
-            write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+            let denied = [TunnelStatus::Denied.as_byte()];
+            tokio::select! {
+                biased;
+                () = &mut cut => return Err(stop_pending(&mut send, &mut recv, None)),
+                why = &mut asked => return Err(stop_pending(&mut send, &mut recv, Some(why))),
+                refused = write_frame(&mut send, &denied) => refused?,
+            }
             let _ = send.finish();
             return Err(Error::TunnelDenied(
                 "the local service did not accept the connection (is it running?)",
@@ -441,9 +485,35 @@ where
     if let Some(w) = &watch {
         w.set_local(tcp.local_addr().ok());
     }
-    write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
-    let cut = withdrawn(reachers, offered, *client_id, tag);
-    splice_until(send, recv, tcp, cut, watch).await
+    // A successful asynchronous connect is not authority. Recheck the live, normalized service
+    // and peer immediately before accepting; endpoint replacement under the same tag is unchanged.
+    if !reachers.borrow().contains(client_id) || !offered.borrow().contains_key(&tag) {
+        return Err(stop_pending(&mut send, &mut recv, None));
+    }
+    let accepted = [TunnelStatus::Accepted.as_byte()];
+    tokio::select! {
+        biased;
+        () = &mut cut => return Err(stop_pending(&mut send, &mut recv, None)),
+        why = &mut asked => return Err(stop_pending(&mut send, &mut recv, Some(why))),
+        written = write_frame(&mut send, &accepted) => written?,
+    }
+    splice_until_asked(send, recv, tcp, cut.as_mut(), asked.as_mut(), watch).await
+}
+
+/// No denial write may hold a withdrawn admission waiting for the peer to grant flow credit.
+/// Resetting also discards a partially written Accepted frame before application bytes can flow.
+fn stop_pending(send: &mut SendStream, recv: &mut RecvStream, why: Option<String>) -> Error {
+    let (code, error) = match why {
+        Some(why) => (TUNNEL_CLOSED_CODE, Error::TunnelClosed(why)),
+        None => (
+            REACH_WITHDRAWN_CODE,
+            Error::TunnelRevoked("the host withdrew access to this service"),
+        ),
+    };
+    let code = quinn::VarInt::from_u32(code);
+    let _ = send.reset(code);
+    let _ = recv.stop(code);
+    error
 }
 
 /// What a close's reason says when the tunnel was closed at the other end, not here: the host's
@@ -645,10 +715,28 @@ fn spoken(after: std::time::Duration) -> String {
 /// resolves; and, given its [`TunnelWatch`], marking when it last moved a byte and ending with
 /// [`TUNNEL_CLOSED_CODE`] when it is asked to close or is stuck.
 async fn splice_until(
+    send: SendStream,
+    recv: RecvStream,
+    tcp: TcpStream,
+    cut: impl core::future::Future<Output = ()>,
+    watch: Option<TunnelWatch>,
+) -> Result<()> {
+    let asked_watch = watch.clone();
+    let asked = async move {
+        match asked_watch {
+            Some(w) => w.close_asked().await,
+            None => std::future::pending().await,
+        }
+    };
+    splice_until_asked(send, recv, tcp, cut, asked, watch).await
+}
+
+async fn splice_until_asked(
     mut send: SendStream,
     mut recv: RecvStream,
     mut tcp: TcpStream,
     cut: impl core::future::Future<Output = ()>,
+    asked: impl core::future::Future<Output = String>,
     watch: Option<TunnelWatch>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -736,30 +824,33 @@ async fn splice_until(
                 }
             }
         };
-        let asked = async {
-            match &watch {
-                Some(w) => w.close_asked().await,
-                None => std::future::pending().await,
+        let transfer = async {
+            tokio::pin!(outbound, inbound);
+            let (mut out_done, mut in_done) = (false, false);
+            loop {
+                // Keep the two byte directions fair while already-ready cancellation wins
+                // outside this transfer future.
+                tokio::select! {
+                    leg = &mut outbound, if !out_done => match leg {
+                        Leg::Clean => out_done = true,
+                        other => return other,
+                    },
+                    leg = &mut inbound, if !in_done => match leg {
+                        Leg::Clean => in_done = true,
+                        other => return other,
+                    },
+                }
+                if out_done && in_done {
+                    return Leg::Clean;
+                }
             }
         };
-        tokio::pin!(outbound, inbound, cut, asked);
-        let (mut out_done, mut in_done) = (false, false);
-        loop {
-            tokio::select! {
-                leg = &mut outbound, if !out_done => match leg {
-                    Leg::Clean => out_done = true,
-                    other => break Some(Ok(other)),
-                },
-                leg = &mut inbound, if !in_done => match leg {
-                    Leg::Clean => in_done = true,
-                    other => break Some(Ok(other)),
-                },
-                () = &mut cut => break None,
-                why = &mut asked => break Some(Err(why)),
-            }
-            if out_done && in_done {
-                break Some(Ok(Leg::Clean));
-            }
+        tokio::pin!(transfer, cut, asked);
+        tokio::select! {
+            biased;
+            () = &mut cut => None,
+            why = &mut asked => Some(Err(why)),
+            leg = &mut transfer => Some(Ok(leg)),
         }
     };
     // A tunnel closed on purpose — here, there, or as stuck — is reset with the closing code,
