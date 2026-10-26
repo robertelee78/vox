@@ -7221,6 +7221,183 @@ fn prove_declined_refusal_lifecycle(
         }
         std::thread::yield_now();
     };
+    // Actual BodyNotHeld already established the missing target. Widen only Bob's local
+    // message preference so new ordinary expiry is not a legitimate writer in this minute.
+    // This cannot restore a missing payload and does not certify all maintenance complete.
+    std::fs::write(bob.join("cfg/retention"), "default forever\n")
+        .expect("APPARATUS: sparse quiet Bob retention configuration");
+    let (ok, out, err) = vox(bob, &["room", "retention", room, "--steps", "7d"], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's sparse quiet local retention reload was refused: {out}{err}"
+    );
+    assert!(!reads(bob, room, pruned),
+        "APPARATUS: Bob's missing target became readable after local retention widened; no sparse quiet premise");
+    // Measure live-eligible, still-wanted Bob-body debt after this reachable source refused.
+    // Carol's offline copy remains retained: this is not global erasure or a below-window
+    // target. The earlier original bursts/Older stages supply the below-window composition.
+    let sparse_ready = |status: &serde_json::Value, identity: &str, peer: &str| {
+        assert!(
+            status["identity"] == identity,
+            "APPARATUS: sparse quiet Status selected another identity: {status}"
+        );
+        let room_status = pub_probe_room(status, room);
+        let observation = pub_port_observation(status, room, peer);
+        status["governance_pending"] == false
+            && room_status["retention"] == 0
+            && room_status["render_backfill_pending"] == false
+            && room_status["members"].as_array().is_some_and(|members| {
+                members
+                    .iter()
+                    .find(|member| member["id"] == peer)
+                    .is_some_and(|member| {
+                        member["connected"] == true && member["key_delivery_pending"] == false
+                    })
+            })
+            && observation["initialized"] == true
+            && observation["dirty"] == false
+            && observation["desired"] == observation["sent"]
+            && pub_has_resolved_own_probe(status, room, peer)
+            && pub_current_own_probe(status, room, peer).is_some_and(|probe| {
+                probe["node"] == identity
+                    && probe["epoch"] == room_status["epoch"]
+                    && ["connection", "instance", "epoch"]
+                        .iter()
+                        .all(|key| probe[*key] == observation[*key])
+                    && probe["completed"]["disposition"] == "snapshot"
+                    && probe["completed"]["root"]["target"] == probe["local_head"]
+                    && probe["last_started"]["target"] == probe["local_head"]
+                    && probe["last_started"]["request"] == probe["completed"]["root"]["request"]
+                    && observation["desired"]["own_head"] == pub_local_head(probe, identity)
+            })
+    };
+    let (sparse_before, sparse_before_status) = loop {
+        let snapshots = [synced(bob), synced(late)];
+        let statuses = snapshots.each_ref().map(|sample| {
+            serde_json::from_str::<serde_json::Value>(&sample.2)
+                .expect("PRODUCT: sparse quiet-entry Status was not JSON")
+        });
+        if sparse_ready(&statuses[0], &fps[1], &fps[3])
+            && sparse_ready(&statuses[1], &fps[3], &fps[1])
+        {
+            check_saved_refusal(&statuses[1]);
+            break (snapshots, statuses);
+        }
+        std::thread::yield_now();
+    };
+    // Local publication may settle after the first observed refusal. Keep that refusal
+    // immutable, but use this one fresh coherent own-question baseline for BOTH the minute
+    // and the later reconnect; never lower a previously captured local feed prefix.
+    assert!(
+        pub_probe_room(&sparse_before_status[1], room)["own_feed_through"]
+            .as_u64()
+            .zip(pub_probe_room(&refusal_baseline, room)["own_feed_through"].as_u64())
+            .is_some_and(|(current, prior)| current >= prior),
+        "APPARATUS: sparse quiet settling lowered Late's original local feed prefix"
+    );
+    let refusal_baseline = sparse_before_status[1].clone();
+    let sparse_profiles = [("bob", bob), ("late", late)];
+    let sparse_stores_before = store_artifacts(&sparse_profiles);
+    let sparse_counted = Instant::now();
+    std::thread::sleep(IDLE);
+    let sparse_stores_after = store_artifacts(&sparse_profiles);
+    let sparse_after = [synced(bob), synced(late)];
+    let sparse_after_status = sparse_after.each_ref().map(|sample| {
+        serde_json::from_str::<serde_json::Value>(&sample.2)
+            .expect("PRODUCT: sparse quiet-end Status was not JSON")
+    });
+    let sparse_elapsed = sparse_counted.elapsed();
+    eprintln!("SPARSE REFUSAL QUIET MINUTE: elapsed={sparse_elapsed:?} saved={saved_refusal:?} Bob_before={} Late_before={} Bob_after={} Late_after={}",
+        sparse_before[0].2, sparse_before[1].2, sparse_after[0].2, sparse_after[1].2);
+    let sparse_wrote: Vec<_> = sparse_stores_before.iter().filter_map(|(name, before)| {
+        let after = sparse_stores_after.get(name)
+            .unwrap_or_else(|| panic!("APPARATUS: sparse quiet {name} store disappeared"));
+        (before.bytes != after.bytes || before.modified != after.modified).then(|| format!(
+            "{name}: bytes changed {} ({} -> {} bytes), mtime changed {} ({:?} -> {:?}), store {}",
+            before.bytes != after.bytes, before.bytes.len(), after.bytes.len(),
+            before.modified != after.modified, before.modified, after.modified, before.path.display()))
+    }).collect();
+    let sparse_allowed =
+        2 * (sparse_elapsed.as_secs() / vox_core::node::syncstream::SYNC_INTERVAL_SECS + 1);
+    for (index, name, identity, peer) in [
+        (0usize, "bob", &fps[1], &fps[3]),
+        (1, "late", &fps[3], &fps[1]),
+    ] {
+        let before_status = &sparse_before_status[index];
+        let after_status = &sparse_after_status[index];
+        assert!(
+            after_status["identity"] == *identity,
+            "APPARATUS: sparse quiet-end selected another {name}: {after_status}"
+        );
+        let before_probe =
+            pub_current_own_probe(before_status, room, peer).expect("ready sparse probe");
+        let after_probe = pub_current_own_probe(after_status, room, peer)
+            .expect("APPARATUS: sparse quiet-end lacks original probe scope");
+        let before_capture = pub_port_observation(before_status, room, peer);
+        let after_capture = pub_port_observation(after_status, room, peer);
+        assert!(["connection", "instance", "epoch"].iter().all(|field|
+                before_probe[*field] == before_capture[*field]
+                    && after_probe[*field] == after_capture[*field])
+            && before_probe["epoch"] == pub_probe_room(before_status, room)["epoch"]
+            && after_probe["epoch"] == pub_probe_room(after_status, room)["epoch"]
+            && ["node", "instance", "epoch", "authorization", "connection", "local_head"].iter()
+                .all(|field| before_probe[*field] == after_probe[*field])
+            && pub_probe_room(before_status, room)["own_feed_through"] == pub_probe_room(after_status, room)["own_feed_through"]
+            && pub_port_observation(before_status, room, peer)["desired"] == pub_port_observation(after_status, room, peer)["desired"],
+            "APPARATUS: sparse quiet {name} room/Head/grant/connection changed across the measured interval: {after_status}");
+        for (edge, status) in [("before", before_status), ("after", after_status)] {
+            let connected = pub_probe_room(status, room)["members"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|member| member["id"] == *peer)
+                .and_then(|member| member["connected"].as_bool());
+            assert_eq!(connected, Some(true),
+                "APPARATUS: sparse quiet known online {name}/{peer} pair disconnected at {edge}: {status}");
+        }
+    }
+    assert!(!reads(bob, room, pruned) && !reads(late, room, pruned),
+        "APPARATUS: sparse quiet missing-body availability changed; no unavailable-body no-write attribution");
+    check_saved_refusal(&sparse_after_status[1]);
+    assert!(
+        sparse_wrote.is_empty(),
+        "PRODUCT: sync rounds that brought nothing wrote to the nodes' complete store artifacts \
+         during sparse refused-body quiet (ADR-038 FX-29, #1021): {}",
+        sparse_wrote.join("; ")
+    );
+    for (index, name, peer) in [(0usize, "bob", &fps[3]), (1, "late", &fps[1])] {
+        let before = quiet_lanes(&sparse_before[index].2);
+        let after = quiet_lanes(&sparse_after[index].2);
+        assert_eq!(
+            before.keys().collect::<BTreeSet<_>>(),
+            after.keys().collect::<BTreeSet<_>>(),
+            "PRODUCT: sparse quiet room/peer lane set changed for {name}"
+        );
+        let required = (room.to_owned(), (*peer).clone());
+        assert!(
+            before.contains_key(&required) && after.contains_key(&required),
+            "PRODUCT: sparse quiet known online {name}/{peer} lane is absent"
+        );
+        for (lane, now) in &after {
+            let grown = now.since(before[lane]);
+            if lane == &required {
+                assert!(grown.completed > 0,
+                    "PRODUCT: sparse quiet known online {name}/{peer} completed no periodic round over {sparse_elapsed:?}");
+            }
+            assert!(
+                grown.completed == grown.empty,
+                "PRODUCT: sparse quiet {name} lane {lane:?} completed nonempty rounds: {grown:?}"
+            );
+            assert!(grown.history_fetched == 0 && grown.history_served == 0 && grown.history_declined == 0,
+                "PRODUCT: sparse quiet {name} lane {lane:?} repeated history fetch/serve/decline: {grown:?}");
+        }
+        assert!(sparse_after[index].0.saturating_sub(sparse_before[index].0) <= sparse_allowed,
+            "PRODUCT: sparse quiet {name} ran more than its periodic/follow-up allowance over {sparse_elapsed:?}: before={:?} after={:?}", sparse_before[index], sparse_after[index]);
+        assert!(
+            sparse_after[index].1,
+            "PRODUCT: sparse quiet {name} Status omitted its last completed sync"
+        );
+    }
     let unchanged_fetch = |grown: QuietLane,
                            status: &serde_json::Value,
                            prior: &serde_json::Value,
