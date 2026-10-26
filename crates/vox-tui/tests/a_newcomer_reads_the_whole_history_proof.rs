@@ -6099,6 +6099,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     }
     let bob_after_interruption = daemon(&bob, "bob-after-interruption");
     attached(&bob, "bob-after-interruption");
+    wait_room_open(&bob, &room, "bob-after-interruption");
     let mut resumed_at = loop {
         use vox_core::node::api::HistoryDemandPhase as Phase;
         let (ok, out, err) = vox(
