@@ -5639,6 +5639,117 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     while !reads(&bob, &room, &package_marker) {
         std::thread::sleep(Duration::from_millis(200));
     }
+    // Newest-first arrival is not the end of its physical Live/Control work. Observe the
+    // existing scoped handoff before asking for separate archive preparation at Control=1.
+    // This is neither a full-role receipt nor a reservation of capacity against later events.
+    let mut settled_scope: Option<(String, u64)> = None;
+    let mut settling_shown = false;
+    loop {
+        let (ok, out, err) = vox(&bob, &["status", "--json"], None);
+        assert!(
+            ok,
+            "PRODUCT: Bob's pre-Older scoped Status was refused: {out}{err}"
+        );
+        let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Bob pre-Older Status was invalid ({error}): {out}")
+        });
+        assert!(
+            status["identity"] == fps[1],
+            "APPARATUS: pre-Older Status selected another identity: {out}"
+        );
+        let current_room = pub_probe_room(&status, &control_room);
+        let port = status["lanes"]["ports"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|port| port["room"] == control_room && port["peer"] == fps[0])
+            .expect("APPARATUS: pre-Older Status omitted Bob's exact Alice port");
+        let observation = &port["observation"];
+        let probe = &port["own_head_probe"];
+        let instance = observation["instance"]
+            .as_str()
+            .expect("PRODUCT: pre-Older observation omitted room instance");
+        let epoch = current_room["epoch"]
+            .as_u64()
+            .expect("PRODUCT: pre-Older room Status omitted epoch");
+        if let Some((expected_instance, expected_epoch)) = &settled_scope {
+            assert!(
+                instance == expected_instance && epoch == *expected_epoch,
+                "APPARATUS: read-only pre-Older staging changed room instance/epoch: {out}"
+            );
+        } else {
+            settled_scope = Some((instance.to_owned(), epoch));
+        }
+        let bounded = &status["lanes"]["bounded"];
+        let no_room_owners = [
+            "ready",
+            "running",
+            "deferred",
+            "required",
+            "admissions",
+            "retiring",
+        ]
+        .iter()
+        .all(|name| {
+            bounded[*name]
+                .as_array()
+                .expect("PRODUCT: bounded Status omitted retained-owner array")
+                .iter()
+                .all(|owner| owner.is_null() || owner["room"] != control_room)
+        });
+        let history = &status["lanes"]["history"];
+        let budget = &status["lanes"]["budget"];
+        let known = &observation["desired"]["peer"]["known_head"];
+        let current_scope = probe["node"] == fps[1]
+            && probe["instance"] == observation["instance"]
+            && probe["epoch"].as_u64() == Some(epoch)
+            && observation["epoch"].as_u64() == Some(epoch)
+            && observation["connection"].is_u64()
+            && observation["connection"] == probe["connection"];
+        let settled = current_scope
+            && port["connected"] == true
+            && port["needs"] == false
+            && port["queued"] == false
+            && port["round_running"] == false
+            && port["publishing"] == false
+            && port["inbound"] == 0
+            && port["out_age_ms"].is_null()
+            && observation["initialized"] == true
+            && observation["dirty"] == false
+            && observation["desired"] == observation["sent"]
+            && observation["owner"] == "settled"
+            && observation["refresh"].is_null()
+            && known["head"].is_string()
+            && known["size"]
+                .as_u64()
+                .is_some_and(|through| through >= marker_through)
+            && no_room_owners
+            && bounded["cleanup"].is_null()
+            && bounded["cleanup_error"].is_null()
+            && budget["control"] == 0
+            && budget["foreground"] == 0
+            && budget["queued"]
+                .as_array()
+                .expect("PRODUCT: budget Status omitted waiters")
+                .iter()
+                .all(|queued| queued == 0)
+            && history["preparing"] == false
+            && history["ready"] == false
+            && history["running"] == false
+            && history["private_work"] == false
+            && history["owner"].is_null();
+        if settled {
+            eprintln!("QUIET PRE OLDER SCOPED WORK SETTLED: room={control_room} peer={} original_alice_cut={marker_through} status={out}", fps[0]);
+            break;
+        }
+        if !settling_shown {
+            eprintln!("QUIET PRE OLDER LIVE WORK WAIT: room={control_room} peer={} bob_profile={} bob_pid={} original_alice_cut={marker_through} status={out}", fps[0], bob.display(), bob_after_gap.0.id());
+            settling_shown = true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Recapture the actual rows/cursor only AFTER the existing work hands off. One Older is
+    // attempted below; a genuine intervening event can still make it Busy (APPARATUS, no retry).
     let bob_rows = room_rows(&bob, &control_room);
     let original_present =
         quiet_original_burst_rows(&bob, &control_room, &fps[0], (&alice_original_posts, false));
