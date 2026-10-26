@@ -4770,13 +4770,12 @@ fn quiet_original_burst_rows(
                         && row["room"] == room
                         && row["author"] == carol
                         && row["owed"] == false
-                        && if structured {
-                            row["envelope"]["v"] == 1
-                                && row["envelope"]["type"] == "say"
-                                && row["envelope"]["body"].as_str() == Some(body.as_str())
-                        } else {
-                            row["envelope"].is_null() && row["text"].as_str() == Some(body.as_str())
-                        },
+                        && row["envelope"]["v"] == 1
+                        && row["envelope"]["type"] == "say"
+                        && row["envelope"]["body"].as_str() == Some(body.as_str())
+                        // Prose is normalized to SAY by Envelope::parse too. Only --json
+                        // changes the stored text: plain posts retain their exact prose.
+                        && (structured || row["text"].as_str() == Some(body.as_str())),
                     "PRODUCT: Holder's original burst hash did not render its accepted SAY: {row}"
                 );
                 present.insert(index);
@@ -5589,8 +5588,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     let alice_original_posts: Vec<(String, String)> = (0..alice_successors).map(|n| {
         let text = format!("alice settled successor {n}");
         let matches: Vec<_> = alice_original_rows.iter().filter(|row| {
-            row["room"] == control_room && row["author"] == fps[0]
-                && row["text"].as_str() == Some(text.as_str()) && row["owed"] == false
+            row["schema"] == "vox.room.row/1" && row["room"] == control_room
+                && row["author"] == fps[0] && row["owed"] == false
+                && row["text"].as_str() == Some(text.as_str())
+                && row["envelope"]["v"] == 1 && row["envelope"]["type"] == "say"
+                && row["envelope"]["body"].as_str() == Some(text.as_str())
         }).collect();
         assert!(matches.len() == 1,
             "PRODUCT: Alice's accepted original successor did not name one shipped row: {text:?} rows={alice_original_rows:?}");
@@ -6426,10 +6428,12 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
                 && row["room"] == control_room
                 && row["author"] == fps[0]
                 && row["owed"] == false
-                && row["envelope"].is_null()
+                && row["envelope"]["v"] == 1
+                && row["envelope"]["type"] == "say"
                 && alice_original_posts.iter().any(|(hash, text)| {
                     row["entry_hash"].as_str() == Some(hash.as_str())
                         && row["text"].as_str() == Some(text.as_str())
+                        && row["envelope"]["body"].as_str() == Some(text.as_str())
                 })
         })
         .collect();
