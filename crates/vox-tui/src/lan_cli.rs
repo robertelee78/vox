@@ -143,6 +143,11 @@ pub const HELPER_SAYS: &str = "vox lan helper";
 /// The protocol this helper speaks: [`HELPER_SAYS`] `1`.
 pub const HELPER_PROTOCOL: u32 = 1;
 
+// The helper name, a space, any u32 protocol version and CRLF. Bound even an
+// unrecognized helper's answer before its line can grow in the client.
+const MAX_HELPER_REPLY_BYTES: usize =
+    HELPER_SAYS.len() + " ".len() + "4294967295".len() + "\r\n".len();
+
 /// How long a helper has to answer [`HELLO`]: it answers at once, so a socket that says nothing
 /// in this time is not one.
 const HELLO_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
@@ -158,7 +163,7 @@ const HELLO_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 /// # Errors
 /// As above.
 pub fn helper_answers(socket: &Path) -> Result<(), String> {
-    use std::io::{BufRead as _, Write as _};
+    use std::io::{BufRead as _, Read as _, Write as _};
     let Ok(mut s) = std::os::unix::net::UnixStream::connect(socket) else {
         return Err(no_helper(socket));
     };
@@ -176,7 +181,11 @@ pub fn helper_answers(socket: &Path) -> Result<(), String> {
         return Err(not_one(format!("it would not take a line: {e}")));
     }
     let mut line = String::new();
-    match std::io::BufReader::new(&s).read_line(&mut line) {
+    let answer = (&s).take((MAX_HELPER_REPLY_BYTES + 1) as u64);
+    match std::io::BufReader::new(answer).read_line(&mut line) {
+        Ok(_) if line.len() > MAX_HELPER_REPLY_BYTES => Err(not_one(format!(
+            "its answer exceeds {MAX_HELPER_REPLY_BYTES} bytes"
+        ))),
         Ok(_) if line.starts_with(HELPER_SAYS) => {
             let version = line[HELPER_SAYS.len()..].trim();
             if version == HELPER_PROTOCOL.to_string() {
