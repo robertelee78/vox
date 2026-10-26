@@ -5130,9 +5130,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "VOX_TEST_CONTROL_JOBS",
         "VOX_TEST_FX29_MUTANT",
         "VOX_TEST_FX29_CONTENT_OUTCOME_FILE",
-        "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE",
-        "VOX_TEST_FX29_CONTENT_REFILL_HASH",
-        "VOX_TEST_HOLD_RETENTION_SWEEP_FILE",
     ]);
     watchdog::arm();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
@@ -6893,12 +6890,12 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 
 /// Continue the quiet-room journey through the durable refusal's actual user lifecycle. `late`
 /// was mutually trusted with every author before any room post. Alice and Bob visibly prune one
-/// Bob body while its only retaining source is offline, so late settles its authenticated header
-/// and records a real missing-body decision. A later local post visibly aging out proves that
-/// header's sealed retention origin is already expired. Carol then returns with the body while a
-/// proof-only sweep hold preserves the exact post-refill observation: the old body must not become
-/// visible merely because its bytes arrived later. No forged frame or database inspection stands
-/// in for the shipped product.
+/// Bob body while its only retaining source is offline. Late keeps forever so that it genuinely
+/// needs the missing body through decline, reconnect, restart, grant change and rejoin.
+///
+/// Automatic expired-body refill is not measured here: after receiver expiry the product may
+/// correctly remove that missing-body need and request no refill. Retention-origin correctness
+/// remains a product contract; this journey does not claim the withdrawn witness/marker proof.
 ///
 /// Refusal boundaries use current outbound roots and actual terminal outcomes; unrelated incoming
 /// completions impose no round quota. With no configured watchdog, a causal wait has no elapsed
@@ -6941,7 +6938,7 @@ fn prove_declined_refusal_lifecycle(
         "PRODUCT: Carol's shipped retention reload was refused while staging the delayed body: \
          {out}{err}"
     );
-    std::fs::write(late.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
+    std::fs::write(late.join("cfg/retention"), "default forever\n").unwrap_or_else(|error| {
         panic!("APPARATUS: could not stage late's local retention file: {error}")
     });
     let (ok, out, err) = vox(bob, &["room", "post", room, "--json", pruned], None);
@@ -6950,12 +6947,17 @@ fn prove_declined_refusal_lifecycle(
         "PRODUCT: Bob's authorized refusal-lifecycle post was refused: {out}{err}"
     );
     let posted: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|error| {
-        panic!("PRODUCT: Bob's delayed-refill post response was not JSON: {error}: {out}")
+        panic!("PRODUCT: Bob's refusal-lifecycle post response was not JSON: {error}: {out}")
     });
     let pruned_hash = posted["entry_hash"]
         .as_str()
-        .unwrap_or_else(|| panic!("PRODUCT: Bob's delayed-refill post named no entry hash: {out}"))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: Bob's refusal-lifecycle post named no entry hash: {out}")
+        })
         .to_owned();
+    eprintln!(
+        "[proof] FX-29 refusal body staged: hash={pruned_hash} receiver keeps forever; Carol is the delayed source"
+    );
     while !reads(carol, room, pruned) || !reads(alice, room, pruned) {
         std::thread::yield_now();
     }
@@ -6974,25 +6976,7 @@ fn prove_declined_refusal_lifecycle(
         std::thread::yield_now();
     }
 
-    let refill_outcome = late.join("fx29-content-refill-outcome");
-    let refill_hold = late.join("hold-retention-after-content-refill");
-    let refill_outcome_text = refill_outcome.to_string_lossy().into_owned();
-    let refill_hold_text = refill_hold.to_string_lossy().into_owned();
-    let late_daemon = daemon_env(
-        late,
-        "late-refusal",
-        &[
-            (
-                "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE",
-                refill_outcome_text.as_str(),
-            ),
-            ("VOX_TEST_FX29_CONTENT_REFILL_HASH", pruned_hash.as_str()),
-            (
-                "VOX_TEST_HOLD_RETENTION_SWEEP_FILE",
-                refill_hold_text.as_str(),
-            ),
-        ],
-    );
+    let late_daemon = daemon(late, "late-refusal");
     attached(late, "late-refusal");
     let (ok, out, err) = vox(
         late,
@@ -7017,6 +7001,13 @@ fn prove_declined_refusal_lifecycle(
         QuietLane::default(),
         "late member's first missing Bob-body decision",
         |grown, status| {
+            // Logical expiry at the source does not certify that physical payload cleanup
+            // finished. Require absence before crediting the actual refusal transaction.
+            assert!(
+                !reads(late, room, pruned),
+                "APPARATUS: the first missing-body refusal was not staged: late received \
+                 Bob's candidate body before its source pruning was established"
+            );
             grown.history_declined > 0
                 && parse_exact_refusal(
                     pub_lane(status, room, &fps[1]),
@@ -7036,67 +7027,6 @@ fn prove_declined_refusal_lifecycle(
         "PRODUCT: the late member read Bob's body after every shipped holder had pruned it; \
          status named its missing-body decision as {declined:?}"
     );
-
-    // The witness is younger than the already-settled Bob header. Its disappearance from the
-    // shipped read is therefore a causal proof that the header's original retention age has
-    // expired; no elapsed threshold decides this verdict. Freeze only later retention sweeps,
-    // return the sole body source, and wait for the exact committed refill marker. One shipped
-    // read while the sweep is held distinguishes preserved age from the mutant's reset age.
-    let witness = "late retention witness after Bob header settlement";
-    let (ok, out, err) = vox(late, &["room", "post", room, witness], None);
-    assert!(
-        ok,
-        "PRODUCT: late's retention witness post was refused: {out}{err}"
-    );
-    assert!(
-        reads(late, room, witness),
-        "PRODUCT: late's accepted retention witness was never visible in its shipped room read"
-    );
-    while reads(late, room, witness) {
-        std::thread::yield_now();
-    }
-    std::fs::write(&refill_hold, b"").unwrap_or_else(|error| {
-        panic!("APPARATUS: could not hold retention after the exact refill: {error}")
-    });
-    let carol_after_refill = daemon(carol, "carol-delayed-refill-source");
-    attached(carol, "carol-delayed-refill-source");
-    wait_room_open(carol, room, "carol-delayed-refill-source");
-    while !refill_outcome.is_file() {
-        std::thread::yield_now();
-    }
-    let refill = std::fs::read_to_string(&refill_outcome).unwrap_or_else(|error| {
-        panic!("APPARATUS: could not read the exact sparse-Content refill marker: {error}")
-    });
-    assert_eq!(
-        refill,
-        format!("accepted:{pruned_hash}"),
-        "APPARATUS: sparse-Content refill marker named a different entry"
-    );
-    eprintln!(
-        "[proof] FX-29 settled Content delayed-refill apparatus staged: hash={pruned_hash} older witness visibly expired"
-    );
-    assert!(
-        !reads(late, room, pruned),
-        "PRODUCT [FX29 settled-content-refill-age]: delayed bytes made expired Bob body \
-         {pruned_hash} visible after its younger shipped retention witness had already disappeared"
-    );
-    std::fs::remove_file(&refill_hold).unwrap_or_else(|error| {
-        panic!("APPARATUS: could not release post-refill retention maintenance: {error}")
-    });
-    std::fs::write(carol.join("cfg/retention"), LOCAL_RETENTION).unwrap_or_else(|error| {
-        panic!("APPARATUS: could not shorten Carol's retention after the refill claim: {error}")
-    });
-    let (ok, out, err) = vox(carol, &["room", "retention", room, "--steps", "7d"], None);
-    assert!(
-        ok,
-        "PRODUCT: Carol's post-refill retention reload was refused: {out}{err}"
-    );
-    while [alice, bob, carol]
-        .iter()
-        .any(|holder| reads(holder, room, pruned))
-    {
-        std::thread::yield_now();
-    }
 
     // A new connection legitimately serves Bob's fresh OwnHead question as metadata. Only
     // late's fetch direction must remain empty, under a new current outbound root and the
@@ -7203,9 +7133,9 @@ fn prove_declined_refusal_lifecycle(
          refusal instead of completing empty in its fetch direction: {reconnect:?}"
     );
 
-    // The hold has no peer selector. Stop the other real sources so only Bob can own it.
+    // The hold has no peer selector. Carol is still offline; stop Alice too so only Bob
+    // can own the actual requester-restart/refusal observation.
     alice_daemon.stop();
-    carol_after_refill.stop();
     while [0usize, 2]
         .iter()
         .any(|index| member_connected(late, room, &fps[*index]) != Some(false))
@@ -7335,7 +7265,15 @@ fn prove_declined_refusal_lifecycle(
     attached(late, "late-refusal-stale");
     wait_room_open(late, room, "late-refusal-stale");
     let decline_entered = std::path::PathBuf::from(format!("{}.entered", decline_hold.display()));
-    while !decline_entered.exists() {
+    loop {
+        assert!(
+            !reads(late, room, stale_body),
+            "APPARATUS: the stale-grant refusal was not staged: late received Bob's \
+             candidate body before the actual decline-write hold; source pruning was not established"
+        );
+        if decline_entered.exists() {
+            break;
+        }
         std::thread::yield_now();
     }
     let staged = std::fs::read_to_string(&decline_entered).unwrap_or_else(|error| {
