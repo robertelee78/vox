@@ -5087,11 +5087,13 @@ fn quiet_retain_original_burst(
 /// still exchange visible posts. Measured before #996's role-aware settlement: the package's
 /// header-only position remained a missing body on Bob, whose periodic inventory probe ended
 /// partial forever. Across the quiet window, every exact shipped lane must complete at least one
-/// periodic round, every completed round must be empty, no lane may fetch, serve or re-decline
+/// periodic round on the known online Alice/Bob pair; every completed round on every lane is
+/// empty, and no lane may fetch, serve or re-decline
 /// history, and Alice's, Bob's and offline Carol's complete `store.redb` bytes and mtimes must be
 /// unchanged. The artifact is the user's storage verdict; no private database field substitutes.
-/// The same journey then admits a member trusted before the posts only after every holder has
-/// visibly pruned one body. Its exact durable refusal must survive a transport reconnect and its
+/// The same journey then admits a member trusted before the posts through the only reachable
+/// source, Bob, after logical expiry at Alice/Bob and actual shutdown of Alice/Carol. Its actual
+/// missing-body decision (not logical expiry alone) must survive a transport reconnect and its
 /// own daemon restart; a trust removal/regrant and a leave/rejoin must invalidate the old
 /// authorization and room/member lifetimes; and Bob's successor must be read while shipped
 /// status names the exact refusal re-armed. Those waits are bounded by completed lane cycles,
@@ -5111,9 +5113,9 @@ fn quiet_retain_original_burst(
 /// or dropping the authorization comparison, makes the transaction-barrier cycle decline without
 /// the shipped lane first reporting the stale old Flow. Retaining the departed room/member
 /// refusal suppresses the rejoined lifetime's decline; treating a changed head as the old
-/// decision prevents the successor's read/re-armed assertion. Resetting a settled Content
-/// header's original first-seen time when its body arrives later exposes an already-expired row
-/// after a younger shipped witness has disappeared. `drop-resume-owed` removes only the replacement
+/// decision prevents the successor's read/re-armed assertion. The former automatic-expired-refill
+/// age witness is withdrawn: source return need not fetch expired data. No age-runtime or mutant
+/// credit is claimed here. `drop-resume-owed` removes only the replacement
 /// owner after an archive Flow becomes authorization-stale while an earlier Control waiter owns
 /// admission; the exact shipped `lanes.history.owner` assertion turns red. Each mutant reaches its
 /// own intended PRODUCT assertion; revised staging requires fresh actual normal/control results.
@@ -6880,7 +6882,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         &carol,
         &late,
         &room,
-        &link,
         &fps,
         alice_after_privacy,
         bob_after_restart,
@@ -6889,9 +6890,10 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 }
 
 /// Continue the quiet-room journey through the durable refusal's actual user lifecycle. `late`
-/// was mutually trusted with every author before any room post. Alice and Bob visibly prune one
-/// Bob body while its only retaining source is offline. Late keeps forever so that it genuinely
-/// needs the missing body through decline, reconnect, restart, grant change and rejoin.
+/// was mutually trusted with every author before any room post. The candidate Bob row visibly
+/// expires at Alice/Bob; both other sources are then stopped. Late joins through Bob's fresh link
+/// and keeps forever, requiring a real Bob body refusal through reconnect, restart and rejoin.
+/// Logical row expiry alone is not a claim that every holder physically deleted its payload.
 ///
 /// Automatic expired-body refill is not measured here: after receiver expiry the product may
 /// correctly remove that missing-body need and request no refill. Retention-origin correctness
@@ -6908,7 +6910,6 @@ fn prove_declined_refusal_lifecycle(
     carol: &Path,
     late: &Path,
     room: &str,
-    link: &str,
     fps: &[String],
     alice_daemon: Daemon,
     bob_daemon: Daemon,
@@ -6955,9 +6956,6 @@ fn prove_declined_refusal_lifecycle(
             panic!("PRODUCT: Bob's refusal-lifecycle post named no entry hash: {out}")
         })
         .to_owned();
-    eprintln!(
-        "[proof] FX-29 refusal body staged: hash={pruned_hash} receiver keeps forever; Carol is the delayed source"
-    );
     while !reads(carol, room, pruned) || !reads(alice, room, pruned) {
         std::thread::yield_now();
     }
@@ -6976,11 +6974,28 @@ fn prove_declined_refusal_lifecycle(
         std::thread::yield_now();
     }
 
+    // Alice's old link would keep an additional source online. Use a real current Bob
+    // address for this exact room, then isolate the actual provider before Late joins.
+    let (ok, initial_link, err) = vox(bob, &["room", "link", room], None);
+    assert!(
+        ok,
+        "PRODUCT: Bob's shipped initial refusal link was refused: {initial_link}{err}"
+    );
+    let initial_link = initial_link.trim();
+    let parsed_link = vox_core::node::link::InviteLink::parse(initial_link)
+        .expect("PRODUCT: Bob's shipped initial refusal link was malformed");
+    assert!(vox_core::node::link::b32_encode(&parsed_link.channel_id) == room
+        && parsed_link.anchors.iter().any(|route| vox_core::node::link::b32_encode(&route.id) == fps[1]),
+        "APPARATUS: initial Bob link does not name this canonical room and actual running source: {initial_link}");
+    alice_daemon.stop();
+    eprintln!(
+        "[proof] FX-29 refusal body staged: hash={pruned_hash} receiver keeps forever; only Bob is reachable"
+    );
     let late_daemon = daemon(late, "late-refusal");
     attached(late, "late-refusal");
     let (ok, out, err) = vox(
         late,
-        &["room", "join", "--passphrase-file", "-", link],
+        &["room", "join", "--passphrase-file", "-", initial_link],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(
@@ -6994,6 +7009,7 @@ fn prove_declined_refusal_lifecycle(
         ok,
         "PRODUCT: late's shipped retention reload was refused after join: {out}{err}"
     );
+    let mut first_refusal = None;
     let declined = await_lane_claim(
         late,
         room,
@@ -7008,25 +7024,73 @@ fn prove_declined_refusal_lifecycle(
                 "APPARATUS: the first missing-body refusal was not staged: late received \
                  Bob's candidate body before its source pruning was established"
             );
-            grown.history_declined > 0
-                && parse_exact_refusal(
-                    pub_lane(status, room, &fps[1]),
-                    "history_refusal_saved",
-                    "first missing Bob body",
-                )
-                .is_some_and(|saved| {
-                    saved.peer == fps[1]
-                        && saved.author == fps[1]
-                        && saved.remembered
-                        && saved.captured_generation == saved.current_generation
+            let Some(saved) = parse_exact_refusal(
+                pub_lane(status, room, &fps[1]),
+                "history_refusal_saved",
+                "first missing Bob body",
+            ) else {
+                return false;
+            };
+            let observation = pub_port_observation(status, room, &fps[1]);
+            if grown.history_declined == 0
+                || saved.peer != fps[1]
+                || saved.author != fps[1]
+                || !saved.remembered
+                || saved.captured_generation != saved.current_generation
+                || observation["desired"]["peer"]["known_head"]["head"] != saved.head
+                || !pub_current_own_probe(status, room, &fps[1]).is_some_and(|probe| {
+                    probe["node"] == fps[3]
+                        && probe["authorization"] == saved.current_generation
+                        && ["instance", "epoch"]
+                            .iter()
+                            .all(|key| probe[*key] == observation[*key])
                 })
+            {
+                return false;
+            }
+            // Preserve only a transaction actually observed as accepted under this scope.
+            // A later idempotent response can overwrite the last-response Status slot.
+            first_refusal = Some((saved, status.clone()));
+            true
         },
     );
     assert!(
         !reads(late, room, pruned),
-        "PRODUCT: the late member read Bob's body after every shipped holder had pruned it; \
-         status named its missing-body decision as {declined:?}"
+        "PRODUCT: the late member read Bob's candidate body after the only reachable source \
+         recorded its missing-body decision, with Alice/Carol stopped: {declined:?}"
     );
+
+    let (saved_refusal, first_refusal_status) = first_refusal
+        .expect("APPARATUS: first accepted refusal was never observed; no historical baseline");
+    let check_saved_refusal = |status: &serde_json::Value| {
+        let observation = pub_port_observation(status, room, &fps[1]);
+        let first_observation = pub_port_observation(&first_refusal_status, room, &fps[1]);
+        let probe = pub_current_own_probe(status, room, &fps[1])
+            .expect("APPARATUS: coherent refusal scope lacks its current own probe");
+        assert!(probe["node"] == fps[3]
+            && probe["authorization"] == saved_refusal.current_generation
+            && ["instance", "epoch"].iter()
+                .all(|key| observation[*key] == first_observation[*key])
+            && observation["desired"]["peer"]["known_head"]
+                == first_observation["desired"]["peer"]["known_head"],
+            "APPARATUS: the first accepted refusal's actual room/grant/Bob Head changed; no unchanged-refusal credit: {status}");
+        let current = parse_exact_refusal(
+            pub_lane(status, room, &fps[1]),
+            "history_refusal_saved",
+            "after first accepted refusal",
+        )
+        .expect("PRODUCT: the current unchanged scope lost its observed durable refusal");
+        assert!(current.peer == saved_refusal.peer
+            && current.author == saved_refusal.author
+            && current.head == saved_refusal.head
+            && current.captured_generation == saved_refusal.captured_generation
+            && current.current_generation == saved_refusal.current_generation,
+            "PRODUCT: unchanged current scope replaced the durable refusal peer/author/Head/grant: {status}");
+        // Replaying the SAME transaction can truthfully report remembered=false after an
+        // idempotent write/cancellation recovery. A different request is a real re-decline.
+        assert_eq!(current.request, saved_refusal.request,
+            "PRODUCT: unchanged durable refusal was fetched and declined again in a different transaction: {status}");
+    };
 
     // A new connection legitimately serves Bob's fresh OwnHead question as metadata. Only
     // late's fetch direction must remain empty, under a new current outbound root and the
@@ -7050,20 +7114,11 @@ fn prove_declined_refusal_lifecycle(
                     && observation["desired"]["own_head"] == pub_local_head(probe, &fps[3])
             })
         {
+            check_saved_refusal(&status);
             break status;
         }
         std::thread::yield_now();
     };
-    let saved_refusal = parse_exact_refusal(
-        pub_lane(&refusal_baseline, room, &fps[1]),
-        "history_refusal_saved",
-        "before refusal reconnect",
-    )
-    .expect("APPARATUS: reconnect baseline lacks the exact saved refusal");
-    assert!(saved_refusal.peer == fps[1] && saved_refusal.author == fps[1]
-        && saved_refusal.remembered
-        && saved_refusal.captured_generation == saved_refusal.current_generation,
-        "APPARATUS: reconnect baseline refusal is not Bob's current durable decision: {saved_refusal:?}");
     let unchanged_fetch = |grown: QuietLane,
                            status: &serde_json::Value,
                            prior: &serde_json::Value,
@@ -7095,16 +7150,7 @@ fn prove_declined_refusal_lifecycle(
             && capture["desired"] == pub_port_observation(prior, room, &fps[1])["desired"]
             && pub_snapshot(probe, &fps[3]) == pub_snapshot(old_probe, &fps[3]),
             "APPARATUS: reconnect/restart changed the actual room/grant/Head/role tuple; no unchanged-refusal credit: {status}");
-        assert_eq!(
-            parse_exact_refusal(
-                pub_lane(status, room, &fps[1]),
-                "history_refusal_saved",
-                "after refusal reconnect/restart"
-            )
-            .as_ref(),
-            Some(&saved_refusal),
-            "PRODUCT: reconnect/restart replaced the exact durable refusal: {status}"
-        );
+        check_saved_refusal(status);
         grown.fetched_completed > 0
     };
     bob_daemon.stop();
@@ -7133,9 +7179,8 @@ fn prove_declined_refusal_lifecycle(
          refusal instead of completing empty in its fetch direction: {reconnect:?}"
     );
 
-    // The hold has no peer selector. Carol is still offline; stop Alice too so only Bob
-    // can own the actual requester-restart/refusal observation.
-    alice_daemon.stop();
+    // The hold has no peer selector. Alice/Carol remain stopped from before the initial
+    // join, so only Bob can own this requester-restart/refusal observation.
     while [0usize, 2]
         .iter()
         .any(|index| member_connected(late, room, &fps[*index]) != Some(false))
@@ -7330,8 +7375,8 @@ fn prove_declined_refusal_lifecycle(
     );
     assert!(
         !reads(late, room, stale_body),
-        "PRODUCT: changing authorization made a body every holder pruned appear; exact lane \
-         outcome {regranted:?}"
+        "PRODUCT: changing authorization made Bob's unavailable body appear while Bob was \
+         the only reachable source; exact lane outcome {regranted:?}"
     );
 
     // Leaving deletes the local room, including its refusal namespace. Rejoining the same room
@@ -7617,7 +7662,7 @@ fn await_lane_claim(
     peer: &str,
     before: QuietLane,
     claim: &str,
-    done: impl Fn(QuietLane, &serde_json::Value) -> bool,
+    mut done: impl FnMut(QuietLane, &serde_json::Value) -> bool,
 ) -> QuietLane {
     loop {
         let (_, _, status) = synced(dir);
