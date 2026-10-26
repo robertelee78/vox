@@ -4730,14 +4730,15 @@ fn foreground_release_wakes_without_a_tick() {
     drop(tails);
 }
 
-/// Cache-only user rows for the accepted Carol burst. Paging this view does not start Older.
+/// Cache-only user rows for the accepted original burst. Paging this view does not start Older.
 #[cfg(feature = "optional-proofs")]
-fn quiet_carol_burst_rows(
+fn quiet_original_burst_rows(
     alice: &Path,
     room: &str,
     carol: &str,
-    posts: &[(String, String)],
+    expected: (&[(String, String)], bool),
 ) -> BTreeSet<usize> {
+    let (posts, structured) = expected;
     let mut before: Option<String> = None;
     let mut cursors = BTreeSet::new();
     let mut present = BTreeSet::new();
@@ -4750,14 +4751,16 @@ fn quiet_carol_burst_rows(
         let (ok, out, err) = vox(alice, &args, None);
         assert!(
             ok,
-            "PRODUCT: Alice's cache-only Carol burst read was refused: {out}{err}"
+            "PRODUCT: Holder's cache-only original burst read was refused: {out}{err}"
         );
         let rows: Vec<serde_json::Value> = out
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
                 serde_json::from_str(line).unwrap_or_else(|error| {
-                    panic!("PRODUCT: Alice's Carol burst row was invalid JSON ({error}): {line}")
+                    panic!(
+                        "PRODUCT: Holder's original burst row was invalid JSON ({error}): {line}"
+                    )
                 })
             })
             .collect();
@@ -4767,11 +4770,20 @@ fn quiet_carol_burst_rows(
                 .enumerate()
                 .find(|(_, (hash, _))| row["entry_hash"].as_str() == Some(hash.as_str()))
             {
-                assert!(row["schema"] == "vox.room.row/1" && row["room"] == room
-                    && row["author"] == carol && row["owed"] == false
-                    && row["envelope"]["v"] == 1 && row["envelope"]["type"] == "say"
-                    && row["envelope"]["body"].as_str() == Some(body.as_str()),
-                    "PRODUCT: Alice's original Carol burst hash did not render its accepted SAY: {row}");
+                assert!(
+                    row["schema"] == "vox.room.row/1"
+                        && row["room"] == room
+                        && row["author"] == carol
+                        && row["owed"] == false
+                        && if structured {
+                            row["envelope"]["v"] == 1
+                                && row["envelope"]["type"] == "say"
+                                && row["envelope"]["body"].as_str() == Some(body.as_str())
+                        } else {
+                            row["envelope"].is_null() && row["text"].as_str() == Some(body.as_str())
+                        },
+                    "PRODUCT: Holder's original burst hash did not render its accepted SAY: {row}"
+                );
                 present.insert(index);
             }
         }
@@ -4782,11 +4794,11 @@ fn quiet_carol_burst_rows(
             .first()
             .and_then(|row| row["entry_hash"].as_str())
             .unwrap_or_else(|| {
-                panic!("PRODUCT: Alice's full Carol cache page named no oldest cursor: {out}")
+                panic!("PRODUCT: Holder's full original author cache page named no oldest cursor: {out}")
             });
         assert!(
             cursors.insert(hash.to_owned()),
-            "PRODUCT: Alice's cache-only Carol pages repeated the same cursor {hash}"
+            "PRODUCT: Holder's cache-only original author pages repeated the same cursor {hash}"
         );
         before = Some(hash.to_owned());
     }
@@ -4796,40 +4808,87 @@ fn quiet_carol_burst_rows(
 /// finishes its own bounded request; another asks for remaining earlier rows only after real
 /// original-row coverage advances, at a new visible cursor. Resume never resets a request's cut.
 #[cfg(feature = "optional-proofs")]
-fn quiet_retain_carol_burst(
+fn quiet_retain_original_burst(
     alice: &Path,
     carol: &Path,
     room: &str,
     alice_id: &str,
     carol_id: &str,
-    posts: &[(String, String)],
+    expected: (&[(String, String)], bool),
     original_cut: u64,
 ) {
+    let (posts, structured) = expected;
     use vox_core::node::api::HistoryDemandPhase as Phase;
     let last = posts
         .len()
         .checked_sub(1)
-        .expect("APPARATUS: nonempty accepted Carol burst");
+        .expect("APPARATUS: nonempty accepted original burst");
     let mut present = loop {
-        let present = quiet_carol_burst_rows(alice, room, carol_id, posts);
+        let present = quiet_original_burst_rows(alice, room, carol_id, (posts, structured));
         if present.contains(&last) {
             break present;
         }
         std::thread::sleep(Duration::from_millis(200));
     };
     eprintln!(
-        "QUIET CAROL BURST LAST ROW: original_cut={original_cut} hash={}",
+        "QUIET ORIGINAL BURST LAST ROW: original_cut={original_cut} hash={}",
         posts[last].0
     );
     assert!(present.len() < posts.len(),
-        "APPARATUS: no missing original Carol burst prefix was staged before the visible cursor; no Older availability-path credit");
+        "APPARATUS: no missing original burst prefix was staged before the visible cursor; no Older availability-path credit");
     let room_id = vox_core::node::link::b32_decode(room, "quiet exact room")
         .expect("APPARATUS: canonical quiet room id");
-    let author = vox_core::node::link::b32_decode(carol_id, "quiet Carol author")
-        .expect("APPARATUS: full Carol fingerprint");
+    let author = vox_core::node::link::b32_decode(carol_id, "quiet original author")
+        .expect("APPARATUS: full original fingerprint");
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let mut selected_instance: Option<String> = None;
+    // Status may first prepare a read-only snapshot. Pin its incarnation immediately;
+    // wait only for metadata, never replace an actual unfinished user request.
+    let mut prior_instance: Option<String> = None;
+    let prior = loop {
+        let (ok, out, err) = vox(
+            alice,
+            &["room", "read", room, "--history", "status", "--json"],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: original-row paging Status was refused: {out}{err}"
+        );
+        let prior: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: prior paging Status was invalid ({error}): {out}")
+        });
+        assert!(
+            prior.schema == "vox.room.history/1"
+                && prior.status.room == room_id
+                && prior.instance == hex(&prior.status.instance)
+                && prior.request == prior.status.request.as_ref().map(|id| hex(id))
+                && prior.status.private_peer.is_none(),
+            "PRODUCT: prior paging Status changed its public binding: {out}"
+        );
+        if let Some(instance) = &prior_instance {
+            assert!(
+                prior.instance == *instance,
+                "APPARATUS: prior Status metadata changed room instance: {out}"
+            );
+        } else {
+            prior_instance = Some(prior.instance.clone());
+        }
+        if matches!(prior.status.phase, Phase::Preparing | Phase::Busy) && prior.request.is_none() {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        assert!(
+            (matches!(prior.status.phase, Phase::Idle | Phase::Cached) && prior.request.is_none())
+                || (prior.status.phase == Phase::Complete && prior.status.remaining == 0),
+            "APPARATUS: a new original-row Older would replace an unfinished request: {out}"
+        );
+        break prior;
+    };
+    let mut selected_instance: Option<String> = Some(prior.instance);
     let mut completed_requests = BTreeSet::new();
+    if let Some(request) = prior.request {
+        completed_requests.insert(request);
+    }
     let mut used_cursors = BTreeSet::new();
     loop {
         // The bounded scan immediately precedes this actually visible row. Never guess an
@@ -4838,12 +4897,28 @@ fn quiet_retain_carol_burst(
             .find(|index| {
                 present.contains(index) && (0..*index).any(|earlier| !present.contains(&earlier))
             })
-            .expect("APPARATUS: remaining original Carol rows need a real visible cursor");
+            .expect("APPARATUS: remaining original rows need a real visible cursor");
         assert!(
             used_cursors.insert(posts[index].0.clone()),
-            "APPARATUS: Carol paging did not reach a new visible cursor; no unchanged Older retry"
+            "APPARATUS: Original paging did not reach a new visible cursor; no unchanged Older retry"
         );
         let before = present.clone();
+        eprintln!(
+            "QUIET ORIGINAL BURST BOUNDARY: original_cut={original_cut} cursor={} rowset={}",
+            posts[index].0,
+            serde_json::to_string(&room_rows(alice, room)).expect("JSON rowset")
+        );
+        for (name, profile) in [("holder", alice), ("source", carol)] {
+            let (ok, status, err) = vox(profile, &["status", "--json"], None);
+            assert!(
+                ok,
+                "PRODUCT: {name}'s late original-row Status was refused: {status}{err}"
+            );
+            let _: serde_json::Value = serde_json::from_str(&status).unwrap_or_else(|error| {
+                panic!("PRODUCT: {name}'s late Status was invalid ({error}): {status}")
+            });
+            eprintln!("QUIET ORIGINAL BURST LATE STATUS: name={name} profile={} original_cut={original_cut} status={status} stderr={err}", profile.display());
+        }
         let (ok, out, err) = vox(
             alice,
             &[
@@ -4860,11 +4935,11 @@ fn quiet_retain_carol_burst(
         );
         assert!(
             ok,
-            "PRODUCT: Alice's explicit Carol burst Older was refused: {out}{err}"
+            "PRODUCT: Holder's explicit original burst Older was refused: {out}{err}"
         );
         // Fresh Older prints cached ROW JSONL. Only subsequent typed Status establishes the
         // new request; an earlier completed request cannot stand in for that acceptance.
-        eprintln!("QUIET CAROL BURST OLDER: original_cut={original_cut} cursor={} original_rows_before={} cached_rows={out} notice={err}", posts[index].0, before.len());
+        eprintln!("QUIET ORIGINAL BURST OLDER: original_cut={original_cut} cursor={} original_rows_before={} cached_rows={out} notice={err}", posts[index].0, before.len());
         let mut retained: Option<(String, String, Option<[u8; 32]>)> = None;
         let mut pending_reply: Option<String> = None;
         let mut resumed_at = None;
@@ -4878,12 +4953,12 @@ fn quiet_retain_carol_burst(
                 );
                 assert!(
                     ok,
-                    "PRODUCT: Alice's exact Carol Older status was refused: {out}{err}"
+                    "PRODUCT: Holder's exact original Older status was refused: {out}{err}"
                 );
                 out
             });
             let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
-                panic!("PRODUCT: Alice's Carol Older status was invalid JSON ({error}): {out}")
+                panic!("PRODUCT: Holder's original Older status was invalid JSON ({error}): {out}")
             });
             assert!(
                 reply.schema == "vox.room.history/1"
@@ -4891,12 +4966,12 @@ fn quiet_retain_carol_burst(
                     && reply.instance == hex(&reply.status.instance)
                     && reply.request == reply.status.request.as_ref().map(|r| hex(r))
                     && reply.status.private_peer.is_none(),
-                "PRODUCT: Alice's Carol Older changed public room or reply binding: {out}"
+                "PRODUCT: Holder's original Older changed public room or reply binding: {out}"
             );
             if let Some(instance) = &selected_instance {
                 assert!(
                     reply.instance == *instance,
-                    "PRODUCT: Alice's Carol Older preparation changed its room instance: {out}"
+                    "PRODUCT: Holder's original Older preparation changed its room instance: {out}"
                 );
             } else {
                 selected_instance = Some(reply.instance.clone());
@@ -4908,34 +4983,37 @@ fn quiet_retain_carol_burst(
             );
             if let Some((instance, request, head)) = &retained {
                 // Local saved Status has no outstanding author after completion. Keep the
-                // original validated Carol author; only that exact terminal state may omit it.
+                // original validated author; only that exact terminal state may omit it.
                 let terminal = reply.status.phase == Phase::Complete && reply.status.remaining == 0;
                 let author_matches = reply.status.author == Some(author)
                     || (reply.status.author.is_none()
-                        && (reply.status.phase == Phase::Preparing || terminal));
+                        && (reply.status.phase == Phase::Preparing
+                            || terminal
+                            || (reply.status.phase == Phase::Paused
+                                && reply.status.remaining > 0)));
                 let head_matches = reply.status.head == *head
                     || (reply.status.phase == Phase::Preparing && reply.status.head.is_none());
                 assert!(reply.instance == *instance
                     && (reply.request.as_deref() == Some(request.as_str())
                         || (reply.status.phase == Phase::Preparing && reply.request.is_none()))
                     && author_matches && head_matches,
-                    "PRODUCT: Alice's original Carol Older request, instance, author or Head changed: {out}");
+                    "PRODUCT: Holder's original Older request, instance, author or Head changed: {out}");
             } else if let Some(request) = &reply.request {
                 if completed_requests.contains(request) {
                     if last_shown != Some(shown) {
-                        eprintln!("QUIET CAROL BURST WAIT NEW REQUEST: original_cut={original_cut} previous_request={request} status={:?}", reply.status);
+                        eprintln!("QUIET ORIGINAL BURST WAIT NEW REQUEST: original_cut={original_cut} previous_request={request} status={:?}", reply.status);
                         last_shown = Some(shown);
                     }
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
                 assert!(reply.status.author == Some(author) && reply.status.head.is_some(),
-                    "APPARATUS: Alice's cursor did not establish Carol's exact authenticated request before completion: {out}");
+                    "APPARATUS: Holder's cursor did not establish Source's exact authenticated request before completion: {out}");
                 retained = Some((reply.instance.clone(), request.clone(), reply.status.head));
-                eprintln!("QUIET CAROL BURST REQUEST: original_cut={original_cut} instance={} request={request} status={:?}", reply.instance, reply.status);
+                eprintln!("QUIET ORIGINAL BURST REQUEST: original_cut={original_cut} instance={} request={request} status={:?}", reply.instance, reply.status);
             }
             if last_shown != Some(shown) {
-                eprintln!("QUIET CAROL BURST PROGRESS: original_cut={original_cut} request={:?} status={:?}", reply.request, reply.status);
+                eprintln!("QUIET ORIGINAL BURST PROGRESS: original_cut={original_cut} request={:?} status={:?}", reply.request, reply.status);
                 last_shown = Some(shown);
             }
             match reply.status.phase {
@@ -4944,45 +5022,45 @@ fn quiet_retain_carol_burst(
                     let key = (reply.status.remaining, reply.status.offset);
                     if resumed_at != Some(key) {
                         let (instance, request, _) = retained.as_ref()
-                            .expect("APPARATUS: Paused Carol Older must name its original request");
+                            .expect("APPARATUS: Paused original Older must name its original request");
                         let (ok, out, err) = vox(alice, &["room", "read", room, "--history", "resume",
                             "--history-instance", instance, "--history-request", request, "--json"], None);
-                        assert!(ok, "PRODUCT: Alice's explicit same-request Carol Resume was refused: {out}{err}");
-                        eprintln!("QUIET CAROL BURST RESUME: original_cut={original_cut} instance={instance} request={request} remaining={} offset={}", key.0, key.1);
+                        assert!(ok, "PRODUCT: Holder's explicit same-request original Resume was refused: {out}{err}");
+                        eprintln!("QUIET ORIGINAL BURST RESUME: original_cut={original_cut} instance={instance} request={request} remaining={} offset={}", key.0, key.1);
                         resumed_at = Some(key); pending_reply = Some(out);
                     }
                 }
                 Phase::Complete if retained.is_some() && reply.status.remaining == 0 => {
                     break retained.expect("checked exact completed request").1;
                 }
-                _ => panic!("APPARATUS: Alice's current bounded Carol request did not complete; no replacement Older is fabricated: {out}"),
+                _ => panic!("APPARATUS: Holder's current bounded original request did not complete; no replacement Older is fabricated: {out}"),
             }
             std::thread::sleep(Duration::from_millis(200));
         };
         // Completing this request is not permission to repeat it. An additional bounded user
         // ask is allowed only after newly rendered ORIGINAL hashes provide a different cursor.
-        let next = quiet_carol_burst_rows(alice, room, carol_id, posts);
+        let next = quiet_original_burst_rows(alice, room, carol_id, (posts, structured));
         assert!(before.is_subset(&next),
-            "APPARATUS: original Carol burst row coverage regressed during bounded paging; original_cut={original_cut}");
+            "APPARATUS: original burst row coverage regressed during bounded paging; original_cut={original_cut}");
         assert!(next.len() > before.len(),
-            "APPARATUS: completed Carol Older made no original-row coverage progress; no repeated Older at unchanged boundary; original_cut={original_cut} request={completed_request}");
+            "APPARATUS: completed original Older made no original-row coverage progress; no repeated Older at unchanged boundary; original_cut={original_cut} request={completed_request}");
         assert!(
             completed_requests.insert(completed_request.clone()),
-            "APPARATUS: a prior completed Carol request was reused as a new request"
+            "APPARATUS: a prior completed original request was reused as a new request"
         );
-        eprintln!("QUIET CAROL BURST INTERVAL COMPLETE: original_cut={original_cut} request={completed_request} original_rows_before={} original_rows_after={}", before.len(), next.len());
+        eprintln!("QUIET ORIGINAL BURST INTERVAL COMPLETE: original_cut={original_cut} request={completed_request} original_rows_before={} original_rows_after={}", before.len(), next.len());
         present = next;
         if present.len() == posts.len() {
             break;
         }
     }
     loop {
-        let present = quiet_carol_burst_rows(alice, room, carol_id, posts);
+        let present = quiet_original_burst_rows(alice, room, carol_id, (posts, structured));
         assert!(present.len() == posts.len(),
-            "APPARATUS: Alice no longer retains every accepted original Carol burst row; original_cut={original_cut}");
+            "APPARATUS: Holder no longer retains every accepted original burst row; original_cut={original_cut}");
         if member_held_through(carol, room, alice_id).is_some_and(|through| through >= original_cut)
         {
-            eprintln!("QUIET CAROL BURST RETAINED: original_cut={original_cut} original_rows={} Alice receipt covers original cut", posts.len());
+            eprintln!("QUIET ORIGINAL BURST RETAINED: original_cut={original_cut} original_rows={} Holder receipt covers original cut", posts.len());
             return;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -4994,9 +5072,10 @@ fn quiet_retain_carol_burst(
 /// each other once. Carol joins,
 /// then goes offline; alice's consent must therefore travel as a key-package in her public feed.
 /// While Bob is offline, Alice and Carol each append more than the production history-page bound.
-/// On return he is hostile-sent Carol's private package body once: he must reject it before
-/// persistence, cross the authenticated header, and durably acknowledge both authors' exact
-/// tails across a restart. Over [`IDLE`] seconds nobody posts, no lane becomes partial merely
+/// On return he explicitly pages missing Content, interrupts one exact retained request under
+/// real Control pressure, resumes it across a restart, and acknowledges both original cuts.
+/// With Alice offline, nonrecipient Bob cannot supply the key Carol needs for Alice's tail;
+/// Alice's return makes that same tail readable. Hostile private-body injection is not measured. Over [`IDLE`] seconds nobody posts, no lane becomes partial merely
 /// because Bob correctly holds only that package's public header, and each profile completes no
 /// more sync rounds than the periodic
 /// request allows (one per [`SYNC_INTERVAL_SECS`](vox_core::node::syncstream::SYNC_INTERVAL_SECS)
@@ -5017,15 +5096,10 @@ fn quiet_retain_carol_burst(
 /// never an elapsed PRODUCT deadline.
 ///
 /// Mutants: the own-head hint offered to every peer on every tick again (`offer_own_head`
-/// ignoring who acknowledged) turns the round-count claim red; undoing role-aware settlement for
-/// the non-recipient package turns the exact held-through assertion red; restoring direct
-/// inventory credit turns the pre-release no-credit assertion red when Bob echoes Alice's merely
-/// committed head; granting body credit persists the hostile ciphertext and turns the exact
-/// pre-persistence refusal assertion red; moving the archive cursor
-/// below the role-only header before its effect makes the interrupted request finish with debt;
-/// skipping the already-settled callback or rejecting its terminal replay strands the resumed
-/// request; dropping bounded continuation stalls the exact older-row assertion; each mutation
-/// has its own script and PRODUCT red. The lane's completion no longer recording the sync
+/// ignoring who acknowledged) targets the round-count claim; restoring direct inventory credit
+/// targets the no-credit assertion while original Content is missing; dropping bounded
+/// continuation targets the exact older-row assertion. Prior role-header/hostile-body controls
+/// are not evidence for this revised journey because their package-selection stage is unreachable. The lane's completion no longer recording the sync
 /// (`note_lane_sync` removed) turns the last-sync claim red. The isolated
 /// `held-inventory-write` mutant commits an unchanged inventory slice without changing the lane
 /// counters and turns only the complete-store artifact assertion red. Removing the indexed
@@ -5040,16 +5114,14 @@ fn quiet_retain_carol_burst(
 /// after a younger shipped witness has disappeared. `drop-resume-owed` removes only the replacement
 /// owner after an archive Flow becomes authorization-stale while an earlier Control waiter owns
 /// admission; the exact shipped `lanes.history.owner` assertion turns red. Each mutant reaches its
-/// own exact terminal PRODUCT red.
+/// own intended PRODUCT assertion; revised staging requires fresh actual normal/control results.
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "an idle minute on two real vox daemons; optional, run it in release"]
 fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     test_knobs::require(&[
         "VOX_TEST_HOLD_PACKAGES_FILE",
-        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
-        "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
-        "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
+        "VOX_TEST_HOLD_ARCHIVE_JOB_FILE",
         "VOX_TEST_HOLD_CONTROL_JOB_FILE",
         "VOX_TEST_HOLD_HISTORY_DECLINE_FILE",
         "VOX_TEST_FOREGROUND_JOBS",
@@ -5092,38 +5164,22 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
-    let hostile = root.join("serve-private-body-once");
-    let hostile_path = hostile
+    let archive_hold = root.join("hold-real-alice-content-archive");
+    let archive_hold_path = archive_hold
         .to_str()
-        .expect("APPARATUS: a UTF-8 hostile-body marker path")
+        .expect("APPARATUS: UTF-8 real archive hold path")
         .to_owned();
-    let alice_knob = [(
-        "VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE",
-        hostile_path.as_str(),
-    )];
-    let settlement_hold = root.join("hold-role-header-settlement");
-    let settlement_hold_path = settlement_hold
-        .to_str()
-        .expect("APPARATUS: a UTF-8 role-settlement hold path")
-        .to_owned();
-    let settlement_engaged =
-        std::path::PathBuf::from(format!("{}.engaged", settlement_hold.display()));
     let control_hold = root.join("hold-archive-resume-control-owner");
     let control_hold_path = control_hold
         .to_str()
         .expect("APPARATUS: a UTF-8 Control-owner hold path")
-        .to_owned();
-    let body_durable = root.join("history-body-durable");
-    let body_durable_path = body_durable
-        .to_str()
-        .expect("APPARATUS: a UTF-8 durable-body marker path")
         .to_owned();
     let sparse_content_outcome = root.join("fx29-sparse-content-outcome");
     let sparse_content_outcome_path = sparse_content_outcome
         .to_str()
         .expect("APPARATUS: a UTF-8 sparse-Content outcome marker path")
         .to_owned();
-    let alice_daemon = daemon_env(&alice, "alice", &alice_knob);
+    let alice_daemon = daemon(&alice, "alice");
     attached(&alice, "alice");
     let (ok, _, err) = vox(
         &alice,
@@ -5509,16 +5565,15 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
              {carol_successors} accepted successors"
         )
     });
-    quiet_retain_carol_burst(
+    quiet_retain_original_burst(
         &alice,
         &carol,
         &control_room,
         &fps[0],
         &fps[2],
-        &carol_posts,
+        (&carol_posts, true),
         carol_tail_through,
     );
-    let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
     carol_daemon.stop();
     let before_private_suffix = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
         panic!(
@@ -5533,6 +5588,26 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         assert!(ok, "PRODUCT: alice's successor {n} was refused: {out}{err}");
     }
     let package_marker = format!("alice settled successor {}", alice_successors - 1);
+    // Bind each original accepted plain-text post to its actual shipped row/hash. Content
+    // numbering is not an author-position cursor: controls can occupy signed feed positions.
+    let alice_original_rows = room_rows(&alice, &control_room);
+    let alice_original_posts: Vec<(String, String)> = (0..alice_successors).map(|n| {
+        let text = format!("alice settled successor {n}");
+        let matches: Vec<_> = alice_original_rows.iter().filter(|row| {
+            row["room"] == control_room && row["author"] == fps[0]
+                && row["text"].as_str() == Some(text.as_str()) && row["owed"] == false
+        }).collect();
+        assert!(matches.len() == 1,
+            "PRODUCT: Alice's accepted original successor did not name one shipped row: {text:?} rows={alice_original_rows:?}");
+        let hash = matches[0]["entry_hash"].as_str()
+            .expect("PRODUCT: Alice's original row omitted entry_hash").to_owned();
+        (hash, text)
+    }).collect();
+    let mut alice_original_posts = alice_original_posts;
+    alice_original_posts.insert(
+        0,
+        (before_package_hash.clone(), before_package_text.to_owned()),
+    );
     let marker_through = room_own_feed_through(&alice, &room).unwrap_or_else(|| {
         panic!(
             "PRODUCT: alice's `vox status --json` did not name her authenticated room-feed \
@@ -5547,38 +5622,18 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         vox_core::log::history::MAX_PAGE_ENTRIES
     );
 
-    // Turn Alice into a hostile authenticated server for exactly the first body frame of the
-    // package addressed to Carol. The server renames this marker only after sending that frame.
-    // Bob must reject it before staging/persistence, then retry the header-only role-complete
-    // entry and causally finish both authors' bounded suffixes.
-    std::fs::write(&hostile, b"")
-        .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", hostile.display()));
-    std::fs::write(&settlement_hold, b"").unwrap_or_else(|e| {
-        panic!(
-            "APPARATUS: could not create {}: {e}",
-            settlement_hold.display()
-        )
-    });
-    let hostile_engaged = std::path::PathBuf::from(format!("{}.engaged", hostile.display()));
-    let bob_settlement_knob = [
-        (
-            "VOX_TEST_HOLD_ROLE_HEADER_SETTLEMENT_FILE",
-            settlement_hold_path.as_str(),
-        ),
-        (
-            "VOX_TEST_HISTORY_BODY_DURABLE_FILE",
-            body_durable_path.as_str(),
-        ),
+    // Hold a REAL missing Content request. Live Control closure already holds every public
+    // package header before the newest row renders, so Older cannot select that cached header.
+    // This journey no longer claims a hostile private Chunk or role-header callback was measured.
+    let bob_archive_knob = [
+        ("VOX_TEST_HOLD_ARCHIVE_JOB_FILE", archive_hold_path.as_str()),
         ("VOX_TEST_FOREGROUND_JOBS", "1"),
         ("VOX_TEST_CONTROL_JOBS", "1"),
         ("VOX_TEST_HOLD_CONTROL_JOB_FILE", control_hold_path.as_str()),
     ];
-    let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_settlement_knob);
+    let bob_after_gap = daemon_env(&bob, "bob-after-gap", &bob_archive_knob);
     attached(&bob, "bob-after-gap");
     wait_room_open(&bob, &room, "bob-after-gap");
-    // Offline catch-up, adversarial staging and retained replay are causal prerequisites,
-    // not the fresh post-after-Ready latency claim. Observe their real outcomes without
-    // borrowing its clock; the final NEW Carol post retains READY_WITHIN below.
     eprintln!(
         "QUIET NEWEST MARKER WAIT: room={control_room} alice_profile={} alice_identity={} alice_pid={} bob_profile={} bob_identity={} bob_pid={} bob_tag=bob-after-gap target={package_marker:?} original_alice_cut={marker_through}",
         alice.display(), fps[0], alice_daemon.0.id(),
@@ -5587,41 +5642,58 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     while !reads(&bob, &room, &package_marker) {
         std::thread::sleep(Duration::from_millis(200));
     }
-    let oldest_alice_live = format!(
-        "alice settled successor {}",
-        alice_successors - vox_core::log::history::MAX_PAGE_ENTRIES
-    );
-    let oldest = read_hash(&bob, &room, &oldest_alice_live).unwrap_or_else(|| {
-        panic!(
-            "PRODUCT: Bob's shipped JSON read omitted Alice's expected oldest live-window row \
-             {oldest_alice_live:?} before archive paging"
-        )
-    });
+    let bob_rows = room_rows(&bob, &control_room);
+    let original_present =
+        quiet_original_burst_rows(&bob, &control_room, &fps[0], (&alice_original_posts, false));
+    let first = *original_present
+        .iter()
+        .next()
+        .expect("APPARATUS: Bob has no actual original Alice cursor");
+    assert!(first > 0,
+        "APPARATUS: no earlier missing original Alice Content was staged for interruption; rows={bob_rows:?}");
+    let oldest = alice_original_posts[first].0.clone();
+    let interrupted_row = alice_original_posts[first - 1].clone();
+    eprintln!("QUIET REAL CONTENT BOUNDARY: original_alice_cut={marker_through} cursor={oldest} missing_original_hash={} missing_original_text={:?} rowset={}",
+        interrupted_row.0, interrupted_row.1, serde_json::to_string(&bob_rows).expect("JSON rows"));
+    for (name, profile) in [("alice", alice.as_path()), ("bob", bob.as_path())] {
+        let (ok, out, err) = vox(profile, &["status", "--json"], None);
+        assert!(
+            ok,
+            "PRODUCT: {name}'s late Content-boundary Status was refused: {out}{err}"
+        );
+        let _: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: {name}'s Content-boundary Status was invalid JSON ({error}): {out}")
+        });
+        eprintln!("QUIET REAL CONTENT LATE STATUS: name={name} profile={} original_alice_cut={marker_through} status={out} stderr={err}", profile.display());
+    }
+    std::fs::write(&archive_hold, format!("room={control_room}\n"))
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot arm real Archive job hold: {error}"));
     let (ok, out, err) = vox(
         &bob,
         &[
             "room",
             "read",
-            &room,
+            &control_room,
             "--history",
             "older",
             "--before",
             &oldest,
+            "--json",
         ],
         None,
     );
     assert!(
         ok,
-        "PRODUCT: Bob's `vox room read --history older --before {oldest}` was refused: {out}{err}"
+        "PRODUCT: Bob's real Content Older was refused: {out}{err}"
     );
-    let hostile_room_id =
-        vox_core::node::link::b32_decode(&control_room, "quiet hostile exact room")
-            .expect("APPARATUS: full quiet room id");
-    let hostile_author = vox_core::node::link::b32_decode(&fps[0], "quiet hostile Alice author")
-        .expect("APPARATUS: full Alice fingerprint");
-    let mut hostile_instance: Option<String> = None;
-    let mut hostile_owner: Option<(String, String, Option<[u8; 32]>)> = None;
-    while !hostile_engaged.is_file() {
+    eprintln!("QUIET REAL CONTENT OLDER ASK: original_alice_cut={marker_through} cursor={oldest} cached_rows={out} notice={err}");
+    let selected_room = vox_core::node::link::b32_decode(&control_room, "real archive room")
+        .expect("APPARATUS: full real archive room");
+    let selected_author = vox_core::node::link::b32_decode(&fps[0], "real archive author")
+        .expect("APPARATUS: full real archive author");
+    let mut selected_instance: Option<String> = None;
+    let mut selected: Option<(String, String, Option<[u8; 32]>)> = None;
+    let held_original_present = loop {
         use vox_core::node::api::HistoryDemandPhase as Phase;
         let (ok, out, err) = vox(
             &bob,
@@ -5637,113 +5709,89 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         );
         assert!(
             ok,
-            "PRODUCT: Bob's exact hostile-opportunity history status was refused: {out}{err}"
+            "PRODUCT: Bob's real archive Status was refused: {out}{err}"
         );
-        let current: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
-            panic!("PRODUCT: Bob's hostile-opportunity status was invalid JSON ({error}): {out}")
+        let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Bob's real archive Status was invalid JSON ({error}): {out}")
         });
         assert!(
-            current.schema == "vox.room.history/1"
-                && current.status.room == hostile_room_id
-                && current.instance == pub_hex(&current.status.instance)
-                && current.request == current.status.request.as_ref().map(|id| pub_hex(id))
-                && current.status.private_peer.is_none(),
-            "APPARATUS: hostile opportunity did not name this exact public room: {out}"
+            reply.schema == "vox.room.history/1"
+                && reply.status.room == selected_room
+                && reply.instance == pub_hex(&reply.status.instance)
+                && reply.request == reply.status.request.as_ref().map(|id| pub_hex(id))
+                && reply.status.private_peer.is_none(),
+            "APPARATUS: real Content request changed public room binding: {out}"
         );
-        // The actual frame may have arrived while Status was in flight. Its physical
-        // witness takes precedence over a now-obsolete staging-only owner observation.
-        if hostile_engaged.is_file() {
-            break;
-        }
-        if let Some(instance) = &hostile_instance {
-            assert!(current.instance == *instance,
-                "APPARATUS: hostile history preparation changed room instance; no privacy measurement: {out}");
+        if let Some(instance) = &selected_instance {
+            assert!(
+                reply.instance == *instance,
+                "APPARATUS: real Content preparation changed instance: {out}"
+            );
         } else {
-            hostile_instance = Some(current.instance.clone());
+            selected_instance = Some(reply.instance.clone());
         }
-        if let Some((instance, request, head)) = &hostile_owner {
-            assert!(current.instance == *instance && current.request.as_deref() == Some(request.as_str())
-                && current.status.head == *head
-                && current.status.author.is_none_or(|author| author == hostile_author),
-                "APPARATUS: hostile opportunity changed its exact request/instance/Head/author; no privacy measurement: {out}");
-        } else if let Some(request) = &current.request {
-            assert!(current.status.author == Some(hostile_author) && current.status.head.is_some(),
-                "APPARATUS: no active exact Alice history opportunity was observed before completion; no privacy measurement: {out}");
-            hostile_owner = Some((
-                current.instance.clone(),
-                request.clone(),
-                current.status.head,
-            ));
+        if let Some((instance, request, head)) = &selected {
+            assert!(
+                reply.instance == *instance
+                    && reply.request.as_deref() == Some(request.as_str())
+                    && reply.status.head == *head
+                    && reply.status.author == Some(selected_author),
+                "APPARATUS: real held Content request changed exact I/R/Head/author: {out}"
+            );
+        } else if let Some(request) = &reply.request {
+            assert!(
+                reply.status.author == Some(selected_author) && reply.status.head.is_some(),
+                "APPARATUS: Older did not establish a real missing Alice interval: {out}"
+            );
+            selected = Some((reply.instance.clone(), request.clone(), reply.status.head));
         }
-        if matches!(
-            current.status.phase,
-            Phase::Complete
-                | Phase::Paused
-                | Phase::More
-                | Phase::Unavailable
-                | Phase::Cancelled
-                | Phase::Cached
-                | Phase::Idle
-        ) {
-            assert!(hostile_engaged.is_file(),
-                "APPARATUS: Bob's selected history opportunity ended without the actual hostile frame; no privacy measurement: {out}");
+        let held = charged_flow_hold_entries(&archive_hold)
+            .into_iter()
+            .any(|(_, node, marker)| {
+                node == fps[1]
+                    && std::fs::read_to_string(marker).is_ok_and(|identity| {
+                        identity
+                            .lines()
+                            .any(|line| line == format!("room={control_room}"))
+                            && identity
+                                .lines()
+                                .any(|line| line == format!("peer={}", fps[0]))
+                    })
+            });
+        if held && selected.is_some() && reply.status.phase == Phase::Pending {
+            assert!(read_hash(&bob, &room, &interrupted_row.1).is_none(),
+                "APPARATUS: the selected original Content rendered before the archive interruption was staged");
+            eprintln!("QUIET REAL CONTENT ARCHIVE HELD: original_alice_cut={marker_through} cursor={oldest} status={out}");
+            break quiet_original_burst_rows(
+                &bob,
+                &control_room,
+                &fps[0],
+                (&alice_original_posts, false),
+            );
         }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let hostile_hash = std::fs::read(&hostile_engaged).unwrap_or_else(|e| {
-        panic!(
-            "APPARATUS: could not read the exact hostile entry from {}: {e}",
-            hostile_engaged.display()
-        )
-    });
-    assert_eq!(
-        hostile_hash.len(),
-        32,
-        "APPARATUS: {} did not name one exact authenticated entry",
-        hostile_engaged.display()
-    );
-    while !settlement_engaged.is_file() {
-        assert_ne!(
-            std::fs::read(&body_durable).ok().as_deref(),
-            Some(hostile_hash.as_slice()),
-            "PRODUCT [FX29 private-body-refusal]: Bob durably stored Carol's exact private body \
-             instead of refusing it before persistence"
+        assert!(
+            matches!(
+                reply.status.phase,
+                Phase::Preparing | Phase::Pending | Phase::Busy
+            ),
+            "APPARATUS: no physical missing-Content archive opportunity was established: {out}"
         );
-        // The suite watchdog is the APPARATUS deadman if neither causal outcome arrives. This
-        // sleep only paces observation; elapsed wall time is not a PRODUCT verdict.
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    let held_status = history_status(&bob, &room);
-    assert!(
-        held_status.0 != "complete" && held_status.1 != 0,
-        "PRODUCT: before Carol's role-only header was semantically settled, Bob reported the \
-         archive request complete with no remaining debt: {held_status:?}"
-    );
-    let bob_held_before_receipt =
-        member_held_through_state(&alice, &room, &fps[1]).unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: while Bob's role-complete receipt path was held, Alice's shipped \
-                 status did not name Bob with a null or numeric held_through receipt"
-            )
-        });
-    assert_ne!(
-        bob_held_before_receipt,
-        Some(marker_through),
-        "PRODUCT: while Bob's role-complete receipt path was held before settlement, Alice's \
-         shipped status credited Bob through her exact current feed position {marker_through}; \
-         his echoed inventory scalar was treated as a catch-up receipt (reported \
-         {bob_held_before_receipt:?})"
-    );
-    // Make the exact archive Flow authorization-stale while Control admission is genuinely busy.
-    // Its own Control job is still held at role settlement. Bob's trust of Carol is a real keyring
-    // generation change; Carol's real post then queues an older Control waiter behind that held
-    // job. Once the archive Flow returns stale, FIFO admission gives Carol the released job and
-    // holds it, so the archive replacement must remain visibly owned as `resume_owed` with its
-    // exact request/ticket/wake. The isolated mutant drops only `owe_resume`; after the exact stale
-    // lane terminal and held Control owner, this assertion turns PRODUCT red rather than waiting.
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let bob_held_before_receipt = member_held_through_state(&alice, &room, &fps[1])
+        .expect("PRODUCT: Alice's Status omitted Bob's null or numeric receipt");
+    assert!(bob_held_before_receipt.is_none_or(|through| through < marker_through),
+        "PRODUCT: Alice credited Bob through the original cut {marker_through} while an original Content row was still missing: {bob_held_before_receipt:?}");
+    // A real trust edit makes this held Content request authorization-stale. Carol's real
+    // Control work owns the sole Control job before Archive is released, so the SAME request
+    // must retain its replacement FIFO ticket/wake. No private-header callback is involved.
     let archive_request = history_observation(&bob, &room)
         .request
         .unwrap_or_else(|| panic!("PRODUCT: the held archive request exposed no exact request id"));
+    assert!(
+        archive_request == selected.as_ref().expect("held request").1,
+        "APPARATUS: archive owner changed between physical hold and authorization staging"
+    );
     let (ok, held_owner_status, err) = vox(&bob, &["status", "--json"], None);
     assert!(
         ok,
@@ -5768,7 +5816,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         })
         .to_owned();
     assert!(
-        held_owner["room"] == room && held_owner["request"] == archive_request,
+        archive_instance == selected.as_ref().expect("held request").0,
+        "APPARATUS: physical archive and typed request have different instances"
+    );
+    assert!(
+        held_owner["room"] == control_room && held_owner["request"] == archive_request,
         "PRODUCT: Bob's held archive owner did not identify the exact room/request before \
          authorization changed: {held_owner_status}"
     );
@@ -5797,34 +5849,33 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             "PRODUCT: Carol's Control-pressure post was refused: {out}{err}"
         );
         loop {
-            let (ok, status, err) = vox(&bob, &["status", "--json"], None);
-            assert!(
-                ok,
-                "APPARATUS: Bob's shipped status failed while staging the queued Control owner: {err}"
-            );
-            let value: serde_json::Value = serde_json::from_str(&status).unwrap_or_else(|error| {
-                panic!("PRODUCT: Bob's shipped status was not JSON while staging Control pressure: {error}: {status}")
-            });
-            let queued = value["lanes"]["bounded"]["admissions"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|owner| {
-                    owner["room"].as_str() == Some(room.as_str())
-                        && owner["peer"].as_str() == Some(fps[2].as_str())
-                        && owner["lane"].as_str() == Some("control")
-                });
-            if queued {
+            let held =
+                charged_flow_hold_entries(&control_hold)
+                    .into_iter()
+                    .any(|(_, node, marker)| {
+                        node == fps[1]
+                            && std::fs::read_to_string(marker).is_ok_and(|identity| {
+                                identity
+                                    .lines()
+                                    .any(|line| line == format!("room={control_room}"))
+                                    && identity
+                                        .lines()
+                                        .any(|line| line == format!("peer={}", fps[2]))
+                            })
+                    });
+            if held {
                 break;
             }
+            assert!(charged_flow_hold_entries(&control_hold).iter().all(|(_, node, _)| node != &fps[1]),
+                "APPARATUS: another actual Control worker reached the hold before Carol's; no Control-busy resume measurement");
             std::thread::sleep(Duration::from_millis(50));
         }
         println!(
             "[proof] FX-29 archive authorization-stale Control-busy apparatus staged: room {room}, peer {}, request {archive_request}",
             fps[0]
         );
-        std::fs::remove_file(&settlement_engaged).unwrap_or_else(|error| {
-            panic!("APPARATUS: could not release the exact stale archive Flow: {error}")
+        std::fs::remove_file(&archive_hold).unwrap_or_else(|error| {
+            panic!("APPARATUS: could not release the exact stale Content archive Flow: {error}")
         });
         loop {
             let stale = exact_lane(
@@ -5835,23 +5886,6 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
             )
             .since(stale_before);
             if stale.stale > 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        loop {
-            let held =
-                charged_flow_hold_entries(&control_hold)
-                    .into_iter()
-                    .any(|(_, _, marker)| {
-                        std::fs::read_to_string(marker).is_ok_and(|identity| {
-                            identity.lines().any(|line| line == format!("room={room}"))
-                                && identity
-                                    .lines()
-                                    .any(|line| line == format!("peer={}", fps[2]))
-                        })
-                    });
-            if held {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -5867,7 +5901,7 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         let owner = &value["lanes"]["history"]["owner"];
         assert!(
             owner["stage"] == "resume_owed"
-                && owner["room"] == room
+                && owner["room"] == control_room
                 && owner["request"] == archive_request
                 && owner["instance"].as_str() == Some(archive_instance.as_str())
                 && owner["ticket"].as_u64().is_some()
@@ -5887,49 +5921,272 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     for (_, _, marker) in charged_flow_hold_entries(&control_hold) {
         let _ = std::fs::remove_file(marker);
     }
-    control_pressure_daemon.stop();
     let bob_after_interruption = daemon(&bob, "bob-after-interruption");
     attached(&bob, "bob-after-interruption");
-    let (ok, out, err) = vox(&bob, &["room", "read", &room, "--history", "resume"], None);
+    let mut resumed_at = loop {
+        use vox_core::node::api::HistoryDemandPhase as Phase;
+        let (ok, out, err) = vox(
+            &bob,
+            &[
+                "room",
+                "read",
+                &control_room,
+                "--history",
+                "status",
+                "--json",
+            ],
+            None,
+        );
+        assert!(
+            ok,
+            "PRODUCT: pre-Resume Content Status was refused: {out}{err}"
+        );
+        let saved: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: pre-Resume Content Status was invalid ({error}): {out}")
+        });
+        assert!(
+            saved.schema == "vox.room.history/1"
+                && saved.status.room == selected_room
+                && saved.instance == archive_instance
+                && saved.instance == pub_hex(&saved.status.instance)
+                && saved.request == saved.status.request.as_ref().map(|id| pub_hex(id))
+                && saved.status.private_peer.is_none(),
+            "PRODUCT: pre-Resume Content Status changed public scope: {out}"
+        );
+        if matches!(saved.status.phase, Phase::Preparing | Phase::Busy) && saved.request.is_none() {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        assert!(saved.request.as_deref() == Some(archive_request.as_str())
+            && saved.status.head == selected.as_ref().expect("held request").2
+            && saved.status.phase == Phase::Paused && saved.status.remaining > 0,
+            "APPARATUS: restart did not retain the original paused interval for explicit Resume: {out}");
+        break Some((saved.status.remaining, saved.status.offset));
+    };
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "room",
+            "read",
+            &control_room,
+            "--history",
+            "resume",
+            "--history-instance",
+            &archive_instance,
+            "--history-request",
+            &archive_request,
+            "--json",
+        ],
+        None,
+    );
     assert!(
         ok,
         "PRODUCT: Bob's shipped `vox room read --history resume` was refused after interruption: \
          {out}{err}"
     );
-    // Reading a fresh later row is not proof of crossing a sparse gap: it can arrive and render
-    // independently. Alice must instead report Bob's authenticated receipt through the exact
-    // feed position after the package. That role-contiguous cursor cannot jump over Carol's
-    // package header, even though Bob must never receive its private body.
-    while member_held_through(&alice, &room, &fps[1]) != Some(marker_through) {
-        let current = history_observation(&bob, &room);
-        assert!(
-            current.phase != "complete" && current.remaining != 0,
-            "PRODUCT: Bob's exact archive request reached terminal status {}/{}, but Alice did \
-             not report his authenticated receipt through {marker_through}; Carol's header-only \
-             package did not settle contiguously for Bob's role\n\
-             bob's daemon said: {}",
-            current.phase,
-            current.remaining,
-            said(&bob, "bob-after-interruption")
+    // This resumed interval must complete as itself before any next bounded user request.
+    loop {
+        let (ok, out, err) = vox(
+            &bob,
+            &[
+                "room",
+                "read",
+                &control_room,
+                "--history",
+                "status",
+                "--json",
+            ],
+            None,
         );
-        assert_history_owned(&bob, &room, &fps[0], 0, 1);
+        assert!(
+            ok,
+            "PRODUCT: resumed Content Status was refused: {out}{err}"
+        );
+        let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: resumed Content Status was invalid ({error}): {out}")
+        });
+        assert!(
+            reply.schema == "vox.room.history/1"
+                && reply.status.room == selected_room
+                && reply.instance == pub_hex(&reply.status.instance)
+                && reply.request == reply.status.request.as_ref().map(|id| pub_hex(id))
+                && reply.status.private_peer.is_none(),
+            "PRODUCT: restarted Content Status changed its canonical public binding: {out}"
+        );
+        use vox_core::node::api::HistoryDemandPhase as Phase;
+        let preparing = reply.status.phase == Phase::Preparing;
+        let terminal = reply.status.phase == Phase::Complete && reply.status.remaining == 0;
+        assert!(reply.instance == archive_instance
+            && (reply.request.as_deref() == Some(archive_request.as_str())
+                || (preparing && reply.request.is_none()))
+            && (reply.status.head == selected.as_ref().expect("held exact request").2
+                || (preparing && reply.status.head.is_none()))
+            && (reply.status.author == Some(selected_author)
+                || (reply.status.author.is_none() && (preparing || terminal
+                    || (reply.status.phase == Phase::Paused && reply.status.remaining > 0)))),
+            "PRODUCT: restarted Content Resume changed its original request/instance/Head/author: {out}");
+        match reply.status.phase {
+            Phase::Complete if reply.status.remaining == 0 => break,
+            Phase::Preparing | Phase::Pending | Phase::Busy => {}
+            Phase::Paused if reply.status.remaining > 0 => {
+                let progress = (reply.status.remaining, reply.status.offset);
+                if resumed_at != Some(progress) {
+                    let (ok, out, err) = vox(&bob, &["room", "read", &control_room,
+                        "--history", "resume", "--history-instance", &archive_instance,
+                        "--history-request", &archive_request, "--json"], None);
+                    assert!(ok, "PRODUCT: same-request Content continuation Resume was refused: {out}{err}");
+                    eprintln!("QUIET CONTENT SAME REQUEST RESUME: instance={archive_instance} request={archive_request} remaining={} offset={} reply={out}", progress.0, progress.1);
+                    resumed_at = Some(progress);
+                }
+            }
+            _ => panic!("APPARATUS: same-request Content resume did not complete; no new Older replaces it: {out}"),
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
+    // Public Status does not expose interval lo/hi. Completion cannot prove that a guessed
+    // adjacent original post belonged to this request. Require real original-row progress,
+    // then retain EVERY remaining original through separate completed bounded requests below.
+    let resumed_original_present =
+        quiet_original_burst_rows(&bob, &control_room, &fps[0], (&alice_original_posts, false));
+    assert!(held_original_present.is_subset(&resumed_original_present)
+        && resumed_original_present.len() > held_original_present.len(),
+        "APPARATUS: the exact resumed interval completed without measurable original-row progress; no claimed interval/user-row credit: request={archive_request} before={held_original_present:?} after={resumed_original_present:?} rows={:?}", room_rows(&bob, &control_room));
+    eprintln!("QUIET SAME REQUEST CONTENT COMPLETE: instance={archive_instance} request={archive_request} original_cut={marker_through} original_rows_before={} original_rows_after={}", held_original_present.len(), resumed_original_present.len());
+    // A completed request authorizes another explicit page only for actual remaining original
+    // data. Reuse the exact bounded request/coverage rules, never widen the completed interval.
+    if quiet_original_burst_rows(&bob, &control_room, &fps[0], (&alice_original_posts, false)).len()
+        < alice_original_posts.len()
+    {
+        quiet_retain_original_burst(
+            &bob,
+            &alice,
+            &control_room,
+            &fps[1],
+            &fps[0],
+            (&alice_original_posts, false),
+            marker_through,
+        );
+    }
+    if quiet_original_burst_rows(&bob, &control_room, &fps[2], (&carol_posts, true)).len()
+        < carol_posts.len()
+    {
+        quiet_retain_original_burst(
+            &bob,
+            &carol,
+            &control_room,
+            &fps[1],
+            &fps[2],
+            (&carol_posts, true),
+            carol_tail_through,
+        );
+    }
+    // Carol remains reachable until her actual original rows have decrypted at Bob. Alice's
+    // retained plaintext is not evidence that Bob obtained Carol's recipient key.
+    while !reads(&bob, &room, "carol's real Control-pressure successor") {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let carol_bob_sync_before = member_last_sync(&carol, &room, &fps[1]);
+    control_pressure_daemon.stop();
+    while member_held_through(&alice, &room, &fps[1]).is_none_or(|through| through < marker_through)
+    {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(read_hash(&bob, &room, before_package_text).as_deref() == Some(before_package_hash.as_str()),
+        "PRODUCT: Bob's completed original Content pages omitted Alice's original pre-package row {before_package_hash}");
+    // Carol retained the OLD generation's package while its installer was held. That
+    // custody cannot test Bob-only privacy after installer release. Mint a NEW generation
+    // only after her owned process has stopped: revoke the existing Bob grant (rotation),
+    // then regrant Bob while reachable. Carol keeps consent but cannot receive the new key.
+    while member_connected(&alice, &room, &fps[2]) != Some(false) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let privacy_before_rotation = room_own_feed_through(&alice, &room)
+        .expect("PRODUCT: Alice Status omitted pre-rotation original feed cut");
+    let (ok, out, err) = vox(&alice, &["trust", "remove", &fps[1]], None);
     assert!(
-        read_hash(&bob, &room, before_package_text).as_deref()
-            == Some(before_package_hash.as_str()),
-        "PRODUCT: Bob's shipped archive read settled Alice's exact cursor through \
-         {marker_through}, but did not continue past Carol's header to the exact older row \
-         {before_package_hash}\nbob's daemon said: {}",
-        said(&bob, "bob-after-interruption")
+        ok,
+        "PRODUCT: Alice's real Bob revocation/rotation was refused: {out}{err}"
     );
-    let archive_status = history_status(&bob, &room);
-    assert_eq!(
-        archive_status,
-        ("complete".to_owned(), 0),
-        "PRODUCT: after the shipped archive read crossed Carol's role-complete header and \
-         returned the exact older row, its status was not exactly complete with zero remaining"
+    eprintln!("QUIET PRIVACY ROTATION: original_alice_cut={marker_through} pre_rotation_cut={privacy_before_rotation} carol_offline={} bob_revoke={out} stderr={err}", fps[2]);
+    let (ok, out, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
+    assert!(
+        ok,
+        "PRODUCT: Alice's real Bob regrant was refused: {out}{err}"
     );
+    let privacy_marker = "alice privacy marker minted after Carol went offline";
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &control_room, privacy_marker, "--json"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Alice's new-generation privacy SAY was refused: {out}{err}"
+    );
+    let posted: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|error| panic!("PRODUCT: privacy SAY reply was invalid ({error}): {out}"));
+    let privacy_hash = posted["entry_hash"]
+        .as_str()
+        .expect("PRODUCT: privacy SAY reply omitted accepted entry_hash")
+        .to_owned();
+    let privacy_posts = [(privacy_hash.clone(), privacy_marker.to_owned())];
+    let privacy_readable = |dir: &Path| {
+        room_rows(dir, &control_room).iter().any(|row| {
+            row["schema"] == "vox.room.row/1"
+                && row["room"] == control_room
+                && row["author"] == fps[0]
+                && row["entry_hash"] == privacy_hash
+                && row["owed"] == false
+                && row["envelope"]["v"] == 1
+                && row["envelope"]["type"] == "say"
+                && row["envelope"]["body"] == privacy_marker
+        })
+    };
+    assert!(
+        quiet_original_burst_rows(&alice, &control_room, &fps[0], (&privacy_posts, true)).len()
+            == 1,
+        "PRODUCT: Alice's accepted new privacy hash did not render its exact SAY"
+    );
+    let privacy_cut = room_own_feed_through(&alice, &room)
+        .expect("PRODUCT: Alice Status omitted actual privacy-message containing cut");
+    assert!(privacy_cut > privacy_before_rotation,
+        "APPARATUS: real revocation/regrant and new privacy SAY did not advance Alice's authenticated feed");
+    loop {
+        let (ok, out, err) = vox(&alice, &["status", "--json"], None);
+        assert!(
+            ok,
+            "PRODUCT: current privacy-delivery Status was refused: {out}{err}"
+        );
+        let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: privacy-delivery Status was invalid ({error}): {out}")
+        });
+        assert!(
+            status["identity"] == fps[0],
+            "APPARATUS: privacy-delivery Status names another identity: {out}"
+        );
+        let current = pub_probe_room(&status, &control_room);
+        let carol_member = current["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|member| member["id"] == fps[2])
+            .expect("PRODUCT: privacy-delivery room Status omitted Carol");
+        assert!(carol_member["trusted"] == true && carol_member["connected"] == false,
+            "APPARATUS: Carol lost her unchanged grant or became reachable during new-generation custody staging: {out}");
+        if status["governance_pending"] == false
+            && current["own_feed_through"]
+                .as_u64()
+                .is_some_and(|through| through >= privacy_cut)
+            && carol_member["key_delivery_pending"] == false
+            && privacy_readable(&bob)
+            && member_held_through(&alice, &room, &fps[1])
+                .is_some_and(|through| through >= privacy_cut)
+        {
+            eprintln!("QUIET NEW GENERATION PRIVACY STAGED: original_alice_cut={marker_through} original_carol_cut={carol_tail_through} pre_rotation_cut={privacy_before_rotation} new_privacy_cut={privacy_cut} accepted_hash={privacy_hash} carol_offline={} Alice_status={out}", fps[2]);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
     // ---- the room is quiet: acknowledgements settle, then the rounds are counted ----------
     let before = [synced(&alice), synced(&bob)];
     let before_lanes = [lane_why(&before[0].2), lane_why(&before[1].2)];
@@ -6092,33 +6349,37 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
     );
 
     // Restart Bob before the next receipt probe. Alice observing a newer completed sync and the
-    // same exact held-through position proves Bob reconstructed the durable cursor; it is not an
+    // receipt covering the ORIGINAL cut proves Bob reconstructed the durable cursor; it is not an
     // in-memory acknowledgement left over from the first daemon.
     bob_after_interruption.stop();
     let bob_after_restart = daemon(&bob, "bob-after-restart");
     attached(&bob, "bob-after-restart");
     wait_room_open(&bob, &room, "bob-after-restart");
     assert!(
-        member_holds_through(&bob, &room, &fps[0]) == Some(marker_through)
+        member_holds_through(&bob, &room, &fps[0]).is_some_and(|through| through >= marker_through)
             && member_holds_through(&bob, &room, &fps[2])
                 .is_some_and(|through| through >= carol_tail_through),
         "PRODUCT: after restarted Bob's shipped room reached its Open terminal state, \
-         `vox status --json` did not restore the exact durable contiguous feed heads for Alice \
-         through {marker_through} and Carol through {carol_tail_through}\nbob said: {}",
+         `vox status --json` did not restore durable contiguous receipts covering Alice's \
+         original cut {marker_through} and Carol's original cut {carol_tail_through}\nbob said: {}",
         said(&bob, "bob-after-restart")
     );
 
+    assert!(member_holds_through(&bob, &room, &fps[0])
+        .is_some_and(|through| through >= privacy_cut),
+        "PRODUCT: restarted Bob did not retain his receipt covering the NEW privacy marker cut {privacy_cut}");
+
     // Alice now goes offline. Release Carol's package hold only after Carol and Bob are running,
-    // then wait for a completed Carol↔Bob sync (not elapsed silence). If Bob persisted the hostile
-    // ciphertext, he can serve it and Carol will show Alice's tail. The correct product completed
-    // that sync but has only the authenticated package header, so her shipped read remains absent.
+    // then wait for a completed Carol↔Bob sync (not elapsed silence). Bob is a nonrecipient:
+    // his available public history must not make Alice's encrypted tail readable to Carol.
+    // No hostile private-body injection is claimed by this normal journey.
     alice_daemon.stop();
     let carol_from_bob_daemon = daemon_env(&carol, "carol-from-bob", &knob);
     attached(&carol, "carol-from-bob");
     wait_room_open(&carol, &room, "carol-from-bob");
     assert!(
-        !reads(&carol, &room, &package_marker),
-        "PRODUCT: Carol read Alice's marker while the confirmed package-installer hold remained \
+        !privacy_readable(&carol),
+        "PRODUCT: Carol read Alice's NEW-generation marker while the confirmed package-installer hold remained \
          armed; the product installed or served the held key-package past its causal hold"
     );
     std::fs::remove_file(&hold)
@@ -6149,11 +6410,9 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::yield_now();
     }
 
-    // A completed inventory round is not evidence that Bob had to answer for Alice's history.
-    // Re-arm Carol's package hold before the shipped reader asks for the exact page below Alice's
-    // oldest live-window row. The hold keeps the shipped pending bit observable until the proof
-    // releases it. The product has only the role-complete header: persisting the hostile private
-    // body already turns the earlier exact refusal assertion red.
+    // A completed inventory round is not an explicit reader request. Re-arm Carol's installer
+    // hold while she asks for Content before Bob's actual observed Alice cursor. This is a
+    // genuine public history ask, not evidence that a cached package header was selected.
     std::fs::write(&hold, b"").unwrap_or_else(|e| {
         panic!(
             "APPARATUS: could not re-arm Carol's package hold at {} before the explicit history \
@@ -6162,19 +6421,41 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         )
     });
 
-    // The bounded interval contains the package. Alice is offline and Bob is the only source, so
-    // the retained request bound to that exact authenticated Alice cursor and ending its quantum
-    // has given Bob the exact opportunity to serve every byte he holds in that interval.
+    // Alice is offline and Bob is the only running source. Bind the real Content request to
+    // Carol's actual readable Alice cursor; do not claim its interval contains her private package.
+    let carol_rows = room_rows(&carol, &control_room);
+    let carol_original_rows: Vec<_> = carol_rows
+        .iter()
+        .filter(|row| {
+            row["schema"] == "vox.room.row/1"
+                && row["room"] == control_room
+                && row["author"] == fps[0]
+                && row["owed"] == false
+                && row["envelope"].is_null()
+                && alice_original_posts.iter().any(|(hash, text)| {
+                    row["entry_hash"].as_str() == Some(hash.as_str())
+                        && row["text"].as_str() == Some(text.as_str())
+                })
+        })
+        .collect();
+    let original_tail_hash = &alice_original_posts.last().expect("original Alice tail").0;
+    let carol_cursor = carol_original_rows.iter()
+        .find(|row| row["entry_hash"].as_str() == Some(original_tail_hash.as_str()))
+        .or_else(|| carol_original_rows.first())
+        .and_then(|row| row["entry_hash"].as_str())
+        .unwrap_or_else(|| panic!("APPARATUS: Carol holds no actual readable original Alice cursor for this public Older; no history-opportunity or Bob-leak measurement: rows={carol_rows:?}"))
+        .to_owned();
+    eprintln!("QUIET CAROL OWN ALICE CURSOR: cursor={carol_cursor} new_privacy_hash={privacy_hash} original_alice_cut={marker_through} rowset={}", serde_json::to_string(&carol_rows).expect("JSON rows"));
     let (ok, out, err) = vox(
         &carol,
         &[
             "room",
             "read",
-            &room,
+            &control_room,
             "--history",
             "older",
             "--before",
-            &oldest,
+            &carol_cursor,
         ],
         None,
     );
@@ -6183,23 +6464,102 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         "PRODUCT: while Alice was offline, Carol's shipped history read through Bob was refused: \
          {out}{err}"
     );
-    let history_deadline = Instant::now() + PAGE_WITHIN;
+    // A cache hit is a completed public read, not an archive transfer. Only a positively
+    // accepted exact Pending/Busy request starts the existing PAGE_WITHIN feature clock.
+    let mut history_deadline = None;
+    let mut carol_history_instance: Option<String> = None;
+    let mut carol_history_owner: Option<(String, String, [u8; 32])> = None;
     let bob_only_history = loop {
-        let observed = history_observation(&carol, &room);
-        if observed.request.is_some() && matches!(observed.phase.as_str(), "more" | "complete") {
-            break observed;
-        }
-        assert!(
-            Instant::now() < history_deadline,
-            "PRODUCT: Carol's shipped history status did not finish the exact Alice page through \
-             reachable Bob within {PAGE_WITHIN:?} while Alice was offline; phase={}, request={:?}, \
-             remaining={}\ncarol said: {}\nbob said: {}",
-            observed.phase,
-            observed.request,
-            observed.remaining,
-            said(&carol, "carol-from-bob"),
-            said(&bob, "bob-after-restart")
+        use vox_core::node::api::HistoryDemandPhase as Phase;
+        let (ok, out, err) = vox(
+            &carol,
+            &[
+                "room",
+                "read",
+                &control_room,
+                "--history",
+                "status",
+                "--json",
+            ],
+            None,
         );
+        assert!(
+            ok,
+            "PRODUCT: Carol's public history Status was refused: {out}{err}"
+        );
+        let reply: HistoryDemandReply = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("PRODUCT: Carol history Status was invalid ({error}): {out}")
+        });
+        assert!(
+            reply.schema == "vox.room.history/1"
+                && reply.status.room == selected_room
+                && reply.instance == pub_hex(&reply.status.instance)
+                && reply.request == reply.status.request.as_ref().map(|id| pub_hex(id))
+                && reply.status.private_peer.is_none(),
+            "PRODUCT: Carol history Status changed canonical public binding: {out}"
+        );
+        if let Some(instance) = &carol_history_instance {
+            assert!(
+                reply.instance == *instance,
+                "APPARATUS: Carol's public history observation changed incarnation: {out}"
+            );
+        } else {
+            carol_history_instance = Some(reply.instance.clone());
+        }
+        if matches!(reply.status.phase, Phase::Preparing | Phase::Busy) && reply.request.is_none() {
+            std::thread::yield_now();
+            continue;
+        }
+        if reply.status.phase == Phase::Cached && reply.request.is_none() {
+            assert!(carol_history_owner.is_none(),
+                "APPARATUS: a retained public request disappeared into a no-request cache observation: {out}");
+            eprintln!("QUIET CAROL PUBLIC CACHE READ: cursor={carol_cursor} transfer_credit=0 status={out}");
+            break HistoryObservation {
+                phase: "cached".to_owned(),
+                remaining: 0,
+                request: None,
+            };
+        }
+        if let Some((instance, request, head)) = &carol_history_owner {
+            assert!(
+                reply.instance == *instance
+                    && reply.request.as_deref() == Some(request.as_str())
+                    && reply.status.head == Some(*head),
+                "APPARATUS: Carol's accepted public interval changed R/I/Head: {out}"
+            );
+        } else if let (Some(request), Some(head)) = (&reply.request, reply.status.head) {
+            assert!(
+                reply
+                    .status
+                    .author
+                    .is_none_or(|author| author == selected_author),
+                "APPARATUS: Carol's actual Alice cursor selected a different author: {out}"
+            );
+            carol_history_owner = Some((reply.instance.clone(), request.clone(), head));
+        }
+        if matches!(reply.status.phase, Phase::More | Phase::Complete)
+            && carol_history_owner.is_some()
+        {
+            let phase = if reply.status.phase == Phase::More {
+                "more"
+            } else {
+                "complete"
+            };
+            eprintln!("QUIET CAROL PUBLIC INTERVAL ENDED: cursor={carol_cursor} status={out}");
+            break HistoryObservation {
+                phase: phase.to_owned(),
+                remaining: u64::try_from(reply.status.remaining)
+                    .expect("bounded history remainder"),
+                request: reply.request,
+            };
+        }
+        assert!(matches!(reply.status.phase, Phase::Pending | Phase::Busy)
+            && carol_history_owner.is_some(),
+            "APPARATUS: Carol's public history opportunity did not reach an accepted interval/quantum terminal: {out}");
+        let deadline = history_deadline.get_or_insert_with(|| Instant::now() + PAGE_WITHIN);
+        assert!(Instant::now() < *deadline,
+            "PRODUCT: Carol's accepted exact Alice interval did not end its quantum through reachable Bob within {PAGE_WITHIN:?} while Alice was offline: {out}\ncarol said: {}\nbob said: {}",
+            said(&carol, "carol-from-bob"), said(&bob, "bob-after-restart"));
         std::thread::yield_now();
     };
 
@@ -6213,11 +6573,11 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
         std::thread::yield_now();
     }
     assert!(
-        !reads(&carol, &room, &package_marker),
-        "PRODUCT: after Bob exhausted Carol's explicit Alice-history quantum (phase={}, \
+        !privacy_readable(&carol),
+        "PRODUCT: after Carol's public Alice-history read ended (phase={}, \
          remaining={}) and retained-package replay completed while Alice was offline, Carol read \
-         Alice's private-package tail {package_marker:?}; Bob persisted and re-served ciphertext \
-         addressed only to Carol\ncarol said: {}\nbob said: {}",
+         Alice's NEW-generation privacy tail {privacy_marker:?} despite having been offline \
+         before its sender-key rotation and with Alice still offline\ncarol said: {}\nbob said: {}",
         bob_only_history.phase,
         bob_only_history.remaining,
         said(&carol, "carol-from-bob"),
@@ -6226,9 +6586,18 @@ fn a_quiet_room_costs_no_rounds_and_says_when_it_last_synced() {
 
     // Bringing the actual source back is the one causal change that makes Carol's package
     // available. Her exact tail appears, then all three shipped daemons still exchange content.
-    let _alice_after_privacy = daemon_env(&alice, "alice-after-privacy", &alice_knob);
+    let _alice_after_privacy = daemon(&alice, "alice-after-privacy");
     attached(&alice, "alice-after-privacy");
-    while !reads(&carol, &room, &package_marker) {
+    while !(privacy_readable(&carol)
+        && read_hash(&carol, &room, &package_marker).as_deref()
+            == Some(
+                alice_original_posts
+                    .last()
+                    .expect("original Alice tail")
+                    .0
+                    .as_str(),
+            ))
+    {
         std::thread::sleep(Duration::from_millis(200));
     }
     let (ok, out, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
