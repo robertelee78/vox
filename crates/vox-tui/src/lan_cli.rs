@@ -291,7 +291,7 @@ const NOT_HERE: &str = "the family LAN is built for macOS only so far: Linux's /
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use std::io::{self, BufRead as _, IoSlice, IoSliceMut, Write as _};
+    use std::io::{self, IoSlice, IoSliceMut, Write as _};
     use std::mem::MaybeUninit;
     use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
@@ -317,6 +317,14 @@ mod mac {
     use super::{AppError, DeviceRequest};
 
     const UTUN_CONTROL: &str = "com.apple.net.utun_control";
+
+    // The longest `up <ipv4|-> <ipv6>` request, including an IPv6 dotted tail and
+    // CRLF. `hello` is shorter. Whitespace padding must also fit this envelope.
+    const MAX_REQUEST_BYTES: usize = "up ".len()
+        + "255.255.255.255".len()
+        + " ".len()
+        + "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255".len()
+        + "\r\n".len();
 
     /// `AF_INET` and `AF_INET6` as a `utun` frames them: a 4-byte big-endian family
     /// ahead of every packet.
@@ -495,13 +503,37 @@ mod mac {
             Err(e) if e.raw_os_error() == Some(nix::libc::EINVAL) => return Ok(None),
             Err(e) => return Err(format!("setting the request's read timeout: {e}")),
         }
-        let mut line = String::new();
-        let got = std::io::BufReader::new(stream)
-            .read_line(&mut line)
-            .map_err(|e| format!("reading the request: {e}"))?;
-        if got == 0 {
+        // Read at most the protocol envelope and one over-limit sentinel before
+        // decoding. A read timeout alone does not bound a continuously growing line.
+        let mut bytes = [0u8; MAX_REQUEST_BYTES + 1];
+        let mut used = 0;
+        let end = loop {
+            let got = match std::io::Read::read(&mut &*stream, &mut bytes[used..]) {
+                Ok(got) => got,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("reading the request: {e}")),
+            };
+            if got == 0 {
+                break used;
+            }
+            let start = used;
+            used += got;
+            // Only the first line is a request, even if this read also got later bytes.
+            if let Some(newline) = bytes[start..used].iter().position(|byte| *byte == b'\n') {
+                break start + newline + 1;
+            }
+            if used > MAX_REQUEST_BYTES {
+                return Err(format!("request exceeds {MAX_REQUEST_BYTES} bytes"));
+            }
+        };
+        if end == 0 {
             return Ok(None);
         }
+        if end > MAX_REQUEST_BYTES {
+            return Err(format!("request exceeds {MAX_REQUEST_BYTES} bytes"));
+        }
+        let line =
+            std::str::from_utf8(&bytes[..end]).map_err(|e| format!("request is not UTF-8: {e}"))?;
         if line.trim() == super::HELLO {
             let _ = std::io::Write::write_all(
                 &mut &*stream,
@@ -509,7 +541,7 @@ mod mac {
             );
             return Ok(None);
         }
-        let req = DeviceRequest::parse(&line)?;
+        let req = DeviceRequest::parse(line)?;
         let (fd, name) = create_utun().map_err(|e| format!("creating a utun: {e}"))?;
         // On any failure from here, dropping `fd` destroys the half-made interface.
         let done = configure(&name, &req)?;
