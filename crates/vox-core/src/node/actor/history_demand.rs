@@ -193,9 +193,14 @@ impl Controller {
         if !self.owns_running_fence(request, generation, &dispatch.fence) {
             return None;
         }
-        self.failed_current(room, instance, request, generation,
-            "Authorization changed. Request this history page again under current access.")
-            .then_some((room, peer, instance, request, generation))
+        self.failed_current(
+            room,
+            instance,
+            request,
+            generation,
+            "Authorization changed. Request this history page again under current access.",
+        )
+        .then_some((room, peer, instance, request, generation))
     }
 
     fn clear_resume_owed(&mut self) {
@@ -1137,6 +1142,38 @@ impl Node {
         let task = tokio::spawn(async move {
             let work = async {
                 if let Some(prior) = prior_private { let _ = prior.task.await; }
+                // Reclaim only an already-admitted exact public entry before taking the room
+                // lock. Each slice removes durable pages; interruption leaves the locator and
+                // remaining pages for the same explicit request.
+                if let Action::Resume { request } = action {
+                    if let Some(mut admission) = resume_admission.take() {
+                        let cleanup_context = Arc::clone(&context);
+                        let cleanup_fence = Arc::clone(&worker_fence);
+                        admission = tokio::task::spawn_blocking(move || -> Result<demand::ResumeAdmission, String> {
+                            let saved = admission.inspect(&cleanup_context)
+                                .map_err(|error| error.to_string())?;
+                            let recover = saved.as_ref().is_some_and(|saved| {
+                                let state = saved.state();
+                                state.request == request && state.binding.room == room
+                                    && state.binding.instance == instance && state.admitted.is_some()
+                                    && !matches!(state.progress(None), demand::Progress::Cancelled | demand::Progress::Complete)
+                            });
+                            drop(saved);
+                            if recover {
+                                loop {
+                                    if cleanup_fence.is_retired() {
+                                        return Err("History recovery was cancelled.".into());
+                                    }
+                                    if demand::reclaim_precharged(&cleanup_context, request, admission.mutation())
+                                        .map_err(|error| error.to_string())? { break; }
+                                    std::thread::yield_now();
+                                }
+                            }
+                            Ok(admission)
+                        }).await.map_err(|_| "History cleanup worker stopped.".to_owned())??;
+                        resume_admission = Some(admission);
+                    }
+                }
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 let room_guard = if local_only || resume_inspect.is_some() { None } else {
                     let shared = shared.ok_or("room is not open")?;
@@ -2224,6 +2261,86 @@ fn prepare(
             answer.status.phase = Phase::Unavailable;
             answer.status.detail =
                 "The requested resume does not match the saved history request.".into();
+            return Ok(answer);
+        }
+        if let Some(admitted) = state.admitted {
+            if state.reclaiming() {
+                return Err("The admitted history entry still has cleanup pending.".into());
+            }
+            let bounds = state.bounds;
+            let remaining = state.remaining;
+            let head = room
+                .history_head_by_id(store, &bounds.head)
+                .map_err(|error| error.to_string())?
+                .ok_or("The original authenticated head is unavailable.")?;
+            let read = room
+                .history_read(store)
+                .map_err(|error| error.to_string())?;
+            let (_, header) = read
+                .history_validated_header(&head.binding.author, admitted.seq)
+                .map_err(|error| error.to_string())?
+                .ok_or("The admitted history entry is unavailable.")?;
+            if header.entry_hash() != admitted.entry
+                || !read
+                    .history_effect_finished(&admitted.entry)
+                    .map_err(|error| error.to_string())?
+            {
+                return Err("The admitted history entry changed or is not settled.".into());
+            }
+            drop(read);
+            let continuation = if remaining == 0 {
+                None
+            } else {
+                let next_seq = admitted
+                    .seq
+                    .checked_sub(1)
+                    .filter(|next| *next >= bounds.lo)
+                    .ok_or("The admitted history continuation is inconsistent.")?;
+                Some(stream::Continuation {
+                    query_kind: 4,
+                    head: bounds.head,
+                    lo: bounds.lo,
+                    hi: bounds.hi,
+                    next_seq,
+                    entry: None,
+                    offset: 0,
+                    entries_remaining: remaining,
+                })
+            };
+            let admission = resume_admission
+                .as_ref()
+                .ok_or("History Resume admission is missing.")?;
+            answer.status = saved_status(state, Some(head.binding.author), None);
+            let mut active =
+                demand::resume_precharged(&context, request, binding, admission.mutation())
+                    .map_err(|error| error.to_string())?;
+            answer.local_boundary = LocalBoundary::Durable;
+            if let Err(error) = demand::checkpoint_precharged(
+                &context,
+                &mut active,
+                if continuation.is_some() {
+                    demand::Progress::More
+                } else {
+                    demand::Progress::Complete
+                },
+                continuation.as_ref(),
+                admission.mutation(),
+            ) {
+                return Ok(committed_resume_failure(answer, error));
+            }
+            let finished = match demand::inspect(&context, job) {
+                Ok(Some(finished)) => finished,
+                Ok(None) => {
+                    return Ok(committed_resume_failure(
+                        answer,
+                        "The recovered history request disappeared.",
+                    ))
+                }
+                Err(error) => return Ok(committed_resume_failure(answer, error)),
+            };
+            answer.status =
+                saved_status(finished.state(), Some(head.binding.author), Some(&active));
+            answer.local_boundary = LocalBoundary::Durable;
             return Ok(answer);
         }
         if state.body.is_none()

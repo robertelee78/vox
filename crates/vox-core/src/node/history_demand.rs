@@ -212,6 +212,14 @@ pub struct Cursor {
     pub offset: u64,
 }
 
+/// The exact entry already admitted to the room, retained through staging cleanup.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmittedEntry {
+    pub entry: Digest32,
+    pub seq: u64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cleanup {
@@ -281,6 +289,8 @@ pub struct State {
     pub body: Option<Body>,
     pub cursor: Option<Cursor>,
     #[serde(default)]
+    pub(crate) admitted: Option<AdmittedEntry>,
+    #[serde(default)]
     pub(crate) private: Option<PrivatePlan>,
     #[serde(default)]
     pub(crate) legacy: Option<LegacyPlan>,
@@ -325,6 +335,16 @@ impl State {
         })?;
         if self.serial == 0 || self.remaining > maximum_remaining {
             return Err(bad());
+        }
+        if let Some(admitted) = self.admitted {
+            if admitted.seq < self.bounds.lo
+                || admitted.seq > self.bounds.hi
+                || self.body.is_some()
+                || self.private.is_some()
+                || self.legacy.is_some()
+            {
+                return Err(bad());
+            }
         }
         if let Some(body) = &self.body {
             if body.seq < self.bounds.lo
@@ -828,6 +848,7 @@ fn start_plan(
         })?,
         body: None,
         cursor: None,
+        admitted: None,
         private,
         legacy,
         progress: Progress::Pending,
@@ -1009,6 +1030,7 @@ pub fn begin_body(
         ));
     }
     state.remaining -= 1;
+    state.admitted = None;
     state.body = Some(Body {
         entry,
         seq,
@@ -1223,7 +1245,14 @@ pub(crate) fn entry_admitted(
     {
         return Err(invalid("history entry is incomplete or changed"));
     }
+    let admitted_seq = state.body.as_ref().expect("validated body").seq;
     schedule_cleanup(&mut state);
+    if context.slot == Slot::Archive && state.private.is_none() && state.legacy.is_none() {
+        state.admitted = Some(AdmittedEntry {
+            entry,
+            seq: admitted_seq,
+        });
+    }
     put(batch, key, &scope, &state)
 }
 
@@ -1290,6 +1319,7 @@ pub(crate) fn role_header_admitted(
     {
         return Err(invalid("role-complete history header changed"));
     }
+    state.admitted = None;
     state.remaining -= 1;
     if state.remaining == 0 {
         state.cursor = None;
@@ -1373,7 +1403,7 @@ pub(crate) fn checkpoint_precharged(
     } else {
         None
     };
-    if state.progress == progress && state.cursor == next_cursor {
+    if state.progress == progress && state.cursor == next_cursor && state.admitted.is_none() {
         // Exact Active, current authority and all cursor/credit invariants were checked in
         // this serialized batch. An identical checkpoint has no durable work to commit.
         let result = context.check();
@@ -1383,6 +1413,7 @@ pub(crate) fn checkpoint_precharged(
         return result;
     }
     state.cursor = next_cursor;
+    state.admitted = None;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;
     commit(batch, active, context)?;
@@ -1510,6 +1541,7 @@ pub(crate) fn cancel_precharged(
     }
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Cancelled;
+    state.admitted = None;
     schedule_cleanup(&mut state);
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)
@@ -1546,6 +1578,7 @@ pub(crate) fn cancel_owned_precharged(
     }
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Cancelled;
+    state.admitted = None;
     schedule_cleanup(&mut state);
     put(&mut batch, key, &scope, &state)?;
     // Preserve the lifecycle fence until the commit's linearization point. A later observation
