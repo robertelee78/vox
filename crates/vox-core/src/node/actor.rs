@@ -14621,7 +14621,13 @@ impl Node {
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
-        self.history_demand.note_route_trust_change();
+        if let Some((room, peer, instance, request, generation)) =
+            self.history_demand.note_route_trust_change()
+        {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            self.sched_rooms.insert(room);
+        }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
         if let Some(decision) = decision {
@@ -14744,7 +14750,13 @@ impl Node {
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
         self.consent_keys = pending;
-        self.history_demand.note_route_trust_change();
+        if let Some((room, peer, instance, request, generation)) =
+            self.history_demand.note_route_trust_change()
+        {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            self.sched_rooms.insert(room);
+        }
         self.trust = next;
         self.deliveries
             .retain(|(_, peer, _), _| peer != fingerprint);
@@ -16215,7 +16227,8 @@ impl Node {
                     && (port.needs()
                         || self.bounded_sync.needs_port(key.0, key.1)
                         || self.history_hints.pending(key.0, key.1)
-                        || self.history_demand.ready_binding(key.0, key.1).is_some())
+                        || (self.trust.is_trusted(&key.1)
+                            && self.history_demand.unstarted_dial_binding(key.0, key.1)))
                     && (!port.backing_off(now) || port.busy_bypass(now))
                     && !self.publishing.contains(*key)
                     && self
@@ -25797,7 +25810,13 @@ impl Node {
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
-        self.history_demand.note_route_trust_change();
+        if let Some((room, peer, instance, request, generation)) =
+            self.history_demand.note_route_trust_change()
+        {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            self.sched_rooms.insert(room);
+        }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
         self.owe_private_support_in_open_rooms().await;
