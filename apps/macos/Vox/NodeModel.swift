@@ -1576,7 +1576,7 @@ final class NodeModel: ObservableObject {
                     let snapshot = showingSession ? [] : messages
                     releaseHistoryViews()
                     messages = snapshot
-                    roomNeedsPage = true
+                    if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
                     switch listedNode?.state {
                     case "attaching": ended = "Node \(node) is attaching."
                     case "detaching": ended = "Node \(node) is detaching."
@@ -1634,6 +1634,7 @@ final class NodeModel: ObservableObject {
                         return
                     }
                 } else {
+                    roomNeedsPage = false
                     ended = nil
                 }
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
@@ -4195,7 +4196,8 @@ extension NodeModel {
                                                     sessionId: s.sessionId)
             guard current() else { return }
             guard read.instance == instance else {
-                throw VoxError.Failed(reason: "The saved room changed while reading Session activity.")
+                await stopped(.roomChanged)
+                return
             }
             var retained: FfiSessionRead?
             if !follows, !heldIDs.isEmpty, let heldInstance {
@@ -4236,7 +4238,7 @@ extension NodeModel {
             scheduleSessionPauseRead()
             scheduleSessionAttentionRead()
             if !sessionReloadNeeded, let now = shownSession {
-                await refreshSessionRequests(room: room, session: now)
+                await refreshSessionRequests(room: room, session: now, whileRecovering: whileRecovering)
             }
         } catch {
             guard current() else { return }
@@ -4285,7 +4287,8 @@ extension NodeModel {
                   now.opening == s.opening, now.canDrive, sessionBefore == before,
                   revision == sessionWindowRevision else { return }
             guard sessionPages.instance == instance, read.instance == instance else {
-                throw VoxError.Failed(reason: "The saved room changed while loading older Session activity.")
+                await stopped(.roomChanged)
+                return
             }
             guard sessionPages.older(read, asked: before) else { return }
             sessionWindowRevision = UUID()
@@ -4302,18 +4305,20 @@ extension NodeModel {
 
     /// Current state for the loaded requests and any request selected from a notification.
     /// The daemon uses its request index; no transcript history is walked to find them.
-    private func refreshSessionRequests(room: String, session s: FfiSession) async {
+    private func refreshSessionRequests(room: String, session s: FfiSession,
+                                        whileRecovering: Bool = false) async {
         let selected = selectedRequest
         let revision = sessionWindowRevision
         let epoch = nodeObservationEpoch, generation = roomReadGeneration
         guard let instance = roomInstance, sessionPages.instance == instance else { return }
         func currentContext() -> Bool {
             roomOnScreen == room && roomInstance == instance && ended == nil && !roomNeedsPage
-                && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && (!observationNeedsRestart || whileRecovering) && shownSession?.nodeFingerprint == s.nodeFingerprint
                 && shownSession?.sessionId == s.sessionId && shownSession?.opening == s.opening
                 && shownSession?.canDrive == true && selectedRequest == selected && revision == sessionWindowRevision
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
         }
+        guard currentContext() else { return }
         var references = Set(sessionEntries.compactMap { $0.request?.reference })
         if let selected { references.insert(selected) }
         guard !references.isEmpty else {
@@ -4329,7 +4334,8 @@ extension NodeModel {
                     sessionId: s.sessionId, reference: reference, before: nil)
                 guard currentContext() else { return }
                 if page.instance != instance {
-                    throw VoxError.Failed(reason: "The saved room changed while refreshing its requests.")
+                    await stopped(.roomChanged)
+                    return
                 }
                 if let row = page.entries.last(where: { $0.request?.reference == reference }) {
                     current.append(row)
@@ -4449,7 +4455,11 @@ extension NodeModel {
     /// Open `room`, its Session `session` of `node`, and select its request `reference`, centred
     /// (P1): where a notification and ⌘J land.
     func openRequest(room: String, node: String, session: String, reference: String) async {
+        guard ended == nil, !observationNeedsRestart else { return }
+        let epoch = nodeObservationEpoch
         await show(.room(room))
+        guard epoch == nodeObservationEpoch, ended == nil, !observationNeedsRestart,
+              !roomNeedsPage, roomOnScreen == room else { return }
         showing = .session(node: node, id: session)
         selectedRequest = reference
         if let s = shownSession, s.canDrive { await refreshSessionRequests(room: room, session: s) }
