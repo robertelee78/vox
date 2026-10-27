@@ -2456,6 +2456,16 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             let cut = vox(Path::new(VOX), home, &["update"], &cut_env);
             let cut_text = said(&cut);
             let interrupted_version = active_app_says(&active);
+            // This specific interruption must have reached the real post-exchange state, not
+            // merely failed for an unrelated reason. The displaced app and journal make that
+            // boundary observable without another test knob.
+            use std::os::unix::process::ExitStatusExt as _;
+            let exchange_abort = point == "publish-exchanged" && mode == "abort";
+            let reached_exchange = !exchange_abort
+                || (cut.status.signal() == Some(rustix::process::Signal::ABORT.as_raw())
+                    && interrupted_version == candidate_version
+                    && active_app_says(&apps.join(".Vox.app.partial")) == previous_version
+                    && apps.join(".Vox.app.publishing/state").is_file());
             let opened = opened_bundle(
                 &exact_identifier,
                 &no_data,
@@ -2465,6 +2475,10 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
             let repaired = vox(Path::new(VOX), home, &["update"], &product_base);
             let after_version = active_app_says(&active);
+            let retained_after_repair = !exchange_abort
+                || (kept_app_says(&previous) == previous_version
+                    && !apps.join(".Vox.app.partial").exists()
+                    && !apps.join(".Vox.app.publishing").exists());
             let after_records = launch_services_paths(&exact_identifier)
                 .unwrap_or_else(|why| panic!("APPARATUS: {why}"));
             let after_exchange = matches!(
@@ -2493,6 +2507,8 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             let ok = primed.status.success()
                 && rewound.status.success()
                 && verdict_truthful
+                && reached_exchange
+                && retained_after_repair
                 && interrupted_version == expected_interrupted
                 && active.join("Contents/Info.plist").is_file()
                 && !previous.join("Contents/Info.plist").exists()
@@ -2503,7 +2519,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 && after_records == [active.clone()];
             boundary_ok &= ok;
             boundary_evidence.push(format!(
-                    "{mode}: prime={}, rewind={}, cut={} said {cut_text:?}; interrupted={interrupted_version:?}, open={:?}; repair={}, after={after_version:?}, records={after_records:?}",
+                    "{mode}: prime={}, rewind={}, cut={} said {cut_text:?}; interrupted={interrupted_version:?}, exchange_witness={reached_exchange}, open={:?}; repair={}, retained={retained_after_repair}, after={after_version:?}, records={after_records:?}",
                     primed.status,
                     rewound.status,
                     cut.status,
