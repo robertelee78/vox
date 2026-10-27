@@ -1589,11 +1589,12 @@ private struct RoomTimelineView: View {
                     // trust both ways (ADR-028 R-5), which a newcomer is not told anywhere else.
                     TrustBanner(model: model)
                     composer
-                } else if model.sessionDriveAvailable, let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
+                } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
                     Hairline()
-                    // One composer per Session: a draft for one never shows in another (D12).
+                    // Keep this Session's draft mounted while authority is being refreshed.
                     SessionComposer(model: model, room: room, session: s)
                         .id("\(room)/\(s.nodeFingerprint)/\(s.sessionId)")
+                        .disabled(!model.sessionDriveAvailable)
                 }
             }
             // The conversation, the timeline and the composer, at the text size View > Bigger and
