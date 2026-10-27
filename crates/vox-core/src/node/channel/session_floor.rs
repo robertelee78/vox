@@ -68,6 +68,10 @@ pub(crate) fn is_session_floor(payload: &[u8]) -> bool {
 impl ChannelState {
     pub(crate) fn authorization_refreshing(error: &Error) -> bool {
         floor_index::refreshing(error)
+            || matches!(
+                error,
+                Error::StreamRefused(super::private_session::CONTROL_REFRESHING)
+            )
     }
 
     pub(super) fn floor_author(

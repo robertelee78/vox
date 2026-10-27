@@ -7858,9 +7858,20 @@ impl ChannelState {
         if let Some(unsaid) = self.drive.change_unsaid {
             return Ok(unsaid);
         }
-        let live = self.drive.chain.as_ref().map(SenderChain::chain_id);
+        let Some(live) = self
+            .drive
+            .chain
+            .as_ref()
+            .map(SenderChain::chain_id)
+            .filter(|g| *g > 0)
+        else {
+            // No key (or the initial generation) cannot owe a key-change notice.
+            // Its answer must not depend on an unrelated legacy control scan.
+            self.drive.change_unsaid = Some(false);
+            return Ok(false);
+        };
         let used = self.drive_used(store)?;
-        let unsaid = live.is_some_and(|g| g > 0 && used.is_none_or(|u| u < g));
+        let unsaid = used.is_none_or(|u| u < live);
         self.drive.change_unsaid = Some(unsaid);
         Ok(unsaid)
     }

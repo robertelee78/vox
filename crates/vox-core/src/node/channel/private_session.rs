@@ -14,7 +14,7 @@ use crate::node::sessionstream::{
 };
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
-const CONTROL_REFRESHING: &str = "Session control facts are refreshing";
+pub(super) const CONTROL_REFRESHING: &str = "Session control facts are refreshing";
 const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
 const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
@@ -775,9 +775,14 @@ impl ChannelState {
         result
     }
 
-    fn migrate_legacy_steps_inner(&mut self, store: &Store, _now: u64) -> Result<bool> {
+    fn migrate_legacy_steps_inner(&mut self, store: &Store, _now: u64) -> Result<SessionAdvance> {
         if !self.private_sessions.legacy_pending.is_empty() {
-            self.index_session_floors(store)?;
+            if let Err(error) = self.index_session_floors(store) {
+                if Self::authorization_refreshing(&error) {
+                    return Ok(SessionAdvance::Waiting);
+                }
+                return Err(error);
+            }
             self.private_sessions.legacy_pending.0 = false;
             self.private_sessions.legacy_work = Some(LegacyWork {
                 through: self.next_log_id,
@@ -786,7 +791,7 @@ impl ChannelState {
             });
         }
         let Some(mut work) = self.private_sessions.legacy_work.take() else {
-            return Ok(true);
+            return Ok(SessionAdvance::Complete);
         };
         let mut bytes = 0usize;
         for _ in 0..WORK_ROWS {
@@ -799,7 +804,7 @@ impl ChannelState {
                     work.migrating = true;
                     work.after = None;
                     self.private_sessions.legacy_work = Some(work);
-                    return Ok(false);
+                    return Ok(SessionAdvance::Advanced);
                 }
                 self.private_sessions.pending_active = true;
                 self.private_sessions.pending_after = None;
@@ -815,7 +820,7 @@ impl ChannelState {
                 self.queue_private_progress(&mut batch)?;
                 batch.commit()?;
                 self.entries.committed();
-                return Ok(true);
+                return Ok(SessionAdvance::Advanced);
             };
             let size = entry.payload.as_ref().map_or(0, Vec::len);
             if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
@@ -829,9 +834,13 @@ impl ChannelState {
             {
                 if work.migrating {
                     if let Err(error) = self.migrate_legacy_row(store, entry) {
-                        if floor_index::refreshing(&error) {
+                        if Self::authorization_refreshing(&error)
+                            || super::governance::refreshing(&error)
+                        {
+                            // Keep the exact last completed source; this readiness boundary
+                            // grants nothing and is not a malformed saved record.
                             self.private_sessions.legacy_work = Some(work);
-                            return Ok(false);
+                            return Ok(SessionAdvance::Waiting);
                         }
                         return Err(error);
                     }
@@ -860,7 +869,7 @@ impl ChannelState {
             work.after = Some(id);
         }
         self.private_sessions.legacy_work = Some(work);
-        Ok(false)
+        Ok(SessionAdvance::Advanced)
     }
 
     /// Wire, exact cached row, retention retirement and public-body pruning commit together.
@@ -1182,8 +1191,7 @@ impl ChannelState {
                     self.advance_private_controls(store)?;
                     return Ok(SessionAdvance::Advanced);
                 }
-                self.migrate_legacy_steps_inner(store, now)?;
-                return Ok(SessionAdvance::Advanced);
+                return self.migrate_legacy_steps_inner(store, now);
             }
             let was_pending = self.private_sessions.pending_active;
             if !self.advance_pending_private(store, now)? {
@@ -1612,7 +1620,7 @@ impl ChannelState {
     }
 
     fn private_save_failed(&mut self, error: &Error) {
-        if super::governance::refreshing(error) || floor_index::refreshing(error) {
+        if super::governance::refreshing(error) || Self::authorization_refreshing(error) {
             return;
         }
         self.poisoned = true;
