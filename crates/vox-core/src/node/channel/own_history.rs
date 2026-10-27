@@ -297,22 +297,21 @@ impl ChannelState {
         let held = read
             .history_held_through(&self.me())
             .map_or(0, |(seq, _)| seq);
-        if held >= head.root.leaves
-            || !self.is_member(peer)
-            || self.held_through(peer).is_none_or(|n| n < head.root.leaves)
-        {
+        let donor_through = self.held_through(peer).unwrap_or(0);
+        if held >= head.root.leaves || !self.is_member(peer) || donor_through <= held {
             return Ok(None);
         }
         let lo = held.checked_add(1).ok_or(Error::OwnHistoryBehind)?;
         let hi = head
             .root
             .leaves
+            .min(donor_through)
             .min(lo.saturating_add(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1));
         Ok(Some(OwnRecoveryPage {
             head: head.id(),
             lo,
             hi,
-            donor_through: self.held_through(peer).ok_or(Error::OwnHistoryBehind)?,
+            donor_through,
         }))
     }
 

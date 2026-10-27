@@ -224,6 +224,12 @@ pub(crate) struct Flow {
     /// Set at the durable/user-visible work edge and drained by the actor before it classifies
     /// the worker result. This survives any later cancellation, error or supersession.
     pub(crate) work_committed: Arc<std::sync::atomic::AtomicBool>,
+    /// Changed, signature-verified own observation committed by the physical receiver.
+    pub(crate) own_head_observed: Arc<std::sync::atomic::AtomicBool>,
+    /// Exact connection which returned unavailable for this startup metadata probe.
+    pub(crate) discovery_unavailable: Option<u64>,
+    pub(crate) discovery_incarnations: Option<(u64, u64)>,
+    pub(crate) receipt_lower: Option<(u64, (u64, u64))>,
     /// Exact unavailable advertised heads declined during this retained flow. The actor reports
     /// the outcome through the lane in `vox status --json`.
     pub(crate) declined: u64,
@@ -440,6 +446,10 @@ impl Flow {
             governance: false,
             brought: false,
             work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            discovery_unavailable: None,
+            discovery_incarnations: None,
+            receipt_lower: None,
             declined: 0,
             offered: 0,
             rearmed: 0,
@@ -514,7 +524,11 @@ impl Flow {
             }
             flow.push(Task {
                 request,
-                purpose: Purpose::Control,
+                purpose: if local_own_discovery {
+                    Purpose::Live
+                } else {
+                    Purpose::Control
+                },
                 // Ordinary inventory hints ask which head the peer currently serves. A
                 // recovery root already names a locally verified signed Head: asking Head
                 // here could retarget it to a lower reply forever. Start its existing exact
@@ -601,6 +615,10 @@ impl Flow {
             governance: false,
             brought: false,
             work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            discovery_unavailable: None,
+            discovery_incarnations: None,
+            receipt_lower: None,
             declined: 0,
             offered: 0,
             rearmed: 0,
@@ -827,6 +845,12 @@ impl Flow {
         author: Digest32,
         head: Digest32,
     ) -> Result<bool> {
+        if self.local_own_discovery {
+            // Startup metadata discovery is scoped to the selected connection, not the old
+            // durable receipt/proof operation. Actor retains its unavailable disposition on
+            // that Port; a genuine reconnect can obtain newly available signed metadata.
+            return Ok(true);
+        }
         // A metadata root is a separate operation from the old ambiguous body/inventory
         // decision. Retain one exact disposition for its whole immutable verification chain.
         let (author, head) = if self.local_own_root() {
@@ -1328,6 +1352,7 @@ impl Flow {
             fence,
             deadline,
             Arc::clone(&self.work_committed),
+            Arc::clone(&self.own_head_observed),
         )
     }
     fn binding(&self) -> Binding {
@@ -2302,8 +2327,18 @@ impl Flow {
                                 if self.local_own_discovery {
                                     self.discovery_reply = Some((*head, conn.serial()));
                                 }
-                                self.mine_held =
-                                    Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
+                                if task.purpose == Purpose::Control && !self.local_own_discovery {
+                                    if self.hint.is_some_and(|hint| {
+                                        hint.author == author && hint.size > head.size
+                                    }) {
+                                        self.receipt_lower = result
+                                            .own_head_incarnations
+                                            .map(|incarnations| (conn.serial(), incarnations));
+                                    }
+                                    self.mine_held = Some(
+                                        self.mine_held.map_or(head.size, |m| m.max(head.size)),
+                                    );
+                                }
                             }
                             // A repeated signed head remains the peer's exact current answer.
                             // Busy handling below retains the dependency and applies the named
@@ -2441,6 +2476,9 @@ impl Flow {
                     ));
                 }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
+                    if self.local_own_discovery {
+                        self.discovery_unavailable = Some(conn.serial());
+                    }
                     if matches!(query, Query::Head(author) if (author == self.peer || author == self.node) && self.hint.is_some_and(|hint| hint.author == author))
                         && !self.departure_probe
                         && self.last_head.is_none()

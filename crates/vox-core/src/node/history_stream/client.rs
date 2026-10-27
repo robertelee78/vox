@@ -65,6 +65,7 @@ pub(crate) struct Receiver {
     node: Digest32,
     staging: Option<Staging>,
     historical: bool,
+    own_head_observed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(crate) enum LocalProof {
@@ -86,6 +87,7 @@ pub(crate) struct Received {
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
     pub(crate) heads: Vec<super::HeadHint>,
+    pub(crate) own_head_incarnations: Option<(u64, u64)>,
     pub(crate) departure_receipt: Option<super::HeadHint>,
     /// The exchange fetched an object this node did not hold (a head, header, context or
     /// proof it saved): what makes a round not `empty` in `vox status --json` (ADR-038 FX-29).
@@ -103,6 +105,7 @@ impl Received {
             body_progress: false,
             inventory: None,
             heads: Vec::new(),
+            own_head_incarnations: None,
             departure_receipt: None,
             brought: false,
         }
@@ -133,6 +136,7 @@ impl Receiver {
         fence: Arc<crate::transport::stream_transport::Fence>,
         deadline: tokio::time::Instant,
         work_committed: Arc<std::sync::atomic::AtomicBool>,
+        own_head_observed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             source: Source::new(
@@ -149,6 +153,7 @@ impl Receiver {
             node,
             staging,
             historical,
+            own_head_observed,
         }
     }
 
@@ -212,12 +217,13 @@ impl Receiver {
         };
         let generation = self.generation;
         let committed = self.source.commit_ledger();
+        let own_observed = Arc::clone(&self.own_head_observed);
         let staged = self
             .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
                 admission::stage(
                     room,
                     store,
-                    &committed,
+                    (&committed, &own_observed),
                     request,
                     generation,
                     &query,
@@ -362,8 +368,10 @@ impl Receiver {
                 }
                 Action::Meta => {
                     let generation = self.generation;
+                    let peer = self.source.peer;
                     let selected = query.clone();
                     let committed = self.source.commit_ledger();
+                    let own_observed = Arc::clone(&self.own_head_observed);
                     // The decoded frame still owns its admitted foreground worker. Reuse that
                     // exact worker for the dependent room read: asking the original Control job
                     // for a second foreground worker while retaining `incoming` can deadlock the
@@ -375,10 +383,19 @@ impl Receiver {
                             let Frame::Meta { object, .. } = incoming.frame()? else {
                                 return Err(Error::MalformedBundle("metadata frame changed"));
                             };
-                            admission::stage(
-                                room, store, &committed, request, generation, &selected, object,
-                            )
-                            .map(Some)
+                            let staged = admission::stage(
+                                room,
+                                store,
+                                (&committed, &own_observed),
+                                request,
+                                generation,
+                                &selected,
+                                object,
+                            )?;
+                            let incarnations = room
+                                .history_inventory_incarnation(&peer)
+                                .zip(room.history_author_inventory_incarnation(&room.me()));
+                            Ok(Some((staged, incarnations)))
                         })
                         .await?;
                     let Lookup::Found(staged) = staged else {
@@ -386,7 +403,7 @@ impl Receiver {
                         result.status = Status::Busy;
                         return Ok(result);
                     };
-                    match &staged.value {
+                    match &staged.value.0 {
                         Staged::Object { brought } => result.brought |= *brought,
                         Staged::Busy => {
                             io.abort(WireError::SessionBusy);
@@ -403,6 +420,9 @@ impl Receiver {
                         } => {
                             if result.heads.len() >= MAX_NEEDS {
                                 return Err(Error::SizeLimitExceeded("history head result bound"));
+                            }
+                            if *author == self.node {
+                                result.own_head_incarnations = staged.value.1;
                             }
                             result.brought |= *brought;
                             result.heads.push(super::HeadHint {

@@ -190,39 +190,16 @@ async fn respond(
             Ok((status, None))
         }
         Query::Head(author) => {
-            let receipt = author == source.peer;
+            // Control requests retain their role-complete receipt semantics. Live Head
+            // is signed commitment discovery only; it conveys no held-through claim.
+            let receipt = preamble.purpose == Purpose::Control && author == source.peer;
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
-                    let Some(head) = room.history_head(store, &author)? else {
-                        return Ok(None);
-                    };
                     if receipt {
-                        // A receipt names the last authenticated feed position whose source and
-                        // semantic effect are complete for this node's role. The durable restart
-                        // prefix cannot jump across an entry this role still owes. In particular,
-                        // another member's key-package is complete here after its authenticated
-                        // header is dispatched; its private body is never requested or claimed.
-                        let read = room.history_read(store)?;
-                        if head.root.leaves != 0 {
-                            let Some((through, hash)) = read.history_held_through(&author) else {
-                                return Ok(None);
-                            };
-                            let Some(included) = read.history_inclusion_receipt(
-                                &head.id(),
-                                &author,
-                                head.root.leaves,
-                            )?
-                            else {
-                                return Ok(None);
-                            };
-                            if through != head.root.leaves
-                                || hash != included.header().entry().entry_hash()
-                            {
-                                return Ok(None);
-                            }
-                        }
+                        room.history_role_head(store, &author)
+                    } else {
+                        room.history_head(store, &author)
                     }
-                    Ok(Some(head))
                 })
                 .await?;
             let held = match found {
@@ -288,7 +265,7 @@ async fn respond(
                     if seq > head.root.leaves {
                         return Err(Error::MalformedBundle("requested header exceeds head"));
                     }
-                    room.history_header(store, &head.binding.author, seq)
+                    room.history_proof_header(store, &head, seq)
                 })
                 .await?;
             let held = match found {

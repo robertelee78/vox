@@ -22354,11 +22354,33 @@ impl Node {
             // offers in 80 s; the serving lane's 953 "rounds" were the requests it answered,
             // about six per row fetched, which `vox status` now counts as `served`).
             let own_targets: Vec<Digest32> = match own_hint {
-                Some((_, _, size)) => self
-                    .connected_peers()
-                    .into_iter()
-                    .filter(|peer| ch.held_through(peer).is_none_or(|held| held < size))
-                    .collect(),
+                Some((_, head, size)) => match ch.history_own_receipt_targets(
+                    profile.store(),
+                    self.connected_peers()
+                        .into_iter()
+                        .map(|peer| {
+                            let parked = self
+                                .ports
+                                .get(&(*channel_id, peer))
+                                .and_then(|port| port.own_receipt_lower)
+                                .zip(
+                                    self.net
+                                        .as_ref()
+                                        .and_then(|net| net.manager().existing(&peer)),
+                                )
+                                .map(|(probe, connection)| (connection.serial(), probe));
+                            (peer, parked)
+                        })
+                        .collect(),
+                    head,
+                    size,
+                ) {
+                    Ok(targets) => targets,
+                    Err(error) => {
+                        ch.poison(&error);
+                        return;
+                    }
+                },
                 None => Vec::new(),
             };
             if sparse

@@ -1279,7 +1279,6 @@ impl ChannelState {
         &self,
         store: &Store,
         peer: &Digest32,
-        authorization: Digest32,
     ) -> Result<Option<(Digest32, Digest32, u64)>> {
         if !self.private_sessions.support_rediscovery || self.own_behind || !self.is_member(peer) {
             return Ok(None);
@@ -1294,17 +1293,9 @@ impl ChannelState {
         let head = read
             .history_head(&id)?
             .ok_or(Error::MalformedAtRest("own discovery head missing"))?;
-        if let Some((refused, grant, peer_life, author_life)) =
-            read.history_declined_metadata(peer, &self.me())?
-        {
-            if refused == id
-                && grant == authorization
-                && self.history_inventory_incarnation(peer) == Some(peer_life)
-                && self.history_author_inventory_incarnation(&self.me()) == Some(author_life)
-            {
-                return Ok(None);
-            }
-        }
+        // This is a fresh connection-scoped metadata probe, distinct from the old
+        // Control receipt and exact-target proof operations. Port owns its unavailable
+        // disposition; neither durable refusal domain is erased or reinterpreted here.
         Ok(Some((self.me(), id, head.root.leaves)))
     }
     /// Caller carries an actual useful Head response on the exact current recipient port,

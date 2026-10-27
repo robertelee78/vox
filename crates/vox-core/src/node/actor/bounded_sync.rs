@@ -2206,6 +2206,17 @@ impl Node {
                 flow.work_committed
                     .swap(false, std::sync::atomic::Ordering::AcqRel),
             );
+            if flow.own_head_observed.swap(false, Ordering::AcqRel)
+                && self
+                    .channels
+                    .get(&work.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            {
+                // The physical callback committed this narrowing knowledge. A later wire
+                // error, cancellation or changed peer grant cannot erase it; a replacement
+                // room must never receive it. Reuse the existing bounded governance owner.
+                self.governance_work.wake_room(work.room);
+            }
             let declined = std::mem::take(&mut flow.declined);
             let offered = std::mem::take(&mut flow.offered);
             let rearmed = std::mem::take(&mut flow.rearmed);
@@ -2247,6 +2258,37 @@ impl Node {
                     .channels
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
+            if valid {
+                if let Some(hint) = flow.hint {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        let scope = |connection| crate::node::ports::SupportDiscovery {
+                            connection,
+                            instance: flow.instance,
+                            epoch: flow.epoch,
+                            authorization: flow.generation,
+                        };
+                        if let Some((connection, incarnations)) = flow
+                            .discovery_unavailable
+                            .take()
+                            .zip(flow.discovery_incarnations)
+                        {
+                            port.support_discovery_unavailable =
+                                Some(crate::node::ports::OwnProbe {
+                                    scope: scope(connection),
+                                    head: hint.head,
+                                    incarnations,
+                                });
+                        }
+                        if let Some((connection, incarnations)) = flow.receipt_lower.take() {
+                            port.own_receipt_lower = Some(crate::node::ports::OwnProbe {
+                                scope: scope(connection),
+                                head: hint.head,
+                                incarnations,
+                            });
+                        }
+                    }
+                }
+            }
             // Authorization and local-durability exits carry ownership themselves. Handle them
             // even when the trust edit also retired the port/fence; generic stale disposal would
             // otherwise discard the only hint, required root, or archive controller dispatch.
@@ -3263,114 +3305,138 @@ impl Node {
                     Ok(value) => Arc::new(value),
                     Err(_) => return false,
                 };
-                let (own_page, own_verification, own_discovery) = if self
-                    .own_recovery_rooms
-                    .contains_key(&room)
-                    || self
-                        .ports
-                        .get(&(room, peer))
-                        .is_some_and(|port| port.support_discovery_check)
-                {
-                    let bytes_wake = state_job.bytes_wake();
-                    let Some(_read) = state_job.reserve(4 * 1024 * 1024) else {
-                        self.bounded_sync.wait_for_bytes(
-                            &self.net_tx,
-                            &mut self.next_token,
-                            room,
-                            peer,
-                            pending_work,
-                            ByteWait::unowned(bytes_wake),
-                        );
-                        return false;
-                    };
-                    match shared.try_lock() {
-                        Ok(channel) => {
-                            let instance = match channel.history_instance(&store) {
-                                Ok(i) => i,
-                                Err(_) => return false,
-                            };
-                            let authorization = match stream::authorization_generation(
-                                &store, node, room, instance, epoch,
-                            ) {
-                                Ok(a) => a,
-                                Err(_) => return false,
-                            };
-                            let verification = match channel.own_recovery_discovery_hint(
-                                &store,
-                                &peer,
-                                authorization,
-                            ) {
-                                Ok(hint) => hint.map(|(author, head, size)| stream::HeadHint {
-                                    author,
-                                    head,
-                                    size,
-                                }),
-                                Err(_) => return false,
-                            };
-                            let discovery_pending = channel.private_support_discovery_pending();
-                            if !discovery_pending {
-                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                                    port.support_discovery_check = false;
-                                }
-                            }
-                            let scope = crate::node::ports::SupportDiscovery {
-                                connection: conn.serial(),
-                                instance,
-                                epoch,
-                                authorization,
-                            };
-                            let already_checked = self
-                                .ports
-                                .get(&(room, peer))
-                                .is_some_and(|port| port.support_discovery == Some(scope));
-                            let discovery = match if already_checked {
-                                Ok(None)
-                            } else {
-                                channel.private_support_discovery_hint(&store, &peer, authorization)
-                            } {
-                                Ok(hint) => hint.map(|(author, head, size)| stream::HeadHint {
-                                    author,
-                                    head,
-                                    size,
-                                }),
-                                Err(_) => return false,
-                            };
-                            let page = if !self.bounded_sync.owns_archive_room(room)
-                                && self.history_demand.ready_binding(room, peer).is_none()
-                                && self.bounded_sync.ready[1].is_none()
-                                && self.bounded_sync.running[1].is_none()
-                            {
-                                match channel.own_recovery_page(&store, &peer) {
-                                    Ok(page) => page.map(|p| (instance, p)),
-                                    Err(_) => return false,
-                                }
-                            } else {
-                                None
-                            };
-                            (page, verification, discovery)
-                        }
-                        Err(_) => {
-                            // Keep the producer edge through the actual release, without a
-                            // Control permit, buffers, or secret-work capture parked on it.
-                            drop(_read);
-                            drop(control);
-                            drop(lease);
-                            drop(state_job);
-                            drop(admitted_control.take());
-                            drop(admitted_archive.take());
-                            self.bounded_sync.wait_for_own_recovery_room(
+                let needs_own_state = self.own_recovery_rooms.contains_key(&room)
+                    || self.ports.get(&(room, peer)).is_some_and(|port| {
+                        port.support_discovery_check || port.own_receipt_lower.is_some()
+                    });
+                let own_state =
+                    if needs_own_state {
+                        let bytes_wake = state_job.bytes_wake();
+                        let Some(_read) = state_job.reserve(4 * 1024 * 1024) else {
+                            self.bounded_sync.wait_for_bytes(
                                 &self.net_tx,
                                 &mut self.next_token,
-                                node,
                                 room,
-                                shared.clone(),
+                                peer,
+                                pending_work,
+                                ByteWait::unowned(bytes_wake),
                             );
                             return false;
+                        };
+                        match shared.try_lock() {
+                            Ok(channel) => {
+                                let instance = match channel.history_instance(&store) {
+                                    Ok(i) => i,
+                                    Err(_) => return false,
+                                };
+                                let authorization = match stream::authorization_generation(
+                                    &store, node, room, instance, epoch,
+                                ) {
+                                    Ok(a) => a,
+                                    Err(_) => return false,
+                                };
+                                let verification =
+                                    match channel.own_recovery_discovery_hint(
+                                        &store,
+                                        &peer,
+                                        authorization,
+                                    ) {
+                                        Ok(hint) => hint.map(|(author, head, size)| {
+                                            stream::HeadHint { author, head, size }
+                                        }),
+                                        Err(_) => return false,
+                                    };
+                                let discovery_pending = channel.private_support_discovery_pending();
+                                if !discovery_pending {
+                                    if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                        port.support_discovery_check = false;
+                                    }
+                                }
+                                let scope = crate::node::ports::SupportDiscovery {
+                                    connection: conn.serial(),
+                                    instance,
+                                    epoch,
+                                    authorization,
+                                };
+                                let already_checked = self
+                                    .ports
+                                    .get(&(room, peer))
+                                    .is_some_and(|port| port.support_discovery == Some(scope));
+                                let discovery =
+                                    match if already_checked {
+                                        Ok(None)
+                                    } else {
+                                        channel.private_support_discovery_hint(&store, &peer)
+                                    } {
+                                        Ok(hint) => hint.map(|(author, head, size)| {
+                                            stream::HeadHint { author, head, size }
+                                        }),
+                                        Err(_) => return false,
+                                    };
+                                let probe_incarnations = channel
+                                    .history_inventory_incarnation(&peer)
+                                    .zip(channel.history_author_inventory_incarnation(&node));
+                                let discovery = discovery.filter(|hint| {
+                                    !self
+                                        .ports
+                                        .get(&(room, peer))
+                                        .and_then(|port| port.support_discovery_unavailable)
+                                        .is_some_and(|probe| {
+                                            probe.matches(scope, hint.head, probe_incarnations)
+                                        })
+                                });
+                                let parked_receipt = self
+                                    .ports
+                                    .get(&(room, peer))
+                                    .and_then(|port| port.own_receipt_lower)
+                                    .filter(|probe| {
+                                        probe.matches(scope, probe.head, probe_incarnations)
+                                    })
+                                    .map(|probe| probe.head);
+                                let page = if !self.bounded_sync.owns_archive_room(room)
+                                    && self.history_demand.ready_binding(room, peer).is_none()
+                                    && self.bounded_sync.ready[1].is_none()
+                                    && self.bounded_sync.running[1].is_none()
+                                {
+                                    match channel.own_recovery_page(&store, &peer) {
+                                        Ok(page) => page.map(|p| (instance, p)),
+                                        Err(_) => return false,
+                                    }
+                                } else {
+                                    None
+                                };
+                                (
+                                    page,
+                                    verification,
+                                    discovery,
+                                    probe_incarnations,
+                                    parked_receipt,
+                                )
+                            }
+                            Err(_) => {
+                                // Keep the producer edge through the actual release, without a
+                                // Control permit, buffers, or secret-work capture parked on it.
+                                drop(_read);
+                                drop(control);
+                                drop(lease);
+                                drop(state_job);
+                                drop(admitted_control.take());
+                                drop(admitted_archive.take());
+                                self.bounded_sync.wait_for_own_recovery_room(
+                                    &self.net_tx,
+                                    &mut self.next_token,
+                                    node,
+                                    room,
+                                    shared.clone(),
+                                );
+                                return false;
+                            }
                         }
-                    }
-                } else {
-                    (None, None, None)
-                };
+                    } else {
+                        (None, None, None, None, None)
+                    };
+                let (own_page, own_verification, own_discovery, probe_incarnations, parked_receipt) =
+                    own_state;
                 let own_page = own_page.and_then(|(instance, page)| {
                     let generation =
                         match stream::authorization_generation(&store, node, room, instance, epoch)
@@ -3478,7 +3544,20 @@ impl Node {
                             departure_hint
                                 .or(own_verification)
                                 .or(own_discovery)
-                                .or_else(|| self.history_hints.take(room, peer, node))
+                                .or_else(|| {
+                                    let hint = self.history_hints.take(room, peer, node)?;
+                                    if hint.author == node && parked_receipt == Some(hint.head) {
+                                        self.history_hints.finish(
+                                            room,
+                                            peer,
+                                            hint.author,
+                                            hint.head,
+                                        );
+                                        None
+                                    } else {
+                                        Some(hint)
+                                    }
+                                })
                         };
                         let reason = foreground_reason(
                             node,
@@ -3514,6 +3593,7 @@ impl Node {
                         ) {
                             Ok(mut flow) => {
                                 flow.reason = reason;
+                                flow.discovery_incarnations = probe_incarnations;
                                 flow.local_own_after_inventory = flow.inventory
                                     && announce_first
                                     && (own_verification.is_some() || own_discovery.is_some());
@@ -3566,7 +3646,16 @@ impl Node {
                         departure_hint
                             .or(own_verification)
                             .or(own_discovery)
-                            .or_else(|| self.history_hints.take(room, peer, node))
+                            .or_else(|| {
+                                let hint = self.history_hints.take(room, peer, node)?;
+                                if hint.author == node && parked_receipt == Some(hint.head) {
+                                    self.history_hints
+                                        .finish(room, peer, hint.author, hint.head);
+                                    None
+                                } else {
+                                    Some(hint)
+                                }
+                            })
                     };
                     let reason = foreground_reason(
                         node,
@@ -3602,6 +3691,7 @@ impl Node {
                     ) {
                         Ok(mut flow) => {
                             flow.reason = reason;
+                            flow.discovery_incarnations = probe_incarnations;
                             flow.local_own_after_inventory = flow.inventory
                                 && announce_first
                                 && (own_verification.is_some() || own_discovery.is_some());

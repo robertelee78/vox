@@ -239,6 +239,24 @@ pub(crate) struct SupportDiscovery {
     pub authorization: Digest32,
 }
 
+/// A terminal, non-authoritative probe disposition on one actual connection/lifetime.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnProbe {
+    pub scope: SupportDiscovery,
+    pub head: Digest32,
+    pub incarnations: (u64, u64),
+}
+impl OwnProbe {
+    pub(crate) fn matches(
+        self,
+        scope: SupportDiscovery,
+        head: Digest32,
+        incarnations: Option<(u64, u64)>,
+    ) -> bool {
+        self.scope == scope && self.head == head && Some(self.incarnations) == incarnations
+    }
+}
+
 /// One `(room, peer)`'s sync port (ADR-025 D1).
 pub struct Port {
     /// The room instance it belongs to.
@@ -273,6 +291,9 @@ pub struct Port {
     /// It is not a peer receipt; false only caches that this room needs no such operation.
     pub(crate) support_discovery_check: bool,
     pub(crate) support_discovery: Option<SupportDiscovery>,
+    /// One unavailable startup metadata probe, retired by connection/authority/local-head change.
+    pub(crate) support_discovery_unavailable: Option<OwnProbe>,
+    pub(crate) own_receipt_lower: Option<OwnProbe>,
     /// The room generation credited to the peer: monotonic within the room instance.
     pub done_gen: u64,
     /// Scheduler-only watermark after one current-only exchange found a legacy gap.
@@ -320,6 +341,8 @@ impl Port {
             own_recovery_parked: None,
             support_discovery_check: true,
             support_discovery: None,
+            support_discovery_unavailable: None,
+            own_receipt_lower: None,
             done_gen: 0,
             legacy_checked_gen: None,
             busy_attempt_gen: 0,

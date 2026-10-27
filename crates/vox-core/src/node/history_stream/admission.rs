@@ -52,12 +52,16 @@ fn invalid(message: &'static str) -> Error {
 pub(super) fn stage(
     room: &ChannelState,
     store: &Store,
-    committed: &std::sync::atomic::AtomicBool,
+    ledgers: (
+        &std::sync::atomic::AtomicBool,
+        &std::sync::atomic::AtomicBool,
+    ),
     request: RequestId,
     generation: Digest32,
     query: &Query,
     object: Object<'_>,
 ) -> Result<Staged> {
+    let (committed, own_observed) = ledgers;
     if room.history_publication_busy(store)? {
         return Ok(Staged::Busy);
     }
@@ -107,6 +111,11 @@ pub(super) fn stage(
                 let conflict = room.history_write_tracked(store, committed, |index| {
                     index.observe_history_head(&verified)
                 })?;
+                if *author == room.me() && !observed_already {
+                    // Set inside the physical callback AFTER commit, even if the following
+                    // proof, wire exchange, cancellation or conflict exit never completes.
+                    own_observed.store(true, std::sync::atomic::Ordering::Release);
+                }
                 if conflict {
                     return Err(invalid("conflicting authenticated heads retained"));
                 }
