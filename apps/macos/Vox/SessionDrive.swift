@@ -27,6 +27,11 @@ extension NodeModel {
 
     /// `drive`, telling a send that was taken from one refused or not known (D13).
     func driveResult(_ s: FfiSession, in room: String, _ action: DriveAction) async -> DriveResult {
+        guard sessionDriveAvailable, roomOnScreen == room,
+              selectedSessionMetadata?.nodeFingerprint == s.nodeFingerprint,
+              selectedSessionMetadata?.sessionId == s.sessionId else {
+            return .refused("Session state is being refreshed; try again when it is available.")
+        }
         guard s.canDrive else {
             return .refused("you cannot drive this Session: \(s.nodeAlias) has not given you drive")
         }
@@ -263,7 +268,7 @@ struct RequestView: View {
                 }
             }
         }
-        .disabled(busy)
+        .disabled(busy || !model.sessionDriveAvailable)
     }
 
     private var approval: some View {

@@ -913,6 +913,7 @@ final class NodeModel: ObservableObject {
     @Published var keyringAsk: KeyringAsk?
     @Published private(set) var nodes: [NodeSummary] = []
     @Published private(set) var peers = 0
+    @Published private var peerStateKnown = false
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
     private var nodeObservationEpoch = UUID() {
@@ -934,7 +935,8 @@ final class NodeModel: ObservableObject {
     }
     @Published private(set) var machineStateKnown = false
     @Published private(set) var daemonFailure: String?
-    var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
+    var peerWords: String { peerStateKnown && daemonReachable && machineStateKnown && ended == nil && !observationNeedsRestart
+        ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
     struct HealthNotice: Decodable, Identifiable, Equatable {
         let key: String
         let message: String
@@ -1494,6 +1496,15 @@ final class NodeModel: ObservableObject {
 
     private var observationNeedsRestart = false
 
+    /// Session controls require the current room and an exact, freshly read Session grant.
+    var sessionDriveAvailable: Bool {
+        guard ended == nil, daemonReachable, machineStateKnown, !observationNeedsRestart,
+              !roomNeedsPage, roomOnScreen != nil, selectedSessionMetadataKnown,
+              let selected = selectedSessionMetadata, selected.open, selected.canDrive,
+              case let .session(node, id) = showing else { return false }
+        return selected.nodeFingerprint == node && selected.sessionId == id
+    }
+
     private func readFacts(restartObservation: Bool = true) async {
         let epoch = nodeObservationEpoch
         // Reachability first: failed reads must not leave stale node/peer states visible.
@@ -1506,6 +1517,7 @@ final class NodeModel: ObservableObject {
             if fresh != nodes { nodes = fresh }
             let listedNode = fresh.first(where: { $0.name == node })
             if listedNode?.state != "attached" {
+                peerStateKnown = false
                 nodeObservationEpoch = UUID()
                 invalidateRoomAnchorState(preservingSnapshot: true)
                 invalidateMemberRoles()
@@ -1542,6 +1554,7 @@ final class NodeModel: ObservableObject {
             // changed daemonReachable. Foreground and unrelated read failures remain visible.
             if outcome?.operation == "", outcome?.backgroundConnectivity == true { outcome = nil }
             if Int(view.peers) != peers { peers = Int(view.peers) }
+            peerStateKnown = true
             if view.keyring != keyring { keyring = view.keyring }
             if fresh.first(where: { $0.name == node })?.state == "attached", !recovering {
                 ended = nil
@@ -1582,6 +1595,13 @@ final class NodeModel: ObservableObject {
         } catch {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = false
+            peerStateKnown = false
+            observationNeedsRestart = true
+            ended = "Node state is unknown. Checking the connection."
+            let snapshot = showingSession ? [] : messages
+            releaseHistoryViews()
+            messages = snapshot
+            if case .room = selection { roomNeedsPage = true }
             individualTrustFacts = [:]
             individualTrustReads = [:]
             machineStateKnown = false
@@ -3759,6 +3779,7 @@ final class NodeModel: ObservableObject {
 
     fileprivate func stopped(_ reason: ObservationStop) async {
         observationNeedsRestart = true
+        peerStateKnown = false
         waitingLedger = nil
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
@@ -3848,8 +3869,10 @@ final class NodeModel: ObservableObject {
         daemonReachable = true
         daemonFailure = nil
         peers = Int(view.peers)
+        peerStateKnown = true
         keyring = view.keyring
         ended = nil
+        observationNeedsRestart = false
         // These install owned tasks synchronously; no old request can start them after
         // ownership has changed at an awaited boundary.
         if case let .room(room) = selection {
@@ -4326,7 +4349,7 @@ extension NodeModel {
     /// The approval selected in the Session on screen, open and this node's to answer: what
     /// ⌥⌘Y and ⌥⌘N act on (P1). Questions are answered by their options, not these keys.
     var selectedApproval: (session: FfiSession, room: String, reference: String)? {
-        guard let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
+        guard sessionDriveAvailable, let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
               let room = roomOnScreen,
               let r = (sessionEntries + [selectedEarlierRequest].compactMap { $0 })
                 .compactMap(\.request).first(where: { $0.reference == reference }),
@@ -4379,7 +4402,12 @@ extension NodeModel {
 
     /// Drive a Session (ADR-029 DR-1), for the Session view's controls (SessionDrive.swift).
     func drive(room: String, node: String, session: String, action: DriveAction) async throws -> DriveAnswer {
-        try await client.drive(room: room, node: node, session: session, action: action)
+        guard sessionDriveAvailable, roomOnScreen == room,
+              selectedSessionMetadata?.nodeFingerprint == node,
+              selectedSessionMetadata?.sessionId == session else {
+            throw VoxError.Failed(reason: "Session state is being refreshed; try again when it is available.")
+        }
+        return try await client.drive(room: room, node: node, session: session, action: action)
     }
 }
 

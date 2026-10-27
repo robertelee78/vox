@@ -1589,7 +1589,7 @@ private struct RoomTimelineView: View {
                     // trust both ways (ADR-028 R-5), which a newcomer is not told anywhere else.
                     TrustBanner(model: model)
                     composer
-                } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
+                } else if model.sessionDriveAvailable, let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
                     Hairline()
                     // One composer per Session: a draft for one never shows in another (D12).
                     SessionComposer(model: model, room: room, session: s)

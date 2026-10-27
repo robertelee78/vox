@@ -52,7 +52,8 @@ extension VoxAction {
         // What the room's commands act on: the Session on screen, when one is, never the room
         // behind it (D2).
         let inSession = node?.showingSession ?? false
-        let driven = node?.shownSession.flatMap { $0.canDrive && $0.open ? $0 : nil }
+        let driven = node?.sessionDriveAvailable == true
+            ? node?.shownSession.flatMap { $0.canDrive && $0.open ? $0 : nil } : nil
         // A keyring row selected, in the keyring view: what Compare, Rename and Remove act on.
         let picked = node?.selection == .keyring && node?.keyringSelected != nil
         let digits: [VoxAction] = (1...9).map { n in
