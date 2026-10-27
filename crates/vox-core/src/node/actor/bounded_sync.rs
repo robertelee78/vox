@@ -2360,13 +2360,23 @@ impl Node {
             if flow.authorization_changed {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
                 let archive = flow.archive_request.and_then(|request| {
+                    let fence = flow.request_fence.as_ref()?;
+                    if !self.history_demand.owns_running_fence(request, flow.generation, fence) {
+                        return None;
+                    }
+                    let other_resume = self.history_demand.has_other_resume(work.room, flow.instance, request);
+                    let detail = if other_resume {
+                        "Authorization changed; the saved history request can be resumed."
+                    } else {
+                        "Authorization changed while this history page was running; the exact request is being resumed."
+                    };
                     self.history_demand.failed_current(
                         work.room,
                         flow.instance,
                         request,
                         flow.generation,
-                        "Authorization changed while this history page was running; the exact request is being resumed.",
-                    ).then_some((request, flow.instance))
+                        detail,
+                    ).then_some((request, flow.instance)).filter(|_| !other_resume)
                 });
                 if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints

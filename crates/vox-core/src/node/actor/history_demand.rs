@@ -220,6 +220,30 @@ impl Controller {
         true
     }
 
+    pub(super) fn owns_running_fence(
+        &self,
+        request: RequestId,
+        generation: Digest32,
+        fence: &Arc<Fence>,
+    ) -> bool {
+        self.running.as_ref().is_some_and(|running| {
+            running.request == request
+                && running.generation == generation
+                && Arc::ptr_eq(&running.fence, fence)
+        })
+    }
+
+    pub(super) fn has_other_resume(
+        &self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+    ) -> bool {
+        self.resume_owed.as_ref().is_some_and(|owed| {
+            owed.room != room || owed.instance != instance || owed.request != request
+        })
+    }
+
     fn resume_owed_matches(&self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
         self.resume_owed.as_ref().is_some_and(|owed| {
             owed.room == room && owed.instance == instance && owed.request == request
