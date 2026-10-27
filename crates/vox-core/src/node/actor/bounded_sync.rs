@@ -2359,13 +2359,14 @@ impl Node {
             }
             if flow.authorization_changed {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
-                let archive = flow.archive_request.map(|request| {
-                    self.history_demand.failed(
+                let archive = flow.archive_request.and_then(|request| {
+                    self.history_demand.failed_current(
+                        work.room,
+                        flow.instance,
                         request,
                         flow.generation,
                         "Authorization changed while this history page was running; the exact request is being resumed.",
-                    );
-                    (request, flow.instance)
+                    ).then_some((request, flow.instance))
                 });
                 if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
@@ -2399,7 +2400,7 @@ impl Node {
                     port.clear_backoff();
                 }
                 if let Some((request, instance)) = archive {
-                    // `failed` retired the stale running generation. Retain the exact Resume as
+                    // `failed_current` retired the still-owned running generation. Retain the exact Resume as
                     // its replacement owner before any fallible profile/room/admission preflight;
                     // `schedule` either installs preparation or keeps its fair Control ticket.
                     self.history_demand.owe_resume(work.room, instance, request);
