@@ -15988,19 +15988,36 @@ impl Node {
         peer: &Digest32,
         preserve_unstarted: bool,
     ) {
-        if let Some((request, generation)) = self
+        if let Some((request, generation, fence)) = self
             .bounded_sync
-            .archive_for_port(*channel_id, *peer)
-            .filter(|binding| {
-                !preserve_unstarted
-                    || self.history_demand.unstarted_binding(*channel_id, *peer) != Some(*binding)
-            })
+            .physical_archive_for_port(*channel_id, *peer)
         {
-            self.history_demand.failed(
-                request,
-                generation,
-                "History peer or room retired; resume explicitly when available.",
-            );
+            if self
+                .history_demand
+                .owns_running_fence(request, generation, &fence)
+            {
+                self.history_demand.failed(
+                    request,
+                    generation,
+                    "History peer or room retired; resume explicitly when available.",
+                );
+            }
+        }
+        if let Some((request, generation, instance)) = self
+            .bounded_sync
+            .archive_admission_for_port(*channel_id, *peer)
+        {
+            // Preserve only the admission of this exact unconsumed dispatch on peer departure.
+            if !preserve_unstarted
+                && self.history_demand.unstarted_binding(*channel_id, *peer)
+                    == Some((request, generation, instance))
+            {
+                self.history_demand.failed(
+                    request,
+                    generation,
+                    "History peer or room retired; resume explicitly when available.",
+                );
+            }
         }
         self.bounded_sync.retire_port(*channel_id, *peer);
         self.history_hints.retire_port(*channel_id, *peer);
