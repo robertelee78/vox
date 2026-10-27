@@ -1478,10 +1478,13 @@ impl ChannelState {
             match applied {
                 Ok(outcome) => {
                     self.record_sparse_received_semantic_owner(
-                        store, entry.skeleton.author_id, *hash, received,
+                        store,
+                        entry.skeleton.author_id,
+                        *hash,
+                        received,
                     )?;
                     outcome
-                },
+                }
                 Err(error) => {
                     self.poison(&error);
                     #[cfg(feature = "test-knobs")]

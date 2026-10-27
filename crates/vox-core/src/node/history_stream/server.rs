@@ -207,9 +207,9 @@ async fn respond(
                     };
                     let boundary = if receipt && head.root.leaves != 0 {
                         let read = room.history_read(store)?;
-                        let Some(included) = read.history_inclusion_receipt(
-                            &head.id(), &author, head.root.leaves,
-                        )? else {
+                        let Some(included) =
+                            read.history_inclusion_receipt(&head.id(), &author, head.root.leaves)?
+                        else {
                             return Ok(None);
                         };
                         Some(included.header().entry().entry_hash())
@@ -217,8 +217,9 @@ async fn respond(
                         None
                     };
                     if exact_ack.as_deref().is_some_and(|expected| {
-                        boundary.as_ref().is_none_or(|hash|
-                            crate::node::link::b32_encode(hash) != expected)
+                        boundary
+                            .as_ref()
+                            .is_none_or(|hash| crate::node::link::b32_encode(hash) != expected)
                     }) {
                         return Ok(None);
                     }

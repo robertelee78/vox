@@ -7080,14 +7080,14 @@ impl ChannelState {
         // `absorb_arrived` may commit one or more batches before a later batch fails. Settle that
         // exact flow even on the partial-failure path; otherwise its committed Durability::None
         // bytes have neither an acknowledgement owner nor a future retry capable of naming them.
-        let settled = received.debt(store).and_then(|debt| {
+        let mut settled = received.debt(store).and_then(|debt| {
             debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
         });
         if settled.is_err() {
             self.received_retries.retain(received.clone());
             // One immediate retry handles a transient terminal flush refusal. If it also fails,
             // `ReceivedRetries::retry` puts the exact owner back for the next session.
-            let _ = self.received_retries.retry(store);
+            settled = self.received_retries.retry(store);
         } else {
             self.received_retries.remove(&received);
         }
@@ -10930,7 +10930,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         &self,
     ) -> std::result::Result<(Vec<crate::log::sync::FeedFrontier>, u64), crate::wire::WireError>
     {
-        let ch = self.room()?;
+        let mut ch = self.room()?;
         if self.legacy.is_some() {
             return Ok((
                 Vec::new(),
@@ -10956,7 +10956,24 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 frontiers.sort_unstable_by_key(|head| head.author_id);
             }
         }
-        Ok((frontiers, ch.gen.load(std::sync::atomic::Ordering::Relaxed)))
+        drop(entries);
+        let generation = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
+        let mut debts = Vec::new();
+        for frontier in &frontiers {
+            debts.extend(
+                ch.received_debts_for_current(self.store, &frontier.author_id)
+                    .map_err(|_| crate::wire::WireError::TransportFailed)?,
+            );
+        }
+        // Capture the exact owners with the advertised frontiers, then release the room before
+        // the durable flush. A failed flush must never return those frontiers to the peer.
+        drop(ch);
+        for debt in debts {
+            self.store
+                .flush_received_through(debt)
+                .map_err(|_| crate::wire::WireError::TransportFailed)?;
+        }
+        Ok((frontiers, generation))
     }
 
     fn wants(

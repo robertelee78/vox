@@ -1223,9 +1223,14 @@ impl Receiver {
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
-            room.commit_history_source(store, &committed, &record.entry, now, &received, |batch| {
-                grant.check_batch(batch, room_id, instance, epoch)
-            })?;
+            room.commit_history_source(
+                store,
+                &committed,
+                &record.entry,
+                now,
+                &received,
+                |batch| grant.check_batch(batch, room_id, instance, epoch),
+            )?;
             // Publication is now Switched, not Idle. Keep the exact verifier until the
             // bounded cleanup phase finishes; sparse metadata cannot mutate these roots yet.
             Ok(Some(()))

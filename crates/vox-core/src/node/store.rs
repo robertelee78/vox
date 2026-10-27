@@ -794,7 +794,8 @@ impl Store {
         // backing closed; a failed directory sync leaves it writable; both refuse a false peer
         // acknowledgement and are retried by the next writer.
         epochs.replacement = true;
-        *backing = Backing::Writable(self.keep_profile(open_database(&self.path).map_err(open_error)?));
+        *backing =
+            Backing::Writable(self.keep_profile(open_database(&self.path).map_err(open_error)?));
         drop(backing);
         self.finish_replacement(&mut epochs)?;
         Ok(())
@@ -810,7 +811,9 @@ impl Store {
         {
             let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
             if matches!(*backing, Backing::Closed) {
-                *backing = Backing::Writable(self.keep_profile(open_database(&self.path).map_err(open_error)?));
+                *backing = Backing::Writable(
+                    self.keep_profile(open_database(&self.path).map_err(open_error)?),
+                );
                 super::paths::set_private_file_mode(&self.path)?;
             }
             if !matches!(*backing, Backing::Writable(_)) {

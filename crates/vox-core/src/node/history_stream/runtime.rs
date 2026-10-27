@@ -1112,12 +1112,13 @@ impl Flow {
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
     pub(crate) async fn retire_slice(&mut self) -> Result<RetirementStep> {
-        self.settle_received(Arc::clone(&self.cleanup_store)).await?;
         self.publication_owner_wait = None;
         if !self.initialized || self.shared.lock().await.history_retirement_locked() {
             self.cancel();
             return Ok(RetirementStep::Done);
         }
+        self.settle_received(Arc::clone(&self.cleanup_store))
+            .await?;
         // A published current body queues only local exact-request reclamation. If its peer
         // departs before the next network turn, finish that bounded cleanup here; membership is
         // never restored and no archive, wire request or new effect is run.
@@ -1538,7 +1539,10 @@ impl Flow {
         // which stops carrying the flow forward settles first; a failure keeps the Flow owned by
         // retirement, which retries this same debt instead of lending it to a later transaction.
         if result.is_err() || self.authorization_changed || self.done() {
-            self.settle_received(store).await?;
+            let settlement = self.settle_received(store).await;
+            if result.is_ok() {
+                settlement?;
+            }
         }
         result
     }
