@@ -1618,9 +1618,14 @@ final class NodeModel: ObservableObject {
                 // Reachability and installed observation do not establish a published inventory.
                 // Keep recovery owned by the follow loop until the authoritative refresh lands.
                 guard refreshed else { observationNeedsRestart = true; return }
+                if case let .room(id) = selection, !rooms.contains(where: { $0.id == id }) {
+                    // The freshly read inventory, not a failed room read, establishes removal.
+                    select(nil)
+                }
                 if case let .room(id) = selection {
                     guard await show(.room(id), whileRecovering: true) else {
                         observationNeedsRestart = true
+                        ended = "Refreshing room after reconnect."
                         return
                     }
                 } else {
@@ -3929,16 +3934,26 @@ final class NodeModel: ObservableObject {
         // Keep the follow owner alive even if this refresh fails; it will retry the same
         // room recovery, without treating a roster alone as an authoritative room page.
         defer { if currentOwner() { follow() } }
-        guard await refresh(restartObservation: false), currentOwner(),
-              nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        let refreshed = await refresh(restartObservation: false)
+        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        // The daemon already confirmed Ready. A pending inventory or room page is a
+        // recovery condition, not a failed unlock; follow() owns the retry.
+        guard refreshed else { return true }
+        if case let .room(room) = selection, !rooms.contains(where: { $0.id == room }) {
+            select(nil)
+        }
         if case let .room(room) = selection {
             roomReadGeneration = UUID()
             roomNeedsPage = true
             watching?.cancel()
             stepRetentionRead = UUID()
             stepRetentionLoading = false
-            guard await show(.room(room), whileRecovering: true), currentOwner(),
-                  nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+            let shown = await show(.room(room), whileRecovering: true)
+            guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+            guard shown else {
+                ended = "Refreshing room after unlock."
+                return true
+            }
         } else {
             ended = nil
         }
