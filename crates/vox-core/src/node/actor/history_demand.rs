@@ -90,6 +90,8 @@ enum LocalBoundary {
 pub(super) struct Preparation {
     pub(super) token: u64,
     origin: PreparationOrigin,
+    action: Action,
+    user_intent: bool,
     room: Digest32,
     instance: [u8; 16],
     fence: Arc<Fence>,
@@ -1251,6 +1253,22 @@ impl Node {
                 "A local history request is being prepared.",
             ));
         }
+        // A retained local cleanup owns a committed entry. Finish or explicitly cancel
+        // that exact request before a new page can replace its recovery wake.
+        if local_admitted.is_none()
+            && matches!(
+                action,
+                Action::Newest | Action::Older { .. } | Action::PrivateRecover { .. }
+            )
+            && self
+                .history_demand
+                .resume_owed
+                .as_ref()
+                .is_some_and(|owed| owed.local_admitted.is_some())
+        {
+            return Ok(status(room, instance, Phase::Busy,
+                "The saved history entry is recovering locally; retry this request when it finishes."));
+        }
         let cancel_request = if let Action::Cancel { request } = action {
             if (self.history_demand.running.is_some() || self.history_demand.private_work.is_some())
                 && !self.history_demand.owner_status.as_ref().is_some_and(|s| {
@@ -1451,8 +1469,21 @@ impl Node {
         };
         let context = Arc::new(Context::unlocked(profile, secret_work).map_err(|e| e.to_string())?);
         let store = profile.store_handle();
+        let preserve_local_owed = cancel_request.is_some_and(|request| {
+            self.history_demand
+                .resume_owed
+                .as_ref()
+                .is_some_and(|owed| {
+                    owed.room == room
+                        && owed.instance == instance
+                        && owed.request == request
+                        && owed.local_admitted.is_some()
+                })
+        });
         let prior_private = if let Some(request) = cancel_request {
-            self.history_demand.clear_resume_owed();
+            if !preserve_local_owed {
+                self.history_demand.clear_resume_owed();
+            }
             if self.history_demand.stop_request(room, instance, request) {
                 self.bounded_sync.cancel_archive(room, instance, request);
             }
@@ -1582,11 +1613,9 @@ impl Node {
         // Only an operation which reached accepted preparation owns public status. Direct
         // Busy/refusal paths above leave the previous operation's status and ownership intact,
         // so they cannot relabel an old result as the newer attempted action.
-        if !matches!(action, Action::Status) {
-            // Only this fully admitted replacement action may retire an older exact waiter.
-            if local_admitted.is_none() {
-                self.history_demand.cancel_auto_recovery();
-            }
+        if !matches!(action, Action::Status) && !preserve_local_owed {
+            // A confirmed exact cancel retires a retained local recovery only after its durable
+            // outcome; other fully admitted replacement actions retire their older waiter here.
             self.history_demand.clear_resume_owed();
         }
         let origin = if matches!(action, Action::Status) {
@@ -1602,6 +1631,8 @@ impl Node {
         self.history_demand.preparing = Some(Preparation {
             token,
             origin,
+            action,
+            user_intent: local_admitted.is_none() && !matches!(action, Action::Status),
             room,
             instance,
             fence,
@@ -1898,6 +1929,8 @@ impl Node {
             return false;
         };
         let origin = preparation.origin;
+        let action = preparation.action;
+        let user_intent = preparation.user_intent;
         let target_room = preparation.room;
         let target_instance = preparation.instance;
         let retired = preparation.fence.is_retired();
@@ -2033,6 +2066,28 @@ impl Node {
                 }
             }
             Ok(prepared) => {
+                // Do not discard automatic local recovery merely because an unvalidated
+                // request reached a worker. Only a validated newer action supersedes it.
+                let accepted_intent = match action {
+                    Action::Cancel { .. } => prepared.local_boundary == LocalBoundary::Durable,
+                    Action::Resume { .. } => {
+                        prepared.resume_kind.is_some()
+                            || prepared.local_boundary == LocalBoundary::Durable
+                            || prepared.dispatch.is_some()
+                            || prepared.private.is_some()
+                            || prepared.legacy.is_some()
+                    }
+                    Action::Newest | Action::Older { .. } | Action::PrivateRecover { .. } => {
+                        !matches!(prepared.status.phase, Phase::Unavailable | Phase::Busy)
+                    }
+                    Action::Status => false,
+                };
+                if user_intent && accepted_intent {
+                    self.history_demand.cancel_auto_recovery();
+                    if matches!(action, Action::Cancel { .. }) {
+                        self.history_demand.clear_resume_owed();
+                    }
+                }
                 if let Some(private) = prepared.resume_kind {
                     if let Some(request) = prepared.status.request {
                         self.history_demand.owner_status = Some(prepared.status);
