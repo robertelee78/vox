@@ -175,14 +175,6 @@ pub(super) struct Controller {
     observation_unread: bool,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
     resume_owed: Option<ResumeOwed>,
-    // Last topology actually offered to an unstarted public request. A candidate which
-    // preparation rejected is not retried again until a real connection or room change.
-    route_attempt: Option<(
-        Digest32,
-        [u8; 16],
-        RequestId,
-        Vec<(Digest32, u64, Option<u64>)>,
-    )>,
     route_lock_wait: Option<RouteLockWait>,
 }
 impl Controller {
@@ -190,7 +182,6 @@ impl Controller {
     pub(super) fn note_route_trust_change(
         &mut self,
     ) -> Option<(Digest32, Digest32, [u8; 16], RequestId, Digest32)> {
-        self.route_attempt = None;
         let dispatch = self.ready.as_ref()?;
         let (room, peer, instance, request, generation) = (
             dispatch.room,
@@ -203,7 +194,7 @@ impl Controller {
             return None;
         }
         self.failed_current(room, instance, request, generation,
-            "Authorization changed. The saved history request is paused; Resume checks current access.")
+            "Authorization changed. Request this history page again under current access.")
             .then_some((room, peer, instance, request, generation))
     }
 
@@ -637,9 +628,8 @@ pub(crate) fn saved_status(
 }
 
 impl Node {
-    /// Hand an unstarted public page back to the existing exact Resume owner when its
-    /// donor is gone and a different trusted connection is available. Preparation checks
-    /// membership and authorization off-actor; no physical Flow has consumed this dispatch.
+    /// Move an unstarted public page to a connected trusted room member without replacing
+    /// its exact request, authorization, staging or bounds. No physical Flow has consumed it.
     pub(super) fn reroute_unstarted_history(&mut self) {
         let Some(dispatch) = self.history_demand.ready.as_ref() else {
             self.history_demand.route_lock_wait = None;
@@ -788,28 +778,23 @@ impl Node {
             }
             return;
         }
-        if self
-            .history_demand
-            .route_attempt
-            .as_ref()
-            .is_some_and(|attempt| {
-                attempt.0 == room
-                    && attempt.1 == instance
-                    && attempt.2 == request
-                    && attempt.3 == candidates
-            })
-        {
+        // The public page binding is independent of its transport donor. Move the same
+        // unconsumed dispatch and exact activation, rather than retiring it for a fallible
+        // asynchronous Resume which could lose the request if this peer disconnects.
+        let Some((next, _, _)) = candidates.into_iter().find(|(_, _, life)| life.is_some()) else {
             return;
+        };
+        if let Some(dispatch) = self.history_demand.ready.as_mut() {
+            dispatch.peer = next;
+            dispatch.eligible = true;
+            dispatch.dial_eligible = true;
         }
-        if !self.history_demand.failed_current(room, instance, request, generation,
-            "The history donor disconnected; the same request is being prepared for another connected member.") {
-            return;
+        if let Some(status) = self.history_demand.owner_status.as_mut().filter(|status| {
+            status.room == room && status.instance == instance && status.request == Some(request)
+        }) {
+            status.detail = "One bounded history quantum is queued with a connected member.".into();
         }
-        self.history_demand.route_attempt = Some((room, instance, request, candidates));
-        self.bounded_sync
-            .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
-        self.history_demand.owe_resume(room, instance, request);
-        self.retry_owed_history_resume();
+        self.sched_rooms.insert(room);
     }
 
     /// Whether the running quantum's page already covers the position below `before`.
@@ -849,25 +834,6 @@ impl Node {
         instance: [u8; 16],
         action: Action,
     ) -> Result<Status, String> {
-        // An exact explicit Resume is a fresh user intent, including while it is pending.
-        // Internal re-preparation uses begin_history_demand_with_job and keeps its dedup key.
-        if let Action::Resume { request } = action {
-            let selected = self
-                .history_demand
-                .owner_status
-                .as_ref()
-                .is_none_or(|status| {
-                    status.room == room
-                        && status.instance == instance
-                        && status.request == Some(request)
-                });
-            if selected
-                && self.history_demand.resume_owed.is_none()
-                && self.history_demand.preparing.is_none()
-            {
-                self.history_demand.route_attempt = None;
-            }
-        }
         let retained_resume = match &action {
             Action::Resume { request } => self
                 .history_demand
