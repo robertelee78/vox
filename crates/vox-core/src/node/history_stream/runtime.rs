@@ -1129,7 +1129,7 @@ impl Flow {
         let result = if let Some(debt) = target.debt.clone() {
             self.settle_received_debt(Arc::clone(&self.cleanup_store), debt)
                 .await
-        } else if target.replacement_pending {
+        } else if target.replacement_pending || target.reopen_pending {
             let store = Arc::clone(&self.cleanup_store);
             tokio::task::spawn_blocking(move || store.finish_received_replacement())
                 .await

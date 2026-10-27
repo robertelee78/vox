@@ -273,9 +273,11 @@ struct Epochs {
     replacement: bool,
     /// Rename failed after the original handle was closed; the original path still owns data.
     reopen_original: bool,
+    reopen_generation: u64,
+    reopen_completed: u64,
     replacement_generation: u64,
     replacement_completed: u64,
-    durable_changed: tokio::sync::watch::Sender<(u64, u64)>,
+    durable_changed: tokio::sync::watch::Sender<(u64, u64, u64)>,
 }
 
 impl Default for Epochs {
@@ -286,9 +288,11 @@ impl Default for Epochs {
             pending: Vec::new(),
             replacement: false,
             reopen_original: false,
+            reopen_generation: 0,
+            reopen_completed: 0,
             replacement_generation: 0,
             replacement_completed: 0,
-            durable_changed: tokio::sync::watch::channel((0, 0)).0,
+            durable_changed: tokio::sync::watch::channel((0, 0, 0)).0,
         }
     }
 }
@@ -297,19 +301,22 @@ impl Default for Epochs {
 pub(crate) struct ReceivedSettlement {
     pub(crate) debt: Option<ReceivedDebt>,
     pub(crate) replacement_pending: bool,
+    pub(crate) reopen_pending: bool,
     replacement: u64,
-    changed: tokio::sync::watch::Receiver<(u64, u64)>,
+    reopen: u64,
+    changed: tokio::sync::watch::Receiver<(u64, u64, u64)>,
 }
 
 impl ReceivedSettlement {
     pub(crate) async fn settled(mut self) {
         loop {
-            let (through, replacement) = *self.changed.borrow_and_update();
+            let (through, replacement, reopen) = *self.changed.borrow_and_update();
             if self
                 .debt
                 .as_ref()
                 .is_none_or(|debt| through >= debt.through)
                 && replacement >= self.replacement
+                && reopen >= self.reopen
             {
                 return;
             }
@@ -850,11 +857,19 @@ impl Store {
                     op: "replace store",
                     detail: "store replacement generation exhausted".into(),
                 })?;
+        let reopen_generation = epochs
+            .reopen_generation
+            .checked_add(1)
+            .ok_or(Error::Storage {
+                op: "replace store",
+                detail: "original reopen generation exhausted".into(),
+            })?;
         // Release the old file, then replace it.
         drop(std::mem::replace(&mut *backing, Backing::Closed));
         if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
             let _ = std::fs::remove_file(&fresh_path);
             epochs.reopen_original = true;
+            epochs.reopen_generation = reopen_generation;
             drop(backing);
             if let Err(reopen_error) = self.reopen_original(&mut epochs) {
                 eprintln!(
@@ -926,6 +941,12 @@ impl Store {
         super::paths::set_private_file_mode(&self.path)?;
         *backing = Backing::Writable(self.keep_profile(db));
         epochs.reopen_original = false;
+        epochs.reopen_completed = epochs.reopen_generation;
+        epochs.durable_changed.send_replace((
+            epochs.durable_through,
+            epochs.replacement_completed,
+            epochs.reopen_completed,
+        ));
         Ok(())
     }
 
@@ -1392,7 +1413,9 @@ impl Store {
         ReceivedSettlement {
             debt,
             replacement_pending: epochs.replacement,
+            reopen_pending: epochs.reopen_original,
             replacement: epochs.replacement_generation,
+            reopen: epochs.reopen_generation,
             changed: epochs.durable_changed.subscribe(),
         }
     }
@@ -1492,9 +1515,11 @@ impl Store {
 
     fn settle_durable_through(epochs: &mut Epochs, through: u64) {
         epochs.durable_through = epochs.durable_through.max(through);
-        epochs
-            .durable_changed
-            .send_replace((epochs.durable_through, epochs.replacement_completed));
+        epochs.durable_changed.send_replace((
+            epochs.durable_through,
+            epochs.replacement_completed,
+            epochs.reopen_completed,
+        ));
         epochs
             .pending
             .retain(|pending| pending.through > epochs.durable_through);
