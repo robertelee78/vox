@@ -14,7 +14,7 @@ use crate::node::sessionstream::{
 };
 
 const SUPPORT: &str = "vox/private-session-stream/v1";
-const CONTROL_REFRESHING: &str = "Session control facts are refreshing";
+pub(super) const CONTROL_REFRESHING: &str = "Session control facts are refreshing";
 const SEG_LEGACY_DRIVE_GENERATIONS: u64 = 19;
 const SEG_PRIVATE_PULLS: u64 = 23;
 const WORK_ROWS: usize = 32;
@@ -150,6 +150,10 @@ pub(super) struct PrivateSessions {
     // record cannot learn it. Set on every admission and open, and clear only after the current
     // node has appended a fresh authenticated announcement.
     support_owed: bool,
+    // A supported old snapshot cannot distinguish a real interrupted admission announcement
+    // from gratuitous reopen renewal. Only this automatic publication waits for a current
+    // recipient's authenticated own-head discovery; ordinary offline user actions do not.
+    support_rediscovery: bool,
 }
 
 impl Stored {
@@ -771,9 +775,14 @@ impl ChannelState {
         result
     }
 
-    fn migrate_legacy_steps_inner(&mut self, store: &Store, _now: u64) -> Result<bool> {
+    fn migrate_legacy_steps_inner(&mut self, store: &Store, _now: u64) -> Result<SessionAdvance> {
         if !self.private_sessions.legacy_pending.is_empty() {
-            self.index_session_floors(store)?;
+            if let Err(error) = self.index_session_floors(store) {
+                if Self::authorization_refreshing(&error) {
+                    return Ok(SessionAdvance::Waiting);
+                }
+                return Err(error);
+            }
             self.private_sessions.legacy_pending.0 = false;
             self.private_sessions.legacy_work = Some(LegacyWork {
                 through: self.next_log_id,
@@ -782,7 +791,7 @@ impl ChannelState {
             });
         }
         let Some(mut work) = self.private_sessions.legacy_work.take() else {
-            return Ok(true);
+            return Ok(SessionAdvance::Complete);
         };
         let mut bytes = 0usize;
         for _ in 0..WORK_ROWS {
@@ -795,7 +804,7 @@ impl ChannelState {
                     work.migrating = true;
                     work.after = None;
                     self.private_sessions.legacy_work = Some(work);
-                    return Ok(false);
+                    return Ok(SessionAdvance::Advanced);
                 }
                 self.private_sessions.pending_active = true;
                 self.private_sessions.pending_after = None;
@@ -811,7 +820,7 @@ impl ChannelState {
                 self.queue_private_progress(&mut batch)?;
                 batch.commit()?;
                 self.entries.committed();
-                return Ok(true);
+                return Ok(SessionAdvance::Advanced);
             };
             let size = entry.payload.as_ref().map_or(0, Vec::len);
             if bytes != 0 && bytes.saturating_add(size) > WORK_BYTES {
@@ -825,9 +834,13 @@ impl ChannelState {
             {
                 if work.migrating {
                     if let Err(error) = self.migrate_legacy_row(store, entry) {
-                        if floor_index::refreshing(&error) {
+                        if Self::authorization_refreshing(&error)
+                            || super::governance::refreshing(&error)
+                        {
+                            // Keep the exact last completed source; this readiness boundary
+                            // grants nothing and is not a malformed saved record.
                             self.private_sessions.legacy_work = Some(work);
-                            return Ok(false);
+                            return Ok(SessionAdvance::Waiting);
                         }
                         return Err(error);
                     }
@@ -856,7 +869,7 @@ impl ChannelState {
             work.after = Some(id);
         }
         self.private_sessions.legacy_work = Some(work);
-        Ok(false)
+        Ok(SessionAdvance::Advanced)
     }
 
     /// Wire, exact cached row, retention retirement and public-body pruning commit together.
@@ -1178,8 +1191,7 @@ impl ChannelState {
                     self.advance_private_controls(store)?;
                     return Ok(SessionAdvance::Advanced);
                 }
-                self.migrate_legacy_steps_inner(store, now)?;
-                return Ok(SessionAdvance::Advanced);
+                return self.migrate_legacy_steps_inner(store, now);
             }
             let was_pending = self.private_sessions.pending_active;
             if !self.advance_pending_private(store, now)? {
@@ -1214,13 +1226,22 @@ impl ChannelState {
 
     /// Authenticated capability, not a Session step. Published old readers skip its unknown
     /// content body. Only an author who advertised support is ever probed with stream 13.
-    pub(crate) fn announce_private_support(&mut self, profile: &Profile, now: u64) -> Result<()> {
+    pub(crate) fn announce_private_support(
+        &mut self,
+        profile: &Profile,
+        now: u64,
+        discovery_ready: bool,
+    ) -> Result<bool> {
         let me = self.me();
-        if !self.settled || self.poisoned || self.has_left(&me) {
-            return Ok(());
+        if !self.settled
+            || self.poisoned
+            || self.has_left(&me)
+            || (self.private_sessions.support_rediscovery && !discovery_ready)
+        {
+            return Ok(false);
         }
         if !self.private_sessions.support_owed && self.supports_private(profile.store(), &me)? {
-            return Ok(());
+            return Ok(false);
         }
         self.append_control_kind(
             profile,
@@ -1230,7 +1251,8 @@ impl ChannelState {
             false,
         )?;
         self.private_sessions.support_owed = false;
-        Ok(())
+        self.private_sessions.support_rediscovery = false;
+        Ok(true)
     }
     pub(super) fn restore_private_sessions(&mut self, store: &Store) -> Result<()> {
         let snapshot = store.snapshot()?;
@@ -1253,8 +1275,59 @@ impl ChannelState {
         // A restart may follow an admission that committed just before its capability
         // announcement. Repeating this one small signed fact is bounded to one per open.
         self.private_sessions.support_owed = true;
+        self.private_sessions.support_rediscovery = self.uses_sparse_history(store)?;
         self.restore_private_pulls(store)?;
         Ok(())
+    }
+
+    pub(crate) fn private_support_discovery_pending(&self) -> bool {
+        self.private_sessions.support_rediscovery
+    }
+    pub(crate) fn private_support_discovery_hint(
+        &self,
+        store: &Store,
+        peer: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64)>> {
+        if !self.private_sessions.support_rediscovery || self.own_behind || !self.is_member(peer) {
+            return Ok(None);
+        }
+        let read = self.history_read(store)?;
+        let Some(id) = read
+            .sparse_author(&self.me(), crate::log::history::LogScope::Public)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(None);
+        };
+        let head = read
+            .history_head(&id)?
+            .ok_or(Error::MalformedAtRest("own discovery head missing"))?;
+        // This is a fresh connection-scoped metadata probe, distinct from the old
+        // Control receipt and exact-target proof operations. Port owns its unavailable
+        // disposition; neither durable refusal domain is erased or reinterpreted here.
+        Ok(Some((self.me(), id, head.root.leaves)))
+    }
+    /// Caller carries an actual useful Head response on the exact current recipient port,
+    /// after refreshing the higher-head write fence. This is not a universal rollback verdict.
+    pub(crate) fn private_support_discovery_reply_valid(
+        &self,
+        store: &Store,
+        hint: crate::node::history_stream::HeadHint,
+    ) -> Result<bool> {
+        if !self.private_sessions.support_rediscovery || hint.author != self.me() {
+            return Ok(false);
+        }
+        let read = self.history_read(store)?;
+        let Some(head) = read.history_head(&hint.head)? else {
+            return Ok(false);
+        };
+        if head.binding.room != self.channel_id
+            || head.binding.author != self.me()
+            || head.root.leaves != hint.size
+            || !read.history_head_accepted(&hint.head, head.binding)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub(crate) fn owe_private_support(&mut self) {
@@ -1547,7 +1620,7 @@ impl ChannelState {
     }
 
     fn private_save_failed(&mut self, error: &Error) {
-        if super::governance::refreshing(error) || floor_index::refreshing(error) {
+        if super::governance::refreshing(error) || Self::authorization_refreshing(error) {
             return;
         }
         self.poisoned = true;

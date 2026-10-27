@@ -11,6 +11,159 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex as StdMutex;
 
+/// Prepare one immutable automatic page using the same durable admission and body machinery as
+/// a user Archive. The namespace is private to this node/room; it never replaces a user's page.
+#[allow(clippy::too_many_arguments)]
+async fn own_recovery_flow(
+    profile: &Profile,
+    room: Digest32,
+    peer: Digest32,
+    epoch: u64,
+    instance: [u8; 16],
+    page: crate::node::channel::OwnRecoveryPage,
+    shared: Arc<tokio::sync::Mutex<ChannelState>>,
+    control: Arc<crate::node::history_demand::Context>,
+    lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    slots: Arc<stream::runtime::BodySlots>,
+    store: Arc<Store>,
+    budget: Arc<crate::node::history_budget::Budget>,
+    state_job: &crate::node::history_budget::Job,
+    trigger: Digest32,
+) -> crate::error::Result<Flow> {
+    use crate::node::history_demand::{self as demand, Binding, Bounds, Progress};
+    use crate::node::history_stream::{Query, Staging};
+    let node = profile.fingerprint();
+    let generation = stream::authorization_generation(&store, node, room, instance, epoch)?;
+    let context = Arc::new(demand::Context::own_recovery_unlocked(
+        profile, room, lease,
+    )?);
+    let binding = Binding {
+        room,
+        instance,
+        epoch,
+        audience: [0; 32],
+        grant: generation,
+    };
+    let work = context.clone();
+    let job = state_job.clone();
+    let (request, query, active, checkpoint, cleanup) =
+        tokio::task::spawn_blocking(move || -> crate::error::Result<_> {
+            let snapshot = demand::inspect(&work, &job)?;
+            if let Some(snapshot) = &snapshot {
+                let state = snapshot.state();
+                // Disposal reclaims each unfinished body before this namespace may be reused.
+                // A crash during cleanup leaves exactly that bounded continuation, not permission
+                // to overwrite it with a new request.
+                if state.reclaiming()
+                    || (!matches!(
+                        state.progress(None),
+                        Progress::Complete | Progress::Cancelled
+                    ) && (state.binding.room != binding.room
+                        || state.binding.instance != binding.instance
+                        || state.binding.epoch != binding.epoch))
+                {
+                    let active = demand::own_recovery_cleanup(&work, state)?;
+                    let query = Query::Page {
+                        head: state.bounds.head,
+                        lo: state.bounds.lo,
+                        hi: state.bounds.hi,
+                        entries: state.remaining,
+                        wire_bytes: 1024 * 1024,
+                    };
+                    return Ok((
+                        state.request,
+                        query,
+                        active,
+                        stream::runtime::OwnRecoveryCheckpoint::of(state),
+                        true,
+                    ));
+                }
+                if !matches!(
+                    state.progress(None),
+                    Progress::Complete | Progress::Cancelled
+                ) {
+                    let request = state.request;
+                    let query = if let Some(body) = &state.body {
+                        Query::Entry {
+                            head: state.bounds.head,
+                            seq: body.seq,
+                            offset: body.offset,
+                        }
+                    } else {
+                        Query::Page {
+                            head: state.bounds.head,
+                            lo: state.bounds.lo,
+                            hi: state
+                                .cursor
+                                .as_ref()
+                                .map_or(state.bounds.hi, |c| c.next_seq),
+                            entries: state.remaining,
+                            wire_bytes: 1024 * 1024,
+                        }
+                    };
+                    let active = demand::resume_own_recovery(&work, request, binding, &job)?;
+                    let checkpoint = stream::runtime::OwnRecoveryCheckpoint::of(state);
+                    return Ok((request, query, active, checkpoint, false));
+                }
+            }
+            let entries = usize::try_from(page.hi - page.lo + 1)
+                .map_err(|_| Error::MalformedAtRest("own recovery page size"))?;
+            let bounds = Bounds {
+                head: page.head,
+                lo: page.lo,
+                hi: page.hi,
+                entries,
+            };
+            let request = crate::identity::rng::random_array::<16>()?;
+            let active = demand::start(&work, request, binding, bounds, &job)?;
+            let saved = demand::inspect(&work, &job)?.ok_or(Error::OwnHistoryBehind)?;
+            let checkpoint = stream::runtime::OwnRecoveryCheckpoint::of(saved.state());
+            Ok((
+                request,
+                Query::Page {
+                    head: page.head,
+                    lo: page.lo,
+                    hi: page.hi,
+                    entries,
+                    wire_bytes: 1024 * 1024,
+                },
+                active,
+                checkpoint,
+                false,
+            ))
+        })
+        .await
+        .map_err(|_| Error::Profile("own recovery preparation worker stopped"))??;
+    let mut flow = Flow::archive(
+        room,
+        peer,
+        node,
+        epoch,
+        instance,
+        generation,
+        shared,
+        control,
+        Staging {
+            context,
+            active: Arc::new(StdMutex::new(active)),
+        },
+        query,
+        request,
+        crate::transport::stream_transport::Fence::new(),
+        slots,
+        store,
+        budget,
+        state_job.flow_owner(),
+    );
+    flow.automatic_own_recovery = true;
+    flow.own_recovery_trigger = Some(trigger);
+    flow.own_recovery_checkpoint = Some(checkpoint);
+    if cleanup {
+        flow.mark_own_recovery_cleanup();
+    }
+    Ok(flow)
+}
+
 type RetirementKey = crate::node::history_budget::RetirementKey;
 type RetirementLedger = crate::node::history_budget::RetirementLedger;
 type RetirementEntry = crate::node::history_budget::RetirementEntry;
@@ -420,7 +573,13 @@ struct ForegroundAdmission {
     ticket: crate::node::history_budget::Ticket,
     task: tokio::task::JoinHandle<()>,
 }
-struct SecretAdmission {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalAdmissionKind {
+    Secret,
+    Room,
+}
+struct LocalAdmission {
+    kind: LocalAdmissionKind,
     token: u64,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
@@ -518,7 +677,7 @@ pub(super) struct Controller {
     /// One retained ticket per startable foreground lane. A release wakes the exact waiting
     /// port; the scheduler tick is neither its notifier nor a correctness fallback.
     foreground_admission: [Option<ForegroundAdmission>; 4],
-    secret_admission: BTreeMap<(Digest32, Digest32), SecretAdmission>,
+    local_admission: BTreeMap<(Digest32, Digest32), LocalAdmission>,
     byte_admission: BTreeMap<(Digest32, Digest32), ByteAdmission>,
     pool_admission: BTreeMap<(Digest32, Digest32), PoolAdmission>,
     deferred: VecDeque<Flow>,
@@ -547,7 +706,7 @@ impl Drop for Controller {
         for index in 0..self.foreground_admission.len() {
             self.cancel_foreground_admission(index);
         }
-        for (_, admission) in std::mem::take(&mut self.secret_admission) {
+        for (_, admission) in std::mem::take(&mut self.local_admission) {
             admission.task.abort();
         }
         for (_, admission) in std::mem::take(&mut self.byte_admission) {
@@ -614,6 +773,31 @@ impl Controller {
         resume_owed_retirements(&self.retirement_ledger, node);
     }
 
+    fn owns_archive_room(&self, room: Digest32) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .chain(self.retiring.iter())
+            .any(|flow| flow.archive && flow.room == room)
+            || self
+                .running
+                .iter()
+                .flatten()
+                .any(|work| work.room == room && work.archive.is_some())
+            || self
+                .cleanup
+                .as_ref()
+                .is_some_and(|work| work.key.room == room && work.key.archive)
+            || self
+                .retirement_ledger
+                .entries
+                .lock()
+                .map_or(true, |entries| {
+                    entries.keys().any(|key| key.room == room && key.archive)
+                })
+    }
+
     pub(super) fn completion_wake(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.completion_wake)
     }
@@ -639,7 +823,7 @@ impl Controller {
                 .iter()
                 .flatten()
                 .any(|admission| admission.room == room && admission.peer == peer)
-            || self.secret_admission.contains_key(&(room, peer))
+            || self.local_admission.contains_key(&(room, peer))
             || self.byte_admission.contains_key(&(room, peer))
             || self.pool_admission.contains_key(&(room, peer))
     }
@@ -748,9 +932,27 @@ impl Controller {
             }
         }
     }
-    fn cancel_secret_admission(&mut self, room: Digest32, peer: Digest32) {
-        if let Some(admission) = self.secret_admission.remove(&(room, peer)) {
+    fn cancel_local_admission(&mut self, room: Digest32, peer: Digest32) {
+        if let Some(admission) = self.local_admission.remove(&(room, peer)) {
             admission.task.abort();
+        }
+    }
+    fn release_local_admission_kind(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+        kind: LocalAdmissionKind,
+    ) -> bool {
+        if self
+            .local_admission
+            .get(&(room, peer))
+            .is_some_and(|entry| entry.token == token && entry.kind == kind)
+        {
+            self.cancel_local_admission(room, peer);
+            true
+        } else {
+            false
         }
     }
     pub(super) fn release_secret_admission(
@@ -759,17 +961,56 @@ impl Controller {
         room: Digest32,
         peer: Digest32,
     ) -> bool {
-        if self
-            .secret_admission
-            .get(&(room, peer))
-            .is_some_and(|admission| admission.token == token)
-        {
-            self.cancel_secret_admission(room, peer);
-            true
-        } else {
-            false
-        }
+        self.release_local_admission_kind(token, room, peer, LocalAdmissionKind::Secret)
     }
+    pub(super) fn release_room_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        node: Digest32,
+    ) -> bool {
+        self.release_local_admission_kind(token, room, node, LocalAdmissionKind::Room)
+    }
+    /// One actual room-lock release edge, coalesced in the existing cancellable admission
+    /// owner. The self-node key cannot collide with a remote peer's secret admission.
+    pub(super) fn wait_for_own_recovery_room(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        node: Digest32,
+        room: Digest32,
+        shared: Arc<tokio::sync::Mutex<ChannelState>>,
+    ) {
+        if self.local_admission.contains_key(&(room, node)) {
+            return;
+        }
+        let token = *next_token;
+        *next_token += 1;
+        let tx = net_tx.clone();
+        let instance = Arc::downgrade(&shared);
+        let task = tokio::spawn(async move {
+            drop(shared.lock_owned().await);
+            let _ = tx
+                .send(NetEvent::OwnRecoveryRoomReady {
+                    token,
+                    room,
+                    node,
+                    instance,
+                })
+                .await;
+        });
+        self.local_admission.insert(
+            (room, node),
+            LocalAdmission {
+                kind: LocalAdmissionKind::Room,
+                token,
+                root: "own_recovery",
+                lane: crate::node::history_budget::Lane::Control,
+                task,
+            },
+        );
+    }
+
     fn wait_for_secret(
         &mut self,
         net_tx: &mpsc::Sender<NetEvent>,
@@ -779,7 +1020,7 @@ impl Controller {
         work: AdmissionWork,
         secret_work: Arc<tokio::sync::RwLock<()>>,
     ) {
-        if self.secret_admission.contains_key(&(room, peer)) {
+        if self.local_admission.contains_key(&(room, peer)) {
             return;
         }
         let token = *next_token;
@@ -792,9 +1033,10 @@ impl Controller {
                 .send(NetEvent::BoundedSecretReady { token, room, peer })
                 .await;
         });
-        self.secret_admission.insert(
+        self.local_admission.insert(
             (room, peer),
-            SecretAdmission {
+            LocalAdmission {
+                kind: LocalAdmissionKind::Secret,
                 token,
                 root: work.root,
                 lane: work.lane,
@@ -860,6 +1102,7 @@ impl Controller {
                 && !flow.archive
                 && flow.archive_request.is_none()
                 && flow.required_root.is_none()
+                && !flow.local_own_root()
                 && flow.hint.is_some_and(|hint| {
                     inbox.newer_pending(room, flow.hint_peer, hint.author, hint.size)
                 })
@@ -1277,13 +1520,13 @@ impl Controller {
             }
         }
         let waiting: Vec<(Digest32, Digest32)> = self
-            .secret_admission
+            .local_admission
             .keys()
             .filter(|(waiting_room, _)| *waiting_room == room)
             .copied()
             .collect();
         for (room, peer) in waiting {
-            self.cancel_secret_admission(room, peer);
+            self.cancel_local_admission(room, peer);
         }
         let waiting: Vec<(Digest32, Digest32)> = self
             .byte_admission
@@ -1370,7 +1613,7 @@ impl Controller {
             self.cancel_archive_admission();
         }
         self.cancel_foreground_port(room, peer);
-        self.cancel_secret_admission(room, peer);
+        self.cancel_local_admission(room, peer);
         self.cancel_byte_admission(room, peer);
         self.cancel_pool_admission(room, peer);
         for slot in &mut self.ready {
@@ -1412,7 +1655,7 @@ impl Controller {
         for index in 0..self.foreground_admission.len() {
             self.cancel_foreground_admission(index);
         }
-        for (_, admission) in std::mem::take(&mut self.secret_admission) {
+        for (_, admission) in std::mem::take(&mut self.local_admission) {
             admission.task.abort();
         }
         for (_, admission) in std::mem::take(&mut self.byte_admission) {
@@ -1677,6 +1920,29 @@ impl Controller {
         ForegroundTurn::Waiting
     }
 }
+/// Removing a parked scalar is not permission to start inventory. The bounded inbox
+/// itself is scheduler need, so continue to another eligible hint without raising a request.
+fn take_foreground_hint(
+    inbox: &stream::HintInbox,
+    room: Digest32,
+    peer: Digest32,
+    node: Digest32,
+    parked_receipt: Option<Digest32>,
+) -> Option<stream::HeadHint> {
+    // Inbound producers may replenish the inbox while this scalar selection runs.
+    // Bound this turn by the existing inventory quantum; remaining hints keep their
+    // ordinary inbox/port-queue ownership and their producer's completion wake.
+    for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
+        let hint = inbox.take(room, peer, node)?;
+        if hint.author == node && parked_receipt == Some(hint.head) {
+            inbox.finish(room, peer, hint.author, hint.head);
+        } else {
+            return Some(hint);
+        }
+    }
+    None
+}
+
 /// Why a foreground round runs (ADR-038 FX-15, #996), from what selected it: the own head
 /// offered for acknowledgement, a head the peer told this node of (or the follow-up such a
 /// fetch needs), an own append owed to the peer, the periodic request, or another request.
@@ -1851,7 +2117,7 @@ impl Node {
     /// selected. Re-arm that exact hint while its inbox scope is still live; room/peer retirement
     /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
     fn dispose_rearming_hint(&mut self, mut flow: Flow) {
-        if let Some(hint) = flow.hint.take() {
+        if let Some(hint) = flow.hint.take().filter(|_| !flow.local_own_root()) {
             self.history_hints
                 .retry(flow.room, flow.hint_peer, hint.author, hint.head);
         }
@@ -1963,6 +2229,17 @@ impl Node {
                 flow.work_committed
                     .swap(false, std::sync::atomic::Ordering::AcqRel),
             );
+            if flow.own_head_observed.swap(false, Ordering::AcqRel)
+                && self
+                    .channels
+                    .get(&work.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            {
+                // The physical callback committed this narrowing knowledge. A later wire
+                // error, cancellation or changed peer grant cannot erase it; a replacement
+                // room must never receive it. Reuse the existing bounded governance owner.
+                self.governance_work.wake_room(work.room);
+            }
             let declined = std::mem::take(&mut flow.declined);
             let offered = std::mem::take(&mut flow.offered);
             let rearmed = std::mem::take(&mut flow.rearmed);
@@ -2004,6 +2281,37 @@ impl Node {
                     .channels
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
+            if valid {
+                if let Some(hint) = flow.hint {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        let scope = |connection| crate::node::ports::SupportDiscovery {
+                            connection,
+                            instance: flow.instance,
+                            epoch: flow.epoch,
+                            authorization: flow.generation,
+                        };
+                        if let Some((connection, incarnations)) = flow
+                            .discovery_unavailable
+                            .take()
+                            .zip(flow.discovery_incarnations)
+                        {
+                            port.support_discovery_unavailable =
+                                Some(crate::node::ports::OwnProbe {
+                                    scope: scope(connection),
+                                    head: hint.head,
+                                    incarnations,
+                                });
+                        }
+                        if let Some((connection, incarnations)) = flow.receipt_lower.take() {
+                            port.own_receipt_lower = Some(crate::node::ports::OwnProbe {
+                                scope: scope(connection),
+                                head: hint.head,
+                                incarnations,
+                            });
+                        }
+                    }
+                }
+            }
             // Authorization and local-durability exits carry ownership themselves. Handle them
             // even when the trust edit also retired the port/fence; generic stale disposal would
             // otherwise discard the only hint, required root, or archive controller dispatch.
@@ -2059,7 +2367,7 @@ impl Node {
                     );
                     (request, flow.instance)
                 });
-                if let Some(hint) = flow.hint {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .retry(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -2102,7 +2410,7 @@ impl Node {
             if let Some(error) = flow.local_retry.take() {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
                 self.settle_archive_exit(&mut flow, &error);
-                if let Some(hint) = flow.hint {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .retry(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -2356,7 +2664,7 @@ impl Node {
                     self.history_demand.failed(request, flow.generation, &error);
                 }
 
-                if let Some(hint) = flow.hint {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -2464,10 +2772,15 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            let superseded = flow.hint.is_some_and(|hint| {
-                self.history_hints
-                    .newer_pending(work.room, flow.hint_peer, hint.author, hint.size)
-            });
+            let superseded = !flow.local_own_root()
+                && flow.hint.is_some_and(|hint| {
+                    self.history_hints.newer_pending(
+                        work.room,
+                        flow.hint_peer,
+                        hint.author,
+                        hint.size,
+                    )
+                });
             if superseded {
                 // The worker has returned from its bounded slice, so no in-flight state is
                 // mutated. Retire its transient capabilities; signed headers, receipts, cursors
@@ -2551,6 +2864,21 @@ impl Node {
                 );
             }
             if flow.done() {
+                if flow.automatic_own_recovery {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        port.req_done = port.req_done.max(work.request);
+                        if flow.own_recovery_progress {
+                            port.own_recovery_parked = None;
+                            port.raise();
+                        } else {
+                            port.own_recovery_parked = flow.own_recovery_trigger;
+                        }
+                    }
+                    if flow.own_recovery_progress {
+                        self.governance_work.wake_room(work.room);
+                        self.sched_rooms.insert(work.room);
+                    }
+                }
                 if !flow.archive && !flow.inventory {
                     if let Some(head) = flow.authenticated_head {
                         let event = NetEvent::BoundedHeadCompleted {
@@ -2560,6 +2888,8 @@ impl Node {
                             epoch: flow.epoch,
                             room_instance: flow.instance,
                             generation: flow.generation,
+                            peer: work.peer,
+                            discovery_connection: flow.completed_support_discovery(),
                         };
                         if self.net_tx.try_send(event).is_err() {
                             // Retain the charged completed flow and its in-flight hint until
@@ -2570,13 +2900,15 @@ impl Node {
                         }
                     }
                 }
-                if let Some(status) = flow.archive_status.take() {
-                    if let Some(request) = status.request {
-                        self.history_demand
-                            .completed(request, flow.generation, status);
+                if !flow.automatic_own_recovery {
+                    if let Some(status) = flow.archive_status.take() {
+                        if let Some(request) = status.request {
+                            self.history_demand
+                                .completed(request, flow.generation, status);
+                        }
                     }
                 }
-                if let Some(hint) = flow.hint {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -2591,13 +2923,19 @@ impl Node {
                         // inventory and recreates the feedback churn the bounded inbox removed.
                         port.req_done = port.req_done.max(work.request);
                     }
+                    if flow.local_own_after_inventory {
+                        // This completed inventory was the producer that deferred an eligible
+                        // local metadata root. Refused/equal roots never set this scalar, so
+                        // ordinary inventories cannot turn parked debt into periodic reoffers.
+                        port.raise();
+                        raised = true;
+                    }
                     if self
                         .bounded_sync
                         .ready
                         .iter()
                         .flatten()
                         .any(|flow| flow.room == work.room && flow.peer == work.peer)
-                        || self.history_hints.pending(work.room, work.peer)
                         || self
                             .leave_waiters
                             .iter()
@@ -2614,7 +2952,7 @@ impl Node {
                 // Raising the port changes its need, but `schedule` only examines touched
                 // rooms. Wake this room now instead of leaving the raised port asleep until
                 // the periodic all-ports tick consumes most of the leave deadline.
-                if raised {
+                if raised || self.history_hints.pending(work.room, work.peer) {
                     self.sched_rooms.insert(work.room);
                 }
                 let reason = flow.reason;
@@ -2846,7 +3184,8 @@ impl Node {
                 }
                 let archive_dispatch = self.bounded_sync.ready[1].is_none()
                     && self.bounded_sync.running[1].is_none()
-                    && self.history_demand.ready_binding(room, peer).is_some();
+                    && (self.history_demand.ready_binding(room, peer).is_some()
+                        || self.own_recovery_rooms.contains_key(&room));
                 if !archive_dispatch
                     && (page_only
                         || self.bounded_sync.ready[0].is_some()
@@ -2988,7 +3327,194 @@ impl Node {
                     Ok(value) => Arc::new(value),
                     Err(_) => return false,
                 };
-                if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
+                let needs_own_state = self.own_recovery_rooms.contains_key(&room)
+                    || self.ports.get(&(room, peer)).is_some_and(|port| {
+                        port.support_discovery_check || port.own_receipt_lower.is_some()
+                    });
+                let own_state =
+                    if needs_own_state {
+                        let bytes_wake = state_job.bytes_wake();
+                        let Some(_read) = state_job.reserve(4 * 1024 * 1024) else {
+                            self.bounded_sync.wait_for_bytes(
+                                &self.net_tx,
+                                &mut self.next_token,
+                                room,
+                                peer,
+                                pending_work,
+                                ByteWait::unowned(bytes_wake),
+                            );
+                            return false;
+                        };
+                        match shared.try_lock() {
+                            Ok(channel) => {
+                                let instance = match channel.history_instance(&store) {
+                                    Ok(i) => i,
+                                    Err(_) => return false,
+                                };
+                                let authorization = match stream::authorization_generation(
+                                    &store, node, room, instance, epoch,
+                                ) {
+                                    Ok(a) => a,
+                                    Err(_) => return false,
+                                };
+                                let verification =
+                                    match channel.own_recovery_discovery_hint(
+                                        &store,
+                                        &peer,
+                                        authorization,
+                                    ) {
+                                        Ok(hint) => hint.map(|(author, head, size)| {
+                                            stream::HeadHint { author, head, size }
+                                        }),
+                                        Err(_) => return false,
+                                    };
+                                let discovery_pending = channel.private_support_discovery_pending();
+                                if !discovery_pending {
+                                    if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                        port.support_discovery_check = false;
+                                    }
+                                }
+                                let scope = crate::node::ports::SupportDiscovery {
+                                    connection: conn.serial(),
+                                    instance,
+                                    epoch,
+                                    authorization,
+                                };
+                                let already_checked = self
+                                    .ports
+                                    .get(&(room, peer))
+                                    .is_some_and(|port| port.support_discovery == Some(scope));
+                                let discovery =
+                                    match if already_checked {
+                                        Ok(None)
+                                    } else {
+                                        channel.private_support_discovery_hint(&store, &peer)
+                                    } {
+                                        Ok(hint) => hint.map(|(author, head, size)| {
+                                            stream::HeadHint { author, head, size }
+                                        }),
+                                        Err(_) => return false,
+                                    };
+                                let probe_incarnations = channel
+                                    .history_inventory_incarnation(&peer)
+                                    .zip(channel.history_author_inventory_incarnation(&node));
+                                let discovery = discovery.filter(|hint| {
+                                    !self
+                                        .ports
+                                        .get(&(room, peer))
+                                        .and_then(|port| port.support_discovery_unavailable)
+                                        .is_some_and(|probe| {
+                                            probe.matches(scope, hint.head, probe_incarnations)
+                                        })
+                                });
+                                let parked_receipt = self
+                                    .ports
+                                    .get(&(room, peer))
+                                    .and_then(|port| port.own_receipt_lower)
+                                    .filter(|probe| {
+                                        probe.matches(scope, probe.head, probe_incarnations)
+                                    })
+                                    .map(|probe| probe.head);
+                                let page = if !self.bounded_sync.owns_archive_room(room)
+                                    && self.history_demand.ready_binding(room, peer).is_none()
+                                    && self.bounded_sync.ready[1].is_none()
+                                    && self.bounded_sync.running[1].is_none()
+                                {
+                                    match channel.own_recovery_page(&store, &peer) {
+                                        Ok(page) => page.map(|p| (instance, p)),
+                                        Err(_) => return false,
+                                    }
+                                } else {
+                                    None
+                                };
+                                (
+                                    page,
+                                    verification,
+                                    discovery,
+                                    probe_incarnations,
+                                    parked_receipt,
+                                )
+                            }
+                            Err(_) => {
+                                // Keep the producer edge through the actual release, without a
+                                // Control permit, buffers, or secret-work capture parked on it.
+                                drop(_read);
+                                drop(control);
+                                drop(lease);
+                                drop(state_job);
+                                drop(admitted_control.take());
+                                drop(admitted_archive.take());
+                                self.bounded_sync.wait_for_own_recovery_room(
+                                    &self.net_tx,
+                                    &mut self.next_token,
+                                    node,
+                                    room,
+                                    shared.clone(),
+                                );
+                                return false;
+                            }
+                        }
+                    } else {
+                        (None, None, None, None, None)
+                    };
+                let (own_page, own_verification, own_discovery, probe_incarnations, parked_receipt) =
+                    own_state;
+                let own_page = own_page.and_then(|(instance, page)| {
+                    let generation =
+                        match stream::authorization_generation(&store, node, room, instance, epoch)
+                        {
+                            Ok(generation) => generation,
+                            Err(_) => return None,
+                        };
+                    let mut encoded = crate::cbor::Encoder::new();
+                    encoded
+                        .array(7)
+                        .bytes(&page.head)
+                        .uint(page.lo)
+                        .uint(page.donor_through)
+                        .bytes(&generation)
+                        .bytes(&instance)
+                        .uint(epoch)
+                        .uint(conn.serial());
+                    let trigger = crate::hash::sha256(&encoded.finish());
+                    if self
+                        .ports
+                        .get(&(room, peer))
+                        .is_some_and(|port| port.own_recovery_parked == Some(trigger))
+                    {
+                        return None;
+                    }
+                    Some((instance, page, trigger))
+                });
+                if let Some((instance, page, trigger)) = own_page {
+                    match own_recovery_flow(
+                        profile,
+                        room,
+                        peer,
+                        epoch,
+                        instance,
+                        page,
+                        shared.clone(),
+                        control,
+                        lease,
+                        self.bounded_sync.body_slots.clone(),
+                        store.clone(),
+                        Arc::clone(&self.history_budget),
+                        &state_job,
+                        trigger,
+                    )
+                    .await
+                    {
+                        Ok(flow) if flow.own_recovery_cleanup => {
+                            self.bounded_sync.dispose(flow);
+                            return false;
+                        }
+                        Ok(flow) => flow,
+                        Err(_) => return false,
+                    }
+                } else if self.bounded_sync.ready[1].is_none()
+                    && self.bounded_sync.running[1].is_none()
+                {
                     if let Some(dispatch) = self.history_demand.take_ready(room, peer) {
                         Flow::archive(
                             room,
@@ -3037,8 +3563,33 @@ impl Node {
                         let hint = if announce_first || required.is_some() {
                             None
                         } else {
-                            departure_hint.or_else(|| self.history_hints.take(room, peer, node))
+                            departure_hint
+                                .or(own_verification)
+                                .or(own_discovery)
+                                .or_else(|| {
+                                    take_foreground_hint(
+                                        &self.history_hints,
+                                        room,
+                                        peer,
+                                        node,
+                                        parked_receipt,
+                                    )
+                                })
                         };
+                        if hint.is_none()
+                            && required.is_none()
+                            && !self
+                                .ports
+                                .get(&(room, peer))
+                                .is_some_and(crate::node::ports::Port::needs)
+                        {
+                            // No eligible hint remains, and no independent request, generation or
+                            // announcement owes inventory; return its actual admission instead of
+                            // manufacturing an exchange which can re-add the same hint.
+                            self.bounded_sync
+                                .cancel_matching_control_admission(room, peer);
+                            return false;
+                        }
                         let reason = foreground_reason(
                             node,
                             hint,
@@ -3055,6 +3606,15 @@ impl Node {
                             live,
                             control,
                             hint,
+                            own_verification.is_some()
+                                && hint == own_verification
+                                && departure_hint.is_none()
+                                && required.is_none(),
+                            own_discovery.is_some()
+                                && hint == own_discovery
+                                && own_verification.is_none()
+                                && departure_hint.is_none()
+                                && required.is_none(),
                             departure_hint.is_some() && required.is_none(),
                             required,
                             self.bounded_sync.body_slots.clone(),
@@ -3064,13 +3624,20 @@ impl Node {
                         ) {
                             Ok(mut flow) => {
                                 flow.reason = reason;
+                                flow.discovery_incarnations = probe_incarnations;
+                                flow.local_own_after_inventory = flow.inventory
+                                    && announce_first
+                                    && (own_verification.is_some() || own_discovery.is_some());
                                 if let Some(at) = required_at {
                                     let _ = self.bounded_sync.required.remove(at);
                                 }
                                 flow
                             }
                             Err(_) => {
-                                if let Some(hint) = hint {
+                                if let Some(hint) = hint.filter(|_| {
+                                    departure_hint.is_some()
+                                        || (hint != own_verification && hint != own_discovery)
+                                }) {
                                     self.history_hints.retry(room, peer, hint.author, hint.head);
                                 }
                                 return false;
@@ -3107,8 +3674,33 @@ impl Node {
                     let hint = if announce_first || required.is_some() {
                         None
                     } else {
-                        departure_hint.or_else(|| self.history_hints.take(room, peer, node))
+                        departure_hint
+                            .or(own_verification)
+                            .or(own_discovery)
+                            .or_else(|| {
+                                take_foreground_hint(
+                                    &self.history_hints,
+                                    room,
+                                    peer,
+                                    node,
+                                    parked_receipt,
+                                )
+                            })
                     };
+                    if hint.is_none()
+                        && required.is_none()
+                        && !self
+                            .ports
+                            .get(&(room, peer))
+                            .is_some_and(crate::node::ports::Port::needs)
+                    {
+                        // No eligible hint remains, and no independent request, generation or
+                        // announcement owes inventory; return its actual admission instead of
+                        // manufacturing an exchange which can re-add the same hint.
+                        self.bounded_sync
+                            .cancel_matching_control_admission(room, peer);
+                        return false;
+                    }
                     let reason = foreground_reason(
                         node,
                         hint,
@@ -3125,6 +3717,15 @@ impl Node {
                         live,
                         control,
                         hint,
+                        own_verification.is_some()
+                            && hint == own_verification
+                            && departure_hint.is_none()
+                            && required.is_none(),
+                        own_discovery.is_some()
+                            && hint == own_discovery
+                            && own_verification.is_none()
+                            && departure_hint.is_none()
+                            && required.is_none(),
                         departure_hint.is_some() && required.is_none(),
                         required,
                         self.bounded_sync.body_slots.clone(),
@@ -3134,13 +3735,20 @@ impl Node {
                     ) {
                         Ok(mut flow) => {
                             flow.reason = reason;
+                            flow.discovery_incarnations = probe_incarnations;
+                            flow.local_own_after_inventory = flow.inventory
+                                && announce_first
+                                && (own_verification.is_some() || own_discovery.is_some());
                             if let Some(at) = required_at {
                                 let _ = self.bounded_sync.required.remove(at);
                             }
                             flow
                         }
                         Err(_) => {
-                            if let Some(hint) = hint {
+                            if let Some(hint) = hint.filter(|_| {
+                                departure_hint.is_some()
+                                    || (hint != own_verification && hint != own_discovery)
+                            }) {
                                 self.history_hints.retry(room, peer, hint.author, hint.head);
                             }
                             return false;
@@ -3700,9 +4308,12 @@ impl Controller {
                 None,
             )
         }));
-        admissions.extend(self.secret_admission.iter().map(|((room, peer), waiting)| {
+        admissions.extend(self.local_admission.iter().map(|((room, peer), waiting)| {
             admission(
-                "secret",
+                match waiting.kind {
+                    LocalAdmissionKind::Secret => "secret",
+                    LocalAdmissionKind::Room => "room",
+                },
                 waiting.token,
                 *room,
                 *peer,
@@ -3749,8 +4360,8 @@ impl Controller {
             admissions.join(","),
             self.archive_admission.is_some(),
             self.foreground_admission.iter().flatten().count(),
-            0,
-            self.secret_admission.len(),
+            self.local_admission.values().filter(|a| a.kind == LocalAdmissionKind::Room).count(),
+            self.local_admission.values().filter(|a| a.kind == LocalAdmissionKind::Secret).count(),
             self.byte_admission.len(),
             self.pool_admission.len(),
             cleanup,

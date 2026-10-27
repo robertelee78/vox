@@ -2,7 +2,7 @@
 //! envelope before these methods; every pinned store read is dropped before network I/O.
 
 use super::*;
-use crate::log::history::{ControlContext, Descriptor, LogScope, SignedHead, TreeBinding};
+use crate::log::history::{ControlContext, LogScope, SignedHead};
 use crate::node::store::Batch;
 
 /// Exact signed header and the length bound governing payload continuations.
@@ -86,10 +86,10 @@ impl ChannelState {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
-        authorization: (Digest32, Digest32),
+        authorization: (Digest32, Digest32, bool),
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<HistoryDeclineResult> {
-        let (node, expected_authorization) = authorization;
+        let (node, expected_authorization, metadata) = authorization;
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
                 .ok_or(Error::MalformedGovernance(
@@ -118,7 +118,12 @@ impl ChannelState {
             return Ok(HistoryDeclineResult::AuthorizationChanged { current });
         }
         let mut index = self.entries.write(&mut batch, &self.sek, &room)?;
-        if index.history_declined_head(&peer, &author)?
+        let prior = if metadata {
+            index.history_declined_metadata(&peer, &author)?
+        } else {
+            index.history_declined_head(&peer, &author)?
+        };
+        if prior
             == Some((
                 head,
                 expected_authorization,
@@ -131,14 +136,25 @@ impl ChannelState {
                 current,
             });
         }
-        index.keep_history_declined_head(
-            peer,
-            author,
-            head,
-            expected_authorization,
-            peer_incarnation,
-            author_incarnation,
-        )?;
+        if metadata {
+            index.keep_history_declined_metadata(
+                peer,
+                author,
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            )?;
+        } else {
+            index.keep_history_declined_head(
+                peer,
+                author,
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            )?;
+        }
         index.seal()?;
         batch.commit()?;
         self.entries.committed();
@@ -277,37 +293,6 @@ impl ChannelState {
             return None;
         }
         Some((own, committed, head.root.leaves))
-    }
-
-    /// Evidence that a member holds entries of this node's own feed that this node does not
-    /// (ADR-037 R5): a settled own tip above the local contiguous own head, an observed own
-    /// conflict, or an observed signed own head above it. A restored older profile shows
-    /// exactly this; writing on would make it an equivocator (V210-63).
-    pub(crate) fn own_history_conflict(&self, store: &Store) -> Result<bool> {
-        let read = self.history_read(store)?;
-        let own = self.me();
-        let contiguous = self.dag.verified_head(&own);
-        if read
-            .history_settled_tip(&own)?
-            .is_some_and(|tip| tip.skeleton.seq > contiguous)
-        {
-            return Ok(true);
-        }
-        let Some(state) = read.sparse_author(&own, LogScope::Public)? else {
-            return Ok(false);
-        };
-        if state.observed_conflict.is_some() {
-            return Ok(true);
-        }
-        if let Some(observed) = state.observed {
-            if read
-                .history_head(&observed)?
-                .is_some_and(|observed| observed.root.leaves > contiguous)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Settlement from this node's own durable record (ADR-037 R5): a sparse room not yet
@@ -486,15 +471,143 @@ impl ChannelState {
             .transpose()
     }
 
-    pub(crate) fn history_tree_range(
+    /// Return only a retained signed commitment exactly at this node's completed role cut.
+    /// A newer accepted commitment is metadata, not a receipt for its unfinished source.
+    pub(crate) fn history_role_head(
         &self,
         store: &Store,
-        binding: TreeBinding,
-        start: u64,
-        leaves: u64,
-    ) -> Result<Option<Descriptor>> {
-        self.history_read(store)?
-            .history_range(binding, start, leaves)
+        author: &Digest32,
+    ) -> Result<Option<SignedHead>> {
+        let read = self.history_read(store)?;
+        let Some(state) = read.sparse_author(author, LogScope::Public)? else {
+            return Ok(None);
+        };
+        let (through, hash) = read.history_held_through(author).unwrap_or((0, [0; 32]));
+        let source = if through == 0 {
+            None
+        } else {
+            read.history_validated_header(author, through)?
+                .map(|(head, _)| head)
+        };
+        for id in [state.committed, state.control_ready, source]
+            .into_iter()
+            .flatten()
+        {
+            let head = read
+                .history_head(&id)?
+                .ok_or(Error::MalformedAtRest("role receipt head missing"))?;
+            if head.id() != id
+                || head.binding.room != self.channel_id
+                || head.binding.author != *author
+                || head.binding.scope != LogScope::Public
+            {
+                return Err(Error::MalformedAtRest("role receipt head binding"));
+            }
+            if head.root.leaves != through || !read.history_head_committed(&id, head.binding)? {
+                continue;
+            }
+            if through != 0 {
+                let Some(included) = read.history_inclusion_receipt(&id, author, through)? else {
+                    continue;
+                };
+                if included.head_id() != id
+                    || included.binding() != head.binding
+                    || included.root() != head.root
+                    || included.header().entry().skeleton.seq != through
+                {
+                    return Err(Error::MalformedAtRest("role receipt inclusion binding"));
+                }
+                if included.header().entry().entry_hash() != hash {
+                    continue;
+                }
+            }
+            return Ok(Some(head));
+        }
+        Ok(None)
+    }
+
+    /// Metadata-only fallback: an exact sealed inclusion receipt can retain a signed header
+    /// before its source/effect has reached the canonical position index. This never supplies
+    /// Entry/Page bodies or publishes a canonical position.
+    pub(crate) fn history_proof_header(
+        &self,
+        store: &Store,
+        head: &SignedHead,
+        seq: u64,
+    ) -> Result<Option<HistoryHeader>> {
+        let read = self.history_read(store)?;
+        if let Some(entry) = read.history_position_header(&head.binding.author, seq)? {
+            return Ok(Some(HistoryHeader {
+                wire: entry.header_wire(),
+            }));
+        }
+        let Some(included) =
+            read.history_inclusion_receipt(&head.id(), &head.binding.author, seq)?
+        else {
+            return Ok(None);
+        };
+        let entry = included.header().entry();
+        if included.head_id() != head.id()
+            || included.binding() != head.binding
+            || included.root() != head.root
+            || entry.skeleton.channel_id != self.channel_id
+            || entry.skeleton.author_id != head.binding.author
+            || entry.skeleton.seq != seq
+        {
+            return Err(Error::MalformedAtRest("proof header receipt binding"));
+        }
+        Ok(Some(HistoryHeader {
+            wire: entry.header_wire(),
+        }))
+    }
+
+    /// A locally queued receipt probe obeys the same durable exact refusal as wire inventory.
+    pub(crate) fn history_own_receipt_targets(
+        &self,
+        store: &Store,
+        peers: Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
+        head: Digest32,
+        size: u64,
+    ) -> Result<Vec<Digest32>> {
+        // One captured index for all current peers, not a Directory decode per peer.
+        let read = self.history_read(store)?;
+        let authorization = crate::node::history_stream::authorization_generation(
+            store,
+            self.me(),
+            self.channel_id,
+            read.sparse_history_instance(),
+            self.epoch,
+        )?;
+        let mut targets = Vec::new();
+        for (peer, parked) in peers {
+            if !self.is_member(&peer) || self.held_through(&peer).is_some_and(|held| held >= size) {
+                continue;
+            }
+            if parked.is_some_and(|(connection, probe)| {
+                probe.matches(
+                    crate::node::ports::SupportDiscovery {
+                        connection,
+                        instance: read.sparse_history_instance(),
+                        epoch: self.epoch,
+                        authorization,
+                    },
+                    head,
+                    self.history_inventory_incarnation(&peer)
+                        .zip(self.history_author_inventory_incarnation(&self.me())),
+                )
+            }) {
+                continue;
+            }
+            let refused = read.history_declined_head(&peer, &self.me())?;
+            let current = self
+                .history_inventory_incarnation(&peer)
+                .zip(self.history_author_inventory_incarnation(&self.me()))
+                .map(|(peer_life, author_life)| (head, authorization, peer_life, author_life));
+            if refused != current {
+                targets.push(peer);
+            }
+        }
+        Ok(targets)
     }
 
     /// Decode and authenticate one body once under the caller's large-record envelope.

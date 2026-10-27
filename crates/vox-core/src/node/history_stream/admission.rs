@@ -52,12 +52,16 @@ fn invalid(message: &'static str) -> Error {
 pub(super) fn stage(
     room: &ChannelState,
     store: &Store,
-    committed: &std::sync::atomic::AtomicBool,
+    ledgers: (
+        &std::sync::atomic::AtomicBool,
+        &std::sync::atomic::AtomicBool,
+    ),
     request: RequestId,
     generation: Digest32,
     query: &Query,
     object: Object<'_>,
 ) -> Result<Staged> {
+    let (committed, own_observed) = ledgers;
     if room.history_publication_busy(store)? {
         return Ok(Staged::Busy);
     }
@@ -107,6 +111,11 @@ pub(super) fn stage(
                 let conflict = room.history_write_tracked(store, committed, |index| {
                     index.observe_history_head(&verified)
                 })?;
+                if *author == room.me() && !observed_already {
+                    // Set inside the physical callback AFTER commit, even if the following
+                    // proof, wire exchange, cancellation or conflict exit never completes.
+                    own_observed.store(true, std::sync::atomic::Ordering::Release);
+                }
                 if conflict {
                     return Err(invalid("conflicting authenticated heads retained"));
                 }
@@ -398,10 +407,31 @@ pub(super) fn advance(
         overlay.generated.borrow_mut().push((step.hash(), step));
     };
     let generated = overlay.generated.into_inner();
+    // Only completed verifiers expose their exact input/reconstructed ranges. These
+    // objects are serving-only: a signed proof is not a consistency/authority verdict.
+    let ranges = match (&result, &mut cursor) {
+        (ResultStep::Included(_), HistoryVerifier::Inclusion(v)) => v.take_verified_ranges()?,
+        (ResultStep::Prefix(_), HistoryVerifier::Consistency(v)) => v.take_verified_ranges()?,
+        (ResultStep::Controls(_), HistoryVerifier::ControlRange(v)) => v.take_verified_ranges()?,
+        (ResultStep::Missing(_), _) => Vec::new(),
+        _ => return Err(invalid("completed proof range kind")),
+    };
     drop(input);
     let keep_generated = |index: &mut entry_store::Write<'_, '_>| -> Result<()> {
         for (_, context) in &generated {
             index.keep_history_context(context)?;
+        }
+        for (start, descriptor) in &ranges {
+            index.keep_history_proof_range(
+                binding.head,
+                crate::log::history::TreeBinding {
+                    room: binding.room,
+                    scope: LogScope::Public,
+                    author: binding.author,
+                },
+                *start,
+                *descriptor,
+            )?;
         }
         Ok(())
     };

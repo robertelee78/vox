@@ -161,7 +161,7 @@ pub struct TreeBinding {
     pub author: Digest32,
 }
 impl TreeBinding {
-    fn decode(d: &mut Decoder<'_>) -> Result<Self> {
+    pub(crate) fn decode(d: &mut Decoder<'_>) -> Result<Self> {
         arity(d, 4, "tree binding arity")?;
         if d.uint()? != 2 {
             return Err(Error::MalformedBundle("tree binding format"));
@@ -172,7 +172,7 @@ impl TreeBinding {
             author: digest(d)?,
         })
     }
-    fn encode(&self, e: &mut Encoder) {
+    pub(crate) fn encode(&self, e: &mut Encoder) {
         e.array(4)
             .uint(2)
             .bytes(&self.room)
@@ -506,6 +506,29 @@ impl LocalAppendBudget {
     ) -> Result<HistoryStep<ConsistentPrefix>> {
         verifier.advance(source, &mut self.work)
     }
+    pub(crate) fn context(
+        &mut self,
+        source: &impl ContextSource,
+        hash: &Digest32,
+    ) -> Result<Option<ControlContext>> {
+        if !self.work.take_context_load() {
+            return Err(Error::SizeLimitExceeded("local append context quota"));
+        }
+        source.context(hash)
+    }
+
+    /// One bounded right-fold step while verifying a recovered local append forest.
+    /// The same trusted-local quota covers all range/context loads and joins in that pass.
+    pub(crate) fn join_ranges(
+        &mut self,
+        binding: TreeBinding,
+        left: Descriptor,
+        right: Descriptor,
+        source: &impl ContextSource,
+    ) -> Result<HistoryStep<(Descriptor, ControlContext)>> {
+        join_descriptors(binding, left, right, source, &mut self.work)
+    }
+
     pub(crate) fn range(
         &mut self,
         source: &impl TreeRangeSource,
@@ -1250,6 +1273,19 @@ impl IncludedHeader {
     }
 }
 
+/// Maximum transient range trace from one existing bounded proof, including reconstructed
+/// parents. It is not a larger wire allowance or a new scheduling limit.
+pub(crate) const PROOF_RANGE_SLOTS: usize = 2 * MAX_PROOF_TOKENS + 4 * MAX_TREE_DEPTH + 4;
+pub(crate) const PROOF_RANGE_BYTES: usize =
+    PROOF_RANGE_SLOTS * std::mem::size_of::<(u64, Descriptor)>();
+fn retain_range(ranges: &mut Vec<(u64, Descriptor)>, start: u64, value: Descriptor) -> Result<()> {
+    if ranges.len() == PROOF_RANGE_SLOTS {
+        return Err(Error::SizeLimitExceeded("verified proof range trace"));
+    }
+    ranges.push((start, value));
+    Ok(())
+}
+
 /// Bounded inclusion reconstruction. Keep this cursor with its exact immutable proof/head.
 #[derive(Clone, Debug)]
 pub struct InclusionVerifier {
@@ -1260,6 +1296,8 @@ pub struct InclusionVerifier {
     index: u64,
     last: u64,
     current: Option<Descriptor>,
+    // Transient only: publication requires the exact completed root below.
+    ranges: Vec<(u64, Descriptor)>,
 }
 impl InclusionVerifier {
     /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
@@ -1282,6 +1320,17 @@ impl InclusionVerifier {
         if proof.position == proof.size && header.entry().skeleton.epoch != head.head().tail_epoch {
             return Err(Error::MalformedBundle("head terminal epoch mismatch"));
         }
+        let coordinates = inclusion_ranges(proof.position, proof.size)?;
+        if coordinates.len() != proof.siblings.len() {
+            return Err(Error::MalformedBundle("inclusion range count"));
+        }
+        let mut ranges = Vec::with_capacity(2 * MAX_TREE_DEPTH + 1);
+        for (range, descriptor) in coordinates.into_iter().zip(&proof.siblings) {
+            if range.leaves != descriptor.leaves {
+                return Err(Error::MalformedBundle("inclusion range length"));
+            }
+            retain_range(&mut ranges, range.start, *descriptor)?;
+        }
         Ok(Self {
             index: proof.position - 1,
             last: proof.size - 1,
@@ -1290,7 +1339,17 @@ impl InclusionVerifier {
             proof,
             next: 0,
             current: None,
+            ranges,
         })
+    }
+    pub(crate) fn take_verified_ranges(&mut self) -> Result<Vec<(u64, Descriptor)>> {
+        if self.last != 0
+            || self.next != self.proof.siblings.len()
+            || self.current != Some(self.head.head().root)
+        {
+            return Err(Error::MalformedBundle("incomplete inclusion range trace"));
+        }
+        Ok(std::mem::take(&mut self.ranges))
     }
     /// Advance bounded work; persist generated context and cursor before another slice.
     pub fn advance(
@@ -1303,6 +1362,7 @@ impl InclusionVerifier {
             return match leaf_descriptor(binding, self.header.entry(), source, budget)? {
                 HistoryStep::Complete((descriptor, context)) => {
                     self.current = Some(descriptor);
+                    retain_range(&mut self.ranges, self.proof.position, descriptor)?;
                     Ok(HistoryStep::Progress(context))
                 }
                 HistoryStep::MissingContext(hash) => Ok(HistoryStep::MissingContext(hash)),
@@ -1332,6 +1392,14 @@ impl InclusionVerifier {
         };
         match join_descriptors(binding, left, right, source, budget)? {
             HistoryStep::Complete((descriptor, context)) => {
+                let mut start = self.proof.position;
+                for range in inclusion_ranges(self.proof.position, self.proof.size)?
+                    .into_iter()
+                    .take(self.next + 1)
+                {
+                    start = start.min(range.start);
+                }
+                retain_range(&mut self.ranges, start, descriptor)?;
                 self.current = Some(descriptor);
                 self.next += 1;
                 if sibling_left {
@@ -1443,6 +1511,7 @@ pub struct ConsistencyVerifier {
     old_acc: Descriptor,
     new_acc: Descriptor,
     old_joined: bool,
+    ranges: Vec<(u64, Descriptor)>,
 }
 impl ConsistencyVerifier {
     /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
@@ -1483,6 +1552,20 @@ impl ConsistencyVerifier {
         if proof.from > 0 && proof.from < proof.to && proof.nodes.is_empty() {
             return Err(Error::MalformedBundle("empty advancing consistency proof"));
         }
+        let coordinates = consistency_ranges(proof.from, proof.to)?;
+        if coordinates.len() != proof.nodes.len() {
+            return Err(Error::MalformedBundle("consistency range count"));
+        }
+        let mut ranges = Vec::with_capacity(4 * MAX_TREE_DEPTH + 4);
+        if prefix.leaves != 0 {
+            retain_range(&mut ranges, 1, prefix)?;
+        }
+        for (range, descriptor) in coordinates.into_iter().zip(&proof.nodes) {
+            if range.leaves != descriptor.leaves {
+                return Err(Error::MalformedBundle("consistency range length"));
+            }
+            retain_range(&mut ranges, range.start, *descriptor)?;
+        }
         Ok(Self {
             head,
             prefix,
@@ -1493,7 +1576,58 @@ impl ConsistencyVerifier {
             old_acc: acc,
             new_acc: acc,
             old_joined: false,
+            ranges,
         })
+    }
+    pub(crate) fn take_verified_ranges(&mut self) -> Result<Vec<(u64, Descriptor)>> {
+        let complete = if self.proof.from == 0 {
+            self.prefix == Descriptor::empty(self.head.head().binding)
+        } else if self.proof.from == self.proof.to {
+            self.prefix == self.head.head().root
+        } else {
+            !self.old_joined
+                && self.next == self.proof.nodes.len()
+                && self.last == 0
+                && self.old_acc == self.prefix
+                && self.new_acc == self.head.head().root
+        };
+        if !complete {
+            return Err(Error::MalformedBundle("incomplete consistency range trace"));
+        }
+        if self.head.head().root.leaves != 0 {
+            retain_range(&mut self.ranges, 1, self.head.head().root)?;
+        }
+        Ok(std::mem::take(&mut self.ranges))
+    }
+    fn accumulator_starts(&self) -> Result<(u64, u64)> {
+        let ranges = consistency_ranges(self.proof.from, self.proof.to)?;
+        let seeded = self.proof.from != 0
+            && self.proof.from != self.proof.to
+            && !self.proof.from.is_power_of_two();
+        let mut old = if seeded {
+            ranges
+                .first()
+                .ok_or(Error::MalformedBundle("consistency seed range"))?
+                .start
+        } else {
+            1
+        };
+        let mut new = old;
+        for range in ranges.iter().take(self.next).skip(usize::from(seeded)) {
+            if range.start < new {
+                old = old.min(range.start);
+                new = range.start;
+            }
+        }
+        if self.old_joined {
+            old = old.min(
+                ranges
+                    .get(self.next)
+                    .ok_or(Error::MalformedBundle("consistency partial range"))?
+                    .start,
+            );
+        }
+        Ok((old, new))
     }
     /// Advance bounded work; persist generated context and cursor before another slice.
     pub fn advance(
@@ -1545,6 +1679,20 @@ impl ConsistencyVerifier {
         };
         match join_descriptors(binding, left, right, source, budget)? {
             HistoryStep::Complete((descriptor, context)) => {
+                let (old_start, new_start) = self.accumulator_starts()?;
+                let node_start = consistency_ranges(self.proof.from, self.proof.to)?
+                    .get(self.next)
+                    .ok_or(Error::MalformedBundle("consistency node range"))?
+                    .start;
+                retain_range(
+                    &mut self.ranges,
+                    if update_old {
+                        old_start.min(node_start)
+                    } else {
+                        new_start.min(node_start)
+                    },
+                    descriptor,
+                )?;
                 if update_old {
                     self.old_acc = descriptor;
                     self.old_joined = true;
@@ -1748,6 +1896,7 @@ pub struct ControlRangeVerifier {
     next: usize,
     signed_leaf: Option<usize>,
     headers: Vec<VerifiedHeader>,
+    ranges: Vec<(u64, Descriptor)>,
 }
 impl ControlRangeVerifier {
     /// Exact immutable target of an authenticated local checkpoint, checked by its store slot.
@@ -1770,6 +1919,33 @@ impl ControlRangeVerifier {
             start: 1,
             leaves: head.head().root.leaves,
         }];
+        let mut ranges = Vec::with_capacity(PROOF_RANGE_SLOTS);
+        let mut coordinates = vec![(1, head.head().root.leaves)];
+        for token in &proof.tokens {
+            let (start, leaves) = coordinates
+                .pop()
+                .ok_or(Error::MalformedBundle("control trace extra token"))?;
+            match token {
+                ControlToken::Collapse(descriptor) => {
+                    if descriptor.leaves != leaves {
+                        return Err(Error::MalformedBundle("control trace range length"));
+                    }
+                    retain_range(&mut ranges, start, *descriptor)?;
+                }
+                ControlToken::Leaf(_) => {}
+                ControlToken::Branch => {
+                    let left = split(leaves)?;
+                    coordinates.push((start + left, leaves - left));
+                    coordinates.push((start, left));
+                    if coordinates.len() > MAX_TREE_DEPTH + 1 {
+                        return Err(Error::SizeLimitExceeded("control trace depth"));
+                    }
+                }
+            }
+        }
+        if !coordinates.is_empty() {
+            return Err(Error::MalformedBundle("control trace missing token"));
+        }
         Ok(Self {
             head,
             proof,
@@ -1778,7 +1954,17 @@ impl ControlRangeVerifier {
             next: 0,
             signed_leaf: None,
             headers: Vec::new(),
+            ranges,
         })
+    }
+    pub(crate) fn take_verified_ranges(&mut self) -> Result<Vec<(u64, Descriptor)>> {
+        if !self.tasks.is_empty()
+            || self.next != self.proof.tokens.len()
+            || self.values.as_slice() != [self.head.head().root]
+        {
+            return Err(Error::MalformedBundle("incomplete control range trace"));
+        }
+        Ok(std::mem::take(&mut self.ranges))
     }
     /// Advance bounded work; persist generated context and cursor before another slice.
     pub fn advance(
@@ -1822,6 +2008,11 @@ impl ControlRangeVerifier {
                         budget,
                     )? {
                         HistoryStep::Complete((descriptor, context)) => {
+                            let start = self.values[..n - 2]
+                                .iter()
+                                .try_fold(1u64, |start, value| start.checked_add(value.leaves))
+                                .ok_or(Error::MalformedBundle("control trace range overflow"))?;
+                            retain_range(&mut self.ranges, start, descriptor)?;
                             self.values.truncate(n - 2);
                             self.values.push(descriptor);
                             self.tasks.pop();
@@ -1909,6 +2100,7 @@ impl ControlRangeVerifier {
                             }
                             match leaf_descriptor(binding, entry, source, budget)? {
                                 HistoryStep::Complete((descriptor, context)) => {
+                                    retain_range(&mut self.ranges, start, descriptor)?;
                                     self.values.push(descriptor);
                                     self.tasks.pop();
                                     self.headers.push(VerifiedHeader((**entry).clone()));

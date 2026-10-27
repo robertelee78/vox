@@ -465,32 +465,9 @@ impl Node {
         if governance_ready && settle_pending {
             self.settle_sparse_room(&room).await;
         }
-        // The own-history conflict detector (ADR-037 R5): a member seen holding more of this
-        // node's own feed than this node does means a restored older profile. Said once, and
-        // the room refuses this node's writes from here on, instead of letting it equivocate.
         if governance_ready {
-            let noted = match shared.try_lock() {
-                Ok(mut channel) => match channel.uses_sparse_history(&store) {
-                    Ok(true) => match channel.own_history_conflict(&store) {
-                        Ok(true) => channel.note_own_history_behind(&store).unwrap_or(false),
-                        _ => false,
-                    },
-                    _ => false,
-                },
-                Err(_) => false,
-            };
-            if noted {
-                // One fact, one sentence: the detector says what every refused write will say
-                // (`Error::OwnHistoryBehind`), once. It used to say it in other words, and the
-                // sentence a person then searched for appeared only where a refusal leaked.
-                let _ = self.event_tx.send(NodeEvent::NodeNote {
-                    note: format!(
-                        "room {}: {}",
-                        crate::node::link::b32_encode(&room),
-                        crate::error::Error::OwnHistoryBehind
-                    ),
-                });
-            }
+            self.advance_own_recovery(room).await;
+            self.advance_support_discovery(room);
         }
         if governance_ready
             && (governance_changed || self.governance_work.consent_after.contains_key(&room))
@@ -529,6 +506,108 @@ impl Node {
         }
         if governance_changed || backfilled > 0 || legacy_finished || views_finished {
             self.publish().await;
+        }
+    }
+}
+
+impl Node {
+    /// New targets, real role-prefix progress and reopen are producer edges. Equal observations
+    /// leave the existing immutable owner alone; a missing donor does not make a polling loop.
+    pub(super) async fn advance_own_recovery(&mut self, room: Digest32) {
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        if self.locking != 0 || profile.signer().is_err() {
+            return;
+        }
+        let Some(shared) = self.channels.get(&room).cloned() else {
+            return;
+        };
+        let store = profile.store_handle();
+        let now = self.now_ms();
+        let (changed, completed, receiver_changed, key) = {
+            let Ok(mut channel) = shared.try_lock() else {
+                // A read-only holder need not publish another event. Retain this exact room's
+                // release edge off actor; no other room or command waits on this mutex.
+                self.bounded_sync.wait_for_own_recovery_room(
+                    &self.net_tx,
+                    &mut self.next_token,
+                    profile.fingerprint(),
+                    room,
+                    shared.clone(),
+                );
+                return;
+            };
+            if !matches!(channel.uses_sparse_history(&store), Ok(true)) {
+                return;
+            }
+            let changed = match channel.refresh_own_recovery(&store) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    channel.poison(&error);
+                    return;
+                }
+            };
+            let (completed, receiver_changed) = match self.with_current_computer_authority(|| {
+                let receiver_changed = channel.prepare_own_recovery_receiver(profile)?;
+                channel
+                    .complete_own_recovery(profile, now)
+                    .map(|done| (done, receiver_changed))
+                    .or_else(|error| {
+                        if matches!(error, crate::error::Error::OwnHistoryBehind) {
+                            Ok((false, receiver_changed))
+                        } else {
+                            Err(error)
+                        }
+                    })
+            }) {
+                Some(Ok(result)) => result,
+                Some(Err(error)) => {
+                    channel.poison(&error);
+                    (false, false)
+                }
+                None => (false, false),
+            };
+            let key = match channel.own_recovery_key(&store) {
+                Ok(key) => key,
+                Err(error) => {
+                    channel.poison(&error);
+                    return;
+                }
+            };
+            (changed, completed, receiver_changed, key)
+        };
+        if receiver_changed {
+            // The committed key/cursor is the producer for ordinary bounded backfill.
+            self.governance_work.wake_room(room);
+        }
+        if completed {
+            self.note_local_governance_append(&room);
+        }
+        let progress = match key {
+            Some(key) => self.own_recovery_rooms.insert(room, key) != Some(key),
+            None => {
+                self.own_recovery_rooms.remove(&room);
+                false
+            }
+        };
+        if progress {
+            for ((r, _), port) in &mut self.ports {
+                if *r == room {
+                    port.raise();
+                }
+            }
+            self.sched_rooms.insert(room);
+        }
+        if changed || completed {
+            let note = if completed {
+                "this node recovered its own history; it can write here again"
+            } else {
+                "this node is behind its own history; it cannot write here until recovery completes"
+            };
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!("room {}: {note}", crate::node::link::b32_encode(&room)),
+            });
         }
     }
 }

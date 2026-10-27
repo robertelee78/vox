@@ -147,6 +147,26 @@ fn body_slot(purpose: Purpose) -> Option<usize> {
     }
 }
 
+/// Only persisted cursor/body progress counts; activating a request or serial changes do not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnRecoveryCheckpoint {
+    remaining: usize,
+    next: u64,
+    body: Option<(u64, u64)>,
+}
+impl OwnRecoveryCheckpoint {
+    pub(crate) fn of(state: &demand::State) -> Self {
+        Self {
+            remaining: state.remaining,
+            next: state
+                .cursor
+                .as_ref()
+                .map_or(state.bounds.hi, |cursor| cursor.next_seq),
+            body: state.body.as_ref().map(|body| (body.seq, body.offset)),
+        }
+    }
+}
+
 pub(crate) struct Flow {
     pub(crate) room: Digest32,
     pub(crate) peer: Digest32,
@@ -156,6 +176,11 @@ pub(crate) struct Flow {
     pub(crate) generation: Digest32,
     pub(crate) shared: Arc<Mutex<ChannelState>>,
     pub(crate) archive: bool,
+    pub(crate) automatic_own_recovery: bool,
+    pub(crate) own_recovery_cleanup: bool,
+    pub(crate) own_recovery_trigger: Option<Digest32>,
+    pub(crate) own_recovery_checkpoint: Option<OwnRecoveryCheckpoint>,
+    pub(crate) own_recovery_progress: bool,
     pub(crate) inventory: bool,
     /// This node has a key delivery to the peer waiting on its prekey bundle (ADR-038 FX-35):
     /// the round reads the peer's board whatever kind of flow this is, until the bundle is
@@ -167,6 +192,13 @@ pub(crate) struct Flow {
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
     pub(crate) hint: Option<super::HeadHint>,
+    /// Canonical local recovery proof root, not a consumed advisory inbox item.
+    pub(crate) local_own_verification: bool,
+    pub(crate) local_own_discovery: bool,
+    /// A newly constructed inventory took precedence over an already eligible local probe.
+    /// Its real completion owns exactly one subsequent port request.
+    pub(crate) local_own_after_inventory: bool,
+    discovery_reply: Option<(super::HeadHint, u64)>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
     pub(crate) hint_peer: Digest32,
@@ -192,6 +224,12 @@ pub(crate) struct Flow {
     /// Set at the durable/user-visible work edge and drained by the actor before it classifies
     /// the worker result. This survives any later cancellation, error or supersession.
     pub(crate) work_committed: Arc<std::sync::atomic::AtomicBool>,
+    /// Changed, signature-verified own observation committed by the physical receiver.
+    pub(crate) own_head_observed: Arc<std::sync::atomic::AtomicBool>,
+    /// Exact connection which returned unavailable for this startup metadata probe.
+    pub(crate) discovery_unavailable: Option<u64>,
+    pub(crate) discovery_incarnations: Option<(u64, u64)>,
+    pub(crate) receipt_lower: Option<(u64, (u64, u64))>,
     /// Exact unavailable advertised heads declined during this retained flow. The actor reports
     /// the outcome through the lane in `vox status --json`.
     pub(crate) declined: u64,
@@ -311,6 +349,14 @@ pub(crate) enum Resumed {
 }
 
 impl Flow {
+    pub(crate) fn local_own_root(&self) -> bool {
+        self.local_own_verification || self.local_own_discovery
+    }
+    pub(crate) fn completed_support_discovery(&self) -> Option<u64> {
+        self.discovery_reply
+            .filter(|(head, _)| self.local_own_discovery && Some(*head) == self.authenticated_head)
+            .map(|(_, connection)| connection)
+    }
     pub(crate) fn root_name(&self) -> &'static str {
         if self.announcement_pending() && self.announcement_can_run() {
             "inventory"
@@ -345,6 +391,8 @@ impl Flow {
         live: Arc<Context>,
         control: Arc<Context>,
         hint: Option<super::HeadHint>,
+        local_own_verification: bool,
+        local_own_discovery: bool,
         departure_probe: bool,
         required: Option<(Digest32, u64)>,
         slots: Arc<BodySlots>,
@@ -352,6 +400,15 @@ impl Flow {
         cleanup_budget: Arc<crate::node::history_budget::Budget>,
         actor_incarnation: Option<u64>,
     ) -> Result<Self> {
+        if (local_own_verification || local_own_discovery)
+            && (hint.is_none_or(|hint| hint.author != node)
+                || departure_probe
+                || required.is_some())
+        {
+            return Err(Error::Profile(
+                "own verification root is not an exact local head",
+            ));
+        }
         let request = request_id()?;
         let mut flow = Self {
             room,
@@ -362,6 +419,11 @@ impl Flow {
             generation: [0; 32],
             shared,
             archive: false,
+            automatic_own_recovery: false,
+            own_recovery_cleanup: false,
+            own_recovery_trigger: None,
+            own_recovery_checkpoint: None,
+            own_recovery_progress: false,
             inventory: hint.is_none() && required.is_none(),
             wants_board: false,
             departure_probe,
@@ -369,6 +431,10 @@ impl Flow {
             required_root: required,
             state_charge: None,
             hint,
+            local_own_verification,
+            local_own_discovery,
+            local_own_after_inventory: false,
+            discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
@@ -380,6 +446,10 @@ impl Flow {
             governance: false,
             brought: false,
             work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            discovery_unavailable: None,
+            discovery_incarnations: None,
+            receipt_lower: None,
             declined: 0,
             offered: 0,
             rearmed: 0,
@@ -454,8 +524,32 @@ impl Flow {
             }
             flow.push(Task {
                 request,
-                purpose: Purpose::Control,
-                operation: Operation::Wire(Query::Head(hint.author)),
+                purpose: if local_own_discovery {
+                    Purpose::Live
+                } else {
+                    Purpose::Control
+                },
+                // Ordinary inventory hints ask which head the peer currently serves. A
+                // recovery root already names a locally verified signed Head: asking Head
+                // here could retarget it to a lower reply forever. Start its existing exact
+                // header/inclusion/consistency promotion path instead; no body is requested.
+                operation: Operation::Wire(if local_own_verification {
+                    if hint.size == 0 {
+                        Query::Proof {
+                            head: hint.head,
+                            kind: super::ProofKind::Consistency,
+                            from: 0,
+                            to: 0,
+                        }
+                    } else {
+                        Query::Header {
+                            head: hint.head,
+                            seq: hint.size,
+                        }
+                    }
+                } else {
+                    Query::Head(hint.author)
+                }),
             })?;
         } else {
             flow.push(Task {
@@ -494,6 +588,11 @@ impl Flow {
             generation,
             shared,
             archive: true,
+            automatic_own_recovery: false,
+            own_recovery_cleanup: false,
+            own_recovery_trigger: None,
+            own_recovery_checkpoint: None,
+            own_recovery_progress: false,
             inventory: false,
             wants_board: false,
             departure_probe: false,
@@ -501,6 +600,10 @@ impl Flow {
             required_root: None,
             state_charge: None,
             hint: None,
+            local_own_verification: false,
+            local_own_discovery: false,
+            local_own_after_inventory: false,
+            discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
@@ -512,6 +615,10 @@ impl Flow {
             governance: false,
             brought: false,
             work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            discovery_unavailable: None,
+            discovery_incarnations: None,
+            receipt_lower: None,
             declined: 0,
             offered: 0,
             rearmed: 0,
@@ -738,8 +845,24 @@ impl Flow {
         author: Digest32,
         head: Digest32,
     ) -> Result<bool> {
+        if self.local_own_discovery {
+            // Startup metadata discovery is scoped to the selected connection, not the old
+            // durable receipt/proof operation. Actor retains its unavailable disposition on
+            // that Port; a genuine reconnect can obtain newly available signed metadata.
+            return Ok(true);
+        }
+        // A metadata root is a separate operation from the old ambiguous body/inventory
+        // decision. Retain one exact disposition for its whole immutable verification chain.
+        let (author, head) = if self.local_own_root() {
+            let hint = self
+                .hint
+                .ok_or(Error::Profile("own metadata refusal root missing"))?;
+            (hint.author, hint.head)
+        } else {
+            (author, head)
+        };
         let remembered = match source
-            .remember_decline(job, author, head, self.request)
+            .remember_decline(job, author, head, self.request, self.local_own_root())
             .await
         {
             Ok(super::source::DeclineResult::Stored {
@@ -780,7 +903,9 @@ impl Flow {
                 return Ok(false);
             }
         };
-        inbox.finish(self.room, source.peer, author, head);
+        if !self.local_own_root() {
+            inbox.finish(self.room, source.peer, author, head);
+        }
         self.declined = self.declined.saturating_add(u64::from(remembered));
         Ok(true)
     }
@@ -926,6 +1051,13 @@ impl Flow {
             _ => None,
         }
     }
+    /// Only the controller retirement owner may execute a recovered deletion capability.
+    pub(crate) fn mark_own_recovery_cleanup(&mut self) {
+        self.own_recovery_cleanup = true;
+        self.initialized = true;
+        self.tasks.clear();
+    }
+
     pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
         use crate::node::history_budget::Lane;
         match self
@@ -997,6 +1129,8 @@ impl Flow {
             self.live.clone().map(|stage| (Purpose::Live, stage))
         } else if reclaim_control && self.control.is_some() {
             self.control.clone().map(|stage| (Purpose::Control, stage))
+        } else if self.automatic_own_recovery {
+            self.history.clone().map(|stage| (Purpose::History, stage))
         } else {
             None
         };
@@ -1105,7 +1239,10 @@ impl Flow {
                     match purpose {
                         Purpose::Live => self.live = None,
                         Purpose::Control => self.control = None,
-                        Purpose::History => unreachable!(),
+                        // Automatic own recovery owns a real History staging slot too.
+                        // Drop it only after exact-request retirement finished; the next
+                        // slice can then clean this Flow's source/verifier owners.
+                        Purpose::History => self.history = None,
                     }
                 }
                 return Ok(RetirementStep::Progress);
@@ -1218,6 +1355,7 @@ impl Flow {
             fence,
             deadline,
             Arc::clone(&self.work_committed),
+            Arc::clone(&self.own_head_observed),
         )
     }
     fn binding(&self) -> Binding {
@@ -2189,8 +2327,21 @@ impl Flow {
                     for head in &result.heads {
                         if head.author == author {
                             if author == self.node {
-                                self.mine_held =
-                                    Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
+                                if self.local_own_discovery {
+                                    self.discovery_reply = Some((*head, conn.serial()));
+                                }
+                                if task.purpose == Purpose::Control && !self.local_own_discovery {
+                                    if self.hint.is_some_and(|hint| {
+                                        hint.author == author && hint.size > head.size
+                                    }) {
+                                        self.receipt_lower = result
+                                            .own_head_incarnations
+                                            .map(|incarnations| (conn.serial(), incarnations));
+                                    }
+                                    self.mine_held = Some(
+                                        self.mine_held.map_or(head.size, |m| m.max(head.size)),
+                                    );
+                                }
                             }
                             // A repeated signed head remains the peer's exact current answer.
                             // Busy handling below retains the dependency and applies the named
@@ -2328,6 +2479,9 @@ impl Flow {
                     ));
                 }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
+                    if self.local_own_discovery {
+                        self.discovery_unavailable = Some(conn.serial());
+                    }
                     if matches!(query, Query::Head(author) if (author == self.peer || author == self.node) && self.hint.is_some_and(|hint| hint.author == author))
                         && !self.departure_probe
                         && self.last_head.is_none()
@@ -2971,78 +3125,81 @@ impl Flow {
         };
         let job = job.clone();
         let next = self.archive_next;
-        self.archive_status = Some(
-            tokio::task::spawn_blocking(
-                move || -> Result<crate::node::api::HistoryDemandStatus> {
-                    let mut snapshot = demand::inspect(&staging.context, &job)?
-                        .ok_or(Error::Profile("archive state missing"))?;
-                    let mut active = staging
-                        .active
-                        .lock()
-                        .map_err(|_| Error::Profile("history activation lock failed"))?;
-                    if snapshot.state().request != active.request()
-                        || snapshot.state().binding != active.binding()
-                    {
-                        return Err(Error::Profile("archive finalization activation changed"));
-                    }
-                    // Role-only admission can already have completed this request. A terminal
-                    // or deliberately paused activation is a durable result, never permission
-                    // to checkpoint again through an invalid live handle.
-                    if active.matches(snapshot.state())
-                        && snapshot.state().body.is_none()
-                        && !snapshot.state().reclaiming()
-                    {
-                        if let Some(next) = next {
-                            // This branch ends More/Complete, so it never needs a subsequent
-                            // pause. Prepay only its work and single reload before the commit.
-                            let work = demand::AdmissionCharge::reserve(&job)?;
-                            let reload = demand::AdmissionCharge::reserve(&job)?;
-                            let state = snapshot.state();
-                            let cursor = (next >= state.bounds.lo && state.remaining > 0)
-                                .then_some(super::Continuation {
-                                    query_kind: 4,
-                                    head: state.bounds.head,
-                                    lo: state.bounds.lo,
-                                    hi: state.bounds.hi,
-                                    next_seq: next,
-                                    entry: None,
-                                    offset: 0,
-                                    entries_remaining: state.remaining,
-                                });
-                            demand::checkpoint_precharged(
-                                &staging.context,
-                                &mut active,
-                                if cursor.is_some() {
-                                    demand::Progress::More
-                                } else {
-                                    demand::Progress::Complete
-                                },
-                                cursor.as_ref(),
-                                &work,
-                            )?;
-                            snapshot = demand::inspect_precharged(&staging.context, reload)?
-                                .ok_or(Error::Profile("archive state missing"))?;
-                        }
-                    }
-                    if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
+        let initial = self.own_recovery_checkpoint;
+        let (status, progressed) = tokio::task::spawn_blocking(
+            move || -> Result<(crate::node::api::HistoryDemandStatus, bool)> {
+                let mut snapshot = demand::inspect(&staging.context, &job)?
+                    .ok_or(Error::Profile("archive state missing"))?;
+                let mut active = staging
+                    .active
+                    .lock()
+                    .map_err(|_| Error::Profile("history activation lock failed"))?;
+                if snapshot.state().request != active.request()
+                    || snapshot.state().binding != active.binding()
+                {
+                    return Err(Error::Profile("archive finalization activation changed"));
+                }
+                // Role-only admission can already have completed this request. A terminal
+                // or deliberately paused activation is a durable result, never permission
+                // to checkpoint again through an invalid live handle.
+                if active.matches(snapshot.state())
+                    && snapshot.state().body.is_none()
+                    && !snapshot.state().reclaiming()
+                {
+                    if let Some(next) = next {
+                        // This branch ends More/Complete, so it never needs a subsequent
+                        // pause. Prepay only its work and single reload before the commit.
                         let work = demand::AdmissionCharge::reserve(&job)?;
                         let reload = demand::AdmissionCharge::reserve(&job)?;
-                        // This explicit quantum has ended; no worker will silently retry it.
-                        // Keep its exact body/cursor and make Resume the next action.
-                        demand::pause_precharged(&staging.context, &mut active, &work)?;
+                        let state = snapshot.state();
+                        let cursor = (next >= state.bounds.lo && state.remaining > 0).then_some(
+                            super::Continuation {
+                                query_kind: 4,
+                                head: state.bounds.head,
+                                lo: state.bounds.lo,
+                                hi: state.bounds.hi,
+                                next_seq: next,
+                                entry: None,
+                                offset: 0,
+                                entries_remaining: state.remaining,
+                            },
+                        );
+                        demand::checkpoint_precharged(
+                            &staging.context,
+                            &mut active,
+                            if cursor.is_some() {
+                                demand::Progress::More
+                            } else {
+                                demand::Progress::Complete
+                            },
+                            cursor.as_ref(),
+                            &work,
+                        )?;
                         snapshot = demand::inspect_precharged(&staging.context, reload)?
                             .ok_or(Error::Profile("archive state missing"))?;
                     }
-                    Ok(crate::node::actor::saved_history_status(
-                        snapshot.state(),
-                        None,
-                        Some(&active),
-                    ))
-                },
-            )
-            .await
-            .map_err(|_| Error::Profile("history status worker stopped"))??,
-        );
+                }
+                if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
+                    let work = demand::AdmissionCharge::reserve(&job)?;
+                    let reload = demand::AdmissionCharge::reserve(&job)?;
+                    // This explicit quantum has ended; no worker will silently retry it.
+                    // Keep its exact body/cursor and make Resume the next action.
+                    demand::pause_precharged(&staging.context, &mut active, &work)?;
+                    snapshot = demand::inspect_precharged(&staging.context, reload)?
+                        .ok_or(Error::Profile("archive state missing"))?;
+                }
+                let progressed =
+                    initial.is_some_and(|old| old != OwnRecoveryCheckpoint::of(snapshot.state()));
+                Ok((
+                    crate::node::actor::saved_history_status(snapshot.state(), None, Some(&active)),
+                    progressed,
+                ))
+            },
+        )
+        .await
+        .map_err(|_| Error::Profile("history status worker stopped"))??;
+        self.archive_status = Some(status);
+        self.own_recovery_progress = progressed;
         Ok(())
     }
 }

@@ -841,6 +841,17 @@ impl RenderView<'_> {
     fn roots(&self) -> Roots {
         self.order.read.directory.active.rendered
     }
+    pub(crate) fn author_backfill_pending(&self, author: &Digest32) -> Result<bool> {
+        Ok(self
+            .source()
+            .number(
+                self.order.read.sek,
+                self.order.read.channel,
+                self.roots().backfill,
+                &hashed(author),
+            )?
+            .is_some())
+    }
     pub(crate) fn has_backfill(&self) -> bool {
         self.roots().backfill != 0
     }

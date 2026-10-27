@@ -60,9 +60,13 @@ mod local_history;
 pub(crate) use legacy_sync::LegacySync;
 mod private_session;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
+mod own_history;
+mod proof_range;
+pub(crate) use proof_range::{ProofRangeRestore, ProofRangeStep};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
+pub(crate) use own_history::OwnRecoveryPage;
 pub(crate) use sparse_history::{
     HistoryDeclineResult, HistoryEffectCursor, HistoryEffectProgress, HistoryPayload,
     HistorySourceStart,
@@ -1126,6 +1130,7 @@ pub struct ChannelState {
     /// A member holds entries of this node's own feed here that this node does not (ADR-037
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
+    own_recovery: own_history::Recovery,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
@@ -1651,9 +1656,30 @@ pub(crate) fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, Composite
 /// [`ReceiverChain::to_state`] blob (which carries its own author/chain binding).
 /// Secret-bearing, so the assembled buffer zeroizes on drop.
 fn receivers_bytes(receivers: &BTreeMap<(Digest32, u64), ReceiverChain>) -> Zeroizing<Vec<u8>> {
+    receivers_bytes_with(receivers, None)
+}
+
+/// Serialize a candidate without publishing it in memory before the receiver/backfill commit.
+fn receivers_bytes_with(
+    receivers: &BTreeMap<(Digest32, u64), ReceiverChain>,
+    replacement: Option<(&(Digest32, u64), &ReceiverChain)>,
+) -> Zeroizing<Vec<u8>> {
+    let count = receivers.len()
+        + usize::from(replacement.is_some_and(|(slot, _)| !receivers.contains_key(slot)));
     let mut e = Encoder::for_secrets();
-    e.array(2).uint(RECEIVERS_VERSION).array(receivers.len());
-    for chain in receivers.values() {
+    e.array(2).uint(RECEIVERS_VERSION).array(count);
+    let mut pending = replacement;
+    for (slot, chain) in receivers {
+        if let Some((new_slot, new_chain)) = pending.filter(|(new_slot, _)| *new_slot <= slot) {
+            e.bytes(&new_chain.to_state());
+            pending = None;
+            if new_slot == slot {
+                continue;
+            }
+        }
+        e.bytes(&chain.to_state());
+    }
+    if let Some((_, chain)) = pending {
         e.bytes(&chain.to_state());
     }
     Zeroizing::new(e.finish())
@@ -2045,6 +2071,7 @@ impl ChannelState {
                 governance::ConsentFacts::empty(),
             ))),
             own_behind: false,
+            own_recovery: own_history::Recovery::UnknownBehind,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
@@ -2526,9 +2553,25 @@ impl ChannelState {
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?
             .is_none();
         // A profile seen to be behind its own history here stays so across reopen (ADR-037 R5).
-        let own_behind = store
-            .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?
-            .is_some();
+        let own_recovery = store
+            .snapshot()?
+            .get_segment_bounded(
+                channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_OWN_BEHIND,
+                crate::log::history::MAX_HEADER_BYTES + 64,
+            )?
+            .map(|segment| {
+                own_history::Recovery::parse(&open_segment(
+                    &sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_OWN_BEHIND,
+                    &segment,
+                )?)
+            })
+            .transpose()?;
+        let own_behind = own_recovery.is_some();
+        let own_recovery = own_recovery.unwrap_or(own_history::Recovery::UnknownBehind);
         // The fork proofs this room kept (V210-63), each checked as a new one would be: a proof
         // that does not verify is a tampered store, as a stored entry that fails acceptance is.
         let mut forks_kept = 0usize;
@@ -2751,6 +2794,7 @@ impl ChannelState {
             governance_ready: false,
             consent_facts,
             own_behind,
+            own_recovery,
             presence,
             sparse_applied_tips,
             sparse_contiguous_pending,
@@ -3022,6 +3066,7 @@ impl ChannelState {
                 governance::ConsentFacts::empty(),
             ))),
             own_behind: false,
+            own_recovery: own_history::Recovery::UnknownBehind,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
@@ -4545,7 +4590,7 @@ impl ChannelState {
         now_ms: u64,
         narrowing: bool,
     ) -> Result<u64> {
-        self.rotate_sender_with_presence(profile, next, now_ms, narrowing, false)
+        self.rotate_sender_with_presence(profile, next, now_ms, narrowing, false, false)
     }
 
     fn rotate_sender_with_presence(
@@ -4555,6 +4600,7 @@ impl ChannelState {
         now_ms: u64,
         narrowing: bool,
         settle_sparse: bool,
+        recover_own: bool,
     ) -> Result<u64> {
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
@@ -4663,6 +4709,7 @@ impl ChannelState {
                 settle_sparse,
                 Some((next, origins)),
                 settle_sparse,
+                recover_own,
             )?;
         } else {
             let persisted = (|| -> Result<()> {
@@ -6690,7 +6737,9 @@ impl ChannelState {
         now_ms: u64,
         rows: &[(u64, SealedSegment)],
     ) -> Result<Digest32> {
-        self.append_governance_with_sender(profile, payload, now_ms, rows, false, None, false)
+        self.append_governance_with_sender(
+            profile, payload, now_ms, rows, false, None, false, false,
+        )
     }
 
     /// Non-mutating command eligibility shared with same-policy no-op decisions.
@@ -6700,13 +6749,26 @@ impl ChannelState {
         profile: &Profile,
         settle_sparse: bool,
     ) -> Result<()> {
+        self.ensure_governance_append_eligible_for(profile, settle_sparse, false)
+    }
+
+    fn ensure_governance_append_eligible_for(
+        &self,
+        profile: &Profile,
+        settle_sparse: bool,
+        recover_own: bool,
+    ) -> Result<()> {
         if self.poisoned {
             return Err(self.save_failure());
         }
         if !self.settled && !settle_sparse {
             return Err(Error::RoomNotSynced);
         }
-        self.require_own_history_current()?;
+        if recover_own {
+            self.require_own_recovery_complete(profile.store())?;
+        } else {
+            self.require_own_history_current()?;
+        }
         if settle_sparse && (!self.uses_sparse_history(profile.store())? || self.settled) {
             return Err(Error::MalformedBundle("sparse settlement state differs"));
         }
@@ -6732,9 +6794,10 @@ impl ChannelState {
         settle_sparse: bool,
         sender: Option<(SenderChain, OriginKeyStore)>,
         after_departure: bool,
+        recover_own: bool,
     ) -> Result<Digest32> {
-        self.ensure_local_append_available_for(profile.store(), after_departure)?;
-        self.ensure_governance_append_eligible(profile, settle_sparse)?;
+        self.ensure_local_append_available_mode(profile.store(), after_departure, recover_own)?;
+        self.ensure_governance_append_eligible_for(profile, settle_sparse, recover_own)?;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         let skeleton = self.next_skeleton(profile, &me, payload, now_ms)?;
@@ -6752,6 +6815,9 @@ impl ChannelState {
         let written = (|| -> Result<()> {
             self.prepare_local_entry(profile, &entry, kind, &key, now_ms)?;
             let mut batch = profile.store().batch()?;
+            if recover_own {
+                self.check_own_recovery_marker_in(&batch)?;
+            }
             let settlement = self.publish_entry_into(&mut batch, &entry)?;
             self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
             batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
@@ -6761,10 +6827,16 @@ impl ChannelState {
             if settle_sparse {
                 batch.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?;
             }
+            if recover_own {
+                batch.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?;
+            }
             self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
         })();
         if let Err(e) = written {
+            if matches!(e, Error::OwnHistoryBehind) {
+                return Err(e);
+            }
             self.poisoned = true;
             self.save_error = Some(e.to_string());
             return Err(e);
@@ -6775,6 +6847,10 @@ impl ChannelState {
         }
         if settle_sparse {
             self.settled = true;
+        }
+        if recover_own {
+            self.own_behind = false;
+            self.own_recovery = own_history::Recovery::UnknownBehind;
         }
         self.entries.committed();
         self.next_log_id = id.saturating_add(1);
@@ -7558,7 +7634,10 @@ impl ChannelState {
     ) -> Result<usize> {
         self.legacy_cache_trusted = Some(trusted.clone());
         let before = self.receivers.len();
-        self.receivers.retain(|(a, _), _| trusted.contains(a));
+        let me = self.me();
+        // Locally authenticated own-history receivers are not third-party trust grants.
+        self.receivers
+            .retain(|(a, _), _| *a == me || trusted.contains(a));
         let dropped = before - self.receivers.len();
         if dropped > 0 {
             self.persist_receivers(store)?;
@@ -7779,9 +7858,20 @@ impl ChannelState {
         if let Some(unsaid) = self.drive.change_unsaid {
             return Ok(unsaid);
         }
-        let live = self.drive.chain.as_ref().map(SenderChain::chain_id);
+        let Some(live) = self
+            .drive
+            .chain
+            .as_ref()
+            .map(SenderChain::chain_id)
+            .filter(|g| *g > 0)
+        else {
+            // No key (or the initial generation) cannot owe a key-change notice.
+            // Its answer must not depend on an unrelated legacy control scan.
+            self.drive.change_unsaid = Some(false);
+            return Ok(false);
+        };
         let used = self.drive_used(store)?;
-        let unsaid = live.is_some_and(|g| g > 0 && used.is_none_or(|u| u < g));
+        let unsaid = used.is_none_or(|u| u < live);
         self.drive.change_unsaid = Some(unsaid);
         Ok(unsaid)
     }
@@ -8569,6 +8659,11 @@ impl ChannelState {
             }
         }
         let Some(chain) = self.receivers.get_mut(&slot) else {
+            if author == me && self.own_behind {
+                // Retaining ciphertext is not readable recovery. A generation minted after
+                // the backup may have no local origin; never give it a role-complete receipt.
+                return Ok(ContentProjection::Unavailable);
+            }
             // Park on the missing fact. Installing or widening an SKDM queues this author in
             // the same durable transaction as the receiver chain. ChannelState is serialized,
             // so a key cannot commit and drain between this check and this row's acceptance.
@@ -10065,6 +10160,7 @@ impl ChannelState {
             false,
             None,
             here,
+            false,
         )?;
         Ok(true)
     }
@@ -10104,7 +10200,7 @@ impl ChannelState {
             .checked_add(1)
             .ok_or(Error::MalformedBundle("chain_id overflow"))?;
         let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now.get())?;
-        self.rotate_sender_with_presence(profile, next, now.get(), false, true)?;
+        self.rotate_sender_with_presence(profile, next, now.get(), false, true, false)?;
         Ok(true)
     }
 
@@ -10126,22 +10222,6 @@ impl ChannelState {
             return Err(Error::OwnHistoryBehind);
         }
         Ok(())
-    }
-
-    /// Record, durably, that a member holds more of this node's own feed than this node does
-    /// (ADR-037 R5). Nothing here writes again until the person resolves it. Whether new.
-    pub(crate) fn note_own_history_behind(&mut self, store: &Store) -> Result<bool> {
-        if self.own_behind {
-            return Ok(false);
-        }
-        store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_OWN_BEHIND,
-            &seal_segment(&self.sek, SegmentKind::KeyMaterial, SEG_OWN_BEHIND, &[1])?,
-        )?;
-        self.own_behind = true;
-        Ok(true)
     }
 
     /// A sync with another member ended cleanly: this node holds its own feed as the room does,
