@@ -377,6 +377,13 @@ pub enum Error {
     #[error("another vox already has this node open")]
     ProfileBusy,
 
+    /// An attempted recovery of the original store failed; retain the underlying fault.
+    #[error("{source}")]
+    OriginalStoreReopen {
+        /// The underlying reason the store could not be reopened.
+        source: Box<Error>,
+    },
+
     /// The node's persistent store (ADR-016) failed an operation: opening or
     /// creating the file, a transaction, or a table access. `op` is a static
     /// description of what was attempted; `detail` carries the engine's message

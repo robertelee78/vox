@@ -937,8 +937,13 @@ impl Store {
                 detail: "store ownership changed while reopening".into(),
             });
         }
-        let db = open_database(&self.path).map_err(open_error)?;
-        super::paths::set_private_file_mode(&self.path)?;
+        let reopen_error = |source| Error::OriginalStoreReopen {
+            source: Box::new(source),
+        };
+        let db = open_database(&self.path)
+            .map_err(open_error)
+            .map_err(reopen_error)?;
+        super::paths::set_private_file_mode(&self.path).map_err(reopen_error)?;
         *backing = Backing::Writable(self.keep_profile(db));
         epochs.reopen_original = false;
         epochs.reopen_completed = epochs.reopen_generation;

@@ -1265,7 +1265,30 @@ impl Flow {
                 .map(|(done, next)| Slice::Source(done, next))
         })
         .await
-        .map_err(|_| Error::Profile("history retirement worker stopped"))??;
+        .map_err(|_| Error::Profile("history retirement worker stopped"))?;
+        let step = match step {
+            Ok(step) => step,
+            Err(error @ Error::OriginalStoreReopen { .. }) => {
+                // Reopening can become necessary after the initial settlement snapshot.
+                // Only this specific failure owns a reopen wake; unrelated cleanup failures
+                // must retain their original recovery behavior.
+                let store = Arc::clone(&self.cleanup_store);
+                let received = self.received.clone();
+                match tokio::task::spawn_blocking(move || store.received_settlement(&received))
+                    .await
+                {
+                    Ok(mut failed) => {
+                        failed.debt = None;
+                        self.failed_settlement = Some(failed);
+                    }
+                    Err(snapshot_error) => eprintln!(
+                        "vox: history reopen recovery snapshot worker stopped: {snapshot_error}"
+                    ),
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let (done, next) = match step {
             Slice::Gone => {
                 self.cancel();
