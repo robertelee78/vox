@@ -238,6 +238,7 @@ final class NodeModel: ObservableObject {
     /// read (ADR-037 R3): the page is provisional, and the timeline says so.
     @Published private(set) var roomProvisional = false
     private var roomBefore: String?
+    var selectedRoomInstance: Data? { roomInstance }
     private var roomInstance: Data? {
         didSet {
             if oldValue != roomInstance {
@@ -1168,7 +1169,8 @@ final class NodeModel: ObservableObject {
                 } else {
                     await self.readFacts()
                 }
-                guard self.daemonReachable else { continue }
+                guard self.daemonReachable, self.ended == nil,
+                      !self.observationNeedsRestart, !self.roomNeedsPage else { continue }
                 await self.readWaiting()
                 if self.showingSession {
                     await self.readSelectedSessionMetadata()
@@ -1623,7 +1625,9 @@ final class NodeModel: ObservableObject {
                     select(nil)
                 }
                 if case let .room(id) = selection {
-                    guard await show(.room(id), whileRecovering: true) else {
+                    let shown = await show(.room(id), whileRecovering: true)
+                    guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                    guard shown else {
                         observationNeedsRestart = true
                         ended = "Refreshing room after reconnect."
                         return
@@ -1631,6 +1635,7 @@ final class NodeModel: ObservableObject {
                 } else {
                     ended = nil
                 }
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 observationNeedsRestart = false
                 await reconcileUnread()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
@@ -1965,6 +1970,7 @@ final class NodeModel: ObservableObject {
         }
         if !whileRecovering { watchReads(id) }
         let view = selectedRoomView, viewGeneration = roomViewGeneration
+        let observation = nodeObservationEpoch
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
         let metadataToken = sessionsMetadataRead
@@ -2034,9 +2040,12 @@ final class NodeModel: ObservableObject {
                   self.selection == .room(id), ended == nil else { return false }
             // A Session restored as this room's last view is read once the room lists it (D12).
             if showingSession {
-                if whileRecovering { await readSelectedSessionMetadata() }
-                if showingSession { await readSession() }
+                if whileRecovering { await readSelectedSessionMetadata(whileRecovering: true) }
+                if showingSession { await readSession(whileRecovering: whileRecovering) }
             }
+            guard !Task.isCancelled, observation == nodeObservationEpoch,
+                  generation == roomReadGeneration, viewGeneration == roomViewGeneration,
+                  self.selection == .room(id), ended == nil else { return false }
             watchReads(id)
             return true
         } catch {
@@ -4069,7 +4078,8 @@ extension NodeModel {
     }
 
     /// Exact selected metadata stays independent of the bounded tab/history pages.
-    func readSelectedSessionMetadata() async {
+    func readSelectedSessionMetadata(whileRecovering: Bool = false) async {
+        guard ended == nil, !roomNeedsPage, !observationNeedsRestart || whileRecovering else { return }
         guard let room = roomOnScreen, case let .session(node, id) = showing else {
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = false
@@ -4079,6 +4089,7 @@ extension NodeModel {
         func current() -> Bool {
             roomOnScreen == room && showing == .session(node: node, id: id)
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
+                && ended == nil && !roomNeedsPage && (!observationNeedsRestart || whileRecovering)
         }
         do {
             let found = try await client.session(room: room, node: node, sessionId: id)
@@ -4141,7 +4152,8 @@ extension NodeModel {
     }
 
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
-    func readSession(reloadNewest: Bool = false) async {
+    func readSession(reloadNewest: Bool = false, whileRecovering: Bool = false) async {
+        guard ended == nil, !roomNeedsPage, !observationNeedsRestart || whileRecovering else { return }
         // Surviving rows still need exact authorization/expiry checks while reload is
         // offered. That refresh must not acknowledge reload or replace the held window.
         guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty else { return }
@@ -4165,6 +4177,7 @@ extension NodeModel {
                 && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
                 && revision == sessionWindowRevision && following == timelineFollowingNewest
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
+                && ended == nil && !roomNeedsPage && (!observationNeedsRestart || whileRecovering)
         }
         do {
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
@@ -4435,14 +4448,14 @@ extension NodeModel {
 
     /// Approve (⌥⌘Y) or Reject (⌥⌘N) the selected approval, and say what came of it (P1).
     func answerSelected(approve: Bool) async {
-        guard let a = selectedApproval else { return }
+        guard let a = selectedApproval, let instance = roomInstance else { return }
         let action: DriveAction = approve ? .approve(reference: a.reference)
             : .reject(reference: a.reference, why: nil)
         // What came of it is this operation's outcome (P6): done, refused, or not known.
         let operation = approve ? "approve-request" : "reject-request"
         let attempt = begin(operation)
         defer { end(attempt) }
-        switch await driveResult(a.session, in: a.room, action) {
+        switch await driveResult(a.session, in: a.room, instance: instance, action) {
         case let .taken(words): report(operation: operation, done: asSentence(words))
         case let .refused(words): report(VoxError.Failed(reason: asSentence(words)), operation: operation)
         case let .unknown(words): report(VoxError.Unknown(reason: asSentence(words)), operation: operation)
@@ -4477,10 +4490,11 @@ extension NodeModel {
     }
 
     /// Drive a Session (ADR-029 DR-1), for the Session view's controls (SessionDrive.swift).
-    func drive(room: String, node: String, session: String, action: DriveAction) async throws -> DriveAnswer {
-        guard sessionDriveAvailable, roomOnScreen == room,
+    func drive(room: String, instance: Data, node: String, session: String, opening: String, action: DriveAction) async throws -> DriveAnswer {
+        guard sessionDriveAvailable, roomOnScreen == room, roomInstance == instance,
               selectedSessionMetadata?.nodeFingerprint == node,
-              selectedSessionMetadata?.sessionId == session else {
+              selectedSessionMetadata?.sessionId == session,
+              selectedSessionMetadata?.opening == opening else {
             throw VoxError.Failed(reason: "Session state is being refreshed; try again when it is available.")
         }
         return try await client.drive(room: room, node: node, session: session, action: action)

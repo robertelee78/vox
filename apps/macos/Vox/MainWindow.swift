@@ -1589,11 +1589,12 @@ private struct RoomTimelineView: View {
                     // trust both ways (ADR-028 R-5), which a newcomer is not told anywhere else.
                     TrustBanner(model: model)
                     composer
-                } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
+                } else if let s = model.shownSession, s.canDrive, s.open,
+                          let room = model.roomOnScreen, let instance = model.selectedRoomInstance {
                     Hairline()
                     // Keep this Session's draft mounted while authority is being refreshed.
-                    SessionComposer(model: model, room: room, session: s)
-                        .id("\(room)/\(s.nodeFingerprint)/\(s.sessionId)")
+                    SessionComposer(model: model, room: room, instance: instance, session: s)
+                        .id("\(room)/\(instance.base64EncodedString())/\(s.nodeFingerprint)/\(s.sessionId)/\(s.opening)")
                         .disabled(!model.sessionDriveAvailable)
                 }
             }

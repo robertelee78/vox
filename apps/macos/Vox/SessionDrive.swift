@@ -21,22 +21,23 @@ enum DriveResult {
 extension NodeModel {
     /// Send `action` to the Session `s` of `room`, the destination its control was drawn for (D3),
     /// and say what came of it (DR-6), as `vox room session` and the TUI say it.
-    func drive(_ s: FfiSession, in room: String, _ action: DriveAction) async -> String {
-        await driveResult(s, in: room, action).said
+    func drive(_ s: FfiSession, in room: String, instance: Data, _ action: DriveAction) async -> String {
+        await driveResult(s, in: room, instance: instance, action).said
     }
 
     /// `drive`, telling a send that was taken from one refused or not known (D13).
-    func driveResult(_ s: FfiSession, in room: String, _ action: DriveAction) async -> DriveResult {
-        guard sessionDriveAvailable, roomOnScreen == room,
+    func driveResult(_ s: FfiSession, in room: String, instance: Data, _ action: DriveAction) async -> DriveResult {
+        guard sessionDriveAvailable, roomOnScreen == room, selectedRoomInstance == instance,
               selectedSessionMetadata?.nodeFingerprint == s.nodeFingerprint,
-              selectedSessionMetadata?.sessionId == s.sessionId else {
+              selectedSessionMetadata?.sessionId == s.sessionId,
+              selectedSessionMetadata?.opening == s.opening else {
             return .refused("Session state is being refreshed; try again when it is available.")
         }
         guard s.canDrive else {
             return .refused("you cannot drive this Session: \(s.nodeAlias) has not given you drive")
         }
         do {
-            let answer = try await drive(room: room, node: s.nodeFingerprint, session: s.sessionId, action: action)
+            let answer = try await drive(room: room, instance: instance, node: s.nodeFingerprint, session: s.sessionId, opening: s.opening, action: action)
             switch answer.delivery {
             case .answered:
                 return answer.ok ? .taken("\(s.label): \(answer.said)")
@@ -63,15 +64,17 @@ struct SessionComposer: View {
     @ObservedObject var model: NodeModel
     /// The room it was drawn in: what it sends goes there and to `session` only (D3).
     let room: String
+    let instance: Data
     let session: FfiSession
     /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
     @FocusState private var composing: Bool
     /// Asked before Stop (⌃C): it ends the session.
     @State private var confirmStop = false
 
-    init(model: NodeModel, room: String, session: FfiSession) {
+    init(model: NodeModel, room: String, instance: Data, session: FfiSession) {
         self.model = model
         self.room = room
+        self.instance = instance
         self.session = session
     }
 
@@ -154,7 +157,8 @@ struct SessionComposer: View {
 
     /// The Session's destination, which its draft is kept under.
     private var key: SessionDraftKey {
-        SessionDraftKey(room: room, node: session.nodeFingerprint, session: session.sessionId)
+        SessionDraftKey(room: room, instance: instance, node: session.nodeFingerprint,
+                        session: session.sessionId, opening: session.opening)
     }
 
     // The operation and its result outlive this particular view instance.
@@ -203,7 +207,7 @@ struct SessionComposer: View {
         said = ""
         let action: DriveAction = text.hasPrefix("/") ? .slash(command: text) : .text(text: text)
         Task {
-            let result = await model.driveResult(session, in: room, action)
+            let result = await model.driveResult(session, in: room, instance: instance, action)
             switch result {
             case .taken:
                 if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
@@ -223,7 +227,7 @@ struct SessionComposer: View {
         interrupting = true
         interruptSaid = ""
         Task {
-            interruptSaid = await model.drive(session, in: room, .interrupt)
+            interruptSaid = await model.drive(session, in: room, instance: instance, .interrupt)
             interrupting = false
         }
     }
@@ -234,7 +238,7 @@ struct SessionComposer: View {
         stopping = true
         stopSaid = ""
         Task {
-            stopSaid = await model.drive(session, in: room, .stop)
+            stopSaid = await model.drive(session, in: room, instance: instance, .stop)
             stopping = false
         }
     }
@@ -245,7 +249,7 @@ struct SessionComposer: View {
         sending = true
         said = ""
         Task {
-            said = await model.drive(session, in: room, action)
+            said = await model.drive(session, in: room, instance: instance, action)
             sending = false
         }
     }
@@ -362,11 +366,11 @@ struct RequestView: View {
     }
 
     private func act(_ action: DriveAction) {
-        guard !busy else { return }
+        guard !busy, let instance = model.selectedRoomInstance else { return }
         busy = true
         said = ""
         Task {
-            said = await model.drive(session, in: room, action)
+            said = await model.drive(session, in: room, instance: instance, action)
             busy = false
         }
     }
