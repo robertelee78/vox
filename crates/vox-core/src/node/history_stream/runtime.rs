@@ -1140,14 +1140,18 @@ impl Flow {
         if let Err(error) = result {
             let store = Arc::clone(&self.cleanup_store);
             let received = self.received.clone();
-            let mut failed =
-                tokio::task::spawn_blocking(move || store.received_settlement(&received))
-                    .await
-                    .map_err(|_| {
-                        Error::Unreachable("history settlement snapshot worker stopped")
-                    })?;
-            failed.debt = target.debt;
-            self.failed_settlement = Some(failed);
+            match tokio::task::spawn_blocking(move || store.received_settlement(&received)).await {
+                Ok(mut failed) => {
+                    failed.debt = target.debt;
+                    self.failed_settlement = Some(failed);
+                }
+                Err(snapshot_error) => {
+                    // The attempted settlement error is the primary failure. Without a fresh
+                    // snapshot we cannot know which replacement must complete, so retain the
+                    // existing explicit recovery/erasure wait instead of claiming a wake.
+                    eprintln!("vox: history settlement recovery snapshot worker stopped: {snapshot_error}");
+                }
+            }
             return Err(error);
         }
         // A published current body queues only local exact-request reclamation. If its peer
