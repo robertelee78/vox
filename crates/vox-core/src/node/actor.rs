@@ -11649,9 +11649,8 @@ impl Node {
                 // A scalar wake schedules only already bounded new head hints. It does not
                 // authorize archive demand, and a retired inbound attempt cannot wake a room.
                 if current.is_some() && inventory_added {
-                    if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
-                        port.raise();
-                    }
+                    // Pending inbox hints already make the port eligible. Do not create an
+                    // extra inventory request when a scoped parked hint is later discarded.
                     self.sched_rooms.insert(channel_id);
                 }
                 let still_departed = if departure_receipt {

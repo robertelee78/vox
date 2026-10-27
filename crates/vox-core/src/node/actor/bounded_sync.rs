@@ -1920,6 +1920,25 @@ impl Controller {
         ForegroundTurn::Waiting
     }
 }
+/// Removing a parked scalar is not permission to start inventory. The bounded inbox
+/// itself is scheduler need, so continue to another eligible hint without raising a request.
+fn take_foreground_hint(
+    inbox: &stream::HintInbox,
+    room: Digest32,
+    peer: Digest32,
+    node: Digest32,
+    parked_receipt: Option<Digest32>,
+) -> Option<stream::HeadHint> {
+    while let Some(hint) = inbox.take(room, peer, node) {
+        if hint.author == node && parked_receipt == Some(hint.head) {
+            inbox.finish(room, peer, hint.author, hint.head);
+        } else {
+            return Some(hint);
+        }
+    }
+    None
+}
+
 /// Why a foreground round runs (ADR-038 FX-15, #996), from what selected it: the own head
 /// offered for acknowledgement, a head the peer told this node of (or the follow-up such a
 /// fetch needs), an own append owed to the peer, the periodic request, or another request.
@@ -2913,7 +2932,6 @@ impl Node {
                         .iter()
                         .flatten()
                         .any(|flow| flow.room == work.room && flow.peer == work.peer)
-                        || self.history_hints.pending(work.room, work.peer)
                         || self
                             .leave_waiters
                             .iter()
@@ -2930,7 +2948,7 @@ impl Node {
                 // Raising the port changes its need, but `schedule` only examines touched
                 // rooms. Wake this room now instead of leaving the raised port asleep until
                 // the periodic all-ports tick consumes most of the leave deadline.
-                if raised {
+                if raised || self.history_hints.pending(work.room, work.peer) {
                     self.sched_rooms.insert(work.room);
                 }
                 let reason = flow.reason;
@@ -3545,20 +3563,29 @@ impl Node {
                                 .or(own_verification)
                                 .or(own_discovery)
                                 .or_else(|| {
-                                    let hint = self.history_hints.take(room, peer, node)?;
-                                    if hint.author == node && parked_receipt == Some(hint.head) {
-                                        self.history_hints.finish(
-                                            room,
-                                            peer,
-                                            hint.author,
-                                            hint.head,
-                                        );
-                                        None
-                                    } else {
-                                        Some(hint)
-                                    }
+                                    take_foreground_hint(
+                                        &self.history_hints,
+                                        room,
+                                        peer,
+                                        node,
+                                        parked_receipt,
+                                    )
                                 })
                         };
+                        if hint.is_none()
+                            && required.is_none()
+                            && !self
+                                .ports
+                                .get(&(room, peer))
+                                .is_some_and(crate::node::ports::Port::needs)
+                        {
+                            // No eligible hint remains, and no independent request, generation or
+                            // announcement owes inventory; return its actual admission instead of
+                            // manufacturing an exchange which can re-add the same hint.
+                            self.bounded_sync
+                                .cancel_matching_control_admission(room, peer);
+                            return false;
+                        }
                         let reason = foreground_reason(
                             node,
                             hint,
@@ -3647,16 +3674,29 @@ impl Node {
                             .or(own_verification)
                             .or(own_discovery)
                             .or_else(|| {
-                                let hint = self.history_hints.take(room, peer, node)?;
-                                if hint.author == node && parked_receipt == Some(hint.head) {
-                                    self.history_hints
-                                        .finish(room, peer, hint.author, hint.head);
-                                    None
-                                } else {
-                                    Some(hint)
-                                }
+                                take_foreground_hint(
+                                    &self.history_hints,
+                                    room,
+                                    peer,
+                                    node,
+                                    parked_receipt,
+                                )
                             })
                     };
+                    if hint.is_none()
+                        && required.is_none()
+                        && !self
+                            .ports
+                            .get(&(room, peer))
+                            .is_some_and(crate::node::ports::Port::needs)
+                    {
+                        // No eligible hint remains, and no independent request, generation or
+                        // announcement owes inventory; return its actual admission instead of
+                        // manufacturing an exchange which can re-add the same hint.
+                        self.bounded_sync
+                            .cancel_matching_control_admission(room, peer);
+                        return false;
+                    }
                     let reason = foreground_reason(
                         node,
                         hint,
