@@ -150,6 +150,10 @@ pub(super) struct PrivateSessions {
     // record cannot learn it. Set on every admission and open, and clear only after the current
     // node has appended a fresh authenticated announcement.
     support_owed: bool,
+    // A supported old snapshot cannot distinguish a real interrupted admission announcement
+    // from gratuitous reopen renewal. Only this automatic publication waits for a current
+    // recipient's authenticated own-head discovery; ordinary offline user actions do not.
+    support_rediscovery: bool,
 }
 
 impl Stored {
@@ -1214,13 +1218,22 @@ impl ChannelState {
 
     /// Authenticated capability, not a Session step. Published old readers skip its unknown
     /// content body. Only an author who advertised support is ever probed with stream 13.
-    pub(crate) fn announce_private_support(&mut self, profile: &Profile, now: u64) -> Result<()> {
+    pub(crate) fn announce_private_support(
+        &mut self,
+        profile: &Profile,
+        now: u64,
+        discovery_ready: bool,
+    ) -> Result<bool> {
         let me = self.me();
-        if !self.settled || self.poisoned || self.has_left(&me) {
-            return Ok(());
+        if !self.settled
+            || self.poisoned
+            || self.has_left(&me)
+            || (self.private_sessions.support_rediscovery && !discovery_ready)
+        {
+            return Ok(false);
         }
         if !self.private_sessions.support_owed && self.supports_private(profile.store(), &me)? {
-            return Ok(());
+            return Ok(false);
         }
         self.append_control_kind(
             profile,
@@ -1230,7 +1243,8 @@ impl ChannelState {
             false,
         )?;
         self.private_sessions.support_owed = false;
-        Ok(())
+        self.private_sessions.support_rediscovery = false;
+        Ok(true)
     }
     pub(super) fn restore_private_sessions(&mut self, store: &Store) -> Result<()> {
         let snapshot = store.snapshot()?;
@@ -1253,8 +1267,68 @@ impl ChannelState {
         // A restart may follow an admission that committed just before its capability
         // announcement. Repeating this one small signed fact is bounded to one per open.
         self.private_sessions.support_owed = true;
+        self.private_sessions.support_rediscovery = self.uses_sparse_history(store)?;
         self.restore_private_pulls(store)?;
         Ok(())
+    }
+
+    pub(crate) fn private_support_discovery_pending(&self) -> bool {
+        self.private_sessions.support_rediscovery
+    }
+    pub(crate) fn private_support_discovery_hint(
+        &self,
+        store: &Store,
+        peer: &Digest32,
+        authorization: Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64)>> {
+        if !self.private_sessions.support_rediscovery || self.own_behind || !self.is_member(peer) {
+            return Ok(None);
+        }
+        let read = self.history_read(store)?;
+        let Some(id) = read
+            .sparse_author(&self.me(), crate::log::history::LogScope::Public)?
+            .and_then(|state| state.committed)
+        else {
+            return Ok(None);
+        };
+        let head = read
+            .history_head(&id)?
+            .ok_or(Error::MalformedAtRest("own discovery head missing"))?;
+        if let Some((refused, grant, peer_life, author_life)) =
+            read.history_declined_metadata(peer, &self.me())?
+        {
+            if refused == id
+                && grant == authorization
+                && self.history_inventory_incarnation(peer) == Some(peer_life)
+                && self.history_author_inventory_incarnation(&self.me()) == Some(author_life)
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((self.me(), id, head.root.leaves)))
+    }
+    /// Caller carries an actual useful Head response on the exact current recipient port,
+    /// after refreshing the higher-head write fence. This is not a universal rollback verdict.
+    pub(crate) fn private_support_discovery_reply_valid(
+        &self,
+        store: &Store,
+        hint: crate::node::history_stream::HeadHint,
+    ) -> Result<bool> {
+        if !self.private_sessions.support_rediscovery || hint.author != self.me() {
+            return Ok(false);
+        }
+        let read = self.history_read(store)?;
+        let Some(head) = read.history_head(&hint.head)? else {
+            return Ok(false);
+        };
+        if head.binding.room != self.channel_id
+            || head.binding.author != self.me()
+            || head.root.leaves != hint.size
+            || !read.history_head_accepted(&hint.head, head.binding)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub(crate) fn owe_private_support(&mut self) {

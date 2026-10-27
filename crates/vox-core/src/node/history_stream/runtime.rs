@@ -194,6 +194,8 @@ pub(crate) struct Flow {
     pub(crate) hint: Option<super::HeadHint>,
     /// Canonical local recovery proof root, not a consumed advisory inbox item.
     pub(crate) local_own_verification: bool,
+    pub(crate) local_own_discovery: bool,
+    discovery_reply: Option<(super::HeadHint, u64)>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
     pub(crate) hint_peer: Digest32,
@@ -338,6 +340,14 @@ pub(crate) enum Resumed {
 }
 
 impl Flow {
+    pub(crate) fn local_own_root(&self) -> bool {
+        self.local_own_verification || self.local_own_discovery
+    }
+    pub(crate) fn completed_support_discovery(&self) -> Option<u64> {
+        self.discovery_reply
+            .filter(|(head, _)| self.local_own_discovery && Some(*head) == self.authenticated_head)
+            .map(|(_, connection)| connection)
+    }
     pub(crate) fn root_name(&self) -> &'static str {
         if self.announcement_pending() && self.announcement_can_run() {
             "inventory"
@@ -373,6 +383,7 @@ impl Flow {
         control: Arc<Context>,
         hint: Option<super::HeadHint>,
         local_own_verification: bool,
+        local_own_discovery: bool,
         departure_probe: bool,
         required: Option<(Digest32, u64)>,
         slots: Arc<BodySlots>,
@@ -380,7 +391,7 @@ impl Flow {
         cleanup_budget: Arc<crate::node::history_budget::Budget>,
         actor_incarnation: Option<u64>,
     ) -> Result<Self> {
-        if local_own_verification
+        if (local_own_verification || local_own_discovery)
             && (hint.is_none_or(|hint| hint.author != node)
                 || departure_probe
                 || required.is_some())
@@ -412,6 +423,8 @@ impl Flow {
             state_charge: None,
             hint,
             local_own_verification,
+            local_own_discovery,
+            discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
@@ -570,6 +583,8 @@ impl Flow {
             state_charge: None,
             hint: None,
             local_own_verification: false,
+            local_own_discovery: false,
+            discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
@@ -809,7 +824,7 @@ impl Flow {
     ) -> Result<bool> {
         // A metadata root is a separate operation from the old ambiguous body/inventory
         // decision. Retain one exact disposition for its whole immutable verification chain.
-        let (author, head) = if self.local_own_verification {
+        let (author, head) = if self.local_own_root() {
             let hint = self
                 .hint
                 .ok_or(Error::Profile("own metadata refusal root missing"))?;
@@ -818,7 +833,7 @@ impl Flow {
             (author, head)
         };
         let remembered = match source
-            .remember_decline(job, author, head, self.request, self.local_own_verification)
+            .remember_decline(job, author, head, self.request, self.local_own_root())
             .await
         {
             Ok(super::source::DeclineResult::Stored {
@@ -859,7 +874,7 @@ impl Flow {
                 return Ok(false);
             }
         };
-        if !self.local_own_verification {
+        if !self.local_own_root() {
             inbox.finish(self.room, source.peer, author, head);
         }
         self.declined = self.declined.saturating_add(u64::from(remembered));
@@ -2279,6 +2294,9 @@ impl Flow {
                     for head in &result.heads {
                         if head.author == author {
                             if author == self.node {
+                                if self.local_own_discovery {
+                                    self.discovery_reply = Some((*head, conn.serial()));
+                                }
                                 self.mine_held =
                                     Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
                             }

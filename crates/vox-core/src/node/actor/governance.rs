@@ -467,6 +467,7 @@ impl Node {
         }
         if governance_ready {
             self.advance_own_recovery(room).await;
+            self.advance_support_discovery(room);
         }
         if governance_ready
             && (governance_changed || self.governance_work.consent_after.contains_key(&room))

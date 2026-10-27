@@ -1102,7 +1102,7 @@ impl Controller {
                 && !flow.archive
                 && flow.archive_request.is_none()
                 && flow.required_root.is_none()
-                && !flow.local_own_verification
+                && !flow.local_own_root()
                 && flow.hint.is_some_and(|hint| {
                     inbox.newer_pending(room, flow.hint_peer, hint.author, hint.size)
                 })
@@ -2094,7 +2094,7 @@ impl Node {
     /// selected. Re-arm that exact hint while its inbox scope is still live; room/peer retirement
     /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
     fn dispose_rearming_hint(&mut self, mut flow: Flow) {
-        if let Some(hint) = flow.hint.take().filter(|_| !flow.local_own_verification) {
+        if let Some(hint) = flow.hint.take().filter(|_| !flow.local_own_root()) {
             self.history_hints
                 .retry(flow.room, flow.hint_peer, hint.author, hint.head);
         }
@@ -2302,7 +2302,7 @@ impl Node {
                     );
                     (request, flow.instance)
                 });
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_verification) {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .retry(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -2345,7 +2345,7 @@ impl Node {
             if let Some(error) = flow.local_retry.take() {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
                 self.settle_archive_exit(&mut flow, &error);
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_verification) {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .retry(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -2599,7 +2599,7 @@ impl Node {
                     self.history_demand.failed(request, flow.generation, &error);
                 }
 
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_verification) {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -2707,7 +2707,7 @@ impl Node {
                 self.sched_rooms.insert(work.room);
                 continue;
             }
-            let superseded = !flow.local_own_verification
+            let superseded = !flow.local_own_root()
                 && flow.hint.is_some_and(|hint| {
                     self.history_hints.newer_pending(
                         work.room,
@@ -2823,6 +2823,8 @@ impl Node {
                             epoch: flow.epoch,
                             room_instance: flow.instance,
                             generation: flow.generation,
+                            peer: work.peer,
+                            discovery_connection: flow.completed_support_discovery(),
                         };
                         if self.net_tx.try_send(event).is_err() {
                             // Retain the charged completed flow and its in-flight hint until
@@ -2841,7 +2843,7 @@ impl Node {
                         }
                     }
                 }
-                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_verification) {
+                if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
                         .finish(work.room, flow.hint_peer, hint.author, hint.head);
                 }
@@ -3254,7 +3256,14 @@ impl Node {
                     Ok(value) => Arc::new(value),
                     Err(_) => return false,
                 };
-                let (own_page, own_verification) = if self.own_recovery_rooms.contains_key(&room) {
+                let (own_page, own_verification, own_discovery) = if self
+                    .own_recovery_rooms
+                    .contains_key(&room)
+                    || self
+                        .ports
+                        .get(&(room, peer))
+                        .is_some_and(|port| port.support_discovery_check)
+                {
                     let bytes_wake = state_job.bytes_wake();
                     let Some(_read) = state_job.reserve(4 * 1024 * 1024) else {
                         self.bounded_sync.wait_for_bytes(
@@ -3291,6 +3300,34 @@ impl Node {
                                 }),
                                 Err(_) => return false,
                             };
+                            let discovery_pending = channel.private_support_discovery_pending();
+                            if !discovery_pending {
+                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                    port.support_discovery_check = false;
+                                }
+                            }
+                            let scope = crate::node::ports::SupportDiscovery {
+                                connection: conn.serial(),
+                                instance,
+                                epoch,
+                                authorization,
+                            };
+                            let already_checked = self
+                                .ports
+                                .get(&(room, peer))
+                                .is_some_and(|port| port.support_discovery == Some(scope));
+                            let discovery = match if already_checked {
+                                Ok(None)
+                            } else {
+                                channel.private_support_discovery_hint(&store, &peer, authorization)
+                            } {
+                                Ok(hint) => hint.map(|(author, head, size)| stream::HeadHint {
+                                    author,
+                                    head,
+                                    size,
+                                }),
+                                Err(_) => return false,
+                            };
                             let page = if !self.bounded_sync.owns_archive_room(room)
                                 && self.history_demand.ready_binding(room, peer).is_none()
                                 && self.bounded_sync.ready[1].is_none()
@@ -3303,7 +3340,7 @@ impl Node {
                             } else {
                                 None
                             };
-                            (page, verification)
+                            (page, verification, discovery)
                         }
                         Err(_) => {
                             // Keep the producer edge through the actual release, without a
@@ -3325,7 +3362,7 @@ impl Node {
                         }
                     }
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
                 let own_page = own_page.and_then(|(instance, page)| {
                     let generation =
@@ -3433,6 +3470,7 @@ impl Node {
                         } else {
                             departure_hint
                                 .or(own_verification)
+                                .or(own_discovery)
                                 .or_else(|| self.history_hints.take(room, peer, node))
                         };
                         let reason = foreground_reason(
@@ -3455,6 +3493,11 @@ impl Node {
                                 && hint == own_verification
                                 && departure_hint.is_none()
                                 && required.is_none(),
+                            own_discovery.is_some()
+                                && hint == own_discovery
+                                && own_verification.is_none()
+                                && departure_hint.is_none()
+                                && required.is_none(),
                             departure_hint.is_some() && required.is_none(),
                             required,
                             self.bounded_sync.body_slots.clone(),
@@ -3471,7 +3514,8 @@ impl Node {
                             }
                             Err(_) => {
                                 if let Some(hint) = hint.filter(|_| {
-                                    departure_hint.is_some() || hint != own_verification
+                                    departure_hint.is_some()
+                                        || (hint != own_verification && hint != own_discovery)
                                 }) {
                                     self.history_hints.retry(room, peer, hint.author, hint.head);
                                 }
@@ -3511,6 +3555,7 @@ impl Node {
                     } else {
                         departure_hint
                             .or(own_verification)
+                            .or(own_discovery)
                             .or_else(|| self.history_hints.take(room, peer, node))
                     };
                     let reason = foreground_reason(
@@ -3533,6 +3578,11 @@ impl Node {
                             && hint == own_verification
                             && departure_hint.is_none()
                             && required.is_none(),
+                        own_discovery.is_some()
+                            && hint == own_discovery
+                            && own_verification.is_none()
+                            && departure_hint.is_none()
+                            && required.is_none(),
                         departure_hint.is_some() && required.is_none(),
                         required,
                         self.bounded_sync.body_slots.clone(),
@@ -3548,9 +3598,10 @@ impl Node {
                             flow
                         }
                         Err(_) => {
-                            if let Some(hint) = hint
-                                .filter(|_| departure_hint.is_some() || hint != own_verification)
-                            {
+                            if let Some(hint) = hint.filter(|_| {
+                                departure_hint.is_some()
+                                    || (hint != own_verification && hint != own_discovery)
+                            }) {
                                 self.history_hints.retry(room, peer, hint.author, hint.head);
                             }
                             return false;

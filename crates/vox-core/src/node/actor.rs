@@ -1429,6 +1429,8 @@ enum NetEvent {
     },
     BoundedHeadCompleted {
         channel_id: Digest32,
+        peer: Digest32,
+        discovery_connection: Option<u64>,
         instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
         head: crate::node::history_stream::HeadHint,
         epoch: u64,
@@ -10687,6 +10689,14 @@ impl Node {
                 }
                 self.connected.remove(&peer);
                 self.discover_peers.remove(&peer);
+                let support_rooms: Vec<_> = self
+                    .ports
+                    .keys()
+                    .filter_map(|(room, member)| (*member == peer).then_some(*room))
+                    .collect();
+                for room in support_rooms {
+                    self.advance_support_discovery(room);
+                }
                 #[cfg(feature = "test-knobs")]
                 let cancel_admissions =
                     std::env::var_os("VOX_TEST_FX35_KEEP_CLOSED_POOL_ADMISSION").is_none();
@@ -11251,6 +11261,7 @@ impl Node {
                         .is_some_and(|(now, old)| Arc::ptr_eq(now, &old))
                 {
                     self.advance_own_recovery(room).await;
+                    self.advance_support_discovery(room);
                     for ((r, _), port) in &mut self.ports {
                         if *r == room {
                             port.raise();
@@ -11476,6 +11487,8 @@ impl Node {
             }
             NetEvent::BoundedHeadCompleted {
                 channel_id,
+                peer,
+                discovery_connection,
                 instance,
                 head,
                 epoch,
@@ -11487,7 +11500,7 @@ impl Node {
                     (current, instance.upgrade(), self.profile.as_ref())
                 {
                     if Arc::ptr_eq(&shared, &old) {
-                        let acknowledged = {
+                        let (acknowledged, discovered) = {
                             let mut room = shared.lock().await;
                             let current = room.epoch() == epoch
                                 && room.history_instance(profile.store()).ok()
@@ -11501,16 +11514,58 @@ impl Node {
                                 )
                                 .ok()
                                     == Some(generation);
-                            if current {
+                            let discovered = current
+                                && discovery_connection.is_some_and(|serial| {
+                                    self.net
+                                        .as_ref()
+                                        .and_then(|net| net.manager().existing(&peer))
+                                        .is_some_and(|connection| {
+                                            connection.serial() == serial
+                                                && connection.quinn().close_reason().is_none()
+                                        })
+                                })
+                                && self
+                                    .with_current_computer_authority(|| {
+                                        // Persist/set the higher-head fence BEFORE any automatic
+                                        // support renewal is allowed. No generic round gets credit.
+                                        room.refresh_own_recovery(profile.store())?;
+                                        room.private_support_discovery_reply_valid(
+                                            profile.store(),
+                                            head,
+                                        )
+                                    })
+                                    .is_some_and(|result| matches!(result, Ok(true)));
+                            let acknowledged = if current {
                                 room.note_history_head_complete(profile.store(), head)
                                     .ok()
                                     .flatten()
                             } else {
                                 None
-                            }
+                            };
+                            (acknowledged, discovered)
                         };
+                        if discovered {
+                            if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
+                                if port.room.is(&crate::node::ports::RoomRef::Channel(
+                                    Arc::downgrade(&shared),
+                                )) {
+                                    port.support_discovery =
+                                        discovery_connection.map(|connection| {
+                                            crate::node::ports::SupportDiscovery {
+                                                connection,
+                                                instance: room_instance,
+                                                epoch,
+                                                authorization: generation,
+                                            }
+                                        });
+                                }
+                            }
+                        }
                         self.settle_sparse_room(&channel_id).await;
                         self.advance_own_recovery(channel_id).await;
+                        if discovered {
+                            self.advance_support_discovery(channel_id);
+                        }
                         // Head promotion advances the shared room generation inside the disk
                         // worker. Touch the room here so schedule observes it immediately and
                         // advertises the newly committed head back to its author.
@@ -24533,6 +24588,112 @@ impl Node {
             .await;
     }
 
+    fn support_recipients_checked(
+        &self,
+        room: &Digest32,
+        channel: &ChannelState,
+        store: &crate::node::store::Store,
+    ) -> crate::error::Result<(bool, bool)> {
+        if !channel.private_support_discovery_pending() {
+            return Ok((true, false));
+        }
+        let Some(net) = self.net.as_ref() else {
+            return Ok((false, false));
+        };
+        let instance = channel.history_instance(store)?;
+        let epoch = channel.epoch();
+        let authorization = crate::node::history_stream::authorization_generation(
+            store,
+            channel.me(),
+            *room,
+            instance,
+            epoch,
+        )?;
+        let current = self.current_room(room);
+        let mut any = false;
+        let mut checked = true;
+        let mut missing_port = false;
+        for peer in net.manager().peers() {
+            if peer == channel.me() || !channel.is_member(&peer) {
+                continue;
+            }
+            let Some(connection) = net
+                .manager()
+                .existing(&peer)
+                .filter(|connection| connection.quinn().close_reason().is_none())
+            else {
+                continue;
+            };
+            any = true;
+            let Some(port) = self
+                .ports
+                .get(&(*room, peer))
+                .filter(|port| current.as_ref().is_some_and(|room| port.room.is(room)))
+            else {
+                checked = false;
+                missing_port = true;
+                continue;
+            };
+            checked &= port.support_discovery
+                == Some(crate::node::ports::SupportDiscovery {
+                    connection: connection.serial(),
+                    instance,
+                    epoch,
+                    authorization,
+                });
+        }
+        Ok((any && checked, missing_port))
+    }
+
+    /// One actual connection/proof/governance edge reconsiders only this automatic renewal.
+    /// Room contention retains the existing bounded release-edge owner, never an actor wait.
+    fn advance_support_discovery(&mut self, room: Digest32) {
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        if self.locking != 0 || profile.signer().is_err() {
+            return;
+        }
+        let Some(shared) = self.channels.get(&room).cloned() else {
+            return;
+        };
+        let Ok(mut channel) = shared.try_lock() else {
+            self.bounded_sync.wait_for_own_recovery_room(
+                &self.net_tx,
+                &mut self.next_token,
+                profile.fingerprint(),
+                room,
+                shared.clone(),
+            );
+            return;
+        };
+        if !channel.private_support_discovery_pending() {
+            return;
+        }
+        let checked = self.support_recipients_checked(&room, &channel, profile.store());
+        let Ok((ready, missing_port)) = checked else {
+            return;
+        };
+        if missing_port {
+            self.discover_rooms.insert(room);
+            self.sched_rooms.insert(room);
+        }
+        if !ready {
+            return;
+        }
+        let now = self.now_ms().get();
+        let appended = self
+            .with_current_computer_authority(|| {
+                channel.refresh_own_recovery(profile.store())?;
+                channel.announce_private_support(profile, now, true)
+            })
+            .is_some_and(|result| matches!(result, Ok(true)));
+        drop(channel);
+        if appended {
+            self.note_local_append(&room);
+        }
+    }
+
     async fn tend_drive_keys_in_guarded(
         &mut self,
         channel_id: &Digest32,
@@ -24568,6 +24729,15 @@ impl Node {
                 return Ok(());
             }
             self.computer_drive_guard(guard)?;
+            let (support_ready, missing_port) =
+                self.support_recipients_checked(channel_id, &ch, profile.store())?;
+            if missing_port {
+                self.discover_rooms.insert(*channel_id);
+                self.sched_rooms.insert(*channel_id);
+            }
+            if !support_ready {
+                return Ok(());
+            }
             // Ordinary-key declarations name only this node's authenticated legacy hashes.
             // They let read-only peers identify withheld steps without granting drive.
             let Some(announced) = self.with_current_computer_authority(|| {
@@ -24580,7 +24750,7 @@ impl Node {
             }
             self.computer_drive_guard(guard)?;
             let Some(announced) = self.with_current_computer_authority(|| {
-                ch.announce_private_support(profile, now_millis)
+                ch.announce_private_support(profile, now_millis, support_ready)
             }) else {
                 return Ok(());
             };

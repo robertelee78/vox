@@ -229,6 +229,16 @@ impl RoomRef {
     }
 }
 
+/// Useful authenticated own-head response, scoped to the actual recipient and connection.
+/// This is not authority, a body receipt, or a certificate about an offline peer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SupportDiscovery {
+    pub connection: u64,
+    pub instance: [u8; 16],
+    pub epoch: u64,
+    pub authorization: Digest32,
+}
+
 /// One `(room, peer)`'s sync port (ADR-025 D1).
 pub struct Port {
     /// The room instance it belongs to.
@@ -259,6 +269,10 @@ pub struct Port {
     /// Exact automatic-recovery trigger which returned without body/cursor progress. Equal
     /// periodic scheduling is not a new producer; a real donor/authority/receipt change is.
     pub(crate) own_recovery_parked: Option<Digest32>,
+    /// A fresh port must inspect whether its restored room owes automatic support discovery.
+    /// It is not a peer receipt; false only caches that this room needs no such operation.
+    pub(crate) support_discovery_check: bool,
+    pub(crate) support_discovery: Option<SupportDiscovery>,
     /// The room generation credited to the peer: monotonic within the room instance.
     pub done_gen: u64,
     /// Scheduler-only watermark after one current-only exchange found a legacy gap.
@@ -304,6 +318,8 @@ impl Port {
             req_gen: 1,
             req_done: 0,
             own_recovery_parked: None,
+            support_discovery_check: true,
+            support_discovery: None,
             done_gen: 0,
             legacy_checked_gen: None,
             busy_attempt_gen: 0,
