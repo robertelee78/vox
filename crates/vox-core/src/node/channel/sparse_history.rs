@@ -923,19 +923,15 @@ impl ChannelState {
         // the later effect turn. A newer current input can also change the causal sequence or
         // historical revocation even when its displayed value stays the same. Keep those facts
         // durable; duplicate, superseded and other-recipient key headers do not qualify.
-        let mirrored_change = accepted.current_advanced
-            && self.authors.contains_key(&entry.skeleton.author_id)
-            && match GovEntry::body_bound_to(entry) {
-                Ok(GovBody::ConsentGrant(grant)) => {
-                    self.authors.contains_key(&grant.body.target_id)
-                }
-                Ok(GovBody::ConsentRevocation(revoke)) => {
-                    self.authors.contains_key(&revoke.body.target_id)
-                }
-                Ok(GovBody::Presence(_)) => true,
-                _ => false,
-            };
-        if mirrored_change {
+        // A consent target can be unknown at publication and become known through a later
+        // derived admission without an intervening flush. Its already-authenticated current
+        // input must therefore be durable before that admission can make it visible.
+        let durable_current = accepted.current_advanced
+            && matches!(
+                GovEntry::body_bound_to(entry),
+                Ok(GovBody::ConsentGrant(_) | GovBody::ConsentRevocation(_) | GovBody::Presence(_))
+            );
+        if durable_current {
             batch.ruled();
         }
         batch.commit()?;
