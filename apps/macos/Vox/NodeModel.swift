@@ -426,7 +426,7 @@ final class NodeModel: ObservableObject {
     /// disk or the wire (D12). A room's draft, To:, Urgent and reply, by room id.
     var roomDrafts: [String: RoomDraft] = [:]
     /// A Session's draft, by its destination (`room/node/session`).
-    var sessionDrafts: [String: String] = [:]
+    @Published var sessionDrafts: [SessionDraftKey: String] = [:]
 
     /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
     /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).

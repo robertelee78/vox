@@ -64,7 +64,6 @@ struct SessionComposer: View {
     /// The room it was drawn in: what it sends goes there and to `session` only (D3).
     let room: String
     let session: FfiSession
-    @State private var draft = ""
     /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
     @FocusState private var composing: Bool
     @State private var said = ""
@@ -109,7 +108,7 @@ struct SessionComposer: View {
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
                 // Return sends, ⇧↩ (or ⌥↩) adds a line (P19).
-                TextField("Composer — to \(session.label)", text: $draft, axis: .vertical)
+                TextField("Composer — to \(session.label)", text: Binding(get: { draft }, set: { draft = $0 }), axis: .vertical)
                     .lineLimit(1...12)
                     .focused($composing)
                     .shiftReturnAddsLine(composing)
@@ -153,9 +152,6 @@ struct SessionComposer: View {
             }
         }
         .voxPadding(Space.s12)
-        // Its draft, kept per Session while the app runs, in memory only (D12).
-        .onAppear { draft = model.sessionDrafts[key] ?? "" }
-        .onChange(of: draft) { model.sessionDrafts[key] = $0 }
         // ⌘O while this Session is shown: a file sent to it, not the room (D2).
         .onChange(of: model.sessionAttachAsked) { _ in
             DispatchQueue.main.async {
@@ -165,7 +161,15 @@ struct SessionComposer: View {
     }
 
     /// The Session's destination, which its draft is kept under.
-    private var key: String { "\(room)/\(session.nodeFingerprint)/\(session.sessionId)" }
+    private var key: SessionDraftKey {
+        SessionDraftKey(room: room, node: session.nodeFingerprint, session: session.sessionId)
+    }
+
+    // Write through immediately: a removed view must not lose an unsent draft.
+    private var draft: String {
+        get { model.sessionDrafts[key] ?? "" }
+        nonmutating set { model.sessionDrafts[key] = newValue }
+    }
 
     /// Type the draft, or send it as a slash command when it starts with "/". The text stays
     /// until the session's node has taken it (D13): refused, it is back as typed; with no answer,
