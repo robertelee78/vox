@@ -2797,7 +2797,17 @@ final class NodeModel: ObservableObject {
             await refresh()
             return nil
         } catch {
-            guard roomMutationCurrent(.leave, ticket: ticket) else { return nil }
+            guard roomMutationCurrent(.leave, ticket: ticket) else {
+                // The submitted request outlives its sheet. Say what happened without
+                // attaching the old result to a newer confirmation or its room.
+                let action = endingIt ? "Ending" : "Leaving"
+                let result = Outcome(operation: "leave-closed-confirmation",
+                                     kind: Outcome.kind(of: error),
+                                     words: "\(action) room \(id): \(sentence(error))")
+                outcomes[result.operation] = result
+                outcome = result
+                return nil
+            }
             report(error, operation: operation)
             return sentence(error)
         }
