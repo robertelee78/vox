@@ -71,13 +71,13 @@ impl Node {
     fn own_key_current(
         &self,
         request: Request,
-        node: Digest32,
-        peer: Digest32,
+        identities: (Digest32, Digest32),
         connection: &Arc<VoxConnection>,
         room: &SharedChannel,
         context: &crate::join::session::JoinContext,
         channel: &ChannelState,
     ) -> bool {
+        let (node, peer) = identities;
         self.locking == 0
             && self.own_key_active.get(&request.room) == Some(&request.id)
             && self.profile.as_ref().is_some_and(|p| p.is_unlocked() && p.fingerprint() == node
@@ -146,8 +146,14 @@ impl Node {
             self.own_key_wait_for_room(request, node, Arc::clone(&room));
             return;
         };
-        let current =
-            self.own_key_current(request, node, peer, &connection, &room, &context, &channel);
+        let current = self.own_key_current(
+            request,
+            (node, peer),
+            &connection,
+            &room,
+            &context,
+            &channel,
+        );
         if !current {
             if self.own_key_active.get(&request.room) == Some(&request.id) {
                 self.own_key_active.remove(&request.room);
@@ -181,7 +187,7 @@ impl Node {
                 };
                 let ready = ResponseReady { request, node, peer, connection, room: room_for_network, context,
                     release: result, _credit: credit, _output: output, _secret: secret };
-                let _ = tx.send(NetEvent::OwnKeyResponseReady(ready)).await;
+                let _ = tx.send(NetEvent::OwnKeyResponseReady(Box::new(ready))).await;
             });
         });
         if authorized.is_none() {
@@ -224,8 +230,7 @@ impl Node {
         };
         if !self.own_key_current(
             request,
-            ready.node,
-            ready.peer,
+            (ready.node, ready.peer),
             &ready.connection,
             &ready.room,
             &ready.context,
@@ -334,7 +339,7 @@ impl Node {
         self.own_key_parked
             .retain(|(room, peer), _| self.ports.contains_key(&(*room, *peer)));
         let mut selected = None;
-        for ((r, peer), _) in &self.ports {
+        for ((r, peer), port) in &self.ports {
             if *r != room_id
                 || !channel.is_member(peer)
                 || channel.has_left(peer)
@@ -356,10 +361,7 @@ impl Node {
                 chain,
                 iteration,
                 connection: connection.serial(),
-                availability: self
-                    .ports
-                    .get(&(room_id, *peer))
-                    .and_then(|p| p.availability.remote(connection.serial())),
+                availability: port.availability.remote(connection.serial()),
             };
             if self.own_key_parked.get(&(room_id, *peer)) == Some(&parked) {
                 continue;
@@ -423,7 +425,7 @@ impl Node {
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
-                    _ = epoch_changed.changed() => return,
+                    _ = epoch_changed.changed() => (),
                     result = async {
                         let node = node_jobs.acquire_owned().await.ok()?;
                         let peer = peer_jobs.acquire_owned().await.ok()?;
@@ -543,7 +545,7 @@ impl Node {
                 output,
                 secret,
             };
-            let _ = tx.send(NetEvent::OwnKeyRequestReady(ready)).await;
+            let _ = tx.send(NetEvent::OwnKeyRequestReady(Box::new(ready))).await;
         });
     }
 

@@ -600,9 +600,9 @@ impl ChannelState {
             if target == head.id() && seq <= head.root.leaves && donor_through >= seq {
                 if let Some((_, header)) = read.history_validated_header(&self.me(), seq)? {
                     if header.entry_hash() == entry_hash
-                        && !read
+                        && read
                             .history_entry(&entry_hash)?
-                            .is_some_and(|entry| entry.payload.is_some())
+                            .is_none_or(|entry| entry.payload.is_none())
                     {
                         return Ok(Some(OwnRecoveryPage {
                             head: target,

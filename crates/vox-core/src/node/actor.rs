@@ -1373,8 +1373,8 @@ enum NetEvent {
     /// A bounded worker has prepared an encrypted own-key response; current authority and
     /// the exact connection are checked again before it is sent.
     OwnKeyDonorReady(own_keys::DonorReady),
-    OwnKeyRequestReady(own_keys::RequestReady),
-    OwnKeyResponseReady(own_keys::ResponseReady),
+    OwnKeyRequestReady(Box<own_keys::RequestReady>),
+    OwnKeyResponseReady(Box<own_keys::ResponseReady>),
     OwnKeyRequestFailed {
         request: own_keys::Request,
         peer: Digest32,
@@ -10331,8 +10331,8 @@ impl Node {
                 self.take_inbound_skdm(stream).await;
             }
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
-            NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(ready),
-            NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(ready),
+            NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
+            NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
             NetEvent::OwnKeyRequestFailed {
                 request,
                 peer,
