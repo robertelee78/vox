@@ -1618,8 +1618,8 @@ final class NodeModel: ObservableObject {
                 // Reachability and installed observation do not establish a published inventory.
                 // Keep recovery owned by the follow loop until the authoritative refresh lands.
                 guard refreshed else { observationNeedsRestart = true; return }
-                if case let .room(id) = selection, !rooms.contains(where: { $0.id == id }) {
-                    // The freshly read inventory, not a failed room read, establishes removal.
+                if case let .room(id) = selection, !rooms.contains(where: { $0.id == id && ($0.open || $0.preparing) }) {
+                    // The freshly read inventory establishes removal or a closed room.
                     select(nil)
                 }
                 if case let .room(id) = selection {
@@ -3897,7 +3897,9 @@ final class NodeModel: ObservableObject {
         selectedSessionMetadata = nil
         selectedSessionMetadataKnown = false
         sessionNote = nil
-        sessionReloadNeeded = false
+        // A scrolled-back private window has been withheld; offer an explicit reload
+        // instead of silently polling an empty window without following newest.
+        sessionReloadNeeded = showingSession && !timelineFollowingNewest
         sessionLoading = false
         messageFooters = [:]
         messageFooterErrors = [:]
@@ -3939,7 +3941,7 @@ final class NodeModel: ObservableObject {
         // The daemon already confirmed Ready. A pending inventory or room page is a
         // recovery condition, not a failed unlock; follow() owns the retry.
         guard refreshed else { return true }
-        if case let .room(room) = selection, !rooms.contains(where: { $0.id == room }) {
+        if case let .room(room) = selection, !rooms.contains(where: { $0.id == room && ($0.open || $0.preparing) }) {
             select(nil)
         }
         if case let .room(room) = selection {
