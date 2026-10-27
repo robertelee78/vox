@@ -229,6 +229,11 @@ impl ChannelState {
                     }
                 }
                 Task::Join { start } => {
+                    // Children may have committed in an earlier slice. A newly observed
+                    // fork/lifetime state cannot authorize another reconstructed parent.
+                    if !reconstruction_allowed {
+                        return Ok(ProofRangeStep::Missing);
+                    }
                     let n = cursor.values.len();
                     if n < 2 {
                         return Err(Error::MalformedAtRest("proof repair operand stack"));
