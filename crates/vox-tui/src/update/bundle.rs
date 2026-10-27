@@ -917,6 +917,22 @@ fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
         .status()
     {
         Ok(status) if status.success() => Ok(()),
+        Ok(status) if !register => {
+            // Once Info.plist has been moved aside, lsregister may refuse to scan the path even
+            // when there is no registration to remove. Treat that as success only when the
+            // database itself confirms this exact path is absent.
+            match launch_services_path_absent(bundle) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(format!(
+                    "LaunchServices did not {verb} {} ({status}); its registration remains",
+                    bundle.display()
+                )),
+                Err(error) => Err(format!(
+                    "LaunchServices did not {verb} {} ({status}); {error}",
+                    bundle.display()
+                )),
+            }
+        }
         Ok(status) => Err(format!(
             "LaunchServices did not {verb} {} ({status})",
             bundle.display()
@@ -926,6 +942,45 @@ fn launch_services(register: bool, bundle: &Path) -> Result<(), String> {
             bundle.display()
         )),
     }
+}
+
+/// Ask LaunchServices whether the exact bundle path is registered; an unreadable database is
+/// not evidence of absence. Resolve aliases such as macOS /var -> /private/var before comparing.
+fn launch_services_path_absent(bundle: &Path) -> Result<bool, String> {
+    const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+                              LaunchServices.framework/Support/lsregister";
+    let wanted = fs::canonicalize(bundle)
+        .map_err(|e| format!("cannot resolve {}: {e}", bundle.display()))?;
+    let output = Command::new(LSREGISTER)
+        .arg("-dump")
+        .output()
+        .map_err(|e| format!("cannot read LaunchServices records: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "LaunchServices record query failed ({})",
+            output.status
+        ));
+    }
+    let dump = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "LaunchServices records are not UTF-8".to_owned())?;
+    let mut paths = 0usize;
+    for line in dump.lines() {
+        if let Some(value) = line.trim().strip_prefix("path:") {
+            paths += 1;
+            let value = value
+                .trim()
+                .split_once(" (0x")
+                .map_or(value.trim(), |(path, _)| path);
+            let path = Path::new(value);
+            if path == wanted || fs::canonicalize(path).is_ok_and(|actual| actual == wanted) {
+                return Ok(false);
+            }
+        }
+    }
+    if paths == 0 {
+        return Err("LaunchServices records contain no recognizable paths".to_owned());
+    }
+    Ok(true)
 }
 
 /// A set-aside bundle's `Info.plist`, kept under this name until a rollback restores it. Without
