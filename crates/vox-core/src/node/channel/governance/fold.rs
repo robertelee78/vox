@@ -17,6 +17,9 @@ const CLEAR: u64 = 1;
 const ACTIONS: u64 = 2;
 const HEAD: u64 = 3;
 const DONE: u64 = 4;
+// One-time reconstruction of the fingerprint that format-1 cursors did not carry.
+const BASELINE_EFFECTS: u64 = 5;
+const BASELINE_AUTHORITY: u64 = 6;
 
 pub(super) const NAME: u64 = 1;
 pub(super) const MESSAGES: u64 = 2;
@@ -227,7 +230,12 @@ impl State {
             writer.projection()
         };
         d.finish()?;
-        if phase > DONE || from == 0 || generation == 0 || !(1..=5).contains(&deny) {
+        if phase > BASELINE_AUTHORITY
+            || (version == 1 && phase > DONE)
+            || from == 0
+            || generation == 0
+            || !(1..=5).contains(&deny)
+        {
             return Err(invalid("governance fold cursor bounds"));
         }
         Ok(Some(Self {
@@ -336,13 +344,28 @@ pub(super) fn advance(
         return Ok(false);
     }
     writer.expire_authority(now)?;
+    let baseline = |writer: &Write<'_, '_>| {
+        let mut state = State::new(writer, now);
+        state.phase = BASELINE_EFFECTS;
+        state.projection = [0; 32];
+        state
+    };
     let mut state = match State::load(writer)? {
         Some(state) if state.legacy => {
             // Format 1 did not record the fingerprint of its partially applied work. Start
-            // a fresh, bounded fold of the sealed index; persist its new cursor and generation
-            // in the same transaction as the first step, rather than guessing that state.
+            // by reconstructing the actual derived output in bounded steps. The old generation
+            // is held unready until the subsequent full fold completes.
             writer.authority_changed()?;
-            State::new(writer, now)
+            baseline(writer)
+        }
+        Some(state)
+            if matches!(state.phase, BASELINE_EFFECTS | BASELINE_AUTHORITY)
+                && (state.generation != writer.authority_generation()
+                    || state.ordered != writer.ordered()) =>
+        {
+            // The derived inputs changed between bounded steps. Restart only the scan rather
+            // than combine fingerprints from different views.
+            baseline(writer)
         }
         Some(state)
             if state.generation == writer.authority_generation()
@@ -379,6 +402,36 @@ pub(super) fn advance(
         ACTIONS => action_step(writer, input, root, &mut state)?,
         HEAD => head_step(writer, root, &mut state)?,
         DONE => return Ok(true),
+        BASELINE_EFFECTS => {
+            if let Some((key, log)) =
+                writer.first(Table::Effects, Some(rank_key(state.after_rank)))?
+            {
+                effect_token(&mut state.projection, &writer.entry(log)?);
+                state.after_rank = rank_from(&key)?;
+            } else {
+                state.phase = BASELINE_AUTHORITY;
+                state.target = None;
+            }
+        }
+        BASELINE_AUTHORITY => {
+            let after = state.target.map(|target| hash_key(&target));
+            if let Some((key, record)) = writer.first(Table::CurrentAuthority, after)? {
+                let target: Digest32 = key[..32]
+                    .try_into()
+                    .map_err(|_| invalid("governance baseline author"))?;
+                if key[32..].iter().any(|byte| *byte != 0) {
+                    return Err(invalid("governance baseline author key"));
+                }
+                let (grant, deny) = current_authority_record(writer, record)?;
+                admin_token(&mut state.projection, &target, grant, deny);
+                state.target = Some(target);
+            } else {
+                // Format 1 had no comparable published fingerprint. Publish this actual
+                // baseline and invalidate display once, then rebuild using normal fold rules.
+                writer.rebaseline_projection(state.projection)?;
+                state = State::new(writer, now);
+            }
+        }
         _ => return Err(invalid("governance fold phase")),
     }
     state.save(writer)?;
