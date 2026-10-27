@@ -47,6 +47,12 @@ pub(super) struct RequestReady {
     secret: SecretLease,
 }
 
+pub(super) enum OwnKeyReply {
+    Available(crate::group::skdm::Skdm),
+    Unavailable,
+    DonorStorageFault,
+}
+
 pub(super) struct ResponseReady {
     request: Request,
     node: Digest32,
@@ -54,7 +60,7 @@ pub(super) struct ResponseReady {
     connection: Arc<VoxConnection>,
     room: SharedChannel,
     context: crate::join::session::JoinContext,
-    release: crate::error::Result<Option<crate::group::skdm::Skdm>>,
+    release: crate::error::Result<OwnKeyReply>,
     _credit: PairwiseCredit,
     _output: crate::node::history_budget::OutputCharge,
     _secret: SecretLease,
@@ -215,19 +221,26 @@ impl Node {
             return;
         }
         match &ready.release {
-            Ok(Some(_)) => {}
-            Ok(None) => {
+            Ok(OwnKeyReply::Available(_)) => {}
+            Ok(OwnKeyReply::Unavailable) => {
+                self.fail_own_key_request(request, ready.peer, ready.connection.serial());
+                return;
+            }
+            Ok(OwnKeyReply::DonorStorageFault) => {
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!("room {}: a peer could not read its retained history key due to a storage error", crate::node::link::b32_encode(&request.room)),
+                });
                 self.fail_own_key_request(request, ready.peer, ready.connection.serial());
                 return;
             }
             Err(error) => {
-                self.own_key_active.remove(&request.room);
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {}: own history key request failed: {error}",
                         crate::node::link::b32_encode(&request.room)
                     ),
                 });
+                self.fail_own_key_request(request, ready.peer, ready.connection.serial());
                 return;
             }
         }
@@ -272,7 +285,7 @@ impl Node {
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
-        let Ok(Some(release)) = &ready.release else {
+        let Ok(OwnKeyReply::Available(release)) = &ready.release else {
             return;
         };
         let result = self.with_current_computer_authority(|| {
@@ -790,6 +803,7 @@ impl Node {
             return;
         };
         let current = current
+            && !channel.has_left(&node)
             && channel.is_member(&peer)
             && !channel.has_left(&peer)
             && channel
@@ -956,7 +970,7 @@ pub(super) fn open_response(
     request: Request,
     author: Digest32,
     now: u64,
-) -> crate::error::Result<Option<crate::group::skdm::Skdm>> {
+) -> crate::error::Result<OwnKeyReply> {
     let crate::node::pairwise_stream::PairwiseFrame::RecoveryReply { channel_id, sealed } = frame
     else {
         return Err(Error::MalformedBundle("own-key response frame"));
@@ -1079,7 +1093,7 @@ pub(super) fn decode_response(
     bytes: &[u8],
     request: Request,
     author: Digest32,
-) -> crate::error::Result<Option<crate::group::skdm::Skdm>> {
+) -> crate::error::Result<OwnKeyReply> {
     if bytes.len() > crate::node::pairwise_stream::MAX_PAIRWISE_FRAME {
         return Err(Error::SizeLimitExceeded("own-key response"));
     }
@@ -1090,12 +1104,8 @@ pub(super) fn decode_response(
     let status = d.uint()?;
     let wire = d.bytes()?;
     let result = match status {
-        0 if wire.is_empty() => None,
-        2 if wire.is_empty() => {
-            return Err(Error::Unreachable(
-                "peer could not read its retained history key due to a storage error",
-            ))
-        }
+        0 if wire.is_empty() => OwnKeyReply::Unavailable,
+        2 if wire.is_empty() => OwnKeyReply::DonorStorageFault,
         1 => {
             let release = crate::group::skdm::Skdm::from_wire(wire)?;
             if release.body.channel_id != request.room
@@ -1108,7 +1118,7 @@ pub(super) fn decode_response(
                     "own-key release does not satisfy request",
                 ));
             }
-            Some(release)
+            OwnKeyReply::Available(release)
         }
         _ => return Err(Error::MalformedBundle("own-key response status")),
     };

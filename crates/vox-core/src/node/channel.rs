@@ -8353,7 +8353,10 @@ impl ChannelState {
             .authors
             .get(&author)
             .ok_or(Error::MalformedAtRest("own release author missing"))?;
+        // Everything read below is a local sealed-store artifact, not peer input. Preserve
+        // corruption/decryption/signature failures as storage health rather than peer refusal.
         receiver_releases::lookup(store, &self.sek, &self.channel_id, receiver, root, floor)
+            .map_err(|error| Error::Storage { op: "read retained sender release", detail: error.to_string() })
     }
 
     pub(crate) fn receiver_release_cleanup_waiting(error: &Error) -> bool {

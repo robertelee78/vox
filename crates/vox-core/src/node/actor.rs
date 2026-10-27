@@ -21498,6 +21498,9 @@ impl Node {
         if published.is_none() {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
+        // Retire request/response owners from any replaced room instance before processing
+        // further actor events. Existing physical blocking workers still join on their own task.
+        self.cancel_own_key_room(channel_id);
         // Reopening replaces the room instance. Never inherit a settled marker retained for the
         // prior instance while it was absent from the open-room map.
         self.governance_work.wake_room(channel_id);
@@ -21682,6 +21685,8 @@ impl Node {
                 return;
             }
         };
+        // The departure is durable; no response prepared for the former membership may escape.
+        self.cancel_own_key_room(channel_id);
         if let Err(fault) = self
             .withdraw_from_boards(
                 &channel_id,
