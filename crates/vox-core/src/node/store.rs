@@ -252,6 +252,7 @@ fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
 #[derive(Debug)]
 struct ReceivedOwner {
     room: Digest32,
+    settled: Arc<tokio::sync::Notify>,
 }
 
 /// One exact flow's latest received transaction. Pointer identity distinguishes concurrent lanes,
@@ -403,7 +404,10 @@ pub(crate) struct ReceivedFlow {
 impl ReceivedFlow {
     pub(crate) fn new(room: Digest32) -> Self {
         Self {
-            owner: Arc::new(ReceivedOwner { room }),
+            owner: Arc::new(ReceivedOwner {
+                room,
+                settled: Arc::new(tokio::sync::Notify::new()),
+            }),
         }
     }
 
@@ -1272,6 +1276,24 @@ impl Store {
         }))
     }
 
+    /// Wait for a successful durable commit to cover this exact captured debt.
+    pub(crate) async fn wait_received_settled(&self, debt: ReceivedDebt) {
+        loop {
+            let mut wake = Box::pin(Arc::clone(&debt.owner.settled).notified_owned());
+            wake.as_mut().enable();
+            if self
+                .writer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .durable_through
+                >= debt.through
+            {
+                return;
+            }
+            wake.await;
+        }
+    }
+
     /// Flush one exact receive-owned transaction. If another durable commit already covered
     /// it, return without beginning a transaction even when newer debt exists. This is the
     /// ownership boundary that makes an empty/unrelated round write nothing (ADR-038 FX-30).
@@ -1361,6 +1383,9 @@ impl Store {
 
     fn settle_durable_through(epochs: &mut Epochs, through: u64) {
         epochs.durable_through = epochs.durable_through.max(through);
+        for pending in &epochs.pending {
+            pending.owner.settled.notify_waiters();
+        }
         epochs
             .pending
             .retain(|pending| pending.through > epochs.durable_through);

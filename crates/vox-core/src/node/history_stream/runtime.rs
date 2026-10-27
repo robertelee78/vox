@@ -303,6 +303,7 @@ pub(crate) struct Flow {
     retirement_request: RequestId,
     request: RequestId,
     cleanup_store: Arc<Store>,
+    failed_settlement: Option<crate::node::store::ReceivedDebt>,
     cleanup_budget: Arc<crate::node::history_budget::Budget>,
     actor_incarnation: Option<u64>,
     cleanup_after: Option<[u8; 64]>,
@@ -486,6 +487,7 @@ impl Flow {
             retirement_request: request,
             request,
             cleanup_store,
+            failed_settlement: None,
             cleanup_budget,
             actor_incarnation,
             cleanup_after: None,
@@ -649,6 +651,7 @@ impl Flow {
             retirement_request: request,
             request,
             cleanup_store,
+            failed_settlement: None,
             cleanup_budget,
             actor_incarnation,
             cleanup_after: None,
@@ -1113,12 +1116,16 @@ impl Flow {
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
     pub(crate) async fn retire_slice(&mut self) -> Result<RetirementStep> {
         self.publication_owner_wait = None;
+        self.failed_settlement = None;
         if !self.initialized || self.shared.lock().await.history_retirement_locked() {
             self.cancel();
             return Ok(RetirementStep::Done);
         }
-        self.settle_received(Arc::clone(&self.cleanup_store))
-            .await?;
+        let debt = self.received.debt(&self.cleanup_store)?;
+        if let Err(error) = self.settle_received(Arc::clone(&self.cleanup_store)).await {
+            self.failed_settlement = debt;
+            return Err(error);
+        }
         // A published current body queues only local exact-request reclamation. If its peer
         // departs before the next network turn, finish that bounded cleanup here; membership is
         // never restored and no archive, wire request or new effect is run.
@@ -1321,7 +1328,25 @@ impl Flow {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
         let shared = Arc::clone(&self.shared);
+        let settlement = self.failed_settlement.clone();
+        let store = Arc::clone(&self.cleanup_store);
         Box::pin(async move {
+            if let Some(debt) = settlement {
+                tokio::select! {
+                    () = store.wait_received_settled(debt) => return,
+                    () = async {
+                        loop {
+                            let wake = {
+                                let room = shared.lock().await;
+                                let wake = room.history_publication_wake();
+                                if room.history_retirement_locked() { return; }
+                                wake
+                            };
+                            wake.await;
+                        }
+                    } => return,
+                }
+            }
             loop {
                 let wake = {
                     let room = shared.lock().await;
