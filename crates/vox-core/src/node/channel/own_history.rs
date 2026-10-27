@@ -405,19 +405,22 @@ impl ChannelState {
         if !candidate.recovers_own_sender(&self.sender) {
             return Err(Error::OwnHistoryBehind);
         }
-        let segment = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
-        )?;
         let mut batch = profile.store().batch()?;
-        batch.put_segment(
+        let stored = receiver_overlay::put(
+            &mut batch,
+            &self.sek,
             &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &segment,
+            &me,
+            self.epoch,
+            self.receiver_persistence.base,
+            &candidate,
         )?;
+        if let receiver_overlay::Put::Busy { changed } = stored {
+            if changed {
+                batch.commit()?;
+            }
+            return Err(Error::StreamRefused(receiver_overlay::CLEANUP_PENDING));
+        }
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;

@@ -21066,7 +21066,7 @@ impl Node {
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
         if let Some(profile) = self.profile.as_ref() {
-            let (more, _) = ch.advance_receiver_release_cleanup(profile.store())?;
+            let (more, _, _) = ch.advance_receiver_release_cleanup(profile.store())?;
             // Existing preparation remains runnable after actual bounded progress. A ready
             // room still publishes now; its ordinary maintenance inherits the durable debt.
             prepared.progressed |= more;

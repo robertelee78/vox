@@ -358,19 +358,28 @@ impl Node {
         };
         // Receiver access narrowed in its original transaction. Its independent index can
         // retire one exact stale object per turn even while history/governance is rebuilding.
-        match channel.advance_receiver_release_cleanup(&store) {
-            Ok((more, retry_ready)) => {
+        let own_retry_ready = match channel.advance_receiver_release_cleanup(&store) {
+            Ok((more, retry_ready, own_retry_ready)) => {
                 self.governance_work.again |= more;
                 if retry_ready {
                     // A physically freed slot, not a periodic retry, replays packages which
                     // could not retain their authenticated key at the earlier admission.
                     self.key_package_rooms.entry(room).or_insert(false);
                 }
+                own_retry_ready
             }
             Err(error) => {
                 channel.poison(&error);
                 return;
             }
+        };
+        if own_retry_ready {
+            // Only actual physical capacity release resumes the owed own receiver seed.
+            // The selected ordinary governance turn remains owed after this handoff.
+            self.governance_work.wake_room(room);
+            drop(channel);
+            self.advance_own_recovery(room).await;
+            return;
         }
         let (governance_ready, governance_pending, governance_changed) =
             if self.governance_work.settled.contains(&room) {
@@ -580,6 +589,12 @@ impl Node {
                     })
             }) {
                 Some(Ok(result)) => result,
+                Some(Err(error)) if ChannelState::receiver_release_cleanup_waiting(&error) => {
+                    // The seed persisted its exact retry bit. Park on bounded physical GC,
+                    // whose freed-slot result is the producer for another attempt.
+                    self.governance_work.wake_room(room);
+                    (false, false)
+                }
                 Some(Err(error)) => {
                     channel.poison(&error);
                     (false, false)

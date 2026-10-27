@@ -97,6 +97,8 @@ pub enum SegmentKind {
     HistoryDemand,
     /// Exact original signed sender releases, indexed independently of history publication.
     ReceiverReleases,
+    /// Bounded own-author receiver slot overrides, bound to the sealed base receiver map.
+    ReceiverStates,
 }
 
 impl SegmentKind {
@@ -119,6 +121,7 @@ impl SegmentKind {
             SegmentKind::SessionAttention => b"vox/seg/session-attention/v1",
             SegmentKind::HistoryDemand => b"vox/seg/history-demand/v1",
             SegmentKind::ReceiverReleases => b"vox/seg/receiver-releases/v1",
+            SegmentKind::ReceiverStates => b"vox/seg/receiver-states/v1",
         }
     }
 }

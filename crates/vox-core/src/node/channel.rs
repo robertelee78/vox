@@ -62,6 +62,7 @@ mod private_session;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
 mod own_history;
 mod proof_range;
+mod receiver_overlay;
 mod receiver_releases;
 pub(crate) use proof_range::{ProofRangeRestore, ProofRangeStep};
 pub(crate) mod session_floor;
@@ -1157,6 +1158,7 @@ pub struct ChannelState {
     /// uses its message key up even when what it opened does not render, so a pass that rendered
     /// nothing must write the chains too, or a restart could derive that key again.
     chains_advanced: bool,
+    receiver_persistence: receiver_overlay::Persistence,
     /// A render backfill was drained while the governance view was refreshing: nothing
     /// rendered, the queue kept; the next governance turn drains it (ADR-038 FX-22, #1007).
     backfill_refreshing: bool,
@@ -2085,6 +2087,9 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
+            receiver_persistence: receiver_overlay::Persistence::new(receiver_overlay::digest(
+                None,
+            ))?,
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -2670,15 +2675,30 @@ impl ChannelState {
         let sender = SenderChain::from_state(&sender_state)?;
         drop(sender_state);
 
-        // Sender keys other members released to us (M14.5b).
-        let receivers =
-            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_RECEIVERS)? {
-                Some(seg) => {
-                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_RECEIVERS, &seg)?;
-                    parse_receivers(&bytes)?
-                }
-                None => BTreeMap::new(),
-            };
+        // Validate the override basis against the exact sealed base in the same snapshot.
+        let receiver_snapshot = store.snapshot()?;
+        let receiver_segment =
+            receiver_snapshot.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_RECEIVERS)?;
+        let receiver_base = receiver_overlay::digest(receiver_segment.as_ref());
+        let mut receivers = match receiver_segment {
+            Some(seg) => parse_receivers(&open_segment(
+                &sek,
+                SegmentKind::KeyMaterial,
+                SEG_RECEIVERS,
+                &seg,
+            )?)?,
+            None => BTreeMap::new(),
+        };
+        receiver_overlay::merge(
+            &receiver_snapshot,
+            &sek,
+            channel_id,
+            &me,
+            epoch,
+            receiver_base,
+            &mut receivers,
+        )?;
+        drop(receiver_snapshot);
         // The services this node offers here (ADR-013 M16.1).
         let (services, kinds) =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SERVICES)? {
@@ -2856,6 +2876,7 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside,
             chains_advanced: false,
+            receiver_persistence: receiver_overlay::Persistence::new(receiver_base)?,
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -3128,6 +3149,9 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
+            receiver_persistence: receiver_overlay::Persistence::new(receiver_overlay::digest(
+                None,
+            ))?,
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -7639,11 +7663,12 @@ impl ChannelState {
                     SEG_RECEIVERS,
                     &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
                 )?;
-                batch.put_segment(
+                receiver_overlay::rewrite(
+                    &mut batch,
+                    &self.sek,
                     &self.channel_id,
-                    SegmentKind::KeyMaterial,
-                    SEG_RECEIVERS,
                     &sealed,
+                    self.receiver_persistence.next_normal()?,
                 )?;
                 let mut writer = self
                     .entries
@@ -7657,6 +7682,9 @@ impl ChannelState {
         match saved {
             Ok(false) => return Err(Error::StreamRefused(receiver_releases::CLEANUP_PENDING)),
             Ok(true) => {}
+            Err(error @ Error::StreamRefused(receiver_overlay::CLEANUP_PENDING)) => {
+                return Err(error)
+            }
             Err(error) => {
                 self.poison(&error);
                 return Err(error);
@@ -7669,6 +7697,7 @@ impl ChannelState {
             });
         }
         self.receivers.insert(slot, candidate);
+        self.receiver_persistence.advance_normal()?;
         self.entries.committed();
         self.drain_backfill(store, now_ms)
             .map(|rendered| AcceptedSkdm {
@@ -8094,6 +8123,7 @@ impl ChannelState {
         let Ok(plaintext) = chain.decrypt(msg).map(Zeroizing::new) else {
             return Ok(());
         };
+        self.receiver_persistence.advance_drive()?;
         self.chains_advanced = true;
         // Only a Session entry opens under a drive key: a node's message to the room is sealed
         // under its sender key, for every reader.
@@ -8142,15 +8172,11 @@ impl ChannelState {
     }
 
     fn persist_drive(&mut self, store: &Store) -> Result<()> {
-        let saved = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_DRIVE,
-            &self.drive.to_state(),
-        )
-        .and_then(|seg| {
-            store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
-        });
+        let saved = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            self.queue_drive(&mut batch)?;
+            batch.commit()
+        })();
         if let Err(e) = saved {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
@@ -8190,6 +8216,7 @@ impl ChannelState {
 
     /// Persist the receiver chains, poisoning the channel if sealing or writing fails.
     fn persist_receivers(&mut self, store: &Store) -> Result<()> {
+        self.receiver_persistence.advance_normal()?;
         let saved = (|| -> Result<()> {
             let mut batch = store.batch()?;
             self.queue_receivers(&mut batch)?;
@@ -8215,11 +8242,11 @@ impl ChannelState {
     pub(crate) fn advance_receiver_release_cleanup(
         &mut self,
         store: &Store,
-    ) -> Result<(bool, bool)> {
+    ) -> Result<(bool, bool, bool)> {
         // A selected package owns its exact cursor until ordinary completion. Do not
         // change the replay basis while preparation waits on that attempt's authority.
         if self.key_packages.has_attempt() {
-            return Ok((false, false));
+            return Ok((false, false, false));
         }
         let mut batch = store.batch()?;
         let progress =
@@ -8233,13 +8260,19 @@ impl ChannelState {
             } else {
                 None
             };
+            let more = more || receiver_overlay::pending(&batch, &self.sek, &self.channel_id)?;
             batch.commit()?;
             if let Some(replay) = replay {
                 self.key_packages = replay;
             }
-            Ok((more, retry_ready))
+            Ok((more, retry_ready, false))
+        } else if let Some((more, own_retry_ready)) =
+            receiver_overlay::advance(&mut batch, &self.sek, &self.channel_id)?
+        {
+            batch.commit()?;
+            Ok((more, false, own_retry_ready))
         } else {
-            Ok((false, false))
+            Ok((false, false, false))
         }
     }
 
@@ -8737,7 +8770,8 @@ impl ChannelState {
             return Ok(ContentProjection::Applied);
         }
         let slot = (author, msg.header.chain_id);
-        if historical {
+        let own = author == me;
+        if historical || own {
             let writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
             let already = writer.has_rendered(&entry_hash)?
                 || writer.read_receipt_cache(&entry_hash)?.is_some()
@@ -8765,16 +8799,21 @@ impl ChannelState {
             // so a key cannot commit and drain between this check and this row's acceptance.
             return Ok(ContentProjection::Applied);
         };
-        let plaintext = match if historical {
+        let plaintext = match if own {
+            chain.decrypt_retained(&msg)
+        } else if historical {
             chain.decrypt_history(&msg)
         } else {
             chain.decrypt(&msg)
         } {
             Ok(p) => Zeroizing::new(p),
-            Err(_) if historical => return Ok(ContentProjection::Unavailable),
+            Err(_) if historical || own => return Ok(ContentProjection::Unavailable),
             Err(_) => return Ok(ContentProjection::Applied),
         };
-        self.chains_advanced = true;
+        if !own {
+            self.receiver_persistence.advance_normal()?;
+            self.chains_advanced = true;
+        }
         // **Skipped, not propagated** — matching the three `Ok(None)` paths above it.
         //
         // An entry this node cannot render is one entry it cannot show, and every other reason for
@@ -8967,22 +9006,24 @@ impl ChannelState {
         settled
     }
 
-    /// Queue the receiver chains, as they stand now, into `batch`.
+    /// Durable written stamps acknowledge only the same transaction as the state. An
+    /// aborted render cannot clear dirty state, and own read-only decrypt writes neither map.
     fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
-        let receivers_seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &receivers_bytes(&self.receivers),
-        )?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &receivers_seg,
-        )?;
-        // The drive keys advance in the same passes.
-        self.queue_drive(batch)
+        let normal = self.receiver_persistence.normal();
+        if receiver_overlay::normal_dirty(batch, &self.sek, &self.channel_id, normal)? {
+            let segment = seal_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_RECEIVERS,
+                &receivers_bytes(&self.receivers),
+            )?;
+            receiver_overlay::rewrite(batch, &self.sek, &self.channel_id, &segment, normal)?;
+        }
+        let drive = self.receiver_persistence.drive();
+        if receiver_overlay::drive_dirty(batch, &self.sek, &self.channel_id, drive)? {
+            self.queue_drive(batch)?;
+        }
+        Ok(())
     }
 
     fn queue_drive(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
@@ -8992,7 +9033,13 @@ impl ChannelState {
             SEG_DRIVE,
             &self.drive.to_state(),
         )?;
-        batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
+        batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)?;
+        receiver_overlay::wrote_drive(
+            batch,
+            &self.sek,
+            &self.channel_id,
+            self.receiver_persistence.drive(),
+        )
     }
 
     /// Note only the committed row's sealed ordering and shown-time facts. No plaintext is

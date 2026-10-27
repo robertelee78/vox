@@ -546,6 +546,19 @@ impl ReceiverChain {
         self.author_id
     }
 
+    pub(crate) fn bound_to(
+        &self,
+        room: &Digest32,
+        epoch: u64,
+        author: &Digest32,
+        chain: u64,
+    ) -> bool {
+        self.channel_id == *room
+            && self.epoch == epoch
+            && self.author_id == *author
+            && self.chain_id == chain
+    }
+
     /// The generation id this receiver reads.
     #[must_use]
     pub fn chain_id(&self) -> u64 {
@@ -647,7 +660,17 @@ impl ReceiverChain {
         if iteration >= self.next_iteration || self.skipped.contains_key(&iteration) {
             return self.decrypt(msg);
         }
-        let gap = iteration
+        self.decrypt_retained(msg)
+    }
+
+    /// Reopen an own-author retained message without changing its live replay/ratchet state.
+    /// Callers deduplicate canonical effects before this operation; the authenticated floor,
+    /// signature, AEAD and existing derivation bound still apply.
+    pub(crate) fn decrypt_retained(&self, msg: &GroupMessage) -> Result<Vec<u8>> {
+        self.check_binding(&msg.header)?;
+        let gap = msg
+            .header
+            .iteration
             .checked_sub(self.history_iteration)
             .ok_or(Error::MalformedBundle(
                 "group iteration before history release",
