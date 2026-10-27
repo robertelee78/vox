@@ -920,10 +920,10 @@ impl ChannelState {
             late,
         )?;
         // Current consent/presence may become visible immediately at source publication, before
-        // the later effect turn. Flush only a verified current input which changes that mirror;
-        // duplicate, superseded, same-value and other-recipient key headers do not qualify.
+        // the later effect turn. A newer current input can also change the causal sequence or
+        // historical revocation even when its displayed value stays the same. Keep those facts
+        // durable; duplicate, superseded and other-recipient key headers do not qualify.
         let mirrored_change = accepted.current_advanced
-            && accepted.work_changed
             && self.authors.contains_key(&entry.skeleton.author_id)
             && match GovEntry::body_bound_to(entry) {
                 Ok(GovBody::ConsentGrant(grant)) => {
