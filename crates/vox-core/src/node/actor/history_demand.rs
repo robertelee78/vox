@@ -30,6 +30,8 @@ pub(super) struct Dispatch {
     pub fence: Arc<Fence>,
     /// Set only after the actor checks the current connected donor's room membership.
     eligible: bool,
+    /// A disconnected current member still owns a reconnect need.
+    dial_eligible: bool,
 }
 
 struct PrivateDispatch {
@@ -184,9 +186,25 @@ pub(super) struct Controller {
     route_lock_wait: Option<RouteLockWait>,
 }
 impl Controller {
-    /// A committed keyring replacement changes the saved authorization generation.
-    pub(super) fn note_route_trust_change(&mut self) {
+    /// Retire only the exact unstarted page when its captured trust generation changes.
+    pub(super) fn note_route_trust_change(
+        &mut self,
+    ) -> Option<(Digest32, Digest32, [u8; 16], RequestId, Digest32)> {
         self.route_attempt = None;
+        let dispatch = self.ready.as_ref()?;
+        let (room, peer, instance, request, generation) = (
+            dispatch.room,
+            dispatch.peer,
+            dispatch.instance,
+            dispatch.request,
+            dispatch.generation,
+        );
+        if !self.owns_running_fence(request, generation, &dispatch.fence) {
+            return None;
+        }
+        self.failed_current(room, instance, request, generation,
+            "Authorization changed. The saved history request is paused; Resume checks current access.")
+            .then_some((room, peer, instance, request, generation))
     }
 
     fn clear_resume_owed(&mut self) {
@@ -312,6 +330,16 @@ impl Controller {
                     )
             })
             .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
+    }
+
+    pub(super) fn unstarted_dial_binding(&self, room: Digest32, peer: Digest32) -> bool {
+        self.ready.as_ref().is_some_and(|dispatch| {
+            dispatch.room == room
+                && dispatch.peer == peer
+                && dispatch.dial_eligible
+                && !dispatch.fence.is_retired()
+                && self.owns_running_fence(dispatch.request, dispatch.generation, &dispatch.fence)
+        })
     }
 
     pub(super) fn take_legacy_cleanup(&mut self) -> Option<(Digest32, LegacyProvisionalOwner)> {
@@ -664,22 +692,6 @@ impl Node {
             })
             .collect();
         candidates.sort_unstable();
-        if !original_connected && candidates.is_empty() {
-            self.bounded_sync
-                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
-            if let Some(dispatch) = self.history_demand.ready.as_mut() {
-                dispatch.eligible = false;
-            }
-            self.history_demand.route_lock_wait = None;
-            if let Some(status) = self.history_demand.owner_status.as_mut().filter(|status| {
-                status.room == room
-                    && status.instance == instance
-                    && status.request == Some(request)
-            }) {
-                status.detail = "History is waiting for a trusted connected room member.".into();
-            }
-            return;
-        }
         let was_eligible = self
             .history_demand
             .ready
@@ -693,6 +705,7 @@ impl Node {
             Err(_) => {
                 if let Some(dispatch) = self.history_demand.ready.as_mut() {
                     dispatch.eligible = false;
+                    dispatch.dial_eligible = false;
                 }
                 self.bounded_sync
                     .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
@@ -725,15 +738,23 @@ impl Node {
                 return;
             }
         };
-        let original_member =
-            original_connected && ch.history_inventory_incarnation(&peer).is_some();
+        let original_member = self.trust.is_trusted(&peer)
+            && self
+                .ports
+                .get(&(room, peer))
+                .is_some_and(|port| port.room.is(&current))
+            && ch.history_inventory_incarnation(&peer).is_some();
+        let original_ready = original_connected && original_member;
         let candidates: Vec<_> = candidates
             .into_iter()
             .map(|(peer, serial)| (peer, serial, ch.history_inventory_incarnation(&peer)))
             .collect();
         drop(ch);
         self.history_demand.route_lock_wait = None;
-        if original_member {
+        if let Some(dispatch) = self.history_demand.ready.as_mut() {
+            dispatch.dial_eligible = original_member;
+        }
+        if original_ready {
             if let Some(dispatch) = self.history_demand.ready.as_mut() {
                 dispatch.eligible = true;
             }
@@ -2389,6 +2410,7 @@ fn prepare(
         },
         fence,
         eligible: false,
+        dial_eligible: false,
     });
     Ok(answer)
 }
