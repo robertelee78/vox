@@ -3844,6 +3844,7 @@ final class NodeModel: ObservableObject {
     fileprivate enum ObservationStop {
         case ended
         case roomChanged
+        case sessionChanged
     }
 
     fileprivate func stopped(_ reason: ObservationStop) async {
@@ -3875,6 +3876,8 @@ final class NodeModel: ObservableObject {
             daemonFailure = notice
         case .roomChanged:
             notice = "The saved room changed. Refreshing its history and observation."
+        case .sessionChanged:
+            notice = "Session state changed. Refreshing the room and observation."
         }
         ended = notice
         machineStateKnown = false
@@ -4242,6 +4245,13 @@ extension NodeModel {
             }
         } catch {
             guard current() else { return }
+            // The daemon uses this refusal for both a changed room instance and a changed
+            // Session projection. Neither authorizes the old room page or its controls.
+            if case let VoxError.Failed(reason) = error,
+               reason == "the room's Sessions changed; refresh the listing" {
+                await stopped(.sessionChanged)
+                return
+            }
             discardSessionWindow(after: error, requiresReload: reloadNewest)
         }
     }
