@@ -1504,15 +1504,34 @@ final class NodeModel: ObservableObject {
             machineStateKnown = true
             daemonFailure = nil
             if fresh != nodes { nodes = fresh }
-            if fresh.first(where: { $0.name == node })?.state != "attached" {
+            let listedNode = fresh.first(where: { $0.name == node })
+            if listedNode?.state != "attached" {
                 nodeObservationEpoch = UUID()
                 invalidateRoomAnchorState(preservingSnapshot: true)
                 invalidateMemberRoles()
                 daemonReachable = true
-                ended = fresh.first(where: { $0.name == node })?.status == "Locked"
-                    ? "Node \(node) is Locked." : "Node \(node) is unavailable."
-                releaseHistoryViews()
-                peers = 0
+                observationNeedsRestart = true
+                if listedNode?.status == "Locked" || listedNode?.state == "detached" {
+                    ended = listedNode?.status == "Locked"
+                        ? "Node \(node) is Locked." : "Node \(node) is unavailable."
+                    releaseHistoryViews()
+                    peers = 0
+                } else {
+                    // Attaching, detaching, an unknown state, and an absent listing do not
+                    // establish detach. Keep the ordinary timeline while suspending actions;
+                    // release Session views until the observation is authorized again.
+                    let snapshot = showingSession ? [] : messages
+                    releaseHistoryViews()
+                    messages = snapshot
+                    roomNeedsPage = true
+                    switch listedNode?.state {
+                    case "attaching": ended = "Node \(node) is attaching."
+                    case "detaching": ended = "Node \(node) is detaching."
+                    default:
+                        ended = "Node \(node) state is unknown. Checking again."
+                        machineStateKnown = false
+                    }
+                }
                 return
             }
             let view = try await client.view()
@@ -3751,7 +3770,7 @@ final class NodeModel: ObservableObject {
         // The room's actions remain unavailable until its page and inspector replace the snapshot
         // together. A confirmed detach/lock releases the rest after the node state is known.
         if case .room = selection {
-            let snapshot = messages
+            let snapshot = showingSession ? [] : messages
             releaseHistoryViews()
             messages = snapshot
             roomNeedsPage = true
