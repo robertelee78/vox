@@ -372,6 +372,7 @@ impl Flow {
         live: Arc<Context>,
         control: Arc<Context>,
         hint: Option<super::HeadHint>,
+        local_own_verification: bool,
         departure_probe: bool,
         required: Option<(Digest32, u64)>,
         slots: Arc<BodySlots>,
@@ -379,6 +380,15 @@ impl Flow {
         cleanup_budget: Arc<crate::node::history_budget::Budget>,
         actor_incarnation: Option<u64>,
     ) -> Result<Self> {
+        if local_own_verification
+            && (hint.is_none_or(|hint| hint.author != node)
+                || departure_probe
+                || required.is_some())
+        {
+            return Err(Error::Profile(
+                "own verification root is not an exact local head",
+            ));
+        }
         let request = request_id()?;
         let mut flow = Self {
             room,
@@ -401,7 +411,7 @@ impl Flow {
             required_root: required,
             state_charge: None,
             hint,
-            local_own_verification: false,
+            local_own_verification,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
@@ -488,7 +498,27 @@ impl Flow {
             flow.push(Task {
                 request,
                 purpose: Purpose::Control,
-                operation: Operation::Wire(Query::Head(hint.author)),
+                // Ordinary inventory hints ask which head the peer currently serves. A
+                // recovery root already names a locally verified signed Head: asking Head
+                // here could retarget it to a lower reply forever. Start its existing exact
+                // header/inclusion/consistency promotion path instead; no body is requested.
+                operation: Operation::Wire(if local_own_verification {
+                    if hint.size == 0 {
+                        Query::Proof {
+                            head: hint.head,
+                            kind: super::ProofKind::Consistency,
+                            from: 0,
+                            to: 0,
+                        }
+                    } else {
+                        Query::Header {
+                            head: hint.head,
+                            seq: hint.size,
+                        }
+                    }
+                } else {
+                    Query::Head(hint.author)
+                }),
             })?;
         } else {
             flow.push(Task {

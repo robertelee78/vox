@@ -3451,6 +3451,10 @@ impl Node {
                             live,
                             control,
                             hint,
+                            own_verification.is_some()
+                                && hint == own_verification
+                                && departure_hint.is_none()
+                                && required.is_none(),
                             departure_hint.is_some() && required.is_none(),
                             required,
                             self.bounded_sync.body_slots.clone(),
@@ -3459,10 +3463,6 @@ impl Node {
                             actor_incarnation,
                         ) {
                             Ok(mut flow) => {
-                                flow.local_own_verification = own_verification.is_some()
-                                    && hint == own_verification
-                                    && departure_hint.is_none()
-                                    && required.is_none();
                                 flow.reason = reason;
                                 if let Some(at) = required_at {
                                     let _ = self.bounded_sync.required.remove(at);
@@ -3529,6 +3529,10 @@ impl Node {
                         live,
                         control,
                         hint,
+                        own_verification.is_some()
+                            && hint == own_verification
+                            && departure_hint.is_none()
+                            && required.is_none(),
                         departure_hint.is_some() && required.is_none(),
                         required,
                         self.bounded_sync.body_slots.clone(),
@@ -3537,10 +3541,6 @@ impl Node {
                         actor_incarnation,
                     ) {
                         Ok(mut flow) => {
-                            flow.local_own_verification = own_verification.is_some()
-                                && hint == own_verification
-                                && departure_hint.is_none()
-                                && required.is_none();
                             flow.reason = reason;
                             if let Some(at) = required_at {
                                 let _ = self.bounded_sync.required.remove(at);
