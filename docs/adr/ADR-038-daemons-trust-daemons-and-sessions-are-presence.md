@@ -561,16 +561,18 @@ lessons. It changes neither this record's decision status nor any requirement or
   `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
-- **FX-31.** A flush to disk of one commit MUST NOT delay what does not depend on it: while a
-  flush is held (apparatus: the store's flush stalled by a `VOX_TEST_*` knob of the `test-knobs`
-  build, the way every held-step proof here stages a stall), the daemon's status
-  publication, a member's read in that room, a post in that room or any other, and attention
-  selection MUST answer within FX-17's bound ("publications, reads, posts and attention never
-  wait on" a flush, ruled 2026-10-20: "sounds right"), and `vox status` MUST NOT say "room
-  publication is busy" for a room whose only activity is a flush. Decision: no commit's flush
-  runs while the room's lock is held; a post's batch is written under the lock and its own
-  flush completes after the lock is released, so the post is accepted, and durable, within the
-  bound while an earlier flush is still held. Measured cause, the same daemon: every commit ran inside `history_write` with
+- **FX-31.** A flush to disk of one commit MUST NOT delay work that does not depend on that
+  flush. While a save is stalled, status publication, reads of already-saved messages, attention
+  selection and other unrelated non-disk work MUST remain responsive; `vox status` MUST NOT say
+  "room publication is busy" for a room whose only activity is a flush. No commit's flush runs
+  while the room's lock is held. A new post can report success only after its own save is durable,
+  as FX-30 requires: if the shared disk cannot finish that save, the post cannot complete yet. Vox
+  MUST report a save failure or pending recovery truthfully, and MUST NOT report a post as saved
+  before its own durability boundary. The 2026-10-27 decider ruling supersedes the earlier
+  promise that every post completes while an earlier flush is held; no fixed elapsed cutoff or
+  new capacity limit determines this behavior. The existing real-binary journey may hold a flush
+  using the `test-knobs` build to show that unrelated work progresses, then release it and verify
+  that the post completes durably. Measured cause, the same daemon: every commit ran inside `history_write` with
   the room mutex held (the `read_charged` closure owns the `lock_owned()` guard), so the daemon
   log said `room publication is busy; retry this operation` 424 times and `attention selection
   remains pending`, and the app's member list flickered (#983).
