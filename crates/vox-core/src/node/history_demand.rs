@@ -770,6 +770,38 @@ pub(crate) fn inspect_precharged(
         .transpose()
 }
 
+/// Inspect an exact admitted locator using a borrowed mutation workspace. The decoded state
+/// is dropped before the workspace can be reused for a reclamation slice.
+pub(crate) fn has_admitted_recovery(
+    context: &Context,
+    _workspace: &AdmissionCharge,
+    room: Digest32,
+    instance: [u8; 16],
+    request: RequestId,
+    expected: Option<AdmittedEntry>,
+) -> Result<bool> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let Some(segment) =
+        context
+            .store()
+            .snapshot()?
+            .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
+    else {
+        return Ok(false);
+    };
+    let state = decode(key, &scope, &segment)?;
+    Ok(state.request == request
+        && state.binding.room == room
+        && state.binding.instance == instance
+        && state.admitted.is_some()
+        && expected.is_none_or(|expected| state.admitted == Some(expected))
+        && !matches!(
+            state.progress(None),
+            Progress::Cancelled | Progress::Complete
+        ))
+}
+
 /// Start only after an explicit local request and current authorization. No abandoned namespaces.
 pub fn start(
     context: &Context,

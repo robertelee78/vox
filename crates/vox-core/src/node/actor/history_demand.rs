@@ -1498,20 +1498,13 @@ impl Node {
                 // lock. Each slice removes durable pages; interruption leaves the locator and
                 // remaining pages for the same explicit request.
                 if let Action::Resume { request } = action {
-                    if let Some(mut admission) = resume_admission.take() {
+                    if let Some(admission) = resume_admission.take() {
                         let cleanup_context = Arc::clone(&context);
                         let cleanup_fence = Arc::clone(&worker_fence);
-                        admission = tokio::task::spawn_blocking(move || -> Result<demand::ResumeAdmission, String> {
-                            let saved = admission.inspect(&cleanup_context)
-                                .map_err(|error| error.to_string())?;
-                            let recover = saved.as_ref().is_some_and(|saved| {
-                                let state = saved.state();
-                                state.request == request && state.binding.room == room
-                                    && state.binding.instance == instance && state.admitted.is_some()
-                                    && local_admitted.is_none_or(|expected| state.admitted == Some(expected))
-                                    && !matches!(state.progress(None), demand::Progress::Cancelled | demand::Progress::Complete)
-                            });
-                            drop(saved);
+                        let admission = tokio::task::spawn_blocking(move || -> Result<demand::ResumeAdmission, String> {
+                            let recover = demand::has_admitted_recovery(
+                                &cleanup_context, admission.mutation(), room, instance, request, local_admitted,
+                            ).map_err(|error| error.to_string())?;
                             if recover {
                                 loop {
                                     if cleanup_fence.is_retired() {
