@@ -1510,6 +1510,8 @@ impl LaunchServicesCleanup {
     fn remember(&mut self, bundle: &Path) {
         self.bundles.push(bundle.to_path_buf());
         let plugins = bundle.join("Contents/PlugIns");
+        // This shipped extension may not exist yet when a future transition path is recorded.
+        self.extensions.push(plugins.join("ShareExtension.appex"));
         match std::fs::read_dir(&plugins) {
             Ok(entries) => {
                 self.extensions.extend(
@@ -1565,25 +1567,55 @@ impl Drop for LaunchServicesCleanup {
                 }
                 let text = String::from_utf8(out.stdout)
                     .map_err(|_| format!("{label}: non-UTF-8 output"))?;
-                for path in paths {
-                    let logical = path.to_string_lossy();
-                    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
-                        let value = logical.as_ref();
+                let normalize = |path: &Path| {
+                    std::fs::canonicalize(path).unwrap_or_else(|_| {
+                        let value = path.to_string_lossy();
                         if value.starts_with("/var/") {
                             PathBuf::from(format!("/private{value}"))
                         } else {
-                            path.clone()
+                            path.to_path_buf()
                         }
-                    });
-                    if text.lines().any(|line| {
-                        line.contains(logical.as_ref())
-                            || line.contains(canonical.to_string_lossy().as_ref())
-                    }) {
+                    })
+                };
+                let wanted: Vec<PathBuf> = paths.iter().map(|p| normalize(p)).collect();
+                let mut parsed = 0usize;
+                for line in text.lines() {
+                    let value = if label == "pluginkit" {
+                        line.rsplit_once('\t').map(|(_, value)| value.trim())
+                    } else {
+                        line.trim()
+                            .strip_prefix("path:")
+                            .map(str::trim)
+                            .map(|value| {
+                                value.rsplit_once(" (0x").map_or(value, |(path, suffix)| {
+                                    if suffix.strip_suffix(')').is_some_and(|hex| {
+                                        !hex.is_empty()
+                                            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                                    }) {
+                                        path
+                                    } else {
+                                        value
+                                    }
+                                })
+                            })
+                    };
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let actual = Path::new(value);
+                    if !actual.is_absolute() {
+                        continue;
+                    }
+                    parsed += 1;
+                    if wanted.iter().any(|path| *path == normalize(actual)) {
                         return Err(format!(
                             "{label}: scratch path {} remains registered",
-                            path.display()
+                            actual.display()
                         ));
                     }
+                }
+                if parsed == 0 && !(label == "pluginkit" && text.trim() == "(0 plug-ins)") {
+                    return Err(format!("{label}: listing has no recognizable paths"));
                 }
                 Ok(())
             };
