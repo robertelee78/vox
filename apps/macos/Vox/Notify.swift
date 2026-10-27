@@ -73,8 +73,8 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// which opens the Attach sheet for it. Replaces an earlier one for the same node.
     func postAttach(node: String) {
         let content = UNMutableNotificationContent()
-        content.title = "Node \(node) needs its passphrase"
-        content.body = "This node is unavailable. Unlock it in Vox."
+        content.title = "Node \(node) needs attention"
+        content.body = "Open Vox to attach or unlock this node."
         content.categoryIdentifier = Notifier.attachCategory
         content.userInfo = ["attachNode": node]
         content.sound = .default

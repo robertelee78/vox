@@ -52,7 +52,8 @@ extension VoxAction {
         // What the room's commands act on: the Session on screen, when one is, never the room
         // behind it (D2).
         let inSession = node?.showingSession ?? false
-        let driven = node?.shownSession.flatMap { $0.canDrive && $0.open ? $0 : nil }
+        let driven = node?.sessionDriveAvailable == true
+            ? node?.shownSession.flatMap { $0.canDrive && $0.open ? $0 : nil } : nil
         // A keyring row selected, in the keyring view: what Compare, Rename and Remove act on.
         let picked = node?.selection == .keyring && node?.keyringSelected != nil
         let digits: [VoxAction] = (1...9).map { n in
@@ -511,8 +512,9 @@ private struct RetentionSheet: View {
                 if let progress = model.progress(of: "step-retention") { ProgressView(progress) }
                 Button("Set Session step retention", role: stepSeconds == 0 ? nil : .destructive) {
                     let chosen = stepSeconds
+                    guard let ticket = model.roomMutationTicket else { return }
                     Task {
-                        if await model.setStepRetention(chosen) { stepsOpened = false; openSteps() }
+                        if await model.setStepRetention(chosen, ticket: ticket) { stepsOpened = false; openSteps() }
                     }
                 }
                 .disabled(stepCurrent == nil || stepSeconds == stepCurrent || model.progress(of: "step-retention") != nil)
@@ -576,7 +578,8 @@ private struct RetentionSheet: View {
 
     private func submit() {
         let s = seconds
-        Task { if await model.setRetention(s) { model.sheet = nil } }
+        guard let ticket = model.roomMutationTicket else { return }
+        Task { _ = await model.setRetention(s, ticket: ticket) }
     }
 }
 
@@ -613,7 +616,8 @@ private struct RenameSheet: View {
     private func submit() {
         let n = name.trimmingCharacters(in: .whitespaces)
         guard !n.isEmpty else { return }
-        Task { if await model.renameRoom(to: n) { model.sheet = nil } }
+        guard let ticket = model.roomMutationTicket else { return }
+        Task { _ = await model.renameRoom(to: n, ticket: ticket) }
     }
 }
 
@@ -703,11 +707,12 @@ private struct EndRoomSheet: View {
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button("End for Everyone", role: .destructive) {
-                    guard let room = authorizedRoom, model.roomOnScreen == room else { return }
+                    guard let room = authorizedRoom, model.roomOnScreen == room,
+                          let ticket = model.roomMutationTicket else { return }
                     working = true
                     Task {
                         defer { working = false }
-                        if let why = await model.endRoomFromSheet(room) {
+                        if let why = await model.endRoomFromSheet(room, ticket: ticket) {
                             reason = why
                             authorizedRoom = nil
                         }
@@ -752,14 +757,13 @@ private struct LeaveSheet: View {
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(ending ? "End for Everyone" : "Leave", role: .destructive) {
+                    guard let ticket = model.roomMutationTicket else { return }
                     working = true
                     failed = nil
                     Task {
                         // Closed only once it is done; a failure stays, with its reason.
-                        if let why = await model.leaveRoom(endingIt: ending) {
+                        if let why = await model.leaveRoom(endingIt: ending, ticket: ticket) {
                             failed = why
-                        } else {
-                            model.sheet = nil
                         }
                         working = false
                     }

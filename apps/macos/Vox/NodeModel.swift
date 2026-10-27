@@ -142,6 +142,7 @@ final class NodeModel: ObservableObject {
     }
     private var roomReadGeneration = UUID() {
         didSet {
+            invalidateRoomMutationSheet()
             invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
@@ -237,9 +238,11 @@ final class NodeModel: ObservableObject {
     /// read (ADR-037 R3): the page is provisional, and the timeline says so.
     @Published private(set) var roomProvisional = false
     private var roomBefore: String?
+    var selectedRoomInstance: Data? { roomInstance }
     private var roomInstance: Data? {
         didSet {
             if oldValue != roomInstance {
+                invalidateRoomMutationSheet()
                 invalidateMemberRoles()
                 roomHistoryPoll?.cancel()
                 roomHistoryPoll = nil
@@ -426,7 +429,8 @@ final class NodeModel: ObservableObject {
     /// disk or the wire (D12). A room's draft, To:, Urgent and reply, by room id.
     var roomDrafts: [String: RoomDraft] = [:]
     /// A Session's draft, by its destination (`room/node/session`).
-    var sessionDrafts: [String: String] = [:]
+    @Published var sessionDrafts: [SessionDraftKey: String] = [:]
+    @Published var sessionDeliveries: [SessionDraftKey: SessionDeliveryState] = [:]
 
     /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
     /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
@@ -447,6 +451,7 @@ final class NodeModel: ObservableObject {
     @Published private var sessionsHistoryAfter: String?
     var sessionsHistoryPaged: Bool { sessionsHistoryAfter != nil }
     private var sessionsMetadataRead = UUID()
+    private var selectedSessionRead = UUID()
     @Published private(set) var selectedSessionMetadata: FfiSession?
     @Published private(set) var selectedSessionMetadataKnown = false
     /// Only the selected Session's current owner is observed; no historical/per-peer cache.
@@ -724,9 +729,43 @@ final class NodeModel: ObservableObject {
         return page
     }
 
+    private struct RoomMutationSheetScope: Equatable {
+        let room: String
+        let instance: Data
+        let epoch: UUID
+        let generation: UUID
+        let editor: UUID
+    }
+    private var roomMutationSheetScope: RoomMutationSheetScope?
     private var sheetInstance = UUID()
     @Published var sheet: NodeSheet? {
-        didSet { if oldValue != sheet { sheetInstance = UUID() } }
+        didSet {
+            guard oldValue != sheet else { return }
+            sheetInstance = UUID()
+            roomMutationSheetScope = nil
+            if isRoomMutationSheet(sheet), let room = roomOnScreen, let instance = roomInstance {
+                roomMutationSheetScope = RoomMutationSheetScope(room: room, instance: instance,
+                    epoch: nodeObservationEpoch, generation: roomReadGeneration, editor: sheetInstance)
+            }
+        }
+    }
+    private func isRoomMutationSheet(_ value: NodeSheet?) -> Bool {
+        switch value {
+        case .leave, .end, .retention, .rename: return true
+        default: return false
+        }
+    }
+    private func invalidateRoomMutationSheet() {
+        if isRoomMutationSheet(sheet) { sheet = nil }
+    }
+    var roomMutationTicket: UUID? { roomMutationSheetScope?.editor }
+    private func roomMutationCurrent(_ expected: NodeSheet, ticket: UUID) -> Bool {
+        guard let scope = roomMutationSheetScope, scope.editor == ticket,
+              sheet == expected, sheetInstance == scope.editor,
+              ended == nil, daemonReachable, machineStateKnown, !observationNeedsRestart,
+              !roomNeedsPage, roomOnScreen == scope.room, roomInstance == scope.instance,
+              nodeObservationEpoch == scope.epoch, roomReadGeneration == scope.generation else { return false }
+        return !Task.isCancelled
     }
     /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
     @Published var inspectorShown = Columns.inspectorShown {
@@ -913,10 +952,12 @@ final class NodeModel: ObservableObject {
     @Published var keyringAsk: KeyringAsk?
     @Published private(set) var nodes: [NodeSummary] = []
     @Published private(set) var peers = 0
+    @Published private var peerStateKnown = false
     /// Last-known states are never presented as current while the daemon cannot be reached.
     @Published private(set) var daemonReachable = true
     private var nodeObservationEpoch = UUID() {
         didSet {
+            invalidateRoomMutationSheet()
             invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
@@ -934,7 +975,8 @@ final class NodeModel: ObservableObject {
     }
     @Published private(set) var machineStateKnown = false
     @Published private(set) var daemonFailure: String?
-    var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
+    var peerWords: String { peerStateKnown && daemonReachable && machineStateKnown && ended == nil && !observationNeedsRestart
+        ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
     struct HealthNotice: Decodable, Identifiable, Equatable {
         let key: String
         let message: String
@@ -1128,7 +1170,8 @@ final class NodeModel: ObservableObject {
                 } else {
                     await self.readFacts()
                 }
-                guard self.daemonReachable else { continue }
+                guard self.daemonReachable, self.ended == nil,
+                      !self.observationNeedsRestart, !self.roomNeedsPage else { continue }
                 await self.readWaiting()
                 if self.showingSession {
                     await self.readSelectedSessionMetadata()
@@ -1494,6 +1537,15 @@ final class NodeModel: ObservableObject {
 
     private var observationNeedsRestart = false
 
+    /// Session controls require the current room and an exact, freshly read Session grant.
+    var sessionDriveAvailable: Bool {
+        guard ended == nil, daemonReachable, machineStateKnown, !observationNeedsRestart,
+              !roomNeedsPage, roomOnScreen != nil, selectedSessionMetadataKnown,
+              let selected = selectedSessionMetadata, selected.open, selected.canDrive,
+              case let .session(node, id) = showing else { return false }
+        return selected.nodeFingerprint == node && selected.sessionId == id
+    }
+
     private func readFacts(restartObservation: Bool = true) async {
         let epoch = nodeObservationEpoch
         // Reachability first: failed reads must not leave stale node/peer states visible.
@@ -1504,15 +1556,35 @@ final class NodeModel: ObservableObject {
             machineStateKnown = true
             daemonFailure = nil
             if fresh != nodes { nodes = fresh }
-            if fresh.first(where: { $0.name == node })?.state != "attached" {
+            let listedNode = fresh.first(where: { $0.name == node })
+            if listedNode?.state != "attached" {
+                peerStateKnown = false
                 nodeObservationEpoch = UUID()
                 invalidateRoomAnchorState(preservingSnapshot: true)
                 invalidateMemberRoles()
                 daemonReachable = true
-                ended = fresh.first(where: { $0.name == node })?.status == "Locked"
-                    ? "Node \(node) is Locked." : "Node \(node) is unavailable."
-                releaseHistoryViews()
-                peers = 0
+                observationNeedsRestart = true
+                if listedNode?.status == "Locked" || listedNode?.state == "detached" {
+                    ended = listedNode?.status == "Locked"
+                        ? "Node \(node) is Locked." : "Node \(node) is unavailable."
+                    releaseHistoryViews()
+                    peers = 0
+                } else {
+                    // Attaching, detaching, an unknown state, and an absent listing do not
+                    // establish detach. Keep the ordinary timeline while suspending actions;
+                    // release Session views until the observation is authorized again.
+                    let snapshot = showingSession ? [] : messages
+                    releaseHistoryViews()
+                    messages = snapshot
+                    if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
+                    switch listedNode?.state {
+                    case "attaching": ended = "Node \(node) is attaching."
+                    case "detaching": ended = "Node \(node) is detaching."
+                    default:
+                        ended = "Node \(node) state is unknown. Checking again."
+                        machineStateKnown = false
+                    }
+                }
                 return
             }
             let view = try await client.view()
@@ -1523,6 +1595,7 @@ final class NodeModel: ObservableObject {
             // changed daemonReachable. Foreground and unrelated read failures remain visible.
             if outcome?.operation == "", outcome?.backgroundConnectivity == true { outcome = nil }
             if Int(view.peers) != peers { peers = Int(view.peers) }
+            peerStateKnown = true
             if view.keyring != keyring { keyring = view.keyring }
             if fresh.first(where: { $0.name == node })?.state == "attached", !recovering {
                 ended = nil
@@ -1548,14 +1621,23 @@ final class NodeModel: ObservableObject {
                 // Reachability and installed observation do not establish a published inventory.
                 // Keep recovery owned by the follow loop until the authoritative refresh lands.
                 guard refreshed else { observationNeedsRestart = true; return }
+                if case let .room(id) = selection, !rooms.contains(where: { $0.id == id && ($0.open || $0.preparing) }) {
+                    // The freshly read inventory establishes removal or a closed room.
+                    select(nil)
+                }
                 if case let .room(id) = selection {
-                    guard await show(.room(id), whileRecovering: true) else {
+                    let shown = await show(.room(id), whileRecovering: true)
+                    guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+                    guard shown else {
                         observationNeedsRestart = true
+                        ended = "Refreshing room after reconnect."
                         return
                     }
                 } else {
+                    roomNeedsPage = false
                     ended = nil
                 }
+                guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
                 observationNeedsRestart = false
                 await reconcileUnread()
                 guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
@@ -1563,6 +1645,13 @@ final class NodeModel: ObservableObject {
         } catch {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = false
+            peerStateKnown = false
+            observationNeedsRestart = true
+            ended = "Node state is unknown. Checking the connection."
+            let snapshot = showingSession ? [] : messages
+            releaseHistoryViews()
+            messages = snapshot
+            if case .room = selection { roomNeedsPage = true }
             individualTrustFacts = [:]
             individualTrustReads = [:]
             machineStateKnown = false
@@ -1883,6 +1972,7 @@ final class NodeModel: ObservableObject {
         }
         if !whileRecovering { watchReads(id) }
         let view = selectedRoomView, viewGeneration = roomViewGeneration
+        let observation = nodeObservationEpoch
         let generation = roomReadGeneration
         let messageRevision = roomMessageRevision
         let metadataToken = sessionsMetadataRead
@@ -1952,9 +2042,12 @@ final class NodeModel: ObservableObject {
                   self.selection == .room(id), ended == nil else { return false }
             // A Session restored as this room's last view is read once the room lists it (D12).
             if showingSession {
-                if whileRecovering { await readSelectedSessionMetadata() }
-                if showingSession { await readSession() }
+                if whileRecovering { await readSelectedSessionMetadata(whileRecovering: true) }
+                if showingSession { await readSession(whileRecovering: whileRecovering) }
             }
+            guard !Task.isCancelled, observation == nodeObservationEpoch,
+                  generation == roomReadGeneration, viewGeneration == roomViewGeneration,
+                  self.selection == .room(id), ended == nil else { return false }
             watchReads(id)
             return true
         } catch {
@@ -2669,35 +2762,72 @@ final class NodeModel: ObservableObject {
 
     /// Leave the room on screen, or end it for everyone: nil once done, else why not (D19), for
     /// the sheet that asked to say where it was asked.
-    func leaveRoom(endingIt: Bool) async -> String? {
+    func leaveRoom(endingIt: Bool, ticket: UUID) async -> String? {
         let operation = "leave"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return "No room is on screen to leave." }
+        guard roomMutationCurrent(.leave, ticket: ticket), let id = roomOnScreen,
+              let instance = roomInstance else {
+            return "The room changed or is being refreshed. Open the confirmation again."
+        }
         do {
             if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
+            guard roomMutationCurrent(.leave, ticket: ticket) else {
+                // Closing the confirmation does not cancel a request already sent to the
+                // daemon. Reconcile its actual result without closing a newer sheet or
+                // treating another room incarnation as the one that was left.
+                let refreshed = await refresh()
+                guard selection == .room(id), roomInstance == instance else { return nil }
+                guard refreshed else {
+                    // A failed inventory read cannot leave the old room actionable after
+                    // the daemon has confirmed this operation completed.
+                    if ended == nil { await stopped(.roomActionCompleted) }
+                    return nil
+                }
+                if !rooms.contains(where: { $0.id == id && $0.open }) {
+                    selection = nil
+                } else if ended == nil {
+                    await stopped(.roomActionCompleted)
+                }
+                return nil
+            }
             report(operation: operation, done: endingIt ? "The room is ended for everyone." : "You left the room.")
+            sheet = nil
             selection = nil
             await refresh()
             return nil
         } catch {
+            guard roomMutationCurrent(.leave, ticket: ticket) else {
+                // The submitted request outlives its sheet. Say what happened without
+                // attaching the old result to a newer confirmation or its room.
+                let action = endingIt ? "Ending" : "Leaving"
+                let result = Outcome(operation: "leave-closed-confirmation",
+                                     kind: Outcome.kind(of: error),
+                                     words: "\(action) room \(id): \(sentence(error))")
+                outcomes[result.operation] = result
+                outcome = result
+                return nil
+            }
             report(error, operation: operation)
             return sentence(error)
         }
     }
 
     /// Set the room on screen's retention: no passphrase (ADR-028 K-11).
-    func setRetention(_ seconds: UInt64) async -> Bool {
+    func setRetention(_ seconds: UInt64, ticket: UUID) async -> Bool {
         let operation = "retention"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return false }
+        guard roomMutationCurrent(.retention, ticket: ticket), let id = roomOnScreen else { return false }
         do {
             try await client.setRetention(room: id, ttlSecs: seconds)
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             report(operation: operation, done: seconds == 0 ? "Messages here are kept for good."
                 : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere.")
+            sheet = nil
             return true
         } catch {
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -2861,24 +2991,27 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    func setStepRetention(_ seconds: UInt64) async -> Bool {
-        guard let id = roomOnScreen else { return false }
+    func setStepRetention(_ seconds: UInt64, ticket: UUID) async -> Bool {
+        guard roomMutationCurrent(.retention, ticket: ticket), let id = roomOnScreen else { return false }
         let operation = "step-retention"
         let attempt = begin(operation)
         defer { end(attempt) }
         do {
             try await AppRequest.run("Setting Session step retention") { [client] in
+                guard self.roomMutationCurrent(.retention, ticket: ticket) else { throw CancellationError() }
                 try await client.setStepRetention(room: id, seconds: seconds)
             }
-            guard roomOnScreen == id else { return true }
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             // A read started before the setter must not overwrite the new rule.
             stepRetentionRead = UUID()
             stepRetentionLoading = false
             await loadStepRetention()
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             let scope = stepRetentionAdmin ? "The room's Session step rule is" : "This node's Session step rule is"
             report(operation: operation, done: "\(scope) \(Retention.words(seconds)). Message retention still applies.")
             return true
         } catch {
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -2886,19 +3019,22 @@ final class NodeModel: ObservableObject {
 
     /// Rename the room on screen: its one name, as every member sees it (ADR-028 R-1). Only its
     /// creator or an admin may; the node's refusal is said as it comes. No passphrase (K-11).
-    func renameRoom(to name: String) async -> Bool {
+    func renameRoom(to name: String, ticket: UUID) async -> Bool {
         let operation = "rename"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return false }
+        guard roomMutationCurrent(.rename, ticket: ticket), let id = roomOnScreen else { return false }
         do {
             let entry = try await client.renameRoom(room: id, name: name)
+            guard roomMutationCurrent(.rename, ticket: ticket) else { return false }
             report(
                 operation: operation,
                 done: "The room is now \(name) for every member. Entry \(entry).")
+            sheet = nil
             await refresh()
             return true
         } catch {
+            guard roomMutationCurrent(.rename, ticket: ticket) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -2920,26 +3056,27 @@ final class NodeModel: ObservableObject {
     /// Bind an ending permission read to the same room and acting node throughout.
     func canEndRoom(_ room: String) async throws -> Bool {
         let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
-        guard roomOnScreen == room, sheet == .end, ended == nil else {
+        guard roomOnScreen == room, roomMutationCurrent(.end, ticket: editor) else {
             throw VoxError.Failed(reason: "The room to end is no longer selected.")
         }
         let admin = try await client.isAdmin(room: room, member: actor)
         guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
-              roomReadGeneration == generation, roomOnScreen == room, sheet == .end, sheetInstance == editor, ended == nil else {
+              roomReadGeneration == generation, roomOnScreen == room, sheetInstance == editor,
+              roomMutationCurrent(.end, ticket: editor) else {
             throw VoxError.Failed(reason: "The room or acting node changed while checking who may end it.")
         }
         return admin
     }
 
     /// A late ending reply must never clear a newer room or close a replacement sheet.
-    func endRoomFromSheet(_ room: String) async -> String? {
+    func endRoomFromSheet(_ room: String, ticket: UUID) async -> String? {
         let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
         let operation = "end-room", attempt = begin("end-room")
         defer { end(attempt) }
         func current() -> Bool {
             !Task.isCancelled && nodeObservationEpoch == epoch && me == actor
                 && roomReadGeneration == generation && roomOnScreen == room
-                && sheet == .end && sheetInstance == editor && ended == nil
+                && sheetInstance == editor && roomMutationCurrent(.end, ticket: ticket)
         }
         guard current() else { return nil }
         do {
@@ -3733,8 +3870,16 @@ final class NodeModel: ObservableObject {
         await refresh()
     }
 
-    fileprivate func stopped(_ text: String) async {
+    fileprivate enum ObservationStop {
+        case ended
+        case roomChanged
+        case sessionChanged
+        case roomActionCompleted
+    }
+
+    fileprivate func stopped(_ reason: ObservationStop) async {
         observationNeedsRestart = true
+        peerStateKnown = false
         waitingLedger = nil
         nodeObservationEpoch = UUID()
         roomReadGeneration = UUID()
@@ -3746,16 +3891,28 @@ final class NodeModel: ObservableObject {
         // The room's actions remain unavailable until its page and inspector replace the snapshot
         // together. A confirmed detach/lock releases the rest after the node state is known.
         if case .room = selection {
-            let snapshot = messages
+            let snapshot = showingSession ? [] : messages
             releaseHistoryViews()
             messages = snapshot
             roomNeedsPage = true
         }
-        ended = "Node \(node) is unavailable."
+        // An observer ending is not a daemon verdict on the node. Keep the last visible
+        // snapshot, suspend actions, and let readFacts establish the current node state.
+        let notice: String
+        switch reason {
+        case .ended:
+            notice = "Node observation ended. Checking its state."
+            daemonReachable = false
+            daemonFailure = notice
+        case .roomChanged:
+            notice = "The saved room changed. Refreshing its history and observation."
+        case .sessionChanged:
+            notice = "Session state changed. Refreshing the room and observation."
+        case .roomActionCompleted:
+            notice = "Room action completed. Refreshing its state."
+        }
+        ended = notice
         machineStateKnown = false
-        daemonReachable = text.localizedCaseInsensitiveContains("detached")
-            || text.localizedCaseInsensitiveContains("Locked")
-        if !daemonReachable { daemonFailure = text }
         // Resubscribing aborts the old Rust observer, which is awaiting this callback.
         // Read readiness here; the existing follow loop (or an independent user action)
         // performs the pending restart and authoritative refresh outside that callback.
@@ -3786,7 +3943,9 @@ final class NodeModel: ObservableObject {
         selectedSessionMetadata = nil
         selectedSessionMetadataKnown = false
         sessionNote = nil
-        sessionReloadNeeded = false
+        // A scrolled-back private window has been withheld; offer an explicit reload
+        // instead of silently polling an empty window without following newest.
+        sessionReloadNeeded = showingSession && !timelineFollowingNewest
         sessionLoading = false
         messageFooters = [:]
         messageFooterErrors = [:]
@@ -3802,8 +3961,19 @@ final class NodeModel: ObservableObject {
     /// Resume the same window after its owner has unlocked the node. Credentials and
     /// the unlock mutation belong to AppModel; this only restores observation.
     func resumeAfterUnlock(currentOwner: @MainActor () -> Bool) async throws -> Bool {
+        guard currentOwner(), !Task.isCancelled else { return false }
+        // Reattachment can arrive without an observer-end callback (for example, forgetting
+        // a passphraseless node). Retire old private authority before the first await.
+        observationNeedsRestart = true
+        ended = "Refreshing node \(node) after unlock."
+        peerStateKnown = false
+        nodeObservationEpoch = UUID()
+        roomReadGeneration = UUID()
+        let snapshot = showingSession ? [] : messages
+        releaseHistoryViews()
+        messages = snapshot
+        if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
         let epoch = nodeObservationEpoch
-        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
         let fresh = try await client.nodes()
         guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
         guard fresh.first(where: { $0.name == node })?.status == "Ready" else { return false }
@@ -3816,19 +3986,37 @@ final class NodeModel: ObservableObject {
         daemonReachable = true
         daemonFailure = nil
         peers = Int(view.peers)
+        peerStateKnown = true
         keyring = view.keyring
-        ended = nil
-        // These install owned tasks synchronously; no old request can start them after
-        // ownership has changed at an awaited boundary.
+        observationNeedsRestart = true
+        ended = "Refreshing node \(node) after unlock."
+        // Keep the follow owner alive even if this refresh fails; it will retry the same
+        // room recovery, without treating a roster alone as an authoritative room page.
+        defer { if currentOwner() { follow() } }
+        let refreshed = await refresh(restartObservation: false)
+        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        // The daemon already confirmed Ready. A pending inventory or room page is a
+        // recovery condition, not a failed unlock; follow() owns the retry.
+        guard refreshed else { return true }
+        if case let .room(room) = selection, !rooms.contains(where: { $0.id == room && ($0.open || $0.preparing) }) {
+            select(nil)
+        }
         if case let .room(room) = selection {
             roomReadGeneration = UUID()
             roomNeedsPage = true
             watching?.cancel()
             stepRetentionRead = UUID()
             stepRetentionLoading = false
-            watchReads(room)
+            let shown = await show(.room(room), whileRecovering: true)
+            guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+            guard shown else {
+                ended = "Refreshing room after unlock."
+                return true
+            }
+        } else {
+            ended = nil
         }
-        follow()
+        observationNeedsRestart = false
         return true
     }
 
@@ -3859,7 +4047,7 @@ private final class Listener: ClientListener {
     func onMessage(room: String, instance: Data, message: RoomMessage) async -> Bool {
         guard let model = current() else { return false }
         guard model.acceptsArrivalInstance(instance, room: room) else {
-            await model.stopped("The saved room changed; refreshing its history and restarting observation.")
+            await model.stopped(.roomChanged)
             return false
         }
         readLog.debug("follow: event message \(message.id, privacy: .public) in \(room, privacy: .public)")
@@ -3876,7 +4064,7 @@ private final class Listener: ClientListener {
 
     func onEnded(text: String) async {
         guard let model = current() else { return }
-        await model.stopped(text)
+        await model.stopped(.ended)
     }
 
     func onSessions(room: String) async -> Bool {
@@ -3938,20 +4126,31 @@ extension NodeModel {
     }
 
     /// Exact selected metadata stays independent of the bounded tab/history pages.
-    func readSelectedSessionMetadata() async {
-        guard let room = roomOnScreen, case let .session(node, id) = showing else {
+    func readSelectedSessionMetadata(whileRecovering: Bool = false) async {
+        guard ended == nil, !roomNeedsPage, !observationNeedsRestart || whileRecovering else { return }
+        guard let room = roomOnScreen, let instance = roomInstance,
+              case let .session(node, id) = showing else {
+            selectedSessionRead = UUID()
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = false
             return
         }
-        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration, token = UUID()
+        selectedSessionRead = token
         func current() -> Bool {
-            roomOnScreen == room && showing == .session(node: node, id: id)
-                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+            roomOnScreen == room && roomInstance == instance && showing == .session(node: node, id: id)
+                && selectedSessionRead == token && epoch == nodeObservationEpoch && generation == roomReadGeneration
+                && ended == nil && !roomNeedsPage && (!observationNeedsRestart || whileRecovering)
         }
         do {
             let found = try await client.session(room: room, node: node, sessionId: id)
             guard current() else { return }
+            if let old = shownSession, let found, old.opening != found.opening {
+                sessionPages.clear()
+                sessionWindowRevision = UUID()
+                selectedEarlierRequest = nil
+                sessionReloadNeeded = !timelineFollowingNewest
+            }
             selectedSessionMetadata = found
             selectedSessionMetadataKnown = true
             // Only this successful exact lookup can revoke the selected tab. Its absence
@@ -3961,10 +4160,20 @@ extension NodeModel {
             scheduleSessionAttentionRead()
         } catch {
             guard current() else { return }
+            if sessionProjectionChanged(error) {
+                await stopped(.sessionChanged)
+                return
+            }
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = true
             discardSessionWindow(after: error)
         }
+    }
+
+    private func sessionProjectionChanged(_ error: Error) -> Bool {
+        guard case let VoxError.Failed(reason) = error else { return false }
+        return reason == "the room's Sessions changed; refresh the listing"
+            || reason == "stream refused: the room's Session activity changed; refresh the page"
     }
 
     /// A failed protected read cannot authorize old bodies. Losing a loaded window also
@@ -4010,35 +4219,52 @@ extension NodeModel {
     }
 
     /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
-    func readSession(reloadNewest: Bool = false) async {
+    func readSession(reloadNewest: Bool = false, whileRecovering: Bool = false) async {
+        guard ended == nil, !roomNeedsPage, !observationNeedsRestart || whileRecovering else { return }
         // Surviving rows still need exact authorization/expiry checks while reload is
         // offered. That refresh must not acknowledge reload or replace the held window.
-        guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty else { return }
+        guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty
+                || !sessionPages.withheldIDs.isEmpty else { return }
         guard !reloadNewest || timelineFollowingNewest else { return }
-        if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
-        guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
+        // A cached page descriptor is not authority while an exact lookup is pending.
+        if showingSession && (!selectedSessionMetadataKnown || selectedSessionMetadata == nil) { return }
+        guard let room = roomOnScreen, let instance = roomInstance,
+              let s = shownSession, s.canDrive else {
             sessionPages.clear()
             selectedEarlierRequest = nil
             if sessionNote != nil { sessionNote = nil }
             sessionLoading = false
             return
         }
+        if let opening = sessionPages.withheldOpening, opening != s.opening {
+            // A replacement cannot inherit an older Session's pinned selection.
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            sessionReloadNeeded = !timelineFollowingNewest
+            return
+        }
         let revision = sessionWindowRevision
         let following = timelineFollowingNewest
         let follows = following && (!sessionReloadNeeded || reloadNewest)
         let epoch = nodeObservationEpoch, generation = roomReadGeneration
-        let heldIDs = sessionEntries.map(\.id)
+        let heldIDs = sessionPages.withheldOpening == nil
+            ? sessionEntries.map(\.id) : sessionPages.withheldIDs
         let heldInstance = sessionPages.instance
         func current() -> Bool {
-            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
-                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
-                && revision == sessionWindowRevision && following == timelineFollowingNewest
+            roomOnScreen == room && roomInstance == instance && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.opening == s.opening
+                && shownSession?.canDrive == true && revision == sessionWindowRevision && following == timelineFollowingNewest
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
+                && ended == nil && !roomNeedsPage && (!observationNeedsRestart || whileRecovering)
         }
         do {
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
             guard current() else { return }
+            guard read.instance == instance else {
+                await stopped(.roomChanged)
+                return
+            }
             var retained: FfiSessionRead?
             if !follows, !heldIDs.isEmpty, let heldInstance {
                 guard heldInstance == read.instance else {
@@ -4078,10 +4304,16 @@ extension NodeModel {
             scheduleSessionPauseRead()
             scheduleSessionAttentionRead()
             if !sessionReloadNeeded, let now = shownSession {
-                await refreshSessionRequests(room: room, session: now)
+                await refreshSessionRequests(room: room, session: now, whileRecovering: whileRecovering)
             }
         } catch {
             guard current() else { return }
+            // The daemon uses this refusal for both a changed room instance and a changed
+            // Session projection. Neither authorizes the old room page or its controls.
+            if sessionProjectionChanged(error) {
+                await stopped(.sessionChanged)
+                return
+            }
             discardSessionWindow(after: error, requiresReload: reloadNewest)
         }
     }
@@ -4109,7 +4341,8 @@ extension NodeModel {
     /// The page of the Session on screen's entries before those held (ADR-034 FR-4): read when
     /// the person scrolls up to the top, or asks, and put before them. One page at a time.
     func readOlderSession() async {
-        guard !sessionReloadNeeded, let room = roomOnScreen, let s = shownSession, s.canDrive,
+        guard ended == nil, !observationNeedsRestart, !roomNeedsPage, !sessionReloadNeeded,
+              let room = roomOnScreen, let instance = roomInstance, let s = shownSession, s.canDrive,
               let before = sessionBefore, !sessionReadingOlder else { return }
         timelineFollowingNewest = false
         let revision = sessionWindowRevision
@@ -4119,37 +4352,49 @@ extension NodeModel {
         do {
             let read = try await client.sessionReadOlder(room: room, node: s.nodeFingerprint,
                                                          sessionId: s.sessionId, before: before)
-            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive, sessionBefore == before,
+            guard roomOnScreen == room, roomInstance == instance, ended == nil,
+                  !observationNeedsRestart, !roomNeedsPage, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, let now = shownSession,
+                  now.nodeFingerprint == s.nodeFingerprint, now.sessionId == s.sessionId,
+                  now.opening == s.opening, now.canDrive, sessionBefore == before,
                   revision == sessionWindowRevision else { return }
-            guard sessionPages.instance == read.instance else {
-                throw VoxError.Failed(reason: "The saved room changed while loading older Session activity.")
+            guard sessionPages.instance == instance, read.instance == instance else {
+                await stopped(.roomChanged)
+                return
             }
             guard sessionPages.older(read, asked: before) else { return }
             sessionWindowRevision = UUID()
             await refreshSessionRequests(room: room, session: now)
         } catch {
             guard revision == sessionWindowRevision, epoch == nodeObservationEpoch,
-                  generation == roomReadGeneration, roomOnScreen == room,
+                  generation == roomReadGeneration, roomOnScreen == room, roomInstance == instance,
+                  ended == nil, !observationNeedsRestart, !roomNeedsPage,
                   shownSession?.nodeFingerprint == s.nodeFingerprint,
-                  shownSession?.sessionId == s.sessionId else { return }
+                  shownSession?.sessionId == s.sessionId, shownSession?.opening == s.opening else { return }
+            if sessionProjectionChanged(error) {
+                await stopped(.sessionChanged)
+                return
+            }
             discardSessionWindow(after: error, requiresReload: true)
         }
     }
 
     /// Current state for the loaded requests and any request selected from a notification.
     /// The daemon uses its request index; no transcript history is walked to find them.
-    private func refreshSessionRequests(room: String, session s: FfiSession) async {
+    private func refreshSessionRequests(room: String, session s: FfiSession,
+                                        whileRecovering: Bool = false) async {
         let selected = selectedRequest
         let revision = sessionWindowRevision
         let epoch = nodeObservationEpoch, generation = roomReadGeneration
-        let instance = sessionPages.instance
+        guard let instance = roomInstance, sessionPages.instance == instance else { return }
         func currentContext() -> Bool {
-            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
-                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
-                && selectedRequest == selected && revision == sessionWindowRevision
+            roomOnScreen == room && roomInstance == instance && ended == nil && !roomNeedsPage
+                && (!observationNeedsRestart || whileRecovering) && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.opening == s.opening
+                && shownSession?.canDrive == true && selectedRequest == selected && revision == sessionWindowRevision
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
         }
+        guard currentContext() else { return }
         var references = Set(sessionEntries.compactMap { $0.request?.reference })
         if let selected { references.insert(selected) }
         guard !references.isEmpty else {
@@ -4164,8 +4409,9 @@ extension NodeModel {
                 let page = try await client.sessionRequestsPage(room: room, node: s.nodeFingerprint,
                     sessionId: s.sessionId, reference: reference, before: nil)
                 guard currentContext() else { return }
-                if let instance, page.instance != instance {
-                    throw VoxError.Failed(reason: "The saved room changed while refreshing its requests.")
+                if page.instance != instance {
+                    await stopped(.roomChanged)
+                    return
                 }
                 if let row = page.entries.last(where: { $0.request?.reference == reference }) {
                     current.append(row)
@@ -4183,6 +4429,10 @@ extension NodeModel {
             }
         } catch {
             guard currentContext() else { return }
+            if sessionProjectionChanged(error) {
+                await stopped(.sessionChanged)
+                return
+            }
             selectedEarlierRequest = nil
             reportBackground(error)
         }
@@ -4285,7 +4535,11 @@ extension NodeModel {
     /// Open `room`, its Session `session` of `node`, and select its request `reference`, centred
     /// (P1): where a notification and ⌘J land.
     func openRequest(room: String, node: String, session: String, reference: String) async {
+        guard ended == nil, !observationNeedsRestart else { return }
+        let epoch = nodeObservationEpoch
         await show(.room(room))
+        guard epoch == nodeObservationEpoch, ended == nil, !observationNeedsRestart,
+              !roomNeedsPage, roomOnScreen == room else { return }
         showing = .session(node: node, id: session)
         selectedRequest = reference
         if let s = shownSession, s.canDrive { await refreshSessionRequests(room: room, session: s) }
@@ -4294,7 +4548,7 @@ extension NodeModel {
     /// The approval selected in the Session on screen, open and this node's to answer: what
     /// ⌥⌘Y and ⌥⌘N act on (P1). Questions are answered by their options, not these keys.
     var selectedApproval: (session: FfiSession, room: String, reference: String)? {
-        guard let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
+        guard sessionDriveAvailable, let reference = selectedRequest, let s = shownSession, s.canDrive, s.open,
               let room = roomOnScreen,
               let r = (sessionEntries + [selectedEarlierRequest].compactMap { $0 })
                 .compactMap(\.request).first(where: { $0.reference == reference }),
@@ -4304,14 +4558,14 @@ extension NodeModel {
 
     /// Approve (⌥⌘Y) or Reject (⌥⌘N) the selected approval, and say what came of it (P1).
     func answerSelected(approve: Bool) async {
-        guard let a = selectedApproval else { return }
+        guard let a = selectedApproval, let instance = roomInstance else { return }
         let action: DriveAction = approve ? .approve(reference: a.reference)
             : .reject(reference: a.reference, why: nil)
         // What came of it is this operation's outcome (P6): done, refused, or not known.
         let operation = approve ? "approve-request" : "reject-request"
         let attempt = begin(operation)
         defer { end(attempt) }
-        switch await driveResult(a.session, in: a.room, action) {
+        switch await driveResult(a.session, in: a.room, instance: instance, action) {
         case let .taken(words): report(operation: operation, done: asSentence(words))
         case let .refused(words): report(VoxError.Failed(reason: asSentence(words)), operation: operation)
         case let .unknown(words): report(VoxError.Unknown(reason: asSentence(words)), operation: operation)
@@ -4327,6 +4581,22 @@ extension NodeModel {
             invalidateSessionPause()
             invalidateSessionAttention()
             clearPrivateJoinCaptions()
+            // This signal also carries drive revocation. Withhold the previous grant and
+            // private rows before the first await; older reads must not republish them.
+            if showingSession, let selected = selectedSessionMetadata {
+                sessionPages.withhold(opening: selected.opening)
+            } else if sessionPages.withheldOpening == nil {
+                sessionPages.clear()
+            }
+            selectedSessionRead = UUID()
+            selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = false
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            if sessionPages.withheldOpening == nil {
+                sessionReloadNeeded = sessionReloadNeeded || (showingSession && !timelineFollowingNewest)
+            }
+            sessionLoading = false
         }
         let epoch = nodeObservationEpoch
         let count = try? await client.sessionsWaiting(room: room)
@@ -4346,8 +4616,14 @@ extension NodeModel {
     }
 
     /// Drive a Session (ADR-029 DR-1), for the Session view's controls (SessionDrive.swift).
-    func drive(room: String, node: String, session: String, action: DriveAction) async throws -> DriveAnswer {
-        try await client.drive(room: room, node: node, session: session, action: action)
+    func drive(room: String, instance: Data, node: String, session: String, opening: String, action: DriveAction) async throws -> DriveAnswer {
+        guard sessionDriveAvailable, roomOnScreen == room, roomInstance == instance,
+              selectedSessionMetadata?.nodeFingerprint == node,
+              selectedSessionMetadata?.sessionId == session,
+              selectedSessionMetadata?.opening == opening else {
+            throw VoxError.Failed(reason: "Session state is being refreshed; try again when it is available.")
+        }
+        return try await client.drive(room: room, node: node, session: session, action: action)
     }
 }
 

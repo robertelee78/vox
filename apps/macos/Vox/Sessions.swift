@@ -4,6 +4,25 @@
 import AppKit
 import SwiftUI
 
+/// A draft belongs to the exact room, remote node and Session, never a display label.
+struct SessionDraftKey: Hashable {
+    let room: String
+    let instance: Data
+    let node: String
+    let session: String
+    let opening: String
+}
+
+/// Delivery state belongs to the Session, not to a particular rendered composer.
+struct SessionDeliveryState {
+    var said = ""
+    var interruptSaid = ""
+    var stopSaid = ""
+    var sending = false
+    var interrupting = false
+    var stopping = false
+}
+
 /// What the room's timeline shows: its conversation, a selected tag, or one Session by node and id.
 enum Showing: Hashable {
     case general

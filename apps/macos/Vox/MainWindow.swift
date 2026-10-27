@@ -185,7 +185,7 @@ private struct Sidebar: View {
                 HStack {
                     NodeIdentity(name: model.node, status: model.nodeStatus)
                         .copyMenu([("Copy Name", model.node)])
-                        .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
+                        .accessibilityIdentifier(model.nodeStatus == nil ? "node-status-unknown" : (model.nodes.first(where: { $0.name == model.node })?.state == "attached" ? "attached" : "detached"))
                     Spacer()
                     RoomsAdd(model: model)
                 }
@@ -442,7 +442,7 @@ private struct NodeIdentity: View {
     let name: String
     /// The daemon supplies Ready or Locked; unavailable remains distinct.
     var status: String? = nil
-    private var state: String { status ?? "unavailable" }
+    private var state: String { status ?? "state unknown" }
 
     var body: some View {
         HStack(alignment: .center, spacing: Space.s8) {
@@ -468,6 +468,17 @@ private struct OnThisMachine: View {
     let nodes: [NodeSummary]
     var known = true
 
+    private func stateWords(_ node: NodeSummary) -> String {
+        guard known else { return "state unknown" }
+        switch node.state {
+        case "attached": return node.status ?? "attached"
+        case "detached": return node.status == "Locked" ? "Locked" : "detached"
+        case "attaching": return "attaching"
+        case "detaching": return "detaching"
+        default: return "state unknown"
+        }
+    }
+
     static func copy(_ words: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(words, forType: .string)
@@ -487,10 +498,10 @@ private struct OnThisMachine: View {
                     HStack {
                         Text(node.name)
                         Spacer()
-                        Text(known ? (node.status ?? "unavailable") : "unavailable").secondaryText()
+                        Text(stateWords(node)).secondaryText()
                     }
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(node.name) \(known ? (node.status ?? "unavailable") : "unavailable")")
+                    .accessibilityLabel("\(node.name) \(stateWords(node))")
                     .contextMenu {
                         Button("Copy Name") { Self.copy(node.name) }
                         if !node.fingerprint.isEmpty {
@@ -1578,11 +1589,13 @@ private struct RoomTimelineView: View {
                     // trust both ways (ADR-028 R-5), which a newcomer is not told anywhere else.
                     TrustBanner(model: model)
                     composer
-                } else if let s = model.shownSession, s.canDrive, s.open, let room = model.roomOnScreen {
+                } else if let s = model.shownSession, s.canDrive, s.open,
+                          let room = model.roomOnScreen, let instance = model.selectedRoomInstance {
                     Hairline()
-                    // One composer per Session: a draft for one never shows in another (D12).
-                    SessionComposer(model: model, room: room, session: s)
-                        .id("\(room)/\(s.nodeFingerprint)/\(s.sessionId)")
+                    // Keep this Session's draft mounted while authority is being refreshed.
+                    SessionComposer(model: model, room: room, instance: instance, session: s)
+                        .id("\(room)/\(instance.base64EncodedString())/\(s.nodeFingerprint)/\(s.sessionId)/\(s.opening)")
+                        .disabled(!model.sessionDriveAvailable)
                 }
             }
             // The conversation, the timeline and the composer, at the text size View > Bigger and
@@ -2212,7 +2225,7 @@ private struct NodeStopped: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             StateMark(kind: .danger, words: model.daemonReachable
-                      ? (model.ended ?? "Node \(model.node) is unavailable.")
+                      ? (model.ended ?? "Node \(model.node) state is unknown.")
                       : (model.daemonFailure ?? "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting."))
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")

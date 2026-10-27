@@ -21,17 +21,23 @@ enum DriveResult {
 extension NodeModel {
     /// Send `action` to the Session `s` of `room`, the destination its control was drawn for (D3),
     /// and say what came of it (DR-6), as `vox room session` and the TUI say it.
-    func drive(_ s: FfiSession, in room: String, _ action: DriveAction) async -> String {
-        await driveResult(s, in: room, action).said
+    func drive(_ s: FfiSession, in room: String, instance: Data, _ action: DriveAction) async -> String {
+        await driveResult(s, in: room, instance: instance, action).said
     }
 
     /// `drive`, telling a send that was taken from one refused or not known (D13).
-    func driveResult(_ s: FfiSession, in room: String, _ action: DriveAction) async -> DriveResult {
+    func driveResult(_ s: FfiSession, in room: String, instance: Data, _ action: DriveAction) async -> DriveResult {
+        guard sessionDriveAvailable, roomOnScreen == room, selectedRoomInstance == instance,
+              selectedSessionMetadata?.nodeFingerprint == s.nodeFingerprint,
+              selectedSessionMetadata?.sessionId == s.sessionId,
+              selectedSessionMetadata?.opening == s.opening else {
+            return .refused("Session state is being refreshed; try again when it is available.")
+        }
         guard s.canDrive else {
             return .refused("you cannot drive this Session: \(s.nodeAlias) has not given you drive")
         }
         do {
-            let answer = try await drive(room: room, node: s.nodeFingerprint, session: s.sessionId, action: action)
+            let answer = try await drive(room: room, instance: instance, node: s.nodeFingerprint, session: s.sessionId, opening: s.opening, action: action)
             switch answer.delivery {
             case .answered:
                 return answer.ok ? .taken("\(s.label): \(answer.said)")
@@ -58,24 +64,17 @@ struct SessionComposer: View {
     @ObservedObject var model: NodeModel
     /// The room it was drawn in: what it sends goes there and to `session` only (D3).
     let room: String
+    let instance: Data
     let session: FfiSession
-    @State private var draft = ""
     /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
     @FocusState private var composing: Bool
-    @State private var said = ""
-    @State private var interruptSaid = ""
-    @State private var stopSaid = ""
-    /// A send (or a file) waiting for its answer: only sending and the paperclip wait on it; Interrupt
-    /// and Stop stay live (D13).
-    @State private var sending = false
-    @State private var interrupting = false
-    @State private var stopping = false
     /// Asked before Stop (⌃C): it ends the session.
     @State private var confirmStop = false
 
-    init(model: NodeModel, room: String, session: FfiSession) {
+    init(model: NodeModel, room: String, instance: Data, session: FfiSession) {
         self.model = model
         self.room = room
+        self.instance = instance
         self.session = session
     }
 
@@ -104,7 +103,7 @@ struct SessionComposer: View {
                     .accessibilityIdentifier("session-compose-as")
                 // Up to 12 lines, so a pasted stack trace or a long prompt is read before it goes;
                 // Return sends, ⇧↩ (or ⌥↩) adds a line (P19).
-                TextField("Composer — to \(session.label)", text: $draft, axis: .vertical)
+                TextField("Composer — to \(session.label)", text: Binding(get: { draft }, set: { draft = $0 }), axis: .vertical)
                     .lineLimit(1...12)
                     .focused($composing)
                     .shiftReturnAddsLine(composing)
@@ -148,9 +147,6 @@ struct SessionComposer: View {
             }
         }
         .voxPadding(Space.s12)
-        // Its draft, kept per Session while the app runs, in memory only (D12).
-        .onAppear { draft = model.sessionDrafts[key] ?? "" }
-        .onChange(of: draft) { model.sessionDrafts[key] = $0 }
         // ⌘O while this Session is shown: a file sent to it, not the room (D2).
         .onChange(of: model.sessionAttachAsked) { _ in
             DispatchQueue.main.async {
@@ -160,7 +156,46 @@ struct SessionComposer: View {
     }
 
     /// The Session's destination, which its draft is kept under.
-    private var key: String { "\(room)/\(session.nodeFingerprint)/\(session.sessionId)" }
+    private var key: SessionDraftKey {
+        SessionDraftKey(room: room, instance: instance, node: session.nodeFingerprint,
+                        session: session.sessionId, opening: session.opening)
+    }
+
+    // The operation and its result outlive this particular view instance.
+    private var delivery: SessionDeliveryState {
+        get { model.sessionDeliveries[key] ?? SessionDeliveryState() }
+        nonmutating set { model.sessionDeliveries[key] = newValue }
+    }
+    private var said: String {
+        get { delivery.said }
+        nonmutating set { var value = delivery; value.said = newValue; delivery = value }
+    }
+    private var interruptSaid: String {
+        get { delivery.interruptSaid }
+        nonmutating set { var value = delivery; value.interruptSaid = newValue; delivery = value }
+    }
+    private var stopSaid: String {
+        get { delivery.stopSaid }
+        nonmutating set { var value = delivery; value.stopSaid = newValue; delivery = value }
+    }
+    private var sending: Bool {
+        get { delivery.sending }
+        nonmutating set { var value = delivery; value.sending = newValue; delivery = value }
+    }
+    private var interrupting: Bool {
+        get { delivery.interrupting }
+        nonmutating set { var value = delivery; value.interrupting = newValue; delivery = value }
+    }
+    private var stopping: Bool {
+        get { delivery.stopping }
+        nonmutating set { var value = delivery; value.stopping = newValue; delivery = value }
+    }
+
+    // Write through immediately: a removed view must not lose an unsent draft.
+    private var draft: String {
+        get { model.sessionDrafts[key] ?? "" }
+        nonmutating set { model.sessionDrafts[key] = newValue }
+    }
 
     /// Type the draft, or send it as a slash command when it starts with "/". The text stays
     /// until the session's node has taken it (D13): refused, it is back as typed; with no answer,
@@ -172,7 +207,7 @@ struct SessionComposer: View {
         said = ""
         let action: DriveAction = text.hasPrefix("/") ? .slash(command: text) : .text(text: text)
         Task {
-            let result = await model.driveResult(session, in: room, action)
+            let result = await model.driveResult(session, in: room, instance: instance, action)
             switch result {
             case .taken:
                 if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
@@ -192,7 +227,7 @@ struct SessionComposer: View {
         interrupting = true
         interruptSaid = ""
         Task {
-            interruptSaid = await model.drive(session, in: room, .interrupt)
+            interruptSaid = await model.drive(session, in: room, instance: instance, .interrupt)
             interrupting = false
         }
     }
@@ -203,7 +238,7 @@ struct SessionComposer: View {
         stopping = true
         stopSaid = ""
         Task {
-            stopSaid = await model.drive(session, in: room, .stop)
+            stopSaid = await model.drive(session, in: room, instance: instance, .stop)
             stopping = false
         }
     }
@@ -214,7 +249,7 @@ struct SessionComposer: View {
         sending = true
         said = ""
         Task {
-            said = await model.drive(session, in: room, action)
+            said = await model.drive(session, in: room, instance: instance, action)
             sending = false
         }
     }
@@ -227,6 +262,7 @@ struct RequestView: View {
     @ObservedObject var model: NodeModel
     /// The room it was drawn in: Approve, Reject and an answer go there and to `session` (D3).
     let room: String
+    let instance: Data?
     let session: FfiSession
     let request: FfiRequest
     /// What the request asks, as its entry's line says it: its buttons name it to VoiceOver.
@@ -243,6 +279,7 @@ struct RequestView: View {
          showsQuestionText: Bool = true) {
         self.model = model
         self.room = room
+        self.instance = model.selectedRoomInstance
         self.session = session
         self.request = request
         self.about = about
@@ -263,7 +300,7 @@ struct RequestView: View {
                 }
             }
         }
-        .disabled(busy)
+        .disabled(busy || !model.sessionDriveAvailable)
     }
 
     private var approval: some View {
@@ -331,11 +368,11 @@ struct RequestView: View {
     }
 
     private func act(_ action: DriveAction) {
-        guard !busy else { return }
+        guard !busy, let instance, model.selectedRoomInstance == instance else { return }
         busy = true
         said = ""
         Task {
-            said = await model.drive(session, in: room, action)
+            said = await model.drive(session, in: room, instance: instance, action)
             busy = false
         }
     }

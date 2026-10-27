@@ -21,6 +21,19 @@ struct SessionPages: Equatable {
     /// Swift/SwiftUI allocation overhead and physical footprint are measured separately.
     private static let windowTextBytes = 8 * 1024 * 1024
     private(set) var hasNewer = false
+    /// Only opaque row IDs survive a Session change while authority is rechecked.
+    private(set) var withheldIDs: [String] = []
+    private(set) var withheldOpening: String?
+
+    /// Hide private bodies immediately but retain the exact pinned selection and cursor.
+    mutating func withhold(opening: String) {
+        guard instance != nil, !opening.isEmpty else { clear(); return }
+        if withheldOpening == nil {
+            withheldIDs = entries.map(\.id)
+            withheldOpening = opening
+        }
+        entries = []
+    }
 
     /// Following replaces the window with the authoritative newest page. While the reader
     /// is on older activity, refresh only held rows; new output must not move that window.
@@ -31,6 +44,8 @@ struct SessionPages: Equatable {
         if following {
             instance = page.instance
             entries = page.entries
+            withheldIDs = []
+            withheldOpening = nil
             older = page.older
             before = page.before
             hasNewer = false
@@ -64,7 +79,10 @@ struct SessionPages: Equatable {
         guard instance == page.instance else { return false }
         let current = Dictionary(page.entries.map { ($0.id, $0) },
                                  uniquingKeysWith: { _, latest in latest })
-        entries = entries.compactMap { current[$0.id] }
+        let ids = withheldOpening == nil ? entries.map(\.id) : withheldIDs
+        entries = ids.compactMap { current[$0] }
+        withheldIDs = []
+        withheldOpening = nil
         boundOlderWindow()
         return true
     }
