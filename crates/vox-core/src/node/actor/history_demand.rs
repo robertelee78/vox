@@ -298,7 +298,7 @@ impl Controller {
         &self,
         room: Digest32,
         peer: Digest32,
-    ) -> Option<(RequestId, Digest32)> {
+    ) -> Option<(RequestId, Digest32, [u8; 16])> {
         self.ready
             .as_ref()
             .filter(|dispatch| {
@@ -311,7 +311,7 @@ impl Controller {
                         &dispatch.fence,
                     )
             })
-            .map(|dispatch| (dispatch.request, dispatch.generation))
+            .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
     }
 
     pub(super) fn take_legacy_cleanup(&mut self) -> Option<(Digest32, LegacyProvisionalOwner)> {

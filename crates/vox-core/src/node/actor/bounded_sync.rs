@@ -1594,32 +1594,50 @@ impl Controller {
         Ok(())
     }
 
-    pub(super) fn archive_for_port(
+    /// A physical archive Flow carries its own fence; its scalar request may have been reused.
+    pub(super) fn physical_archive_for_port(
         &self,
         room: Digest32,
         peer: Digest32,
-    ) -> Option<(stream::RequestId, Digest32)> {
+    ) -> Option<(
+        stream::RequestId,
+        Digest32,
+        Arc<crate::transport::stream_transport::Fence>,
+    )> {
         self.ready
             .iter()
             .flatten()
             .find(|flow| flow.room == room && flow.peer == peer && flow.archive)
             .and_then(|flow| {
-                flow.archive_request
-                    .map(|request| (request, flow.generation))
-            })
-            .or_else(|| {
-                self.archive_admission.as_ref().and_then(|admission| {
-                    (admission.room == room && admission.peer == peer)
-                        .then_some((admission.request, admission.generation))
-                })
+                Some((
+                    flow.archive_request?,
+                    flow.generation,
+                    Arc::clone(flow.request_fence.as_ref()?),
+                ))
             })
             .or_else(|| {
                 self.running
                     .iter()
                     .flatten()
                     .find(|work| work.room == room && work.peer == peer && work.archive.is_some())
-                    .and_then(|work| work.archive)
+                    .and_then(|work| {
+                        work.archive.map(|(request, generation)| {
+                            (request, generation, Arc::clone(&work.fence))
+                        })
+                    })
             })
+    }
+
+    /// Admission is separate from a physical Flow; its owner includes the room incarnation.
+    pub(super) fn archive_admission_for_port(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+    ) -> Option<(stream::RequestId, Digest32, [u8; 16])> {
+        self.archive_admission
+            .as_ref()
+            .filter(|admission| admission.room == room && admission.peer == peer)
+            .map(|admission| (admission.request, admission.generation, admission.instance))
     }
 
     pub(super) fn retire_port(&mut self, room: Digest32, peer: Digest32) {
