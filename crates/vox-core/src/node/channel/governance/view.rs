@@ -232,6 +232,29 @@ impl<'a> View<'a> {
         Ok(Self { facts, root })
     }
 
+    /// The exact current single-writer Presence source, not the last-good display or an
+    /// inventory claim. The canonical facts reader retains its normal freshness/binding checks.
+    pub(in crate::node::channel) fn presence_sender_generation(
+        &self,
+        author: &Digest32,
+    ) -> Result<Option<u64>> {
+        let Some(log) = self.facts.get(Table::Presence, &hash_key(author))? else {
+            return Ok(None);
+        };
+        let entry = self.facts.entry(log)?;
+        match GovEntry::body_bound_to(&entry)? {
+            GovBody::Presence(presence)
+                if entry.skeleton.author_id == *author
+                    && presence.body.author_id == *author
+                    && presence.body.channel_id == entry.skeleton.channel_id
+                    && presence.body.epoch == entry.skeleton.epoch =>
+            {
+                Ok(Some(presence.body.chain_id))
+            }
+            _ => Err(invalid("own recovery presence source binding")),
+        }
+    }
+
     pub(in crate::node::channel) fn admin_clock(&self) -> Option<u64> {
         self.facts.admin_clock()
     }

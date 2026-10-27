@@ -398,7 +398,25 @@ impl ChannelState {
             return Err(Error::OwnHistoryBehind);
         }
         self.require_legacy_current(store)?;
-        self.current_governance(store)?;
+        let governance = self.current_governance(store)?;
+        let generation = match governance.presence_sender_generation(&self.me())? {
+            Some(generation) => generation,
+            // A creator starts settled at generation zero without appending Presence. Sparse
+            // rotations publish Presence and the fresh sender atomically; absence is not an
+            // invented generation for a joiner or a restored later sender.
+            None if self.sender.chain_id() == 0
+                && self.me() == self.genesis.creator_pubkey().fingerprint() =>
+            {
+                0
+            }
+            None => return Err(Error::OwnHistoryBehind),
+        };
+        if generation != self.sender.chain_id() {
+            // Earlier code could count opaque own ciphertext as role-complete. That receipt
+            // cannot certify keys for a generation minted after this backup. Recovery of those
+            // keys remains separate owed work; never clear the fence on this old receipt alone.
+            return Err(Error::OwnHistoryBehind);
+        }
         Ok(())
     }
 
