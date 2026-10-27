@@ -39,6 +39,24 @@ use crate::atrest::store::{
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 
+thread_local! {
+    // A synchronous retirement slice needs to distinguish its own reopen failure from
+    // unrelated cleanup failures. Other operations must see the original error unchanged.
+    static TAG_REOPEN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn tag_reopen_failure<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TAG_REOPEN_FAILURE.with(|tag| tag.set(self.0));
+        }
+    }
+    let previous = TAG_REOPEN_FAILURE.with(|tag| tag.replace(true));
+    let _restore = Restore(previous);
+    run()
+}
+
 /// The on-disk schema version this build reads and writes.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -937,8 +955,14 @@ impl Store {
                 detail: "store ownership changed while reopening".into(),
             });
         }
-        let reopen_error = |source| Error::OriginalStoreReopen {
-            source: Box::new(source),
+        let reopen_error = |source| {
+            if TAG_REOPEN_FAILURE.with(std::cell::Cell::get) {
+                Error::OriginalStoreReopen {
+                    source: Box::new(source),
+                }
+            } else {
+                source
+            }
         };
         let db = open_database(&self.path)
             .map_err(open_error)

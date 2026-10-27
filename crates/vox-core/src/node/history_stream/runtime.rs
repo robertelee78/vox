@@ -1225,50 +1225,56 @@ impl Flow {
             ),
         }
         let step = tokio::task::spawn_blocking(move || {
-            let _charge = charge;
-            let mut channel = room.blocking_lock();
-            if channel.history_retirement_locked() {
-                return Ok(Slice::Gone);
-            }
-            // Lock erases keys immediately. Reopen owns the bounded crash cleanup;
-            // no retired worker may keep/recreate an unlocked room to finish work.
-            match channel.history_instance(&store) {
-                Err(Error::AtRestLocked) => return Ok(Slice::Gone),
-                Err(error) => return Err(error),
-                Ok(current) if current != instance => return Ok(Slice::Gone),
-                Ok(_) => {}
-            }
-            if let Some((purpose, staging)) = staging {
-                // Same room->Active lock order as semantic completion. Observer cancellation
-                // remains set: this route can only delete the captured abandoned staging.
-                let mut active = staging
-                    .active
-                    .lock()
-                    .map_err(|_| Error::Profile("history activation lock failed"))?;
-                let admission = admission
-                    .as_ref()
-                    .ok_or(Error::Profile("history retirement admission missing"))?;
-                let done =
-                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?;
-                return Ok(Slice::Staging(purpose, done));
-            }
-            let wake = channel.history_publication_wake();
-            let publication_owner = channel.history_publication_request(&store)?;
-            if channel.history_publication_busy(&store)? && publication_owner != Some(request) {
-                return Ok(Slice::Publication(publication_owner, wake));
-            }
-            if !channel.cleanup_history_source_owned(&store, &committed, request)? {
-                return Ok(Slice::Source(false, after));
-            }
-            channel
-                .cleanup_history_verifiers(&store, &committed, request, after)
-                .map(|(done, next)| Slice::Source(done, next))
+            crate::node::store::tag_reopen_failure(|| {
+                let _charge = charge;
+                let mut channel = room.blocking_lock();
+                if channel.history_retirement_locked() {
+                    return Ok(Slice::Gone);
+                }
+                // Lock erases keys immediately. Reopen owns the bounded crash cleanup;
+                // no retired worker may keep/recreate an unlocked room to finish work.
+                match channel.history_instance(&store) {
+                    Err(Error::AtRestLocked) => return Ok(Slice::Gone),
+                    Err(error) => return Err(error),
+                    Ok(current) if current != instance => return Ok(Slice::Gone),
+                    Ok(_) => {}
+                }
+                if let Some((purpose, staging)) = staging {
+                    // Same room->Active lock order as semantic completion. Observer cancellation
+                    // remains set: this route can only delete the captured abandoned staging.
+                    let mut active = staging
+                        .active
+                        .lock()
+                        .map_err(|_| Error::Profile("history activation lock failed"))?;
+                    let admission = admission
+                        .as_ref()
+                        .ok_or(Error::Profile("history retirement admission missing"))?;
+                    let done = demand::retire_staging(
+                        &staging.context,
+                        &mut active,
+                        admission,
+                        &committed,
+                    )?;
+                    return Ok(Slice::Staging(purpose, done));
+                }
+                let wake = channel.history_publication_wake();
+                let publication_owner = channel.history_publication_request(&store)?;
+                if channel.history_publication_busy(&store)? && publication_owner != Some(request) {
+                    return Ok(Slice::Publication(publication_owner, wake));
+                }
+                if !channel.cleanup_history_source_owned(&store, &committed, request)? {
+                    return Ok(Slice::Source(false, after));
+                }
+                channel
+                    .cleanup_history_verifiers(&store, &committed, request, after)
+                    .map(|(done, next)| Slice::Source(done, next))
+            })
         })
         .await
         .map_err(|_| Error::Profile("history retirement worker stopped"))?;
         let step = match step {
             Ok(step) => step,
-            Err(error @ Error::OriginalStoreReopen { .. }) => {
+            Err(Error::OriginalStoreReopen { source }) => {
                 // Reopening can become necessary after the initial settlement snapshot.
                 // Only this specific failure owns a reopen wake; unrelated cleanup failures
                 // must retain their original recovery behavior.
@@ -1285,7 +1291,7 @@ impl Flow {
                         "vox: history reopen recovery snapshot worker stopped: {snapshot_error}"
                     ),
                 }
-                return Err(error);
+                return Err(*source);
             }
             Err(error) => return Err(error),
         };

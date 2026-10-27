@@ -377,7 +377,7 @@ pub enum Error {
     #[error("another vox already has this node open")]
     ProfileBusy,
 
-    /// An attempted recovery of the original store failed; retain the underlying fault.
+    /// Internal marker scoped to history retirement; never returned to a caller.
     #[error("{source}")]
     OriginalStoreReopen {
         /// The underlying reason the store could not be reopened.

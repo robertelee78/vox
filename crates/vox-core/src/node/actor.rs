@@ -26671,9 +26671,6 @@ async fn agree_round(
 /// that does the same work itself (`vox id` making an identity, ADR-026 C-5).
 #[must_use]
 pub fn fault_of(e: &Error) -> Fault {
-    if let Error::OriginalStoreReopen { source } = e {
-        return fault_of(source);
-    }
     if ChannelState::governance_refreshing(e)
         || ChannelState::legacy_classification_refreshing(e)
         || ChannelState::authorization_refreshing(e)
