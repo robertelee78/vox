@@ -756,8 +756,10 @@ final class NodeModel: ObservableObject {
     private func invalidateRoomMutationSheet() {
         if isRoomMutationSheet(sheet) { sheet = nil }
     }
-    private func roomMutationCurrent(_ expected: NodeSheet) -> Bool {
-        guard let scope = roomMutationSheetScope, sheet == expected, sheetInstance == scope.editor,
+    var roomMutationTicket: UUID? { roomMutationSheetScope?.editor }
+    private func roomMutationCurrent(_ expected: NodeSheet, ticket: UUID) -> Bool {
+        guard let scope = roomMutationSheetScope, scope.editor == ticket,
+              sheet == expected, sheetInstance == scope.editor,
               ended == nil, daemonReachable, machineStateKnown, !observationNeedsRestart,
               !roomNeedsPage, roomOnScreen == scope.room, roomInstance == scope.instance,
               nodeObservationEpoch == scope.epoch, roomReadGeneration == scope.generation else { return false }
@@ -2744,39 +2746,43 @@ final class NodeModel: ObservableObject {
 
     /// Leave the room on screen, or end it for everyone: nil once done, else why not (D19), for
     /// the sheet that asked to say where it was asked.
-    func leaveRoom(endingIt: Bool) async -> String? {
+    func leaveRoom(endingIt: Bool, ticket: UUID) async -> String? {
         let operation = "leave"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard roomMutationCurrent(.leave), let id = roomOnScreen else {
+        guard roomMutationCurrent(.leave, ticket: ticket), let id = roomOnScreen else {
             return "The room changed or is being refreshed. Open the confirmation again."
         }
         do {
             if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
-            guard roomMutationCurrent(.leave) else { return "The room changed while the request was pending." }
+            guard roomMutationCurrent(.leave, ticket: ticket) else { return "The room changed while the request was pending." }
             report(operation: operation, done: endingIt ? "The room is ended for everyone." : "You left the room.")
+            sheet = nil
             selection = nil
             await refresh()
             return nil
         } catch {
+            guard roomMutationCurrent(.leave, ticket: ticket) else { return nil }
             report(error, operation: operation)
             return sentence(error)
         }
     }
 
     /// Set the room on screen's retention: no passphrase (ADR-028 K-11).
-    func setRetention(_ seconds: UInt64) async -> Bool {
+    func setRetention(_ seconds: UInt64, ticket: UUID) async -> Bool {
         let operation = "retention"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard roomMutationCurrent(.retention), let id = roomOnScreen else { return false }
+        guard roomMutationCurrent(.retention, ticket: ticket), let id = roomOnScreen else { return false }
         do {
             try await client.setRetention(room: id, ttlSecs: seconds)
-            guard roomMutationCurrent(.retention) else { return false }
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             report(operation: operation, done: seconds == 0 ? "Messages here are kept for good."
                 : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere.")
+            sheet = nil
             return true
         } catch {
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -2940,25 +2946,27 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    func setStepRetention(_ seconds: UInt64) async -> Bool {
-        guard roomMutationCurrent(.retention), let id = roomOnScreen else { return false }
+    func setStepRetention(_ seconds: UInt64, ticket: UUID) async -> Bool {
+        guard roomMutationCurrent(.retention, ticket: ticket), let id = roomOnScreen else { return false }
         let operation = "step-retention"
         let attempt = begin(operation)
         defer { end(attempt) }
         do {
             try await AppRequest.run("Setting Session step retention") { [client] in
-                guard self.roomMutationCurrent(.retention) else { throw CancellationError() }
+                guard self.roomMutationCurrent(.retention, ticket: ticket) else { throw CancellationError() }
                 try await client.setStepRetention(room: id, seconds: seconds)
             }
-            guard roomMutationCurrent(.retention) else { return false }
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             // A read started before the setter must not overwrite the new rule.
             stepRetentionRead = UUID()
             stepRetentionLoading = false
             await loadStepRetention()
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             let scope = stepRetentionAdmin ? "The room's Session step rule is" : "This node's Session step rule is"
             report(operation: operation, done: "\(scope) \(Retention.words(seconds)). Message retention still applies.")
             return true
         } catch {
+            guard roomMutationCurrent(.retention, ticket: ticket) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -2966,20 +2974,22 @@ final class NodeModel: ObservableObject {
 
     /// Rename the room on screen: its one name, as every member sees it (ADR-028 R-1). Only its
     /// creator or an admin may; the node's refusal is said as it comes. No passphrase (K-11).
-    func renameRoom(to name: String) async -> Bool {
+    func renameRoom(to name: String, ticket: UUID) async -> Bool {
         let operation = "rename"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard roomMutationCurrent(.rename), let id = roomOnScreen else { return false }
+        guard roomMutationCurrent(.rename, ticket: ticket), let id = roomOnScreen else { return false }
         do {
             let entry = try await client.renameRoom(room: id, name: name)
-            guard roomMutationCurrent(.rename) else { return false }
+            guard roomMutationCurrent(.rename, ticket: ticket) else { return false }
             report(
                 operation: operation,
                 done: "The room is now \(name) for every member. Entry \(entry).")
+            sheet = nil
             await refresh()
             return true
         } catch {
+            guard roomMutationCurrent(.rename, ticket: ticket) else { return false }
             report(error, operation: operation)
             return false
         }
@@ -3001,27 +3011,27 @@ final class NodeModel: ObservableObject {
     /// Bind an ending permission read to the same room and acting node throughout.
     func canEndRoom(_ room: String) async throws -> Bool {
         let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
-        guard roomOnScreen == room, roomMutationCurrent(.end) else {
+        guard roomOnScreen == room, roomMutationCurrent(.end, ticket: editor) else {
             throw VoxError.Failed(reason: "The room to end is no longer selected.")
         }
         let admin = try await client.isAdmin(room: room, member: actor)
         guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
               roomReadGeneration == generation, roomOnScreen == room, sheetInstance == editor,
-              roomMutationCurrent(.end) else {
+              roomMutationCurrent(.end, ticket: editor) else {
             throw VoxError.Failed(reason: "The room or acting node changed while checking who may end it.")
         }
         return admin
     }
 
     /// A late ending reply must never clear a newer room or close a replacement sheet.
-    func endRoomFromSheet(_ room: String) async -> String? {
+    func endRoomFromSheet(_ room: String, ticket: UUID) async -> String? {
         let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
         let operation = "end-room", attempt = begin("end-room")
         defer { end(attempt) }
         func current() -> Bool {
             !Task.isCancelled && nodeObservationEpoch == epoch && me == actor
                 && roomReadGeneration == generation && roomOnScreen == room
-                && sheetInstance == editor && roomMutationCurrent(.end)
+                && sheetInstance == editor && roomMutationCurrent(.end, ticket: ticket)
         }
         guard current() else { return nil }
         do {
