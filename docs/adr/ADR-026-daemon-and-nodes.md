@@ -266,8 +266,13 @@ network presence from the start: there is no interim design with one socket per 
   necessary. Prior-release data migration and its proofs, including the v0.4.5 recovery path
   previously required by F-4, are not release requirements for v0.4.10.
   This supersedes the prior-release obligations in ADR-031 SA-5, SA-6, SA-10 and SA-11,
-  ADR-032 AN-14, ADR-034 UP-2's cross-version compatibility measurement, and ADR-035 CT-20's
-  shared-upgrade contribution. Their current-version feature and security requirements remain.
+  ADR-032 AN-14, and ADR-034 UP-2's mixed-version peer requirement and planned compatibility
+  measurement. UP-2's refusal of a mismatched client and its own daemon remains. ADR-035 CT-20's
+  current-data and unsupported-format protections remain, as do current-version feature and
+  security requirements.
+  - ADR-031 CW-3 and ADR-034 UP-1 still require remembered current-version nodes to return Ready.
+    For v0.4.10, an unsupported prior-release remembered node MAY instead be refused unchanged
+    with the reason; an update MUST report that outcome truthfully rather than claim it is Ready.
   - Current-version identities, keyrings, rooms, messages, repository bindings and supported
     Session records MUST retain their specified integrity and restart behavior. Trust decisions,
     revocations, drive restrictions and retention still apply.
