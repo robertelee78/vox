@@ -255,15 +255,24 @@ network presence from the start: there is no interim design with one socket per 
   from the same file in the account's config directory. The daemon's own settings (listen, metrics,
   relay limits) MUST be read from `.daemon/config`; the relay limits are `relay-circuits` and
   `relay-circuits-per-asker` (ADR-012 N-45).
-- **F-3. Current-release data and compatibility scope** (amended 2026-10-12). The decider:
+- **F-3. Current-release data and compatibility scope** (amended 2026-10-12 and 2026-10-27).
+  The decider:
   "we don't yet have to worry about backwards compat", "don't over engineer things", and
   "we have no users yet". For v0.4.5, the earlier requirement to upgrade every data root written
   since v0.4.0 and prove that upgrade before release is superseded. Prior-release data migration,
   mixed-version wire compatibility and their proofs are out of scope; there is no replacement
-  migration architecture or compatibility gate.
+  migration architecture or compatibility gate. For v0.4.10 the decider reiterated "I don't
+  want to over engineer backwards compat" and said old nodes and rooms may be torn down if
+  necessary. Prior-release data migration and its proofs, including the v0.4.5 recovery path
+  previously required by F-4, are not release requirements for v0.4.10.
   This supersedes the prior-release obligations in ADR-031 SA-5, SA-6, SA-10 and SA-11,
-  ADR-032 AN-14, ADR-034 UP-2's cross-version compatibility measurement, and ADR-035 CT-20's
-  shared-upgrade contribution. Their current-version feature and security requirements remain.
+  ADR-032 AN-14, and ADR-034 UP-2's mixed-version peer requirement and planned compatibility
+  measurement. UP-2's refusal of a mismatched client and its own daemon remains. ADR-035 CT-20's
+  current-data and unsupported-format protections remain, as do current-version feature and
+  security requirements.
+  - ADR-031 CW-3 and ADR-034 UP-1 still require remembered current-version nodes to return Ready.
+    For v0.4.10, an unsupported prior-release remembered node MAY instead be refused unchanged
+    with the reason; an update MUST report that outcome truthfully rather than claim it is Ready.
   - Current-version identities, keyrings, rooms, messages, repository bindings and supported
     Session records MUST retain their specified integrity and restart behavior. Trust decisions,
     revocations, drive restrictions and retention still apply.
@@ -271,23 +280,21 @@ network presence from the start: there is no interim design with one socket per 
     unsupported layout or format, including a future or malformed format marker, MUST be refused
     unchanged with the reason. Removing the compatibility requirement does not authorize an
     automatic reset, data deletion or silent reinterpretation of unsupported data.
-  - Existing compatibility code need not be removed merely because it is no longer a v0.4.5
+  - Existing compatibility code need not be removed merely because it is no longer an
     acceptance requirement. No new previous-release fixture or proof is required.
   - One node is one identity: a node holding a vault runs its anchor (`vox node`) as node
     `<name>-anchor`.
 
-- **F-4. v0.4.6 recovery installation** (2026-10-15; not yet delivered). Opening the existing
-  v0.4.5 node data MUST preserve identities, trust, rooms, messages, repository bindings and
-  supported Session records. Before writing an index representation v0.4.5 cannot read, the
-  daemon MUST advance `.daemon/format` under the account lock to a value v0.4.5 refuses.
-  Interrupted preparation MUST resume without resetting data. This is the observed recovery
-  path, not a requirement to support every historical release.
-  The update MUST install matching app, CLI and daemon helpers before restarting from the
+- **F-4. Update and recovery installation** (2026-10-15; amended 2026-10-27). The earlier
+  v0.4.5 data migration and compatibility proof are superseded for v0.4.10 by F-3. Supported
+  current-version data still has the integrity and restart guarantees in F-3; unsupported
+  formats are refused unchanged rather than reset or silently reinterpreted.
+  An update MUST install matching app, CLI and daemon helpers before restarting from the
   actual managed executable path, then verify the replacement daemon's reported version and
-  kept-node outcomes. A successful binary replacement with an incomplete restart MUST be
-  reported as that partial outcome. Replacing only a binary MUST NOT be described as a safe
-  rollback after newer-format data has been written. App helper processes MUST inherit the
-  actual user environment unless an explicit complete override is supplied.
+  outcomes for kept nodes supported by that release. A successful binary replacement with an
+  incomplete restart MUST be reported as that partial outcome. Replacing only a binary MUST NOT
+  be described as a safe rollback after newer-format data has been written. App helper processes
+  MUST inherit the actual user environment unless an explicit complete override is supplied.
 
 ### 8. Process-wide state
 
@@ -350,7 +357,8 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 10. a fresh data root works end to end, and one holding a node's files outside `nodes/`, an
     unsupported future format or a malformed format marker is refused with the reason and left
     unchanged (`a_data_root_of_an_earlier_release_is_refused_proof`). The former previous-release
-    upgrade arm is no longer required for v0.4.5 (F-3, decider 2026-10-12);
+    upgrade arm is no longer required for v0.4.5 or v0.4.10 (F-3, decider 2026-10-12 and
+    2026-10-27);
 11. a node keeps running in full past the keyring window, and only a keyring change asks for the
     passphrase again (`a_keyring_change_needs_a_recent_passphrase_proof`);
 12. R40 and R42 are re-measured (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
