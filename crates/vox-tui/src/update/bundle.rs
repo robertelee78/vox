@@ -168,6 +168,35 @@ pub(super) fn install_app(
     let marker_partial = apps.join(".marker.partial");
     require_optional_file(&marker, "installer marker")?;
     require_optional_bundle(&active, BUNDLE)?;
+    if !path_exists(&active)? {
+        let legacy_stage = apps.join(".Vox.install.rollback.partial");
+        let previous = apps.join(PREVIOUS);
+        require_optional_bundle(&legacy_stage, "legacy installer staging")?;
+        require_optional_bundle(&previous, PREVIOUS)?;
+        let has_stage = path_exists(&legacy_stage)?;
+        let has_previous = path_exists(&previous)?;
+        if has_stage || has_previous {
+            if !path_exists(&marker)?
+                || has_stage == has_previous
+                || path_exists(&apps.join(PUBLISHING))?
+                || path_exists(&apps.join(ROLLBACK_PARTIAL))?
+            {
+                return Err(usage(
+                    "ambiguous interrupted installation; no bundle was removed",
+                ));
+            }
+            let old = if has_stage { &legacy_stage } else { &previous };
+            restore(old)?;
+            require_active_app_version(old)?;
+            if apple_required() {
+                verify_apple(source, old)?;
+            }
+            fs::rename(old, &active).map_err(AppError::Io)?;
+            sync_dir(apps)?;
+            launch_services(true, &active).map_err(usage)?;
+            println!("vox: restored Vox.app from an interrupted installer");
+        }
+    }
     if path_exists(&active)? {
         if !path_exists(&marker)? {
             return Err(usage(
@@ -724,7 +753,33 @@ fn read_transition(journal: &Path) -> Result<Option<Transition>, AppError> {
 }
 
 fn finish_transition(apps: &Path) -> Result<(), AppError> {
-    clear(&apps.join(PUBLISHING))
+    let journal = apps.join(PUBLISHING);
+    let mut records = 0;
+    for entry in fs::read_dir(&journal).map_err(AppError::Io)? {
+        let entry = entry.map_err(AppError::Io)?;
+        if ![
+            TRANSITION_STATE,
+            TRANSITION_STATE_PARTIAL,
+            LEGACY_TRANSITION_VERSION,
+        ]
+        .iter()
+        .any(|name| entry.file_name() == *name)
+        {
+            return Err(transition_conflict(
+                &journal,
+                "unexpected item prevents journal removal",
+            ));
+        }
+        require_optional_file(&entry.path(), "transition journal record")?;
+        records += 1;
+        if records > 1 {
+            return Err(transition_conflict(
+                &journal,
+                "multiple transition records prevent journal removal",
+            ));
+        }
+    }
+    clear(&journal)
 }
 
 /// Make the verified `.Vox.app.partial` the bundle, keeping the one it replaces.
@@ -1043,12 +1098,32 @@ fn in_use(bundle: &Path) -> Result<bool, AppError> {
 /// that the exchange happened.
 fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let mut repaired = Recovery::default();
+    let journal = apps.join(PUBLISHING);
+    require_optional_dir(&journal, PUBLISHING)?;
+    if path_exists(&journal)? {
+        for entry in fs::read_dir(&journal).map_err(AppError::Io)? {
+            let entry = entry.map_err(AppError::Io)?;
+            if ![
+                TRANSITION_STATE,
+                TRANSITION_STATE_PARTIAL,
+                LEGACY_TRANSITION_VERSION,
+                BUNDLE,
+            ]
+            .iter()
+            .any(|name| entry.file_name() == *name)
+            {
+                return Err(transition_conflict(
+                    &journal,
+                    "unexpected item in transition journal",
+                ));
+            }
+        }
+    }
     sweep(apps, &mut repaired)?;
     let active = apps.join(BUNDLE);
     let staged = apps.join(PARTIAL);
     let rollback_staged = apps.join(ROLLBACK_PARTIAL);
     let previous = apps.join(PREVIOUS);
-    let journal = apps.join(PUBLISHING);
     require_bundle(&active, BUNDLE)?;
     // Before a durable journal exists, the publish path is only extraction scratch. It may be
     // structurally incomplete because power stopped `bsdtar`; validate only that its reserved
@@ -1114,6 +1189,15 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
         repaired.interrupted_transition = Some(InterruptedTransition::Unrecorded);
         return Ok(repaired);
     };
+    for entry in fs::read_dir(&journal).map_err(AppError::Io)? {
+        let entry = entry.map_err(AppError::Io)?;
+        if entry.file_name() != TRANSITION_STATE && entry.file_name() != BUNDLE {
+            return Err(transition_conflict(
+                &journal,
+                "unexpected item in committed transition journal",
+            ));
+        }
+    }
     let active_id = file_id(&active)?;
     if active_id == transition.active_id {
         require_transition_identity(
@@ -1343,6 +1427,12 @@ fn recover_legacy_publish(apps: &Path, repaired: &mut Recovery) -> Result<Recove
     require_optional_bundle(&previous, PREVIOUS)?;
     require_optional_bundle(&older, "legacy journal's retained bundle")?;
     let published = require_active_app_version(&active)? == version;
+    if !published && path_exists(&older)? && path_exists(&previous)? {
+        return Err(transition_conflict(
+            &journal,
+            "two prior bundles are present before publication",
+        ));
+    }
     if path_exists(&staged)? {
         if published {
             if path_exists(&previous)? {
