@@ -4128,6 +4128,10 @@ extension NodeModel {
             scheduleSessionAttentionRead()
         } catch {
             guard current() else { return }
+            if sessionProjectionChanged(error) {
+                await stopped(.sessionChanged)
+                return
+            }
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = true
             discardSessionWindow(after: error)
