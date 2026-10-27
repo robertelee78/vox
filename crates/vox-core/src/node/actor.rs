@@ -15973,7 +15973,28 @@ impl Node {
 
     /// Retire a port's attempts and forget it (its room is gone or held again).
     fn drop_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
-        if let Some((request, generation)) = self.bounded_sync.archive_for_port(*channel_id, *peer)
+        self.drop_port_inner(channel_id, peer, false);
+    }
+
+    /// Departure removes this peer's port, but an unconsumed page still owns its request.
+    fn drop_departed_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        self.drop_port_inner(channel_id, peer, true);
+        self.sched_rooms.insert(*channel_id);
+    }
+
+    fn drop_port_inner(
+        &mut self,
+        channel_id: &Digest32,
+        peer: &Digest32,
+        preserve_unstarted: bool,
+    ) {
+        if let Some((request, generation)) = self
+            .bounded_sync
+            .archive_for_port(*channel_id, *peer)
+            .filter(|binding| {
+                !preserve_unstarted
+                    || self.history_demand.unstarted_binding(*channel_id, *peer) != Some(*binding)
+            })
         {
             self.history_demand.failed(
                 request,

@@ -2063,7 +2063,7 @@ impl Node {
         });
         if !keep_receipt {
             if self.ports.contains_key(&(room, peer)) {
-                self.drop_port(&room, &peer);
+                self.drop_departed_port(&room, &peer);
             }
             return;
         }
