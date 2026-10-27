@@ -152,6 +152,8 @@ struct State {
     deny: u64,
     head_grant: Option<Grant>,
     projection: Digest32,
+    /// An interrupted format-1 fold may have changed output before its last publication.
+    force_publication: bool,
     /// A format-1 cursor predates the semantic projection fingerprint. Its partially
     /// folded state cannot be resumed with a guessed fingerprint.
     legacy: bool,
@@ -189,6 +191,7 @@ impl State {
             deny: 1,
             head_grant: None,
             projection: writer.projection(),
+            force_publication: false,
             legacy: false,
         }
     }
@@ -198,7 +201,7 @@ impl State {
         };
         let mut d = Decoder::new(&bytes);
         let (arity, version) = (d.array()?, d.uint()?);
-        if !matches!((arity, version), (16, 1) | (17, 2)) {
+        if !matches!((arity, version), (16, 1) | (17, 2) | (18, 3)) {
             return Err(invalid("governance fold cursor format"));
         }
         let phase = d.uint()?;
@@ -220,7 +223,7 @@ impl State {
         let after_cert = read_option(&mut d)?;
         let deny = d.uint()?;
         let head_grant = read_grant(&mut d)?;
-        let projection = if version == 2 {
+        let projection = if version >= 2 {
             d.bytes()?
                 .try_into()
                 .map_err(|_| invalid("governance fold projection"))?
@@ -228,6 +231,15 @@ impl State {
             // The caller restarts this validated legacy cursor from the sealed index before
             // using or publishing its projection; it never resumes the partial old fold.
             writer.projection()
+        };
+        let force_publication = if version == 3 {
+            match d.uint()? {
+                0 => false,
+                1 => true,
+                _ => return Err(invalid("governance fold force publication")),
+            }
+        } else {
+            false
         };
         d.finish()?;
         if phase > BASELINE_AUTHORITY
@@ -255,13 +267,14 @@ impl State {
             deny,
             head_grant,
             projection,
+            force_publication,
             legacy: version == 1,
         }))
     }
     fn save(&self, writer: &mut Write<'_, '_>) -> Result<()> {
         let mut e = Encoder::new();
-        e.array(17)
-            .uint(2)
+        e.array(18)
+            .uint(3)
             .uint(self.phase)
             .uint(self.ordered)
             .uint(self.generation)
@@ -286,6 +299,7 @@ impl State {
         e.uint(self.deny);
         write_grant(&mut e, self.head_grant);
         e.bytes(&self.projection);
+        e.uint(u64::from(self.force_publication));
         writer.save_cursor(Cursor::Evaluation, &e.finish())
     }
     fn clear_query(&mut self) {
@@ -344,10 +358,11 @@ pub(super) fn advance(
         return Ok(false);
     }
     writer.expire_authority(now)?;
-    let baseline = |writer: &Write<'_, '_>| {
+    let baseline = |writer: &Write<'_, '_>, force_publication| {
         let mut state = State::new(writer, now);
         state.phase = BASELINE_EFFECTS;
         state.projection = [0; 32];
+        state.force_publication = force_publication;
         state
     };
     let mut state = match State::load(writer)? {
@@ -356,7 +371,7 @@ pub(super) fn advance(
             // by reconstructing the actual derived output in bounded steps. The old generation
             // is held unready until the subsequent full fold completes.
             writer.authority_changed()?;
-            baseline(writer)
+            baseline(writer, state.phase != DONE)
         }
         Some(state)
             if matches!(state.phase, BASELINE_EFFECTS | BASELINE_AUTHORITY)
@@ -365,7 +380,7 @@ pub(super) fn advance(
         {
             // The derived inputs changed between bounded steps. Restart only the scan rather
             // than combine fingerprints from different views.
-            baseline(writer)
+            baseline(writer, state.force_publication)
         }
         Some(state)
             if state.generation == writer.authority_generation()
@@ -373,7 +388,12 @@ pub(super) fn advance(
         {
             state
         }
-        _ => State::new(writer, now),
+        Some(state) => {
+            let mut next = State::new(writer, now);
+            next.force_publication = state.force_publication;
+            next
+        }
+        None => State::new(writer, now),
     };
     // A suffix fold retains the published prefix's genuine expiry dependency. Merge it
     // for resumed cursors too: an interrupted older fold may not yet carry that minimum.
@@ -394,7 +414,9 @@ pub(super) fn advance(
     // time may be published after a relevant deadline passed during paged work.
     if state.deadline != 0 && now >= state.deadline {
         writer.authority_changed()?;
+        let force_publication = state.force_publication;
         state = State::new(writer, now);
+        state.force_publication = force_publication;
     }
     match state.phase {
         AUTHORITY => authority_step(writer, root, &mut state)?,
@@ -426,10 +448,12 @@ pub(super) fn advance(
                 admin_token(&mut state.projection, &target, grant, deny);
                 state.target = Some(target);
             } else {
-                // Format 1 had no comparable published fingerprint. Publish this actual
-                // baseline and invalidate display once, then rebuild using normal fold rules.
+                // Format 1 had no comparable fingerprint. Record the actual baseline and
+                // defer any partial-fold invalidation until the rebuilt output is published.
                 writer.rebaseline_projection(state.projection)?;
+                let force_publication = state.force_publication;
                 state = State::new(writer, now);
+                state.force_publication = force_publication;
             }
         }
         _ => return Err(invalid("governance fold phase")),
@@ -571,7 +595,8 @@ fn action_step(
                 // contributes a new expiry. Publish it with the completed projection so the
                 // existing room deadline wake cannot lose that historical authorization edge.
                 writer.authority_published(state.generation, state.deadline)?;
-                writer.projection_published(state.projection)?;
+                writer.projection_published(state.projection, state.force_publication)?;
+                state.force_publication = false;
                 writer.evaluation_published(state.ordered)?;
                 state.phase = DONE;
             } else {
@@ -688,7 +713,8 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
         let Some((key, _)) = writer.first(Table::AllCerts, None)? else {
             writer.authority_published(state.generation, state.deadline)?;
             writer.head_published(state.generation)?;
-            writer.projection_published(state.projection)?;
+            writer.projection_published(state.projection, state.force_publication)?;
+            state.force_publication = false;
             writer.evaluation_published(state.ordered)?;
             state.phase = DONE;
             return Ok(());
@@ -743,7 +769,8 @@ fn head_step(writer: &mut Write<'_, '_>, root: &Digest32, state: &mut State) -> 
         None => {
             writer.authority_published(state.generation, state.deadline)?;
             writer.head_published(state.generation)?;
-            writer.projection_published(state.projection)?;
+            writer.projection_published(state.projection, state.force_publication)?;
+            state.force_publication = false;
             writer.evaluation_published(state.ordered)?;
             state.phase = DONE;
         }

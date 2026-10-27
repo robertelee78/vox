@@ -1266,16 +1266,16 @@ impl<'a, 'store> Write<'a, 'store> {
         self.header.projection
     }
 
-    /// Format-1 folds lacked a comparable fingerprint; invalidate once after reconstructing it.
+    /// Record the actual derived output before rebuilding a legacy fold.
     pub(super) fn rebaseline_projection(&mut self, projection: Digest32) -> Result<()> {
         self.header.projection = projection;
-        self.display_changed()
+        Ok(())
     }
 
     /// Publish one completed canonical output. Intermediate clear/rebuild steps never revise the
     /// user-visible projection, and an authorized replay with identical meaning is a no-op.
-    pub(super) fn projection_published(&mut self, projection: Digest32) -> Result<()> {
-        if self.header.projection != projection {
+    pub(super) fn projection_published(&mut self, projection: Digest32, force: bool) -> Result<()> {
+        if force || self.header.projection != projection {
             self.header.projection = projection;
             self.display_changed()?;
         }
