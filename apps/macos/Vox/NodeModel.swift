@@ -4187,7 +4187,8 @@ extension NodeModel {
         guard ended == nil, !roomNeedsPage, !observationNeedsRestart || whileRecovering else { return }
         // Surviving rows still need exact authorization/expiry checks while reload is
         // offered. That refresh must not acknowledge reload or replace the held window.
-        guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty else { return }
+        guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty
+                || !sessionPages.withheldIDs.isEmpty else { return }
         guard !reloadNewest || timelineFollowingNewest else { return }
         // A cached page descriptor is not authority while an exact lookup is pending.
         if showingSession && (!selectedSessionMetadataKnown || selectedSessionMetadata == nil) { return }
@@ -4199,11 +4200,19 @@ extension NodeModel {
             sessionLoading = false
             return
         }
+        if let opening = sessionPages.withheldOpening, opening != s.opening {
+            // A replacement cannot inherit an older Session's pinned selection.
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            sessionReloadNeeded = !timelineFollowingNewest
+            return
+        }
         let revision = sessionWindowRevision
         let following = timelineFollowingNewest
         let follows = following && (!sessionReloadNeeded || reloadNewest)
         let epoch = nodeObservationEpoch, generation = roomReadGeneration
-        let heldIDs = sessionEntries.map(\.id)
+        let heldIDs = sessionPages.withheldOpening == nil
+            ? sessionEntries.map(\.id) : sessionPages.withheldIDs
         let heldInstance = sessionPages.instance
         func current() -> Bool {
             roomOnScreen == room && roomInstance == instance && shownSession?.nodeFingerprint == s.nodeFingerprint
@@ -4538,13 +4547,19 @@ extension NodeModel {
             clearPrivateJoinCaptions()
             // This signal also carries drive revocation. Withhold the previous grant and
             // private rows before the first await; older reads must not republish them.
+            if showingSession, let selected = selectedSessionMetadata {
+                sessionPages.withhold(opening: selected.opening)
+            } else if sessionPages.withheldOpening == nil {
+                sessionPages.clear()
+            }
             selectedSessionRead = UUID()
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = false
-            sessionPages.clear()
             sessionWindowRevision = UUID()
             selectedEarlierRequest = nil
-            sessionReloadNeeded = sessionReloadNeeded || (showingSession && !timelineFollowingNewest)
+            if sessionPages.withheldOpening == nil {
+                sessionReloadNeeded = sessionReloadNeeded || (showingSession && !timelineFollowingNewest)
+            }
             sessionLoading = false
         }
         let epoch = nodeObservationEpoch
