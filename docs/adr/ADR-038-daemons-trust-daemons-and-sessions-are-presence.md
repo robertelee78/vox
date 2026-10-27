@@ -562,18 +562,19 @@ lessons. It changes neither this record's decision status nor any requirement or
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
 - **FX-31.** A flush to disk of one commit MUST NOT delay work that does not depend on that
-  flush. While a save is stalled, status publication, reads of already-saved messages, attention
-  selection and other unrelated non-disk work MUST remain responsive; `vox status` MUST NOT say
-  "room publication is busy" for a room whose only activity is a flush. No commit's flush runs
-  while the room's lock is held. A new post can report success only after its own save is durable,
-  as FX-30 requires: if the shared disk cannot finish that save, the post cannot complete yet. Vox
-  MUST report a save failure or pending recovery truthfully, and MUST NOT report a post as saved
-  before its own durability boundary. The 2026-10-27 decider ruling supersedes the earlier
-  promise that every post completes while an earlier flush is held; no fixed elapsed cutoff or
-  new capacity limit determines this behavior. The existing real-binary journey may hold a flush
-  using the `test-knobs` build to show that unrelated work progresses, then release it and verify
-  that the post completes durably. Measured cause, the same daemon: every commit ran inside `history_write` with
-  the room mutex held (the `read_charged` closure owns the `lock_owned()` guard), so the daemon
+  flush. While a save is stalled, status publication and `vox status` queries, reads of
+  already-saved messages, attention selection and other unrelated non-disk work MUST remain
+  responsive; `vox status` MUST NOT say "room publication is busy" for a room whose only activity
+  is a flush. No commit's flush runs while the room's lock is held. A new post stays pending while
+  its own save can still complete and reports success only after that save is durable, as FX-30
+  requires. If its save definitively fails, the post reports failure and MUST NOT be reported as
+  saved. Vox MUST report pending recovery truthfully. The 2026-10-27 decider ruling supersedes
+  the earlier promise that every post completes while an earlier flush is held; no fixed elapsed
+  cutoff or new capacity limit determines this behavior. The existing real-binary journey may
+  hold a flush using the `test-knobs` build to show that unrelated work progresses, then release
+  it and verify that the post completes durably. Measured cause, the same daemon: every commit
+  ran inside `history_write` with the room mutex held (the `read_charged` closure owns the
+  `lock_owned()` guard), so the daemon
   log said `room publication is busy; retry this operation` 424 times and `attention selection
   remains pending`, and the app's member list flickered (#983).
 - **FX-32.** A node that finds a member holding more of its own feed than it does (a restored
