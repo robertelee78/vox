@@ -220,6 +220,10 @@ impl Queue {
         *self = done;
         Ok(())
     }
+    pub(super) fn has_attempt(&self) -> bool {
+        self.attempt.is_some()
+    }
+
     /// A physically available release slot and the durable replay request share the same
     /// transaction. The actor finishes a selected package before entering room maintenance.
     pub(super) fn capacity_retry(

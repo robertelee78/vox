@@ -7619,11 +7619,14 @@ impl ChannelState {
                 &self.channel_id,
                 &key,
                 skdm,
+                self.receivers.get(&slot),
                 &candidate,
             )?;
             match retained {
-                receiver_releases::Remember::Busy => {
-                    batch.commit()?;
+                receiver_releases::Remember::Busy { changed } => {
+                    if changed {
+                        batch.commit()?;
+                    }
                     return Ok(false);
                 }
                 receiver_releases::Remember::Unchanged if !changed => return Ok(true),
@@ -8202,10 +8205,22 @@ impl ChannelState {
         Ok(())
     }
 
+    pub(crate) fn receiver_release_cleanup_waiting(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::StreamRefused(receiver_releases::CLEANUP_PENDING)
+        )
+    }
+
     pub(crate) fn advance_receiver_release_cleanup(
         &mut self,
         store: &Store,
     ) -> Result<(bool, bool)> {
+        // A selected package owns its exact cursor until ordinary completion. Do not
+        // change the replay basis while preparation waits on that attempt's authority.
+        if self.key_packages.has_attempt() {
+            return Ok((false, false));
+        }
         let mut batch = store.batch()?;
         let progress =
             receiver_releases::advance(&mut batch, &self.sek, &self.channel_id, &self.receivers)?;

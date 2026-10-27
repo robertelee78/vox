@@ -11926,17 +11926,18 @@ impl Node {
                         use crate::node::channel::history::Reply;
                         let mut room = shared.lock().await;
                         let trusted = self.trust.trusted();
-                        let result = room
-                            .forget_keys_except(profile.store(), &trusted)
-                            .map_err(|error| error.to_string())
-                            .and_then(|_| {
-                                room.history_query(
-                                    profile.store(),
-                                    query,
-                                    crate::node::ipc::rows_budget(),
-                                    (self.clock)(),
-                                )
-                            });
+                        let removed = room.forget_keys_except(profile.store(), &trusted);
+                        if removed.as_ref().is_ok_and(|count| *count > 0) {
+                            self.governance_work.wake_room(channel_id);
+                        }
+                        let result = removed.map_err(|error| error.to_string()).and_then(|_| {
+                            room.history_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                                (self.clock)(),
+                            )
+                        });
                         match result {
                             Ok(Reply::DisplayRevision(revision)) => {
                                 use sha2::{Digest, Sha256};
@@ -14489,9 +14490,13 @@ impl Node {
             let trusted = self.trust.trusted();
             {
                 let mut channel = shared.lock().await;
-                if let Err(error) = channel.forget_keys_except(profile.store(), &trusted) {
-                    channel.poison(&error);
-                    return Err(error);
+                match channel.forget_keys_except(profile.store(), &trusted) {
+                    Ok(count) if count > 0 => self.governance_work.wake_room(*channel_id),
+                    Ok(_) => {}
+                    Err(error) => {
+                        channel.poison(&error);
+                        return Err(error);
+                    }
                 }
             }
             let signer = profile.signer()?;
@@ -14756,12 +14761,20 @@ impl Node {
         // lock, when it opens (recorded above). What was already read stays read. A re-trust is
         // offered its key again, as any member whose key this node does not hold.
         let trusted = self.trust.trusted();
-        let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
-        for ch in shared {
-            let _ = ch
+        let shared: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(room, channel)| (*room, Arc::clone(channel)))
+            .collect();
+        for (room, ch) in shared {
+            if ch
                 .lock()
                 .await
-                .forget_keys_except(profile.store(), &trusted);
+                .forget_keys_except(profile.store(), &trusted)
+                .is_ok_and(|count| count > 0)
+            {
+                self.governance_work.wake_room(room);
+            }
         }
         // Before the rotation, not after: rotation talks to the network and may be slow,
         // and the removal must bite the moment it is decided (M17.11).
@@ -14880,16 +14893,20 @@ impl Node {
             .collect();
         let trusted: BTreeSet<Digest32> = self.trust.trusted().into_iter().collect();
         let now_ms = self.now_ms();
-        for shared in self.channels.values() {
+        for (room, shared) in &self.channels {
             // A room mid-session is skipped, not waited for; the next tick comes round.
             let Ok(mut channel) = shared.try_lock() else {
                 continue;
             };
             // Other members' generations this node has read to the end go too (R14 on the
             // receiving side), whatever this node still owes with its own.
-            pruned |= channel
+            let receiver_pruned = channel
                 .prune_superseded_receivers(&store)
                 .is_ok_and(|n| n > 0);
+            pruned |= receiver_pruned;
+            if receiver_pruned {
+                self.governance_work.wake_room(*room);
+            }
             // A refreshing or unreadable consent projection cannot prove that old keys are
             // no longer owed. Preserve them until a later bounded governance turn settles it.
             if channel.key_generations() <= 1
@@ -18179,6 +18196,12 @@ impl Node {
                 if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
                 }
+                if installed
+                    .as_ref()
+                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                {
+                    self.governance_work.wake_room(*channel_id);
+                }
                 installed
             };
             if let Ok(accepted) = installed {
@@ -19475,11 +19498,17 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                let installed = channel.accept_skdm(profile.store(), skdm, now_ms).ok();
-                if installed.as_ref().is_some_and(|accepted| accepted.changed) {
+                let installed = channel.accept_skdm(profile.store(), skdm, now_ms);
+                if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
                 }
-                installed
+                if installed
+                    .as_ref()
+                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                {
+                    self.governance_work.wake_room(channel_id);
+                }
+                installed.ok()
             }
             _ => None,
         };
@@ -21036,6 +21065,12 @@ impl Node {
         prepared: &mut RoomPreparation,
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
+        if let Some(profile) = self.profile.as_ref() {
+            let (more, _) = ch.advance_receiver_release_cleanup(profile.store())?;
+            // Existing preparation remains runnable after actual bounded progress. A ready
+            // room still publishes now; its ordinary maintenance inherits the durable debt.
+            prepared.progressed |= more;
+        }
         if ch.legacy_startup_cleanup_blocks_current() {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let Some(cleaned) = self.with_current_computer_authority(|| {
@@ -21129,6 +21164,12 @@ impl Node {
                                 let installed = ch.accept_skdm(profile.store(), &skdm, now);
                                 if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                                     self.governance_work.pending = true;
+                                }
+                                if installed
+                                    .as_ref()
+                                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                                {
+                                    self.governance_work.wake_room(ch.channel_id());
                                 }
                                 installed.map(|_| ())
                             }

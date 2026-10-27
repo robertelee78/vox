@@ -398,8 +398,10 @@ impl Node {
             Ok(true) => {
                 // Current trust narrowing is still immediate; all publication-dependent
                 // writes await explicit recovery. Never busy-loop on a parked cursor.
-                if let Err(error) = channel.forget_keys_except(&store, &self.trust.trusted()) {
-                    channel.poison(&error);
+                match channel.forget_keys_except(&store, &self.trust.trusted()) {
+                    Ok(count) if count > 0 => self.governance_work.wake_room(room),
+                    Ok(_) => {}
+                    Err(error) => channel.poison(&error),
                 }
                 drop(channel);
                 if governance_changed {

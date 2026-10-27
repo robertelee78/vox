@@ -352,6 +352,28 @@ impl ReceiverChain {
         self.epoch
     }
 
+    /// Scalar binding for an auxiliary original release; the temporary body zeroizes and
+    /// no chain-key bytes escape this receiver.
+    pub(crate) fn history_release_binding(&self) -> (u64, crate::hash::Digest32) {
+        let body = crate::group::skdm::SkdmBody {
+            channel_id: self.channel_id,
+            epoch: self.epoch,
+            author_id: self.author_id,
+            chain_id: self.chain_id,
+            iteration: self.history_iteration,
+            chain_key: self.history_key.clone(),
+            signing_pubkey: self.signing_pubkey.to_bytes(),
+            algo_ids: [
+                crate::suite::algo::COMPOSITE_ED25519_ML_DSA_65,
+                crate::suite::algo::AES_256_GCM,
+            ],
+        };
+        (
+            self.history_iteration,
+            crate::hash::sha256(&body.canonical_body()),
+        )
+    }
+
     /// An original root-signed release may be retained only for this exact installed floor.
     /// This exposes no key bytes and never substitutes peer state for a root signature.
     pub(crate) fn matches_history_release(&self, release: &Skdm) -> bool {
