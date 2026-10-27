@@ -10696,6 +10696,7 @@ impl Node {
                     .collect();
                 for room in support_rooms {
                     self.advance_support_discovery(room);
+                    self.sched_rooms.insert(room);
                 }
                 #[cfg(feature = "test-knobs")]
                 let cancel_admissions =
@@ -14620,6 +14621,7 @@ impl Node {
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        self.history_demand.note_route_trust_change();
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
         if let Some(decision) = decision {
@@ -14742,6 +14744,7 @@ impl Node {
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
         self.consent_keys = pending;
+        self.history_demand.note_route_trust_change();
         self.trust = next;
         self.deliveries
             .retain(|(_, peer, _), _| peer != fingerprint);
@@ -16092,6 +16095,7 @@ impl Node {
             return false;
         }
         self.discover().await;
+        self.reroute_unstarted_history();
         let all = std::mem::take(&mut self.sched_all);
         let rooms = std::mem::take(&mut self.sched_rooms);
         let now = std::time::Instant::now();
@@ -25755,6 +25759,7 @@ impl Node {
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        self.history_demand.note_route_trust_change();
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
         self.owe_private_support_in_open_rooms().await;

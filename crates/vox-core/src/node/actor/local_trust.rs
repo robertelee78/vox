@@ -56,6 +56,7 @@ impl Node {
         let mut next = self.trust.clone();
         next.import_local_removals(removed);
         next.save(profile.store(), signer)?;
+        self.history_demand.note_route_trust_change();
         self.trust = next;
         self.decisions.hold_for_local_trust_import(false);
         Ok(())

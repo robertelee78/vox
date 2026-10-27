@@ -1402,6 +1402,7 @@ impl Node {
         // expiry repair can make the old marker short-circuit the required grant restoration.
         self.computer_revision
             .store(u64::MAX, std::sync::atomic::Ordering::Release);
+        self.history_demand.note_route_trust_change();
         self.trust = next;
         self.consent_keys = pending;
         let receipt = if expired {

@@ -833,6 +833,24 @@ impl Controller {
             admission.task.abort();
         }
     }
+    pub(super) fn cancel_unstarted_archive_admission(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        instance: [u8; 16],
+        request: stream::RequestId,
+        generation: Digest32,
+    ) {
+        if self.archive_admission.as_ref().is_some_and(|admission| {
+            admission.room == room
+                && admission.peer == peer
+                && admission.instance == instance
+                && admission.request == request
+                && admission.generation == generation
+        }) {
+            self.cancel_archive_admission();
+        }
+    }
     pub(super) fn release_archive_admission(&mut self, token: u64, room: Digest32, peer: Digest32) {
         if self.archive_admission.as_ref().is_some_and(|admission| {
             admission.token == token && admission.room == room && admission.peer == peer
@@ -3526,7 +3544,12 @@ impl Node {
                 } else if self.bounded_sync.ready[1].is_none()
                     && self.bounded_sync.running[1].is_none()
                 {
-                    if let Some(dispatch) = self.history_demand.take_ready(room, peer) {
+                    if let Some(dispatch) = self
+                        .trust
+                        .is_trusted(&peer)
+                        .then(|| self.history_demand.take_ready(room, peer))
+                        .flatten()
+                    {
                         Flow::archive(
                             room,
                             peer,
