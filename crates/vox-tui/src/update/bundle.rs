@@ -946,6 +946,9 @@ fn set_aside(bundle: &Path) -> Result<bool, AppError> {
     let kept = bundle.join(KEPT_INFO_PLIST);
     if !plist.is_file() {
         return if kept.is_file() {
+            // An earlier attempt may have renamed the plist but failed before its directory
+            // fence. Complete that fence before relying on it to make the bundle unlaunchable.
+            sync_dir(&bundle.join("Contents"))?;
             launch_services(false, bundle)
                 .map_err(usage)
                 .map(|()| false)
