@@ -1514,6 +1514,16 @@ impl Flow {
                 self.waiting = true;
                 return Ok(());
             };
+            // A public archive dispatch was authorized for this exact saved request at
+            // preparation. Do not silently replace that binding when the room or trust
+            // incarnation changed before its first worker turn. The actor retains the same
+            // request for reauthorization through the existing authorization-changed path.
+            if self.archive
+                && !self.automatic_own_recovery
+                && value.value != (self.instance, self.generation)
+            {
+                return Err(Error::Profile("history authorization changed"));
+            }
             (self.instance, self.generation) = value.value;
             self.initialized = true;
             return Ok(());
