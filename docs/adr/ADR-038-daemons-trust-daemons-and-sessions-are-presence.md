@@ -546,8 +546,9 @@ lessons. It changes neither this record's decision status nor any requirement or
   **Causal handoffs and access.** A response already consumed from a peer MUST retain its exact
   local continuation until its result is committed or the request is invalidated; local
   publication being busy MUST NOT require fetching that same response again. Work that is only
-  waiting MUST NOT occupy a physical worker or byte reservation; a worker that is still running
-  retains its resources until it exits. Resumption MUST recheck current room and authority, and
+  waiting MUST NOT occupy a physical worker or byte reservation after releasing its worker and
+  buffers; retained bytes remain charged, and a worker still running retains its resources until
+  it exits. Resumption MUST recheck current room and authority, and
   peer work MUST also recheck the connection. An actual change MUST retain the wake needed to make
   progress; unchanged information MUST NOT recreate a completed need or spin empty rounds.
   A signed Head or inventory hint is not a receipt: only authenticated, role-complete evidence
@@ -555,8 +556,8 @@ lessons. It changes neither this record's decision status nor any requirement or
   needs rather than credit uncommitted work as transferred history.
 
   ADR-036 H-2 and H-6 distinguish the public authenticated position of an addressed key package
-  from its recipient's private key application. Public position and control progress MUST NOT
-  depend on obtaining that private body. For the signed recipient, H-6's body-before-effect
+  from its recipient's private key application. Public authenticated position and control-source
+  metadata progress MUST NOT depend on obtaining that private body. For the signed recipient, H-6's body-before-effect
   requirement applies to the recipient's key effect and role-complete receipt: neither completes
   without the exact authorized body and its effect. A nonrecipient MUST NOT obtain the body or
   gain private access from the public header. This clarifies the scope of H-6's reference to
@@ -564,11 +565,13 @@ lessons. It changes neither this record's decision status nor any requirement or
   checks or authorize missing evidence.
 
   An explicit requested-history Resume MUST recheck current authority without widening the
-  saved request's node, room, audience, interval, content or progress. A renewed activation MUST
+  saved request's node, room, audience, interval or content, and MUST preserve its progress. A renewed activation MUST
   fence older workers so they cannot publish through it. A reachable authorized source MUST be
   able to serve the same request without being starved by an obsolete unavailable source; its
   retained authenticated current-format history MUST support the required proofs or bounded
-  reconstruction from already held metadata, without fetching unrelated private bodies. These
+  reconstruction from already held metadata, without fetching unrequested unrelated public or
+  private bodies. An unavailable source is distinct from invalid evidence, storage failure or
+  authorization failure; these MUST NOT be disguised as ordinary unavailability. These
   are user and security outcomes under ADR-036 H-2, H-4 and H-8, not a prescribed queue, donor
   algorithm or on-disk index. Active private-transfer fairness remains separate work under #1047.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
