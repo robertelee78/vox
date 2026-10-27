@@ -337,29 +337,43 @@ in_use() { # <bundle>: whether any process runs one of its executables
 retire() { # <bundle>
   mv "$1" "$APPS/.Vox.app.retired.$(date +%s).$$" || fail "could not move $1 aside"
 }
-for r in "$APPS"/.Vox.app.retired.*; do
-  [ -e "$r" ] || continue
-  set_aside "$r"
-  in_use "$r" || gone "$r"
-done
 # The journal belongs to the shipped updater and authenticates exact bundle objects. The shell
 # installer cannot safely reproduce that recovery protocol, so it preserves every byte and asks
 # that updater to finish before a reinstall proceeds.
 J="$APPS/.Vox.app.publishing"
 [ ! -e "$J" ] \
   || fail "$J records an unfinished app transition; run the installed 'vox update' to recover it before reinstalling"
-gone "$APPS/.Vox.app.partial"
-gone "$APPS/.Vox.app.previous.partial"
-if [ -e "$APPS/.Vox.install.rollback.partial" ] || [ -L "$APPS/.Vox.install.rollback.partial" ]; then
+OLD_STAGE="$APPS/.Vox.install.rollback.partial"
+OLD_PREVIOUS="$APPS/.Vox.app.previous"
+if [ -e "$OLD_STAGE" ] || [ -L "$OLD_STAGE" ]; then
   [ ! -e "$APPS/Vox.app" ] && [ ! -L "$APPS/Vox.app" ] \
-    || fail "$APPS/.Vox.install.rollback.partial exists beside Vox.app; neither was changed"
-  restore "$APPS/.Vox.install.rollback.partial"
-  mv "$APPS/.Vox.install.rollback.partial" "$APPS/Vox.app" \
+    && [ ! -e "$OLD_PREVIOUS" ] && [ ! -L "$OLD_PREVIOUS" ] \
+    || fail "ambiguous interrupted installation; no bundle was changed"
+  OLD="$OLD_STAGE"
+elif [ ! -e "$APPS/Vox.app" ] && [ ! -L "$APPS/Vox.app" ] \
+  && { [ -e "$OLD_PREVIOUS" ] || [ -L "$OLD_PREVIOUS" ]; }; then
+  OLD="$OLD_PREVIOUS"
+else
+  OLD=""
+fi
+if [ -n "$OLD" ]; then
+  [ -f "$APPS/$MARKER" ] && [ ! -L "$APPS/$MARKER" ] \
+    && [ -d "$OLD" ] && [ ! -L "$OLD" ] \
+    || fail "interrupted install has an invalid marker or retained bundle; no bundle was changed"
+  restore "$OLD"
+  mv "$OLD" "$APPS/Vox.app" \
     || fail "could not restore the Vox.app from an interrupted install"
   "$LSREGISTER" -f "$APPS/Vox.app" >/dev/null 2>&1 \
     || fail "restored Vox.app after an interrupted install, but LaunchServices could not register it"
   printf 'vox install: restored the Vox.app left by an interrupted install before continuing\n' >&2
 fi
+for r in "$APPS"/.Vox.app.retired.*; do
+  [ -e "$r" ] || continue
+  set_aside "$r"
+  in_use "$r" || gone "$r"
+done
+gone "$APPS/.Vox.app.partial"
+gone "$APPS/.Vox.app.previous.partial"
 /usr/bin/ditto "$NEW" "$APPS/.Vox.app.partial" || fail "could not copy Vox.app into $APPS"
 printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
   "$CHANNEL" >"$APPS/.marker.partial" || fail "could not write $APPS/$MARKER"

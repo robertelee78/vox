@@ -942,12 +942,13 @@ const INFO_PLIST: &str = "Contents/Info.plist";
 /// `recover`, the next publish), until it succeeds.
 fn set_aside(bundle: &Path) -> Result<bool, AppError> {
     require_bundle(bundle, "the bundle being set aside")?;
-    let release = launch_services(false, bundle).map_err(usage);
     let plist = bundle.join(INFO_PLIST);
     let kept = bundle.join(KEPT_INFO_PLIST);
     if !plist.is_file() {
         return if kept.is_file() {
-            release.map(|()| false)
+            launch_services(false, bundle)
+                .map_err(usage)
+                .map(|()| false)
         } else {
             Err(usage(format!(
                 "{} has neither a live nor kept Info.plist; it was not removed",
@@ -968,7 +969,7 @@ fn set_aside(bundle: &Path) -> Result<bool, AppError> {
         ))
     })?;
     sync_dir(&bundle.join("Contents"))?;
-    release.map(|()| true)
+    launch_services(false, bundle).map_err(usage).map(|()| true)
 }
 
 /// Make a set-aside bundle an application again, for the swap that brings it back.
