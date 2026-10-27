@@ -1239,7 +1239,10 @@ impl Flow {
                     match purpose {
                         Purpose::Live => self.live = None,
                         Purpose::Control => self.control = None,
-                        Purpose::History => unreachable!(),
+                        // Automatic own recovery owns a real History staging slot too.
+                        // Drop it only after exact-request retirement finished; the next
+                        // slice can then clean this Flow's source/verifier owners.
+                        Purpose::History => self.history = None,
                     }
                 }
                 return Ok(RetirementStep::Progress);
