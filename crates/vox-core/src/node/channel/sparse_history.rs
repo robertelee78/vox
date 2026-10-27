@@ -1383,7 +1383,16 @@ impl ChannelState {
                 kind,
                 SignedEntryKind::Governance | SignedEntryKind::StepPolicy
             ) {
-                batch.ruled();
+                // Current consent inputs were classified and, when they advanced, made durable
+                // in their source publication. Their later effect is derived bookkeeping; in
+                // particular a superseded older grant must not force a second full flush.
+                // Other governance can change authority in this turn and stays conservative.
+                if !matches!(
+                    GovEntry::body_bound_to(&entry),
+                    Ok(GovBody::ConsentGrant(_) | GovBody::ConsentRevocation(_))
+                ) {
+                    batch.ruled();
+                }
                 self.observe_governance_into(store, &mut batch, &entry, log)?;
             }
             if kind == SignedEntryKind::KeyPackage && key_package_for(&entry, &self.me()) {
