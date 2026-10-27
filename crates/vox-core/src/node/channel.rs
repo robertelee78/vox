@@ -1118,6 +1118,23 @@ impl ReceivedRetries {
             .retain(|known| !known.same_owner(owner));
     }
 
+    /// Settle this exact flow even if another retry is concurrently draining the registry.
+    fn retry_owner(&self, store: &Store, owner: &ReceivedFlow) -> Result<()> {
+        let result = owner.debt(store).and_then(|debt| {
+            debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
+        });
+        match result {
+            Ok(()) => {
+                self.remove(owner);
+                Ok(())
+            }
+            Err(error) => {
+                self.retain(owner.clone());
+                Err(error)
+            }
+        }
+    }
+
     fn retry(&self, store: &Store) -> Result<()> {
         let owners = std::mem::take(
             &mut *self
@@ -7085,9 +7102,8 @@ impl ChannelState {
         });
         if settled.is_err() {
             self.received_retries.retain(received.clone());
-            // One immediate retry handles a transient terminal flush refusal. If it also fails,
-            // `ReceivedRetries::retry` puts the exact owner back for the next session.
-            settled = self.received_retries.retry(store);
+            // Retry this exact owner: another retry may be draining the shared registry.
+            settled = self.received_retries.retry_owner(store, &received);
         } else {
             self.received_retries.remove(&received);
         }
@@ -7773,12 +7789,11 @@ impl ChannelState {
         };
         if let Some(debt) = debt {
             let observed = debt.clone();
-            if let Err(error) = store.flush_received_through(debt) {
+            if store.flush_received_through(debt).is_err() {
                 room.received_retries.retain(room.received.clone());
-                room.remember_fatal(error);
-                // Retry through the retained registry, not the still-in-scope local handle. The
-                // isolated mutant removes that retention and therefore cannot be rescued here.
-                let _ = room.received_retries.retry(store);
+                if let Err(error) = room.received_retries.retry_owner(store, &room.received) {
+                    room.remember_fatal(error);
+                }
                 if let Err(error) =
                     crate::node::store::mark_received_retry_observed(&observed, channel_id, peer)
                 {
