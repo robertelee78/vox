@@ -66,14 +66,6 @@ struct SessionComposer: View {
     let session: FfiSession
     /// Whether the composer has the keyboard: ⇧↩ adds a line only then (P19).
     @FocusState private var composing: Bool
-    @State private var said = ""
-    @State private var interruptSaid = ""
-    @State private var stopSaid = ""
-    /// A send (or a file) waiting for its answer: only sending and the paperclip wait on it; Interrupt
-    /// and Stop stay live (D13).
-    @State private var sending = false
-    @State private var interrupting = false
-    @State private var stopping = false
     /// Asked before Stop (⌃C): it ends the session.
     @State private var confirmStop = false
 
@@ -163,6 +155,36 @@ struct SessionComposer: View {
     /// The Session's destination, which its draft is kept under.
     private var key: SessionDraftKey {
         SessionDraftKey(room: room, node: session.nodeFingerprint, session: session.sessionId)
+    }
+
+    // The operation and its result outlive this particular view instance.
+    private var delivery: SessionDeliveryState {
+        get { model.sessionDeliveries[key] ?? SessionDeliveryState() }
+        nonmutating set { model.sessionDeliveries[key] = newValue }
+    }
+    private var said: String {
+        get { delivery.said }
+        nonmutating set { var value = delivery; value.said = newValue; delivery = value }
+    }
+    private var interruptSaid: String {
+        get { delivery.interruptSaid }
+        nonmutating set { var value = delivery; value.interruptSaid = newValue; delivery = value }
+    }
+    private var stopSaid: String {
+        get { delivery.stopSaid }
+        nonmutating set { var value = delivery; value.stopSaid = newValue; delivery = value }
+    }
+    private var sending: Bool {
+        get { delivery.sending }
+        nonmutating set { var value = delivery; value.sending = newValue; delivery = value }
+    }
+    private var interrupting: Bool {
+        get { delivery.interrupting }
+        nonmutating set { var value = delivery; value.interrupting = newValue; delivery = value }
+    }
+    private var stopping: Bool {
+        get { delivery.stopping }
+        nonmutating set { var value = delivery; value.stopping = newValue; delivery = value }
     }
 
     // Write through immediately: a removed view must not lose an unsent draft.

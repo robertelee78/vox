@@ -427,6 +427,7 @@ final class NodeModel: ObservableObject {
     var roomDrafts: [String: RoomDraft] = [:]
     /// A Session's draft, by its destination (`room/node/session`).
     @Published var sessionDrafts: [SessionDraftKey: String] = [:]
+    @Published var sessionDeliveries: [SessionDraftKey: SessionDeliveryState] = [:]
 
     /// The request selected in the Session on screen, by its reference: what Approve (⌥⌘Y) and
     /// Reject (⌥⌘N) act on, and where ⌘J and a notification land (P1).
@@ -3871,19 +3872,25 @@ final class NodeModel: ObservableObject {
         peers = Int(view.peers)
         peerStateKnown = true
         keyring = view.keyring
-        ended = nil
-        observationNeedsRestart = false
-        // These install owned tasks synchronously; no old request can start them after
-        // ownership has changed at an awaited boundary.
+        observationNeedsRestart = true
+        ended = "Refreshing node \(node) after unlock."
+        // Keep the follow owner alive even if this refresh fails; it will retry the same
+        // room recovery, without treating a roster alone as an authoritative room page.
+        defer { if currentOwner() { follow() } }
+        guard await refresh(restartObservation: false), currentOwner(),
+              nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
         if case let .room(room) = selection {
             roomReadGeneration = UUID()
             roomNeedsPage = true
             watching?.cancel()
             stepRetentionRead = UUID()
             stepRetentionLoading = false
-            watchReads(room)
+            guard await show(.room(room), whileRecovering: true), currentOwner(),
+                  nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
+        } else {
+            ended = nil
         }
-        follow()
+        observationNeedsRestart = false
         return true
     }
 
