@@ -48,7 +48,7 @@
 //! **Which side a red is on.** The daemon's mapping missing, a renewal refused or unanswered, or a
 //! mapping left at stop, or a stop that does not say its deletion was answered, is `PRODUCT:`. The
 //! router not speaking PCP, answering the probe with neither SUCCESS nor NOT_AUTHORIZED, or
-//! granting a lifetime too long to see a renewal within the watchdog's budget is `CANNOT MEASURE`.
+//! granting a lifetime beyond this proof's source-owned observation window is `CANNOT MEASURE`.
 
 #![cfg(unix)]
 
@@ -76,7 +76,7 @@ const ASK_LIFETIME: u32 = 60;
 const PROBE_LIFETIME: u32 = 60;
 /// How long the first discovery may take (PCP, NAT-PMP and UPnP's search, with room).
 const DISCOVERY: Duration = Duration::from_secs(45);
-/// The longest this proof waits for a renewal: inside the watchdog's 600 s.
+/// The longest this proof waits for a renewal before its own precondition is not measurable.
 const RENEWAL_CAP: Duration = Duration::from_secs(420);
 /// What a router that does not enforce RFC 6887 §11.3 cannot show, and where it is shown.
 const NOT_HERE: &str = "the nonce kept on renewal, and the deletion at stop seen at the router \
@@ -418,7 +418,7 @@ fn a_real_router_maps_renews_and_deletes() {
     assert!(
         window <= RENEWAL_CAP,
         "CANNOT MEASURE (precondition unmet): the router granted {lifetime}s for a {ASK_LIFETIME}s \
-         request; the first renewal would come after {}s, past what the watchdog allows.",
+         request; the first renewal would come after {}s, outside this proof's observation window.",
         lifetime / 2
     );
     let renewed = loop {

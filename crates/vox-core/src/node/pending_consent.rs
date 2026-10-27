@@ -162,12 +162,23 @@ impl PendingConsents {
 
     /// Seal and write. Requires an unlocked identity.
     pub fn save(&self, store: &Store, signer: &dyn RootSigner) -> Result<()> {
+        let mut batch = store.batch()?;
+        self.queue_save(&mut batch, signer)?;
+        batch.commit()
+    }
+
+    /// Stage pending keys atomically with the keyring which owns their trust decision.
+    pub(crate) fn queue_save(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        signer: &dyn RootSigner,
+    ) -> Result<()> {
         let sek = pending_consent_sek(signer)?;
         let sealed = seal_segment(&sek, SegmentKind::Trust, SEGMENT_ID, &self.to_bytes())?;
         let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
         blob.extend_from_slice(&sealed.nonce);
         blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(META_KEY, &blob)
+        batch.put_meta(META_KEY, &blob)
     }
 
     /// Read and open, or an empty map if nothing was ever pending. Requires an unlocked identity.

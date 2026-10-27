@@ -40,10 +40,15 @@ enum Operation {
         seq: u64,
     },
     Wire(Query),
+    /// A refused local allocation may follow a durable body append/checkpoint. Rebind from
+    /// the exact saved staging cursor before another network request, rather than replaying
+    /// an old offset or forgetting a complete body's remaining semantic application.
+    ResumeWire(Query),
     LocalProof(Query),
     Local(LocalStep),
     Reclaim(Purpose),
     ReclaimUnavailable,
+    FinishArchive,
     Governance,
 }
 /// How long one turn keeps running local slices before it yields to the actor.
@@ -56,11 +61,50 @@ const GOVERNANCE_STEPS_PER_TURN: u8 = 4;
 /// The body bytes one explicit history quantum fetches at most; past it the request pauses and
 /// `vox room read --history resume` asks for the rest.
 const ARCHIVE_QUANTUM_BYTES: u64 = 1024 * 1024;
+
+pub(crate) enum RetirementStep {
+    Done,
+    Progress,
+    Wait(RetirementWait),
+}
+pub(crate) enum RetirementWait {
+    Bytes(crate::node::history_budget::BytePressure),
+    Publication {
+        wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+    },
+}
+impl RetirementWait {
+    pub(crate) async fn released(self) {
+        match self {
+            Self::Bytes(pressure) => pressure.released().await,
+            Self::Publication { wake } => wake.await,
+        }
+    }
+}
 #[derive(Clone)]
 struct Task {
     request: RequestId,
     purpose: Purpose,
     operation: Operation,
+}
+
+/// One inventory exchange prepended to an already-retained foreground flow. It is deliberately
+/// outside `tasks`/`replay`: announcing an own append must not need a thirteenth retained Flow or
+/// a spare dependency-stack position, and it must not replace the hint/required owner already in
+/// this Flow.
+struct Announcement {
+    request: RequestId,
+    prior_request: RequestId,
+    task: Option<Task>,
+    through: u64,
+    brought: bool,
+    complete: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AnnouncementReceipt {
+    pub(crate) through: u64,
+    pub(crate) brought: bool,
 }
 
 /// Scalar ownership of the existing fixed body slots. A progressing transfer keeps its slot
@@ -103,6 +147,26 @@ fn body_slot(purpose: Purpose) -> Option<usize> {
     }
 }
 
+/// Only persisted cursor/body progress counts; activating a request or serial changes do not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnRecoveryCheckpoint {
+    remaining: usize,
+    next: u64,
+    body: Option<(u64, u64)>,
+}
+impl OwnRecoveryCheckpoint {
+    pub(crate) fn of(state: &demand::State) -> Self {
+        Self {
+            remaining: state.remaining,
+            next: state
+                .cursor
+                .as_ref()
+                .map_or(state.bounds.hi, |cursor| cursor.next_seq),
+            body: state.body.as_ref().map(|body| (body.seq, body.offset)),
+        }
+    }
+}
+
 pub(crate) struct Flow {
     pub(crate) room: Digest32,
     pub(crate) peer: Digest32,
@@ -112,10 +176,29 @@ pub(crate) struct Flow {
     pub(crate) generation: Digest32,
     pub(crate) shared: Arc<Mutex<ChannelState>>,
     pub(crate) archive: bool,
+    pub(crate) automatic_own_recovery: bool,
+    pub(crate) own_recovery_cleanup: bool,
+    pub(crate) own_recovery_trigger: Option<Digest32>,
+    pub(crate) own_recovery_checkpoint: Option<OwnRecoveryCheckpoint>,
+    pub(crate) own_recovery_progress: bool,
     pub(crate) inventory: bool,
+    /// This node has a key delivery to the peer waiting on its prekey bundle (ADR-038 FX-35):
+    /// the round reads the peer's board whatever kind of flow this is, until the bundle is
+    /// held. Set by the actor at each start from the fact `vox status` reports as `key_waits`.
+    pub(crate) wants_board: bool,
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
+    /// Exact required control root removed from the actor queue when this foreground flow was
+    /// built. An authorization retirement must return this owner just as it returns a hint.
+    pub(crate) required_root: Option<(Digest32, u64)>,
     pub(crate) hint: Option<super::HeadHint>,
+    /// Canonical local recovery proof root, not a consumed advisory inbox item.
+    pub(crate) local_own_verification: bool,
+    pub(crate) local_own_discovery: bool,
+    /// A newly constructed inventory took precedence over an already eligible local probe.
+    /// Its real completion owns exactly one subsequent port request.
+    pub(crate) local_own_after_inventory: bool,
+    discovery_reply: Option<(super::HeadHint, u64)>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
     pub(crate) hint_peer: Digest32,
@@ -126,10 +209,37 @@ pub(crate) struct Flow {
     /// (ADR-028 R-6). The actor records it, and the settlement tick stops offering the own
     /// head to a peer that holds it (ADR-038 FX-15).
     pub(crate) mine_held: Option<u64>,
+    /// Why this flow's rounds run (ADR-038 FX-15, #996), set when the actor selects it and
+    /// kept across its slices; counted on the lane when a round completes.
+    pub(crate) reason: crate::node::status::RoundReason,
     pub(crate) waiting: bool,
+    pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
     pub(crate) published: bool,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
+    /// An exchange of this flow fetched something this node did not hold (an object it saved,
+    /// a body chunk, a hint it did not have): a completed flow that brought nothing is an
+    /// `empty` round in `vox status --json` (ADR-038 FX-29).
+    pub(crate) brought: bool,
+    /// Set at the durable/user-visible work edge and drained by the actor before it classifies
+    /// the worker result. This survives any later cancellation, error or supersession.
+    pub(crate) work_committed: Arc<std::sync::atomic::AtomicBool>,
+    /// Changed, signature-verified own observation committed by the physical receiver.
+    pub(crate) own_head_observed: Arc<std::sync::atomic::AtomicBool>,
+    /// Exact connection which returned unavailable for this startup metadata probe.
+    pub(crate) discovery_unavailable: Option<u64>,
+    pub(crate) discovery_incarnations: Option<(u64, u64)>,
+    pub(crate) receipt_lower: Option<(u64, (u64, u64))>,
+    /// Exact unavailable advertised heads declined during this retained flow. The actor reports
+    /// the outcome through the lane in `vox status --json`.
+    pub(crate) declined: u64,
+    /// Newly eligible scalar hints and durable refusal relationships invalidated this turn.
+    /// The actor publishes them even if the enclosing attempt is later retired or stale.
+    pub(crate) offered: u64,
+    pub(crate) rearmed: u64,
+    /// Exact refusal transaction outcomes are published even when the enclosing flow is retired.
+    pub(crate) refusal_stale: Option<crate::node::status::HistoryRefusalStatus>,
+    pub(crate) refusal_saved: Option<crate::node::status::HistoryRefusalStatus>,
     pub(crate) admitted_authors: usize,
     pub(crate) external: Option<(Digest32, u64)>,
     pub(crate) archive_status: Option<crate::node::api::HistoryDemandStatus>,
@@ -138,6 +248,10 @@ pub(crate) struct Flow {
     pub(crate) reroute: Option<Digest32>,
     /// Original peer while the next exact wire dependency runs against its author.
     pub(crate) route_origin: Option<Digest32>,
+    /// Fetch progress accumulated on the advertising source's lane before a dependency is routed
+    /// to its author. The routed lane gets a fresh directional account; returning restores only
+    /// the origin's progress, so one fetched object cannot make both lanes non-empty.
+    pub(crate) route_origin_brought: bool,
     /// The routed wire response completed and the retained continuation must return to origin.
     pub(crate) route_complete: bool,
     /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
@@ -146,13 +260,28 @@ pub(crate) struct Flow {
     /// Durability debt created by this flow alone. It follows every receiver handoff and is
     /// detached whenever the flow returns to the actor.
     received: ReceivedFlow,
+    /// A refusal reached the peer successfully but could not be recorded in the local store.
+    /// The actor re-arms the exact owner without charging this failure to the peer.
+    pub(crate) local_retry: Option<String>,
     tasks: Vec<Task>,
     // One exact suspended foreground root. Intermediate pre-body continuations
     // are re-derived from durable receipts after the current dependency finishes.
     replay: Option<Task>,
+    announcement: Option<Announcement>,
+    /// The returned error came from the prefix itself, not an ordinary task that ran while a
+    /// prefix was pending behind a publication owner.
+    announcement_error: bool,
+    /// True only while the worker owns the scalar prefix task. A supervisor-observed panic can
+    /// therefore reconstruct that task without guessing from a merely pending announcement.
+    announcement_active: bool,
+    /// A post arriving while the announcement exchange is in flight must not make announcements
+    /// starve the retained root. One actual ordinary worker quantum runs before another prefix.
+    ordinary_turn_due: bool,
+    /// This turn returned one of the two retryable coded peer refusals after restoring its exact
+    /// ordinary continuation. The announcement scalar is deliberately separate provenance.
+    peer_busy_retry: bool,
     slots: Arc<BodySlots>,
     owners: [Option<RequestId>; 2],
-    no_progress: u8,
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
@@ -160,11 +289,22 @@ pub(crate) struct Flow {
     /// R2): a local wait, not a body slot held against a busy peer, so it never retires the slot,
     /// and the actor's fold hook is asked to drive the fold.
     pub(crate) governance_wait: bool,
+    /// The last local slice found an unfinished sparse publication. Before retrying that newer
+    /// slice, select the exact older request in this Flow that owns the publication.
+    publication_wait: bool,
+    /// Exact durable publication owner when it belongs to another retained Flow. The actor uses
+    /// this causal edge to resume that owner, rather than retrying this waiter on an unrelated
+    /// port cadence.
+    publication_owner_wait: Option<RequestId>,
     governance_cycles: u8,
-    last_head: Option<(super::HeadHint, u8)>,
+    last_head: Option<super::HeadHint>,
+    /// Immutable identity of this cleanup obligation. `request` changes as continuations are
+    /// derived; retirement ownership must not.
+    retirement_request: RequestId,
     request: RequestId,
     cleanup_store: Arc<Store>,
-    cleanup_job: Job,
+    cleanup_budget: Arc<crate::node::history_budget::Budget>,
+    actor_incarnation: Option<u64>,
     cleanup_after: Option<[u8; 64]>,
     live_context: Option<Arc<Context>>,
     control_context: Arc<Context>,
@@ -184,7 +324,9 @@ pub(crate) struct Flow {
     // authenticated successor schedules its own closure without mutating the in-flight work.
     control_head: Option<Digest32>,
     // Declared last: actual state/capabilities die before the shared admission is returned.
-    _state_charge: crate::node::history_budget::FlowStateCharge,
+    // `None` while the flow is parked (ADR-038 FX-35): a flow that is not running holds no
+    // daemon-wide flow state; [`Flow::resume`] reserves it again before a round.
+    state_charge: Option<crate::node::history_budget::FlowStateCharge>,
 }
 // The retained-flow permit includes the exact Vec allocation, the scalar replay root,
 // and conservative room for the one-object receiver handoff and small staging handles.
@@ -193,7 +335,55 @@ const _: () = assert!(
     std::mem::size_of::<Flow>() + MAX_TASKS * std::mem::size_of::<Task>() + 4096
         <= crate::node::history_budget::FLOW_STATE_BYTES
 );
+/// What [`Flow::resume`] came to (ADR-038 FX-35).
+pub(crate) enum Resumed {
+    /// The round holds its flow state.
+    Held,
+    /// Every pool position is occupied by a running charge or earlier release-edge promise. The
+    /// exact flow remains parked until a charge release wakes it.
+    PoolFull(crate::node::history_budget::FlowReleaseEdge),
+    /// Pool accounting already exceeds its limit; exact equality is reserved for `PoolFull`.
+    PoolOvercommitted(crate::node::history_budget::FlowReleaseEdge),
+    /// The current and retiring actor generations already occupy this fingerprint's two shared
+    /// running slots. Exact charge release, not a tick, wakes the retained round.
+    NodeBusy(crate::node::history_budget::FlowReleaseEdge),
+    /// The admitted worker's actor generation no longer owns pool capacity.
+    OwnerMissing,
+}
+
 impl Flow {
+    pub(crate) fn local_own_root(&self) -> bool {
+        self.local_own_verification || self.local_own_discovery
+    }
+    pub(crate) fn completed_support_discovery(&self) -> Option<u64> {
+        self.discovery_reply
+            .filter(|(head, _)| self.local_own_discovery && Some(*head) == self.authenticated_head)
+            .map(|(_, connection)| connection)
+    }
+    pub(crate) fn root_name(&self) -> &'static str {
+        if self.announcement_pending() && self.announcement_can_run() {
+            "inventory"
+        } else if self.archive {
+            "archive"
+        } else if self.hint.is_some() {
+            "hint"
+        } else if self.departure_probe {
+            "departure"
+        } else if self.inventory {
+            "inventory"
+        } else {
+            "required"
+        }
+    }
+
+    pub(crate) fn retirement_request(&self) -> RequestId {
+        self.retirement_request
+    }
+
+    pub(crate) fn actor_incarnation(&self) -> Option<u64> {
+        self.actor_incarnation
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn foreground(
         room: Digest32,
@@ -204,13 +394,24 @@ impl Flow {
         live: Arc<Context>,
         control: Arc<Context>,
         hint: Option<super::HeadHint>,
+        local_own_verification: bool,
+        local_own_discovery: bool,
         departure_probe: bool,
         required: Option<(Digest32, u64)>,
-        state_charge: crate::node::history_budget::FlowStateCharge,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
-        cleanup_job: Job,
+        cleanup_budget: Arc<crate::node::history_budget::Budget>,
+        actor_incarnation: Option<u64>,
     ) -> Result<Self> {
+        if (local_own_verification || local_own_discovery)
+            && (hint.is_none_or(|hint| hint.author != node)
+                || departure_probe
+                || required.is_some())
+        {
+            return Err(Error::Profile(
+                "own verification root is not an exact local head",
+            ));
+        }
         let request = request_id()?;
         let mut flow = Self {
             room,
@@ -221,38 +422,72 @@ impl Flow {
             generation: [0; 32],
             shared,
             archive: false,
+            automatic_own_recovery: false,
+            own_recovery_cleanup: false,
+            own_recovery_trigger: None,
+            own_recovery_checkpoint: None,
+            own_recovery_progress: false,
             inventory: hint.is_none() && required.is_none(),
+            wants_board: false,
             departure_probe,
             archive_request: None,
-            _state_charge: state_charge,
+            required_root: required,
+            state_charge: None,
             hint,
+            local_own_verification,
+            local_own_discovery,
+            local_own_after_inventory: false,
+            discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            reason: crate::node::status::RoundReason::Request,
             waiting: false,
+            byte_pressure: None,
             published: false,
             rendered: false,
             governance: false,
+            brought: false,
+            work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            discovery_unavailable: None,
+            discovery_incarnations: None,
+            receipt_lower: None,
+            declined: 0,
+            offered: 0,
+            rearmed: 0,
+            refusal_stale: None,
+            refusal_saved: None,
             admitted_authors: 0,
             external: None,
             archive_status: None,
             reroute: None,
             route_origin: None,
+            route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
             received: ReceivedFlow::new(room),
+            local_retry: None,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
+            announcement: None,
+            announcement_error: false,
+            announcement_active: false,
+            ordinary_turn_due: false,
+            peer_busy_retry: false,
             slots,
             owners: [None, None],
-            no_progress: 0,
             body_progress: false,
             governance_wait: false,
+            publication_wait: false,
+            publication_owner_wait: None,
             governance_cycles: 0,
             last_head: None,
+            retirement_request: request,
             request,
             cleanup_store,
-            cleanup_job,
+            cleanup_budget,
+            actor_incarnation,
             cleanup_after: None,
             live_context: Some(live),
             control_context: control,
@@ -276,6 +511,7 @@ impl Flow {
                     head,
                     seq,
                     body: false,
+                    role_header: false,
                     phase: EntryPhase::Start,
                 }),
             })?;
@@ -292,8 +528,32 @@ impl Flow {
             }
             flow.push(Task {
                 request,
-                purpose: Purpose::Control,
-                operation: Operation::Wire(Query::Head(hint.author)),
+                purpose: if local_own_discovery {
+                    Purpose::Live
+                } else {
+                    Purpose::Control
+                },
+                // Ordinary inventory hints ask which head the peer currently serves. A
+                // recovery root already names a locally verified signed Head: asking Head
+                // here could retarget it to a lower reply forever. Start its existing exact
+                // header/inclusion/consistency promotion path instead; no body is requested.
+                operation: Operation::Wire(if local_own_verification {
+                    if hint.size == 0 {
+                        Query::Proof {
+                            head: hint.head,
+                            kind: super::ProofKind::Consistency,
+                            from: 0,
+                            to: 0,
+                        }
+                    } else {
+                        Query::Header {
+                            head: hint.head,
+                            seq: hint.size,
+                        }
+                    }
+                } else {
+                    Query::Head(hint.author)
+                }),
             })?;
         } else {
             flow.push(Task {
@@ -318,10 +578,10 @@ impl Flow {
         query: Query,
         request: RequestId,
         fence: Arc<Fence>,
-        state_charge: crate::node::history_budget::FlowStateCharge,
         slots: Arc<BodySlots>,
         cleanup_store: Arc<Store>,
-        cleanup_job: Job,
+        cleanup_budget: Arc<crate::node::history_budget::Budget>,
+        actor_incarnation: Option<u64>,
     ) -> Self {
         Self {
             room,
@@ -332,36 +592,65 @@ impl Flow {
             generation,
             shared,
             archive: true,
+            automatic_own_recovery: false,
+            own_recovery_cleanup: false,
+            own_recovery_trigger: None,
+            own_recovery_checkpoint: None,
+            own_recovery_progress: false,
             inventory: false,
+            wants_board: false,
             departure_probe: false,
             archive_request: Some(request),
-            _state_charge: state_charge,
+            required_root: None,
+            state_charge: None,
             hint: None,
+            local_own_verification: false,
+            local_own_discovery: false,
+            local_own_after_inventory: false,
+            discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
+            reason: crate::node::status::RoundReason::Page,
             waiting: false,
+            byte_pressure: None,
             published: false,
             rendered: false,
             governance: false,
+            brought: false,
+            work_committed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            own_head_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            discovery_unavailable: None,
+            discovery_incarnations: None,
+            receipt_lower: None,
+            declined: 0,
+            offered: 0,
+            rearmed: 0,
+            refusal_stale: None,
+            refusal_saved: None,
             admitted_authors: 0,
             external: None,
             archive_status: None,
             reroute: None,
             route_origin: None,
+            route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
             received: ReceivedFlow::new(room),
+            local_retry: None,
             slots,
             owners: [None, None],
-            no_progress: 0,
             body_progress: false,
             governance_wait: false,
+            publication_wait: false,
+            publication_owner_wait: None,
             governance_cycles: 0,
             last_head: None,
+            retirement_request: request,
             request,
             cleanup_store,
-            cleanup_job,
+            cleanup_budget,
+            actor_incarnation,
             cleanup_after: None,
             tasks: {
                 let mut tasks = Vec::with_capacity(MAX_TASKS);
@@ -373,6 +662,11 @@ impl Flow {
                 tasks
             },
             replay: None,
+            announcement: None,
+            announcement_error: false,
+            announcement_active: false,
+            ordinary_turn_due: false,
+            peer_busy_retry: false,
             live_context: None,
             control_context: control,
             live: None,
@@ -393,6 +687,40 @@ impl Flow {
         }
         self.tasks.push(task);
         Ok(())
+    }
+    /// Move this Flow's exact durable publication owner to the top of its bounded LIFO stack.
+    /// An owner outside the retained task/replay set belongs to another Flow and is untouched.
+    fn prioritize_publication_owner(&mut self, owner: RequestId) -> bool {
+        if let Some(at) = self.tasks.iter().rposition(|task| task.request == owner) {
+            let task = self.tasks.remove(at);
+            self.tasks.push(task);
+            return true;
+        }
+        if self
+            .replay
+            .as_ref()
+            .is_some_and(|task| task.request == owner)
+        {
+            if let Some(task) = self.replay.take() {
+                self.tasks.push(task);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn publication_owner_wait(&self) -> Option<RequestId> {
+        self.publication_owner_wait
+    }
+
+    pub(crate) fn owns_request(&self, request: RequestId) -> bool {
+        self.request == request
+            || self.retirement_request == request
+            || self.tasks.iter().any(|task| task.request == request)
+            || self
+                .replay
+                .as_ref()
+                .is_some_and(|task| task.request == request)
     }
     /// Retain exact control closure above any ordinary-body work already on the LIFO stack.
     /// Source proof runs before effect application; a successor gets a distinct pair of tasks.
@@ -422,11 +750,278 @@ impl Flow {
         self.control_head = Some(window.head);
         Ok(())
     }
+    /// Park (ADR-038 FX-35): a flow that is ready but not running, deferred, retiring or
+    /// awaiting cleanup holds none of the daemon's flow-state pool. Measured before this: four
+    /// hosted nodes' parked hinted flows held all sixteen, and the inventory round that would
+    /// have let them resume could never be started.
+    pub(crate) fn park(&mut self) {
+        self.state_charge = None;
+    }
+
+    /// The Control bytes one flow state costs, reserved on this flow's own control job before
+    /// the pool is asked (ADR-038 FX-35): `None` is the control budget's refusal, never the
+    /// pool's, and the caller names it so.
+    pub(crate) fn reserve_state_bytes(
+        &self,
+        job: &Job,
+    ) -> Option<crate::node::history_budget::BufferCharge> {
+        job.reserve(crate::node::history_budget::FLOW_STATE_BYTES)
+    }
+
+    pub(crate) fn state_bytes_wake(
+        job: &Job,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        job.bytes_wake()
+    }
+
+    /// Reserve the flow state as the round begins, its bytes already held: the last gate before
+    /// running, so a held charge always belongs to a running round. [`Resumed::NodeBusy`] when
+    /// this fingerprint's current and retiring generations already hold its source-owned slots;
+    /// [`Resumed::PoolFull`] when every pool position is occupied by a charge or release-edge
+    /// promise. A flow already holding its state keeps it, and the bytes go back.
+    pub(crate) fn resume(
+        &mut self,
+        job: &Job,
+        bytes: crate::node::history_budget::BufferCharge,
+        waiter: Option<&mut crate::node::history_budget::FlowReleaseTicket>,
+    ) -> Resumed {
+        if self.state_charge.is_some() {
+            return Resumed::Held;
+        }
+        match job.reserve_flow_state(
+            self.room,
+            self.peer,
+            self.retirement_request,
+            self.instance,
+            bytes,
+            waiter,
+        ) {
+            crate::node::history_budget::FlowStateTry::Reserved(charge) => {
+                self.state_charge = Some(charge);
+                Resumed::Held
+            }
+            crate::node::history_budget::FlowStateTry::PoolFull(edge) => Resumed::PoolFull(edge),
+            crate::node::history_budget::FlowStateTry::PoolOvercommitted(edge) => {
+                Resumed::PoolOvercommitted(edge)
+            }
+            crate::node::history_budget::FlowStateTry::NodeBusy(edge) => Resumed::NodeBusy(edge),
+            crate::node::history_budget::FlowStateTry::OwnerMissing => Resumed::OwnerMissing,
+        }
+    }
+
+    /// Whether this round begins by exchanging boards with the peer: a fresh inventory flow's
+    /// first round, or any round while a key to the peer waits on its bundle (ADR-038 FX-35):
+    /// the bundle a key delivery opens its session against travels only on that exchange.
     pub(crate) fn needs_board(&self) -> bool {
-        self.inventory && !self.initialized
+        (self.inventory && !self.initialized) || self.wants_board
+    }
+    /// The author of a retained signed head, for the record of a peer that could not fill a
+    /// body under it; `None` when the head is not retained or the room is busy, and then no
+    /// record is made (the next period asks once more).
+    async fn head_author(
+        &self,
+        source: &super::source::Source,
+        job: &Job,
+        head: Digest32,
+    ) -> Result<Option<Digest32>> {
+        let found = source
+            .read(
+                job,
+                std::mem::size_of::<Option<Digest32>>(),
+                move |room, store| {
+                    Ok(Some(
+                        room.history_read(store)?
+                            .history_head(&head)?
+                            .map(|signed| signed.binding.author),
+                    ))
+                },
+            )
+            .await?;
+        Ok(match found {
+            Lookup::Found(found) => found.value,
+            Lookup::Busy | Lookup::Missing => None,
+        })
+    }
+    async fn decline(
+        &mut self,
+        source: &super::source::Source,
+        job: &Job,
+        inbox: &super::hints::HintInbox,
+        author: Digest32,
+        head: Digest32,
+    ) -> Result<bool> {
+        if self.local_own_discovery {
+            // Startup metadata discovery is scoped to the selected connection, not the old
+            // durable receipt/proof operation. Actor retains its unavailable disposition on
+            // that Port; a genuine reconnect can obtain newly available signed metadata.
+            return Ok(true);
+        }
+        // A metadata root is a separate operation from the old ambiguous body/inventory
+        // decision. Retain one exact disposition for its whole immutable verification chain.
+        let (author, head) = if self.local_own_root() {
+            let hint = self
+                .hint
+                .ok_or(Error::Profile("own metadata refusal root missing"))?;
+            (hint.author, hint.head)
+        } else {
+            (author, head)
+        };
+        let remembered = match source
+            .remember_decline(job, author, head, self.request, self.local_own_root())
+            .await
+        {
+            Ok(super::source::DeclineResult::Stored {
+                remembered,
+                captured,
+                current,
+            }) => {
+                self.refusal_saved = Some(crate::node::status::HistoryRefusalStatus {
+                    peer: source.peer,
+                    author,
+                    head,
+                    request: self.request,
+                    captured_generation: captured,
+                    current_generation: current,
+                    remembered,
+                });
+                remembered
+            }
+            Ok(super::source::DeclineResult::AuthorizationChanged { captured, current }) => {
+                self.refusal_stale = Some(crate::node::status::HistoryRefusalStatus {
+                    peer: source.peer,
+                    author,
+                    head,
+                    request: self.request,
+                    captured_generation: captured,
+                    current_generation: current,
+                    remembered: false,
+                });
+                self.authorization_changed = true;
+                self.waiting = true;
+                return Ok(false);
+            }
+            Err(error) => {
+                self.local_retry = Some(format!(
+                    "local history refusal was not durably recorded: {error}"
+                ));
+                self.waiting = true;
+                return Ok(false);
+            }
+        };
+        if !self.local_own_root() {
+            inbox.finish(self.room, source.peer, author, head);
+        }
+        self.declined = self.declined.saturating_add(u64::from(remembered));
+        Ok(true)
     }
     pub(crate) fn done(&self) -> bool {
-        self.tasks.is_empty() && self.replay.is_none()
+        self.tasks.is_empty() && self.replay.is_none() && self.announcement.is_none()
+    }
+
+    /// Whether an ordinary operation, rather than the separate announcement prefix, remains
+    /// owned by this Flow. A peer-Busy settlement may retain the Flow only when the exact popped
+    /// operation was restored here; an announcement alone is not provenance for retrying it.
+    #[must_use]
+    pub(crate) fn ordinary_pending(&self) -> bool {
+        !self.tasks.is_empty() || self.replay.is_some()
+    }
+
+    /// Consume the proof that this returned peer-Busy result still owns its exact ordinary task.
+    /// A pending announcement alone can never satisfy this predicate.
+    pub(crate) fn take_peer_busy_retry(&mut self) -> bool {
+        std::mem::take(&mut self.peer_busy_retry) && self.ordinary_pending()
+    }
+
+    /// Prepend one real inventory exchange to this retained foreground owner. A failed prefix
+    /// remains this same scalar; it never consumes, rebuilds or retires the ordinary root.
+    pub(crate) fn arm_announcement(&mut self, through: u64) -> Result<()> {
+        if self.archive || self.inventory {
+            return Err(Error::Profile(
+                "history announcement prefix requires a retained foreground root",
+            ));
+        }
+        if self.announcement.is_some() {
+            return Ok(());
+        }
+        let request = request_id()?;
+        self.announcement = Some(Announcement {
+            request,
+            prior_request: self.request,
+            task: Some(Task {
+                request,
+                purpose: Purpose::Control,
+                operation: Operation::Wire(Query::Inventory),
+            }),
+            through,
+            brought: false,
+            complete: false,
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn announcement_pending(&self) -> bool {
+        self.announcement
+            .as_ref()
+            .is_some_and(|announcement| !announcement.complete)
+    }
+
+    #[must_use]
+    pub(crate) fn announcement_can_run(&self) -> bool {
+        !self.archive
+            && !self.inventory
+            && !self.publication_wait
+            && self.active_publication_owner().is_none()
+    }
+
+    #[must_use]
+    pub(crate) fn announcement_failed(&self) -> bool {
+        self.announcement_error || self.announcement_active
+    }
+
+    pub(crate) fn retain_failed_announcement(&mut self) -> Result<()> {
+        let Some(announcement) = self.announcement.as_mut() else {
+            return Err(Error::Profile("history announcement owner missing"));
+        };
+        if !announcement.complete && announcement.task.is_none() {
+            announcement.task = Some(Task {
+                request: announcement.request,
+                purpose: Purpose::Control,
+                operation: Operation::Wire(Query::Inventory),
+            });
+        }
+        self.request = announcement.prior_request;
+        self.announcement_error = false;
+        self.announcement_active = false;
+        self.peer_busy_retry = false;
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn ordinary_turn_due(&self) -> bool {
+        self.ordinary_turn_due
+    }
+
+    pub(crate) fn take_announcement_receipt(&mut self) -> Option<AnnouncementReceipt> {
+        let announcement = self
+            .announcement
+            .take_if(|announcement| announcement.complete)?;
+        self.ordinary_turn_due = true;
+        Some(AnnouncementReceipt {
+            through: announcement.through,
+            brought: announcement.brought,
+        })
+    }
+
+    fn restore_announcement_task(&mut self, task: Task) -> Result<()> {
+        let Some(announcement) = self.announcement.as_mut() else {
+            return Err(Error::Profile("history announcement owner missing"));
+        };
+        if announcement.complete || announcement.task.is_some() {
+            return Err(Error::Profile("history announcement task already retained"));
+        }
+        announcement.task = Some(task);
+        Ok(())
     }
     /// Whether the next task is a local slice, with no wire exchange, so this turn may run it.
     fn next_slice_is_local(&self) -> bool {
@@ -441,10 +1036,33 @@ impl Flow {
                     | Operation::Tail { .. }
                     | Operation::Reclaim(_)
                     | Operation::ReclaimUnavailable
+                    | Operation::FinishArchive
                     | Operation::Governance
             )
         )
     }
+
+    /// The exact request whose sparse publication is between Begin and Cleanup in the next
+    /// local slice. This is a durable room-wide exclusion, not ordinary retained Flow state: it
+    /// must reach Cleanup (or explicit retirement rollback) before this Flow can be parked.
+    fn active_publication_owner(&self) -> Option<RequestId> {
+        let next = self.tasks.last().or(self.replay.as_ref())?;
+        match &next.operation {
+            Operation::Local(LocalStep::Entry {
+                request,
+                phase: EntryPhase::Prepare(_) | EntryPhase::Commit(_) | EntryPhase::Cleanup(_),
+                ..
+            }) => Some(*request),
+            _ => None,
+        }
+    }
+    /// Only the controller retirement owner may execute a recovered deletion capability.
+    pub(crate) fn mark_own_recovery_cleanup(&mut self) {
+        self.own_recovery_cleanup = true;
+        self.initialized = true;
+        self.tasks.clear();
+    }
+
     pub(crate) fn lane(&self) -> crate::node::history_budget::Lane {
         use crate::node::history_budget::Lane;
         match self
@@ -453,9 +1071,11 @@ impl Flow {
             .or(self.replay.as_ref())
             .map(|task| (&task.operation, task.purpose))
         {
-            Some((Operation::Wire(Query::Entry { .. } | Query::Page { .. }), Purpose::History)) => {
-                Lane::Archive
-            }
+            Some((
+                Operation::Wire(Query::Entry { .. } | Query::Page { .. })
+                | Operation::ResumeWire(Query::Entry { .. } | Query::Page { .. }),
+                Purpose::History,
+            )) => Lane::Archive,
             Some((_, Purpose::Live)) => Lane::Live,
             _ => Lane::Control,
         }
@@ -491,14 +1111,12 @@ impl Flow {
     }
     /// The Controller owns this future and awaits it before dropping an abandoned flow.
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
-    pub(crate) async fn retire_slice(&mut self) -> Result<bool> {
-        // Retirement, cancellation and shutdown retain this flow until its exact received debt
-        // is durable. A failed flush leaves both the owner and the flow queued for another slice.
-        self.settle_received(Arc::clone(&self.cleanup_store))
-            .await?;
-        if !self.initialized {
+    pub(crate) async fn retire_slice(&mut self) -> Result<RetirementStep> {
+        self.settle_received(Arc::clone(&self.cleanup_store)).await?;
+        self.publication_owner_wait = None;
+        if !self.initialized || self.shared.lock().await.history_retirement_locked() {
             self.cancel();
-            return Ok(true);
+            return Ok(RetirementStep::Done);
         }
         // A published current body queues only local exact-request reclamation. If its peer
         // departs before the next network turn, finish that bounded cleanup here; membership is
@@ -513,62 +1131,160 @@ impl Flow {
             .tasks
             .iter()
             .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
-        let cleanup_job = self.cleanup_job.clone();
-        if reclaim_live
-            && !self
-                .reclaim_stage(Purpose::Live, &cleanup_job, true)
-                .await?
-        {
-            return Ok(false);
-        }
-        if reclaim_control
-            && !self
-                .reclaim_stage(Purpose::Control, &cleanup_job, true)
-                .await?
-        {
-            return Ok(false);
-        }
+        let staging = if reclaim_live && self.live.is_some() {
+            self.live.clone().map(|stage| (Purpose::Live, stage))
+        } else if reclaim_control && self.control.is_some() {
+            self.control.clone().map(|stage| (Purpose::Control, stage))
+        } else if self.automatic_own_recovery {
+            self.history.clone().map(|stage| (Purpose::History, stage))
+        } else {
+            None
+        };
+        // A parked flow owns no worker. Retirement admits one independent large-control job for
+        // this bounded local slice and gives it back before the flow is retained again.
+        let cleanup_job = self
+            .cleanup_budget
+            .admit_job(self.node, crate::node::history_budget::Lane::LargeControl)
+            .await;
         // No worker owns this Flow while it is retiring. Retain its already-fenced local
         // capability only through the exact queued reclamation above, then cancel it before
         // any general publication/verifier cleanup. Nothing here opens a stream or schedules
         // another turn.
-        self.cancel();
-        // Retained flow metadata is charged to the daemon's small control reservation.
-        // Cleanup must not need that same pool to free it: several hosted nodes can fill
-        // its headroom. Use an independently admitted foreground-control envelope instead.
+        if staging.is_none() {
+            self.cancel();
+        }
+        // Cleanup uses the independently admitted foreground-control envelope above; no parked
+        // flow retains a Control worker merely so it can eventually retire.
         const CLEANUP_ENVELOPE: usize = 6 * 1024 * 1024;
-        let Some(cleanup_job) = self.cleanup_job.record_job(CLEANUP_ENVELOPE) else {
-            return Ok(false);
+        let envelope = if staging.is_some() {
+            demand::AdmissionCharge::total(CLEANUP_ENVELOPE)?
+        } else {
+            CLEANUP_ENVELOPE
         };
-        let Some(charge) = cleanup_job.reserve(CLEANUP_ENVELOPE) else {
-            return Ok(false);
+        let mut charge = match cleanup_job.reserve_or_pressure(envelope) {
+            Ok(charge) => charge,
+            Err(Error::HistoryCapacity(pressure)) => {
+                return Ok(RetirementStep::Wait(RetirementWait::Bytes(*pressure)))
+            }
+            Err(error) => return Err(error),
+        };
+        let admission = if staging.is_some() {
+            Some(demand::AdmissionCharge::split_from(&mut charge)?)
+        } else {
+            None
         };
         let room = self.shared.clone();
         let store = self.cleanup_store.clone();
         let request = self.request;
         let instance = self.instance;
         let after = self.cleanup_after;
+        let committed = Arc::clone(&self.work_committed);
+        enum Slice {
+            Gone,
+            Staging(Purpose, bool),
+            Source(bool, Option<[u8; 64]>),
+            Publication(
+                Option<RequestId>,
+                std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>,
+            ),
+        }
         let step = tokio::task::spawn_blocking(move || {
             let _charge = charge;
             let mut channel = room.blocking_lock();
+            if channel.history_retirement_locked() {
+                return Ok(Slice::Gone);
+            }
             // Lock erases keys immediately. Reopen owns the bounded crash cleanup;
             // no retired worker may keep/recreate an unlocked room to finish work.
             match channel.history_instance(&store) {
-                Err(Error::AtRestLocked) => return Ok((true, None)),
+                Err(Error::AtRestLocked) => return Ok(Slice::Gone),
                 Err(error) => return Err(error),
-                Ok(current) if current != instance => return Ok((true, None)),
+                Ok(current) if current != instance => return Ok(Slice::Gone),
                 Ok(_) => {}
             }
-            if !channel.cleanup_history_source_owned(&store, request)? {
-                return Ok((false, after));
+            if let Some((purpose, staging)) = staging {
+                // Same room->Active lock order as semantic completion. Observer cancellation
+                // remains set: this route can only delete the captured abandoned staging.
+                let mut active = staging
+                    .active
+                    .lock()
+                    .map_err(|_| Error::Profile("history activation lock failed"))?;
+                let admission = admission
+                    .as_ref()
+                    .ok_or(Error::Profile("history retirement admission missing"))?;
+                let done =
+                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?;
+                return Ok(Slice::Staging(purpose, done));
             }
-            channel.cleanup_history_verifiers(&store, request, after)
+            let wake = channel.history_publication_wake();
+            let publication_owner = channel.history_publication_request(&store)?;
+            if channel.history_publication_busy(&store)? && publication_owner != Some(request) {
+                return Ok(Slice::Publication(publication_owner, wake));
+            }
+            if !channel.cleanup_history_source_owned(&store, &committed, request)? {
+                return Ok(Slice::Source(false, after));
+            }
+            channel
+                .cleanup_history_verifiers(&store, &committed, request, after)
+                .map(|(done, next)| Slice::Source(done, next))
         })
         .await
         .map_err(|_| Error::Profile("history retirement worker stopped"))??;
-        self.cleanup_after = step.1;
-        if !step.0 {
-            return Ok(false);
+        let (done, next) = match step {
+            Slice::Gone => {
+                self.cancel();
+                return Ok(RetirementStep::Done);
+            }
+            Slice::Staging(purpose, done) => {
+                if done {
+                    if let Some(index) = body_slot(purpose) {
+                        if let Some(request) = self.owners[index].take() {
+                            self.slots.release(purpose, request);
+                        }
+                    }
+                    match purpose {
+                        Purpose::Live => self.live = None,
+                        Purpose::Control => self.control = None,
+                        // Automatic own recovery owns a real History staging slot too.
+                        // Drop it only after exact-request retirement finished; the next
+                        // slice can then clean this Flow's source/verifier owners.
+                        Purpose::History => self.history = None,
+                    }
+                }
+                return Ok(RetirementStep::Progress);
+            }
+            Slice::Source(done, next) => (done, next),
+            Slice::Publication(owner, wake) => {
+                // A foreground flow may suspend publication A while a freshly derived request B is
+                // its current scalar. Verifier cleanup for B correctly waits while A is publishing,
+                // but retirement must first select A when this same Flow still owns it. Otherwise
+                // B waits for A forever and the actor retains a room-busy Flow with no running
+                // worker. The task/replay stack is the exact ownership set; an unrelated owner's
+                // publication remains untouched and is retried after its own causal completion.
+                if let Some(owner) = owner.filter(|owner| *owner != request) {
+                    let owned = self.retirement_request == owner
+                        || self.tasks.iter().any(|task| task.request == owner)
+                        || self
+                            .replay
+                            .as_ref()
+                            .is_some_and(|task| task.request == owner);
+                    if owned {
+                        self.request = owner;
+                        self.cleanup_after = None;
+                        return Ok(RetirementStep::Progress);
+                    } else {
+                        // This retirement is causally blocked by one exact publication owner. The
+                        // controller runs that owner first and retries this flow from the owner's
+                        // completion, never from a wall-clock backoff.
+                        self.publication_owner_wait = Some(owner);
+                    }
+                }
+                return Ok(RetirementStep::Wait(RetirementWait::Publication { wake }));
+            }
+        };
+        self.cleanup_after = next;
+        if !done {
+            return Ok(RetirementStep::Progress);
         }
 
         // A foreground flow may suspend an older root while a freshly identified entry uses
@@ -592,10 +1308,31 @@ impl Flow {
             .or_else(|| self.replay.as_ref().map(|task| task.request));
         if let Some(next) = next {
             self.request = next;
-            Ok(false)
+            Ok(RetirementStep::Progress)
         } else {
-            Ok(true)
+            Ok(RetirementStep::Done)
         }
+    }
+
+    /// Permanent cleanup faults wait only for actual key erasure (or explicit controller
+    /// recovery). Publication notifications while unlocked never retry a broken store.
+    pub(crate) fn retirement_erasure(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
+        let shared = Arc::clone(&self.shared);
+        Box::pin(async move {
+            loop {
+                let wake = {
+                    let room = shared.lock().await;
+                    let wake = room.history_publication_wake();
+                    if room.history_retirement_locked() {
+                        return;
+                    }
+                    wake
+                };
+                wake.await;
+            }
+        })
     }
 
     fn stage(&self, purpose: Purpose) -> Option<Staging> {
@@ -625,6 +1362,8 @@ impl Flow {
             purpose == Purpose::History,
             fence,
             deadline,
+            Arc::clone(&self.work_committed),
+            Arc::clone(&self.own_head_observed),
         )
     }
 
@@ -706,16 +1445,20 @@ impl Flow {
         now: u64,
     ) -> Result<()> {
         self.waiting = false;
+        self.byte_pressure = None;
         self.body_progress = false;
         self.governance_wait = false;
         self.governance_cycles = 0;
         self.external = None;
+        self.announcement_error = false;
+        self.announcement_active = false;
+        self.peer_busy_retry = false;
         // Local slices run back to back inside one turn; a slice that needs the wire, waits,
         // errs or spends the slice budget ends it. Each slice used to be a turn of its own,
         // and a turn costs an actor round trip (~10 ms): one body took ~30 slices, so a
         // 128-position live window drained at three positions a second (40 s), and a creator
         // serving three joiners at once read their first posts after 30 s (#934).
-        let started = tokio::time::Instant::now();
+        let mut quantum_started = tokio::time::Instant::now();
         let mut slices = 0u32;
         let mut result = loop {
             let result = self
@@ -730,16 +1473,46 @@ impl Flow {
                     now,
                 )
                 .await;
+            let result = match result {
+                Err(Error::HistoryCapacity(pressure)) => {
+                    // Initialization/publication-owner reads precede task selection. Their
+                    // allocation refusal retains the unchanged stack; no popped task exists
+                    // to reconstruct here. Post-selection helpers retain their own phase.
+                    self.byte_pressure = Some(*pressure);
+                    self.waiting = true;
+                    Ok(())
+                }
+                result => result,
+            };
             slices += 1;
+            let publication_active = self.active_publication_owner().is_some();
             if result.is_err()
                 || self.waiting
                 || self.external.is_some()
-                || slices >= LOCAL_SLICES_PER_TURN
-                || started.elapsed() >= LOCAL_TURN_BUDGET
-                || tokio::time::Instant::now() >= deadline
+                // The actor owns the separate announcement receipt/accounting boundary. Do not
+                // let an ordinary local phase run behind it in this worker return.
+                || self
+                    .announcement
+                    .as_ref()
+                    .is_some_and(|announcement| announcement.complete)
+                || (!publication_active
+                    && (slices >= LOCAL_SLICES_PER_TURN
+                        || quantum_started.elapsed() >= LOCAL_TURN_BUDGET
+                        || tokio::time::Instant::now() >= deadline))
                 || !self.next_slice_is_local()
             {
                 break result;
+            }
+            if publication_active
+                && (slices >= LOCAL_SLICES_PER_TURN
+                    || quantum_started.elapsed() >= LOCAL_TURN_BUDGET)
+            {
+                // The quantum protects executor fairness, not correctness. Yield the worker
+                // without returning its Flow to the actor, then finish the publication under
+                // the same running ownership.
+                tokio::task::yield_now().await;
+                slices = 0;
+                quantum_started = tokio::time::Instant::now();
             }
         };
         if result.as_ref().is_err_and(|error| {
@@ -748,6 +1521,7 @@ impl Flow {
                 Error::Profile(
                     "history authorization changed"
                         | "history authorization changed before publication"
+                        | "history authorization changed before refusal"
                         | "live window authorization changed"
                         | "live retry authorization changed"
                 )
@@ -756,22 +1530,9 @@ impl Flow {
             self.authorization_changed = true;
             result = Ok(());
         }
-        if self.owners.iter().any(Option::is_some)
-            && self.waiting
-            && !self.body_progress
-            && !self.governance_wait
-        {
-            self.no_progress = self.no_progress.saturating_add(1);
-            if self.no_progress >= 3 {
-                result = Err(Error::Unreachable(
-                    "current work repeatedly busy; retiring its body slot",
-                ));
-            }
-        } else {
-            // A successful metadata/local slice or durable body chunk is progress. Retain
-            // its exact body slot across progressing multi-quantum current entries.
-            self.no_progress = 0;
-        }
+        // Busy is a retained exact need. A count of turns can neither revoke the body slot nor
+        // dispose its root; the semantic response/progress edge is the only thing that advances
+        // it, while the actor's named Busy backoff prevents spinning between those edges.
         // A successful partial turn keeps this exact owner inside the returned Flow, allowing a
         // sparse source and its later semantic effect to share one durability debt. Every path
         // which stops carrying the flow forward settles first; a failure keeps the Flow owned by
@@ -803,6 +1564,8 @@ impl Flow {
             self.peer,
             fence.clone(),
             deadline,
+            Some((self.node, self.generation)),
+            Arc::clone(&self.work_committed),
         );
         if !self.initialized {
             let room = self.room;
@@ -824,12 +1587,60 @@ impl Flow {
             self.initialized = true;
             return Ok(());
         }
+        if self.publication_wait {
+            let owner = source
+                .read(job, 0, |channel, store| {
+                    Ok(Some(channel.history_publication_request(store)?))
+                })
+                .await?;
+            match owner {
+                Lookup::Found(owner) => match owner.value {
+                    None => {
+                        self.publication_wait = false;
+                        self.publication_owner_wait = None;
+                    }
+                    Some(owner) if self.prioritize_publication_owner(owner) => {
+                        self.publication_wait = false;
+                        self.publication_owner_wait = None;
+                    }
+                    Some(owner) => {
+                        // Another live Flow owns the room's publication. Keep this exact task
+                        // parked and name that owner so the actor can resume its exact port.
+                        self.publication_owner_wait = Some(owner);
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                },
+                Lookup::Busy | Lookup::Missing => {
+                    self.waiting = true;
+                    return Ok(());
+                }
+            }
+        }
         if self.tasks.is_empty() {
             if let Some(root) = self.replay.take() {
                 self.tasks.push(root);
             }
         }
-        let Some(task) = self.tasks.pop() else {
+        // A publication Begin..Cleanup owner is correctness-critical and remains ahead of the
+        // announcement prefix. Once no exact publication phase is active, the scalar inventory
+        // task gets one response quantum ahead of the ordinary retained stack.
+        let announcement_task = if self.active_publication_owner().is_none() {
+            self.announcement
+                .as_mut()
+                .and_then(|announcement| announcement.task.take())
+        } else {
+            None
+        };
+        let (task, announcement_task) = if let Some(task) = announcement_task {
+            self.announcement_active = true;
+            (task, true)
+        } else if let Some(task) = self.tasks.pop() {
+            // Initialization, publication-owner lookup and worker admission do not spend the
+            // fairness quantum. Only selecting an actual ordinary task does.
+            self.ordinary_turn_due = false;
+            (task, false)
+        } else {
             return Ok(());
         };
         // Retirement's scalar always names the operation that can disappear from the bounded
@@ -837,7 +1648,130 @@ impl Flow {
         if !self.archive {
             self.request = task.request;
         }
+        let original_task = task.clone();
+        let mut retry_task = Some(Task {
+            operation: match &task.operation {
+                Operation::Wire(query) => Operation::ResumeWire(query.clone()),
+                operation => operation.clone(),
+            },
+            ..task.clone()
+        });
+        // Prefix work has its own empty/nonempty account. Preserve progress already made by the
+        // ordinary root, then restore it after the inventory exchange.
+        let ordinary_brought = announcement_task.then(|| std::mem::take(&mut self.brought));
+        let ordinary_request = announcement_task.then(|| {
+            self.announcement
+                .as_ref()
+                .map_or(self.retirement_request, |announcement| {
+                    announcement.prior_request
+                })
+        });
+        let result = self
+            .execute_task(
+                task,
+                source,
+                store,
+                conn,
+                job,
+                fence,
+                deadline,
+                inbox,
+                inbox_generation,
+                now,
+                announcement_task,
+                &mut retry_task,
+            )
+            .await;
+        if let Some(request) = ordinary_request {
+            self.request = request;
+        }
+        let announcement_brought = announcement_task.then(|| {
+            let brought = self.brought;
+            self.brought = ordinary_brought.unwrap_or(false);
+            brought
+        });
+        match result {
+            Err(Error::HistoryCapacity(pressure)) => {
+                if let Some(task) = retry_task {
+                    if announcement_task {
+                        self.restore_announcement_task(task)?;
+                    } else {
+                        self.push(task)?;
+                    }
+                }
+                self.byte_pressure = Some(*pressure);
+                self.waiting = true;
+                self.announcement_active = false;
+                if let Some(brought) = announcement_brought {
+                    if let Some(announcement) = self.announcement.as_mut() {
+                        announcement.brought |= brought;
+                    }
+                }
+                Ok(())
+            }
+            Err(error) if announcement_task => {
+                // A new stream retries the inventory prefix. The ordinary stack and every local
+                // continuation remain exactly where they were when this prefix began.
+                self.restore_announcement_task(original_task)?;
+                if let Some(brought) = announcement_brought {
+                    if let Some(announcement) = self.announcement.as_mut() {
+                        announcement.brought |= brought;
+                    }
+                }
+                self.announcement_error = true;
+                self.announcement_active = false;
+                Err(error)
+            }
+            Err(
+                error @ Error::PeerRefused(
+                    crate::wire::WireError::SessionBusy | crate::wire::WireError::NotYetMember,
+                ),
+            ) => {
+                // These are the two coded, transient peer refusals paced as Busy by the port.
+                // Restore the exact popped operation before returning it to the actor: a Wire
+                // operation resumes from durable staging/cursor state, never from offset zero.
+                // If a helper consumed the retry owner, do not fabricate a replacement.
+                if let Some(task) = retry_task {
+                    self.push(task)?;
+                    self.peer_busy_retry = true;
+                }
+                Err(error)
+            }
+            Ok(()) if announcement_task => {
+                let Some(announcement) = self.announcement.as_mut() else {
+                    return Err(Error::Profile("history announcement owner missing"));
+                };
+                announcement.brought |= announcement_brought.unwrap_or(false);
+                if announcement.task.is_none() {
+                    announcement.complete = true;
+                }
+                self.announcement_active = false;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// Each fallible helper owns either the still-popped task or a more precise finalization
+    /// continuation. Successfully derived tasks remain on the stack and are never rolled back.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_task(
+        &mut self,
+        task: Task,
+        source: Source,
+        store: Arc<Store>,
+        conn: &VoxConnection,
+        job: &Job,
+        fence: Arc<Fence>,
+        deadline: tokio::time::Instant,
+        inbox: &super::HintInbox,
+        inbox_generation: u64,
+        now: u64,
+        announcement_task: bool,
+        retry_task: &mut Option<Task>,
+    ) -> Result<()> {
         let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
+        let resuming_wire = matches!(task.operation, Operation::ResumeWire(_));
         match task.operation.clone() {
             Operation::LiveWindow { author, head } => {
                 if author == self.node {
@@ -877,6 +1811,7 @@ impl Flow {
                 let node = self.node;
                 let room = self.room;
                 let epoch = self.epoch;
+                let committed = Arc::clone(&self.work_committed);
                 let found = source
                     .read(job, 256, move |channel, store| {
                         if channel.history_instance(store)? != instance
@@ -920,16 +1855,26 @@ impl Flow {
                         let through = target.root.leaves;
                         drop(input);
                         channel
-                            .history_write(store, |index| {
+                            .history_write_tracked(store, &committed, |index| {
                                 index.select_history_live_window(&author, head)
                             })
                             .map(|window| Some((window, through)))
                     })
                     .await?;
-                let Lookup::Found(found) = found else {
-                    self.push(task)?;
-                    self.waiting = true;
-                    return Ok(());
+                let found = match found {
+                    Lookup::Found(found) => found,
+                    Lookup::Missing => {
+                        self.publication_wait = true;
+                        self.publication_owner_wait = None;
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    Lookup::Busy => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
                 };
                 let (window, target_through) = found.value;
                 // Report the exact authenticated Head(author) response that selected this
@@ -1024,10 +1969,20 @@ impl Flow {
                         Ok(Some(input.missing_contains(&author, window.next)?))
                     })
                     .await?;
-                let Lookup::Found(found) = found else {
-                    self.push(task)?;
-                    self.waiting = true;
-                    return Ok(());
+                let found = match found {
+                    Lookup::Found(found) => found,
+                    Lookup::Missing => {
+                        self.publication_wait = true;
+                        self.publication_owner_wait = None;
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    Lookup::Busy => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
                 };
                 if found.value {
                     let request = request_id()?;
@@ -1082,6 +2037,7 @@ impl Flow {
                 let room = self.room;
                 let epoch = self.epoch;
                 let unavailable = self.live_unavailable == Some((window.head, window.next));
+                let committed = Arc::clone(&self.work_committed);
                 let advanced = source
                     .read(job, 128, move |channel, store| {
                         if channel.history_instance(store)? != instance
@@ -1122,16 +2078,26 @@ impl Flow {
                         }
                         drop(input);
                         channel
-                            .history_write(store, |index| {
+                            .history_write_tracked(store, &committed, |index| {
                                 index.advance_history_live_window(&author, window)
                             })
                             .map(Some)
                     })
                     .await?;
-                if !matches!(advanced, Lookup::Found(_)) {
-                    self.push(task)?;
-                    self.waiting = true;
-                    return Ok(());
+                match advanced {
+                    Lookup::Found(_) => {}
+                    Lookup::Missing => {
+                        self.publication_wait = true;
+                        self.publication_owner_wait = None;
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    Lookup::Busy => {
+                        self.push(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
                 }
                 self.live_unavailable = None;
                 self.push(Task {
@@ -1196,6 +2162,7 @@ impl Flow {
                                 head,
                                 seq,
                                 body: content && !expired,
+                                role_header: false,
                                 phase: EntryPhase::Start,
                             }),
                         })?;
@@ -1214,13 +2181,98 @@ impl Flow {
                     }
                 }
             }
-            Operation::Wire(mut query) => {
+            Operation::Wire(mut query) | Operation::ResumeWire(mut query) => {
                 let body = matches!(query, Query::Entry { .. } | Query::Page { .. });
+                if resuming_wire && body {
+                    if let Some(staging) = self.stage(task.purpose) {
+                        let snapshot = inspect(&staging.context, job)
+                            .await?
+                            .ok_or(Error::Profile("history retry state missing"))?;
+                        let active = staging
+                            .active
+                            .lock()
+                            .map_err(|_| Error::Profile("history activation lock failed"))?;
+                        let state = snapshot.state();
+                        if !active.matches(state)
+                            || active.request() != task.request
+                            || active.binding() != self.binding()
+                        {
+                            return Err(Error::Profile("history retry activation changed"));
+                        }
+                        if let Some(saved) = &state.body {
+                            let exact = match query {
+                                Query::Entry { head, seq, .. } => {
+                                    head == state.bounds.head && seq == saved.seq
+                                }
+                                Query::Page { head, lo, hi, .. } => {
+                                    head == state.bounds.head && saved.seq >= lo && saved.seq <= hi
+                                }
+                                _ => false,
+                            };
+                            if !exact {
+                                return Err(Error::Profile(
+                                    "history retry body differs from request",
+                                ));
+                            }
+                            if saved.offset == saved.length {
+                                // Bytes alone establish no room effect. Resume the normal opaque
+                                // inclusion/control/authority checks under the original request.
+                                if task.purpose == Purpose::History {
+                                    self.archive_next = saved
+                                        .seq
+                                        .checked_sub(1)
+                                        .filter(|next| *next >= state.bounds.lo);
+                                    self.archive_wire_bytes =
+                                        self.archive_wire_bytes.saturating_add(saved.length);
+                                    self.push(Task {
+                                        operation: Operation::Local(LocalStep::Entry {
+                                            request: task.request,
+                                            head: state.bounds.head,
+                                            seq: saved.seq,
+                                            body: true,
+                                            role_header: false,
+                                            phase: EntryPhase::Start,
+                                        }),
+                                        ..task.clone()
+                                    })?;
+                                } else {
+                                    // Current body requests are dependencies of an already
+                                    // retained Local phase. As with normal body_ready delivery,
+                                    // resume that exact owner instead of adding a second Start.
+                                    // A nested dependency may live on tasks while an older,
+                                    // different root occupies the scalar replay slot.
+                                    let owns_body = |pending: &Task| {
+                                        pending.request == task.request
+                                            && pending.purpose == task.purpose
+                                            && matches!(pending.operation,
+                                                Operation::Local(LocalStep::Entry { request, head, seq, body: true, role_header: false, .. })
+                                                if request == task.request
+                                                    && head == state.bounds.head
+                                                    && seq == saved.seq)
+                                    };
+                                    if !self.tasks.iter().any(owns_body)
+                                        && !self.replay.as_ref().is_some_and(owns_body)
+                                    {
+                                        return Err(Error::Profile(
+                                            "completed current body has no retained local owner",
+                                        ));
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            query = Query::Entry {
+                                head: state.bounds.head,
+                                seq: saved.seq,
+                                offset: saved.offset,
+                            };
+                        }
+                    }
+                }
                 if task.purpose == Purpose::History
                     && body
                     && self.archive_wire_bytes >= ARCHIVE_QUANTUM_BYTES
                 {
-                    self.finish_archive(job).await?;
+                    self.finish_archive_owned(job, &task, retry_task).await?;
                     self.tasks.clear();
                     return Ok(());
                 }
@@ -1258,7 +2310,7 @@ impl Flow {
                 } else {
                     task.request
                 };
-                let result = super::exchange(
+                let mut result = super::exchange(
                     &receiver,
                     conn,
                     job.clone(),
@@ -1274,6 +2326,52 @@ impl Flow {
                 )
                 .await?;
                 self.body_progress |= result.body_progress;
+                let brought_now = result.brought || result.body_progress;
+                self.brought |= brought_now;
+                if brought_now {
+                    self.work_committed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                if announcement_task {
+                    if result.status == Status::Busy {
+                        self.restore_announcement_task(task)?;
+                        self.waiting = true;
+                        return Ok(());
+                    }
+                    if result.status != Status::Complete
+                        || result.continuation.is_some()
+                        || !result.needs.is_empty()
+                        || !result.verifiers.is_empty()
+                        || result.body_ready.is_some()
+                        || result.role_ready.is_some()
+                        || !result.heads.is_empty()
+                        || result.departure_receipt.is_some()
+                    {
+                        return Err(Error::MalformedBundle(
+                            "history announcement inventory response",
+                        ));
+                    }
+                    let Some(inventory) = result.inventory.take() else {
+                        return Err(Error::MalformedBundle(
+                            "history announcement inventory missing",
+                        ));
+                    };
+                    for page in inventory.hints.chunks(64) {
+                        let offered = source
+                            .offer_inventory(job, inbox, inbox_generation, self.room, page)
+                            .await?;
+                        self.offered = self.offered.saturating_add(offered.added as u64);
+                        self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
+                        let added = offered.added != 0;
+                        self.brought |= added;
+                        if added {
+                            self.work_committed
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    *retry_task = None;
+                    return Ok(());
+                }
                 if self.route_origin.is_some()
                     && !matches!(result.status, Status::Busy | Status::EvidenceUnavailable)
                 {
@@ -1298,21 +2396,26 @@ impl Flow {
                     for head in &result.heads {
                         if head.author == author {
                             if author == self.node {
-                                self.mine_held =
-                                    Some(self.mine_held.map_or(head.size, |m| m.max(head.size)));
+                                if self.local_own_discovery {
+                                    self.discovery_reply = Some((*head, conn.serial()));
+                                }
+                                if task.purpose == Purpose::Control && !self.local_own_discovery {
+                                    if self.hint.is_some_and(|hint| {
+                                        hint.author == author && hint.size > head.size
+                                    }) {
+                                        self.receipt_lower = result
+                                            .own_head_incarnations
+                                            .map(|incarnations| (conn.serial(), incarnations));
+                                    }
+                                    self.mine_held = Some(
+                                        self.mine_held.map_or(head.size, |m| m.max(head.size)),
+                                    );
+                                }
                             }
-                            let repeats = self
-                                .last_head
-                                .filter(|(prior, _)| {
-                                    prior.author == head.author
-                                        && prior.head == head.head
-                                        && prior.size == head.size
-                                })
-                                .map_or(0, |(_, repeats)| repeats.saturating_add(1));
-                            self.last_head = Some((*head, repeats));
-                            if repeats >= 2 {
-                                return Err(Error::Unreachable("peer repeats a head that cannot satisfy the current dependency"));
-                            }
+                            // A repeated signed head remains the peer's exact current answer.
+                            // Busy handling below retains the dependency and applies the named
+                            // port backoff; no count of identical answers may dispose its root.
+                            self.last_head = Some(*head);
                         }
                         if head.author == author
                             && self.hint.is_some_and(|hint| hint.author == author)
@@ -1342,8 +2445,13 @@ impl Flow {
                         let offered = source
                             .offer_inventory(job, inbox, inbox_generation, self.room, page)
                             .await?;
-                        if let Some(seq) = offered.mine_held {
-                            self.mine_held = Some(self.mine_held.map_or(seq, |m| m.max(seq)));
+                        self.offered = self.offered.saturating_add(offered.added as u64);
+                        self.rearmed = self.rearmed.saturating_add(offered.rearmed as u64);
+                        let added = offered.added != 0;
+                        self.brought |= added;
+                        if added {
+                            self.work_committed
+                                .store(true, std::sync::atomic::Ordering::Release);
                         }
                     }
                 }
@@ -1353,6 +2461,36 @@ impl Flow {
                             "live body refusal has no exact entry",
                         ));
                     };
+                    // The peer does not hold a missing body of this author's newest window:
+                    // an answer that says it cannot fill the hint. Its inventory's same head
+                    // is not pulled from it again until it names another (ADR-038 FX-29), in
+                    // a required flow as in a hinted one: an author whose missing bodies no
+                    // peer held any more was pulled from every peer every period, about 370
+                    // commits a sync, for bodies none of them had.
+                    let author = self
+                        .tasks
+                        .iter()
+                        .find_map(|pending| match pending.operation {
+                            Operation::LiveAdvance { author, window, .. }
+                                if window.head == head && window.next == seq =>
+                            {
+                                Some(author)
+                            }
+                            _ => None,
+                        });
+                    if let Some(author) = author {
+                        if !self.decline(&source, job, inbox, author, head).await? {
+                            return Ok(());
+                        }
+                    }
+                    if let Some(hint) = self.hint {
+                        if !self
+                            .decline(&source, job, inbox, hint.author, hint.head)
+                            .await?
+                        {
+                            return Ok(());
+                        }
+                    }
                     if !self.tasks.iter().any(|pending| matches!(pending.operation,
                         Operation::LiveAdvance { window, .. } if window.head == head && window.next == seq)) {
                         return Err(Error::MalformedBundle("live body refusal is outside the selected window"));
@@ -1380,6 +2518,7 @@ impl Flow {
                             head,
                             seq,
                             body: false,
+                            role_header: false,
                             phase: EntryPhase::Start,
                         }),
                         ..task
@@ -1388,15 +2527,30 @@ impl Flow {
                 }
                 if matches!(result.status, Status::BodyNotHeld | Status::Cancelled) {
                     if self.archive && body {
-                        self.finish_archive(job).await?;
+                        self.finish_archive_owned(job, &task, retry_task).await?;
                         self.tasks.clear();
                         return Ok(());
+                    }
+                    if result.status == Status::BodyNotHeld {
+                        // The peer said it cannot fill this body: not asked for it again until
+                        // its inventory names another head of the author (ADR-038 FX-29).
+                        if let Query::Entry { head, .. } | Query::Page { head, .. } = &query {
+                            let head = *head;
+                            if let Some(author) = self.head_author(&source, job, head).await? {
+                                if !self.decline(&source, job, inbox, author, head).await? {
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                     return Err(Error::Unreachable(
                         "selected current body is unavailable or cancelled",
                     ));
                 }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
+                    if self.local_own_discovery {
+                        self.discovery_unavailable = Some(conn.serial());
+                    }
                     if matches!(query, Query::Head(author) if (author == self.peer || author == self.node) && self.hint.is_some_and(|hint| hint.author == author))
                         && !self.departure_probe
                         && self.last_head.is_none()
@@ -1408,6 +2562,21 @@ impl Flow {
                         // the healthy room/peer port can strand a later fresh head behind it.
                         // Third-party heads route to their author below; dependency failures
                         // after a head was selected remain hard failures.
+                        // A peer that cannot serve the head it advertised, its own feed's or
+                        // this node's own (the echo settlement asks for), is not asked for that
+                        // hint again until its inventory names another head of the author
+                        // (ADR-038 FX-29): the asking side stops, whatever the serving side does.
+                        match (&query, self.hint) {
+                            (Query::Head(author), Some(hint)) if hint.author == *author => {
+                                if !self
+                                    .decline(&source, job, inbox, *author, hint.head)
+                                    .await?
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            _ => {}
+                        }
                         self.tasks.clear();
                         return Ok(());
                     }
@@ -1447,6 +2616,19 @@ impl Flow {
                             }
                             Query::Inventory | Query::Context(_) => None,
                         };
+                        // The peer said it cannot serve this header or proof: the hint that
+                        // depends on it is not pulled from that peer again until its inventory
+                        // names another head of the author (ADR-038 FX-29), whether the flow
+                        // was hinted or required. The route to the author's port below still
+                        // runs once for this exact query.
+                        if let Some(dependency) = dependency {
+                            if !self
+                                .decline(&source, job, inbox, dependency.author, dependency.head)
+                                .await?
+                            {
+                                return Ok(());
+                            }
+                        }
                         if dependency.is_some_and(|head| {
                             head.author != self.peer && head.author != self.node
                         }) {
@@ -1464,9 +2646,30 @@ impl Flow {
                         "required current evidence is unavailable",
                     ));
                 }
-                if matches!(result.status, Status::Busy | Status::EvidenceUnavailable) {
+                if result.status == Status::Busy {
+                    // Busy did not end the admitted request. Keep the exact body/page and its
+                    // continuation in this Flow; the actor parks the round and the port's Busy
+                    // edge retries this same owner. In particular, do not checkpoint/pause the
+                    // shipped archive request and require a person to resume work the peer only
+                    // deferred.
+                    // A Busy delivery may follow a committed body append but precede its
+                    // body_ready handoff (authorization/ACK metadata can yield). Preserve Busy
+                    // pacing and rebind this exact body from disk on the next allowed turn.
+                    let retry = Task {
+                        operation: if body {
+                            Operation::ResumeWire(query)
+                        } else {
+                            task.operation.clone()
+                        },
+                        ..task
+                    };
+                    self.push(retry)?;
+                    self.waiting = true;
+                    return Ok(());
+                }
+                if result.status == Status::EvidenceUnavailable {
                     if self.archive && body {
-                        self.finish_archive(job).await?;
+                        self.finish_archive_owned(job, &task, retry_task).await?;
                         self.tasks.clear();
                     } else {
                         self.push(task)?;
@@ -1475,37 +2678,58 @@ impl Flow {
                     return Ok(());
                 }
                 if self.archive && body {
-                    if result.body_ready.is_none() {
-                        // The one requested quantum ended. Its exact body/page continuation is
-                        // already durable; only a new explicit Resume may request more bytes.
-                        self.finish_archive(job).await?;
-                        self.tasks.clear();
-                        return Ok(());
-                    }
-                    let staging = self
-                        .history
-                        .as_ref()
-                        .ok_or(Error::Profile("archive staging missing"))?;
-                    let state = inspect(&staging.context, job)
-                        .await?
-                        .ok_or(Error::Profile("archive state missing"))?;
-                    if let Some(body) = &state.state().body {
-                        self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
-                        self.archive_wire_bytes =
-                            self.archive_wire_bytes.saturating_add(body.length);
+                    if let Some((head, seq, _)) = result.role_ready {
+                        self.archive_next = seq
+                            .checked_sub(1)
+                            .filter(|next| matches!(query, Query::Page { lo, .. } if *next >= lo));
                         self.push(Task {
                             request: wire_request,
                             purpose: Purpose::History,
                             operation: Operation::Local(LocalStep::Entry {
                                 request: wire_request,
-                                head: state.state().bounds.head,
-                                seq: body.seq,
-                                body: true,
+                                head,
+                                seq,
+                                body: false,
+                                role_header: true,
                                 phase: EntryPhase::Start,
                             }),
                         })?;
+                    } else if result.body_ready.is_none() {
+                        // The one requested quantum ended. Its exact body/page continuation is
+                        // already durable; only a new explicit Resume may request more bytes.
+                        self.finish_archive_owned(job, &task, retry_task).await?;
+                        self.tasks.clear();
+                        return Ok(());
+                    } else {
+                        let staging = self
+                            .history
+                            .as_ref()
+                            .ok_or(Error::Profile("archive staging missing"))?;
+                        let state = inspect(&staging.context, job)
+                            .await?
+                            .ok_or(Error::Profile("archive state missing"))?;
+                        if let Some(body) = &state.state().body {
+                            self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
+                            self.archive_wire_bytes =
+                                self.archive_wire_bytes.saturating_add(body.length);
+                            self.push(Task {
+                                request: wire_request,
+                                purpose: Purpose::History,
+                                operation: Operation::Local(LocalStep::Entry {
+                                    request: wire_request,
+                                    head: state.state().bounds.head,
+                                    seq: body.seq,
+                                    body: true,
+                                    role_header: false,
+                                    phase: EntryPhase::Start,
+                                }),
+                            })?;
+                        }
                     }
                 }
+                // No demand helper follows these derived tasks. In particular a role-only
+                // header needs no body inspect after its exact Local continuation was pushed.
+                *retry_task = None;
                 for query in result.needs.into_iter().rev() {
                     self.push(Task {
                         request: task.request,
@@ -1548,6 +2772,9 @@ impl Flow {
             }
             Operation::Local(step) => {
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
+                // The returned next/need now owns the continuation. Archive finalization
+                // installs its own retry instead of duplicating a next phase pushed below.
+                *retry_task = None;
                 if let Some(next) = result.next {
                     if matches!(next, LocalStep::Entry { head, seq, phase: EntryPhase::Effect(_), .. }
                         if self.live_unavailable == Some((head, seq)))
@@ -1586,7 +2813,35 @@ impl Flow {
                         self.push(continuation)?;
                     }
                 }
+                if let Some(pressure) = result.byte_pressure {
+                    // The exact local continuation was retained above. Its worker and temporary
+                    // buffers must leave before the actor starts the byte-release handoff.
+                    self.byte_pressure = Some(pressure);
+                    self.waiting = true;
+                    return Ok(());
+                }
                 if result.busy {
+                    // Local admission deliberately collapses disk pressure and an occupied
+                    // sparse publication into `busy`. Recover the durable distinction here,
+                    // after retaining this exact continuation: a newer local task must not
+                    // park ahead of an older task in this Flow that owns the publication.
+                    // No-owner remains ordinary capacity waiting; another Flow's owner is
+                    // left untouched and its completion is the causal room wake.
+                    let owner = source
+                        .read(job, 0, |channel, store| {
+                            Ok(Some(channel.history_publication_request(store)?))
+                        })
+                        .await?;
+                    if let Lookup::Found(owner) = owner {
+                        if let Some(owner) = owner.value.filter(|owner| *owner != task.request) {
+                            if self.prioritize_publication_owner(owner) {
+                                self.publication_owner_wait = None;
+                                return Ok(());
+                            }
+                            self.publication_wait = true;
+                            self.publication_owner_wait = Some(owner);
+                        }
+                    }
                     self.waiting = true;
                     return Ok(());
                 }
@@ -1623,7 +2878,7 @@ impl Flow {
                             return Err(Error::MalformedAtRest("body dependency has no entry"));
                         };
                         if task.purpose == Purpose::History {
-                            self.finish_archive(job).await?;
+                            self.finish_archive_owned(job, &task, retry_task).await?;
                             self.tasks.clear();
                         } else {
                             self.push(Task {
@@ -1656,6 +2911,7 @@ impl Flow {
                                 head,
                                 seq,
                                 body: false,
+                                role_header: false,
                                 phase: EntryPhase::Start,
                             }),
                         })?;
@@ -1689,7 +2945,7 @@ impl Flow {
                     && self.tasks.is_empty()
                     && !self.archive_continue(job).await?
                 {
-                    self.finish_archive(job).await?;
+                    self.finish_archive_owned(job, &task, retry_task).await?;
                 }
             }
             Operation::ReclaimUnavailable => {
@@ -1701,6 +2957,10 @@ impl Flow {
                 if !self.reclaim_stage(Purpose::Live, job, true).await? {
                     self.push(task)?;
                 }
+            }
+            Operation::FinishArchive => {
+                self.finish_archive(job).await?;
+                self.tasks.clear();
             }
             Operation::Governance => {
                 let generation = self.generation;
@@ -1915,67 +3175,100 @@ impl Flow {
         Ok(true)
     }
 
+    async fn finish_archive_owned(
+        &mut self,
+        job: &Job,
+        task: &Task,
+        retry_task: &mut Option<Task>,
+    ) -> Result<()> {
+        *retry_task = Some(Task {
+            operation: Operation::FinishArchive,
+            ..task.clone()
+        });
+        self.finish_archive(job).await
+    }
+
     async fn finish_archive(&mut self, job: &Job) -> Result<()> {
         let Some(staging) = self.history.clone() else {
             return Ok(());
         };
         let job = job.clone();
         let next = self.archive_next;
-        self.archive_status = Some(
-            tokio::task::spawn_blocking(
-                move || -> Result<crate::node::api::HistoryDemandStatus> {
-                    let mut snapshot = demand::inspect(&staging.context, &job)?
-                        .ok_or(Error::Profile("archive state missing"))?;
-                    let mut active = staging
-                        .active
-                        .lock()
-                        .map_err(|_| Error::Profile("history activation lock failed"))?;
-                    if snapshot.state().body.is_none() && !snapshot.state().reclaiming() {
-                        if let Some(next) = next {
-                            let state = snapshot.state();
-                            let cursor = (next >= state.bounds.lo && state.remaining > 0)
-                                .then_some(super::Continuation {
-                                    query_kind: 4,
-                                    head: state.bounds.head,
-                                    lo: state.bounds.lo,
-                                    hi: state.bounds.hi,
-                                    next_seq: next,
-                                    entry: None,
-                                    offset: 0,
-                                    entries_remaining: state.remaining,
-                                });
-                            demand::checkpoint(
-                                &staging.context,
-                                &mut active,
-                                if cursor.is_some() {
-                                    demand::Progress::More
-                                } else {
-                                    demand::Progress::Complete
-                                },
-                                cursor.as_ref(),
-                                &job,
-                            )?;
-                            snapshot = demand::inspect(&staging.context, &job)?
-                                .ok_or(Error::Profile("archive state missing"))?;
-                        }
-                    }
-                    if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
-                        // This explicit quantum has ended; no worker will silently retry it.
-                        // Keep its exact body/cursor and make Resume the next action.
-                        demand::pause(&staging.context, &mut active, &job)?;
-                        snapshot = demand::inspect(&staging.context, &job)?
+        let initial = self.own_recovery_checkpoint;
+        let (status, progressed) = tokio::task::spawn_blocking(
+            move || -> Result<(crate::node::api::HistoryDemandStatus, bool)> {
+                let mut snapshot = demand::inspect(&staging.context, &job)?
+                    .ok_or(Error::Profile("archive state missing"))?;
+                let mut active = staging
+                    .active
+                    .lock()
+                    .map_err(|_| Error::Profile("history activation lock failed"))?;
+                if snapshot.state().request != active.request()
+                    || snapshot.state().binding != active.binding()
+                {
+                    return Err(Error::Profile("archive finalization activation changed"));
+                }
+                // Role-only admission can already have completed this request. A terminal
+                // or deliberately paused activation is a durable result, never permission
+                // to checkpoint again through an invalid live handle.
+                if active.matches(snapshot.state())
+                    && snapshot.state().body.is_none()
+                    && !snapshot.state().reclaiming()
+                {
+                    if let Some(next) = next {
+                        // This branch ends More/Complete, so it never needs a subsequent
+                        // pause. Prepay only its work and single reload before the commit.
+                        let work = demand::AdmissionCharge::reserve(&job)?;
+                        let reload = demand::AdmissionCharge::reserve(&job)?;
+                        let state = snapshot.state();
+                        let cursor = (next >= state.bounds.lo && state.remaining > 0).then_some(
+                            super::Continuation {
+                                query_kind: 4,
+                                head: state.bounds.head,
+                                lo: state.bounds.lo,
+                                hi: state.bounds.hi,
+                                next_seq: next,
+                                entry: None,
+                                offset: 0,
+                                entries_remaining: state.remaining,
+                            },
+                        );
+                        demand::checkpoint_precharged(
+                            &staging.context,
+                            &mut active,
+                            if cursor.is_some() {
+                                demand::Progress::More
+                            } else {
+                                demand::Progress::Complete
+                            },
+                            cursor.as_ref(),
+                            &work,
+                        )?;
+                        snapshot = demand::inspect_precharged(&staging.context, reload)?
                             .ok_or(Error::Profile("archive state missing"))?;
                     }
-                    Ok(crate::node::actor::saved_history_status(
-                        snapshot.state(),
-                        None,
-                        Some(&active),
-                    ))
-                },
-            )
-            .await
-            .map_err(|_| Error::Profile("history status worker stopped"))??,
-        );
+                }
+                if snapshot.state().progress(Some(&active)) == demand::Progress::Pending {
+                    let work = demand::AdmissionCharge::reserve(&job)?;
+                    let reload = demand::AdmissionCharge::reserve(&job)?;
+                    // This explicit quantum has ended; no worker will silently retry it.
+                    // Keep its exact body/cursor and make Resume the next action.
+                    demand::pause_precharged(&staging.context, &mut active, &work)?;
+                    snapshot = demand::inspect_precharged(&staging.context, reload)?
+                        .ok_or(Error::Profile("archive state missing"))?;
+                }
+                let progressed =
+                    initial.is_some_and(|old| old != OwnRecoveryCheckpoint::of(snapshot.state()));
+                Ok((
+                    crate::node::actor::saved_history_status(snapshot.state(), None, Some(&active)),
+                    progressed,
+                ))
+            },
+        )
+        .await
+        .map_err(|_| Error::Profile("history status worker stopped"))??;
+        self.archive_status = Some(status);
+        self.own_recovery_progress = progressed;
         Ok(())
     }
 }

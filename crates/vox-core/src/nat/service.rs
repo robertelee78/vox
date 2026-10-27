@@ -58,7 +58,7 @@ use crate::nat::record::{
 };
 use crate::nat::store::{RendezvousStore, Source, MAX_AUTHORS_PER_BUCKET, MAX_PREJOIN_PER_CHANNEL};
 use crate::time::Clock;
-use crate::transport::framing::{read_frame, write_frame};
+use crate::transport::framing::{read_frame, read_frame_until, write_frame};
 use crate::transport::quic::{close_code, VoxConnection};
 use crate::transport::streams::{open_typed, StreamKind};
 use crate::wire::{parse_frame, StructTag};
@@ -223,6 +223,10 @@ pub enum RejectReason {
     /// (V030-14, #520). Its own code, so a refused replay of a departed member's admission says
     /// why.
     Withdrawn = 7,
+    /// The signed publication time is outside the board's accepted clock window. Distinct from
+    /// generic policy so a publisher does not proceed as though the record landed and later blame
+    /// the responder's authentication when the board never authorized it.
+    Clock = 8,
 }
 
 impl RejectReason {
@@ -235,6 +239,7 @@ impl RejectReason {
             5 => Some(Self::UnknownKind),
             6 => Some(Self::Stale),
             7 => Some(Self::Withdrawn),
+            8 => Some(Self::Clock),
             _ => None,
         }
     }
@@ -251,6 +256,7 @@ impl RejectReason {
             Self::UnknownKind => "rejected: unknown record kind",
             Self::Stale => "rejected: the board holds a newer record from that author",
             Self::Withdrawn => "rejected: withdrawn, its author left the room",
+            Self::Clock => "rejected: timestamp is outside the board's accepted clock window",
         }
     }
 
@@ -261,6 +267,9 @@ impl RejectReason {
             Error::RendezvousRejected(s) if s.ends_with("at capacity") => Self::Capacity,
             Error::RendezvousRejected(s) if s.starts_with("non-increasing") => Self::Stale,
             Error::RendezvousRejected("withdrawn") => Self::Withdrawn,
+            Error::RendezvousRejected(
+                "timestamp too far in the future" | "record already expired",
+            ) => Self::Clock,
             Error::RendezvousRejected(_) => Self::Policy,
             _ => Self::Malformed,
         }
@@ -612,6 +621,74 @@ fn computer_verifier(
     ])
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistrationEvent {
+    Pending,
+    Registered,
+    Removed,
+}
+
+struct RegistrationWaiters {
+    changed: tokio::sync::watch::Sender<RegistrationEvent>,
+    waiting: usize,
+}
+
+type RegistrationKey = (Digest32, Digest32);
+type RegistrationEvents = Arc<Mutex<BTreeMap<RegistrationKey, RegistrationWaiters>>>;
+
+struct ComputerRevocation {
+    expires_ms: u64,
+    source: Source,
+}
+
+/// Test-only exact publication hold: owner arm, held registration, release socket, waiting
+/// redeemer marker, apparatus fault. Normal builds contain neither the name nor the hook.
+#[cfg(feature = "test-knobs")]
+const TEST_HOLD_COMPUTER_REGISTRATION: &str = "VOX_TEST_HOLD_COMPUTER_REGISTRATION_FILE";
+
+#[cfg(feature = "test-knobs")]
+fn registration_proof_files() -> Option<[std::path::PathBuf; 5]> {
+    std::env::var(TEST_HOLD_COMPUTER_REGISTRATION)
+        .ok()?
+        .split('\t')
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()
+}
+
+#[cfg(feature = "test-knobs")]
+fn registration_proof_fault(files: &[std::path::PathBuf; 5], words: &str) -> ! {
+    let _ = std::fs::write(&files[4], words);
+    eprintln!("APPARATUS: computer registration hold: {words}");
+    std::process::exit(70);
+}
+
+#[cfg(feature = "test-knobs")]
+fn registration_proof_key((owner, registration): RegistrationKey) -> Vec<u8> {
+    [owner.as_slice(), registration.as_slice()].concat()
+}
+
+/// A scoped interest in one exact registration. Cancellation removes the last registry entry;
+/// neither a dead stream nor an absent owner leaves an event cell behind.
+struct RegistrationWaiter {
+    key: RegistrationKey,
+    events: RegistrationEvents,
+    changed: tokio::sync::watch::Receiver<RegistrationEvent>,
+}
+
+impl Drop for RegistrationWaiter {
+    fn drop(&mut self) {
+        let mut events = lock(&self.events);
+        if let Some(entry) = events.get_mut(&self.key) {
+            entry.waiting -= 1;
+            if entry.waiting == 0 {
+                events.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// The server side: a [`RendezvousStore`] behind a lock, the membership oracle
 /// and a clock. Clone-cheap (`Arc`s) so one service serves every connection.
 #[derive(Clone)]
@@ -627,6 +704,12 @@ pub struct RendezvousService {
     rooms: AnchorRooms,
     computer_anchor: Option<Digest32>,
     computer_registrations: Arc<Mutex<BTreeMap<(Digest32, Digest32), ComputerRegistration>>>,
+    /// Authenticated revocations retain the admitted source and already-known lifetime. Active
+    /// and unexpired revoked entries share the existing admission budgets: cancellation moves
+    /// the same reservation, so recent revocations may cause a new capacity refusal. Unknown
+    /// registrations, including after restart, never acquire an invented expiry or reservation.
+    computer_revocations: Arc<Mutex<BTreeMap<RegistrationKey, ComputerRevocation>>>,
+    computer_registration_events: RegistrationEvents,
 }
 
 /// Whether a record by `author` that the board took credits its room to the source it came from
@@ -663,6 +746,8 @@ impl RendezvousService {
             rooms: AnchorRooms::Held,
             computer_anchor: None,
             computer_registrations: Arc::new(Mutex::new(BTreeMap::new())),
+            computer_revocations: Arc::new(Mutex::new(BTreeMap::new())),
+            computer_registration_events: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -677,7 +762,7 @@ impl RendezvousService {
     /// node's status. A node that holds rooms files their geneses itself (see
     /// [`RendezvousService::handle_local`]); a peer never needs to give it one.
     pub fn serve_rooms(&mut self, rooms: AnchorRooms) {
-        lock(&self.computer_registrations).retain(|(owner, _), record| {
+        lock(&self.computer_registrations).retain(|key @ (owner, _), record| {
             let permitted = match &rooms {
                 AnchorRooms::Anyone => true,
                 AnchorRooms::CreatedBy(identities) => identities.contains(owner),
@@ -685,6 +770,7 @@ impl RendezvousService {
             };
             if !permitted {
                 record.expiry.send_replace(None);
+                self.registration_changed(*key, RegistrationEvent::Removed);
             }
             permitted
         });
@@ -707,6 +793,141 @@ impl RendezvousService {
     /// Bind transport registrations to this authenticated network identity.
     pub(crate) fn computer_anchor(&mut self, identity: Digest32) {
         self.computer_anchor = Some(identity);
+    }
+
+    fn registration_waiter(&self, key: RegistrationKey) -> RegistrationWaiter {
+        let mut events = lock(&self.computer_registration_events);
+        let entry = events.entry(key).or_insert_with(|| RegistrationWaiters {
+            changed: tokio::sync::watch::channel(RegistrationEvent::Pending).0,
+            waiting: 0,
+        });
+        entry.waiting += 1;
+        RegistrationWaiter {
+            key,
+            events: Arc::clone(&self.computer_registration_events),
+            changed: entry.changed.subscribe(),
+        }
+    }
+
+    fn registration_changed(&self, key: RegistrationKey, event: RegistrationEvent) {
+        if let Some(entry) = lock(&self.computer_registration_events).get(&key) {
+            entry.changed.send_replace(event);
+        }
+    }
+
+    fn computer_registration_permitted(&self, owner: &Digest32) -> bool {
+        self.computer_anchor.is_some()
+            && match &self.rooms {
+                AnchorRooms::Anyone => true,
+                AnchorRooms::CreatedBy(identities) => identities.contains(owner),
+                AnchorRooms::Held => false,
+            }
+    }
+
+    fn registration_revoked(&self, key: RegistrationKey) -> bool {
+        let now = (self.clock)();
+        let mut revoked = lock(&self.computer_revocations);
+        revoked.retain(|_, record| record.expires_ms > now);
+        revoked.contains_key(&key)
+    }
+
+    #[cfg(feature = "test-knobs")]
+    async fn hold_registration_for_proof(&self, key: RegistrationKey, send: &SendStream) {
+        let Some(files) = registration_proof_files() else {
+            return;
+        };
+        if std::fs::read(&files[0]).ok().as_deref() != Some(key.0.as_slice())
+            || std::fs::remove_file(&files[0]).is_err()
+        {
+            return;
+        }
+        let _ = std::fs::remove_file(&files[2]);
+        let listener = tokio::net::UnixListener::bind(&files[2]).unwrap_or_else(|error| {
+            registration_proof_fault(&files, &format!("release socket: {error}"))
+        });
+        std::fs::write(&files[1], registration_proof_key(key)).unwrap_or_else(|error| {
+            registration_proof_fault(&files, &format!("held marker: {error}"))
+        });
+        tokio::select! {
+            _ = listener.accept() => {},
+            _ = send.stopped() => {},
+        }
+        let _ = std::fs::remove_file(&files[1]);
+        let _ = std::fs::remove_file(&files[2]);
+    }
+
+    #[cfg(feature = "test-knobs")]
+    fn mark_registration_waiting_for_proof(&self, key: RegistrationKey) {
+        let Some(files) = registration_proof_files() else {
+            return;
+        };
+        let exact = registration_proof_key(key);
+        if std::fs::read(&files[1]).ok().as_deref() != Some(exact.as_slice()) {
+            return;
+        }
+        if let Ok(previous) = std::fs::read(&files[3]) {
+            if previous != exact {
+                registration_proof_fault(&files, "waiting marker named another registration");
+            }
+        } else {
+            std::fs::write(&files[3], exact).unwrap_or_else(|error| {
+                registration_proof_fault(&files, &format!("waiting marker: {error}"))
+            });
+        }
+    }
+
+    #[cfg(feature = "test-knobs")]
+    fn mark_registration_revoked_for_proof(&self, key: RegistrationKey) {
+        let Some(files) = registration_proof_files() else {
+            return;
+        };
+        let exact = registration_proof_key(key);
+        if std::fs::read(&files[3]).ok().as_deref() != Some(exact.as_slice()) {
+            return;
+        }
+        std::fs::write(files[3].with_extension("revoked"), exact).unwrap_or_else(|error| {
+            registration_proof_fault(&files, &format!("revoked marker: {error}"))
+        });
+    }
+
+    /// The invitation can reach its holder before the owner's independent publication reaches
+    /// this anchor. Absence is pending publication, not a token/policy refusal. Park this one
+    /// request on its exact event; no history worker, Management slot or registry lock is held.
+    /// The caller's receive-half cancellation stops our send half and drops the scoped waiter.
+    async fn await_registration(&self, key: RegistrationKey, send: &SendStream) -> bool {
+        // A service which cannot admit this owner's publication has an actual policy refusal,
+        // not pending work. Let the normal one-shot validation return that refusal immediately.
+        if !self.computer_registration_permitted(&key.0) {
+            return true;
+        }
+        let mut waiter = self.registration_waiter(key);
+        loop {
+            // Subscribe before checking absence, so publication cannot be lost between the
+            // predicate and the wait. An existing entry, including an expired one, proceeds to
+            // the ordinary policy check exactly once; actual refusals are never retried.
+            let event = *waiter.changed.borrow_and_update();
+            if lock(&self.computer_registrations).contains_key(&key)
+                || self.registration_revoked(key)
+                || event != RegistrationEvent::Pending
+            {
+                return true;
+            }
+            #[cfg(feature = "test-knobs")]
+            {
+                self.mark_registration_waiting_for_proof(key);
+                if std::env::var("VOX_TEST_FX28_MUTANT").as_deref()
+                    == Ok("redeem-rejects-pending-registration")
+                {
+                    return true;
+                }
+            }
+            tokio::select! {
+                _ = send.stopped() => return false,
+                changed = waiter.changed.changed() => {
+                    if changed.is_err() { return false; }
+                }
+            }
+        }
     }
 
     /// Whether this identity may open a circuit stream for its already-redeemed pair.
@@ -751,15 +972,18 @@ impl RendezvousService {
         let anchor = self.computer_anchor.ok_or(RejectReason::Policy)?;
         let now = (self.clock)();
         let mut records = lock(&self.computer_registrations);
-        records.retain(|_, r| {
+        let mut revoked = lock(&self.computer_revocations);
+        revoked.retain(|_, record| record.expires_ms > now);
+        records.retain(|key, r| {
             if r.expires_ms <= now {
                 r.expiry.send_replace(None);
+                self.registration_changed(*key, RegistrationEvent::Removed);
                 false
             } else {
                 true
             }
         });
-        match request {
+        let outcome = match request {
             RendezvousRequest::ComputerRegister {
                 anchor: expected,
                 registration,
@@ -767,12 +991,9 @@ impl RendezvousService {
                 expires_ms,
                 peer,
             } => {
-                let permitted = match &self.rooms {
-                    AnchorRooms::Anyone => true,
-                    AnchorRooms::CreatedBy(identities) => identities.contains(&owner),
-                    AnchorRooms::Held => false,
-                };
+                let permitted = self.computer_registration_permitted(&owner);
                 if !permitted
+                    || revoked.contains_key(&(owner, *registration))
                     || *expected != anchor
                     || peer.as_ref() == Some(&owner)
                     || *expires_ms <= now
@@ -791,16 +1012,28 @@ impl RendezvousService {
                     }
                     r.expires_ms = *expires_ms;
                     r.expiry.send_replace(Some(*expires_ms));
+                    self.registration_changed(
+                        (owner, *registration),
+                        RegistrationEvent::Registered,
+                    );
                     return Ok(());
                 }
                 let source = source.ok_or(RejectReason::Policy)?;
-                if records.len() >= MAX_COMPUTER_REGISTRATIONS
+                // The original registration reserved its retained lifetime, not merely its
+                // active interval. Moving it to revocations cannot create free admission slots
+                // while still retaining its evidence and source/accounting cost.
+                if records.len() + revoked.len() >= MAX_COMPUTER_REGISTRATIONS
                     || records.keys().filter(|(id, _)| *id == owner).count()
+                        + revoked.keys().filter(|(id, _)| *id == owner).count()
                         >= MAX_COMPUTER_REGISTRATIONS_PER_OWNER
                     || records
                         .values()
                         .filter(|r| r.source.level(0) == source.level(0))
                         .count()
+                        + revoked
+                            .values()
+                            .filter(|r| r.source.level(0) == source.level(0))
+                            .count()
                         >= MAX_COMPUTER_REGISTRATIONS_PER_SOURCE
                 {
                     return Err(RejectReason::Capacity);
@@ -823,7 +1056,7 @@ impl RendezvousService {
                 registration,
                 token,
             } => {
-                if owner == *target {
+                if owner == *target || revoked.contains_key(&(*target, *registration)) {
                     return Err(RejectReason::Policy);
                 }
                 let r = records
@@ -839,12 +1072,43 @@ impl RendezvousService {
             }
             RendezvousRequest::ComputerRevoke { registration } => {
                 if let Some(r) = records.remove(&(owner, *registration)) {
+                    revoked
+                        .entry((owner, *registration))
+                        .and_modify(|held| held.expires_ms = held.expires_ms.max(r.expires_ms))
+                        .or_insert(ComputerRevocation {
+                            expires_ms: r.expires_ms,
+                            source: r.source,
+                        });
                     r.expiry.send_replace(None);
+                    #[cfg(feature = "test-knobs")]
+                    self.mark_registration_revoked_for_proof((owner, *registration));
                 }
                 Ok(())
             }
             _ => Err(RejectReason::Malformed),
+        };
+        // Publish under the same record lock as the transition. Otherwise a delayed Register
+        // event could overwrite a later Revoke event and strand an exact missing-record waiter.
+        // Waiter subscription releases the event lock before taking records; Drop takes only
+        // events, so records -> revocations -> events never crosses an inverse acquisition or
+        // an await. The revocation ledger uses only each already-recorded lease's expiry.
+        if outcome.is_ok() {
+            match request {
+                RendezvousRequest::ComputerRegister { registration, .. } => {
+                    self.registration_changed(
+                        (owner, *registration),
+                        RegistrationEvent::Registered,
+                    );
+                }
+                RendezvousRequest::ComputerRevoke { registration } => {
+                    self.registration_changed((owner, *registration), RegistrationEvent::Removed);
+                }
+                _ => {}
+            }
         }
+        drop(revoked);
+        drop(records);
+        outcome
     }
 
     /// Be told when a record by an author **other than this node** is admitted.
@@ -921,7 +1185,8 @@ impl RendezvousService {
             RendezvousRequest::ComputerRegister { .. }
             | RendezvousRequest::ComputerRedeem { .. }
             | RendezvousRequest::ComputerRevoke { .. } => {
-                vec![match self.computer_request(publisher, source, request) {
+                let outcome = self.computer_request(publisher, source, request);
+                vec![match outcome {
                     Ok(()) => RendezvousResponse::Accepted,
                     Err(reason) => RendezvousResponse::Rejected(reason),
                 }]
@@ -1153,11 +1418,16 @@ impl RendezvousService {
                 use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
                 let w =
                     BoardWithdraw::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                // A withdrawal is permanent negative state, so a rejected future-dated pre-join
+                // must not return after a crash as a future tombstone which blocks a corrected
+                // join. Check before both the authenticated and pending-withdraw paths mutate.
+                crate::nat::store::check_clock_sanity(w.timestamp_ms, now)
+                    .map_err(|e| RejectReason::for_error(&e))?;
                 let mut store = lock(&self.store);
                 let key = match w.scope {
-                    WithdrawScope::Member => {
-                        self.known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
-                    }
+                    WithdrawScope::Member => self
+                        .known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
+                        .or_else(|| store.prejoin_key(&w.channel_id, &w.author_id, now).cloned()),
                     // The creator, or a member its current roster names: an admin whose admin
                     // was taken back is refused.
                     WithdrawScope::Room => {
@@ -1294,6 +1564,27 @@ impl RendezvousService {
                     return Err(e);
                 }
             };
+            drop(frame);
+            #[cfg(feature = "test-knobs")]
+            if let RendezvousRequest::ComputerRegister { registration, .. } = &request {
+                self.hold_registration_for_proof((publisher, *registration), &send)
+                    .await;
+            }
+            if let RendezvousRequest::ComputerRedeem {
+                owner,
+                registration,
+                ..
+            } = &request
+            {
+                if *owner != publisher
+                    && !self
+                        .await_registration((*owner, *registration), &send)
+                        .await
+                {
+                    request.clear_transport_secret();
+                    return Ok(());
+                }
+            }
             let responses = self.handle(Some(&publisher), Some(source), &request);
             request.clear_transport_secret();
             for response in responses {
@@ -1311,6 +1602,18 @@ fn reset(send: &mut SendStream, recv: &mut RecvStream, err: &Error) {
     let code = close_code(wire_error_for(err));
     let _ = send.reset(code);
     let _ = recv.stop(code);
+}
+
+async fn write_transport_frame_until(
+    send: &mut SendStream,
+    frame: &[u8],
+    deadline: std::time::Instant,
+) -> Result<()> {
+    tokio::time::timeout_at(deadline.into(), write_frame(send, frame))
+        .await
+        .map_err(|_| {
+            Error::Unreachable("computer transport request reached its owner's deadline")
+        })?
 }
 
 /// The client side of one rendezvous stream.
@@ -1333,7 +1636,20 @@ impl RendezvousClient {
         RendezvousResponse::from_frame(&frame)
     }
 
+    async fn next_response_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<RendezvousResponse> {
+        let frame = read_frame_until(&mut self.recv, MAX_RENDEZVOUS_FRAME, deadline)
+            .await?
+            .ok_or(Error::MalformedRendezvous("rendezvous stream closed early"))?;
+        RendezvousResponse::from_frame(&frame)
+    }
+
     /// Register/renew only this authenticated connection's computer identity at this anchor.
+    // The authenticated anchor/owner, exact capability and existing caller deadline form one
+    // registration; keep the time owner explicit rather than introducing a hidden stage budget.
+    #[allow(clippy::too_many_arguments)]
     pub async fn register_computer_transport(
         &mut self,
         anchor: Digest32,
@@ -1342,14 +1658,18 @@ impl RendezvousClient {
         token: &Digest32,
         expires_ms: u64,
         peer: Option<Digest32>,
+        deadline: std::time::Instant,
     ) -> Result<()> {
-        self.computer_transport_request(RendezvousRequest::ComputerRegister {
-            anchor,
-            registration,
-            verifier: computer_verifier(&anchor, &owner, &registration, token),
-            expires_ms,
-            peer,
-        })
+        self.computer_transport_request(
+            RendezvousRequest::ComputerRegister {
+                anchor,
+                registration,
+                verifier: computer_verifier(&anchor, &owner, &registration, token),
+                expires_ms,
+                peer,
+            },
+            deadline,
+        )
         .await
     }
 
@@ -1359,32 +1679,45 @@ impl RendezvousClient {
         owner: Digest32,
         registration: Digest32,
         token: &Digest32,
+        deadline: std::time::Instant,
     ) -> Result<()> {
-        self.computer_transport_request(RendezvousRequest::ComputerRedeem {
-            owner,
-            registration,
-            token: *token,
-        })
+        self.computer_transport_request(
+            RendezvousRequest::ComputerRedeem {
+                owner,
+                registration,
+                token: *token,
+            },
+            deadline,
+        )
         .await
     }
 
     /// Revoke this authenticated connection's own registration and any relays using it.
-    pub async fn revoke_computer_transport(&mut self, registration: Digest32) -> Result<()> {
-        self.computer_transport_request(RendezvousRequest::ComputerRevoke { registration })
-            .await
+    pub async fn revoke_computer_transport(
+        &mut self,
+        registration: Digest32,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        self.computer_transport_request(
+            RendezvousRequest::ComputerRevoke { registration },
+            deadline,
+        )
+        .await
     }
 
     /// Read the counterpart of this connection's own registration, never another owner's.
     pub async fn computer_transport_peer(
         &mut self,
         registration: Digest32,
+        deadline: std::time::Instant,
     ) -> Result<Option<Digest32>> {
-        write_frame(
+        write_transport_frame_until(
             &mut self.send,
             &RendezvousRequest::ComputerPeer { registration }.to_frame(),
+            deadline,
         )
         .await?;
-        match self.next_response().await? {
+        match self.next_response_until(deadline).await? {
             RendezvousResponse::ComputerPeer(peer) => Ok(peer),
             RendezvousResponse::Rejected(r) => Err(Error::RendezvousRejected(r.as_str())),
             _ => Err(Error::MalformedRendezvous(
@@ -1393,11 +1726,15 @@ impl RendezvousClient {
         }
     }
 
-    async fn computer_transport_request(&mut self, mut request: RendezvousRequest) -> Result<()> {
+    async fn computer_transport_request(
+        &mut self,
+        mut request: RendezvousRequest,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
         let bytes = zeroize::Zeroizing::new(request.to_frame());
         request.clear_transport_secret();
-        write_frame(&mut self.send, &bytes).await?;
-        match self.next_response().await? {
+        write_transport_frame_until(&mut self.send, &bytes, deadline).await?;
+        match self.next_response_until(deadline).await? {
             RendezvousResponse::Accepted => Ok(()),
             RendezvousResponse::Rejected(r) => Err(Error::RendezvousRejected(r.as_str())),
             _ => Err(Error::MalformedRendezvous(

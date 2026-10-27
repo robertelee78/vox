@@ -160,6 +160,18 @@ fn vox(
     args: &[&str],
     stdin: Option<&str>,
 ) -> (bool, String, String) {
+    vox_with_env(data, cfg, args, stdin, &[])
+}
+
+/// Run the shipped binary with proof-only environment added after harness variables are stripped.
+/// The ordinary helper passes none; a proof that uses one first verifies that the binary reads it.
+fn vox_with_env(
+    data: &std::path::Path,
+    cfg: &std::path::Path,
+    args: &[&str],
+    stdin: Option<&str>,
+    extra_env: &[(&str, &std::ffi::OsStr)],
+) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
     support::strip_harness_env(&mut cmd);
     cmd.args(args)
@@ -172,6 +184,7 @@ fn vox(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    cmd.envs(extra_env.iter().copied());
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
     if support::typed::is_keyring_change(args) || args.starts_with(&["node", "rename"]) {
         let (ok, shown) = support::typed::keyring(&cmd);
@@ -830,8 +843,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
 /// is PRODUCT and quotes the daemon's own stderr (an abort there says "has overflowed its stack").
 #[test]
 fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
-    // `vox id` and the daemon's unlock, and the room key's seal: three Argon2id runs.
-    watchdog::arm_for_setup(0, 3);
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("data");
     let cfg = tmp.path().join("cfg");
@@ -909,6 +921,296 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
             "PRODUCT: the post is not in the room: {read}{err}"
         ))
     );
+    // FX-14: the person replies using the displayed entry's eight-character prefix.
+    // Mutant: answers passes re.to_owned() through instead of resolving reply_entry.
+    let root = read
+        .lines()
+        .find(|line| line.ends_with(" posted in debug"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("PRODUCT: room read did not print the posted entry hash");
+    let root_prefix = root.get(..8).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: room read printed a reply selector without an eight-character ASCII prefix: {root:?}"
+        )
+    });
+    let post = |args: &[&str]| {
+        let mut argv = vec!["room", "post", &room, "--json"];
+        argv.extend_from_slice(args);
+        let (ok, out, err) = vox(&data, &cfg, &argv, None);
+        assert!(ok, "PRODUCT: room post {args:?} failed: {out}{err}");
+        let row: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("PRODUCT: room post returned invalid JSON: {out}: {e}"));
+        row["entry_hash"]
+            .as_str()
+            .expect("PRODUCT: post named no entry")
+            .to_owned()
+    };
+    let reply = post(&["--re", root_prefix, "PREFIX-REPLY"]);
+    let (ok, rows, err) = vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(ok, "PRODUCT: read reply failed: {rows}{err}");
+    let reply_row = rows
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|error| {
+                panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+            })
+        })
+        .find(|row| row["entry_hash"] == reply)
+        .unwrap_or_else(|| panic!("PRODUCT: room read did not show reply {reply}: {rows}"));
+    assert!(
+        reply_row["envelope"]["re"] == root && reply_row["envelope"]["thread"] == root,
+        "PRODUCT: shortened reply must answer the full entry in its canonical thread: {reply_row}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "post",
+            &room,
+            "--re",
+            "777777777777",
+            "PREFIX-MISSING",
+        ],
+        None,
+    );
+    assert!(
+        !ok && err.contains("no message printed by room read matches"),
+        "PRODUCT: a missing reply prefix must name the problem: {out}{err}"
+    );
+    let (read_ok, after_missing, read_err) =
+        vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        read_ok,
+        "PRODUCT: could not read after the missing-prefix refusal: {after_missing}{read_err}"
+    );
+    assert!(
+        !after_missing.contains("PREFIX-MISSING"),
+        "PRODUCT: the missing-prefix refusal posted the rejected text: {after_missing}"
+    );
+
+    // Cross the daemon's real bounded page size. The ambiguous prefix is selected only after
+    // one matching entry is observed in the newest page and another in its older page, so a
+    // first-page-only resolver and an incomplete ambiguity report each die on this assertion.
+    for i in 0..(vox_core::node::ipc::SESSION_PAGE_ROWS + 33) {
+        post(&[&format!("PREFIX-PAGED-COLLISION-{i}")]);
+    }
+    let (newest_ok, newest_rows, newest_err) =
+        vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        newest_ok,
+        "PRODUCT: could not read the newest collision page: {newest_rows}{newest_err}"
+    );
+    let entry_ids = |rows: &str| {
+        rows.lines()
+            .map(|line| {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+                });
+                row["entry_hash"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("PRODUCT: room read row named no string entry_hash: {row}")
+                    })
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    let newest_ids = entry_ids(&newest_rows);
+    assert!(
+        newest_ids.len() == vox_core::node::ipc::SESSION_PAGE_ROWS,
+        "PRODUCT: newest room page held {} entries instead of the product bound {}: {newest_rows}",
+        newest_ids.len(),
+        vox_core::node::ipc::SESSION_PAGE_ROWS
+    );
+    let boundary = newest_ids
+        .first()
+        .expect("APPARATUS: the full newest room page had no first entry");
+    let (older_ok, older_rows, older_err) = vox(
+        &data,
+        &cfg,
+        &["room", "read", &room, "--json", "--before", boundary],
+        None,
+    );
+    assert!(
+        older_ok,
+        "PRODUCT: could not read the older collision page: {older_rows}{older_err}"
+    );
+    let older_ids = entry_ids(&older_rows);
+    assert!(
+        !older_ids.is_empty(),
+        "PRODUCT: the staged posts did not cross the room's bounded page: {older_rows}"
+    );
+    let older_first: std::collections::BTreeSet<_> = older_ids
+        .iter()
+        .filter_map(|entry| entry.chars().next())
+        .collect();
+    let ambiguous = newest_ids
+        .iter()
+        .filter_map(|entry| entry.chars().next())
+        .find(|first| older_first.contains(first))
+        .map(|first| first.to_string())
+        .expect("APPARATUS: staged newest and older pages shared no base32 prefix");
+    let collision_ids: Vec<_> = newest_ids
+        .iter()
+        .chain(&older_ids)
+        .filter(|entry| entry.starts_with(&ambiguous))
+        .cloned()
+        .collect();
+    assert!(
+        collision_ids.iter().any(|entry| newest_ids.contains(entry))
+            && collision_ids.iter().any(|entry| older_ids.contains(entry)),
+        "APPARATUS: the staged prefix {ambiguous} did not span newest and older pages"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "post",
+            &room,
+            "--re",
+            &ambiguous,
+            "PREFIX-AMBIGUOUS",
+        ],
+        None,
+    );
+    assert!(
+        !ok
+            && err.contains("entry prefix is ambiguous")
+            && collision_ids.iter().all(|entry| err.contains(entry)),
+        "PRODUCT: an ambiguous reply prefix must name every matching entry {collision_ids:?}: {out}{err}"
+    );
+    let (read_ok, after_ambiguous, read_err) =
+        vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        read_ok,
+        "PRODUCT: could not read after the ambiguous-prefix refusal: {after_ambiguous}{read_err}"
+    );
+    assert!(
+        !after_ambiguous.contains("PREFIX-AMBIGUOUS"),
+        "PRODUCT: the ambiguous-prefix refusal posted the rejected text: {after_ambiguous}"
+    );
+
+    // A unique match that exists only below the newest bounded page is still a prefix a person
+    // can use. Mutant: traverse old pages only to find collisions, then reject a sole old-page
+    // match; this reply fails or names the wrong canonical parent.
+    let all_ids = newest_ids.iter().chain(&older_ids).collect::<Vec<_>>();
+    let (older_target, older_prefix) = older_ids
+        .iter()
+        .filter(|entry| entry.as_str() != root && entry.as_str() != reply)
+        .find_map(|entry| {
+            let prefix = entry.get(..51)?;
+            (all_ids
+                .iter()
+                .filter(|candidate| candidate.starts_with(prefix))
+                .count()
+                == 1)
+                .then_some((entry.clone(), prefix.to_owned()))
+        })
+        .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
+    let older_reply = post(&["--re", &older_prefix, "PREFIX-OLDER-UNIQUE"]);
+    let (ok, older_reply_rows, err) = vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+    assert!(
+        ok,
+        "PRODUCT: room read failed after the older-page prefix reply: {older_reply_rows}{err}"
+    );
+    let older_reply_row = entry_ids(&older_reply_rows)
+        .iter()
+        .any(|entry| entry == &older_reply);
+    let canonical_parent = older_reply_rows.lines().find_map(|line| {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("PRODUCT: room read returned invalid JSON row {line:?}: {error}")
+        });
+        (row["entry_hash"] == older_reply).then_some(row)
+    });
+    let canonical_parent = canonical_parent.unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: room read omitted older-page prefix reply {older_reply}: {older_reply_rows}"
+        )
+    });
+    assert!(
+        older_reply_row
+            && canonical_parent["envelope"]["re"] == older_target
+            && canonical_parent["envelope"]["thread"] == older_target,
+        "PRODUCT: unique older-page prefix {older_prefix} did not reply to canonical parent {older_target}: {canonical_parent}"
+    );
+
+    // A multi-page selector is one logical read. Hold the shipped CLI after its first page,
+    // change the room through a second shipped CLI, then let it continue. It must refuse the
+    // stale scan and post nothing. Mutant: remove the display-revision comparison; the reply is
+    // posted against a collection that never existed as one room view.
+    #[cfg(feature = "test-knobs")]
+    {
+        test_knobs::require(&["VOX_TEST_REPLY_PREFIX_HOLD_FILE"]);
+        let (changing_target, changing_prefix) = older_ids
+            .iter()
+            .find_map(|entry| {
+                let prefix = entry.get(..51)?;
+                (all_ids
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(prefix))
+                    .count()
+                    == 1)
+                    .then_some((entry.clone(), prefix.to_owned()))
+            })
+            .expect("APPARATUS: no older printed entry had a unique 51-character prefix");
+        let hold = tmp.path().join("reply-prefix.hold");
+        let reached = hold.with_extension("reached");
+        std::fs::write(&hold, b"hold")
+            .expect("APPARATUS: could not stage the reply-prefix scan hold");
+
+        let scan_data = data.clone();
+        let scan_cfg = cfg.clone();
+        let scan_room = room.clone();
+        let scan_hold = hold.clone();
+        let scan = std::thread::spawn(move || {
+            vox_with_env(
+                &scan_data,
+                &scan_cfg,
+                &[
+                    "room",
+                    "post",
+                    &scan_room,
+                    "--re",
+                    &changing_prefix,
+                    "PREFIX-CHANGED-SCAN",
+                ],
+                None,
+                &[("VOX_TEST_REPLY_PREFIX_HOLD_FILE", scan_hold.as_os_str())],
+            )
+        });
+        while !reached.exists() {
+            assert!(
+                !scan.is_finished(),
+                "APPARATUS: reply-prefix command ended before reaching its staged first-page hold"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let changed = post(&["PREFIX-CHANGES-WHILE-SCANNED"]);
+        std::fs::remove_file(&hold)
+            .expect("APPARATUS: could not release the staged reply-prefix scan");
+        let (changed_ok, changed_out, changed_err) = scan
+            .join()
+            .expect("APPARATUS: reply-prefix command thread panicked");
+        assert!(
+            !changed_ok && changed_err.contains("room changed"),
+            "PRODUCT: reply-prefix scan accepted stale pages after room entry {changed} changed revision while resolving {changing_target}: {changed_out}{changed_err}"
+        );
+        let (read_ok, after_changed, read_err) =
+            vox(&data, &cfg, &["room", "read", &room, "--json"], None);
+        assert!(
+            read_ok && !after_changed.contains("PREFIX-CHANGED-SCAN"),
+            "PRODUCT: stale reply-prefix scan posted after the room changed: {after_changed}{read_err}"
+        );
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    {
+        let _ = writeln!(
+            std::io::stderr(),
+            "OPTIONAL PROOF NOT RUN: changing-room reply-prefix scan needs --features vox-tui/test-knobs"
+        );
+    }
     let exited = node.0.try_wait().ok().flatten();
     assert!(
         exited.is_none(),

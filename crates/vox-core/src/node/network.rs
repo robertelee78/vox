@@ -693,9 +693,10 @@ impl NodeNet {
         token: &Digest32,
         expires_ms: u64,
         peer: Option<Digest32>,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
                 .register_computer_transport(
@@ -705,6 +706,7 @@ impl NodeNet {
                     token,
                     expires_ms,
                     peer,
+                    deadline,
                 )
                 .await
         })
@@ -719,12 +721,13 @@ impl NodeNet {
         owner: Digest32,
         registration: Digest32,
         token: &Digest32,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
-                .redeem_computer_transport(owner, registration, token)
+                .redeem_computer_transport(owner, registration, token, deadline)
                 .await
         })
         .await
@@ -736,12 +739,13 @@ impl NodeNet {
         &self,
         anchor: &VoxConnection,
         registration: Digest32,
+        deadline: std::time::Instant,
     ) -> Result<()> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
-                .revoke_computer_transport(registration)
+                .revoke_computer_transport(registration, deadline)
                 .await
         })
         .await
@@ -753,12 +757,13 @@ impl NodeNet {
         &self,
         anchor: &VoxConnection,
         registration: Digest32,
+        deadline: std::time::Instant,
     ) -> Result<Option<Digest32>> {
         self.require_computer_anchor(anchor)?;
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout_at(deadline.into(), async {
             RendezvousClient::open(anchor)
                 .await?
-                .computer_transport_peer(registration)
+                .computer_transport_peer(registration, deadline)
                 .await
         })
         .await
@@ -2778,15 +2783,23 @@ impl NodeNet {
     ///
     /// `passphrase` is collected out of band by the client — never from the invite
     /// link (ADR-016).
-    pub async fn start_join(
+    /// The preparation callback must durably retain rollback covering the exact verified
+    /// proposal's epoch and timestamp before it returns: admission cannot commit until that handoff.
+    #[allow(clippy::too_many_arguments)] // authenticated exchange plus durable preparation
+    pub async fn start_join<F, Fut>(
         &self,
         conn: &VoxConnection,
         ctx: JoinContext,
         passphrase: &[u8],
         signer: &(dyn RootSigner + Send + Sync),
         ik: &X25519IdentityKey,
-    ) -> Result<JoinOutcome> {
-        run_initiator(conn, ctx, passphrase, signer, ik).await
+        prepare_before_admission: F,
+    ) -> Result<JoinOutcome>
+    where
+        F: FnOnce(crate::node::joinstream::AdmissionProposal) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        run_initiator(conn, ctx, passphrase, signer, ik, prepare_before_admission).await
     }
 
     /// Read everything the board holds for `(channel_id, epoch)`: the genesis, the

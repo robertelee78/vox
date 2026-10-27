@@ -12,6 +12,98 @@ use super::record::{EnvelopeRef, Part, Source};
 use super::storage::{Read, Tree};
 use super::text::Input;
 
+pub(super) struct Eligibility<'a> {
+    pub channel: &'a super::super::ChannelState,
+    pub view: &'a super::super::entry_store::RenderView<'a>,
+    pub now: u64,
+}
+
+/// A published locator may outlive its selected source while the bounded fold rebuilds.
+/// Retirement is proved from the exact current locator in this same snapshot, never inferred
+/// from an unrelated revision change or from a missing body alone.
+pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source) -> Result<bool> {
+    let snapshot = scope.view.snapshot();
+    let channel = scope.channel;
+    if source.position.private {
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(&source.position.hash);
+        let current = read.canonical_find(Tree::PrivateHash, &key)?;
+        let Some(descriptor) = read.canonical_find(Tree::Candidates, &source.position.key())?
+        else {
+            if current.is_some() {
+                return Err(invalid("Session metadata candidate missing"));
+            }
+            return Ok(false);
+        };
+        let bytes = read.descriptor(descriptor)?;
+        let mut d = Decoder::new(&bytes);
+        let candidate = Source::read(&mut d)?;
+        d.finish()?;
+        if candidate != source || current != Some(source.id) {
+            return Err(invalid("Session metadata candidate binding"));
+        }
+        let sealed = snapshot
+            .get_segment(&channel.channel_id, SegmentKind::PrivateSession, source.id)?
+            .ok_or_else(|| invalid("Session metadata source missing"))?;
+        if sealed.ciphertext.len()
+            > (2 * crate::node::sessionstream::MAX_RECORD).saturating_add(TAG_LEN)
+        {
+            return Err(invalid("Session metadata source exceeds record format"));
+        }
+        let bytes = open_segment(
+            &channel.sek,
+            SegmentKind::PrivateSession,
+            source.id,
+            &sealed,
+        )?;
+        let saved = super::super::private_session::Stored::read(&bytes)?;
+        let row = saved
+            .row
+            .as_ref()
+            .ok_or_else(|| invalid("Session metadata source is not readable"))?;
+        if row.entry_hash != source.position.hash
+            || row.author != source.author
+            || row.created_millis != source.position.created
+        {
+            return Err(invalid("Session metadata source binding"));
+        }
+        return Ok(!channel.private_expired(&saved, scope.now));
+    }
+    let Some(fact) = scope.view.fact(&source.position.hash)? else {
+        return Ok(false);
+    };
+    if fact.created != source.position.created {
+        return Err(invalid("Session metadata source binding"));
+    }
+    let row = scope
+        .view
+        .row(&source.position.hash)?
+        .ok_or_else(|| invalid("Session metadata source missing"))?;
+    if row.author != source.author || row.created_millis != source.position.created {
+        return Err(invalid("Session metadata source binding"));
+    }
+    let transaction = scope.view.transaction();
+    let tracked = channel
+        .retention_get_in(transaction, &source.position.hash)?
+        .ok_or_else(|| invalid("Session metadata retention missing"))?;
+    if tracked.cache_id != Some(fact.cache) {
+        return Err(invalid("Session metadata retention binding"));
+    }
+    let entry = channel
+        .entry_at(transaction, &source.position.hash)?
+        .ok_or_else(|| invalid("Session metadata entry missing"))?;
+    if entry.skeleton.channel_id != channel.channel_id || entry.skeleton.author_id != source.author
+    {
+        return Err(invalid("Session metadata source binding"));
+    }
+    if fact.cache != source.id {
+        // All replacement body, age and author bindings above remain mandatory.
+        return Ok(false);
+    }
+    let ttl = channel.entry_retention(transaction, &entry)?;
+    Ok(ttl == 0 || scope.now < tracked.base().saturating_add(ttl.saturating_mul(1000)))
+}
+
 fn invalid(why: &'static str) -> Error {
     Error::MalformedAtRest(why)
 }
@@ -65,6 +157,7 @@ pub(super) struct EnvelopeInput<'a> {
     read: &'a Read<'a>,
     envelope: EnvelopeRef,
     loaded: Option<(u64, String)>,
+    retired: bool,
 }
 
 impl<'a> EnvelopeInput<'a> {
@@ -73,6 +166,21 @@ impl<'a> EnvelopeInput<'a> {
             read,
             envelope,
             loaded: None,
+            retired: false,
+        }
+    }
+
+    pub fn retired(&self) -> bool {
+        self.retired
+    }
+
+    fn source(&mut self, source: Source) -> Result<String> {
+        match self.read.source(source)? {
+            Some(text) => Ok(text),
+            None => {
+                self.retired = true;
+                Err(Error::Profile("Session metadata source retired"))
+            }
         }
     }
 
@@ -85,7 +193,7 @@ impl<'a> EnvelopeInput<'a> {
             return Ok(());
         }
         if self.envelope.bundle.is_none() {
-            let text = self.read.source(self.envelope.first)?;
+            let text = self.source(self.envelope.first)?;
             if text.len() as u64 != self.envelope.bytes {
                 return Err(invalid("Session metadata source length changed"));
             }
@@ -115,7 +223,7 @@ impl<'a> EnvelopeInput<'a> {
         {
             return Err(invalid("Session metadata part range"));
         }
-        let text = self.read.source(part.source)?;
+        let text = self.source(part.source)?;
         let envelope = vox_agentcomms::envelope::Envelope::parse(&text)
             .map_err(|_| invalid("Session metadata part envelope changed"))?;
         if envelope.body.len() as u64 != part.bytes {

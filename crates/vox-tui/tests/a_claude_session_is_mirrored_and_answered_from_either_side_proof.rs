@@ -347,7 +347,7 @@ impl World {
 #[test]
 #[ignore = "real binary; run in release"]
 fn a_claude_sessions_activity_reaches_its_session_and_the_terminal_answer_is_said() {
-    watchdog::arm_for(Duration::from_secs(600));
+    watchdog::arm();
     let (w, _daemon, room) = World::setup();
     let work = w.root.join("work");
     let transcript = Transcript(work.join(format!("{SESSION}.jsonl")));
@@ -931,7 +931,7 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 #[test]
 #[ignore = "real binary; run in release"]
 fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
-    watchdog::arm_for(Duration::from_secs(900));
+    watchdog::arm();
     let (w, _daemon, room) = World::setup();
     let t = Tmux::new(&w, &room, "t1");
 
@@ -1457,7 +1457,7 @@ fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
 #[test]
 #[ignore = "real binary; run in release"]
 fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
-    watchdog::arm_for(Duration::from_secs(600));
+    watchdog::arm();
     let (w, _daemon, room) = World::setup();
     let work = w.root.join("work");
     let transcript = Transcript(work.join(format!("{SESSION}.jsonl")));
@@ -1943,7 +1943,7 @@ fn can_drive_becomes(
 #[test]
 #[ignore = "real binary; run in release"]
 fn drive_given_on_an_idle_session_is_held_at_once_and_taken_back_at_once() {
-    watchdog::arm_for(Duration::from_secs(600));
+    watchdog::arm();
     let (w, _daemon, room) = World::setup();
 
     // ---- (1) S9 works in the room, then is moved to a second room, where it writes nothing ----
@@ -2188,7 +2188,7 @@ fn a_full_room_recovers_and_keeps_its_session_entries() {
     }
     #[cfg(target_os = "macos")]
     {
-        watchdog::arm_for(Duration::from_secs(240));
+        watchdog::arm();
         std::fs::create_dir_all(SHORT_ROOT).expect("APPARATUS: short root");
         let tmp = tempfile::Builder::new()
             .prefix("full-")
@@ -2611,7 +2611,7 @@ fn served_to_member(
 #[test]
 #[ignore = "real binary, production Argon2id; run in release"]
 fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
-    watchdog::arm_for(Duration::from_secs(360));
+    watchdog::arm();
     let (w, _daemon, room) = World::setup();
     let transcript = w.root.join("forward-session.jsonl");
     std::fs::write(&transcript, "").expect("APPARATUS: transcript");
@@ -2762,7 +2762,7 @@ fn a_sessions_steps_start_at_the_later_of_join_and_drive() {
 #[test]
 #[ignore = "real binary, production Argon2id; run in release"]
 fn a_rejoined_author_is_not_sent_its_old_session_steps() {
-    watchdog::arm_for(Duration::from_secs(240));
+    watchdog::arm();
     let (w, _daemon, room) = World::setup();
     let transcript = w.root.join("author-rejoin.jsonl");
     std::fs::write(&transcript, "").expect("APPARATUS: author transcript");

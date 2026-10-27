@@ -350,9 +350,20 @@ pub(super) struct Read<'a> {
     room: &'a Digest32,
     pub header: Header,
     working: bool,
+    sources: Option<super::source::Eligibility<'a>>,
 }
 
 impl<'a> Read<'a> {
+    pub fn with_sources(
+        mut self,
+        channel: &'a super::super::ChannelState,
+        view: &'a super::super::entry_store::RenderView<'a>,
+        now: u64,
+    ) -> Self {
+        self.sources = Some(super::source::Eligibility { channel, view, now });
+        self
+    }
+
     pub fn waiting_find(&self, root: u64, key: &Key) -> Result<Option<u64>> {
         session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND).find(root, key)
     }
@@ -403,6 +414,7 @@ impl<'a> Read<'a> {
             room,
             header,
             working: false,
+            sources: None,
         }))
     }
 
@@ -411,8 +423,26 @@ impl<'a> Read<'a> {
             .find(self.root(tree)?, key)
     }
 
-    pub fn source(&self, source: super::record::Source) -> Result<String> {
-        super::source::body(self.snapshot, self.sek, self.room, source)
+    /// Canonical input locators are never staged projection roots, including during a build.
+    pub fn canonical_find(&self, tree: Tree, key: &Key) -> Result<Option<u64>> {
+        session_tree::Read::snapshot(self.snapshot, self.sek, self.room, KIND)
+            .find(self.header.roots[tree.index()], key)
+    }
+
+    pub fn source(&self, source: super::record::Source) -> Result<Option<String>> {
+        if let Some(eligibility) = &self.sources {
+            if !super::source::retained(self, eligibility, source)? {
+                return Ok(None);
+            }
+        }
+        super::source::body(self.snapshot, self.sek, self.room, source).map(Some)
+    }
+
+    pub fn retained(&self, source: super::record::Source) -> Result<bool> {
+        match &self.sources {
+            Some(eligibility) => super::source::retained(self, eligibility, source),
+            None => Ok(true),
+        }
     }
 
     pub fn next(&self, tree: Tree, after: Option<Key>) -> Result<Option<(Key, u64)>> {

@@ -27,9 +27,7 @@ pub(crate) async fn exchange(
     deadline: tokio::time::Instant,
 ) -> Result<Received> {
     query.validate()?;
-    let opening = job
-        .reserve(1024)
-        .ok_or(Error::Unreachable("history opening buffer busy"))?;
+    let opening = job.reserve_or_pressure(1024)?;
     let streams = tokio::select! {
         biased;
         () = fence.retired() => return Err(Error::Unreachable("history opening cancelled")),
@@ -43,6 +41,7 @@ pub(crate) async fn exchange(
     let result = handshake_and_pull(receiver, &mut io, preamble, query, kind_bytes).await;
     if let Err(error) = &result {
         io.abort(match error {
+            Error::HistoryCapacity(_) => WireError::SessionBusy,
             Error::MalformedBundle(_) | Error::SizeLimitExceeded(_) => WireError::ProtocolLimits,
             _ => WireError::TransportFailed,
         });
@@ -59,13 +58,11 @@ async fn handshake_and_pull(
 ) -> Result<Received> {
     let mut overhead = kind_bytes + io.write_preamble(preamble).await?;
     let hello = Frame::Hello(crate::wire::SYNC_MODE_BOUNDED_HISTORY);
-    let Some(encoded) = hello.encode(io.job())? else {
-        return Err(Error::Unreachable("history HELLO buffer busy"));
-    };
+    let encoded = hello.encode_required(io.job())?;
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
-    let reply = match io.read_hello().await? {
+    let reply = match io.read_hello_required().await? {
         Read::Frame(frame) => frame,
         Read::Busy => return Err(Error::Unreachable("history HELLO reader busy")),
         Read::End => return Err(Error::Unreachable("history closed before HELLO")),
@@ -80,9 +77,7 @@ async fn handshake_and_pull(
         request: preamble.request,
         query: query.clone(),
     };
-    let Some(encoded) = want.encode(io.job())? else {
-        return Err(Error::Unreachable("history WANT buffer busy"));
-    };
+    let encoded = want.encode_required(io.job())?;
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
@@ -91,9 +86,7 @@ async fn handshake_and_pull(
             return Err(Error::Unreachable("history inventory buffers busy"));
         };
         let frame = Frame::Have(std::mem::take(&mut held.value));
-        let Some(encoded) = frame.encode(io.job())? else {
-            return Err(Error::Unreachable("history inventory writer busy"));
-        };
+        let encoded = frame.encode_required(io.job())?;
         overhead += encoded.as_slice().len() + 4;
         if overhead + super::DONE_RESERVE > super::MAX_RESPONSE_BYTES {
             return Err(Error::SizeLimitExceeded("inventory handshake quantum"));

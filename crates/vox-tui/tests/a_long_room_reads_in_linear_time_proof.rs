@@ -361,11 +361,8 @@ fn spread(took: &[Duration]) -> (Duration, Duration, Duration) {
 #[test]
 #[ignore = "optional: a real daemon and thousands of 16 KiB posts; run in release"]
 fn a_long_room_is_read_in_time_proportional_to_its_length() {
-    // Staging thousands of posts takes minutes, past the default budget: a longer one, unless the
-    // runner set its own.
-    if std::env::var_os("VOX_TEST_WATCHDOG_SECS").is_none() {
-        std::env::set_var("VOX_TEST_WATCHDOG_SECS", "3000");
-    }
+    // This long proof has no implicit elapsed bound. An operator may choose the ADR-018 §6
+    // emergency timebox explicitly for an unattended run.
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("alice");

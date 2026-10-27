@@ -202,7 +202,7 @@ fn post(dir: &Path, room: &str, text: &str) {
 #[test]
 #[ignore = "three real daemons and `vox tui` in a pty, with production Argon2id; CI runs it in release"]
 fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
-    watchdog::arm_for(Duration::from_secs(1300));
+    watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS (harness): a temporary directory");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");

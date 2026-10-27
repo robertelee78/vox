@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::atrest::{Argon2Profile, IdentityVault};
 use crate::cbor::{Decoder, Encoder};
@@ -15,14 +16,251 @@ use crate::identity::composite::{
     CompositePublicKey, CompositeSignature, RootSigner, SoftwareRootSigner,
 };
 use crate::identity::rng::random_array;
-use crate::node::paths::{create_private_dir, write_private_file, Account};
+use crate::node::paths::{
+    create_private_dir, write_private_file, write_private_file_checked, Account,
+};
 use zeroize::Zeroizing;
 
 mod pairing;
 pub use pairing::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
-    Management, PairingPreview,
+    ExchangeRecord, Management, PairingPreview, COMPUTER_PAIR_WITHIN,
 };
+
+/// A trust change must either be applied by an attached node or make that node visibly no longer
+/// attached within this long (ADR-038 FX-28).
+pub const COMPUTER_CHANGE_SHOWN_WITHIN: Duration = Duration::from_secs(5);
+
+/// A reachable enrolled computer must show a trust change within this long, including after a
+/// failed path becomes reachable again (ADR-038 FX-28).
+pub const COMPUTER_RETURN_SHOWN_WITHIN: Duration = Duration::from_secs(60);
+/// Backoff before retrying the `failures`th consecutive failed computer exchange. Proofs use the
+/// same exported calculation to stage recovery between a causal deadline and an ordinary retry;
+/// they never duplicate a count or delay.
+pub fn computer_exchange_backoff(failures: u32) -> Duration {
+    Duration::from_secs(2).saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+}
+
+/// A confirmed computer with no state to settle is not exchanged before this fallback cadence.
+pub const COMPUTER_QUIET_EXCHANGE_AFTER: Duration = Duration::from_secs(60);
+
+/// Test-knob build only: select one deliberately faulty FX-28 behavior. The release binary does
+/// not contain the variable or mode names; each mode is run separately so one red cannot satisfy
+/// another claim's mutant.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn fx28_mutant(named: &str) -> bool {
+    std::env::var("VOX_TEST_FX28_MUTANT").as_deref() == Ok(named)
+}
+
+/// Test apparatus: park one exact Computer-state commit after its replacement snapshot is ready
+/// and before any filesystem work. `<arm>\t<engaged>\t<release socket>`; removing `arm` selects
+/// one write, `engaged` names the exact remaining source-owned deadline, and one local connection
+/// releases it. The derived `finished` marker publishes only after save classification. The release
+/// binary contains none of these names or behavior.
+#[cfg(feature = "test-knobs")]
+fn hold_state_commit_for_proof(deadline: Option<std::time::Instant>) -> Option<std::path::PathBuf> {
+    let Ok(spec) = std::env::var("VOX_TEST_HOLD_COMPUTER_STATE_COMMIT") else {
+        return None;
+    };
+    let mut fields = spec.splitn(3, '\t');
+    let (Some(arm), Some(engaged), Some(release)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    if std::fs::remove_file(arm).is_err() {
+        return None;
+    }
+    let finished = std::path::Path::new(engaged).with_extension("finished");
+    let _ = std::fs::remove_file(&finished);
+    let _ = std::fs::remove_file(release);
+    let Ok(listener) = std::os::unix::net::UnixListener::bind(release) else {
+        return None;
+    };
+    let remaining_ns = deadline
+        .map(|deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_nanos()
+        })
+        .unwrap_or(0);
+    if publish_proof_marker(
+        std::path::Path::new(engaged),
+        format!("computer state commit held\tremaining_ns={remaining_ns}\n").as_bytes(),
+    )
+    .is_err()
+    {
+        return None;
+    }
+    let _ = listener.accept();
+    let _ = std::fs::remove_file(engaged);
+    let _ = std::fs::remove_file(release);
+    Some(finished)
+}
+
+#[cfg(feature = "test-knobs")]
+fn finish_state_commit_for_proof(
+    marker: Option<&std::path::Path>,
+    outcome: &str,
+    storage_failed: bool,
+) {
+    let Some(marker) = marker else {
+        return;
+    };
+    let _ = publish_proof_marker(
+        marker,
+        format!("computer state commit {outcome}; storage_failed={storage_failed}\n").as_bytes(),
+    );
+}
+
+/// Publish a populated proof marker in one namespace operation, without replacing an existing
+/// marker. Test-knob call sites use this only for causal staging; shipped builds compile every
+/// caller out.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn publish_proof_marker(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> core::result::Result<(), String> {
+    use std::io::Write as _;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+    let staged = path.with_file_name(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|e| format!("could not create {}: {e}", staged.display()))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let cleanup = std::fs::remove_file(&staged).err();
+        return Err(format!(
+            "could not populate {}: {error}; cleanup: {cleanup:?}",
+            staged.display()
+        ));
+    }
+    drop(file);
+    if let Err(error) = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &staged,
+        rustix::fs::CWD,
+        path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        let cleanup = std::fs::remove_file(&staged).err();
+        return Err(format!(
+            "could not publish {} without replacement: {error}; cleanup: {cleanup:?}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Make a hook setup failure causally visible to the shipped-binary journey. If even the fault
+/// marker cannot be published, process termination is the journey's independent apparatus signal.
+#[cfg(feature = "test-knobs")]
+pub(crate) fn publish_proof_fault(path: &std::path::Path, detail: &str) {
+    if let Err(error) = publish_proof_marker(path, detail.as_bytes()) {
+        eprintln!(
+            "APPARATUS: could not publish proof fault {}: {error}",
+            path.display()
+        );
+        std::process::exit(70);
+    }
+}
+
+/// The exact durable policy projection an attached node must apply.
+///
+/// Expiry can change without advancing the operator-policy revision, so revision alone is not
+/// sufficient ownership for a delayed actor message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputerPolicyTarget {
+    revision: u64,
+    expired: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ComputerChangeBoundary {
+    Deadline(std::time::Instant),
+    Current(ComputerChange),
+}
+
+impl ComputerPolicyTarget {
+    /// Durable operator-policy revision.
+    #[must_use]
+    pub fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// Whether this exact revision is durably expired and therefore revocation-only.
+    #[must_use]
+    pub fn expired(self) -> bool {
+        self.expired
+    }
+}
+
+/// One exact durable policy target and the absolute ends of the two user-visible contracts its
+/// cause began. A remote merge may shorten the local apply deadline, but never restarts the
+/// outer return deadline shared by exchange and reconciliation.
+#[derive(Clone, Copy, Debug)]
+pub struct ComputerChange {
+    target: ComputerPolicyTarget,
+    apply_deadline: std::time::Instant,
+    return_deadline: std::time::Instant,
+}
+
+impl ComputerChange {
+    /// A local cause gets the apply-or-detach contract from the instant it is observed.
+    #[must_use]
+    pub fn now(target: ComputerPolicyTarget) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            target,
+            apply_deadline: now + COMPUTER_CHANGE_SHOWN_WITHIN,
+            return_deadline: now + COMPUTER_RETURN_SHOWN_WITHIN,
+        }
+    }
+
+    /// Construct a change with already-owned absolute deadlines. Used when a lagged follower
+    /// must carry the current exact revision without granting it a fresh convergence window.
+    #[must_use]
+    pub fn at(
+        target: ComputerPolicyTarget,
+        apply_deadline: std::time::Instant,
+        return_deadline: std::time::Instant,
+    ) -> Self {
+        Self {
+            target,
+            apply_deadline,
+            return_deadline,
+        }
+    }
+
+    /// The durable policy revision carried by this event.
+    #[must_use]
+    pub fn revision(self) -> u64 {
+        self.target.revision
+    }
+
+    /// The exact revision and expiry state carried by this event.
+    #[must_use]
+    pub fn target(self) -> ComputerPolicyTarget {
+        self.target
+    }
+
+    /// The absolute end of this event's apply-or-detach contract.
+    #[must_use]
+    pub fn apply_deadline(self) -> std::time::Instant {
+        self.apply_deadline
+    }
+
+    /// The absolute end of this event's reachable-peer return contract.
+    #[must_use]
+    pub fn return_deadline(self) -> std::time::Instant {
+        self.return_deadline
+    }
+}
 
 /// The one fixed policy, displayed before either operator approves an enrollment.
 pub const POLICY: &str = "Every managed node can read every other managed node. Each computer's selected personal node can drive the non-personal nodes. Earlier individual grants are replaced by this policy; there are no per-node exceptions. Pairing does not join rooms or change repository bindings.";
@@ -34,12 +272,27 @@ const MAX_RECORDS: usize = 4096;
 const MAX_STATE: u64 = 64 * 1024 * 1024;
 const HISTORY_FULL: &str = "computer control history is full; no authority was discarded";
 const STORAGE_FAILED: &str = "computer policy storage failed; computer trust is suspended until storage is repaired and the daemon restarted";
+const COMPUTER_COMMIT_CAUSAL_EXPIRED: &str =
+    "the computer change reached its causal convergence deadline before its atomic commit";
 
 fn bad() -> Error {
     Error::Profile("computer management state is malformed; it was left unchanged")
 }
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// Computer-state transactions contain synchronous filesystem staging, flush and rename. When
+/// invoked by the daemon's multi-thread Tokio runtime, declare that whole blocking region so a
+/// slow disk or an earlier serialized writer cannot consume a runtime worker and starve read-only
+/// status/network work. Non-runtime and current-thread callers execute it directly.
+fn blocking_transaction<T>(transaction: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(transaction)
+    } else {
+        transaction()
+    }
 }
 fn arity(d: &mut Decoder<'_>, n: usize) -> Result<()> {
     if d.array()? == n {
@@ -846,6 +1099,10 @@ pub(crate) struct State {
     pub receipts: BTreeMap<Digest32, Signed>,
     pub vault: Vec<u8>,
     pub description: Description,
+    /// Journal revision of the last effective operator-policy change. Reachability and other
+    /// transport records may advance `revision`, but only a later policy cause replaces a missed
+    /// policy contract.
+    pub policy_revision: u64,
     pub revision: u64,
     pub invitations: Vec<Invitation>,
     pub genesis: Option<Enrollment>,
@@ -854,6 +1111,30 @@ pub(crate) struct State {
     pub pending: Option<Enrollment>,
     /// Exact local policy application revision for each attached node; never a distributed clock.
     pub applied: BTreeMap<Digest32, AppliedPolicy>,
+    /// Exact policy-covered grants durably prepared before a node keyring commit. Application
+    /// moves these into `applied`; crash recovery includes them in fail-closed revocation.
+    prepared: BTreeMap<Digest32, AppliedPolicy>,
+    /// Per node of this computer, the revision its binding was last derived at and when
+    /// (ADR-038 FX-28): a binding is derived once per revision, across restarts too, and a node
+    /// whose record names the current revision is left alone.
+    pub derived: BTreeMap<Digest32, DerivedBinding>,
+    /// Peers for which this exact local operator-policy revision missed its causal deadline,
+    /// and whether a real ordinary exchange later repaired it. Journal delivery positions are
+    /// not policy owners. This history is durable across later payload movement and restart.
+    pub missed_exchanges: BTreeMap<Digest32, (u64, bool)>,
+    /// Pre-candidate received expiry markers, retained only so a state written by an earlier
+    /// FX-28 development build can heal on its next authenticated matching-frontier exchange.
+    /// A peer's missed deadline is historical status on that peer, never authority here: the
+    /// exchange carrying the policy is itself its authenticated repair.
+    received_misses: BTreeMap<Digest32, u64>,
+    /// Latest local application boundary missed by each managed node. Completion clears the
+    /// node's live pending state but not this historical fact; one record per node bounds growth.
+    application_misses: BTreeMap<Digest32, u64>,
+    /// Oldest unresolved ordinary-delivery watermark for each peer. A policy change records
+    /// its policy revision; later preview/receipt/reach payloads may instead own a journal-only
+    /// watermark. A complete sent snapshot may clear only covered values. Only an exact policy
+    /// watermark can become policy-miss history; journal-only work remains queued on restart.
+    pub pending_exchanges: BTreeMap<Digest32, u64>,
     intervals: BTreeMap<Digest32, Vec<MembershipInterval>>,
     retired_nodes: BTreeMap<Digest32, u64>,
     individual: BTreeMap<Digest32, BTreeMap<Digest32, u64>>,
@@ -864,6 +1145,28 @@ pub(crate) struct State {
     retired_groups: BTreeMap<Digest32, Enrollment>,
 }
 impl State {
+    /// Advance the durable journal for a management fact which is exchanged but is not yet an
+    /// operator-policy fact. The later activation/fold owns `policy_revision`; preview and one-
+    /// sided approval still need their own crash-recoverable exchange obligation.
+    fn advance_journal(&mut self) -> Result<()> {
+        self.revision = self.revision.checked_add(1).ok_or_else(bad)?;
+        self.receipts.clear();
+        Ok(())
+    }
+
+    /// Every identity which can be affected by the current management transaction. A pending
+    /// enrollment precedes membership, so `descriptions` alone loses exactly the peer which must
+    /// learn a preview or one-sided approval.
+    fn exchange_peers(&self) -> Result<BTreeSet<Digest32>> {
+        let mut peers: BTreeSet<_> = self.descriptions().into_keys().collect();
+        if let Some(pending) = &self.pending {
+            for computer in &pending.computers {
+                peers.insert(computer.fingerprint()?);
+            }
+        }
+        Ok(peers)
+    }
+
     fn group(&self) -> Option<Digest32> {
         self.genesis
             .as_ref()
@@ -1340,12 +1643,11 @@ impl State {
                     .any(|interval| interval.grants.contains(grant))
             })
         });
-        if first_activation
+        let policy_changed = first_activation
             || self.members != next.members
             || self.rosters != next.rosters
-            || self.quarantined != next.quarantined
-            || self.reaches != next.reaches
-        {
+            || self.quarantined != next.quarantined;
+        if policy_changed || self.reaches != next.reaches {
             let revision = self.revision.checked_add(1).ok_or_else(bad)?;
             if self.genesis.is_some() {
                 let mut active: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
@@ -1435,6 +1737,9 @@ impl State {
             self.quarantined = next.quarantined;
             self.reaches = next.reaches;
             self.revision = revision;
+            if policy_changed {
+                self.policy_revision = revision;
+            }
             self.receipts.clear();
         }
         Ok(())
@@ -1442,7 +1747,7 @@ impl State {
 
     fn body(&self) -> Vec<u8> {
         let mut e = Encoder::for_secrets();
-        e.array(25)
+        e.array(32)
             .bytes(&self.description.encode())
             .uint(self.revision)
             .array(self.invitations.len());
@@ -1563,11 +1868,51 @@ impl State {
         for (group, genesis) in &self.retired_groups {
             e.array(2).bytes(group).bytes(&genesis.encode());
         }
+        e.array(self.derived.len());
+        for (node, d) in &self.derived {
+            e.array(3).bytes(node).uint(d.revision).uint(d.at_ms);
+        }
+        e.array(self.missed_exchanges.len());
+        for (peer, (revision, repaired)) in &self.missed_exchanges {
+            e.array(3)
+                .bytes(peer)
+                .uint(*revision)
+                .uint(u64::from(*repaired));
+        }
+        e.array(self.pending_exchanges.len());
+        for (peer, revision) in &self.pending_exchanges {
+            e.array(2).bytes(peer).uint(*revision);
+        }
+        e.uint(self.policy_revision).array(self.prepared.len());
+        for (id, prepared) in &self.prepared {
+            e.array(4)
+                .bytes(id)
+                .uint(prepared.revision)
+                .bytes(&prepared.interval)
+                .array(prepared.grants.len());
+            for (peer, created) in &prepared.grants {
+                e.array(2).bytes(peer).uint(*created);
+            }
+        }
+        e.array(self.received_misses.len());
+        for (peer, revision) in &self.received_misses {
+            e.array(2).bytes(peer).uint(*revision);
+        }
+        e.array(self.application_misses.len());
+        for (node, revision) in &self.application_misses {
+            e.array(2).bytes(node).uint(*revision);
+        }
         e.finish()
     }
     fn read(vault: Vec<u8>, body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
-        arity(&mut d, 25)?;
+        // 32 elements; older current-version states have no distinct operator-policy revision,
+        // durable pre-keyring application record, inbound/outbound miss distinction, or local
+        // node-application miss history.
+        let fields = count(&mut d)?;
+        if !(25..=32).contains(&fields) {
+            return Err(bad());
+        }
         let description = Description::decode(d.bytes()?)?;
         let revision = d.uint()?;
         let n = count(&mut d)?;
@@ -1815,8 +2160,125 @@ impl State {
                 return Err(bad());
             }
         }
+        let mut derived = BTreeMap::new();
+        if fields >= 26 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 3)?;
+                let node = digest(&mut d)?;
+                let at = d.uint()?;
+                let at_ms = d.uint()?;
+                if at > revision
+                    || derived
+                        .insert(
+                            node,
+                            DerivedBinding {
+                                revision: at,
+                                at_ms,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(bad());
+                }
+            }
+        }
+        let mut missed_exchanges = BTreeMap::new();
+        if fields >= 27 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 3)?;
+                let peer = digest(&mut d)?;
+                let at = d.uint()?;
+                let repaired = match d.uint()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(bad()),
+                };
+                if at > revision || missed_exchanges.insert(peer, (at, repaired)).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
+        let mut pending_exchanges = BTreeMap::new();
+        if fields >= 28 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let peer = digest(&mut d)?;
+                let at = d.uint()?;
+                if at > revision || pending_exchanges.insert(peer, at).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
+        let policy_revision = if fields >= 29 { d.uint()? } else { revision };
+        if policy_revision > revision {
+            return Err(bad());
+        }
+        let mut prepared = BTreeMap::new();
+        if fields >= 30 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 4)?;
+                let id = digest(&mut d)?;
+                let prepared_revision = d.uint()?;
+                let interval = digest(&mut d)?;
+                let mut grants = BTreeMap::new();
+                for _ in 0..count(&mut d)? {
+                    arity(&mut d, 2)?;
+                    let peer = digest(&mut d)?;
+                    let created = d.uint()?;
+                    if created == 0
+                        || created > prepared_revision
+                        || grants.insert(peer, created).is_some()
+                    {
+                        return Err(bad());
+                    }
+                }
+                if prepared_revision == 0
+                    || prepared_revision > revision
+                    || prepared
+                        .insert(
+                            id,
+                            AppliedPolicy {
+                                revision: prepared_revision,
+                                interval,
+                                grants,
+                            },
+                        )
+                        .is_some()
+                {
+                    return Err(bad());
+                }
+            }
+        }
+        let mut received_misses = BTreeMap::new();
+        if fields >= 31 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let peer = digest(&mut d)?;
+                let at = d.uint()?;
+                if at > revision || received_misses.insert(peer, at).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
+        let mut application_misses = BTreeMap::new();
+        if fields >= 32 {
+            for _ in 0..count(&mut d)? {
+                arity(&mut d, 2)?;
+                let node = digest(&mut d)?;
+                let at = d.uint()?;
+                if at > revision || application_misses.insert(node, at).is_some() {
+                    return Err(bad());
+                }
+            }
+        }
         d.finish()?;
         let mut s = Self {
+            application_misses,
+            received_misses,
+            prepared,
+            pending_exchanges,
+            missed_exchanges,
+            derived,
             retired_groups,
             binding_approvals,
             intervals,
@@ -1838,6 +2300,7 @@ impl State {
             receipts,
             vault,
             description,
+            policy_revision,
             revision,
             invitations,
             genesis,
@@ -2041,6 +2504,7 @@ fn exclude_retired(
 
 /// A complete replacement for the covered part of one node's keyring.
 /// `denied` includes retained bindings: a fault cannot reveal an older manual grant.
+#[derive(Clone)]
 pub struct PolicyPlan {
     /// Exact durable local policy journal revision.
     pub revision: u64,
@@ -2048,32 +2512,189 @@ pub struct PolicyPlan {
     pub grants: Vec<(Digest32, String, crate::node::trust::Capability)>,
     /// Covered grants that must be purged before networking.
     pub denied: Vec<Digest32>,
+    /// This revision missed its causal convergence boundary. The plan is revocation-only and
+    /// must never be recorded as an ordinary applied policy.
+    pub(crate) expired: bool,
+}
+
+/// Whether a node-keyring write still belongs to the durable policy observed before that write.
+/// The node store and Computer journal cannot share one atomic rename, so the actor must repeat
+/// reconciliation when an authenticated policy change wins between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplicationReceipt {
+    Current,
+    Reconcile,
 }
 
 /// One persistent management identity and transaction domain, owned by its account daemon.
 pub struct Computer {
     path: PathBuf,
     storage_failed: std::sync::atomic::AtomicBool,
+    /// Fail closed across the gap between staging a policy replacement and publishing its new
+    /// in-memory snapshot. Status reads do not consult this flag and therefore never wedge on I/O.
+    authority_blocked: std::sync::atomic::AtomicBool,
     pub(crate) signer: Arc<dyn RootSigner + Send + Sync>,
+    /// Serialize replacement-state transactions without making readers wait for their disk I/O.
+    /// `state` is held only to take and publish a snapshot; `changes` keeps two writers from
+    /// staging from the same snapshot while either one has released `state` to save it.
+    changes: Mutex<()>,
     pub(crate) state: Mutex<State>,
     // Existing live room gates, weakly held: a durable policy change invalidates them before
     // exposing the new revision. Actors republish only after their keyring is reconciled.
     reachers: Mutex<
         Vec<std::sync::Weak<tokio::sync::watch::Sender<std::collections::BTreeSet<Digest32>>>>,
     >,
+    /// The policy revision, sent whenever a change moves it: a local change or a merged
+    /// exchange alike (ADR-038 FX-28). The daemon reconciles its nodes on this, and on no timer.
+    changed: tokio::sync::broadcast::Sender<ComputerChange>,
+    /// Every durable journal movement, including application receipts and transport facts which
+    /// do not change operator authority. Management exchange follows this edge so it can remain
+    /// event-driven without making node reconciliation re-run or polling an applying peer.
+    journal_changed: tokio::sync::broadcast::Sender<()>,
+    /// Each node's plan at the revision it was derived at: the app's polling and every trust
+    /// command answer from it while the revision stands, instead of verifying the history again.
+    plans: Mutex<BTreeMap<Digest32, (u64, PolicyPlan)>>,
+}
+
+/// When a node's management binding was last derived, and at which policy revision (ADR-038
+/// FX-28): what `vox computer status` shows, so a person can tell a stale binding from a
+/// current one. Part of the signed state, so a restart derives nothing again at the same
+/// revision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DerivedBinding {
+    /// The policy revision the binding was derived at.
+    pub revision: u64,
+    /// When, Unix milliseconds.
+    pub at_ms: u64,
 }
 impl Computer {
-    /// Local durable policy revision.
-    pub fn revision(&self) -> u64 {
-        lock(&self.state).revision
+    /// Exact durable policy projection current at this instant. Callers carry both fields through
+    /// delayed work; expiry can move without a new operator-policy revision.
+    pub fn policy_target(&self) -> ComputerPolicyTarget {
+        let state = lock(&self.state);
+        ComputerPolicyTarget {
+            revision: state.policy_revision,
+            expired: Self::revision_expired(&state),
+        }
+    }
+
+    /// Startup rejected by an in-progress authority write must await that writer, not repeatedly
+    /// reapply the still-published old target. The existing writer guard covers staging through
+    /// publication (or failure); take no view, slot or state lock while waiting for it.
+    pub(crate) fn policy_target_after_writer(&self) -> Result<ComputerPolicyTarget> {
+        blocking_transaction(|| {
+            let _change = lock(&self.changes);
+            if self
+                .authority_blocked
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(Error::Profile(
+                    "the computer policy writer did not finish publishing its durable result",
+                ));
+            }
+            let state = lock(&self.state);
+            if state.genesis.is_some() || !state.intervals.is_empty() {
+                self.storage_ready()?;
+            }
+            Ok(ComputerPolicyTarget {
+                revision: state.policy_revision,
+                expired: Self::revision_expired(&state),
+            })
+        })
+    }
+
+    pub(crate) fn policy_target_is(&self, target: ComputerPolicyTarget) -> bool {
+        let state = lock(&self.state);
+        state.policy_revision == target.revision && Self::revision_expired(&state) == target.expired
+    }
+
+    /// Journal revision of the last effective operator-policy change. Transport-only journal
+    /// movement cannot replace a missed policy contract.
+    pub fn policy_revision(&self) -> u64 {
+        lock(&self.state).policy_revision
+    }
+
+    /// Follow the policy revision: `changed()` resolves when a change moved it, whether the
+    /// change was made here or arrived in an exchange (ADR-038 FX-28).
+    pub fn changes(&self) -> tokio::sync::broadcast::Receiver<ComputerChange> {
+        self.changed.subscribe()
+    }
+
+    pub(crate) fn journal_changes(&self) -> tokio::sync::broadcast::Receiver<()> {
+        self.journal_changed.subscribe()
+    }
+
+    /// Whether `node`'s binding was derived at the current policy revision.
+    pub fn binding_current(&self, node: &Digest32) -> bool {
+        let s = lock(&self.state);
+        !Self::revision_expired(&s)
+            && s.derived
+                .get(node)
+                .is_some_and(|d| d.revision == s.policy_revision)
     }
 
     /// A failed policy write invalidates current grants even when the durable revision did not
     /// advance. Restart revalidates the retained state and its ability to be saved before attach.
-    pub(crate) fn policy_current(&self, applied: u64) -> bool {
+    pub(crate) fn policy_current(&self, applied: u64, expired: bool, node: Digest32) -> bool {
         let s = lock(&self.state);
-        (s.genesis.is_none() && s.intervals.is_empty())
-            || (self.storage_ready().is_ok() && s.revision == applied)
+        !self
+            .authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+            && ((s.genesis.is_none() && s.intervals.is_empty())
+                || (self.storage_ready().is_ok()
+                    && s.policy_revision == applied
+                    && Self::revision_expired(&s) == expired)
+                    && if Self::revision_expired(&s)
+                        || s.grant(&self.signer.fingerprint()).is_none()
+                    {
+                        // Expiry revokes the missed revision's managed grants; it does not make the
+                        // node unusable forever. A retired local computer follows the same rule. The
+                        // actor may publish again only after its exact node keyring is durably settled
+                        // with no retained managed grant.
+                        Self::application_settled_in(&s, &node, applied)
+                    } else {
+                        Self::application_settled_in(&s, &node, applied)
+                            && s.derived
+                                .get(&node)
+                                .is_some_and(|derived| derived.revision == s.policy_revision)
+                    })
+    }
+
+    /// Execute one synchronous irreversible publication only while `node`'s actor projection is
+    /// current. The policy-state lock stays held through `publish`, so a durable revocation cannot
+    /// land between the final revision/binding check and the room-log or delivery-queue write.
+    /// Callers must complete every await (connection, prekey, channel lock) before entering.
+    pub(crate) fn publish_with_current_authority<T>(
+        &self,
+        applied: u64,
+        expired: bool,
+        node: Digest32,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = lock(&self.state);
+        let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
+        let current = !self
+            .authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+            && (unmanaged
+                || (self.storage_ready().is_ok()
+                    && state.policy_revision == applied
+                    && Self::revision_expired(&state) == expired
+                    && if Self::revision_expired(&state)
+                        || state.grant(&self.signer.fingerprint()).is_none()
+                    {
+                        // The expired policy itself is not authority.  The safe, durably-revoked
+                        // projection is: it lets manual/unmanaged work continue without allowing a
+                        // grant from the missed revision to survive or reappear.
+                        Self::application_settled_in(&state, &node, applied)
+                    } else {
+                        Self::application_settled_in(&state, &node, applied)
+                            && state
+                                .derived
+                                .get(&node)
+                                .is_some_and(|derived| derived.revision == state.policy_revision)
+                    }));
+        current.then(publish)
     }
 
     pub(crate) fn storage_ready(&self) -> Result<()> {
@@ -2087,7 +2708,7 @@ impl Computer {
         }
     }
 
-    fn invalidate_reachers(&self) {
+    pub(crate) fn invalidate_reachers(&self) {
         lock(&self.reachers).retain(|weak| {
             if let Some(gate) = weak.upgrade() {
                 crate::node::tunnel::publish_reachers(&gate, Default::default());
@@ -2126,8 +2747,12 @@ impl Computer {
     pub fn binding_group(&self) -> Option<Digest32> {
         let s = lock(&self.state);
         let local = self.signer.fingerprint();
-        if s.genesis.is_some() && s.grant(&local).is_some() {
-            return s.group();
+        if s.genesis.is_some() {
+            // Once an incarnation is established, its retained pairing intent is history, not a
+            // second source of binding authority. A removed computer has no binding group and
+            // must proceed to revocation-only application; falling through to `pending` made it
+            // rediscover the old approved genesis forever.
+            return s.grant(&local).and_then(|_| s.group());
         }
         let g = s.pending.as_ref()?;
         if g.group.is_some() {
@@ -2144,108 +2769,255 @@ impl Computer {
     /// Bind an already unlocked local node. The signer never crosses the daemon's actor boundary.
     /// This does not unlock or create a node, enroll a computer, or authorize an unapproved group.
     pub fn bind_node(&self, signer: &dyn RootSigner, name: &str) -> Result<()> {
-        let Some(group) = self.binding_group() else {
-            return Ok(());
-        };
+        self.bind_node_until(
+            signer,
+            name,
+            std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+        )
+    }
+    pub(crate) fn bind_node_until(
+        &self,
+        signer: &dyn RootSigner,
+        name: &str,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        self.bind_node_guarded(signer, name, ComputerChangeBoundary::Deadline(deadline))
+            .map(|current| {
+                debug_assert!(current, "a deadline boundary cannot be superseded");
+            })
+    }
+
+    /// Bind only while the accepted follower event still owns the exact policy projection.
+    /// `false` means policy movement superseded this event; its own broadcast owns the successor.
+    pub(crate) fn bind_node_for_change(
+        &self,
+        signer: &dyn RootSigner,
+        name: &str,
+        change: ComputerChange,
+    ) -> Result<bool> {
+        self.bind_node_guarded(signer, name, ComputerChangeBoundary::Current(change))
+    }
+
+    fn bind_node_guarded(
+        &self,
+        signer: &dyn RootSigner,
+        name: &str,
+        boundary: ComputerChangeBoundary,
+    ) -> Result<bool> {
         let local = self.signer.fingerprint();
         let key = signer.fingerprint();
-        self.change(|s| {
-            if s.quarantined.contains(&local) {
-                return Ok(());
-            }
-            let (_old_revision, old_personal, mut bindings) = match s.rosters.get(&local) {
-                Some(r) => r.read(&local, &group)?,
-                None => (0, None, Vec::new()),
+        loop {
+            let Some(group) = self.binding_group() else {
+                return Ok(true);
             };
-            let authority = s.derive()?;
-            let approval = s.binding_approvals.get(&key).cloned();
-            let mut retained = None;
-            let mut was_local = false;
-            let mut known = false;
-            for id in &authority.accepted {
-                let e = s.history[id].event()?;
-                for binding in e.bindings {
-                    if binding.verify(&e.author, &group)? != key { continue; }
-                    known = true;
-                    was_local |= e.author == local;
-                    if e.author == local && authority.binding_owners.get(&key) == Some(&binding.id()) {
-                        retained = Some(binding);
+            let bind = |s: &mut State| {
+                // `binding_group` and this transaction take the state lock separately. A remote
+                // removal or replacement incarnation can land between them; never use the
+                // captured group's grant to sign in the newer state. Retry a replacement group
+                // within the original causal boundary, or finish without a binding when this
+                // computer retired.
+                if s.group() != Some(group) || s.grant(&local).is_none() {
+                    return Ok(false);
+                }
+                // Derived once per revision (ADR-038 FX-28): the history is verified again only
+                // when the policy moved, by a change here or by a merged exchange.
+                if !Self::revision_expired(s)
+                    && s.derived
+                        .get(&key)
+                        .is_some_and(|derived| derived.revision == s.policy_revision)
+                {
+                    return Ok(true);
+                }
+                if s.quarantined.contains(&local) {
+                    return Ok(true);
+                }
+                let (_old_revision, old_personal, mut bindings) = match s.rosters.get(&local) {
+                    Some(r) => r.read(&local, &group)?,
+                    None => (0, None, Vec::new()),
+                };
+                let authority = s.derive()?;
+                let approval = s.binding_approvals.get(&key).cloned();
+                let mut retained = None;
+                let mut was_local = false;
+                let mut known = false;
+                for id in &authority.accepted {
+                    let e = s.history[id].event()?;
+                    for binding in e.bindings {
+                        if binding.verify(&e.author, &group)? != key {
+                            continue;
+                        }
+                        known = true;
+                        was_local |= e.author == local;
+                        if e.author == local
+                            && authority.binding_owners.get(&key) == Some(&binding.id())
+                        {
+                            retained = Some(binding);
+                        }
                     }
                 }
-            }
-            if known && retained.is_none() && approval.is_none() {
-                if was_local { return Ok(()); } // Released: never silently reclaim an old vault.
-                return Err(Error::Profile("this node is bound to another computer; explicitly approve its signed transfer or recovery before unlocking it"));
-            }
-            if approval.is_some() { bindings.retain(|b| b.verify(&local, &group).ok() != Some(key)); }
-            let mut changed = false;
-            if let Some(binding) = bindings
-                .iter_mut()
-                .find(|b| b.verify(&local, &group).ok() == Some(key))
-            {
-                if binding.name != name {
+                if known && retained.is_none() && approval.is_none() {
+                    if was_local {
+                        return Ok(true);
+                    } // Released: never silently reclaim an old vault.
+                    return Err(Error::Profile("this node is bound to another computer; explicitly approve its signed transfer or recovery before unlocking it"));
+                }
+                if approval.is_some() {
+                    bindings.retain(|b| b.verify(&local, &group).ok() != Some(key));
+                }
+                let mut changed = false;
+                if let Some(binding) = bindings
+                    .iter_mut()
+                    .find(|b| b.verify(&local, &group).ok() == Some(key))
+                {
+                    if binding.name != name {
+                        binding.name = name.to_owned();
+                        changed = true;
+                    }
+                }
+                if !bindings
+                    .iter()
+                    .any(|b| b.verify(&local, &group).ok() == Some(key))
+                {
+                    // Reuse this node's own signed binding after local roster removal or rename.
+                    // A copied fingerprint file or name cannot construct this proof.
+                    let body = if let Some(approval) = &approval {
+                        let mut body = Encoder::new();
+                        body.array(6)
+                            .uint(PROTOCOL)
+                            .bytes(&signer.public_key().to_bytes())
+                            .bytes(&self.signer.public_key().to_bytes())
+                            .bytes(&group)
+                            .bytes(&random_array::<32>()?)
+                            .bytes(&approval.encode());
+                        body.finish()
+                    } else {
+                        Binding::body(
+                            &signer.public_key(),
+                            &self.signer.public_key(),
+                            &group,
+                            &random_array()?,
+                        )
+                    };
+                    if approval.is_some() {
+                        retained = None;
+                    }
+                    let mut binding = if let Some(binding) = retained {
+                        binding
+                    } else {
+                        Binding {
+                            node: Signed::create(
+                                b"vox/computer-binding/v1\0",
+                                body.clone(),
+                                signer,
+                            )?,
+                            computer: Signed::create(
+                                b"vox/computer-binding/v1\0",
+                                body,
+                                self.signer.as_ref(),
+                            )?,
+                            name: name.to_owned(),
+                        }
+                    };
                     binding.name = name.to_owned();
+                    bindings.push(binding);
                     changed = true;
                 }
+                if s.selected == Some(key) {
+                    s.selected_name = name.to_owned();
+                }
+                let selection = s.selected.filter(|selected| {
+                    bindings
+                        .iter()
+                        .any(|b| b.verify(&local, &group).ok() == Some(*selected))
+                });
+                changed |= selection != old_personal;
+                if changed {
+                    bindings.sort_by_key(|b| sha256(&b.node.public));
+                    let r = Control::create(s, &bindings, selection, self.signer.as_ref())?;
+                    s.retain_roster(r)?;
+                    s.binding_approvals.remove(&key);
+                }
+                // The revision the binding now stands at: the one the roster event just made, or
+                // the one it was found current at. Saved with the state, so a restart does not
+                // derive it again.
+                s.derived.insert(
+                    key,
+                    DerivedBinding {
+                        revision: s.policy_revision,
+                        at_ms: pairing::now(),
+                    },
+                );
+                Ok(true)
+            };
+            let current = match boundary {
+                ComputerChangeBoundary::Deadline(deadline) => {
+                    Some(self.change_until(deadline, bind)?)
+                }
+                ComputerChangeBoundary::Current(change) => self.change_for_target(change, bind)?,
+            };
+            let Some(current) = current else {
+                return Ok(false);
+            };
+            if current {
+                return Ok(true);
             }
-            if !bindings
-                .iter()
-                .any(|b| b.verify(&local, &group).ok() == Some(key))
-            {
-                // Reuse this node's own signed binding after local roster removal or rename.
-                // A copied fingerprint file or name cannot construct this proof.
-                let body = if let Some(approval) = &approval {
-                    let mut body = Encoder::new();
-                    body.array(6).uint(PROTOCOL).bytes(&signer.public_key().to_bytes())
-                        .bytes(&self.signer.public_key().to_bytes()).bytes(&group)
-                        .bytes(&random_array::<32>()?).bytes(&approval.encode());
-                    body.finish()
-                } else { Binding::body(&signer.public_key(), &self.signer.public_key(), &group, &random_array()?) };
-                if approval.is_some() { retained = None; }
-                let mut binding = if let Some(binding) = retained {
-                    binding
-                } else {
-                    Binding {
-                        node: Signed::create(b"vox/computer-binding/v1\0", body.clone(), signer)?,
-                        computer: Signed::create(
-                            b"vox/computer-binding/v1\0",
-                            body,
-                            self.signer.as_ref(),
-                        )?,
-                        name: name.to_owned(),
-                    }
-                };
-                binding.name = name.to_owned();
-                bindings.push(binding);
-                changed = true;
-            }
-            if s.selected == Some(key) {
-                s.selected_name = name.to_owned();
-            }
-            let selection = s.selected.filter(|selected| {
-                bindings
-                    .iter()
-                    .any(|b| b.verify(&local, &group).ok() == Some(*selected))
-            });
-            changed |= selection != old_personal;
-            if changed {
-                bindings.sort_by_key(|b| sha256(&b.node.public));
-                let r = Control::create(s, &bindings, selection, self.signer.as_ref())?;
-                s.retain_roster(r)?;
-                s.binding_approvals.remove(&key);
-            }
-            Ok(())
-        })
+        }
     }
 
     /// Exact policy for an attached node, from verified durable rosters. No roster grants room
-    /// membership. The revision is local journal order, not a distributed membership clock.
+    /// membership. The revision is the local operator-policy cause, not a distributed clock.
     pub fn plan(&self, node: Digest32) -> Result<Option<PolicyPlan>> {
         let s = lock(&self.state);
         if s.genesis.is_none() && s.intervals.is_empty() {
             return Ok(None);
         }
         self.storage_ready()?;
+        if Self::revision_expired(&s) {
+            // An expired operator policy is fail closed. Capability changes and grants from
+            // earlier revisions are still computer-managed authority; so are grants prepared
+            // durably before a node keyring commit whose applied receipt was interrupted by a
+            // crash. Leaving either set effective would preserve the authority whose causal
+            // application contract was missed.
+            let mut denied = BTreeSet::new();
+            if let Some(applied) = s.applied.get(&node) {
+                denied.extend(applied.grants.keys().copied());
+            }
+            let prepared = s.prepared.get(&node);
+            if let Some(prepared) = prepared {
+                denied.extend(prepared.grants.keys().copied());
+            }
+            return Ok(Some(PolicyPlan {
+                revision: s.policy_revision,
+                grants: Vec::new(),
+                denied: denied.into_iter().collect(),
+                expired: true,
+            }));
+        }
+        // Derived once per operator-policy revision (ADR-038 FX-28). Reachability journal
+        // records do not change trust and cannot make an expired policy current again.
+        if let Some((revision, plan)) = lock(&self.plans).get(&node) {
+            if *revision == s.policy_revision {
+                return Ok(Some(plan.clone()));
+            }
+        }
+        let plan = Self::derive_plan(&s, self.signer.fingerprint(), node)?;
+        lock(&self.plans).insert(node, (s.policy_revision, plan.clone()));
+        Ok(Some(plan))
+    }
+
+    pub(crate) fn current_revision_expired(&self) -> bool {
+        let s = lock(&self.state);
+        Self::revision_expired(&s)
+    }
+
+    fn revision_expired(s: &State) -> bool {
+        s.received_misses
+            .values()
+            .any(|revision| *revision == s.policy_revision)
+    }
+
+    /// The plan for `node` from the verified rosters of `s`, derived.
+    fn derive_plan(s: &State, local: Digest32, node: Digest32) -> Result<PolicyPlan> {
         let group = s.genesis.as_ref().map(Enrollment::incarnation);
         let mut covered = BTreeMap::new();
         let mut owner = None;
@@ -2262,7 +3034,7 @@ impl Computer {
                     .entry(id)
                     .or_insert_with(BTreeSet::new)
                     .insert(e.author);
-                if id == node && e.author == self.signer.fingerprint() {
+                if id == node && e.author == local {
                     owner = Some(e.author);
                 }
             }
@@ -2345,30 +3117,207 @@ impl Computer {
                 .then_some(peer)
             })
             .collect();
-        Ok(Some(PolicyPlan {
-            revision: s.revision,
+        Ok(PolicyPlan {
+            revision: s.policy_revision,
             grants,
             denied,
-        }))
+            expired: false,
+        })
     }
 
     /// Is this exact local policy revision durably applied to this node's keyring?
     pub fn applied(&self, node: &Digest32, revision: u64) -> bool {
-        lock(&self.state)
-            .applied
-            .get(node)
-            .is_some_and(|a| a.revision == revision)
+        let state = lock(&self.state);
+        !Self::revision_expired(&state) && Self::application_settled_in(&state, node, revision)
+    }
+
+    /// Durably remember that this node missed the local observation boundary for the exact
+    /// still-current policy. A later completion repairs current state but cannot rewrite history.
+    /// `false` means policy movement superseded the observed flight before the miss was recorded.
+    pub fn record_application_miss(&self, node: Digest32, change: ComputerChange) -> Result<bool> {
+        blocking_transaction(|| {
+            let _change = lock(&self.changes);
+            self.storage_ready()?;
+            let held = lock(&self.state).clone();
+            if held.policy_revision != change.target.revision
+                || Self::revision_expired(&held) != change.target.expired
+            {
+                return Ok(false);
+            }
+            let mut state = held.clone();
+            let revision = change.revision();
+            state
+                .application_misses
+                .entry(node)
+                .and_modify(|held| *held = (*held).max(revision))
+                .or_insert(revision);
+            if held.body() != state.body() {
+                if let Err(error) = self.save_before(&state, None) {
+                    self.storage_failure();
+                    return Err(error);
+                }
+                *lock(&self.state) = state;
+            }
+            Ok(true)
+        })
     }
 
     /// Record application only after the actor saved the complete keyring under the ordinary
     /// node store protection. A crash before this write repeats reconciliation before networking.
     pub fn mark_applied(&self, node: Digest32, revision: u64, covered: &[Digest32]) -> Result<()> {
-        self.change(|s| {
-            if revision > s.revision {
+        self.mark_applied_until(
+            node,
+            revision,
+            covered,
+            std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+        )
+        .map(|_| ())
+    }
+
+    /// Persist the exact revocation set before committing the node's keyring. This is not an
+    /// applied receipt: the actor must still save the keyring and finish its live or expired
+    /// receipt. If the process ends between those writes, the retained preparation prevents an
+    /// old live receipt from certifying an interrupted application or revocation.
+    pub(crate) fn prepare_application_until(
+        &self,
+        node: Digest32,
+        revision: u64,
+        expected_expired: bool,
+        covered: &[Digest32],
+        deadline: std::time::Instant,
+    ) -> Result<bool> {
+        self.prepare_application_guarded(
+            node,
+            revision,
+            expected_expired,
+            covered,
+            ComputerChangeBoundary::Deadline(deadline),
+        )
+    }
+
+    pub(crate) fn prepare_application_for_change(
+        &self,
+        node: Digest32,
+        revision: u64,
+        expected_expired: bool,
+        covered: &[Digest32],
+        change: ComputerChange,
+    ) -> Result<bool> {
+        self.prepare_application_guarded(
+            node,
+            revision,
+            expected_expired,
+            covered,
+            ComputerChangeBoundary::Current(change),
+        )
+    }
+
+    fn prepare_application_guarded(
+        &self,
+        node: Digest32,
+        revision: u64,
+        expected_expired: bool,
+        covered: &[Digest32],
+        boundary: ComputerChangeBoundary,
+    ) -> Result<bool> {
+        blocking_transaction(|| self.change_guarded_blocking(boundary, |state| {
+            let current = state.policy_revision;
+            let expired = Self::revision_expired(state);
+            if current != revision || expired != expected_expired {
+                // This plan lost a race with another authenticated policy revision before the
+                // node keyring commit. Nothing from it became authority, so keep the caller's
+                // original causal deadline and derive the now-current plan instead of making a
+                // normal concurrent change fail node startup.
+                eprintln!(
+                    "vox node: computer keyring plan at policy revision {revision} became stale before preparation (current revision {current}, expired {expired}); deriving the current plan within the original causal boundary"
+                );
+                return Ok(false);
+            }
+            let interval = state
+                .genesis
+                .as_ref()
+                .map(Enrollment::incarnation)
+                .unwrap_or([0; 32]);
+            state.prepared.insert(
+                node,
+                AppliedPolicy {
+                    revision,
+                    interval,
+                    grants: covered.iter().map(|peer| (*peer, revision)).collect(),
+                },
+            );
+            if expired {
+                // Keep the rollback set above before retiring the live applied receipt. This
+                // preparation precedes the node-store revocation, so a same-revision repair or
+                // a crash on either side of that commit must reapply instead of claiming the
+                // revoked keyring still represents the live policy.
+                if state
+                    .applied
+                    .get(&node)
+                    .is_none_or(|applied| applied.revision <= revision)
+                {
+                    state.applied.remove(&node);
+                    state.receipts.remove(&self.signer.fingerprint());
+                }
+            }
+            Ok(true)
+        }))
+        .map(|prepared| prepared.unwrap_or(false))
+    }
+
+    /// Commit one node's complete policy projection only if the prepared plan still names the
+    /// current revision and expiry state. The Computer writer guard prevents policy movement
+    /// through the node-store commit, while the state lock is released before filesystem I/O so
+    /// status remains readable. Callers must open their node transaction inside `commit`, never
+    /// hold a node-store writer while acquiring this guard.
+    pub(crate) fn commit_application_if_current<T>(
+        &self,
+        revision: u64,
+        expired: bool,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        blocking_transaction(|| {
+            let _change = lock(&self.changes);
+            self.storage_ready()?;
+            {
+                let state = lock(&self.state);
+                if state.policy_revision != revision || Self::revision_expired(&state) != expired {
+                    return Ok(None);
+                }
+            }
+            commit().map(Some)
+        })
+    }
+
+    pub(crate) fn mark_applied_until(
+        &self,
+        node: Digest32,
+        revision: u64,
+        covered: &[Digest32],
+        _deadline: std::time::Instant,
+    ) -> Result<ApplicationReceipt> {
+        let mut receipt = ApplicationReceipt::Current;
+        // The node-keyring commit is already irreversible. Its receipt or rollback decision is
+        // safety recovery, not fresh authorization, and must not be abandoned merely because the
+        // initiating convergence deadline ended between the two durable stores.
+        self.change_durable(|s| {
+            if revision > s.policy_revision {
                 return Err(bad());
+            }
+            // The node keyring was prepared while this revision was live, but an authenticated
+            // missed-exchange marker may have expired it during the node-store rename. Preserve
+            // the durable prepared rollback set and make the actor revoke the just-written grant
+            // before it publishes the projection or starts networking. This check deliberately
+            // shares the policy-state transaction with the receipt below.
+            if revision == s.policy_revision && Self::revision_expired(s) {
+                receipt = ApplicationReceipt::Reconcile;
+                return Ok(());
             }
             // Another authenticated roster may have arrived during the node store write.
             // Record the exact revision actually applied; the actor retries before authorizing.
+            if revision != s.policy_revision {
+                receipt = ApplicationReceipt::Reconcile;
+            }
 
             let interval = s
                 .genesis
@@ -2385,8 +3334,171 @@ impl Computer {
                 applied.grants.entry(*peer).or_insert(revision);
             }
             applied.revision = revision;
+            if s.prepared
+                .get(&node)
+                .is_some_and(|prepared| prepared.revision == revision)
+            {
+                s.prepared.remove(&node);
+            }
             Ok(())
-        })
+        })?;
+        Ok(receipt)
+    }
+
+    /// Record that all computer-managed grants for an expired revision were removed. The miss
+    /// itself remains durable; an old applied receipt can therefore never resurrect them.
+    pub(crate) fn mark_expired_until(
+        &self,
+        node: Digest32,
+        revision: u64,
+        _deadline: std::time::Instant,
+    ) -> Result<ApplicationReceipt> {
+        let mut receipt = ApplicationReceipt::Current;
+        // As with the applied receipt, the keyring write already happened. Completing or
+        // superseding its recovery journal cannot be cut off by the earlier apply deadline.
+        self.change_durable(|state| {
+            if revision > state.policy_revision {
+                return Err(bad());
+            }
+            // The revoked node keyring already committed. Its old live receipt is obsolete
+            // even if the expiry was repaired before this journal write; keeping it would
+            // certify the revoked keyring as live at the same revision, including on restart.
+            // A strictly newer application belongs to another completed projection and stands.
+            if state
+                .applied
+                .get(&node)
+                .is_none_or(|applied| applied.revision <= revision)
+            {
+                state.applied.remove(&node);
+                state.receipts.remove(&self.signer.fingerprint());
+            }
+            // A newer authenticated policy can arrive during the revocation keyring rename.
+            // The stale revocation is safe but is not current: retain its recovery records and
+            // immediately derive the newer policy instead of failing or claiming convergence.
+            if state.policy_revision != revision || !Self::revision_expired(state) {
+                receipt = ApplicationReceipt::Reconcile;
+                return Ok(());
+            }
+            // Only the exact current expiry can discharge its prepared rollback obligation.
+            state.prepared.remove(&node);
+            Ok(())
+        })?;
+        Ok(receipt)
+    }
+
+    /// Whether the durable Computer journal proves this exact node projection is complete.
+    /// Expiry is complete only after its prepared rollback set is gone and its recorded
+    /// computer-managed grants are empty; observing the expiry marker alone is not settlement.
+    pub(crate) fn application_settled(
+        &self,
+        node: &Digest32,
+        revision: u64,
+        expired: bool,
+    ) -> bool {
+        let state = lock(&self.state);
+        Self::revision_expired(&state) == expired
+            && Self::application_settled_in(&state, node, revision)
+    }
+
+    fn application_settled_in(state: &State, node: &Digest32, revision: u64) -> bool {
+        // No computer group has policy to apply. Keep this decision under the same state lock as
+        // the grouped checks below, so establishing a group cannot race Ready publication.
+        if state.genesis.is_none() && state.intervals.is_empty() {
+            return true;
+        }
+        if state.policy_revision != revision || state.prepared.contains_key(node) {
+            return false;
+        }
+        if Self::revision_expired(state) {
+            state
+                .applied
+                .get(node)
+                .is_none_or(|applied| applied.grants.is_empty())
+        } else {
+            state
+                .applied
+                .get(node)
+                .is_some_and(|applied| applied.revision == revision)
+        }
+    }
+
+    fn startup_binding_current_in(
+        &self,
+        state: &State,
+        node: &Digest32,
+        revision: u64,
+        expired: bool,
+    ) -> bool {
+        (state.genesis.is_none() && state.intervals.is_empty())
+            || expired
+            || state.grant(&self.signer.fingerprint()).is_none()
+            || state
+                .derived
+                .get(node)
+                .is_some_and(|binding| binding.revision == revision)
+    }
+
+    /// A changed target retries the accepted startup. Missing ownership at that same target is
+    /// a real refusal: an old vault must never silently reclaim a released/transferred binding.
+    pub(crate) fn require_startup_binding(
+        &self,
+        node: Digest32,
+        target: ComputerPolicyTarget,
+    ) -> Result<()> {
+        let state = lock(&self.state);
+        if state.policy_revision != target.revision
+            || Self::revision_expired(&state) != target.expired
+        {
+            return Err(Error::ComputerPolicySuperseded);
+        }
+        if !self.startup_binding_current_in(&state, &node, target.revision, target.expired) {
+            return Err(Error::Profile(
+                "this vault's Computer binding is no longer approved here; a released or transferred vault requires deliberate transfer or recovery before Ready",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publish Ready only while this exact application and its live binding are current. The
+    /// state lock stays held through `publish`, so policy movement after the actor's receipt
+    /// cannot land between this check and Ready. Revoked/unmanaged projections need no live
+    /// binding; they still must have completed their durable application.
+    pub(crate) fn with_application_settled<T>(
+        &self,
+        node: &Digest32,
+        revision: u64,
+        expired: bool,
+        publish: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let state = lock(&self.state);
+        let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
+        let settled = !self
+            .authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+            && (unmanaged || self.storage_ready().is_ok())
+            && Self::revision_expired(&state) == expired
+            && Self::application_settled_in(&state, node, revision)
+            && self.startup_binding_current_in(&state, node, revision, expired);
+        #[cfg(feature = "test-knobs")]
+        let settled = settled || fx28_mutant("ready-fence-accepts-unsettled");
+        settled.then(publish)
+    }
+
+    /// Test apparatus predicate for identifying the exact successful applied receipt. It exposes
+    /// no authority and is compiled out of shipped builds.
+    #[cfg(feature = "test-knobs")]
+    pub(crate) fn application_recorded_grant(
+        &self,
+        node: &Digest32,
+        revision: u64,
+        peer: &Digest32,
+    ) -> bool {
+        let state = lock(&self.state);
+        state.policy_revision == revision
+            && !state.prepared.contains_key(node)
+            && state.applied.get(node).is_some_and(|applied| {
+                applied.revision == revision && applied.grants.contains_key(peer)
+            })
     }
 
     /// The policy replaces a covered individual entry, including stronger drive. Aliases remain
@@ -2446,6 +3558,12 @@ impl Computer {
             let (_, personal, mut bindings) = roster.read(&local, &group)?;
             let was = bindings.len();
             bindings.retain(|b| names.contains(&b.name));
+            let retained: BTreeSet<_> = bindings
+                .iter()
+                .filter_map(|binding| binding.verify(&local, &group).ok())
+                .collect();
+            s.application_misses
+                .retain(|node, _| retained.contains(node));
             let selected = personal.filter(|id| {
                 bindings
                     .iter()
@@ -2461,13 +3579,49 @@ impl Computer {
 
     /// Capture alias metadata before automatic grant consumption or removal.
     pub fn retain_aliases(&self, node: Digest32, aliases: &[(Digest32, String)]) -> Result<()> {
-        self.change(|s| {
-            s.aliases
-                .entry(node)
-                .or_default()
-                .extend(aliases.iter().cloned());
-            Ok(())
+        self.retain_aliases_until(
+            node,
+            aliases,
+            std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+        )
+    }
+    pub(crate) fn retain_aliases_until(
+        &self,
+        node: Digest32,
+        aliases: &[(Digest32, String)],
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        self.retain_aliases_guarded(node, aliases, ComputerChangeBoundary::Deadline(deadline))
+            .map(|retained| {
+                debug_assert!(retained, "a deadline boundary cannot be superseded");
+            })
+    }
+
+    pub(crate) fn retain_aliases_for_change(
+        &self,
+        node: Digest32,
+        aliases: &[(Digest32, String)],
+        change: ComputerChange,
+    ) -> Result<bool> {
+        self.retain_aliases_guarded(node, aliases, ComputerChangeBoundary::Current(change))
+    }
+
+    fn retain_aliases_guarded(
+        &self,
+        node: Digest32,
+        aliases: &[(Digest32, String)],
+        boundary: ComputerChangeBoundary,
+    ) -> Result<bool> {
+        blocking_transaction(|| {
+            self.change_guarded_blocking(boundary, |s| {
+                s.aliases
+                    .entry(node)
+                    .or_default()
+                    .extend(aliases.iter().cloned());
+                Ok(())
+            })
         })
+        .map(|retained| retained.is_some())
     }
     /// A local alias survives a revoked permission.
     pub fn alias(&self, node: &Digest32, peer: &Digest32) -> Option<String> {
@@ -2499,23 +3653,26 @@ impl Computer {
         Ok(!managers.iter().any(|m| s.quarantined.contains(m)))
     }
     /// The ordinary explicit Trust command after retirement chooses individual mode. Journal
-    /// that choice before its keyring write; a failed write grants nothing and can be retried.
-    pub fn individual_choice(&self, node: Digest32, peer: Digest32) -> Result<()> {
-        if self.capability(node, &peer)?.is_some() {
+    /// that local choice before its keyring write; a failed write grants nothing and can be
+    /// retried. A peer that Computer policy never covered needs no Computer journal entry.
+    pub(crate) fn individual_choice(&self, node: Digest32, peer: Digest32) -> Result<()> {
+        let Some(plan) = self.plan(node)? else {
+            return Ok(());
+        };
+        if !plan.denied.contains(&peer) {
             return Ok(());
         }
         if !self.individual_permitted(node, &peer)? {
             return Err(Error::SignatureInvalid);
         }
-        self.change(|s| {
+        self.change_durable(|s| {
             s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
-            s.individual
-                .entry(node)
-                .or_default()
-                .insert(peer, s.revision);
-            s.receipts.clear();
+            let revision = s.revision;
+            s.individual.entry(node).or_default().insert(peer, revision);
             Ok(())
-        })
+        })?;
+        lock(&self.plans).remove(&node);
+        Ok(())
     }
 
     /// Open or atomically create the separate unattended software vault. Corrupt, unsupported,
@@ -2553,9 +3710,14 @@ impl Computer {
             let c = Arc::new(Self {
                 path,
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
+                authority_blocked: std::sync::atomic::AtomicBool::new(false),
                 signer,
+                changes: Mutex::new(()),
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
+                changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
+                journal_changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
+                plans: Mutex::new(BTreeMap::new()),
             });
             // Validate present storage before any endpoint or managed node can resume authority.
             // If a failed prior write could not persist its fault, the retained signed state is
@@ -2602,24 +3764,54 @@ impl Computer {
             receipts: BTreeMap::new(),
             vault,
             description,
+            policy_revision: 0,
             revision: 0,
             invitations: Vec::new(),
             genesis: None,
             rosters: BTreeMap::new(),
             pending: None,
             applied: BTreeMap::new(),
+            prepared: BTreeMap::new(),
+            derived: BTreeMap::new(),
+            missed_exchanges: BTreeMap::new(),
+            received_misses: BTreeMap::new(),
+            application_misses: BTreeMap::new(),
+            pending_exchanges: BTreeMap::new(),
         };
         let c = Arc::new(Self {
             path,
             storage_failed: std::sync::atomic::AtomicBool::new(false),
+            authority_blocked: std::sync::atomic::AtomicBool::new(false),
             signer: Arc::new(root),
+            changes: Mutex::new(()),
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
+            changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
+            journal_changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
+            plans: Mutex::new(BTreeMap::new()),
         });
         c.save(&lock(&c.state))?;
         Ok(c)
     }
     fn save(&self, s: &State) -> Result<()> {
+        self.save_before(s, None)
+    }
+    fn save_before(&self, s: &State, deadline: Option<std::time::Instant>) -> Result<()> {
+        #[cfg(feature = "test-knobs")]
+        let mutant_snapshot = if fx28_mutant("preview-approval-not-durable") {
+            let mut snapshot = s.clone();
+            // Save every surrounding transaction but never the authenticated preview or
+            // approval-bearing enrollment. Even a later background bookkeeping save cannot
+            // accidentally make the deliberately ephemeral fields durable before the crash.
+            snapshot.pending = None;
+            snapshot.pending_expires = 0;
+            snapshot.pair_link = None;
+            Some(snapshot)
+        } else {
+            None
+        };
+        #[cfg(feature = "test-knobs")]
+        let s = mutant_snapshot.as_ref().unwrap_or(s);
         secure(self.path.parent().ok_or_else(bad)?, true)?;
         if self.path.symlink_metadata().is_ok() {
             secure(&self.path, false)?;
@@ -2636,12 +3828,77 @@ impl Computer {
                 "computer management history is full; no state was discarded",
             ));
         }
-        write_private_file(&self.path, &bytes)
+        if let Some(deadline) = deadline {
+            write_private_file_checked(&self.path, &bytes, || {
+                if std::time::Instant::now() >= deadline {
+                    Err(Error::Profile(COMPUTER_COMMIT_CAUSAL_EXPIRED))
+                } else {
+                    Ok(())
+                }
+            })
+        } else {
+            write_private_file(&self.path, &bytes)
+        }
     }
     /// Commit a complete management transaction before publishing it to live authorization.
     pub(crate) fn change<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        let mut held = lock(&self.state);
+        self.change_until(std::time::Instant::now() + COMPUTER_RETURN_SHOWN_WITHIN, f)
+    }
+
+    /// Commit a transaction whose causal event already owns `deadline`. A merge and the
+    /// attached-node reconciliation it wakes share this one clock.
+    pub(crate) fn change_until<T>(
+        &self,
+        deadline: std::time::Instant,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<T> {
+        blocking_transaction(|| {
+            self.change_guarded_blocking(ComputerChangeBoundary::Deadline(deadline), f)
+                .and_then(|value| {
+                    value.ok_or(Error::Profile(
+                        "the deadline-bound computer transaction ended without a committed result",
+                    ))
+                })
+        })
+    }
+
+    /// Commit work only while `target` is still the exact durable policy projection. Unlike an
+    /// observation deadline, target movement is real supersession and therefore discards the
+    /// uncommitted closure. The caller receives `None` and yields to the event for the new target.
+    fn change_for_target<T>(
+        &self,
+        change: ComputerChange,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<Option<T>> {
+        blocking_transaction(|| {
+            self.change_guarded_blocking(ComputerChangeBoundary::Current(change), f)
+        })
+    }
+
+    fn change_guarded_blocking<T>(
+        &self,
+        boundary: ComputerChangeBoundary,
+        f: impl FnOnce(&mut State) -> Result<T>,
+    ) -> Result<Option<T>> {
+        // A writer owns the transaction order, but readers own no part of its filesystem work:
+        // status and authorization observations remain live while staging or flush is slow.
+        let _change = lock(&self.changes);
         self.storage_ready()?;
+        let held = lock(&self.state).clone();
+        match boundary {
+            ComputerChangeBoundary::Deadline(deadline) if std::time::Instant::now() >= deadline => {
+                return Err(Error::Profile(
+                    "the computer change reached its causal convergence deadline before its transaction began",
+                ));
+            }
+            ComputerChangeBoundary::Current(change)
+                if held.policy_revision != change.target.revision
+                    || Self::revision_expired(&held) != change.target.expired =>
+            {
+                return Ok(None);
+            }
+            _ => {}
+        }
         let mut next = held.clone();
         let value = match f(&mut next) {
             Ok(value) => value,
@@ -2651,18 +3908,318 @@ impl Computer {
             }
             Err(error) => return Err(error),
         };
+        // The obligation is part of the same durable transaction as its exchanged cause. This
+        // includes authenticated preview and one-sided approval, before activation makes either
+        // one operator policy. A crash after this save therefore recovers the exact unfinished
+        // journal cause; it can never manufacture a fresh clock after restart.
+        if held.revision != next.revision {
+            let local = self.signer.fingerprint();
+            let policy_moved = held.policy_revision != next.policy_revision;
+            for peer in next
+                .exchange_peers()?
+                .into_iter()
+                .filter(|peer| *peer != local)
+            {
+                // A transport-only journal movement cannot overwrite an unfinished policy
+                // cause: after a crash that would turn a real policy miss into an irrelevant
+                // reach revision. A newer operator policy does replace the durable cause (and
+                // `mark_retry` independently keeps the earlier absolute deadline in memory).
+                match next.pending_exchanges.entry(peer) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(if policy_moved {
+                            next.policy_revision
+                        } else {
+                            next.revision
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) if policy_moved => {
+                        entry.insert(next.policy_revision);
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
         if held.body() != next.body() {
-            if let Err(error) = self.save(&next) {
-                self.storage_failure();
+            if let ComputerChangeBoundary::Deadline(deadline) = boundary {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::Profile(
+                        "the computer change reached its causal convergence deadline before it could be saved",
+                    ));
+                }
+            }
+            let authorization_changed = held.policy_revision != next.policy_revision
+                || Self::revision_expired(&held) != Self::revision_expired(&next);
+            if authorization_changed {
+                self.authority_blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            #[cfg(feature = "test-knobs")]
+            let mutant_state_guard =
+                fx28_mutant("lock-through-computer-write").then(|| lock(&self.state));
+            let deadline = match boundary {
+                ComputerChangeBoundary::Deadline(deadline) => Some(deadline),
+                ComputerChangeBoundary::Current(_) => None,
+            };
+            #[cfg(feature = "test-knobs")]
+            let state_commit_marker = hold_state_commit_for_proof(deadline);
+            let saved = self.save_before(&next, deadline);
+            #[cfg(feature = "test-knobs")]
+            drop(mutant_state_guard);
+            if let Err(error) = saved {
+                // A refused pre-rename causal check leaves the old named file and in-memory
+                // state intact. It is a missed clock, not evidence that durable storage failed.
+                #[cfg(feature = "test-knobs")]
+                let deadline_is_storage_failure = fx28_mutant("deadline-as-storage-failure");
+                #[cfg(not(feature = "test-knobs"))]
+                let deadline_is_storage_failure = false;
+                if deadline_is_storage_failure
+                    || deadline.is_none()
+                    || !matches!(&error, Error::Profile(why) if *why == COMPUTER_COMMIT_CAUSAL_EXPIRED)
+                {
+                    self.storage_failure();
+                }
+                self.authority_blocked
+                    .store(false, std::sync::atomic::Ordering::Release);
+                #[cfg(feature = "test-knobs")]
+                finish_state_commit_for_proof(
+                    state_commit_marker.as_deref(),
+                    &format!("refused: {error}"),
+                    self.storage_failed
+                        .load(std::sync::atomic::Ordering::Acquire),
+                );
                 return Err(error);
             }
-            if held.revision != next.revision {
+            let committed_late = deadline.filter(|deadline| std::time::Instant::now() >= *deadline);
+            if authorization_changed {
                 self.invalidate_reachers();
             }
-            *held = next;
+            let mut published = lock(&self.state);
+            *published = next;
+            self.authority_blocked
+                .store(false, std::sync::atomic::Ordering::Release);
+            #[cfg(feature = "test-knobs")]
+            finish_state_commit_for_proof(
+                state_commit_marker.as_deref(),
+                "saved",
+                self.storage_failed
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
+            let _ = self.journal_changed.send(());
+            if let Some(deadline) = committed_late {
+                self.invalidate_reachers();
+                // The atomic rename happened. Publish an already-expired reconciliation event so
+                // actors revoke/detach instead of leaving the durable new policy live but unseen.
+                if authorization_changed {
+                    let now = std::time::Instant::now();
+                    let _ = self.changed.send(ComputerChange::at(
+                        ComputerPolicyTarget {
+                            revision: published.policy_revision,
+                            expired: Self::revision_expired(&published),
+                        },
+                        now,
+                        deadline,
+                    ));
+                }
+                return Err(Error::Profile(
+                    "the computer change committed at its causal boundary and was published as expired",
+                ));
+            }
+            if authorization_changed {
+                // Only operator authority makes nodes re-derive keyrings. Receipt, reach and
+                // pairing-journal movement is exchange payload and wakes Management through
+                // `journal_changed`; treating it as policy repeatedly reconciled every node.
+                // The local apply contract may shorten an outer return deadline, never extend it.
+                let _ = self.changed.send(ComputerChange::at(
+                    ComputerPolicyTarget {
+                        revision: published.policy_revision,
+                        expired: Self::revision_expired(&published),
+                    },
+                    match boundary {
+                        ComputerChangeBoundary::Deadline(deadline) => {
+                            deadline.min(std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN)
+                        }
+                        ComputerChangeBoundary::Current(change) => change.apply_deadline,
+                    },
+                    match boundary {
+                        ComputerChangeBoundary::Deadline(deadline) => deadline,
+                        ComputerChangeBoundary::Current(change) => change.return_deadline,
+                    },
+                ));
+            }
+        }
+        Ok(Some(value))
+    }
+
+    pub(crate) fn missed_exchanges(&self) -> (u64, BTreeMap<Digest32, (u64, bool)>) {
+        let state = lock(&self.state);
+        (state.policy_revision, state.missed_exchanges.clone())
+    }
+
+    /// Record a missed policy owner separately from the ordinary snapshot's journal coverage.
+    /// `sent_revision` is the completed snapshot on success, or the owned source position when
+    /// expiring a failed/blocked cause; that source position alone proves no delivery. `repaired`
+    /// means this real exchange completed, not that an older exchange once repaired the policy.
+    /// Without an exact pending/retained policy owner there is only
+    /// an operational transport outcome, so no policy history is created.
+    pub(crate) fn record_missed_exchange(
+        &self,
+        peer: Digest32,
+        sent_revision: u64,
+        policy_revision: u64,
+        repaired: bool,
+    ) -> Result<Option<u64>> {
+        self.change_durable(|state| {
+            // A superseded older flight cannot consume or repair the newer operator cause.
+            if state.policy_revision != policy_revision {
+                return Ok(None);
+            }
+            let covered_pending = state
+                .pending_exchanges
+                .get(&peer)
+                .copied()
+                .filter(|watermark| *watermark <= sent_revision);
+            let pending_policy = covered_pending.filter(|owner| *owner == policy_revision);
+            let retained_policy = state
+                .missed_exchanges
+                .get(&peer)
+                .map(|(owner, _)| *owner)
+                .filter(|owner| *owner == policy_revision);
+            // Expiring an actual policy cause consumes its pending consequence. Only actual
+            // successful delivery may also consume covered journal-only work. Repaired history
+            // alone is never evidence that this attempt sent the later preview/receipt payload.
+            if pending_policy.is_some() || (repaired && covered_pending.is_some()) {
+                state.pending_exchanges.remove(&peer);
+            }
+            let Some(owner) = pending_policy.or(retained_policy) else {
+                return Ok(None);
+            };
+            let held = state
+                .missed_exchanges
+                .entry(peer)
+                .or_insert((owner, repaired));
+            // A value beyond the current policy can only be the old mixed-axis journal bug.
+            // Replace it only with this independently proven current-policy owner; never infer
+            // a miss by merely relabeling an unowned journal watermark.
+            if owner > held.0 || held.0 > state.policy_revision || (owner == held.0 && repaired) {
+                *held = (owner, repaired);
+            }
+            Ok(Some(owner))
+        })
+    }
+
+    /// Own the consequence of a causal exchange before opening a socket. This write has no
+    /// elapsed product verdict: it either commits, or the exchange is not allowed to start.
+    pub(crate) fn record_pending_exchange(
+        &self,
+        peer: Digest32,
+        policy_revision: u64,
+    ) -> Result<Option<u64>> {
+        self.change_durable(|state| {
+            // Operational journal records may land between scheduler selection and this durable
+            // reservation. They change the payload revision, not the operator policy or its
+            // causal clock, so adopt the current journal position instead of repeatedly cutting
+            // a useful flight. A different policy really does supersede this reservation.
+            if state.policy_revision != policy_revision {
+                return Ok(None);
+            }
+            let revision = state.revision;
+            // Policy obligations are already recorded atomically by their policy change. Never
+            // mint one merely because a failed fallback retries at journal == policy. Preserve
+            // any existing policy cause; a vacant later journal watermark is payload work only.
+            if revision > policy_revision {
+                state.pending_exchanges.entry(peer).or_insert(revision);
+            }
+            Ok(Some(revision))
+        })
+    }
+
+    /// Clear covered delivery work only after a real complete exchange. Policy miss history
+    /// is separate and never erased here; an unsent later journal watermark stays pending.
+    pub(crate) fn record_timely_exchange(&self, peer: Digest32, sent_revision: u64) -> Result<()> {
+        self.change_durable(|state| {
+            // The completed flight may acknowledge only the state it actually sent. A newer
+            // obligation which appeared while it was in flight remains pending.
+            if state
+                .pending_exchanges
+                .get(&peer)
+                .is_some_and(|watermark| *watermark <= sent_revision)
+            {
+                state.pending_exchanges.remove(&peer);
+            }
+            Ok(())
+        })
+    }
+
+    /// A process exit cannot reset an unresolved operator-policy clock. Its exact policy
+    /// watermark becomes a miss; journal-only payload work remains queued for actual delivery
+    /// and cannot overwrite policy history with a transport/preview revision.
+    pub(crate) fn recover_pending_exchanges(&self) -> Result<()> {
+        self.change_durable(|state| {
+            for (peer, watermark) in std::mem::take(&mut state.pending_exchanges) {
+                if watermark != state.policy_revision {
+                    state.pending_exchanges.insert(peer, watermark);
+                    continue;
+                }
+                let held = state
+                    .missed_exchanges
+                    .entry(peer)
+                    .or_insert((watermark, false));
+                if watermark > held.0 || held.0 > state.policy_revision {
+                    *held = (watermark, false);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Persistence used by convergence bookkeeping whose truth must survive a crash and which
+    /// has no wall-clock success criterion of its own.
+    fn change_durable<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        blocking_transaction(|| self.change_durable_blocking(f))
+    }
+
+    fn change_durable_blocking<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
+        let _change = lock(&self.changes);
+        self.storage_ready()?;
+        let held = lock(&self.state).clone();
+        let mut next = held.clone();
+        let value = f(&mut next)?;
+        if held.body() != next.body() {
+            let authorization_changed =
+                Self::revision_expired(&held) != Self::revision_expired(&next);
+            if authorization_changed {
+                self.authority_blocked
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            if let Err(error) = self.save_before(&next, None) {
+                self.storage_failure();
+                self.authority_blocked
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(error);
+            }
+            if authorization_changed {
+                self.invalidate_reachers();
+            }
+            let mut published = lock(&self.state);
+            *published = next;
+            self.authority_blocked
+                .store(false, std::sync::atomic::Ordering::Release);
+            let _ = self.journal_changed.send(());
+            if authorization_changed {
+                let now = std::time::Instant::now();
+                let _ = self.changed.send(ComputerChange::at(
+                    ComputerPolicyTarget {
+                        revision: published.policy_revision,
+                        expired: Self::revision_expired(&published),
+                    },
+                    now + COMPUTER_CHANGE_SHOWN_WITHIN,
+                    now + COMPUTER_RETURN_SHOWN_WITHIN,
+                ));
+            }
         }
         Ok(value)
     }
+
     /// Publish into an existing room gate only while its node's durable keyring matches
     /// current policy. Register the same gate for synchronous invalidation on later changes.
     pub(crate) fn publish_reachers(
@@ -2670,6 +4227,8 @@ impl Computer {
         gate: &crate::node::tunnel::Reachers,
         next: std::collections::BTreeSet<Digest32>,
         applied: u64,
+        expired: bool,
+        node: Digest32,
     ) {
         let state = lock(&self.state);
         let mut gates = lock(&self.reachers);
@@ -2678,8 +4237,23 @@ impl Computer {
         }
         crate::node::tunnel::publish_reachers(
             gate,
-            if (state.genesis.is_none() && state.intervals.is_empty())
-                || (self.storage_ready().is_ok() && applied == state.revision)
+            if !self
+                .authority_blocked
+                .load(std::sync::atomic::Ordering::Acquire)
+                && ((state.genesis.is_none() && state.intervals.is_empty())
+                    || (self.storage_ready().is_ok()
+                        && applied == state.policy_revision
+                        && Self::revision_expired(&state) == expired
+                        && if Self::revision_expired(&state)
+                            || state.grant(&self.signer.fingerprint()).is_none()
+                        {
+                            Self::application_settled_in(&state, &node, applied)
+                        } else {
+                            Self::application_settled_in(&state, &node, applied)
+                                && state.derived.get(&node).is_some_and(|derived| {
+                                    derived.revision == state.policy_revision
+                                })
+                        }))
             {
                 next
             } else {

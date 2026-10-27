@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Past this the driver is stopped from outside: beyond its own budget and its `faulthandler`
-/// backstop, and well inside the proof watchdog's 600 s.
+/// backstop. This is the driver's explicit protocol bound, not a whole-proof elapsed verdict.
 pub const BOUND: Duration = Duration::from_secs(360);
 /// How long a driver told to stop has to clean up before it is killed.
 pub const GRACE: Duration = Duration::from_secs(30);

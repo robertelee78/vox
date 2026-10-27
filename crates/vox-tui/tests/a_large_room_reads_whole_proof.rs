@@ -1524,7 +1524,7 @@ fn a_hundred_thousand_entry_session_opens_in_one_second_with_bounded_memory() {
 #[test]
 #[ignore = "OPTIONAL: 64 MiB of unread messages and 1000 real service/decision operations"]
 fn every_large_collection_reaches_the_cli_and_app() {
-    watchdog::arm_for(Duration::from_secs(1200));
+    watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1772,7 +1772,7 @@ async fn collection_app(worker: &support::Worker) -> std::sync::Arc<vox_ffi::Vox
 #[test]
 #[ignore = "OPTIONAL: real 6000-entry room and its terminal timeline"]
 fn a_six_thousand_entry_room_opens_in_the_tui_in_order() {
-    watchdog::arm_for(Duration::from_secs(1200));
+    watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1837,7 +1837,7 @@ fn a_six_thousand_entry_room_opens_in_the_tui_in_order() {
 #[test]
 #[ignore = "OPTIONAL: 70 shipped nodes, their full trust graph, read marks and terminal"]
 fn a_seventy_member_room_opens_with_every_read_mark_and_trust() {
-    watchdog::arm_for(Duration::from_secs(2400));
+    watchdog::arm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

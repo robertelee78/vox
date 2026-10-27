@@ -236,8 +236,14 @@ relay circuit.
   - The board MUST be served on a `rendezvous` stream with `PUT <record>`, answered `ACCEPTED` or
     `REJECTED <reason>`, and `GET <channelID, epoch, kinds>`, answered with `RECORD` frames then
     `END`.
-  - The reasons MUST be `NotMember` 1, `Malformed` 2, `Policy` 3, `Capacity` 4, `UnknownKind` 5 and
-    `Stale` 6.
+  - The reasons MUST be `NotMember` 1, `Malformed` 2, `Policy` 3, `Capacity` 4, `UnknownKind` 5,
+    `Stale` 6, `Withdrawn` 7 and `Clock` 8. `Clock` means the signed publication timestamp is
+    outside the board's accepted window (future by more than N-27's tolerance, or already
+    expired), so the publisher can diagnose its clock instead of seeing generic policy.
+  - A joiner's pre-join `PUT` MAY treat only `Stale` as success, because that response proves this
+    author already has a newer announcement on the board. Every other refusal MUST stop using that
+    board as though the pre-join landed. In particular, the join MUST NOT proceed to an
+    unauthorized `Join` stream and misreport its resulting `AuthenticatorInvalid` refusal.
   - Reads MUST be open to any authenticated peer that knows the channelID, and records come back
     unverified for the reader to verify.
   - A record is self-authenticating, so the connection's peer need not be its author: a member MAY

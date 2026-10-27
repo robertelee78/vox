@@ -79,6 +79,8 @@ pub struct Attempt {
     pub fence: Arc<Fence>,
     /// Its place among the port's running sessions in `vox status`, removed when it drops.
     pub running: crate::node::status::Running,
+    /// Why it ran (ADR-038 FX-15, #996): counted on the lane when it completes.
+    pub reason: crate::node::status::RoundReason,
     /// Set only after a bounded inbound request has decoded the exact
     /// `Control/Head(peer)` query. If that peer departs while the response is in flight,
     /// lifecycle cleanup may retain this attempt long enough to return its semantic receipt;
@@ -227,12 +229,47 @@ impl RoomRef {
     }
 }
 
+/// Useful authenticated own-head response, scoped to the actual recipient and connection.
+/// This is not authority, a body receipt, or a certificate about an offline peer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SupportDiscovery {
+    pub connection: u64,
+    pub instance: [u8; 16],
+    pub epoch: u64,
+    pub authorization: Digest32,
+}
+
+/// A terminal, non-authoritative probe disposition on one actual connection/lifetime.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnProbe {
+    pub scope: SupportDiscovery,
+    pub head: Digest32,
+    pub incarnations: (u64, u64),
+}
+impl OwnProbe {
+    pub(crate) fn matches(
+        self,
+        scope: SupportDiscovery,
+        head: Digest32,
+        incarnations: Option<(u64, u64)>,
+    ) -> bool {
+        self.scope == scope && self.head == head && Some(self.incarnations) == incarnations
+    }
+}
+
 /// One `(room, peer)`'s sync port (ADR-025 D1).
 pub struct Port {
     /// The room instance it belongs to.
     pub room: RoomRef,
     /// The room's generation.
     pub gen: Arc<AtomicU64>,
+    /// Immutable epoch of this room instance. A reopen or epoch change replaces the room
+    /// instance and therefore this port; outbound scheduling does not need the room mutex merely
+    /// to rediscover it.
+    pub epoch: u64,
+    /// Wire/history format of this room instance. The sparse marker is immutable after creation;
+    /// keeping it with the port removes room-lock acquisition from the scheduler's start path.
+    pub sparse: bool,
     /// At most one outbound attempt.
     pub out: Option<Attempt>,
     /// Up to [`INBOUND_PER_PORT`] inbound attempts.
@@ -247,11 +284,24 @@ pub struct Port {
     pub req_gen: u64,
     /// Requests consumed by clean completions.
     pub req_done: u64,
+    /// Exact automatic-recovery trigger which returned without body/cursor progress. Equal
+    /// periodic scheduling is not a new producer; a real donor/authority/receipt change is.
+    pub(crate) own_recovery_parked: Option<Digest32>,
+    /// A fresh port must inspect whether its restored room owes automatic support discovery.
+    /// It is not a peer receipt; false only caches that this room needs no such operation.
+    pub(crate) support_discovery_check: bool,
+    pub(crate) support_discovery: Option<SupportDiscovery>,
+    /// One unavailable startup metadata probe, retired by connection/authority/local-head change.
+    pub(crate) support_discovery_unavailable: Option<OwnProbe>,
+    pub(crate) own_receipt_lower: Option<OwnProbe>,
     /// The room generation credited to the peer: monotonic within the room instance.
     pub done_gen: u64,
     /// Scheduler-only watermark after one current-only exchange found a legacy gap.
     /// This is not evidence that the peer received this generation; agreement still uses done_gen.
     pub legacy_checked_gen: Option<u64>,
+    /// Scheduler-only generation spent by an actual foreground outbound attempt. A refused
+    /// attempt does not acknowledge the peer, but the same fact cannot bypass Busy repeatedly.
+    busy_attempt_gen: u64,
     /// When a completion last made progress, for concurrent completions (progress wins).
     pub last_progress: Option<Instant>,
     /// When this node's own outbound session last completed cleanly, so the periodic request
@@ -263,15 +313,24 @@ pub struct Port {
     /// `own_seq` when this port last began an inventory exchange. While `own_seq` is past it,
     /// the port owes the peer an announcement, and a parked hinted continuation waits one round.
     pub announced_seq: u64,
+    /// `req_gen` as the periodic request (ADR-025 D7) last left it: while it is the newest
+    /// request and unconsumed, a round the port runs for it is a `periodic` round in
+    /// `vox status` (ADR-038 FX-15, #996).
+    pub periodic_req: u64,
+    /// Why the last `start_outbound` for this port ended as it did, and when: what
+    /// `vox status --json` names under `lanes.ports[].last_start` (ADR-038 FX-16).
+    pub last_start: Option<(&'static str, Instant)>,
 }
 
 impl Port {
     /// A fresh port for `room`, with a request raised: a new port syncs at once.
     #[must_use]
-    pub fn new(room: RoomRef, gen: Arc<AtomicU64>) -> Self {
+    pub fn new(room: RoomRef, gen: Arc<AtomicU64>, epoch: u64, sparse: bool) -> Self {
         Self {
             room,
             gen,
+            epoch,
+            sparse,
             out: None,
             inbound: BTreeMap::new(),
             queued: false,
@@ -279,12 +338,20 @@ impl Port {
             poisoned: false,
             req_gen: 1,
             req_done: 0,
+            own_recovery_parked: None,
+            support_discovery_check: true,
+            support_discovery: None,
+            support_discovery_unavailable: None,
+            own_receipt_lower: None,
             done_gen: 0,
             legacy_checked_gen: None,
+            busy_attempt_gen: 0,
             last_progress: None,
             last_clean_out: None,
             own_seq: 0,
             announced_seq: 0,
+            periodic_req: 0,
+            last_start: None,
         }
     }
 
@@ -315,6 +382,19 @@ impl Port {
         self.req_gen = self.req_gen.saturating_add(1);
     }
 
+    /// Raise the periodic request (ADR-025 D7), remembered as such for `vox status`.
+    pub fn raise_periodic(&mut self) {
+        self.raise();
+        self.periodic_req = self.req_gen;
+    }
+
+    /// Whether the newest unconsumed request on this port is the periodic one: nothing else has
+    /// asked for a round since it came due.
+    #[must_use]
+    pub fn periodic_pending(&self) -> bool {
+        self.req_gen > self.req_done && self.periodic_req == self.req_gen
+    }
+
     /// Whether the periodic request (ADR-025 D7) has anything to add at `now`: not while this
     /// node's own session on the port is running, nor within `fresh` of its last clean completion.
     /// The request is a safety net for a port nothing has served lately. Raised on a port that had
@@ -340,17 +420,27 @@ impl Port {
     /// Whether new published entries bypass a Busy backoff at `now`. The Busy backoff spaces
     /// owed-work retries while nothing new arrived; a peer's newly published entries are new
     /// demand, and holding the round that carries them behind a transient-refusal backoff
-    /// delayed a fresh member's join and floor visibility past the person-facing bounds. A
-    /// transport (Unreachable) backoff still holds: a peer that cannot be reached gains
-    /// nothing from an immediate retry.
+    /// delayed a fresh member's join and floor visibility past the person-facing bounds.
+    /// Each published generation gives one actual foreground attempt this bypass; an unchanged
+    /// unfinished generation is not another new event after a refusal. A transport (Unreachable)
+    /// backoff still holds: a peer that cannot be reached gains nothing from an immediate retry.
     #[must_use]
     pub fn busy_bypass(&self, now: Instant) -> bool {
         self.backoff.is_some_and(|b| {
             b.kind == BackoffKind::Busy
                 && !self.poisoned
                 && self.gen.load(Ordering::Relaxed)
-                    > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
+                    > self
+                        .done_gen
+                        .max(self.legacy_checked_gen.unwrap_or(0))
+                        .max(self.busy_attempt_gen)
         }) && self.backing_off(now)
+    }
+
+    /// Spend bypass credit only when a real foreground outbound attempt was installed. The
+    /// caller captured this generation before launch; a change during flight stays fresh.
+    pub(crate) fn note_foreground_attempt(&mut self, generation: u64) {
+        self.busy_attempt_gen = self.busy_attempt_gen.max(generation);
     }
 
     /// Clear the backoff: a new connection, a new epoch, or a person's `vox room sync`.
@@ -470,6 +560,13 @@ impl Slots {
     #[must_use]
     pub fn any_free(slots: &SharedSlots) -> bool {
         slots.lock().unwrap_or_else(PoisonError::into_inner).in_use < OUTBOUND_SLOTS
+    }
+
+    /// The slots in use now, overall and per peer, for `vox status --json`.
+    #[must_use]
+    pub fn snapshot(slots: &SharedSlots) -> (usize, Vec<(Digest32, usize)>) {
+        let s = slots.lock().unwrap_or_else(PoisonError::into_inner);
+        (s.in_use, s.per_peer.iter().map(|(p, n)| (*p, *n)).collect())
     }
 
     /// Take a slot for `peer`, if one is free; `on_free` runs when it is given back.

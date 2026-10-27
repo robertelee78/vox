@@ -58,8 +58,12 @@ It takes a scratch HOME and data root with no node, no keychain item of Vox's an
 
 - Run from the repository root, on a machine doing its ordinary work.
 - Run **one test at a time**, by its exact name, as each row shows.
-  - The watchdog's budget (10 minutes, `VOX_TEST_WATCHDOG_SECS` overrides it) covers a whole test binary.
-  - Two tests of one binary run together would share that budget.
+  - There is no default elapsed watchdog. A progressing proof is allowed to take as long as its
+    work takes; its product and structural assertions decide whether it passed or wedged.
+  - For an unattended run, the operator may set a positive `VOX_TEST_WATCHDOG_SECS` emergency
+    timebox for the whole test binary. If it expires, the helper gathers diagnostics and cleans
+    descendants, but the result is only `NO RESULT`/`CANNOT MEASURE`, never a product or release
+    verdict. Two tests run together would share that explicitly chosen emergency timebox.
 - The first run compiles vox-tui with the feature. Later runs reuse the build.
 - Every command here also enables `test-knobs` (#300): several optional proofs stage with a `VOX_TEST_*` knob, which only a `test-knobs` build of `vox` reads. Without it, such a proof stops at `CANNOT MEASURE` naming the knob.
 
@@ -149,6 +153,96 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 
 `update_proof`'s other test, `vox_update_replaces_an_install_it_owns_and_refuses_the_rest`, measures this build's refusals, record lookup, `--check` and `--rollback`, and is not optional.
 
+### Computer convergence journeys
+
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `nodes_of_one_daemon_proof::computer_pairing_uses_an_anchor_without_room_membership_and_reconnects` | Paired computers do not converge after path loss, historical misses disappear across restart, or Ready exposes an old application after a later operator policy changes the personal-node role while losing current managed or manual grants. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_pairing_uses_an_anchor_without_room_membership_and_reconnects --nocapture` | a real machine with IPv4 and IPv6 loopback; run alone | several minutes; not timed in CI |
+| `nodes_of_one_daemon_proof::computer_preview_and_approval_survive_a_crash` | An authenticated Add Computer preview or the local operator's approval disappears when the daemon crashes before the other operator approves. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact computer_preview_and_approval_survive_a_crash --nocapture` | a real machine; run alone | not timed in CI |
+| `nodes_of_one_daemon_proof::two_paired_computers_that_are_idle_exchange_nothing` | Idle paired computers keep exchanging unchanged histories, re-derive bindings, or fail to reconcile siblings while one actor is held. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test nodes_of_one_daemon_proof -- --ignored --exact two_paired_computers_that_are_idle_exchange_nothing --nocapture` | a real machine; run alone | about five minutes; not timed in CI |
+
+FX-28's nineteen executable mutants are run one at a time with
+`scripts/run-fx28-mutant.sh <mode>`, where `<mode>` is
+`preview-approval-not-durable`, `stopped-reader-fresh-write`, `lock-through-computer-write`,
+`deadline-as-storage-failure`, `withdrawal-not-durable`, `stale-tick-authority`, `stale-join-authority`,
+`fresh-preview-inherits-old-deadline`, `late-application-abandons-work`, `detach-keeps-reconciliation`,
+`redeem-rejects-pending-registration`, `owner-refusal-decoded-as-payload`,
+`due-backoff-drops-causal-cause`,
+`ready-fence-accepts-unsettled`, `stale-post-authority`, `stale-room-create-authority`,
+`stale-trust-projection`, `stale-rekey-authority`, or
+`legacy-ended-unanswered-not-selected`. Each mode selects the journey which stages that fault and accepts
+only its exact named `PRODUCT [FX28 ...]:` verdict; another product red is an apparatus failure,
+not evidence for the mutant. `stopped-reader-fresh-write` uses one real shipped daemon as an
+authenticated peer which fills the other daemon's bounded management slots and leaves every
+response unread. `lock-through-computer-write` restores the former state lock across an exact held
+durable Computer write; shipped status must still answer with the last committed revision inside
+its existing actor-liveness contract. `deadline-as-storage-failure` turns an exact pre-rename
+causal refusal into permanent storage quarantine again. `withdrawal-not-durable` omits the refused
+join's prepared and pending board-withdrawal journals; after the responder path reopens with the
+joining daemon stopped, restart must still remove both exact accepted records from that real board.
+`ready-fence-accepts-unsettled` bypasses only the daemon's final state-locked
+publication fence after a successful receipt. A later real operator change supersedes that
+receipt while startup is held; the mutant exposes the stale or held-back projection instead of
+the current personal role and exact managed/manual grants. `stale-post-authority` bypasses the durable-policy fence around an
+ordinary text append; `stale-trust-projection` makes the shipped trust list copy unreconciled
+trusted rows; `stale-room-create-authority` bypasses only the first durable commit of an exact
+sealed room create, so its shipped create answer and room list expose stale authority;
+`stale-rekey-authority` bypasses the final fence around exact sender-key queue
+admission after every preceding await. `legacy-ended-unanswered-not-selected` suppresses only
+the real `ENDED_UNANSWERED` compatibility-route selection; the shipped roster then fails to say
+that the exact peer runs an older Vox, before the authority race is staged. Full transcripts are
+written under `target/fx28-mutants/`. That same causal route makes the authority rejection seal
+through the legacy long-lived ratchet; the normal build restores its exact unpublished session
+snapshot, while the stale-authority mutant independently makes the shipped revoked reader expose
+the forbidden post. These are
+on-demand diagnostics, not CI or release gates, and are serialized like the journeys.
+
+The former expiry-before-keyring-commit phase and the `expired-plan-drops-prepared` and
+`keyring-commit-not-recoverable` mutants are removed. The node-store commit now serializes the
+exact policy revision and expiry state across one atomic batch of keyring and dependent metadata;
+a superseding plan commits nothing. A sender's missed exchange is historical timing evidence and
+does not revoke an authenticated receiver policy. The dedicated pre-receipt crash phase and its
+knobs are removed too: an actual later removal derives its denied peers from authenticated
+binding history regardless of a prepared receipt, so the old omitted-preparation mutation no
+longer affects it. The same journey retains unchanged restart and final Ready supersession;
+the independent preview/approval crash journey retains the operator's durable intent claim.
+
+`redeem-rejects-pending-registration` restores the immediate policy refusal when the exact
+inviter registration is still being published. The anchor journey holds that real registration,
+observes the matching redemption, then releases publication and requires the same shipped pairing
+command to authenticate the valid code. Known refusal and direct reach remain independent.
+
+`owner-refusal-decoded-as-payload` skips recognition of the existing tagged peer refusal.
+The anchor journey retries a cancelled invitation over an established computer connection and
+requires the shipped command to preserve the owner's cancellation reason rather than report
+malformed response data. It does not accept a transport failure as evidence of cancellation.
+
+`due-backoff-drops-causal-cause` restores the due-backoff selector's early return before causal
+classification. After an early failed exchange and its retry are staged, the anchor journey
+requires the same unfinished cause to become expired in shipped status. A pending-state read
+started after the original conservative return boundary is a product failure. A positive expired
+read proves the structural outcome without inferring the instant it was published.
+
+`fresh-preview-inherits-old-deadline` makes a new pairing request inherit an older ordinary
+exchange's clock. The existing anchor journey holds that fresh reservation while the ordinary
+miss stays visible, then verifies the exact invitation after reachability returns. Preview does
+not acknowledge ordinary delivery. `late-application-abandons-work` drops only the accepted actor
+causally held past its observation boundary. The journey requires that same revision to become
+current and usable after release without a role toggle, detach, unlock or restart, while its
+historical miss remains visible. Its return boundary stays fixed throughout the observation.
+`detach-keeps-reconciliation` retains the departing actor's owned flight and live pending row.
+The existing replacement journey first observes that exact public pending result and miss, then
+requires same-policy reattachment to clear live pending status and confirm its actual grant while
+retaining history. Its existing delayed-reply interval stages the race; failure to stage it is
+APPARATUS and cannot count as a product or mutant verdict.
+
+Startup derives the actual current binding and settles its exact application before the
+state-locked Ready publication. Genuine policy movement continues the same accepted operation;
+observation lateness does not destroy it. Every authority-bearing use also checks current durable
+policy. The pause mutant is judged by the saved state shown by shipped `vox room session`, with
+a registered Session and known pause status, even when the original command reports delivery
+unknown. Ordinary text append and sender-key admission have their own use-boundary mutants above.
+
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
@@ -165,16 +259,51 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `a_reach_waits_for_the_anchor_being_dialled_proof::a_forward_whose_anchor_is_still_being_dialled_reaches_on_its_first_attempt` | A restarted `vox forward` whose anchor connection is still being made fails its first reach and pays the 500 ms retry (V210-132). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_reach_waits_for_the_anchor_being_dialled_proof -- --ignored --exact a_forward_whose_anchor_is_still_being_dialled_reaches_on_its_first_attempt` | a real machine with IPv4 and IPv6 loopback | not timed in CI |
 | `a_post_answers_promptly_while_a_peer_posts_proof::a_post_answers_promptly_while_a_peer_posts` | `vox room post` is sluggish while someone else in the room is posting (100 ms). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_post_answers_promptly_while_a_peer_posts_proof -- --ignored --exact a_post_answers_promptly_while_a_peer_posts` | a real machine | 11 s / 12 s |
 | `a_trust_check_does_not_stall_the_node_proof::a_trust_check_does_not_stall_posts_and_reads_on_the_same_node` | Posting and reading freeze while trust checks run (1 s and 150 ms bounds). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_trust_check_does_not_stall_the_node_proof -- --ignored --exact a_trust_check_does_not_stall_posts_and_reads_on_the_same_node` | a real machine | 32 s / 42 s |
+| `a_newcomer_reads_the_whole_history_proof::retained_rows_render_once_their_key_and_consent_arrive` | A held key bypasses consent, or exact retained rows fail to reproject for either row→key→consent or row→consent→key (ADR-038 FX-22; #1007). Marker holds stage each ordering; one author contributes more than a production projection page while a competing author contributes another row. After both exact sender keys are held, a causal marker parks the first bounded turn that commits the competing author's row; shipped `vox status` plus exact paged `vox room read --json` must then show that row readable while the long author's backlog remains unfinished. This proves fair author service without sampling a transient window. The same shipped surfaces, `vox agent doctor`, `vox room admin list`, and exact rename hashes prove exact retained objects, continued completion, semantic no-op revisions, and stale-consent invalidation. When status says a continuation is exhausted, the proof re-reads exact rows before any verdict so a paged observation cannot punish a healthy completion. A separate marker parks a bounded sweep past an effective administrator; a changed-name semantic revision makes failed hold staging an explicit APPARATUS result, while the quiet room's source-owned authority deadline is the only successful wake and must remove that administrator with exactly one semantic revision. Both row sources stop before the releasing fact, so success cannot be a refetch. The causal mutant clears the next sparse continuation after its first exact row: status then says finished while hashes/text remain missing, producing a PRODUCT red. Elapsed time and CPU are not verdicts; an operator may stop a structurally stalled run as NO RESULT. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact retained_rows_render_once_their_key_and_consent_arrive` | a real machine; `test-knobs` | not timed in CI |
 | `a_newcomer_reads_the_whole_history_proof::a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog` | A member who joins a room that already has history waits longer than one who joins an empty room before the room is usable: its first post is refused or slow to be read, or it is slow to read the others (ADR-037 R1, #958). Two rooms in one run, an empty one and one of 160 posts (past the 128-row live window a sparse join holds); from each join's return, the creator reads the joiner's first post and the joiner reads the creator's within the same 10 s. A red names which room passed the bound and by how much. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact a_newcomer_talks_both_ways_at_one_wait_fresh_or_behind_a_backlog` | a real machine | not timed in CI (about 2 min on a Mac) |
+| `a_newcomer_reads_the_whole_history_proof::hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port` | A many-node daemon wedges a room at the flow-state floor, retains a parked lane/byte/flow charge, loses exact archive/hint/required work at admission, hands a release to a later contender before the earliest eligible retained Flow, or accounts current and retiring actor generations inconsistently. Fifteen named nodes share one shipped `vox daemon --no-node` and a peer runs on another daemon. Real live rounds plus both shipped older-history requests cross the source-defined floor; every member must read every other, and the production daemon-wide limit must return to exactly `2 × active-or-retiring hosted node identities`, with no fixed or minimum floor. The fault segment proves PoolFull only at `occupied == limit`, unrelated identity registration cannot wake retained work, and a granted-but-unconsumed release appears in `promised` and `occupied`; one status snapshot accounts every charge and retained owner by actor, node, room, peer, request and incarnation. Proof-only barriers stage capacity and actor replacement but never decide the verdict. Progress and exact shipped ownership decide each red; only the operator-selected external deadman can end an otherwise progressing run, as APPARATUS. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact hosted_nodes_read_each_other_and_the_flow_state_pool_holds_no_port --nocapture` | a real machine | not timed |
 
 ### The governance fold held by a knob (ADR-037 R3, #953; needs `test-knobs`)
 
 `VOX_TEST_FOLD_HOLD_FILE=<path>`: while that file exists, no room's governance fold advances in that daemon. A proof stages "received but not folded" with it, drives an egress, and removes the file to see the recovery. Only a `vox` built with `test-knobs` reads it; without it the proof stops at `CANNOT MEASURE` naming the knob.
 
+`VOX_TEST_HOLD_PACKAGES_FILE=<path>`: while the marker exists, every sender-key acceptance entrance is held: the ordinary retained-package worker, a retained package encountered during room preparation, and live pairwise delivery. The first real attempt writes `<path>.engaged`; retained packages stay queued, while a live sender receives not-accepted and retains/retries its delivery. The FX-22 proof observes that causal engagement and zero received generations before releasing the marker and driving an idempotent trust command to replay the held packages. Same `test-knobs` rule.
+
+`VOX_TEST_HOLD_RENDER_FILE=<path>`: an empty marker parks existing render work. A 96-byte marker containing a raw room id and two raw author ids parks that room and is renamed with `.ready` appended when both exact sender keys are held. A 64-byte marker containing a raw room id and one raw author id lets one real bounded turn run, then is renamed with `.engaged` appended after that author's row commits and parks later turns. The FX-22 proof reads only shipped status and exact room rows for its verdict; these marker states only establish and freeze the causal boundary. Same `test-knobs` rule.
+
+`VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE=<path>`: the marker contains one raw room id. One bounded governance sweep renames it with `.engaged` appended after selecting that room and parks with the cursor beyond it. The FX-22 proof lets the room's real stored authority deadline provide the only wake, proving an expiry behind an in-progress cursor receives another sweep. Same `test-knobs` rule.
+
 `VOX_TEST_PRIVATE_POLICY_HOLD_FILE=<path>`: while that file exists, no room's private-Session policy is ready in that daemon, as while its Session-floor index is behind its authors' heads at a restart. A proof stages a peer's drive key arriving in that window (its pass is saved as pending and not run), stops the daemon, removes the file and starts it again to see the room open (ADR-038 FX-26). Same `test-knobs` rule.
+
+`VOX_TEST_HOLD_PACKAGES_FILE=<path>`: while that file exists, the daemon leaves received key-packages queued instead of opening them. The quiet-room proof uses the hold only on the addressed recipient; another member must settle the authenticated public header without receiving or claiming the private body. Same `test-knobs` rule.
+
+`VOX_TEST_SERVE_NONRECIPIENT_HISTORY_BODY_FILE=<path>`: while that marker exists, the first authenticated key-package request by a non-recipient is answered with one hostile body frame, then the marker is renamed with `.engaged` appended. The quiet-room proof uses this only on the source daemon to prove a real receiving `vox` refuses the unexpected ciphertext before persistence. Same `test-knobs` rule.
+
+`VOX_TEST_FX29_CONTENT_OUTCOME_FILE=<path>`: the first sparse Content effect on that daemon
+creates the marker once with `accepted:<entry-hash>` after its transaction and visible projection
+complete, or `refused:<entry-hash>` after the room records the effect failure. The quiet-room proof
+matches Alice's hash, then performs exactly one shipped Bob read for the Content publication
+verdict. The marker is causal apparatus only and the exact read is the PRODUCT verdict. Same
+`test-knobs` rule.
+
+The isolated FX-29 mutants are
+`VOX_TEST_WATCHDOG_SECS=<operator-deadman> scripts/run-fx29-mutant.sh drop-resume-owed` and the
+same command with `finish-control-after-effect`, `track-content-through-settled-index`, or
+`refill-content-with-current-time`. The first
+removes only the `ResumeOwed` installation after the causally staged stale archive return; the
+second restores the merge bug that tries to apply a sparse Presence before its position is
+semantically published; the third makes sparse Content retention rediscover the entry only through
+the still-unsettled public index instead of using the transaction's exact authenticated entry. The
+Content verdict is attached only to one Bob read after the outcome marker binds Alice's exact
+accepted entry hash; later reads retain their own claims. The runner accepts only each exact named
+PRODUCT verdict after its exact staging line. Its
+transcript is written under `target/fx29-mutants/`. The required positive deadman is chosen by the
+operator for that machine and only turns a whole-proof wedge into APPARATUS; elapsed time never
+decides the PRODUCT verdict. This is an on-demand diagnostic, not CI or a release gate.
 
 | Proof | Helps troubleshoot | Run | Needs | Time |
 |---|---|---|---|---|
+| `a_newcomer_reads_the_whole_history_proof::a_quiet_room_costs_no_rounds_and_says_when_it_last_synced` | A quiet room keeps probing, rewriting storage or recording non-empty/partial syncs after a member holds an authenticated key-package header addressed only to somebody else (FX-29; #996, #1021). Bob returns behind two authors whose suffixes each exceed the production page bound; Alice hostile-sends Carol's private body once. Bob must refuse it before persistence; when that archive Flow becomes authorization-stale while Carol's earlier real Control work owns the sole admission, shipped `lanes.history.owner` must retain its exact room, request, incarnation, FIFO ticket and wake as `resume_owed`. Bob then restarts, resumes through the shipped command, acknowledges both exact feed tails through bounded continuation (including terminal effect replay), and enters a quiet minute in which every exact lane completes an empty periodic round, fetches/serves/re-declines no history, and Alice's, Bob's and offline Carol's complete `store.redb` bytes and mtimes remain unchanged. With Alice offline, Carol completes a sync with Bob, triggers retained package processing through an idempotent trust command, and waits until shipped status says that bounded queue is empty, but cannot read Alice's tail; it appears only when the actual source returns. Finally, a member trusted before the posts joins after Alice and Bob visibly prune one Bob body while its sole retaining source is offline. After its exact refusal, a younger shipped witness visibly expires; Carol returns and the exact settled-body refill must preserve the older header age rather than expose the body anew. That refusal then survives a reconnect fenced by visible disconnect and a requester restart fenced before its first Flow, is rejected as stale when a real in-flight old-grant refusal meets a trust removal/regrant, is invalidated by a shipped leave/rejoin, and is re-armed for Bob's readable successor. Proof-only barriers stage the first startup Flow, the exact post-refill read and the stale refusal transaction but never decide a verdict. These lifecycle verdicts terminate on shipped rows, exact lane/owner or room-open state, not elapsed PRODUCT bounds. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact a_quiet_room_costs_no_rounds_and_says_when_it_last_synced --nocapture` | one real machine; run alone because it measures one quiet minute | not timed in CI |
 | `a_newcomer_reads_the_whole_history_proof::a_room_that_cannot_finish_preparing_says_why_and_costs_nothing` | A room sits at "preparing history" with no reason shown, or a preparing room keeps the daemon busy (ADR-038 FX-15, FX-16, FX-24; #991). Alice's fold is held while bob's rows arrive; after her restart `vox room list` and `vox status --json` must name the wait within 5 s, the room must cost under 3 s of CPU and run no sync round over a minute, and open within 10 s of the hold's end. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact a_room_that_cannot_finish_preparing_says_why_and_costs_nothing` | a real machine | not timed in CI (about 2 min on a Mac) |
 | `a_newcomer_reads_the_whole_history_proof::a_room_with_its_own_session_records_opens_after_a_restart` | A room with Session records never leaves "preparing history" after a restart, or a peer's drive key received at a restart is never rendered (ADR-038 FX-26; #991). Bob's drive key reaches alice while her private-Session policy is held not ready; after her restart the room must open within 20 s, read its rows, and within 30 s list bob's Session as one she can drive. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact a_room_with_its_own_session_records_opens_after_a_restart` | a real machine | not timed in CI (about 2 min on a Mac) |
 | `a_session_is_sealed_to_drive_proof::a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional` | A Session entry reaches a driver while the author's room still has control entries it has not folded (the audience was chosen off stale governance), or `vox room read` on such a room does not say `note: this room is still folding its control entries; this page is provisional` before its rows, or a text post waits on the fold, or the held Session entry is lost rather than landing once the fold is current. An anchor and three daemons; alice's daemon holds its fold while carol joins through bob's link; alice's next Session entry (written through her node's control socket as her harness's hook writes one) must not be read by bob for 8 s, her text post must; the file is removed and the entry lands within 60 s (sent again if her node refused it while behind) and the note is gone. A red quotes what `vox room read` or `vox room session` showed. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_session_is_sealed_to_drive_proof -- --ignored --exact a_sessions_append_waits_for_the_fold_and_a_read_meanwhile_is_provisional` | nothing beyond `vox` built with `test-knobs` | not timed in CI (about 2 min on a Mac) |
@@ -192,7 +321,7 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `notify_proof::a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | A room that has gone ten minutes without a completed sync is never said, is said more than once, or is never said to have recovered (PRD-001 R37). alice's only other member and the anchor are stopped; one notification names the room once the condition starts, and one "recovered" once the anchor is back. | `cargo test --release -p vox-tui --features optional-proofs --test notify_proof -- --ignored --exact a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again` | nothing beyond `vox` | over ten minutes (the condition takes `STALE_SYNC_SECS`) |
 | `a_join_outlives_its_displaced_path_proof::a_join_outlives_its_displaced_path` | A slow join fails when the network path changes under it. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_join_outlives_its_displaced_path_proof -- --ignored --exact a_join_outlives_its_displaced_path` | time (a 300 s join grind) | 314 s / 315 s |
 | `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_old_patience_gets_in` | A slow machine can't get into a room. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_old_patience_gets_in` | time (a 150 s grind) | 488 s / 490 s for both, run together |
-| `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_patience_is_told_why` | A machine too slow to join gets no explanation. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_patience_is_told_why` | time (a 485 s grind; near the 10-minute watchdog, so run it alone) | (in the figure above) |
+| `a_slow_joiner_gets_in_or_is_told_why_proof::a_joiner_slower_than_the_patience_is_told_why` | A machine too slow to join gets no explanation. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_slow_joiner_gets_in_or_is_told_why_proof -- --ignored --exact a_joiner_slower_than_the_patience_is_told_why` | time (a 485 s grind; run it alone so other work does not distort it) | (in the figure above) |
 | `two_backlogs_meet_proof::two_backlogs_that_meet_both_cross` | Two members who were offline with big backlogs don't both catch up. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test two_backlogs_meet_proof -- --ignored --exact two_backlogs_that_meet_both_cross` | 48 MB of history | 42 s / 48 s |
 | `a_member_reads_only_what_follows_trust_proof::posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read` | Someone trusted later reads what came before the trust, or misses what came after. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_member_reads_only_what_follows_trust_proof -- --ignored --exact posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read` | 3,160 posts through the CLI | 148 s / 181 s |
 | `a_newcomer_reads_the_whole_history_proof::a_newcomer_trusted_before_every_post_reads_all_of_them` | A newcomer trusted from the start misses part of a long room's history, or the page below what it holds does not come when asked for (`vox room read --history older --before <oldest row>`, ADR-037 R1). A red names the page that never arrived and quotes `--history status`. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_newcomer_reads_the_whole_history_proof -- --ignored --exact a_newcomer_trusted_before_every_post_reads_all_of_them` | 1,500 posts, read back a page at a time in the room's order | 27 s / 30 s (before the pages were asked for on demand) |
@@ -204,7 +333,7 @@ The Linux form runs unprivileged in a network namespace and is an ordinary proof
 | `a_displaced_relay_is_let_go_proof::a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace` | An anchor keeps carrying relays for pairs that went direct. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_displaced_relay_is_let_go_proof -- --ignored --exact a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace` | time (a 60 s grace) | 82 s / 83 s |
 | `every_member_is_back_after_an_anchor_restart_proof::every_member_is_back_after_an_anchor_restart` | After an anchor restarts, some members stay disconnected for many seconds, or a member refused by a busy anchor is told of a bad signature instead of "the peer is busy". | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test every_member_is_back_after_an_anchor_restart_proof -- --ignored --exact every_member_is_back_after_an_anchor_restart` | 300 real `vox daemon`s and one `vox node` on one machine (about 300 processes); run it alone | about 4 min in release (176–223 s measured on macOS); not timed on CI |
 | `a_room_takes_every_joiner_proof::every_joiner_of_a_three_hundred_member_room_gets_in` | Joining a large room fails with "the anchor could not be reached" while the anchor is up: a busy anchor closed the connection the join was fetching the room over (V210-104, #299). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_room_takes_every_joiner_proof -- --ignored --exact every_joiner_of_a_three_hundred_member_room_gets_in` | an anchor, a host and 301 one-shot `vox connect` joins, four at a time; run it alone. A rate claim: the defect failed 1–2% of joins, so when hunting it, run it up to three times | about 8 min in release; not timed on CI |
-| `a_room_of_about_500_members_works_proof::a_room_of_about_500_members_works` | A room of about 500 members does not work: a join is refused, a post does not reach every member, or a stopped member does not catch up (PRD-001 R2). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_room_of_about_500_members_works_proof -- --ignored --exact a_room_of_about_500_members_works` | an anchor, a host and about 500 real `vox daemon`s on one machine; run it alone, in a terminal that stays open | 1.5 to 2.5 hours in release (its watchdog allows 4); not timed on CI |
+| `a_room_of_about_500_members_works_proof::a_room_of_about_500_members_works` | A room of about 500 members does not work: a join is refused, a post does not reach every member, or a stopped member does not catch up (PRD-001 R2). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_room_of_about_500_members_works_proof -- --ignored --exact a_room_of_about_500_members_works` | an anchor, a host and about 500 real `vox daemon`s on one machine; run it alone, in a terminal that stays open | 1.5 to 2.5 hours in release; not timed on CI |
 | `an_anchor_that_restarts_is_redialled_promptly_proof::a_connection_held_only_through_the_stopped_anchor_says_so` | When the anchor a host's only path ran through stops, the message about the host blames a liveness probe instead of saying the path ran through the stopped anchor (V210-93). | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test an_anchor_that_restarts_is_redialled_promptly_proof -- --ignored --exact a_connection_held_only_through_the_stopped_anchor_says_so` | a real machine with IPv4 and IPv6 loopback; it says CANNOT MEASURE when the forward did not hold the relayed connection as its host's | not timed here |
 | `opening_a_room_does_not_hold_up_a_post_proof::a_post_answers_while_the_node_opens_another_room` (macOS only) | Posting stalls while the same node opens another room with its passphrase. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test opening_a_room_does_not_hold_up_a_post_proof -- --ignored --exact a_post_answers_while_the_node_opens_another_room` | drives the TUI (`pyte`, or `VOX_PYTE_PATH`); hundreds of posts | not timed here |
 | `a_room_of_many_members_syncs_without_holding_its_lock_proof::a_room_of_many_members_syncs_without_holding_its_lock` | A room with many members stops answering its own member while it syncs. | `cargo test --release -p vox-tui --features optional-proofs,test-knobs --test a_room_of_many_members_syncs_without_holding_its_lock_proof -- --ignored --exact a_room_of_many_members_syncs_without_holding_its_lock` | time (joins many identities) | not timed here |

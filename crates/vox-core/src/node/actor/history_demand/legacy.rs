@@ -27,6 +27,7 @@ pub(super) fn prepare_legacy(
     mut answer: Prepared,
     saved: Option<&demand::State>,
     fence: Arc<Fence>,
+    resume_admission: Option<demand::ResumeAdmission>,
 ) -> Result<Prepared, String> {
     let binding = Binding {
         room: room.channel_id(),
@@ -35,15 +36,33 @@ pub(super) fn prepare_legacy(
         audience: [0; 32],
         grant: answer.generation,
     };
-    let (plan, bounds, active) = if let Action::Resume { request } = action {
-        let state = saved
-            .filter(|state| state.request == request)
-            .ok_or("The saved legacy history request changed.")?;
+    let (plan, bounds, active, remaining) = if let Action::Resume { request } = action {
+        let Some(state) = saved else {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail = "No legacy history request is saved to resume.".into();
+            return Ok(answer);
+        };
+        if state.request != request {
+            answer.status.phase = Phase::Unavailable;
+            answer.status.detail =
+                "The requested resume does not match the saved legacy history request.".into();
+            return Ok(answer);
+        }
         let plan = state
             .legacy
             .ok_or("The saved request is not legacy history.")?;
-        let active = demand::resume(&context, request, binding, job).map_err(|e| e.to_string())?;
-        (plan, state.bounds, active)
+        // This status read may fail, so finish it before activation can commit.
+        let accepted = room
+            .legacy_accepted_head(store, &plan.author)
+            .map_err(|error| error.to_string())?;
+        let remaining =
+            usize::try_from(plan.through.saturating_sub(accepted)).unwrap_or(usize::MAX);
+        let admission = resume_admission
+            .as_ref()
+            .ok_or("Legacy Resume admission is missing.")?;
+        let active = demand::resume_precharged(&context, request, binding, admission.mutation())
+            .map_err(|error| error.to_string())?;
+        (plan, state.bounds, active, remaining)
     } else {
         if saved.is_some_and(|state| {
             !matches!(
@@ -81,8 +100,12 @@ pub(super) fn prepare_legacy(
         let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
         let active = demand::start_legacy(&context, request, binding, bounds, plan, job)
             .map_err(|e| e.to_string())?;
-        (plan, bounds, active)
+        let remaining = usize::try_from(plan.through.saturating_sub(base)).unwrap_or(usize::MAX);
+        (plan, bounds, active, remaining)
     };
+    if resume_admission.is_some() {
+        answer.local_boundary = LocalBoundary::Durable;
+    }
     let request = active.request();
     // A publication-only Resume can proceed without a connected donor. The worker checks
     // its sealed cursor first; only a network quantum needs the selected peer online.
@@ -99,13 +122,7 @@ pub(super) fn prepare_legacy(
     answer.status.request = Some(request);
     answer.status.author = Some(plan.author);
     answer.status.head = Some(bounds.head);
-    answer.status.remaining = usize::try_from(
-        plan.through.saturating_sub(
-            room.legacy_accepted_head(store, &plan.author)
-                .map_err(|e| e.to_string())?,
-        ),
-    )
-    .unwrap_or(usize::MAX);
+    answer.status.remaining = remaining;
     answer.status.headers = bounds.entries;
     answer.status.wire_bytes = crate::log::sync::LEGACY_QUANTUM_BYTES;
     answer.legacy = Some(LegacyDispatch {

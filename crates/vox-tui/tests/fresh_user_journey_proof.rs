@@ -995,7 +995,7 @@ mod journey {
     }
 
     pub fn run() {
-        watchdog::arm_for(Duration::from_secs(2700));
+        watchdog::arm();
         if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             panic!(
                 "CANNOT MEASURE: the journey installs Vox.app and confines each harness with macOS \

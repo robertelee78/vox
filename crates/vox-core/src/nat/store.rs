@@ -259,12 +259,19 @@ fn within_refresh_floor(new_ts: u64, cur_ts: u64) -> bool {
     new_ts < cur_ts.saturating_add(min_refresh_ms())
 }
 
-/// Common time-sanity checks applied to every incoming record before it can be
-/// stored: not implausibly future-dated, and not already expired.
-fn check_time_validity(timestamp: u64, expiry: u64, now: u64) -> Result<()> {
+/// A signed board fact may not be dated beyond the rendezvous clock-skew ceiling. Withdrawals
+/// have no TTL, but must pass this same check before they can create even a pending tombstone.
+pub(super) fn check_clock_sanity(timestamp: u64, now: u64) -> Result<()> {
     if timestamp > now.saturating_add(MAX_CLOCK_SKEW_MS) {
         return Err(Error::RendezvousRejected("timestamp too far in the future"));
     }
+    Ok(())
+}
+
+/// Common time-sanity checks applied to every incoming record before it can be
+/// stored: not implausibly future-dated, and not already expired.
+fn check_time_validity(timestamp: u64, expiry: u64, now: u64) -> Result<()> {
+    check_clock_sanity(timestamp, now)?;
     if now >= expiry {
         return Err(Error::RendezvousRejected("record already expired"));
     }
@@ -304,8 +311,8 @@ pub struct RendezvousStore {
     /// after a withdraw, so the leaver's key still checks its withdraw; refused as admission by it.
     notices: HashMap<Digest32, BTreeMap<Digest32, AdmissionNotice>>,
     /// `(channelID, author)` → a member withdraw that came before any key to check it by (#520):
-    /// held, unchecked, until a notice brings the member's key. It can refuse only a notice whose
-    /// key it verifies under, so nobody but the member can make it count.
+    /// held, unchecked, until a pre-join or notice brings that identity's key. It can refuse only
+    /// records whose key it verifies under, so nobody but that identity can make it count.
     pending_withdraws: HashMap<(Digest32, Digest32), BoardWithdraw>,
     /// Rooms withdrawn whole (V030-14): nothing of them is taken again. With the signed room
     /// withdraw that took it off when the room was ended, which a joiner is shown so it can be
@@ -327,8 +334,9 @@ pub struct RendezvousStore {
 }
 
 impl RendezvousStore {
-    /// Take `author`'s records for `channel_id` stamped at or before `timestamp` off this board,
-    /// every epoch, and refuse any such from now on (V030-14). Returns how many went.
+    /// Take `author`'s member, bundle and pre-join records for `channel_id` stamped at or before
+    /// `timestamp` off this board, every epoch, and refuse any such from now on (V030-14).
+    /// Returns how many went.
     ///
     /// A record stamped later stays: the member signed it after the leave, so it joined again. A
     /// withdraw comes back to a board again and again — every member keeps it and files it
@@ -360,6 +368,15 @@ impl RendezvousStore {
                 bucket.remove(author);
                 gone += 1;
             }
+        }
+        if self
+            .prejoins
+            .get(channel_id)
+            .and_then(|bucket| bucket.get(author))
+            .is_some_and(|(_, record)| record.timestamp_ms <= timestamp)
+            && self.forget_prejoin(channel_id, author)
+        {
+            gone += 1;
         }
         let at = self
             .withdrawn_members
@@ -497,6 +514,23 @@ impl RendezvousStore {
             .get(channel_id)
             .and_then(|r| r.get(author))
             .map(|n| &n.key)
+    }
+
+    /// The exact self-authenticated root key held for a pending joiner. It can authenticate
+    /// that identity's own Member withdrawal, but conveys no room membership or admin authority.
+    #[must_use]
+    pub(super) fn prejoin_key(
+        &self,
+        channel_id: &Digest32,
+        author: &Digest32,
+        now: u64,
+    ) -> Option<&CompositePublicKey> {
+        self.prejoins
+            .get(channel_id)
+            .and_then(|bucket| bucket.get(author))
+            .map(|(_, record)| record)
+            .filter(|record| now < prejoin_expiry(record))
+            .map(|record| &record.asserted_pubkey)
     }
 
     /// Keep a member's own signed withdraw (#520), the newest one, to pass on with the room's
@@ -941,6 +975,26 @@ impl RendezvousStore {
         }
 
         let asserted_id = record.asserted_id();
+        // A withdrawal may arrive before even the self-signed pre-join key. Verify the retained
+        // statement against this exact key before allowing it to create a tombstone, as an
+        // admission notice does. Replaying a removed pre-join cannot restore PendingJoiner.
+        if let Some(withdraw) = self
+            .pending_withdraws
+            .remove(&(record.channel_id, asserted_id))
+        {
+            if withdraw.verify(&record.asserted_pubkey).is_ok() {
+                self.withdraw_member(&record.channel_id, &asserted_id, withdraw.timestamp_ms);
+                self.keep_member_withdraw(
+                    &record.channel_id,
+                    &asserted_id,
+                    withdraw.timestamp_ms,
+                    withdraw.to_wire(),
+                );
+            }
+        }
+        if self.withdrawn(&record.channel_id, &asserted_id, record.timestamp_ms) {
+            return Err(Error::RendezvousRejected("withdrawn"));
+        }
         let bucket = self.prejoins.entry(record.channel_id).or_default();
 
         // 3. Freshness vs the current record for this asserted identity.

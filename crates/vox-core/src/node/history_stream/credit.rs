@@ -235,6 +235,30 @@ impl Response {
         Ok(())
     }
 
+    /// Validate the exact ACK reserved by `accept` without claiming that its bytes are durable.
+    /// The caller uses this only to admit every mandatory final-chunk operation before append.
+    pub(super) fn pending_ack_completes(
+        &self,
+        request: RequestId,
+        entry: Digest32,
+        next: u64,
+    ) -> Result<bool> {
+        if self.done || request != self.request {
+            return Err(invalid("history ack request"));
+        }
+        let body = self
+            .body
+            .as_ref()
+            .ok_or(invalid("history ack before body"))?;
+        if body.entry != entry {
+            return Err(invalid("history ack entry"));
+        }
+        if body.pending != Some(next) {
+            return Err(invalid("history ack offset/credit"));
+        }
+        Ok(next == body.length)
+    }
+
     /// Called by the sender for an ACK, or by the receiver only AFTER it durably writes the
     /// exact next offset. A duplicate acknowledges no new work and never adds byte credit.
     pub(super) fn acknowledge(

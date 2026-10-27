@@ -113,61 +113,64 @@ impl NodeSnapshot {
     /// tunnel tables.
     #[must_use]
     pub fn of(handle: &NodeHandle) -> Self {
-        handle.inspect_view(|nv, policy_current| {
-            let me = nv.identity.as_ref().map(|i| i.fingerprint);
-            Self {
-                me,
-                mlock_active: nv.mlock_active,
-                rooms: nv
-                    .channels
-                    .iter()
-                    .map(|c| RoomSnap {
-                        channel_id: c.channel_id,
-                        name: c.name.clone(),
-                        open: c.open,
-                        preparing: c.preparing,
-                    })
-                    .collect(),
-                open: nv
-                    .open_channels
-                    .iter()
-                    .map(|d| OpenRoomSnap {
-                        channel_id: d.channel_id,
-                        display_revision: d.display_revision,
-                        name: d.name.clone(),
-                        members: d.members.clone(),
-                        member_consent: d.member_consent.clone(),
-                        governance_revision: d.governance_revision,
-                        consenting: d.consenting.clone(),
-                        equivocations: d.equivocations.clone(),
-                        read_by: d.read_by.clone(),
-                        held: d.held.clone(),
-                        trusted_by: d.trusted_by.clone(),
-                        retention: d.retention,
-                        room_retention: d.room_retention,
-                        room_step_retention: d.room_step_retention,
-                        step_retention: d.step_retention,
-                        local_step_retention: d.local_step_retention,
-                        session_revision: handle.session_display_token(d, policy_current),
-                    })
-                    .collect(),
-                trusted: nv.trusted.clone(),
-                drive: if policy_current {
-                    nv.drive.clone()
-                } else {
-                    Vec::new()
-                },
-                offers: nv.offers.clone(),
-                connected_peers: nv.connected_peers.clone(),
-                tunnels: me
-                    .map(|me| crate::transport::quic::live_tunnels(&me))
-                    .unwrap_or_default(),
-                closed_tunnels: me
-                    .map(|me| crate::transport::quic::closed_tunnels(&me))
-                    .unwrap_or_default(),
-                keyring_open_secs: handle.keyring_open_secs(),
-            }
-        })
+        let (nv, policy_current) = handle.coherent_view();
+        let me = nv.identity.as_ref().map(|i| i.fingerprint);
+        Self {
+            me,
+            mlock_active: nv.mlock_active,
+            rooms: nv
+                .channels
+                .iter()
+                .map(|c| RoomSnap {
+                    channel_id: c.channel_id,
+                    name: c.name.clone(),
+                    open: c.open,
+                    preparing: c.preparing,
+                })
+                .collect(),
+            open: nv
+                .open_channels
+                .iter()
+                .map(|d| OpenRoomSnap {
+                    channel_id: d.channel_id,
+                    display_revision: d.display_revision,
+                    name: d.name.clone(),
+                    members: d.members.clone(),
+                    member_consent: d.member_consent.clone(),
+                    governance_revision: d.governance_revision,
+                    consenting: d.consenting.clone(),
+                    equivocations: d.equivocations.clone(),
+                    read_by: d.read_by.clone(),
+                    held: d.held.clone(),
+                    trusted_by: d.trusted_by.clone(),
+                    retention: d.retention,
+                    room_retention: d.room_retention,
+                    room_step_retention: d.room_step_retention,
+                    step_retention: d.step_retention,
+                    local_step_retention: d.local_step_retention,
+                    session_revision: handle.session_display_token(d, policy_current),
+                })
+                .collect(),
+            trusted: if policy_current {
+                nv.trusted.clone()
+            } else {
+                Vec::new()
+            },
+            drive: if policy_current {
+                nv.drive.clone()
+            } else {
+                Vec::new()
+            },
+            offers: nv.offers.clone(),
+            connected_peers: nv.connected_peers.clone(),
+            tunnels: me
+                .map(|me| crate::transport::quic::live_tunnels(&me))
+                .unwrap_or_default(),
+            closed_tunnels: me
+                .map(|me| crate::transport::quic::closed_tunnels(&me))
+                .unwrap_or_default(),
+            keyring_open_secs: handle.keyring_open_secs(),
+        }
     }
 
     /// Canonical CBOR body of the reply (unframed).

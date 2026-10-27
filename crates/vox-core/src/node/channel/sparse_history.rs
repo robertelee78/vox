@@ -2,7 +2,7 @@
 //! envelope before these methods; every pinned store read is dropped before network I/O.
 
 use super::*;
-use crate::log::history::{ControlContext, Descriptor, LogScope, SignedHead, TreeBinding};
+use crate::log::history::{ControlContext, LogScope, SignedHead};
 use crate::node::store::Batch;
 
 /// Exact signed header and the length bound governing payload continuations.
@@ -28,7 +28,163 @@ pub(crate) enum HistoryPayload {
     Held { payload_len: u64, bytes: Vec<u8> },
 }
 
+/// Atomic result of persisting one advertised-head refusal. Authorization mismatch is not a
+/// storage error: it carries the fresh generation read by the same batch that fenced the flow's
+/// captured generation.
+pub(crate) enum HistoryDeclineResult {
+    Stored { remembered: bool, current: Digest32 },
+    AuthorizationChanged { current: Digest32 },
+}
+
 impl ChannelState {
+    /// The current membership incarnation whose inventory a refusal describes. A leave makes
+    /// this absent; a readmission uses the leave position until the member's signed `back`
+    /// statement supplies its newer position. Thus the same scalar head after a real scope
+    /// removal is a changed inventory lifetime, while a socket reconnect is not.
+    pub(crate) fn history_inventory_incarnation(&self, member: &Digest32) -> Option<u64> {
+        if !self.is_member(member) {
+            return None;
+        }
+        if let Some(left) = self.left_at(member) {
+            if self.readmitted.get(member) == Some(&left) {
+                return Some(left);
+            }
+        }
+        Some(
+            self.presence
+                .get(member)
+                .and_then(|presence| presence.back)
+                .map_or(0, |(seq, _)| seq),
+        )
+    }
+
+    /// The admitted author's inventory lifetime, including a historical author who has left.
+    /// Peers may still advertise that author's terminal head after the departure. The departure
+    /// itself changes the incarnation that validates prior refusals; if the same historical head
+    /// is subsequently advertised, that indexed relationship is invalidated and becomes one new
+    /// exact decision scoped to the departed author's terminal position.
+    pub(crate) fn history_author_inventory_incarnation(&self, author: &Digest32) -> Option<u64> {
+        if !self.is_author(author) {
+            return None;
+        }
+        if let Some(left) = self.left_at(author) {
+            return Some(left);
+        }
+        Some(
+            self.presence
+                .get(author)
+                .and_then(|presence| presence.back)
+                .map_or(0, |(seq, _)| seq),
+        )
+    }
+
+    /// Persist one exact refusal before the flow treats it as settled. Repeating the same
+    /// decision is write-free; a successor replaces it under the same real relationship key.
+    pub(crate) fn remember_history_decline(
+        &self,
+        store: &Store,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+        authorization: (Digest32, Digest32, bool),
+        committed: &std::sync::atomic::AtomicBool,
+    ) -> Result<HistoryDeclineResult> {
+        let (node, expected_authorization, metadata) = authorization;
+        let peer_incarnation =
+            self.history_inventory_incarnation(&peer)
+                .ok_or(Error::MalformedGovernance(
+                    "declined history source is not a member",
+                ))?;
+        let author_incarnation = self.history_author_inventory_incarnation(&author).ok_or(
+            Error::MalformedGovernance("declined history author is not admitted"),
+        )?;
+        if node != self.me() {
+            return Err(Error::Profile(
+                "history authorization changed before refusal",
+            ));
+        }
+        let room = self.channel_id();
+        let instance = self.history_instance(store)?;
+        let epoch = self.epoch();
+        // The trust nonce read and refusal replacement share one store transaction. If a trust
+        // save commits first, this old flow is rejected here. If this transaction commits first,
+        // the later trust nonce makes the recorded generation stale. Cancellation after either
+        // commit cannot relabel the refusal because no current generation is read outside it.
+        let mut batch = store.batch()?;
+        let current = crate::node::history_stream::authorization_generation_in(
+            &batch, node, room, instance, epoch,
+        )?;
+        if current != expected_authorization {
+            return Ok(HistoryDeclineResult::AuthorizationChanged { current });
+        }
+        let mut index = self.entries.write(&mut batch, &self.sek, &room)?;
+        let prior = if metadata {
+            index.history_declined_metadata(&peer, &author)?
+        } else {
+            index.history_declined_head(&peer, &author)?
+        };
+        if prior
+            == Some((
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            ))
+        {
+            return Ok(HistoryDeclineResult::Stored {
+                remembered: false,
+                current,
+            });
+        }
+        if metadata {
+            index.keep_history_declined_metadata(
+                peer,
+                author,
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            )?;
+        } else {
+            index.keep_history_declined_head(
+                peer,
+                author,
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            )?;
+        }
+        index.seal()?;
+        batch.commit()?;
+        self.entries.committed();
+        committed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(HistoryDeclineResult::Stored {
+            remembered: true,
+            current,
+        })
+    }
+
+    /// A relevant advertised successor or changed membership incarnation removes the durable
+    /// refusal. The inbox holds only charge-free pending scalar hints; this indexed record is the
+    /// sole refusal state.
+    pub(crate) fn forget_history_decline(
+        &self,
+        store: &Store,
+        peer: Digest32,
+        author: Digest32,
+        committed: &std::sync::atomic::AtomicBool,
+    ) -> Result<()> {
+        let read = self.history_read(store)?;
+        if read.history_declined_head(&peer, &author)?.is_none() {
+            return Ok(());
+        }
+        drop(read);
+        self.history_write_tracked(store, committed, |index| {
+            index.forget_history_declined_head(peer, author)
+        })
+    }
+
     pub(crate) fn uses_sparse_history(&self, store: &Store) -> Result<bool> {
         if self.poisoned {
             return Err(self.save_failure());
@@ -139,37 +295,6 @@ impl ChannelState {
         Some((own, committed, head.root.leaves))
     }
 
-    /// Evidence that a member holds entries of this node's own feed that this node does not
-    /// (ADR-037 R5): a settled own tip above the local contiguous own head, an observed own
-    /// conflict, or an observed signed own head above it. A restored older profile shows
-    /// exactly this; writing on would make it an equivocator (V210-63).
-    pub(crate) fn own_history_conflict(&self, store: &Store) -> Result<bool> {
-        let read = self.history_read(store)?;
-        let own = self.me();
-        let contiguous = self.dag.verified_head(&own);
-        if read
-            .history_settled_tip(&own)?
-            .is_some_and(|tip| tip.skeleton.seq > contiguous)
-        {
-            return Ok(true);
-        }
-        let Some(state) = read.sparse_author(&own, LogScope::Public)? else {
-            return Ok(false);
-        };
-        if state.observed_conflict.is_some() {
-            return Ok(true);
-        }
-        if let Some(observed) = state.observed {
-            if read
-                .history_head(&observed)?
-                .is_some_and(|observed| observed.root.leaves > contiguous)
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Settlement from this node's own durable record (ADR-037 R5): a sparse room not yet
     /// settled, no evidence that a member holds more of the own feed, and current governance.
     /// No peer acknowledgement is waited for; the detector above reads that when it comes.
@@ -235,6 +360,20 @@ impl ChannelState {
         index.seal()?;
         batch.commit()?;
         self.entries.committed();
+        Ok(result)
+    }
+
+    /// Run one history transaction and mark its user-visible lane immediately after the commit.
+    /// A later transaction or callback failure must not turn already durable work into a quiet
+    /// status sample.
+    pub(crate) fn history_write_tracked<T>(
+        &self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        let result = self.history_write(store, operation)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         Ok(result)
     }
 
@@ -439,15 +578,143 @@ impl ChannelState {
             .transpose()
     }
 
-    pub(crate) fn history_tree_range(
+    /// Return only a retained signed commitment exactly at this node's completed role cut.
+    /// A newer accepted commitment is metadata, not a receipt for its unfinished source.
+    pub(crate) fn history_role_head(
         &self,
         store: &Store,
-        binding: TreeBinding,
-        start: u64,
-        leaves: u64,
-    ) -> Result<Option<Descriptor>> {
-        self.history_read(store)?
-            .history_range(binding, start, leaves)
+        author: &Digest32,
+    ) -> Result<Option<SignedHead>> {
+        let read = self.history_read(store)?;
+        let Some(state) = read.sparse_author(author, LogScope::Public)? else {
+            return Ok(None);
+        };
+        let (through, hash) = read.history_held_through(author).unwrap_or((0, [0; 32]));
+        let source = if through == 0 {
+            None
+        } else {
+            read.history_validated_header(author, through)?
+                .map(|(head, _)| head)
+        };
+        for id in [state.committed, state.control_ready, source]
+            .into_iter()
+            .flatten()
+        {
+            let head = read
+                .history_head(&id)?
+                .ok_or(Error::MalformedAtRest("role receipt head missing"))?;
+            if head.id() != id
+                || head.binding.room != self.channel_id
+                || head.binding.author != *author
+                || head.binding.scope != LogScope::Public
+            {
+                return Err(Error::MalformedAtRest("role receipt head binding"));
+            }
+            if head.root.leaves != through || !read.history_head_committed(&id, head.binding)? {
+                continue;
+            }
+            if through != 0 {
+                let Some(included) = read.history_inclusion_receipt(&id, author, through)? else {
+                    continue;
+                };
+                if included.head_id() != id
+                    || included.binding() != head.binding
+                    || included.root() != head.root
+                    || included.header().entry().skeleton.seq != through
+                {
+                    return Err(Error::MalformedAtRest("role receipt inclusion binding"));
+                }
+                if included.header().entry().entry_hash() != hash {
+                    continue;
+                }
+            }
+            return Ok(Some(head));
+        }
+        Ok(None)
+    }
+
+    /// Metadata-only fallback: an exact sealed inclusion receipt can retain a signed header
+    /// before its source/effect has reached the canonical position index. This never supplies
+    /// Entry/Page bodies or publishes a canonical position.
+    pub(crate) fn history_proof_header(
+        &self,
+        store: &Store,
+        head: &SignedHead,
+        seq: u64,
+    ) -> Result<Option<HistoryHeader>> {
+        let read = self.history_read(store)?;
+        if let Some(entry) = read.history_position_header(&head.binding.author, seq)? {
+            return Ok(Some(HistoryHeader {
+                wire: entry.header_wire(),
+            }));
+        }
+        let Some(included) =
+            read.history_inclusion_receipt(&head.id(), &head.binding.author, seq)?
+        else {
+            return Ok(None);
+        };
+        let entry = included.header().entry();
+        if included.head_id() != head.id()
+            || included.binding() != head.binding
+            || included.root() != head.root
+            || entry.skeleton.channel_id != self.channel_id
+            || entry.skeleton.author_id != head.binding.author
+            || entry.skeleton.seq != seq
+        {
+            return Err(Error::MalformedAtRest("proof header receipt binding"));
+        }
+        Ok(Some(HistoryHeader {
+            wire: entry.header_wire(),
+        }))
+    }
+
+    /// A locally queued receipt probe obeys the same durable exact refusal as wire inventory.
+    pub(crate) fn history_own_receipt_targets(
+        &self,
+        store: &Store,
+        peers: Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
+        head: Digest32,
+        size: u64,
+    ) -> Result<Vec<Digest32>> {
+        // One captured index for all current peers, not a Directory decode per peer.
+        let read = self.history_read(store)?;
+        let authorization = crate::node::history_stream::authorization_generation(
+            store,
+            self.me(),
+            self.channel_id,
+            read.sparse_history_instance(),
+            self.epoch,
+        )?;
+        let mut targets = Vec::new();
+        for (peer, parked) in peers {
+            if !self.is_member(&peer) || self.held_through(&peer).is_some_and(|held| held >= size) {
+                continue;
+            }
+            if parked.is_some_and(|(connection, probe)| {
+                probe.matches(
+                    crate::node::ports::SupportDiscovery {
+                        connection,
+                        instance: read.sparse_history_instance(),
+                        epoch: self.epoch,
+                        authorization,
+                    },
+                    head,
+                    self.history_inventory_incarnation(&peer)
+                        .zip(self.history_author_inventory_incarnation(&self.me())),
+                )
+            }) {
+                continue;
+            }
+            let refused = read.history_declined_head(&peer, &self.me())?;
+            let current = self
+                .history_inventory_incarnation(&peer)
+                .zip(self.history_author_inventory_incarnation(&self.me()))
+                .map(|(peer_life, author_life)| (head, authorization, peer_life, author_life));
+            if refused != current {
+                targets.push(peer);
+            }
+        }
+        Ok(targets)
     }
 
     /// Decode and authenticate one body once under the caller's large-record envelope.
@@ -498,6 +765,7 @@ impl ChannelState {
     pub(crate) fn begin_history_source(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         request: [u8; 16],
         entry: &Entry,
         validated: &governance::ValidatedSparseEntry,
@@ -555,6 +823,7 @@ impl ChannelState {
                 )
                 .map_err(|_| Error::MalformedBundle("sparse fork proof verification failed"))?;
             self.keep_forks(store)?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             return Err(Error::MalformedGovernance(
                 "author equivocated at a held sparse position",
             ));
@@ -577,19 +846,28 @@ impl ChannelState {
                 local_id: self.me(),
             },
         )?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         Ok(HistorySourceStart::Started)
     }
 
     /// One bounded preparation quantum. A true result still leaves roots unpublished until
     /// commit_history_source records both the source and its governance work atomically.
-    pub(crate) fn advance_history_source(&self, store: &Store) -> Result<bool> {
-        self.entries
-            .advance_sparse_publication(store, &self.sek, &self.channel_id)
+    pub(crate) fn advance_history_source(
+        &self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
+        let ready = self
+            .entries
+            .advance_sparse_publication(store, &self.sek, &self.channel_id)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(ready)
     }
 
     pub(crate) fn commit_history_source(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         entry: &Entry,
         now: crate::time::Ms,
         received: &crate::node::store::ReceivedFlow,
@@ -627,9 +905,10 @@ impl ChannelState {
             &first_seen_bytes(now.get(), false),
         )?;
         batch.put_segment(&self.channel_id, SegmentKind::Index, log, &first_seen)?;
-        // Only source/causal facts are observed here. Presence, private floors, keys and
-        // rendering wait for semantic completion, so source validation cannot grant effects.
-        governance::accepted_into(
+        // The governance index records authenticated single-writer current inputs at this
+        // publication boundary. Presence side effects, private floors, keys and rendering still
+        // wait for semantic completion.
+        let accepted = governance::accepted_into(
             &mut batch,
             &self.entries,
             &self.sek,
@@ -642,20 +921,31 @@ impl ChannelState {
             late,
         )?;
         batch.commit()?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
+        // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
+        // publication paths, a sparse history caller does not poison the room on commit failure.
+        if accepted.current_advanced {
+            self.note_committed_consent(entry)?;
+        }
         self.entries.committed();
         self.next_log_id = log
             .checked_add(1)
             .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-        self.governance_ready = false;
         Ok(())
     }
 
     /// Cleanup is resumable and does not turn source storage into a user-visible admission.
-    pub(crate) fn cleanup_history_source(&mut self, store: &Store) -> Result<bool> {
+    pub(crate) fn cleanup_history_source(
+        &mut self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+    ) -> Result<bool> {
         let done = self
             .entries
             .cleanup_publication(store, &self.sek, &self.channel_id)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         if done {
+            self.history_publication_changed.notify_waiters();
             let read = self.history_read(store)?;
             self.dag.set_order_revision(
                 read.order_revision(),
@@ -665,17 +955,37 @@ impl ChannelState {
         Ok(done)
     }
 
+    /// The exact request that owns an unfinished sparse-history publication, if any.
+    pub(crate) fn history_publication_request(&self, store: &Store) -> Result<Option<[u8; 16]>> {
+        Ok(self.history_read(store)?.sparse_publication_request())
+    }
+
+    /// Subscribe under the room mutex before testing its actual publication owner. Only a
+    /// committed completion or key erasure publishes this edge; no room guard is retained.
+    pub(crate) fn history_publication_wake(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
+        let mut wake =
+            Box::pin(std::sync::Arc::clone(&self.history_publication_changed).notified_owned());
+        wake.as_mut().enable();
+        wake
+    }
+    pub(crate) fn history_retirement_locked(&self) -> bool {
+        self.sek.key_bytes().is_err()
+    }
+
     /// A retired request may roll back only its own unpublished roots, or finish only its
     /// own post-switch cleanup. The room lock covers this ownership check and transaction.
     pub(crate) fn cleanup_history_source_owned(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         request: [u8; 16],
     ) -> Result<bool> {
         if self.history_read(store)?.sparse_publication_request() != Some(request) {
             return Ok(true);
         }
-        self.cleanup_history_source(store)
+        self.cleanup_history_source(store, committed)
     }
 
     /// One local retirement slice. Another request's publication must finish first; it is
@@ -683,6 +993,7 @@ impl ChannelState {
     pub(crate) fn cleanup_history_verifiers(
         &self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         request: [u8; 16],
         after: Option<[u8; 64]>,
     ) -> Result<(bool, Option<[u8; 64]>)> {
@@ -698,14 +1009,18 @@ impl ChannelState {
         if changed {
             index.seal()?;
             batch.commit()?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
         }
         Ok((done, next))
     }
 }
 
-/// Created only after the signed prior-control closure and the typed handler finish. The
-/// marker means semantic dispatch completed; encrypted key installation stays independent.
+/// Transaction-scoped authority for the exact typed effect. Content constructs it only after
+/// semantic admission. Non-Content may stage it before dispatch in the same Batch because its
+/// handler requires the marker; no marker becomes durable unless that handler and the Batch both
+/// succeed. A committed marker therefore always means semantic dispatch completed. Encrypted key
+/// installation stays independent.
 pub(super) struct FinishedHistoryEffect {
     hash: Digest32,
 }
@@ -714,6 +1029,13 @@ impl FinishedHistoryEffect {
         self.hash
     }
 }
+
+#[cfg(feature = "test-knobs")]
+const TEST_FX29_CONTENT_OUTCOME_ENV: &str = "VOX_TEST_FX29_CONTENT_OUTCOME_FILE";
+#[cfg(feature = "test-knobs")]
+const TEST_FX29_REFILL_OUTCOME_ENV: &str = "VOX_TEST_FX29_CONTENT_REFILL_OUTCOME_FILE";
+#[cfg(feature = "test-knobs")]
+const TEST_FX29_REFILL_HASH_ENV: &str = "VOX_TEST_FX29_CONTENT_REFILL_HASH";
 
 #[derive(Clone, Copy)]
 pub(crate) struct HistoryEffectCursor {
@@ -743,12 +1065,113 @@ pub(crate) enum HistoryEffectProgress {
 }
 
 impl ChannelState {
+    #[cfg(feature = "test-knobs")]
+    fn record_fx29_content_outcome(&self, hash: &Digest32, accepted: bool) -> Result<()> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+        let Some(path) = std::env::var_os(TEST_FX29_CONTENT_OUTCOME_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            return Ok(());
+        };
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(
+            ".writing.{}.{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temporary: std::path::PathBuf = temporary.into();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| {
+                Error::Profile("test sparse-Content outcome marker could not be created")
+            })?;
+        let outcome = if accepted { "accepted" } else { "refused" };
+        if write!(file, "{outcome}:{}", crate::node::link::b32_encode(hash)).is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(Error::Profile(
+                "test sparse-Content outcome marker could not be written",
+            ));
+        }
+        drop(file);
+        // A hard link is the no-replace publication primitive here: all callers have a unique,
+        // complete temporary inode, and exactly one can attach it at `path`. Unlike a
+        // check-then-rename, a later Content outcome can never replace the first marker.
+        let published = match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) => Err(Error::Profile(
+                "test sparse-Content outcome marker could not be published",
+            )),
+        };
+        let _ = std::fs::remove_file(&temporary);
+        published
+    }
+
+    #[cfg(feature = "test-knobs")]
+    fn record_fx29_refill_outcome(&self, hash: &Digest32) -> Result<()> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+        let encoded = crate::node::link::b32_encode(hash);
+        if std::env::var(TEST_FX29_REFILL_HASH_ENV).as_deref() != Ok(encoded.as_str()) {
+            return Ok(());
+        }
+        let Some(path) = std::env::var_os(TEST_FX29_REFILL_OUTCOME_ENV)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            return Ok(());
+        };
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(
+            ".writing.{}.{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temporary: std::path::PathBuf = temporary.into();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| {
+                Error::Profile("test sparse-Content refill marker could not be created")
+            })?;
+        if write!(file, "accepted:{encoded}").is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary);
+            return Err(Error::Profile(
+                "test sparse-Content refill marker could not be written",
+            ));
+        }
+        drop(file);
+        let published = match std::fs::hard_link(&temporary, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) => Err(Error::Profile(
+                "test sparse-Content refill marker could not be published",
+            )),
+        };
+        let _ = std::fs::remove_file(&temporary);
+        published
+    }
+
     /// One signed-context coordinate per call. The caller retains only (hash,next), never
     /// a full context/map, and holds the shared read/verification envelope for this turn.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn advance_history_effect(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         cursor: &mut HistoryEffectCursor,
         now: crate::time::Ms,
         body_expected: bool,
@@ -790,12 +1213,25 @@ impl ChannelState {
                     .retention(hash)?
                     .is_none_or(|tracked| tracked.cache_id.is_none());
             drop(input);
+            if !refill_pending {
+                // A foreground flow may have settled this effect after the archive staged the
+                // same header. The archive acknowledgement is still owed. Run its idempotent
+                // callback under the current grant and commit it before reporting completion;
+                // otherwise the demand can retain semantic debt forever despite the effect.
+                let mut batch = store.batch()?;
+                check_binding(&batch)?;
+                on_admitted(&mut batch, *hash)?;
+                batch.commit()?;
+            }
             // Feed restoration is local accepted-header maintenance. Advance at most one
             // successor in this bounded turn, including while the exact staged body continues
             // through refill below.
-            self.advance_history_contiguous(store, &author)?;
+            let contiguous_pending = self.advance_history_contiguous(store, committed, &author)?;
             if refill_pending {
                 return Ok(HistoryEffectProgress::RefillPending { governance: false });
+            }
+            if contiguous_pending {
+                return Ok(HistoryEffectProgress::Progress);
             }
             return Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
@@ -897,15 +1333,31 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
-        // A received entry's effect (ADR-038 FX-30): flushed before this node acknowledges it;
-        // governance and key packages say `ruled` below and are flushed at once.
-        let applied = (|| -> Result<(bool, bool, bool, bool)> {
-            let finished = FinishedHistoryEffect { hash: *hash };
-            let mut index = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            index.finish_history_effect(&entry, &finished)?;
-            index.seal()?;
+        let applied = (|| -> Result<(
+            bool,
+            bool,
+            bool,
+            bool,
+            entry_store::sparse::ContiguousAdvance,
+        )> {
+            // Governance effects may update Presence, whose durable invariant requires this
+            // exact sparse position to be semantically published. Publish the effect first in
+            // the same transaction: any failure below rolls both changes back. Content remains
+            // delayed until its selected body is actually admitted (role-complete receipts).
+            #[cfg(feature = "test-knobs")]
+            let publish_before_effect = kind != SignedEntryKind::Content
+                && std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
+                    != Ok("finish-control-after-effect");
+            #[cfg(not(feature = "test-knobs"))]
+            let publish_before_effect = kind != SignedEntryKind::Content;
+            if publish_before_effect {
+                let finished = FinishedHistoryEffect { hash: *hash };
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                index.finish_history_effect(&entry, &finished, self.me())?;
+                index.seal()?;
+            }
             session_projection::private_index::observe_public(
                 &mut batch,
                 &self.sek,
@@ -931,12 +1383,24 @@ impl ChannelState {
             let mut body_unavailable = false;
             if kind == SignedEntryKind::Content {
                 if let Some(payload) = &entry.payload {
-                    self.track_body_into(&mut batch, *hash, log, now.get())?;
+                    #[cfg(feature = "test-knobs")]
+                    if std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
+                        == Ok("track-content-through-settled-index")
+                        && std::env::var_os(TEST_FX29_CONTENT_OUTCOME_ENV).is_some()
+                        && entry.skeleton.author_id != self.me()
+                    {
+                        self.track_body_into(&mut batch, *hash, log, now.get())?;
+                    } else {
+                        self.track_known_body_into(&mut batch, &entry, log)?;
+                    }
+                    #[cfg(not(feature = "test-knobs"))]
+                    self.track_known_body_into(&mut batch, &entry, log)?;
                     match self.render_content_into(
                         &mut batch,
                         entry.skeleton.author_id,
                         *hash,
                         payload,
+                        Some(&entry),
                         now.get(),
                         historical,
                         &mut expired,
@@ -951,10 +1415,37 @@ impl ChannelState {
             let staged_deferred = body_expected && projection_deferred;
             self.queue_receivers(&mut batch)?;
             self.queue_private_generations(&mut batch)?;
-            if !(refill_pending || staged_deferred || body_unavailable) {
+            let effect_complete = !(refill_pending || staged_deferred || body_unavailable);
+            if effect_complete {
+                // Role-complete means the requested body was semantically admitted, not merely
+                // durable. `Deferred` and `Unavailable` deliberately leave both the effect
+                // obligation and contiguous receipt cursor behind this position, including
+                // across restart. A non-recipient package has no owed body and reaches this same
+                // point after its authenticated header's semantic dispatch.
+                if kind == SignedEntryKind::Content || !publish_before_effect {
+                    let finished = FinishedHistoryEffect { hash: *hash };
+                    let mut index = self
+                        .entries
+                        .write(&mut batch, &self.sek, &self.channel_id)?;
+                    index.finish_history_effect(&entry, &finished, self.me())?;
+                    index.seal()?;
+                }
                 on_admitted(&mut batch, *hash)?;
             }
+            // Settlement, obligation retirement, and the restart receipt cursor are one
+            // transaction. A crash can expose all of them or none of them, never a settled
+            // position whose receipt cursor still waits for an unrelated event.
+            let contiguous = {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                let progress =
+                    index.advance_sparse_contiguous(&entry.skeleton.author_id, &self.me())?;
+                index.seal()?;
+                progress
+            };
             batch.commit()?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
             // The settled-tip index and presence update are now durable in the same Batch.
             // A source-only entry cannot change membership, and a late earlier effect must
@@ -975,23 +1466,46 @@ impl ChannelState {
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
             self.settle_display_order(store)?;
-            Ok((rendered, refill_pending, staged_deferred, body_unavailable))
+            Ok((
+                rendered,
+                refill_pending,
+                staged_deferred,
+                body_unavailable,
+                contiguous,
+            ))
         })();
-        let (rendered, refill_pending, projection_deferred, body_unavailable) = match applied {
-            Ok(outcome) => {
-                self.record_sparse_received_semantic_owner(
-                    store,
-                    entry.skeleton.author_id,
-                    *hash,
-                    received,
-                )?;
-                outcome
-            }
-            Err(error) => {
-                self.poison(&error);
-                return Err(error);
-            }
-        };
+        let (rendered, refill_pending, projection_deferred, body_unavailable, contiguous) =
+            match applied {
+                Ok(outcome) => {
+                    self.record_sparse_received_semantic_owner(
+                        store, entry.skeleton.author_id, *hash, received,
+                    )?;
+                    outcome
+                },
+                Err(error) => {
+                    self.poison(&error);
+                    #[cfg(feature = "test-knobs")]
+                    if kind == SignedEntryKind::Content
+                        && entry.payload.is_some()
+                        && entry.skeleton.author_id != self.me()
+                    {
+                        self.record_fx29_content_outcome(hash, false)?;
+                    }
+                    return Err(error);
+                }
+            };
+        let contiguous_more = contiguous.more;
+        if let Err(error) = self.note_contiguous_advance(entry.skeleton.author_id, contiguous) {
+            self.poison(&error);
+            return Err(error);
+        }
+        #[cfg(feature = "test-knobs")]
+        if kind == SignedEntryKind::Content
+            && entry.payload.is_some()
+            && entry.skeleton.author_id != self.me()
+        {
+            self.record_fx29_content_outcome(hash, true)?;
+        }
         cursor.rendered |= rendered;
         if body_unavailable {
             return Ok(HistoryEffectProgress::BodyUnavailable);
@@ -1001,48 +1515,87 @@ impl ChannelState {
                 governance: projection_deferred,
             });
         }
-        match self.advance_history_contiguous(store, &entry.skeleton.author_id) {
-            Ok(_) => Ok(HistoryEffectProgress::Complete {
-                rendered: cursor.rendered,
-            }),
-            Err(error) => {
-                self.poison(&error);
-                Err(error)
-            }
+        if contiguous_more {
+            return Ok(HistoryEffectProgress::Progress);
         }
+        Ok(HistoryEffectProgress::Complete {
+            rendered: cursor.rendered,
+        })
     }
 }
 
 impl ChannelState {
-    /// One real Feed successor, after its semantic publication. The actor may schedule
-    /// another bounded turn only when this reports progress; sparse holes stop immediately.
+    /// One bounded page of role-complete successors after semantic publication. A full page
+    /// remains explicitly pending; a real sparse hole parks until its own arrival wakes it.
     pub(crate) fn advance_history_contiguous(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         author: &Digest32,
     ) -> Result<bool> {
         if self.poisoned {
             return Err(self.save_failure());
         }
         if self.history_publication_busy(store)? {
-            return Ok(false);
+            return Ok(self.sparse_contiguous_pending.contains(author));
         }
         let mut batch = store.batch()?;
         batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
-        let Some(state) = index.advance_sparse_contiguous(author)? else {
+        let progress = index.advance_sparse_contiguous(author, &self.me())?;
+        if progress.state.is_none() && !progress.more {
+            drop(index);
+            self.note_contiguous_advance(*author, progress)?;
             return Ok(false);
-        };
+        }
         index.seal()?;
         batch.commit()?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
         self.entries.committed();
-        if let Err(error) = self.dag.restore_contiguous_author(*author, &state) {
-            self.poison(&error);
-            return Err(error);
+        let more = progress.more;
+        self.note_contiguous_advance(*author, progress)?;
+        Ok(more)
+    }
+
+    fn note_contiguous_advance(
+        &mut self,
+        author: Digest32,
+        progress: entry_store::sparse::ContiguousAdvance,
+    ) -> Result<()> {
+        if let Some(state) = progress.state {
+            self.dag.restore_contiguous_author(author, &state)?;
         }
-        Ok(true)
+        if progress.more {
+            self.sparse_contiguous_pending.insert(author);
+        } else {
+            self.sparse_contiguous_pending.remove(&author);
+        }
+        Ok(())
+    }
+
+    /// Advance one author per room turn, rotating after the last author examined. The set is
+    /// reconstructed from settled tips on restart, so continuation is durable without a timer.
+    pub(crate) fn advance_pending_sparse_contiguous(&mut self, store: &Store) -> Result<bool> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let next = self
+            .sparse_contiguous_after
+            .and_then(|after| {
+                self.sparse_contiguous_pending
+                    .range((Excluded(after), Unbounded))
+                    .next()
+                    .copied()
+            })
+            .or_else(|| self.sparse_contiguous_pending.first().copied());
+        let Some(author) = next else {
+            self.sparse_contiguous_after = None;
+            return Ok(false);
+        };
+        self.sparse_contiguous_after = Some(author);
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        self.advance_history_contiguous(store, &committed, &author)?;
+        Ok(!self.sparse_contiguous_pending.is_empty())
     }
 }
 
@@ -1053,6 +1606,7 @@ impl ChannelState {
     pub(crate) fn refill_history_body(
         &mut self,
         store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
         entry: &Entry,
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
@@ -1139,7 +1693,20 @@ impl ChannelState {
             let mut deferred = false;
             let mut unavailable = false;
             if settled && kind == SignedEntryKind::Content {
-                self.track_body_into(&mut batch, hash, log, now.get())?;
+                // Settlement can precede a selected Content body. Its sealed source time is the
+                // retention origin; a later refill must not make an old body young again.
+                #[cfg(feature = "test-knobs")]
+                if std::env::var("VOX_TEST_FX29_MUTANT").as_deref()
+                    == Ok("refill-content-with-current-time")
+                    && std::env::var(TEST_FX29_REFILL_HASH_ENV).as_deref()
+                        == Ok(crate::node::link::b32_encode(&hash).as_str())
+                {
+                    self.track_body_into(&mut batch, hash, log, now.get())?;
+                } else {
+                    self.track_known_body_into(&mut batch, entry, log)?;
+                }
+                #[cfg(not(feature = "test-knobs"))]
+                self.track_known_body_into(&mut batch, entry, log)?;
                 match self.render_content_into(
                     &mut batch,
                     entry.skeleton.author_id,
@@ -1148,6 +1715,7 @@ impl ChannelState {
                         .payload
                         .as_deref()
                         .ok_or(Error::MalformedBundle("refill body vanished"))?,
+                    Some(entry),
                     now.get(),
                     historical,
                     &mut expired,
@@ -1163,7 +1731,19 @@ impl ChannelState {
             if settled && !deferred && !unavailable {
                 on_admitted(&mut batch, hash)?;
             }
+            let contiguous = if settled && !deferred && !unavailable {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                let progress =
+                    index.advance_sparse_contiguous(&entry.skeleton.author_id, &self.me())?;
+                index.seal()?;
+                Some(progress)
+            } else {
+                None
+            };
             batch.commit()?;
+            committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
@@ -1173,10 +1753,20 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
+            let contiguous_more = contiguous.as_ref().is_some_and(|progress| progress.more);
+            if let Some(progress) = contiguous {
+                self.note_contiguous_advance(entry.skeleton.author_id, progress)?;
+            }
+            #[cfg(feature = "test-knobs")]
+            if settled && kind == SignedEntryKind::Content && !deferred && !unavailable {
+                self.record_fx29_refill_outcome(&hash)?;
+            }
             Ok(if unavailable {
                 HistoryEffectProgress::BodyUnavailable
             } else if deferred {
                 HistoryEffectProgress::RefillPending { governance: true }
+            } else if contiguous_more {
+                HistoryEffectProgress::Progress
             } else if settled {
                 HistoryEffectProgress::Complete { rendered }
             } else {

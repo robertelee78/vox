@@ -1083,13 +1083,17 @@ final class FirstRunProof: XCTestCase {
     /// sidebar on bg.panel, the timeline on bg.base, the inspector and the status bar on
     /// bg.raised, and between the timeline and the inspector a line of line.hair. Room > Rename's
     /// sheet is on bg.panel, its title SF Pro semibold (one line of about 24 points, not Inter
-    /// Display's 34). Return in Room > Retention sets nothing: the sheet stays. Bob's keyring row
+    /// Display's 34); submitting it says the exact authenticated entry the shipped
+    /// `vox room read --hashes` exposes. Return in Room > Retention sets nothing: the sheet stays.
+    /// Bob's keyring row
     /// says he has read and offers no way to give him drive (the decider, v0.4.1: the app has no
     /// Sessions to drive). Colours are compared in the screenshot's own colour space, within 4 of
     /// 255 per channel. Mutations: the inspector without bg.raised → red at "inspector"; the
     /// hairline the system's divider again → red at "line.hair"; a sheet title in Inter Display →
-    /// red at "title"; Set the default again → red at "Retention"; the keyring's drive button back
-    /// → red at "no way to give". Forget preserves this window's identity and Locked fingerprint;
+    /// red at "title"; discarding, substituting or omitting NodeModel's rename entry → red at the
+    /// exact shipped hash; Set the default again → red at "Retention"; the keyring's drive button
+    /// back → red at "no way to give". Forget preserves this window's identity and Locked
+    /// fingerprint;
     /// correct Unlock returns Ready. A replacement vault must never retain a stale fingerprint.
     func testTheLookIsTheTokensAndReturnNeverGivesWhatItShouldNot() throws {
         let env = ProcessInfo.processInfo.environment
@@ -1240,7 +1244,16 @@ final class FirstRunProof: XCTestCase {
         XCTAssertNotNil(hair, "PRODUCT: the timeline and the inspector must be separated by line.hair #303137 (L-2, L-6); no pixel of it in the 40 points left of the inspector, at height \(y)")
         read.append("line.hair at x \(hair.map { "\($0)" } ?? "none")")
 
-        // Room > Rename…: a sheet on bg.panel, its title SF Pro semibold.
+        // Room > Rename…: take the shipped authenticated order before the UI action. The returned
+        // NodeModel entry must be the one new final row—not merely any valid hash already present.
+        let renameOrderBeforeResult = run(vox, ["room", "read", "--node", "alice", room, "--hashes"], env: voxEnv)
+        XCTAssertEqual(renameOrderBeforeResult.status, 0,
+                       "PRODUCT: shipped `vox room read --hashes` refused before the macOS rename: \(renameOrderBeforeResult.out)")
+        let renameOrderBefore = renameOrderBeforeResult.out.split(separator: "\n").compactMap {
+            $0.split(whereSeparator: \.isWhitespace).first.map(String.init)
+        }
+
+        // The sheet is on bg.panel, and its title is SF Pro semibold.
         ui.menuBars.menuBarItems["Room"].click()
         tap(ui, Key.menuItem("Rename…"), "Room > Rename…")
         let title = Key.showing("Rename the room")
@@ -1262,8 +1275,32 @@ final class FirstRunProof: XCTestCase {
         } else {
             XCTFail("APPARATUS: Rename's title shows, but XCTest finds no sheet to read")
         }
-        ui.typeKey(XCUIKeyboardKey.escape.rawValue, modifierFlags: [])
-        missingWithin(ui, title, 5, "Escape must close Rename's sheet")
+        type(ui, Key.id("rename-name"), "talk-renamed", "the new room name")
+        tap(ui, Key.id("rename-submit"), "Rename")
+        guard let renamed = words(
+            ui,
+            Key.id("status-outcome-done"),
+            timeout: 20,
+            "the NodeModel rename must report its exact authenticated entry",
+            until: { $0.hasPrefix("The room is now talk-renamed for every member. Entry ") }
+        ) else { return }
+        let renamePrefix = "The room is now talk-renamed for every member. Entry "
+        guard renamed.hasPrefix(renamePrefix), renamed.hasSuffix(".") else {
+            XCTFail("PRODUCT: the macOS rename completed without saying one exact entry: \(renamed.debugDescription)")
+            return
+        }
+        let renameEntry = String(renamed.dropFirst(renamePrefix.count).dropLast())
+        XCTAssertEqual(renameEntry.count, 52,
+                       "PRODUCT: the macOS rename said a malformed exact entry: \(renamed.debugDescription)")
+        let ordered = run(vox, ["room", "read", "--node", "alice", room, "--hashes"], env: voxEnv)
+        XCTAssertEqual(ordered.status, 0,
+                       "PRODUCT: shipped `vox room read --hashes` refused after the macOS rename: \(ordered.out)")
+        let orderedHashes = ordered.out.split(separator: "\n").compactMap {
+            $0.split(whereSeparator: \.isWhitespace).first.map(String.init)
+        }
+        XCTAssertEqual(orderedHashes, renameOrderBefore + [renameEntry],
+                       "PRODUCT: macOS rename entry \(renameEntry) was not the exact newly inserted final authenticated row; before \(renameOrderBefore), after \(orderedHashes)")
+        missingWithin(ui, title, 5, "a completed Rename must close its sheet")
 
         // Room > Retention…: Return sets nothing (A9: a retention that deletes has no default).
         ui.menuBars.menuBarItems["Room"].click()

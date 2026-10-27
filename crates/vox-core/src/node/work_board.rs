@@ -167,7 +167,7 @@ fn now() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 fn roster(handle: &NodeHandle, room: Digest32) -> Result<(Digest32, Vec<Digest32>), String> {
-    handle.inspect_view(|view, _| {
+    handle.inspect_published_view(|view| {
         let me = view
             .identity
             .as_ref()

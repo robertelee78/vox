@@ -189,11 +189,7 @@ impl Room {
 #[test]
 #[ignore = "optional: 301 real joins with production Argon2id and proof of work; run in release"]
 fn every_joiner_of_a_three_hundred_member_room_gets_in() {
-    watchdog::arm_for(Duration::from_secs(if cfg!(debug_assertions) {
-        6 * 60 * 60
-    } else {
-        90 * 60
-    }));
+    watchdog::arm();
     let r = stage();
     let next = AtomicUsize::new(0);
     let joined = AtomicUsize::new(0);

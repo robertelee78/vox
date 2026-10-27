@@ -27,7 +27,7 @@
 //! the node schedules it after pruning (ADR-016 §Consequences).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
@@ -75,12 +75,48 @@ impl Drop for DatabaseCacheLease {
     }
 }
 
+/// Non-owning observation of the final profile database/transaction and directory guard release.
+#[derive(Clone)]
+pub(crate) struct ProfileClosed(Arc<ProfileClosure>);
+
+struct ProfileClosure {
+    closed: AtomicBool,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl ProfileClosed {
+    pub(crate) async fn wait(self) {
+        let mut changed = Box::pin(Arc::clone(&self.0.changed).notified_owned());
+        changed.as_mut().enable();
+        if !self.0.closed.load(Ordering::Acquire) {
+            changed.await;
+        }
+    }
+}
+
+/// Every database and owned transaction retains this guard. Its observer retains no file.
+struct ProfileOwner {
+    lock: Option<std::fs::File>,
+    closure: Arc<ProfileClosure>,
+}
+
+impl Drop for ProfileOwner {
+    fn drop(&mut self) {
+        // Cached drops its inner database/transaction first. The actual directory guard is
+        // released before publishing completion, including when the last owner is a Snapshot.
+        drop(self.lock.take());
+        self.closure.closed.store(true, Ordering::Release);
+        self.closure.changed.notify_waiters();
+    }
+}
+
 /// Private redb ownership adapter. Transactions can outlive the database handle that made
 /// them: Snapshot does, and a reopen can overlap a read. Every such owner keeps the same
 /// lease. Field order frees redb's owner before returning its last cache credits.
 struct Cached<T> {
     inner: T,
     cache: Arc<DatabaseCacheLease>,
+    profile: Option<Arc<ProfileOwner>>,
 }
 
 impl<T> std::ops::Deref for Cached<T> {
@@ -103,6 +139,7 @@ impl Cached<Database> {
         Ok(Cached {
             inner: self.inner.begin_read()?,
             cache: Arc::clone(&self.cache),
+            profile: self.profile.clone(),
         })
     }
 
@@ -112,6 +149,7 @@ impl Cached<Database> {
         Ok(Cached {
             inner: self.inner.begin_write()?,
             cache: Arc::clone(&self.cache),
+            profile: self.profile.clone(),
         })
     }
 }
@@ -123,15 +161,21 @@ impl Cached<ReadOnlyDatabase> {
         Ok(Cached {
             inner: self.inner.begin_read()?,
             cache: Arc::clone(&self.cache),
+            profile: self.profile.clone(),
         })
     }
 }
 
 impl Cached<redb::WriteTransaction> {
     fn commit(self) -> std::result::Result<(), redb::CommitError> {
-        let Self { inner, cache } = self;
+        let Self {
+            inner,
+            cache,
+            profile,
+        } = self;
         let result = inner.commit();
         drop(cache);
+        drop(profile);
         result
     }
 
@@ -156,6 +200,7 @@ fn open_database(path: &Path) -> std::result::Result<Cached<Database>, redb::Dat
     Ok(Cached {
         inner: builder.create(path)?,
         cache,
+        profile: None,
     })
 }
 
@@ -166,6 +211,7 @@ fn open_read_only_database(
     Ok(Cached {
         inner: builder.open_read_only(path)?,
         cache,
+        profile: None,
     })
 }
 
@@ -428,7 +474,7 @@ pub struct Store {
     /// `db` so it is released only after the database is closed: the store goes with its last
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
     /// store the other was still closing and be refused.
-    _lock: Option<std::fs::File>,
+    profile_owner: Option<Arc<ProfileOwner>>,
 }
 
 /// How the store's file is open.
@@ -511,7 +557,7 @@ impl Store {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
             writer: Mutex::new(Epochs::default()),
-            _lock: None,
+            profile_owner: None,
         };
         store.init_schema()?;
         Ok(store)
@@ -534,7 +580,7 @@ impl Store {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
             writer: Mutex::new(Epochs::default()),
-            _lock: None,
+            profile_owner: None,
         };
         if store.schema_is_current()? {
             Ok(store)
@@ -548,8 +594,31 @@ impl Store {
     /// after the database is closed (V210-100).
     #[must_use]
     pub fn keep_lock(mut self, lock: std::fs::File) -> Self {
-        self._lock = Some(lock);
+        let owner = Arc::new(ProfileOwner {
+            lock: Some(lock),
+            closure: Arc::new(ProfileClosure {
+                closed: AtomicBool::new(false),
+                changed: Arc::new(tokio::sync::Notify::new()),
+            }),
+        });
+        match self.db.get_mut().unwrap_or_else(PoisonError::into_inner) {
+            Backing::Writable(db) => db.profile = Some(Arc::clone(&owner)),
+            Backing::ReadOnly(db) => db.profile = Some(Arc::clone(&owner)),
+            Backing::Closed => {}
+        }
+        self.profile_owner = Some(owner);
         self
+    }
+
+    pub(crate) fn profile_closed(&self) -> Option<ProfileClosed> {
+        self.profile_owner
+            .as_ref()
+            .map(|owner| ProfileClosed(Arc::clone(&owner.closure)))
+    }
+
+    fn keep_profile<T>(&self, mut db: Cached<T>) -> Cached<T> {
+        db.profile = self.profile_owner.clone();
+        db
     }
 
     /// Re-save a room after a failed write: rewrite this room's persisted sealed state durably
@@ -627,12 +696,12 @@ impl Store {
         match open_database(&self.path) {
             Ok(db) => {
                 super::paths::set_private_file_mode(&self.path)?;
-                *backing = Backing::Writable(db);
+                *backing = Backing::Writable(self.keep_profile(db));
                 Ok(())
             }
             Err(e) => {
                 if let Ok(db) = open_read_only_database(&self.path) {
-                    *backing = Backing::ReadOnly(db);
+                    *backing = Backing::ReadOnly(self.keep_profile(db));
                 }
                 Err(open_error(e))
             }
@@ -712,7 +781,9 @@ impl Store {
         drop(std::mem::replace(&mut *backing, Backing::Closed));
         if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
             let _ = std::fs::remove_file(&fresh_path);
-            *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
+            *backing = Backing::Writable(
+                self.keep_profile(open_database(&self.path).map_err(open_error)?),
+            );
             return Err(Error::Path {
                 op: "replace store",
                 detail: format!("{}: {e}", self.path.display()),
@@ -723,7 +794,7 @@ impl Store {
         // backing closed; a failed directory sync leaves it writable; both refuse a false peer
         // acknowledgement and are retried by the next writer.
         epochs.replacement = true;
-        *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
+        *backing = Backing::Writable(self.keep_profile(open_database(&self.path).map_err(open_error)?));
         drop(backing);
         self.finish_replacement(&mut epochs)?;
         Ok(())
@@ -739,7 +810,7 @@ impl Store {
         {
             let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
             if matches!(*backing, Backing::Closed) {
-                *backing = Backing::Writable(open_database(&self.path).map_err(open_error)?);
+                *backing = Backing::Writable(self.keep_profile(open_database(&self.path).map_err(open_error)?));
                 super::paths::set_private_file_mode(&self.path)?;
             }
             if !matches!(*backing, Backing::Writable(_)) {
@@ -1041,11 +1112,23 @@ impl Store {
     /// Write a public metadata entry (its own durable transaction). Meta holds
     /// only public facts (schema version, identity fingerprint, creation time).
     pub fn put_meta(&self, name: &str, value: &[u8]) -> Result<()> {
+        self.put_meta_checked(name, value, || Ok(()))
+    }
+
+    /// Stage one metadata write, then check its caller-owned condition at the transaction commit
+    /// boundary. A refused check drops the transaction without publishing it.
+    pub(crate) fn put_meta_checked(
+        &self,
+        name: &str,
+        value: &[u8],
+        before_commit: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         let (mut epochs, txn) = self.begin_write()?;
         {
             let mut meta = txn.open_table(META).map_err(storage("open meta"))?;
             meta.insert(name, value).map_err(storage("write meta"))?;
         }
+        before_commit()?;
         self.commit_flushed(txn, &mut epochs, "commit")
     }
 
@@ -1502,6 +1585,24 @@ impl Batch<'_> {
         }
         #[cfg(not(feature = "test-knobs"))]
         let _ = (author, generation);
+    }
+
+    /// Read and replace one metadata entry inside this batch's serialized write transaction.
+    /// The replacement remains invisible with the rest of the batch until commit.
+    pub(crate) fn update_meta<T>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(Option<&[u8]>) -> Result<(Vec<u8>, T)>,
+    ) -> Result<T> {
+        let mut meta = self.txn.open_table(META).map_err(storage("open meta"))?;
+        let current = meta
+            .get(name)
+            .map_err(storage("read meta"))?
+            .map(|v| v.value().to_vec());
+        let (next, out) = f(current.as_deref())?;
+        meta.insert(name, next.as_slice())
+            .map_err(storage("write meta"))?;
+        Ok(out)
     }
 
     /// Read a fixed metadata incarnation inside the same serialized publication transaction.

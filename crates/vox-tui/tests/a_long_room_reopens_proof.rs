@@ -278,7 +278,7 @@ const LARGE: usize = 100_000;
 #[test]
 #[ignore = "optional: real vox daemons, 5,000 CLI posts and production Argon2id; run it in release"]
 fn a_room_of_five_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_them_all() {
-    watchdog::arm_for(Duration::from_secs(1_200));
+    watchdog::arm();
     a_room_of(MID, 4, Duration::from_secs(300));
 }
 
@@ -286,7 +286,7 @@ fn a_room_of_five_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_th
 #[test]
 #[ignore = "optional: 100,000 CLI posts, most of an hour; run in release"]
 fn a_room_of_a_hundred_thousand_posts_reopens_and_a_newcomer_holds_them_all() {
-    watchdog::arm_for(Duration::from_secs(4 * 3_600));
+    watchdog::arm();
     a_room_of(LARGE, 8, Duration::from_secs(1_800));
 }
 

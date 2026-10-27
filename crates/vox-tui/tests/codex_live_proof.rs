@@ -44,7 +44,8 @@
 //! `~/.codex`, mode 0600, flushed, then renamed over it); if the operator's file changed
 //! meanwhile it is left as it is, and the run says so loudly. Each turn says "Codex rotated its
 //! sign-in; the operator's file was updated" or "unchanged". The file's contents are never
-//! printed. A run killed by a signal (the watchdog's abort, SIGTERM) runs no destructor: its
+//! printed. A run killed by a signal (including operator emergency cleanup or SIGTERM) runs no
+//! destructor: its
 //! copy is unlinked by the signal handler, and a rotation made in that turn is not written back.
 //!
 //! **No hook of the operator's runs.** `CODEX_HOME` is inside the root and holds only the
@@ -455,7 +456,7 @@ struct Turn {
 #[test]
 #[ignore = "drives a real Codex model turn; optional, on the decider's request, in release"]
 fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
-    watchdog::arm_for(Duration::from_secs(900));
+    watchdog::arm();
     if !oc_sandbox::live_model_allowed(
         "codex_live_proof::a_live_codex_turn_reads_the_room_only_through_a_trusted_hook",
     ) {
@@ -996,7 +997,7 @@ fn session_until(
 #[test]
 #[ignore = "drives a live Codex session's model turns; optional, on the decider's request, in release"]
 fn a_live_codex_session_is_mirrored_and_driven() {
-    watchdog::arm_for(Duration::from_secs(1200));
+    watchdog::arm();
     if !oc_sandbox::live_model_allowed(
         "codex_live_proof::a_live_codex_session_is_mirrored_and_driven",
     ) {

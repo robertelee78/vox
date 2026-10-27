@@ -100,6 +100,44 @@ impl ChannelState {
         store: &Store,
         after_departure: bool,
     ) -> Result<()> {
+        self.ensure_local_append_available_mode(store, after_departure, false)
+    }
+
+    pub(super) fn ensure_local_append_available_mode(
+        &self,
+        store: &Store,
+        after_departure: bool,
+        recover_own: bool,
+    ) -> Result<()> {
+        let read = self.local_append_eligible_mode(store, after_departure, recover_own)?;
+        if read.publication_busy()
+            || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
+        {
+            return Err(if recover_own {
+                Error::OwnHistoryBehind
+            } else {
+                Error::Profile("room publication is busy; retry this operation")
+            });
+        }
+        Ok(())
+    }
+
+    /// Eligibility is independent of capacity for an entry a no-op will never append.
+    /// Return the same read so actual append admission does not reopen the index.
+    pub(super) fn local_append_eligible_for<'a>(
+        &'a self,
+        store: &Store,
+        after_departure: bool,
+    ) -> Result<entry_store::Read<'a>> {
+        self.local_append_eligible_mode(store, after_departure, false)
+    }
+
+    fn local_append_eligible_mode<'a>(
+        &'a self,
+        store: &Store,
+        after_departure: bool,
+        recover_own: bool,
+    ) -> Result<entry_store::Read<'a>> {
         // The departure statement must remain this author's tail until another member has
         // acknowledged it. Background key, receipt, session, or share work cannot make a node
         // appear to rejoin after the person chose Leave.
@@ -112,14 +150,10 @@ impl ChannelState {
                 "Legacy history required; resume explicit recovery before posting in this room",
             ));
         }
-        if read.publication_busy()
-            || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
-        {
-            return Err(Error::Profile(
-                "room publication is busy; retry this operation",
-            ));
+        if !recover_own && read.sparse_enabled() {
+            self.require_own_history_safe_in(&read)?;
         }
-        Ok(())
+        Ok(read)
     }
 
     /// At most sixteen actual settled tips are named. Their prefixes are local cached proof

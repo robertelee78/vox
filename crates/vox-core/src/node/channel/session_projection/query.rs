@@ -255,33 +255,65 @@ fn descriptor(read: &Read<'_>, id: u64) -> Result<Descriptor> {
     Ok(row)
 }
 
-fn next(
-    read: &Read<'_>,
-    authors: &[Digest32],
-    after: u64,
-    open_only: bool,
-) -> Result<Option<(u64, Descriptor)>> {
-    let mut next = None;
-    // Current drive holders are keyring-bounded. Each lookup walks one sealed
-    // path; revoked authors' histories do not have to be scanned and discarded.
-    for author in authors {
-        let mut key = hash_key(author);
-        key[32..40].copy_from_slice(&after.to_be_bytes());
-        if let Some((found, id)) = read.next(
-            if open_only {
-                Tree::OpenSessions
-            } else {
-                Tree::AuthorOpenings
-            },
-            Some(key),
-        )? {
-            if found[..32] == author[..] && next.is_none_or(|old| id < old) {
-                next = Some(id);
+fn live_descriptor(read: &Read<'_>, id: u64) -> Result<Option<Descriptor>> {
+    let mut row = descriptor(read, id)?;
+    if !read.retained(row.opening)? {
+        return Ok(None);
+    }
+    let mut checked = (row.opening, true);
+    // A later opening can remain current after an older name/harness field expires.
+    // Keep the Session and the fields that remain available, not a dangling text locator.
+    for field in [&mut row.name, &mut row.harness, &mut row.cwd] {
+        if let Some(saved) = field {
+            let source = saved.envelope.first;
+            if checked.0 != source {
+                checked = (source, read.retained(source)?);
+            }
+            if !checked.1 {
+                *field = None;
             }
         }
     }
-    next.map(|id| descriptor(read, id).map(|row| (id, row)))
-        .transpose()
+    Ok(Some(row))
+}
+
+fn next(
+    read: &Read<'_>,
+    authors: &[Digest32],
+    mut after: u64,
+    open_only: bool,
+    retired_remaining: &mut usize,
+) -> Answer<Option<(u64, Descriptor)>> {
+    loop {
+        let mut next = None;
+        // Choose the minimum using only locators. Metadata/body validation belongs to that
+        // one selected row, not every competing author's head for every emitted row.
+        for author in authors {
+            let mut key = hash_key(author);
+            key[32..40].copy_from_slice(&after.to_be_bytes());
+            if let Some((found, id)) = read.next(
+                if open_only {
+                    Tree::OpenSessions
+                } else {
+                    Tree::AuthorOpenings
+                },
+                Some(key),
+            )? {
+                if found[..32] == author[..] && next.is_none_or(|old| id < old) {
+                    next = Some(id);
+                }
+            }
+        }
+        let Some(id) = next else { return Ok(None) };
+        if let Some(row) = live_descriptor(read, id)? {
+            return Ok(Some((id, row)));
+        }
+        *retired_remaining = retired_remaining.saturating_sub(1);
+        if *retired_remaining == 0 {
+            return Err(Failure::Request(REFRESHING));
+        }
+        after = id;
+    }
 }
 
 impl ChannelState {
@@ -295,7 +327,7 @@ impl ChannelState {
             if !self.advance_private_sessions(store, now)? {
                 return Ok(false);
             }
-            let metadata = super::build::advance(self, store)?;
+            let metadata = super::build::advance(self, store, now)?;
             let activity = super::activity_fold::advance(self, store)?;
             let waiting = super::waiting::advance(self, store)?;
             Ok(metadata || activity || waiting)
@@ -362,7 +394,7 @@ impl ChannelState {
         store: &Store,
         query: Query,
         max_bytes: usize,
-        _now: u64,
+        now: u64,
     ) -> std::result::Result<Reply, String> {
         if self.poisoned {
             return Err(self.save_failure().to_string());
@@ -370,12 +402,12 @@ impl ChannelState {
         let result = (|| -> Answer<Reply> {
             let (authors, refreshing) = self.drive_from_known(store)?;
             let me = self.me();
-            let snapshot = store.snapshot()?;
-            let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
-            let public = self
+            let view = self
                 .entries
-                .render_view(store, &self.sek, &self.channel_id)?
-                .session_revision();
+                .render_view(store, &self.sek, &self.channel_id)?;
+            let read = Read::existing(view.snapshot(), &self.sek, &self.channel_id)?
+                .map(|read| read.with_sources(self, &view, now));
+            let public = view.session_revision();
             let published = read.as_ref().and_then(|read| read.header.published);
             // The published fold is the answer. It is provisional while the fold is behind
             // the room's inputs or has never published, and while a saved-Session upgrade,
@@ -479,6 +511,7 @@ impl ChannelState {
                     Query::Summary { .. } | Query::Text { .. } => Err(Failure::Request(CHANGED)),
                 };
             };
+            let mut retired_remaining = PAGE_ROWS;
             match query {
                 Query::Summary {
                     opening,
@@ -488,7 +521,8 @@ impl ChannelState {
                     let descriptor_id = read
                         .find(Tree::OpeningHash, &hash_key(&opening))?
                         .ok_or(Failure::Request(CHANGED))?;
-                    let row = descriptor(&read, descriptor_id)?;
+                    let row =
+                        live_descriptor(&read, descriptor_id)?.ok_or(Failure::Request(CHANGED))?;
                     if !authors.contains(&row.node) {
                         return Err(Failure::Request(CHANGED));
                     }
@@ -583,7 +617,9 @@ impl ChannelState {
                         let Some(row_id) = read.find(Tree::Groups, &hash_key(&group))? else {
                             continue;
                         };
-                        let row = descriptor(&read, row_id)?;
+                        let Some(row) = live_descriptor(&read, row_id)? else {
+                            continue;
+                        };
                         if row.node != f.author || row.id != f.session {
                             return Err(
                                 Error::MalformedAtRest("Session pending opening binding").into()
@@ -638,7 +674,8 @@ impl ChannelState {
                             let id = read
                                 .find(Tree::OpeningHash, &hash_key(&cursor.opening))?
                                 .ok_or(Failure::Request(CHANGED))?;
-                            let row = descriptor(&read, id)?;
+                            let row =
+                                live_descriptor(&read, id)?.ok_or(Failure::Request(CHANGED))?;
                             let time = if cursor.ended {
                                 row.ended.map(|e| e.position.created)
                             } else {
@@ -680,6 +717,14 @@ impl ChannelState {
                             older = true;
                             break;
                         }
+                        cursor = Some((time, id, ended));
+                        let Some(row) = live_descriptor(&read, id)? else {
+                            retired_remaining = retired_remaining.saturating_sub(1);
+                            if retired_remaining == 0 {
+                                return Err(Failure::Request(REFRESHING));
+                            }
+                            continue;
+                        };
                         bytes = bytes.saturating_add(cost);
                         cursor = Some((time, id, ended));
                         let cursor = crate::node::sessions::LifecycleCursor {
@@ -703,7 +748,7 @@ impl ChannelState {
                     if node != me {
                         readable(&node)?;
                     }
-                    let open = read.find(Tree::OpenCounts, &hash_key(&node))?.unwrap_or(0) != 0;
+                    let open = next(&read, &[node], 0, true, &mut retired_remaining)?.is_some();
                     if node != me {
                         proven(open)?;
                     }
@@ -715,7 +760,7 @@ impl ChannelState {
                     // member whose controls are refreshing, or whose opening a provisional
                     // fold does not hold yet, is told to retry rather than "none".
                     let row = if (authors.contains(&node) || node == me) && self.is_member(&node) {
-                        next(&read, &[node], 0, true)?.map(|(_, row)| row)
+                        next(&read, &[node], 0, true, &mut retired_remaining)?.map(|(_, row)| row)
                     } else {
                         None
                     };
@@ -776,7 +821,11 @@ impl ChannelState {
                             let id = read
                                 .find(Tree::OpeningHash, &hash_key(&hash))?
                                 .ok_or(Failure::Request("cursor not among this room's Sessions"))?;
-                            if !listed.contains(&descriptor(&read, id)?.node) {
+                            if !listed.contains(
+                                &live_descriptor(&read, id)?
+                                    .ok_or(Failure::Request(CHANGED))?
+                                    .node,
+                            ) {
                                 return Err(Failure::Request(CHANGED));
                             }
                             id
@@ -784,7 +833,8 @@ impl ChannelState {
                     };
                     let mut rows = Vec::new();
                     let mut bytes = 0u64;
-                    let mut candidate = next(&read, &listed, cursor, open_only)?;
+                    let mut candidate =
+                        next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
                     while let Some((id, row)) = candidate {
                         let cost = 256u64
                             .saturating_add(row.name.map_or(0, |f| f.bytes))
@@ -803,7 +853,8 @@ impl ChannelState {
                         bytes = bytes.saturating_add(cost);
                         cursor = id;
                         rows.push(Row::from(row));
-                        candidate = next(&read, &listed, cursor, open_only)?;
+                        candidate =
+                            next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
                     }
                     Ok(Reply::Page {
                         rows,
@@ -821,8 +872,9 @@ impl ChannelState {
                         sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
                     let row = read
                         .find(Tree::Groups, &hash_key(&group))?
-                        .map(|id| descriptor(&read, id))
+                        .map(|id| live_descriptor(&read, id))
                         .transpose()?
+                        .flatten()
                         .map(Row::from);
                     proven(row.is_some())?;
                     Ok(Reply::Page {
@@ -837,8 +889,9 @@ impl ChannelState {
                         sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
                     let row = read
                         .find(Tree::Groups, &hash_key(&group))?
-                        .map(|id| descriptor(&read, id))
+                        .map(|id| live_descriptor(&read, id))
                         .transpose()?
+                        .flatten()
                         .map(Row::from);
                     proven(row.is_some())?;
                     Ok(Reply::Lookup(row))
@@ -854,6 +907,9 @@ impl ChannelState {
                         .find(Tree::OpeningHash, &hash_key(&opening))?
                         .ok_or(Failure::Request(CHANGED))?;
                     let row = descriptor(&read, id)?;
+                    if !read.retained(row.opening)? {
+                        return Err(Failure::Request(CHANGED));
+                    }
                     if !authors.contains(&row.node) {
                         return Err(Failure::Request(CHANGED));
                     }
@@ -868,13 +924,16 @@ impl ChannelState {
                             next: None,
                         }));
                     };
+                    if !read.retained(field.envelope.first)? {
+                        return Err(Failure::Request(CHANGED));
+                    }
                     let mut input = EnvelopeInput::new(&read, field.envelope);
-                    let page = super::text::page(
-                        &mut input,
-                        field,
-                        after,
-                        max_bytes.clamp(4, TEXT_BYTES),
-                    )?;
+                    let page =
+                        super::text::page(&mut input, field, after, max_bytes.clamp(4, TEXT_BYTES));
+                    if input.retired() {
+                        return Err(Failure::Request(CHANGED));
+                    }
+                    let page = page?;
                     Ok(Reply::Text(TextPage {
                         bytes: page.bytes,
                         next: page.next,

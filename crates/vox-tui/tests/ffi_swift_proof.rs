@@ -48,7 +48,9 @@
 //!    with the node's own sentence; on a room the app created and the peer joined, it renames
 //!    the room for both, and the peer's own `vox room list` shows the new name (R-1). The card
 //!    is fetched from a local server, so this test needs `--features vox-tui/test-knobs`
-//!    (`VOX_TEST_CARD_ALLOW`) and refuses as CANNOT MEASURE without it.
+//!    (`VOX_TEST_CARD_ALLOW`) and refuses as CANNOT MEASURE without it. A successful rename
+//!    returns the exact authenticated entry it appended, and the peer's shipped room order must
+//!    contain that same entry.
 //!
 //! 8. **A Session, as the app reads it** (ADR-029 SC-1, CL-1, CL-2, #554): a session of the app's
 //!    own node, staged through its real hook with Claude Code's own hook JSON (a prompt, a Bash
@@ -69,8 +71,8 @@
 //! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
 //! Mutants for (7), one per claim, each red PRODUCT: `RoomMessage.card` always nil;
-//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
-//! always empty.
+//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node or discards the
+//! appended entry; `pulledBy` always empty.
 //! 8b. **Drive over another node's Session, as the app keeps it** (#662): the peer opens a
 //!    Session through its hook and gives the app's node drive, typed at a terminal; the app holds
 //!    drive with the entry. The peer takes drive back: within 30 s the listener hears the room's
@@ -489,9 +491,9 @@ const CARD_IMAGE: &[u8; 1024] = &[0x5a; 1024];
 #[ignore = "builds the xcframework, compiles Swift, runs a real daemon; CI runs it in release on macOS"]
 fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
     let tmp = tempfile::tempdir().unwrap();
-    // Built before the watchdog is armed: the build is a release compile of the workspace plus
-    // the bindings, minutes on a CI runner, and the 600 s budget bounds a hung *proof*, not cargo
-    // (#257: the watchdog killed aws-lc-sys's build script mid-compile).
+    // Built before optional emergency cleanup is armed: the build is a release compile of the
+    // workspace plus the bindings and can take minutes on a runner. An operator's elapsed
+    // timebox is for the proof run, not cargo (#257: the old default killed aws-lc-sys mid-build).
     let harness = &harnesses().node;
     watchdog::arm();
 
@@ -968,7 +970,16 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "mine passphrase\n",
     );
     writeln!(to_app).unwrap();
-    let renamed = expect(&from_app, &seen, "RENAMED");
+    let renamed = expect(&from_app, &seen, "RENAMED ");
+    let rename_entry = renamed.strip_prefix("RENAMED ").unwrap_or_else(|| {
+        panic!("PRODUCT: `renameRoom` did not return its exact appended entry: {renamed}")
+    });
+    vox_core::node::link::b32_decode(rename_entry, "renameRoom entry").unwrap_or_else(|error| {
+        panic!(
+            "PRODUCT: `renameRoom` returned a malformed appended entry ({error}): \
+             {rename_entry}"
+        )
+    });
     // (10) What a retention change starts from (D14).
     let retention_secs = expect(&from_app, &seen, "RETENTION_SECS ");
     assert_eq!(
@@ -983,14 +994,23 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     };
     let until = Instant::now() + TIMEOUT;
     let mut peer_rooms = String::new();
+    let mut peer_hashes = String::new();
     while Instant::now() < until {
         peer_rooms = peer.run(&["room", "list"], "");
-        if peer_rooms.lines().any(|l| shows_renamed(l, &made)) {
+        peer_hashes = peer.run(&["room", "read", &made, "--hashes"], "");
+        if peer_rooms.lines().any(|l| shows_renamed(l, &made))
+            && peer_hashes
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(rename_entry))
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    eprintln!("{card}\n{image}\n{pulled_by}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room list`: {peer_rooms}");
+    eprintln!(
+        "{card}\n{image}\n{pulled_by}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room \
+         list`: {peer_rooms}\nthe peer's exact room order: {peer_hashes}"
+    );
     assert_eq!(
         card,
         format!(
@@ -1019,6 +1039,13 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         peer_rooms.lines().any(|l| shows_renamed(l, &made)),
         "PRODUCT: a room the app renamed must show its new name in the peer's own `vox room \
          list`: {peer_rooms}"
+    );
+    assert!(
+        peer_hashes
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(rename_entry)),
+        "PRODUCT: the app reported rename entry {rename_entry}, but the peer's shipped room order \
+         did not contain that exact authenticated action: {peer_hashes}"
     );
 
     // (8) A Session of the app's own node, through its hook as Claude Code runs it. The hook is

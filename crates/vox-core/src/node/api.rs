@@ -641,6 +641,8 @@ pub struct ChannelDetail {
     /// Whether this node has completed the room's first sync since joining it (V210-164): until
     /// then its log may not yet hold what the room's members have written, shares included.
     pub synced: bool,
+    /// Last contiguous authenticated position in this node's own room feed.
+    pub own_feed_through: u64,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
@@ -651,6 +653,12 @@ pub struct ChannelDetail {
     pub member_consent: Vec<Digest32>,
     /// Revision of the checked governance projection used by this display.
     pub governance_revision: u64,
+    /// Whether retained ciphertext still has bounded rendering work queued. This is published
+    /// with the room view so status can distinguish parked missing-fact state from active work.
+    pub render_backfill_pending: bool,
+    /// Members still owed any generation of this node's sender key, from the durable delivery
+    /// ledger. The live actor may additionally have an admitted delivery in flight.
+    pub key_delivery_pending: Vec<Digest32>,
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `member_consent`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,
@@ -684,6 +692,8 @@ pub struct ChannelDetail {
     /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
     /// receiving side).
     pub received_key_generations: usize,
+    /// Whether a bounded scan or retained key-package replay still owes this room another turn.
+    pub key_packages_pending: bool,
     /// Authors this node froze here for signing two entries at one position (ADR-008).
     pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened
@@ -698,6 +708,10 @@ pub struct ChannelDetail {
     /// other members' nodes said they hold it)`, oldest first, for the same messages as
     /// [`Self::read_by`] looks at.
     pub held: Vec<(Digest32, u64)>,
+    /// Last authenticated position each member said it holds in this node's feed.
+    pub held_through: Vec<(Digest32, u64)>,
+    /// Last authenticated, role-complete position this node holds in each member's feed.
+    pub holds_through: Vec<(Digest32, u64)>,
     /// What this node's person has not read here, oldest first
     /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
     pub unread: Vec<Digest32>,
@@ -711,6 +725,9 @@ pub struct ChannelDetail {
 /// The node's latest-wins view (published over a `watch`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodeView {
+    /// Exact actor-applied Computer policy of these trust rows. Internal publication metadata,
+    /// copied with the rows; never inferred from a separately observed atomic revision.
+    pub(crate) computer_policy: Option<(u64, bool)>,
     /// Display-only last-known anchors of every saved room, separate from dialing authority.
     pub room_anchors: Vec<RoomAnchorView>,
     /// Actual dial observations for anchors this running node uses, not saved provenance.
@@ -1615,7 +1632,7 @@ impl Fault {
             Fault::WrongPassphrase => {
                 "the passphrase is wrong\n       check it and type it again"
             }
-            Fault::ComputerPolicy => "trust comes from computer mode; stop trusting the computer before choosing individual node permissions",
+            Fault::ComputerPolicy => "computer trust changed while this command was being applied\n       review the current policy and retry the command",
             Fault::PassphraseNeeded => {
                 "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       type it, and the change is made: `vox trust` asks for it at a terminal"
             }

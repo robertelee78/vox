@@ -39,6 +39,19 @@ pub(crate) struct LocalHistorySettlement {
 const MAX_OBLIGATIONS: u64 = 4096;
 const STATE_BYTES: usize = 256;
 
+/// Whether a bodyless authenticated source still owes its body to this node's role. Ordinary
+/// content and a package addressed here are owed; a package addressed only to another member is
+/// complete here after its signed header/effect is accepted, and its private body must stay away.
+fn body_owed_to(entry: &Entry, local_id: &Digest32) -> bool {
+    if entry.payload.is_some() {
+        return false;
+    }
+    !entry.skeleton.v2.as_ref().is_some_and(|v2| {
+        v2.kind == crate::log::history::SignedEntryKind::KeyPackage
+            && v2.recipient.is_some_and(|recipient| recipient != *local_id)
+    })
+}
+
 fn expected_entry_wire(header: &Entry) -> Result<usize> {
     let length = usize::try_from(header.skeleton.payload_len)
         .map_err(|_| invalid("history payload length"))?;
@@ -69,6 +82,8 @@ pub(super) struct Roots {
     terminations: u64,
     settled_tips: u64,
     prior_heads: u64,
+    /// One current refused inventory head per `(source peer, author)`.
+    declined_heads: u64,
     author_count: u64,
     obligation_count: u64,
     pub(super) enabled: bool,
@@ -76,7 +91,7 @@ pub(super) struct Roots {
 
 impl Roots {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(20)
+        e.array(21)
             .uint(self.objects)
             .uint(self.authors)
             .uint(self.validated_positions)
@@ -94,15 +109,17 @@ impl Roots {
             .uint(self.terminations)
             .uint(self.settled_tips)
             .uint(self.prior_heads)
+            .uint(self.declined_heads)
             .uint(self.author_count)
             .uint(self.obligation_count)
             .uint(u64::from(self.enabled));
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
-        if d.array()? != 20 {
+        let arity = d.array()?;
+        if !matches!(arity, 20 | 21) {
             return Err(invalid("sparse roots arity"));
         }
-        Ok(Self {
+        let mut result = Self {
             objects: d.uint()?,
             authors: d.uint()?,
             validated_positions: d.uint()?,
@@ -120,10 +137,18 @@ impl Roots {
             terminations: d.uint()?,
             settled_tips: d.uint()?,
             prior_heads: d.uint()?,
-            author_count: d.uint()?,
-            obligation_count: d.uint()?,
-            enabled: flag(d)?,
-        })
+            declined_heads: 0,
+            author_count: 0,
+            obligation_count: 0,
+            enabled: false,
+        };
+        if arity == 21 {
+            result.declined_heads = d.uint()?;
+        }
+        result.author_count = d.uint()?;
+        result.obligation_count = d.uint()?;
+        result.enabled = flag(d)?;
+        Ok(result)
     }
     pub(super) fn valid_for(self, next: u64) -> bool {
         [
@@ -144,6 +169,7 @@ impl Roots {
             self.terminations,
             self.settled_tips,
             self.prior_heads,
+            self.declined_heads,
         ]
         .iter()
         .all(|root| *root < next)
@@ -163,11 +189,14 @@ pub(crate) enum ObjectKind {
     InclusionReceipt = 6,
     PrefixReceipt = 7,
     PendingHeader = 8,
+    // Exact-head proof-serving cache only; never used by acceptance or authored appends.
+    ProofRange = 9,
 }
 impl ObjectKind {
     pub(crate) const fn limit(self) -> usize {
         match self {
             Self::Context => MAX_CONTEXT_BYTES,
+            Self::ProofRange => STATE_BYTES,
             Self::Head | Self::Header | Self::PendingHeader => MAX_HEADER_BYTES,
             Self::Verifier => MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES + 512,
             Self::ParentReceipt | Self::InclusionReceipt | Self::PrefixReceipt => {
@@ -179,6 +208,21 @@ impl ObjectKind {
 fn object_key(kind: ObjectKind, hash: &Digest32) -> Key {
     let mut key = hashed(hash);
     key[32] = kind as u8;
+    key
+}
+fn declined_head_key(peer: &Digest32, author: &Digest32) -> Key {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(peer);
+    key[32..].copy_from_slice(author);
+    key
+}
+fn metadata_decline_key(peer: &Digest32, author: &Digest32) -> Key {
+    let mut bytes = b"vox/own-metadata-refusal/v1".to_vec();
+    bytes.extend_from_slice(peer);
+    bytes.extend_from_slice(author);
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(peer);
+    key[32..].copy_from_slice(&sha256(&bytes));
     key
 }
 fn author_key(author: &Digest32, scope: LogScope) -> Key {
@@ -200,6 +244,43 @@ fn range_key(binding: TreeBinding, start: u64, leaves: u64) -> Result<Key> {
     key[48] = binding.scope as u8;
     Ok(key)
 }
+fn proof_range_key(
+    head: &Digest32,
+    binding: TreeBinding,
+    start: u64,
+    leaves: u64,
+) -> Result<Digest32> {
+    let _ = range_key(binding, start, leaves)?;
+    let mut e = Encoder::new();
+    e.array(5).bytes(b"vox/proof-serving-range/v1").bytes(head);
+    binding.encode(&mut e);
+    e.uint(start).uint(leaves);
+    Ok(sha256(&e.finish()))
+}
+fn decode_proof_range(
+    bytes: &[u8],
+    head: &Digest32,
+    binding: TreeBinding,
+    start: u64,
+    leaves: u64,
+) -> Result<Descriptor> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 5
+        || d.uint()? != 1
+        || d.bytes()? != head
+        || TreeBinding::decode(&mut d)? != binding
+        || d.uint()? != start
+    {
+        return Err(invalid("proof-serving range binding"));
+    }
+    let value = Descriptor::decode(&mut d)?;
+    d.finish()?;
+    if value.leaves != leaves {
+        return Err(invalid("proof-serving range length"));
+    }
+    Ok(value)
+}
+
 fn hash_option(e: &mut Encoder, value: Option<Digest32>) {
     match value {
         Some(hash) => {
@@ -667,6 +748,72 @@ impl Source<'_> {
 }
 
 impl Read<'_> {
+    pub(crate) fn sparse_history_instance(&self) -> [u8; 16] {
+        self.directory.history_instance
+    }
+    /// The exact inventory head this source refused for this author, and the authorization plus
+    /// two membership incarnations that scope that decision. One indexed scalar exists per real
+    /// relationship.
+    pub(crate) fn history_declined_head(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        self.history_declined_in_domain(peer, author, false)
+    }
+    pub(crate) fn history_declined_metadata(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        self.history_declined_in_domain(peer, author, true)
+    }
+    fn history_declined_in_domain(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+        metadata: bool,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        let key = if metadata {
+            metadata_decline_key(peer, author)
+        } else {
+            declined_head_key(peer, author)
+        };
+        let Some(id) = self.source().number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.declined_heads,
+            &key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let bytes = self
+            .source()
+            .sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 7 || d.uint()? != 2 || d.bytes()? != peer || d.bytes()? != author {
+            return Err(invalid("declined history head binding"));
+        }
+        let head = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history head"))?;
+        let authorization = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history authorization generation"))?;
+        let peer_incarnation = d.uint()?;
+        let author_incarnation = d.uint()?;
+        d.finish()?;
+        Ok(Some((
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+        )))
+    }
+
     pub(crate) fn history_settled_tip(&self, author: &Digest32) -> Result<Option<Entry>> {
         let source = self.source();
         let Some(id) = source.number(
@@ -696,6 +843,16 @@ impl Read<'_> {
             self.directory.active.sparse.settled_entries,
             &hashed(hash),
         )? == Some(Value::Present))
+    }
+    /// The last authenticated, semantically complete contiguous position of this author's
+    /// public feed for this node's role. Unlike `settled_tips`, this cannot jump across an
+    /// unfinished predecessor. The hash binds a receipt to the exact accepted position.
+    pub(crate) fn history_held_through(&self, author: &Digest32) -> Option<(u64, Digest32)> {
+        self.directory
+            .restart
+            .as_ref()
+            .and_then(|state| state.feeds.get(author))
+            .map(|feed| (feed.seq, feed.hash))
     }
     pub(crate) fn control_effects_complete(&self, head: &Digest32, through: u64) -> Result<bool> {
         let source = self.source();
@@ -977,6 +1134,23 @@ impl Read<'_> {
             })
             .transpose()
     }
+    /// Head-scoped serving material is deliberately separate from canonical prefix ranges.
+    /// A verified proof may name a signed head whose consistency is still unresolved.
+    pub(crate) fn history_proof_range(
+        &self,
+        head: &Digest32,
+        binding: TreeBinding,
+        start: u64,
+        leaves: u64,
+    ) -> Result<Option<Descriptor>> {
+        if binding.room != *self.channel {
+            return Err(invalid("proof-serving range room"));
+        }
+        let key = proof_range_key(head, binding, start, leaves)?;
+        self.history_object(ObjectKind::ProofRange, &key)?
+            .map(|bytes| decode_proof_range(&bytes, head, binding, start, leaves))
+            .transpose()
+    }
     pub(crate) fn history_range(
         &self,
         binding: TreeBinding,
@@ -1036,6 +1210,154 @@ pub(crate) enum SourceProgress {
 }
 
 impl Write<'_, '_> {
+    /// Read one refusal from this writer's transaction. This is deliberately the same batch
+    /// that checks the authorization nonce and, when needed, replaces the refusal record.
+    pub(crate) fn history_declined_head(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        self.history_declined_in_domain(peer, author, false)
+    }
+    pub(crate) fn history_declined_metadata(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        self.history_declined_in_domain(peer, author, true)
+    }
+    fn history_declined_in_domain(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+        metadata: bool,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        let key = if metadata {
+            metadata_decline_key(peer, author)
+        } else {
+            declined_head_key(peer, author)
+        };
+        let Some(id) = Source::Batch(self.batch).number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.declined_heads,
+            &key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let bytes =
+            Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
+        let mut d = Decoder::new(&bytes);
+        if d.array()? != 7 || d.uint()? != 2 || d.bytes()? != peer || d.bytes()? != author {
+            return Err(invalid("declined history head binding"));
+        }
+        let head = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history head"))?;
+        let authorization = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| invalid("declined history authorization generation"))?;
+        let peer_incarnation = d.uint()?;
+        let author_incarnation = d.uint()?;
+        d.finish()?;
+        Ok(Some((
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+        )))
+    }
+
+    pub(crate) fn keep_history_declined_head(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+        authorization: Digest32,
+        peer_incarnation: u64,
+        author_incarnation: u64,
+    ) -> Result<()> {
+        self.keep_history_declined_in_domain(
+            peer,
+            author,
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+            false,
+        )
+    }
+    pub(crate) fn keep_history_declined_metadata(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+        authorization: Digest32,
+        peer_incarnation: u64,
+        author_incarnation: u64,
+    ) -> Result<()> {
+        self.keep_history_declined_in_domain(
+            peer,
+            author,
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Existing exact refusal tuple plus private domain.
+    fn keep_history_declined_in_domain(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+        authorization: Digest32,
+        peer_incarnation: u64,
+        author_incarnation: u64,
+        metadata: bool,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let key = if metadata {
+            metadata_decline_key(&peer, &author)
+        } else {
+            declined_head_key(&peer, &author)
+        };
+        let root = self.directory.active.sparse.declined_heads;
+        let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
+        let mut e = Encoder::new();
+        e.array(7)
+            .uint(2)
+            .bytes(&peer)
+            .bytes(&author)
+            .bytes(&head)
+            .bytes(&authorization)
+            .uint(peer_incarnation)
+            .uint(author_incarnation);
+        let id = self.save_sparse_record(old, &e.finish(), STATE_BYTES)?;
+        self.directory.active.sparse.declined_heads =
+            self.change_value(root, key, Some(Value::Number(id)))?;
+        Ok(())
+    }
+
+    pub(crate) fn forget_history_declined_head(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let key = declined_head_key(&peer, &author);
+        let root = self.directory.active.sparse.declined_heads;
+        if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
+            self.retire(id)?;
+            self.directory.active.sparse.declined_heads = self.change_value(root, key, None)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn publish_local_history(
         &mut self,
         publication: LocalHistoryPublication<'_>,
@@ -1165,11 +1487,20 @@ impl Write<'_, '_> {
         &mut self,
         entry: &Entry,
         finished: &super::super::sparse_history::FinishedHistoryEffect,
+        local_id: Digest32,
     ) -> Result<()> {
         if finished.entry_hash() != entry.entry_hash() {
             return Err(invalid("sparse effect token differs"));
         }
-        self.finish_history_effect_bookkeeping(entry, None)
+        self.finish_history_effect_bookkeeping(entry, None)?;
+        // A recipient-scoped package is satisfied for every other member by its authenticated
+        // header and completed semantic dispatch. Its private body is neither owed nor fetched.
+        // `entry` is the exact accepted source named by `finished`, so untrusted tag data cannot
+        // clear recovery work. This lands with the effect receipt and survives restart.
+        if !body_owed_to(entry, &local_id) {
+            self.set_missing(&entry.skeleton.author_id, entry.skeleton.seq, false)?;
+        }
+        Ok(())
     }
 
     /// Consume only the opaque token returned by this exact local publication. The caller has
@@ -1691,6 +2022,41 @@ impl Write<'_, '_> {
         self.directory.active.sparse.ranges =
             self.change_value(root, key, Some(Value::Number(id)))?;
         Ok(())
+    }
+    /// Cache only a fully verified proof node or a deterministic reconstruction from
+    /// independently committed canonical sources. This does not change prefix acceptance.
+    pub(crate) fn keep_history_proof_range(
+        &mut self,
+        head: Digest32,
+        binding: TreeBinding,
+        start: u64,
+        descriptor: Descriptor,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        if binding.room != *self.channel {
+            return Err(invalid("proof-serving range room"));
+        }
+        descriptor.validate()?;
+        let key = proof_range_key(&head, binding, start, descriptor.leaves)?;
+        if let Some(id) = Source::Batch(self.batch).number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.objects,
+            &object_key(ObjectKind::ProofRange, &key),
+        )? {
+            let bytes =
+                Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
+            if decode_proof_range(&bytes, &head, binding, start, descriptor.leaves)? != descriptor {
+                return Err(invalid("conflicting proof-serving range"));
+            }
+            return Ok(());
+        }
+        let mut e = Encoder::new();
+        e.array(5).uint(1).bytes(&head);
+        binding.encode(&mut e);
+        e.uint(start);
+        descriptor.encode(&mut e);
+        self.save_history_object(ObjectKind::ProofRange, key, &e.finish())
     }
     fn save_sparse_author(&mut self, binding: TreeBinding, state: AuthorState) -> Result<()> {
         if binding.room != *self.channel {
@@ -2461,12 +2827,15 @@ impl EntryRead for HeaderRead<'_, '_> {
 }
 
 impl Write<'_, '_> {
-    /// At most one actually held, semantically settled next position. There is no scan,
-    /// guessed prefix, or promotion to the signed head's leaf count.
+    /// Advance through at most one live-window page of actually held, semantically settled
+    /// successors. There is no unbounded scan, guessed prefix, or promotion to a signed head's
+    /// leaf count. Closing a formerly missing position can therefore carry already-settled later
+    /// positions forward in this same bounded event instead of waiting for a timer or new peer.
     pub(crate) fn advance_sparse_contiguous(
         &mut self,
         author: &Digest32,
-    ) -> Result<Option<crate::log::dag::PublishedFeed>> {
+        local_id: &Digest32,
+    ) -> Result<ContiguousAdvance> {
         self.require_sparse_idle()?;
         let restart = self
             .directory
@@ -2474,56 +2843,84 @@ impl Write<'_, '_> {
             .as_ref()
             .ok_or(invalid("sparse restart state absent"))?;
         let mut state = restart.feeds.get(author).cloned().unwrap_or_default();
-        if state.ended {
-            return Ok(None);
+        let mut advanced = 0usize;
+        for _ in 0..crate::log::history::MAX_PAGE_ENTRIES {
+            if state.ended {
+                break;
+            }
+            let next = state
+                .seq
+                .checked_add(1)
+                .ok_or(invalid("contiguous sequence overflow"))?;
+            let headers = HeaderRead {
+                source: Source::Batch(self.batch),
+                sek: self.sek,
+                room: self.channel,
+                roots: self.directory.active,
+            };
+            let Some(entry) = headers.get(author, next)? else {
+                break;
+            };
+            if headers.source.find_value(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.settled_entries,
+                &hashed(&entry.entry_hash()),
+            )? != Some(Value::Present)
+            {
+                break;
+            }
+            // Effect completion alone is not receipt of a body this role is entitled to.
+            // Conversely, another member's private key-package body is deliberately absent and
+            // cannot hold the public feed prefix back.
+            if headers.source.find_value(
+                self.sek,
+                self.channel,
+                self.directory.active.missing_positions,
+                &position(author, next),
+            )? == Some(Value::Present)
+                && body_owed_to(&entry, local_id)
+            {
+                break;
+            }
+            let feed = if state.seq == 0 {
+                crate::log::feed::Feed::default()
+            } else {
+                crate::log::feed::Feed::restore_published(
+                    *author,
+                    state.seq,
+                    state.hash,
+                    state.first_claimed_ms,
+                    state.ended,
+                )?
+            };
+            feed.validate_next(&headers, &entry)
+                .map_err(|error| match error {
+                    crate::log::feed::FeedError::Invalid(error)
+                    | crate::log::feed::FeedError::Local(error) => error,
+                })?;
+            restart::advance(&mut state, &entry)?;
+            self.directory
+                .restart
+                .as_mut()
+                .ok_or(invalid("sparse restart state vanished"))?
+                .feeds
+                .insert(*author, state.clone());
+            advanced += 1;
         }
-        let next = state
-            .seq
-            .checked_add(1)
-            .ok_or(invalid("contiguous sequence overflow"))?;
-        let headers = HeaderRead {
-            source: Source::Batch(self.batch),
-            sek: self.sek,
-            room: self.channel,
-            roots: self.directory.active,
-        };
-        let Some(entry) = headers.get(author, next)? else {
-            return Ok(None);
-        };
-        if headers.source.find_value(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.settled_entries,
-            &hashed(&entry.entry_hash()),
-        )? != Some(Value::Present)
-        {
-            return Ok(None);
-        }
-        let feed = if state.seq == 0 {
-            crate::log::feed::Feed::default()
-        } else {
-            crate::log::feed::Feed::restore_published(
-                *author,
-                state.seq,
-                state.hash,
-                state.first_claimed_ms,
-                state.ended,
-            )?
-        };
-        feed.validate_next(&headers, &entry)
-            .map_err(|error| match error {
-                crate::log::feed::FeedError::Invalid(error)
-                | crate::log::feed::FeedError::Local(error) => error,
-            })?;
-        restart::advance(&mut state, &entry)?;
-        self.directory
-            .restart
-            .as_mut()
-            .ok_or(invalid("sparse restart state vanished"))?
-            .feeds
-            .insert(*author, state.clone());
-        Ok(Some(state))
+        Ok(ContiguousAdvance {
+            state: (advanced != 0).then_some(state.clone()),
+            // This is deliberately conservative: an exact full page schedules one bounded
+            // successor turn. That turn either advances another page or observes the first
+            // real hole and parks. No timer or unrelated peer event is needed for continuation.
+            more: advanced == crate::log::history::MAX_PAGE_ENTRIES && !state.ended,
+        })
     }
+}
+
+pub(crate) struct ContiguousAdvance {
+    pub(crate) state: Option<crate::log::dag::PublishedFeed>,
+    pub(crate) more: bool,
 }
 
 impl crate::log::history::ContextSource for Read<'_> {

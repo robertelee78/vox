@@ -8,8 +8,9 @@
 //! Asserted, over the help of **every** subcommand (walked from `vox --help`, as clap lists them),
 //! over what a running node says to `vox status`, `vox status --json`, a room it does not hold,
 //! `vox room link` and `vox serve`, and over every screen of `vox tui` on that node (its room
-//! list, a room, its members, `:link`, its tunnels, the `:new` and `:join` prompts and an unknown
-//! command's answer, read off a real terminal):
+//! list, a room, the exact authenticated entry shown by `:rename`, its members, `:link`, its
+//! tunnels, the `:new` and `:join` prompts and an unknown command's answer, read off a real
+//! terminal):
 //! - no "profile" (the node's old name);
 //! - no "channel" and no "consent": a person has rooms, and trusts a member (#406);
 //! - no "invite": a room has a room link, which `vox room link` prints; `vox room invite` is
@@ -251,12 +252,17 @@ impl Tui {
 }
 
 /// Every screen of `vox tui` on the attached node, `(screen, text)`, as a person reaches them.
-fn tui_screens(data: &Path) -> Vec<(String, String)> {
+fn tui_screens(data: &Path, room: &str) -> Vec<(String, String)> {
     let mut tui = Tui::spawn(data);
     let mut screens = Vec::new();
-    let steps: [(&str, &str, &str); 10] = [
+    let steps: [(&str, &str, &str); 11] = [
         ("the room list", "", "words"),
         ("a room", "\r", "Timeline"),
+        (
+            "a same-name rename's exact entry",
+            ":rename words\r",
+            "room renamed · entry ",
+        ),
         ("its members", "\t\t", "Members [focus]"),
         (":link", ":link\r", "room link"),
         ("an unknown command", ":nosuch\r", "unknown command"),
@@ -269,6 +275,28 @@ fn tui_screens(data: &Path) -> Vec<(String, String)> {
     for (name, keys, want) in steps {
         screens.push((format!("vox tui: {name}"), tui.after(keys, want)));
     }
+    let rename_screen = &screens[2].1;
+    let rename_entry = rename_screen
+        .split("room renamed · entry ")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: `vox tui` said the room was renamed without showing the exact appended \
+                 entry: {rename_screen}"
+            )
+        });
+    vox_core::node::link::b32_decode(rename_entry, "TUI rename entry").unwrap_or_else(|error| {
+        panic!("PRODUCT: `vox tui` showed a malformed rename entry ({error}): {rename_entry}")
+    });
+    let (ok, hashes) = vox(data, &["room", "read", room, "--hashes"]);
+    assert!(
+        ok && hashes
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(rename_entry)),
+        "PRODUCT: `vox tui` reported rename entry {rename_entry}, but the shipped room order did \
+         not contain that exact authenticated action: {hashes}"
+    );
     screens
 }
 
@@ -391,7 +419,7 @@ fn help_and_messages_name_the_node_and_no_design_document() {
         "PRODUCT: `vox room invite` must be refused as an unknown command, not run: ok {ok}: {said}"
     );
     said_by_node.push(("vox serve web=9".into(), serve_says(tmp.path())));
-    let screens = tui_screens(tmp.path());
+    let screens = tui_screens(tmp.path(), &room);
     let _ = vox(tmp.path(), &["node", "detach", "a"]);
 
     // No command keeps contacts, a directory or a one-to-one path (E-3).

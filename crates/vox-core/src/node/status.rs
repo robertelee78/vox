@@ -44,7 +44,7 @@
 //! `"tunnels"` lists every live tunnel (V210-81): the member, the service, which way it was
 //! opened, and when it was opened and last moved a byte.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -63,6 +63,15 @@ use crate::transport::router::DatagramStats;
 
 /// A room with other members and no completed sync for this long is flagged.
 pub const STALE_SYNC_MS: u64 = 10 * 60 * 1_000;
+
+/// The stale threshold in the unit a person reads: minutes, or seconds under a minute.
+fn stale_words(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{} minutes", ms / 60_000)
+    } else {
+        format!("{} seconds", ms.div_ceil(1_000))
+    }
+}
 
 /// An anchor this node keeps and has not reached for this long is flagged (PRD-001 R37). Long
 /// enough that an anchor restarting, which members are back from within seconds (V210-86), never
@@ -102,6 +111,13 @@ pub struct MemberStatus {
     /// What is said of it about this identity's key in this room, after its name, if anything
     /// (ADR-030 D-5, W-4): that the key waits, and why, or that it runs an older Vox.
     pub key_waits: Option<String>,
+    /// Last authenticated position this member said it holds in this node's room feed.
+    pub held_through: Option<u64>,
+    /// Last authenticated, role-complete position this node holds in this member's room feed.
+    pub holds_through: Option<u64>,
+    /// Whether this member is still owed, or is actively being sent, any generation of this
+    /// node's sender key in this room.
+    pub key_delivery_pending: bool,
 }
 
 /// One room that is still preparing: not open, not closed, and saying what it waits for.
@@ -142,6 +158,12 @@ pub struct RoomStatus {
     /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
     /// receiving side: a generation read to the end is deleted).
     pub received_key_generations: usize,
+    /// Whether this room still owes a bounded retained key-package processing turn.
+    pub key_packages_pending: bool,
+    /// Revision of the room's checked governance projection.
+    pub governance_revision: u64,
+    /// Whether retained ciphertext still has bounded rendering work queued.
+    pub render_backfill_pending: bool,
     /// Authors this node froze here for signing two entries at one position (ADR-008).
     pub frozen: Vec<Digest32>,
     /// Entries this node refused here as at or below their author's checkpoint since it opened
@@ -156,6 +178,8 @@ pub struct RoomStatus {
     /// and what no person is shown, such as read records (ADR-028 §6). What the room costs this
     /// node in storage and every sync in traffic, which a count of rows does not say.
     pub log_entries: u64,
+    /// Last contiguous authenticated position in this node's own room feed.
+    pub own_feed_through: u64,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -255,6 +279,9 @@ impl GatewayFamily {
 /// Everything `vox status` shows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatusReport {
+    /// Why the sync lanes stand as they do, pre-rendered JSON (ADR-038 FX-16): slots, budget
+    /// lanes, the bounded lane's flow slots, the history request and each port's last start.
+    pub lanes: String,
     /// The account daemon's bounded diagnostic log (ADR-034 LG-3).
     pub log_path: String,
     /// When this was taken, unix milliseconds.
@@ -270,6 +297,9 @@ pub struct StatusReport {
     pub identity: Option<Digest32>,
     /// Whether it is on the network.
     pub networked: bool,
+    /// Whether the actor has bounded governance maintenance queued. A room's displayed
+    /// projection remains the last complete one while this is true.
+    pub governance_pending: bool,
     /// When the machine's network last changed, unix milliseconds, and the change in one line
     /// (ADR-012 N-52); `None` if it has not since the daemon started.
     pub network_changed: Option<(u64, String)>,
@@ -331,9 +361,14 @@ fn short(d: &Digest32) -> String {
     b32_encode(d).chars().take(12).collect()
 }
 
+const RETAINED_POOL_HEALTH: &str = "retained continuation is waiting for the flow-state pool";
+
 impl StatusReport {
-    /// Work out the unhealthy lines from the rest of the report.
-    pub fn diagnose(&mut self) {
+    /// Work out the unhealthy lines from the rest of the report. `retained_pool_rooms` comes
+    /// from the actor's exact retained Flow ownership, not from elapsed time or a full-pool
+    /// guess: a room is attributed to the flow-state pool if and only if it owns one of those
+    /// continuations.
+    pub fn diagnose(&mut self, retained_pool_rooms: &BTreeSet<Digest32>) {
         let mut out = Vec::new();
         for room in &self.rooms {
             let others = room.members.iter().filter(|m| !m.me).count();
@@ -345,15 +380,26 @@ impl StatusReport {
             // having synced in its first seconds, and would otherwise alarm on every start.
             let since = room.last_sync.unwrap_or(self.started);
             let stale = self.now.saturating_sub(since) > STALE_SYNC_MS;
+            let retained_by_pool = retained_pool_rooms.contains(&room.id);
+            let retained_cause = retained_by_pool.then_some(RETAINED_POOL_HEALTH);
             if stale {
                 out.push(Unhealthy {
                     key: format!("room-stale:{}", b32_encode(&room.id)),
                     message: format!(
-                        "room {} ({}): no completed sync in {} minutes",
+                        "room {} ({}): no completed sync in {}{}",
                         short(&room.id),
                         room.name,
-                        STALE_SYNC_MS / 60_000
+                        stale_words(STALE_SYNC_MS),
+                        retained_cause.map_or_else(String::new, |cause| format!("; {cause}"))
                     ),
+                });
+            } else if let Some(cause) = retained_cause {
+                // A retained continuation is an invariant-pressure condition worth showing now;
+                // waiting ten minutes would hide the product-owned cause that can already be
+                // named exactly. The stale form above uses the same per-room ownership predicate.
+                out.push(Unhealthy {
+                    key: format!("room-flow-state-pool:{}", b32_encode(&room.id)),
+                    message: format!("room {} ({}): {cause}", short(&room.id), room.name),
                 });
             }
             for m in &room.members {
@@ -422,6 +468,7 @@ impl StatusReport {
             self.identity.map_or("null".into(), |d| q(&b32_encode(&d)))
         );
         let _ = write!(j, "\"networked\":{},", self.networked);
+        let _ = write!(j, "\"governance_pending\":{},", self.governance_pending);
         let _ = write!(
             j,
             "\"keyring_open_secs\":{},",
@@ -455,19 +502,22 @@ impl StatusReport {
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{},\"key_waits\":{},\"held_through\":{},\"holds_through\":{},\"key_delivery_pending\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
                     m.connected,
                     opt(m.last_seen),
                     opt(m.last_sync),
-                    m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q)
+                    m.key_waits.as_deref().map_or_else(|| "null".to_owned(), q),
+                    opt(m.held_through),
+                    opt(m.holds_through),
+                    m.key_delivery_pending
                 )
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"step_retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"key_packages_pending\":{},\"governance_revision\":{},\"render_backfill_pending\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"log_entries\":{},\"own_feed_through\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
@@ -476,10 +526,14 @@ impl StatusReport {
                 r.step_retention,
                 r.key_generations,
                 r.received_key_generations,
+                r.key_packages_pending,
+                r.governance_revision,
+                r.render_backfill_pending,
                 frozen,
                 r.refused_below_checkpoint,
                 r.entries,
                 r.log_entries,
+                r.own_feed_through,
                 list(members)
             )
         });
@@ -576,6 +630,15 @@ impl StatusReport {
                 a.reached,
                 opt(a.unreached_since)
             )))
+        );
+        let _ = write!(
+            j,
+            "\"lanes\":{},",
+            if self.lanes.is_empty() {
+                "{}"
+            } else {
+                self.lanes.as_str()
+            }
         );
         let _ = write!(
             j,
@@ -1045,7 +1108,135 @@ impl BackoffKind {
     }
 }
 
+/// Why a sync round ran (ADR-038 FX-15, #996): the need `vox status` names for each completed
+/// round of a lane, so a round with no need a person can read is seen as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundReason {
+    /// This node offered its own head to the peer for acknowledgement (the settlement tick).
+    Offer,
+    /// A head the peer told this node of, and this node fetched: its inventory, or a third
+    /// party's head it named; the follow-ups such a fetch needs count here too.
+    Hint,
+    /// This node appended in the room and owed the peer the announcement (ADR-037 R7).
+    Announce,
+    /// The periodic request (ADR-025 D7), with nothing else pending on the port.
+    Periodic,
+    /// A reader's history page this node asked the peer for (`vox room read --history older`).
+    Page,
+    /// Another request raised on the port: the join, a new connection, the room's generation
+    /// advancing, `vox room sync`, a continuation re-raised.
+    Request,
+    /// A request the peer made that this node answered: the peer's round, not this node's.
+    Served,
+}
+
+impl RoundReason {
+    /// The name `vox status --json` prints.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Offer => "offer",
+            Self::Hint => "hint",
+            Self::Announce => "announce",
+            Self::Periodic => "periodic",
+            Self::Page => "page",
+            Self::Request => "request",
+            Self::Served => "served",
+        }
+    }
+}
+
+/// How many of a lane's completed rounds ran for each [`RoundReason`]; they add up to
+/// `completed`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoundReasons {
+    /// Own-head offers.
+    pub offer: u64,
+    /// The peer's hints.
+    pub hint: u64,
+    /// Own appends announced.
+    pub announce: u64,
+    /// Periodic requests.
+    pub periodic: u64,
+    /// A reader's pages.
+    pub page: u64,
+    /// Other requests.
+    pub request: u64,
+    /// The peer's requests this node answered.
+    pub served: u64,
+}
+
+impl RoundReasons {
+    /// Count one completed round that ran for `reason`.
+    pub fn count(&mut self, reason: RoundReason) {
+        let slot = match reason {
+            RoundReason::Offer => &mut self.offer,
+            RoundReason::Hint => &mut self.hint,
+            RoundReason::Announce => &mut self.announce,
+            RoundReason::Periodic => &mut self.periodic,
+            RoundReason::Page => &mut self.page,
+            RoundReason::Request => &mut self.request,
+            RoundReason::Served => &mut self.served,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// The JSON object `vox status --json` prints for `reasons`.
+    #[must_use]
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"offer\":{},\"hint\":{},\"announce\":{},\"periodic\":{},\"page\":{},\
+             \"request\":{},\"served\":{}}}",
+            self.offer,
+            self.hint,
+            self.announce,
+            self.periodic,
+            self.page,
+            self.request,
+            self.served
+        )
+    }
+}
+
 /// One `(room, peer)`'s counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoryRefusalStatus {
+    pub(crate) peer: Digest32,
+    pub(crate) author: Digest32,
+    pub(crate) head: Digest32,
+    pub(crate) request: [u8; 16],
+    pub(crate) captured_generation: Digest32,
+    pub(crate) current_generation: Digest32,
+    pub(crate) remembered: bool,
+}
+
+fn request_text(request: &[u8; 16]) -> String {
+    let mut text = String::with_capacity(request.len() * 2);
+    for byte in request {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn history_refusal_json(refusal: Option<&HistoryRefusalStatus>) -> String {
+    refusal.map_or_else(
+        || "null".to_owned(),
+        |refusal| {
+            format!(
+                "{{\"peer\":\"{}\",\"author\":\"{}\",\"head\":\"{}\",\"request\":\"{}\",\"captured_generation\":\"{}\",\"current_generation\":\"{}\",\"remembered\":{}}}",
+                b32_encode(&refusal.peer),
+                b32_encode(&refusal.author),
+                b32_encode(&refusal.head),
+                request_text(&refusal.request),
+                b32_encode(&refusal.captured_generation),
+                b32_encode(&refusal.current_generation),
+                refusal.remembered,
+            )
+        },
+    )
+}
+
+/// One `(room, peer)`'s counters and exact current diagnostic facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortCounters {
     /// Outbound sessions this node opened.
@@ -1056,6 +1247,41 @@ pub struct PortCounters {
     pub busy_refused: u64,
     /// Sessions (either direction) that completed with every requested entry received.
     pub completed: u64,
+    /// Why each of them ran (ADR-038 FX-15, #996): one count per `completed`.
+    pub reasons: RoundReasons,
+    /// Completed rounds, in either direction, that moved nothing: a round this node ran that
+    /// fetched no head, header, context, proof, body or hint it lacked, or a round it served
+    /// whose inventory exchange added no hint and that asked for no object (ADR-038 FX-29). In
+    /// a quiet room every round is one; a lane whose `completed` climbs faster than its
+    /// `empty` is pulling or serving something.
+    pub empty: u64,
+    /// Completed outbound bounded-history rounds on which this node was the requester.
+    pub fetched_completed: u64,
+    /// Completed outbound bounded-history rounds that fetched nothing.
+    pub fetched_empty: u64,
+    /// Completed inbound bounded-history rounds on which this node was the server.
+    pub served_completed: u64,
+    /// Completed inbound bounded-history rounds that served nothing and accepted no new hint.
+    pub served_empty: u64,
+    /// Worker turns that committed or accepted at least one history item this node did not
+    /// already hold. Counted at the commit edge even if the enclosing attempt is later stale,
+    /// cancelled, superseded or failed, so zero means no durable fetched-side work occurred.
+    pub history_fetched: u64,
+    /// Bounded-history rounds in which this node actually sent at least one history object or
+    /// newly accepted a peer inventory hint, including a round that later ended partial, failed,
+    /// or stale.
+    pub history_served: u64,
+    /// New exact advertised-head decisions durably remembered after this peer could not serve
+    /// an unavailable newest body. Repeating an unchanged standing refusal does not increment it.
+    pub history_declined: u64,
+    /// Scalar history hints this lane accepted as newly eligible work.
+    pub history_offered: u64,
+    /// Exact durable refusal relationships invalidated by changed relevant inventory.
+    pub history_rearmed: u64,
+    /// Exact last transaction fenced because its flow carried an older authorization.
+    pub(crate) history_refusal_stale: Option<HistoryRefusalStatus>,
+    /// Exact last refusal transaction accepted under its captured authorization.
+    pub(crate) history_refusal_saved: Option<HistoryRefusalStatus>,
     /// Sessions that ended without error but left requested entries unreceived (a bounded serve).
     pub partial: u64,
     /// Sessions that failed.
@@ -1500,8 +1726,12 @@ impl SyncBook {
             let _ = write!(
                 s,
                 "{{\"room\":\"{}\",\"peer\":\"{}\",\"opened\":{},\"admitted\":{},\"busy_refused\":{},\
-                 \"completed\":{},\"partial\":{},\"failed\":{},\"last_failure\":{},\"stale\":{},\
-                 \"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
+                 \"completed\":{},\"reasons\":{},\"empty\":{},\"fetched_completed\":{},\"fetched_empty\":{},\
+                 \"served_completed\":{},\"served_empty\":{},\"history_fetched\":{},\"history_served\":{},\
+                 \"history_declined\":{},\"history_offered\":{},\"history_rearmed\":{},\
+                 \"history_refusal_stale\":{},\"history_refusal_saved\":{},\
+                 \"partial\":{},\"failed\":{},\"last_failure\":{},\
+                 \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
                  \"running\":[{}]}}",
                 b32_encode(room),
                 b32_encode(peer),
@@ -1509,6 +1739,19 @@ impl SyncBook {
                 c.admitted,
                 c.busy_refused,
                 c.completed,
+                c.reasons.json(),
+                c.empty,
+                c.fetched_completed,
+                c.fetched_empty,
+                c.served_completed,
+                c.served_empty,
+                c.history_fetched,
+                c.history_served,
+                c.history_declined,
+                c.history_offered,
+                c.history_rearmed,
+                history_refusal_json(c.history_refusal_stale.as_ref()),
+                history_refusal_json(c.history_refusal_saved.as_ref()),
                 c.partial,
                 c.failed,
                 c.last_failure

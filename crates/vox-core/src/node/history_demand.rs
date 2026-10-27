@@ -54,6 +54,7 @@ pub struct Context {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
     Archive,
+    OwnRecovery,
     Live,
     Control,
 }
@@ -91,6 +92,16 @@ impl Context {
             Purpose::History => return Err(invalid("archive requires explicit local demand")),
         };
         Self::with_slot(profile, slot, secret_work)
+    }
+    /// Local durable own-feed recovery only; no public command or network request mints it.
+    pub(crate) fn own_recovery_unlocked(
+        profile: &Profile,
+        room: Digest32,
+        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Self> {
+        let mut context = Self::with_slot(profile, Slot::OwnRecovery, secret_work)?;
+        context.scope = own_recovery_scope(context.node, room);
+        Ok(context)
     }
     fn with_slot(
         profile: &Profile,
@@ -192,7 +203,7 @@ pub struct Body {
     pub header: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cursor {
     pub query_kind: u8,
@@ -411,9 +422,154 @@ fn bad() -> Error {
     Error::MalformedAtRest("history demand state")
 }
 fn charge(job: &Job, bytes: usize) -> Result<BufferCharge> {
-    job.reserve(bytes)
-        .ok_or_else(|| invalid("history demand buffer budget is busy"))
+    job.reserve_or_pressure(bytes)
 }
+
+/// The exact demand-state working envelope prepaid with a staged record. Semantic application
+/// borrows this proof after it has begun; it never performs another fallible byte reservation.
+pub(crate) struct AdmissionCharge {
+    _charge: BufferCharge,
+}
+
+/// Exact durable terminal state returned to the one accepted local Cancel owner.
+pub(crate) enum LocalCancelOutcome {
+    NewlyCancelled(Box<CommittedCancel>),
+    AlreadyCancelled(Box<CommittedCancel>),
+    AlreadyComplete,
+}
+
+/// Capability to reclaim only the exact request whose Cancelled fence is already durable.
+pub(crate) struct CommittedCancel {
+    node: Digest32,
+    scope: Digest32,
+    request: RequestId,
+    binding: Binding,
+}
+
+pub(crate) enum CommittedReclaim {
+    More,
+    Complete,
+    Superseded,
+}
+
+impl AdmissionCharge {
+    pub(crate) fn reserve(job: &Job) -> Result<Self> {
+        charge(job, STATE_WORK).map(|charge| Self { _charge: charge })
+    }
+    /// Peak while reconstructing a staged body: one page's temporary state/page buffers and,
+    /// when it shares the record's lane, the original demand Snapshot are simultaneously live.
+    pub(crate) fn reconstruction_peak(record: usize, shared_snapshot: bool) -> Result<usize> {
+        record
+            .checked_add(STATE_WORK + PAGE_WORK)
+            .and_then(|bytes| bytes.checked_add(if shared_snapshot { STATE_WORK } else { 0 }))
+            .ok_or(Error::SizeLimitExceeded("history reconstruction envelope"))
+    }
+
+    pub(crate) fn total(record: usize) -> Result<usize> {
+        record
+            .checked_add(STATE_WORK)
+            .ok_or(Error::SizeLimitExceeded("history completion envelope"))
+    }
+
+    pub(crate) fn split_from(combined: &mut BufferCharge) -> Result<Self> {
+        let charge = combined
+            .split_off(STATE_WORK)
+            .ok_or(Error::SizeLimitExceeded("history completion envelope"))?;
+        Ok(Self { _charge: charge })
+    }
+}
+
+/// Complete bounded preparation for one accepted Resume. The private branch can retain both
+/// its original and refreshed Snapshot; public/legacy preparation does not reserve that credit.
+/// Activation and an immediate pause are sequential and borrow the same mutation credit.
+pub(crate) struct ResumeAdmission {
+    _scratch: BufferCharge,
+    inspect: Option<AdmissionCharge>,
+    mutation: AdmissionCharge,
+    followup: Option<AdmissionCharge>,
+}
+
+impl ResumeAdmission {
+    pub(crate) fn reserve(job: &Job, scratch: usize, private: bool) -> Result<Self> {
+        let peak = STATE_WORK
+            .checked_mul(if private { 3 } else { 2 })
+            .and_then(|state| scratch.checked_add(state))
+            .ok_or(Error::SizeLimitExceeded(
+                "history resume preparation envelope",
+            ))?;
+        let mut combined = charge(job, peak)?;
+        let inspect = AdmissionCharge::split_from(&mut combined)?;
+        let mutation = AdmissionCharge::split_from(&mut combined)?;
+        let followup = private
+            .then(|| AdmissionCharge::split_from(&mut combined))
+            .transpose()?;
+        Ok(Self {
+            _scratch: combined,
+            inspect: Some(inspect),
+            mutation,
+            followup,
+        })
+    }
+
+    pub(crate) fn inspect(&mut self, context: &Context) -> Result<Option<Snapshot>> {
+        let credit = self
+            .inspect
+            .take()
+            .ok_or_else(|| invalid("history resume inspection credit"))?;
+        inspect_precharged(context, credit)
+    }
+
+    pub(crate) fn mutation(&self) -> &AdmissionCharge {
+        &self.mutation
+    }
+
+    pub(crate) fn take_followup(&mut self) -> Result<AdmissionCharge> {
+        self.followup
+            .take()
+            .ok_or_else(|| invalid("history resume follow-up credit"))
+    }
+
+    pub(crate) fn is_private(&self) -> bool {
+        self.followup.is_some()
+    }
+}
+
+/// Complete memory admission for one local Status or Cancel. The actor obtains this before it
+/// accepts the action; the worker then consumes these exact credits without another reservation.
+pub(crate) struct LocalAdmission {
+    inspect: AdmissionCharge,
+    mutation: Option<AdmissionCharge>,
+}
+
+impl LocalAdmission {
+    pub(crate) fn status(job: &Job) -> Result<Self> {
+        Ok(Self {
+            inspect: AdmissionCharge::reserve(job)?,
+            mutation: None,
+        })
+    }
+
+    pub(crate) fn cancel(job: &Job) -> Result<Self> {
+        let peak = STATE_WORK
+            .checked_mul(2)
+            .ok_or(Error::SizeLimitExceeded("local history operation envelope"))?;
+        let mut combined = charge(job, peak)?;
+        let inspect = AdmissionCharge::split_from(&mut combined)?;
+        Ok(Self {
+            inspect,
+            mutation: Some(AdmissionCharge { _charge: combined }),
+        })
+    }
+
+    pub(crate) fn inspect(
+        self,
+        context: &Context,
+    ) -> Result<(Option<Snapshot>, Option<AdmissionCharge>)> {
+        let snapshot = inspect_precharged(context, self.inspect)?;
+        Ok((snapshot, self.mutation))
+    }
+}
+
 fn key(context: &Context) -> Result<&Sek> {
     context.check()?;
     Ok(&context.key)
@@ -428,8 +584,26 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
         Slot::Archive => 0,
         Slot::Live => 1,
         Slot::Control => 2,
+        Slot::OwnRecovery => 3,
     });
     sha256(&bytes)
+}
+
+fn own_recovery_scope(node: Digest32, room: Digest32) -> Digest32 {
+    let mut bytes = b"vox/history-demand-own-recovery-scope/v1".to_vec();
+    bytes.extend_from_slice(&node);
+    bytes.extend_from_slice(&room);
+    sha256(&bytes)
+}
+
+/// Room retirement deletes derived staging in the same lifecycle transaction.
+pub(crate) fn purge_own_recovery_in(
+    batch: &mut Batch<'_>,
+    node: Digest32,
+    room: Digest32,
+) -> Result<()> {
+    batch.purge_channel(&own_recovery_scope(node, room))?;
+    Ok(())
 }
 
 type RetainedLegacyOwner = (Digest32, RequestId, [u8; 16], Digest32);
@@ -556,7 +730,14 @@ fn next_serial(serial: u64) -> Result<u64> {
 
 /// Local status/cache inspection only; does not create an Active handle or request peer work.
 pub fn inspect(context: &Context, job: &Job) -> Result<Option<Snapshot>> {
-    let charge = charge(job, STATE_WORK)?;
+    inspect_precharged(context, AdmissionCharge::reserve(job)?)
+}
+
+pub(crate) fn inspect_precharged(
+    context: &Context,
+    admission: AdmissionCharge,
+) -> Result<Option<Snapshot>> {
+    let charge = admission._charge;
     let key = key(context)?;
     let scope = scope(context);
     context
@@ -669,14 +850,15 @@ fn start_plan(
     })
 }
 
-/// The caller supplies freshly rechecked authority. Bounds and remaining count come only from disk.
-pub fn resume(
+/// The caller prepaid this mutation and supplies freshly rechecked authority. Bounds and
+/// remaining count come only from disk. Precommit authorization/cancellation checks remain;
+/// postcommit observer cancellation cannot replace a successful activation with failure.
+pub(crate) fn resume_precharged(
     context: &Context,
     request: RequestId,
     binding: Binding,
-    job: &Job,
+    _admission: &AdmissionCharge,
 ) -> Result<Active> {
-    let _charge = charge(job, STATE_WORK)?;
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
@@ -693,9 +875,72 @@ pub fn resume(
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Pending;
     put(&mut batch, key, &scope, &state)?;
-    commit_context(batch, context)?;
+    // A successful activation is a durable fact even if observer cancellation arrives just
+    // after commit. Dispatch still requires the actor's fresh authority/lifecycle checks.
+    context.check()?;
+    batch.commit()?;
     Ok(Active {
         node: context.fingerprint(),
+        scope,
+        request,
+        serial: state.serial,
+        valid: true,
+        binding,
+        cancellation: context.cancellation(),
+    })
+}
+
+/// Reconstruct deletion ownership after a crash, never a live admission capability.
+pub(crate) fn own_recovery_cleanup(context: &Context, state: &State) -> Result<Active> {
+    if context.slot != Slot::OwnRecovery || state.scope != context.scope {
+        return Err(invalid("own recovery cleanup binding"));
+    }
+    Ok(Active {
+        node: context.node,
+        scope: context.scope,
+        request: state.request,
+        serial: state.serial,
+        valid: false,
+        binding: state.binding,
+        cancellation: context.cancellation(),
+    })
+}
+
+/// Automatic recovery rechecks current authority in this Batch while preserving its original
+/// signed interval and body cursor. A trust nonce change is not permission to replace the page.
+pub(crate) fn resume_own_recovery(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    job: &Job,
+) -> Result<Active> {
+    if context.slot != Slot::OwnRecovery {
+        return Err(invalid("own recovery context required"));
+    }
+    let _charge = charge(job, STATE_WORK)?;
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
+    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no own recovery"))?;
+    if state.request != request
+        || state.binding.room != binding.room
+        || state.binding.instance != binding.instance
+        || state.binding.epoch != binding.epoch
+        || state.binding.audience != binding.audience
+        || state.progress.terminal()
+        || state.cleanup.is_some()
+    {
+        return Err(invalid("own recovery lifetime changed"));
+    }
+    state.binding = binding;
+    state.serial = next_serial(state.serial)?;
+    state.progress = Progress::Pending;
+    put(&mut batch, key, &scope, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(Active {
+        node: context.node,
         scope,
         request,
         serial: state.serial,
@@ -796,6 +1041,7 @@ fn held_in_page(offset: u64, page: u64) -> usize {
 
 /// Commit at most two coalesced storage pages plus the exact offset before returning ACK credit.
 /// A duplicate chunk is idempotent only when every byte matches; its end was already persisted.
+/// Return the persisted offset and completion from this same checked state, without a second read.
 pub fn append(
     context: &Context,
     active: &mut Active,
@@ -803,7 +1049,7 @@ pub fn append(
     offset: u64,
     bytes: &[u8],
     job: &Job,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     let _charge = charge(job, STATE_WORK + 2 * PAGE_WORK)?;
     if bytes.is_empty() || bytes.len() > MAX_CHUNK_BYTES {
         return Err(invalid("history chunk bounds"));
@@ -862,13 +1108,14 @@ pub fn append(
     }
     if duplicate {
         context.check()?;
-        return Ok(end);
+        return Ok((end, body.offset == body.length));
     }
     body.offset = end;
+    let complete = body.offset == body.length;
     state.cursor = None;
     put(&mut batch, key, &scope, &state)?;
     commit(batch, active, context)?;
-    Ok(end)
+    Ok((end, complete))
 }
 
 fn read_bound(
@@ -942,14 +1189,13 @@ fn schedule_cleanup(state: &mut State) {
 /// Call only after complete hash/signature/governance admission, in that SAME accepted-entry Batch.
 /// This adds one row, so the caller must reserve one row in its <=64-row publication slice.
 /// Commit failure must poison the enclosing admission; no ACK/progress is claimed on that failure.
-pub fn entry_admitted(
+pub(crate) fn entry_admitted(
     batch: &mut Batch<'_>,
     context: &Context,
     active: &Active,
     entry: Digest32,
-    job: &Job,
+    _admission: &AdmissionCharge,
 ) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
     let key = key(context)?;
     let scope = scope(context);
     let mut state = live(batch, key, &scope, context, active)?;
@@ -964,6 +1210,85 @@ pub fn entry_admitted(
     put(batch, key, &scope, &state)
 }
 
+/// Commit one bodyless, authenticated entry that is complete for this node's recipient role.
+/// The caller invokes this only from the exact entry's semantic-effect transaction, after its
+/// inclusion proof and typed dispatch have succeeded. Unlike body staging, this both advances
+/// the archive count and moves the cursor below the role-only header atomically.
+pub(crate) fn role_header_admitted(
+    batch: &mut Batch<'_>,
+    context: &Context,
+    active: &Active,
+    seq: u64,
+    _admission: &AdmissionCharge,
+) -> Result<()> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut state = load(batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
+    // The same settled semantic effect can be handed back after the callback that completed
+    // this request: bounded contiguous feed restoration continues independently and asks the
+    // effect step to finish once more. Match the exact activation and authorize it before the
+    // terminal idempotence check; `Active::matches` intentionally rejects terminal work.
+    if active.node != context.fingerprint()
+        || !active.valid
+        || active.cancellation.is_cancelled()
+        || active.scope != state.scope
+        || active.request != state.request
+        || active.serial != state.serial
+        || active.binding != state.binding
+    {
+        return Err(invalid("history demand is paused, cancelled or replaced"));
+    }
+    authorize_in(batch, context, state.binding)?;
+    if seq < state.bounds.lo || seq > state.bounds.hi {
+        return Err(invalid("role-complete history header exceeds demand"));
+    }
+    let next = seq.checked_sub(1).filter(|next| *next >= state.bounds.lo);
+    let already_admitted = state.body.is_none()
+        && state.cleanup.is_none()
+        && ((state.progress == Progress::Complete && state.remaining == 0)
+            || state.cursor.is_some_and(|cursor| {
+                cursor.query_kind == 4
+                    && next == Some(cursor.next_seq)
+                    && cursor.entry.is_none()
+                    && cursor.offset == 0
+            }));
+    if already_admitted {
+        return Ok(());
+    }
+    if !active.matches(&state) {
+        return Err(invalid("history demand is paused, cancelled or replaced"));
+    }
+    if state.body.is_some()
+        || state.cleanup.is_some()
+        || state.remaining == 0
+        || seq < state.bounds.lo
+        || seq > state.bounds.hi
+        || state.progress != Progress::More
+        || !state.cursor.is_some_and(|cursor| {
+            cursor.query_kind == 4
+                && cursor.next_seq == seq
+                && cursor.entry.is_none()
+                && cursor.offset == 0
+        })
+    {
+        return Err(invalid("role-complete history header changed"));
+    }
+    state.remaining -= 1;
+    if state.remaining == 0 {
+        state.cursor = None;
+        state.progress = Progress::Complete;
+    } else if let Some(next) = next {
+        let cursor = state
+            .cursor
+            .as_mut()
+            .ok_or_else(|| invalid("role-complete history cursor vanished"))?;
+        cursor.next_seq = next;
+    } else {
+        return Err(invalid("role-complete lower bound left remaining entries"));
+    }
+    put(batch, key, &scope, &state)
+}
+
 /// Persist a locally normalized cursor within the original authorization and actual credit.
 /// An Entry quantum's [seq,seq] wire bounds must first be rebound to the original local page;
 /// never treat the peer's narrower quantum, new query kind or count as fresh authorization.
@@ -974,7 +1299,17 @@ pub fn checkpoint(
     cursor: Option<&Continuation>,
     job: &Job,
 ) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    checkpoint_precharged(context, active, progress, cursor, &charge)
+}
+
+pub(crate) fn checkpoint_precharged(
+    context: &Context,
+    active: &mut Active,
+    progress: Progress,
+    cursor: Option<&Continuation>,
+    _charge: &AdmissionCharge,
+) -> Result<()> {
     if matches!(progress, Progress::Cancelled | Progress::Paused) {
         return Err(invalid("use explicit history cancel/pause"));
     }
@@ -986,11 +1321,14 @@ pub fn checkpoint(
     let mut batch = context.store().batch()?;
     let mut state = live(&batch, key, &scope, context, active)?;
     if progress == Progress::Complete
-        && (state.body.is_some() || state.cleanup.is_some() || cursor.is_some())
+        && (state.body.is_some()
+            || state.cleanup.is_some()
+            || cursor.is_some()
+            || state.remaining != 0)
     {
-        return Err(invalid("history demand still has an unfinished body"));
+        return Err(invalid("history demand still has unfinished work"));
     }
-    state.cursor = if let Some(cursor) = cursor {
+    let next_cursor = if let Some(cursor) = cursor {
         if cursor.head != state.bounds.head
             || cursor.lo != state.bounds.lo
             || cursor.hi != state.bounds.hi
@@ -1018,6 +1356,16 @@ pub fn checkpoint(
     } else {
         None
     };
+    if state.progress == progress && state.cursor == next_cursor {
+        // Exact Active, current authority and all cursor/credit invariants were checked in
+        // this serialized batch. An identical checkpoint has no durable work to commit.
+        let result = context.check();
+        if result.is_err() {
+            active.valid = false;
+        }
+        return result;
+    }
+    state.cursor = next_cursor;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;
     commit(batch, active, context)?;
@@ -1104,8 +1452,11 @@ pub(crate) fn checkpoint_legacy(
     Ok(())
 }
 
-pub fn pause(context: &Context, active: &mut Active, job: &Job) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
+pub(crate) fn pause_precharged(
+    context: &Context,
+    active: &mut Active,
+    _charge: &AdmissionCharge,
+) -> Result<()> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
@@ -1120,7 +1471,16 @@ pub fn pause(context: &Context, active: &mut Active, job: &Job) -> Result<()> {
 
 /// First fence demand atomically; bounded reclamation is separate and never starts peer traffic.
 pub fn cancel(context: &Context, request: RequestId, job: &Job) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    cancel_precharged(context, request, &charge)
+}
+
+/// Cancel using an already-accounted state workspace; no allocation admission occurs here.
+pub(crate) fn cancel_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<()> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
@@ -1138,10 +1498,99 @@ pub fn cancel(context: &Context, request: RequestId, job: &Job) -> Result<()> {
     commit_context(batch, context)
 }
 
+/// Commit the exact local cancellation and return capability-bound cleanup ownership. Lifecycle
+/// cancellation immediately before commit still refuses; cancellation observed after a successful
+/// commit cannot change the durable outcome into an error.
+pub(crate) fn cancel_owned_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<LocalCancelOutcome> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
+    if state.request != request {
+        return Err(invalid("history request ID changed"));
+    }
+    let binding = state.binding;
+    let committed = || CommittedCancel {
+        node: context.node,
+        scope,
+        request,
+        binding,
+    };
+    match state.progress {
+        Progress::Cancelled => {
+            return Ok(LocalCancelOutcome::AlreadyCancelled(Box::new(committed())));
+        }
+        Progress::Complete => return Ok(LocalCancelOutcome::AlreadyComplete),
+        _ => {}
+    }
+    state.serial = next_serial(state.serial)?;
+    state.progress = Progress::Cancelled;
+    schedule_cleanup(&mut state);
+    put(&mut batch, key, &scope, &state)?;
+    // Preserve the lifecycle fence until the commit's linearization point. A later observation
+    // cannot truthfully deny the committed result.
+    context.check()?;
+    batch.commit()?;
+    Ok(LocalCancelOutcome::NewlyCancelled(Box::new(committed())))
+}
+
+/// Reclaim one bounded slice owned by an exact durable Cancelled capability. The retained Context
+/// keeps the key and secret-work lease alive, but postcommit lifecycle cancellation cannot revoke
+/// deletion of this exact request. Missing or replaced state is never recreated.
+pub(crate) fn reclaim_committed(
+    context: &Context,
+    committed: &CommittedCancel,
+    _charge: &AdmissionCharge,
+) -> Result<CommittedReclaim> {
+    if context.node != committed.node || context.scope != committed.scope {
+        return Err(invalid("history cancellation owner changed"));
+    }
+    let key = &context.key;
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, key, &committed.scope)? else {
+        return Ok(CommittedReclaim::Superseded);
+    };
+    if state.request != committed.request
+        || state.binding != committed.binding
+        || state.progress != Progress::Cancelled
+    {
+        return Ok(CommittedReclaim::Superseded);
+    }
+    let Some(mut cleanup) = state.cleanup else {
+        return Ok(CommittedReclaim::Complete);
+    };
+    let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+    for page in cleanup.next..=end {
+        batch.delete_segment(&committed.scope, KIND, page)?;
+    }
+    cleanup.next = end + 1;
+    state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    put(&mut batch, key, &committed.scope, &state)?;
+    batch.commit()?;
+    Ok(if state.cleanup.is_none() {
+        CommittedReclaim::Complete
+    } else {
+        CommittedReclaim::More
+    })
+}
+
 /// At most 14 page deletes plus one header write (also <=1 MiB). New start waits for true.
 /// Safe after restart for cancelled/completed staging: reclamation does not authorize any sync.
 pub fn reclaim(context: &Context, request: RequestId, job: &Job) -> Result<bool> {
-    let _charge = charge(job, STATE_WORK)?;
+    let charge = AdmissionCharge::reserve(job)?;
+    reclaim_precharged(context, request, &charge)
+}
+
+/// Reclaim one bounded slice using an already-accounted state workspace.
+pub(crate) fn reclaim_precharged(
+    context: &Context,
+    request: RequestId,
+    _charge: &AdmissionCharge,
+) -> Result<bool> {
     let key = key(context)?;
     let scope = scope(context);
     let mut batch = context.store().batch()?;
@@ -1160,5 +1609,55 @@ pub fn reclaim(context: &Context, request: RequestId, job: &Job) -> Result<bool>
     state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)?;
+    Ok(state.cleanup.is_none())
+}
+
+/// Retirement deletion only. The room owner first holds the room mutex and verifies its
+/// unlocked incarnation. Observer cancellation cannot revoke permission to delete this exact
+/// abandoned staging, but a replacement request/binding is always left untouched. This route
+/// cannot start/resume demand, admit entries, append bodies, acknowledge bytes or grant access.
+pub(crate) fn retire_staging(
+    context: &Context,
+    active: &mut Active,
+    _admission: &AdmissionCharge,
+    committed: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    let key = &context.key;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, key, &scope)? else {
+        return Ok(true);
+    };
+    if active.node != context.node
+        || active.scope != scope
+        || state.request != active.request
+        || state.binding != active.binding
+        || state.serial != active.serial
+    {
+        return Ok(true);
+    }
+    if state.progress.terminal() && state.cleanup.is_none() {
+        return Ok(true);
+    }
+    if !state.progress.terminal() {
+        state.serial = next_serial(state.serial)?;
+        state.progress = Progress::Cancelled;
+        schedule_cleanup(&mut state);
+    }
+    if let Some(mut cleanup) = state.cleanup {
+        let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+        for page in cleanup.next..=end {
+            batch.delete_segment(&scope, KIND, page)?;
+        }
+        cleanup.next = end + 1;
+        state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    }
+    put(&mut batch, key, &scope, &state)?;
+    batch.commit()?;
+    committed.store(true, std::sync::atomic::Ordering::Release);
+    // Keep only this retired deletion owner's serial current across bounded page slices.
+    // It remains invalid for all ordinary body/admission/ACK operations.
+    active.serial = state.serial;
+    active.valid = false;
     Ok(state.cleanup.is_none())
 }

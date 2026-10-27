@@ -167,11 +167,27 @@ enum Slot {
 }
 
 /// An attached node.
+struct ComputerReconciliation {
+    target: vox_core::node::computer::ComputerPolicyTarget,
+    pass: u64,
+    superseded: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ComputerReconciliation {
+    fn drop(&mut self) {
+        self.superseded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 struct Attached {
     handle: NodeHandle,
     paths: Paths,
     /// Which attach this is: a release or a panic meant for an earlier one changes nothing.
     generation: u64,
+    /// Exact policy target and pass currently reconciling this attach. Dropping it supersedes the
+    /// actor future on policy movement, detach, or daemon shutdown; elapsed time never does.
+    computer_reconciliation: Option<ComputerReconciliation>,
     /// Attached implicitly: it detaches when its last holder goes (L-3).
     implicit: bool,
     /// The actual credential that opened this identity was empty (or this is a headless node).
@@ -248,7 +264,7 @@ impl Drop for HolderGuard {
                 Some(Slot::Attached(a)) if a.generation == self.generation => {
                     a.holders = a.holders.saturating_sub(1);
                     if a.implicit && a.holders == 0 && a.sessions.is_empty() {
-                        begin_detach(&mut slots, &self.node)
+                        begin_detach(&mut slots, &self.node, &inner.defaults.computer)
                     } else {
                         None
                     }
@@ -281,10 +297,28 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn begin_detach(
     slots: &mut BTreeMap<NodeName, Slot>,
     node: &NodeName,
+    management: &vox_core::node::computer::Management,
 ) -> Option<(Box<Attached>, watch::Sender<DetachOutcome>)> {
     let (tx, rx) = watch::channel(None);
     match slots.insert(node.clone(), Slot::Detaching(rx)) {
-        Some(Slot::Attached(a)) => Some((a, tx)),
+        Some(Slot::Attached(mut a)) => {
+            // Lifecycle supersession belongs to this slot transition, not later actor cleanup.
+            // Drop the exact owned flight now so its guard cannot keep publishing while detach
+            // waits for other work. This same slot lock fences every pending-result writer and
+            // prevents a replacement attachment from acquiring status that we could erase.
+            #[cfg(feature = "test-knobs")]
+            let keep_reconciliation = a.computer_reconciliation.as_ref().is_some_and(|flight| {
+                management.keep_detach_reconciliation_for_proof(node.as_str(), flight.target)
+                    && a.handle.computer_current()
+            });
+            #[cfg(not(feature = "test-knobs"))]
+            let keep_reconciliation = false;
+            if !keep_reconciliation {
+                drop(a.computer_reconciliation.take());
+                management.node_detached(node.as_str());
+            }
+            Some((a, tx))
+        }
         Some(other) => {
             slots.insert(node.clone(), other);
             None
@@ -2969,7 +3003,7 @@ impl Router {
                     crate::wake::end_checked(&a.paths, session).map_err(failed)?;
                     a.sessions.remove(session);
                     let going = if a.implicit && a.holders == 0 && a.sessions.is_empty() {
-                        begin_detach(&mut slots, node)
+                        begin_detach(&mut slots, node, &self.inner.defaults.computer)
                     } else {
                         None
                     };
@@ -3026,10 +3060,12 @@ impl Router {
             let step = {
                 let mut slots = lock(&self.inner.slots);
                 match slots.get(node) {
-                    Some(Slot::Attached(_)) => match begin_detach(&mut slots, node) {
-                        Some(going) => DStep::Go(going),
-                        None => DStep::NotAttached,
-                    },
+                    Some(Slot::Attached(_)) => {
+                        match begin_detach(&mut slots, node, &self.inner.defaults.computer) {
+                            Some(going) => DStep::Go(going),
+                            None => DStep::NotAttached,
+                        }
+                    }
                     Some(Slot::Attaching(rx)) => DStep::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => DStep::WaitDetach(rx.clone()),
                     None if matches!(cause, DetachCause::Requested) => {
@@ -3289,6 +3325,10 @@ impl Router {
                 }
                 Step::NotAttached => return Err(Refusal::NotAttached { node: node.clone() }),
                 Step::Mine(tx) => {
+                    let failed = |why: String| Refusal::Failed {
+                        node: node.clone(),
+                        why,
+                    };
                     let w = match want.take() {
                         Some(Want::Checked) => Want::Explicit(None),
                         w => w.unwrap_or(Want::IfAttached),
@@ -3301,7 +3341,7 @@ impl Router {
                         self.refresh_manual_anchors(&anchors).await;
                     }
                     let manual = self.inner.manual_anchors.lock().await;
-                    if let Ok(a) = &started {
+                    if let Ok((a, _, _)) = &started {
                         let _ = a
                             .handle
                             .apply(NodeCommand::SetAnchors {
@@ -3309,61 +3349,122 @@ impl Router {
                             })
                             .await;
                     }
-                    let mut slots = lock(&self.inner.slots);
+                    drop(manual);
                     return match started {
-                        Ok(mut a) => {
-                            a.implicit = !a.unprotected && !matches!(w, Want::Explicit(_));
-                            let mut granted = self.grant(node, &mut a, w);
-                            // Attaching succeeded even if the session registration was refused.
-                            // Publish ownership of the running actor before returning that refusal.
-                            if let Ok(granted) = &mut granted {
-                                granted.notes = a.notes.clone();
-                                granted.attached_now = true;
+                        Ok((a, computer_deadline, startup_identity)) => {
+                            let mut pending = Some((a, w));
+                            loop {
+                                let Some(handle) = pending
+                                    .as_ref()
+                                    .map(|(attached, _)| attached.handle.clone())
+                                else {
+                                    break Err(failed(
+                                        "its Ready publication lost the attaching node".into(),
+                                    ));
+                                };
+                                let published = {
+                                    let mut slots = lock(&self.inner.slots);
+                                    handle.with_computer_application_settled(
+                                        startup_identity,
+                                        || {
+                                            let Some((mut a, w)) = pending.take() else {
+                                                return Err(failed(
+                                                    "its Ready publication lost the attaching node"
+                                                        .into(),
+                                                ));
+                                            };
+                                            a.implicit =
+                                                !a.unprotected && !matches!(w, Want::Explicit(_));
+                                            let mut granted = self.grant(node, &mut a, w);
+                                            // Attaching succeeded even if session registration was
+                                            // refused. Publish ownership before returning that refusal.
+                                            if let Ok(granted) = &mut granted {
+                                                granted.notes = a.notes.clone();
+                                                granted.attached_now = true;
+                                            }
+                                            let implicit = a.implicit;
+                                            let fingerprint = a.fingerprint;
+                                            let registered = crate::wake::registered(&a.paths);
+                                            let opening_handle = a.handle.clone();
+                                            let opening_detached = a.detached.subscribe();
+                                            // Drive input from members with drive (ADR-029 §3), while
+                                            // attached.
+                                            self.serve_drive(
+                                                node,
+                                                &a.handle,
+                                                a.detached.subscribe(),
+                                            );
+                                            self.serve_attention(&a.handle, a.detached.subscribe());
+                                            slots.insert(node.clone(), Slot::Attached(a));
+                                            self.inner
+                                                .metrics
+                                                .nodes_attached
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            let _ = tx.send(Some(Ok(())));
+                                            eprintln!(
+                                                "vox daemon: node {node} is Ready{}",
+                                                if implicit { " (implicitly)" } else { "" }
+                                            );
+                                            Ok((
+                                                granted,
+                                                fingerprint,
+                                                registered,
+                                                opening_handle,
+                                                opening_detached,
+                                            ))
+                                        },
+                                    )
+                                };
+                                match published {
+                                    Some(Ok((
+                                        granted,
+                                        fingerprint,
+                                        registered,
+                                        opening_handle,
+                                        opening_detached,
+                                    ))) => {
+                                        let _ = self.inner.events.send(DaemonEvent::Attached {
+                                            node: node.clone(),
+                                            fingerprint,
+                                        });
+                                        // A saved registration is a durable opening obligation.
+                                        for session in registered {
+                                            self.watch_harness(node, &session);
+                                            self.watch_title(node, &session);
+                                            self.open_registered(
+                                                node,
+                                                &opening_handle,
+                                                opening_detached.clone(),
+                                                &session,
+                                            );
+                                        }
+                                        break granted;
+                                    }
+                                    Some(Err(refusal)) => break Err(refusal),
+                                    None => {}
+                                }
+                                if let Err(error) =
+                                    handle.reconcile_computer_startup(computer_deadline).await
+                                {
+                                    let refusal = failed(format!(
+                                        "its startup computer trust did not settle: {error}"
+                                    ));
+                                    let Some((mut a, _)) = pending.take() else {
+                                        break Err(refusal);
+                                    };
+                                    if let Some(tasks) = a.tasks.take() {
+                                        tasks.stop().await;
+                                    }
+                                    stop_actor_fully(&a.handle, a.ended.clone()).await;
+                                    lock(&self.inner.slots).remove(node);
+                                    let _ = tx.send(Some(Err(refusal.clone())));
+                                    break Err(refusal);
+                                }
                             }
-                            let implicit = a.implicit;
-                            let fingerprint = a.fingerprint;
-                            let registered = crate::wake::registered(&a.paths);
-                            let opening_handle = a.handle.clone();
-                            let opening_detached = a.detached.subscribe();
-                            // Drive input from members with drive (ADR-029 §3), while attached.
-                            self.serve_drive(node, &a.handle, a.detached.subscribe());
-                            self.serve_attention(&a.handle, a.detached.subscribe());
-                            slots.insert(node.clone(), Slot::Attached(a));
-                            drop(slots);
-                            drop(manual);
-                            self.inner
-                                .metrics
-                                .nodes_attached
-                                .fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(Some(Ok(())));
-                            eprintln!(
-                                "vox daemon: node {node} is Ready{}",
-                                if implicit { " (implicitly)" } else { "" }
-                            );
-                            let _ = self.inner.events.send(DaemonEvent::Attached {
-                                node: node.clone(),
-                                fingerprint,
-                            });
-                            // A saved registration is a durable opening obligation. Restore its
-                            // harness/title readers and its idempotent room opening after the
-                            // attached slot is visible, so a daemon crash after acknowledgment
-                            // cannot strand the Session until another hook turn.
-                            for session in registered {
-                                self.watch_harness(node, &session);
-                                self.watch_title(node, &session);
-                                self.open_registered(
-                                    node,
-                                    &opening_handle,
-                                    opening_detached.clone(),
-                                    &session,
-                                );
-                            }
-                            granted
                         }
                         Err(r) => {
+                            let mut slots = lock(&self.inner.slots);
                             slots.remove(node);
-                            drop(slots);
-                            drop(manual);
                             let _ = tx.send(Some(Err(r.clone())));
                             Err(r)
                         }
@@ -3426,7 +3527,7 @@ impl Router {
         passphrase: Option<&Zeroizing<String>>,
         rooms: &[Zeroizing<String>],
         anchors: &[String],
-    ) -> Result<Box<Attached>, Refusal> {
+    ) -> Result<(Box<Attached>, std::time::Instant, Digest32), Refusal> {
         let failed = |why: String| Refusal::Failed {
             node: node.clone(),
             why,
@@ -3551,7 +3652,31 @@ impl Router {
         let session_retirements =
             self.follow_session_room_removals(node, &handle, &paths, removals, ended.clone());
         drop(room_removed);
-        // Watched from the start, so a panic during the unlock is not lost either.
+        // Logical retirement is visible before actual cleanup finishes. Keep the task-join
+        // watcher independent: detach must never await a signal driven by its own waiter.
+        let panic_reported = Arc::new(AtomicBool::new(false));
+        {
+            let router = Arc::downgrade(&self.inner);
+            let node = node.clone();
+            let mut termination = handle.termination();
+            let panic_reported = Arc::clone(&panic_reported);
+            self.inner.rt.spawn(async move {
+                if let Some(ActorEnd::Panicked(message)) = termination.retiring().await {
+                    if let Some(inner) = router.upgrade() {
+                        if !panic_reported.swap(true, Ordering::AcqRel) {
+                            eprintln!(
+                                "vox daemon: node {node} stopped: its actor panicked: {message}"
+                            );
+                            inner.metrics.node_panics.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Router { inner }
+                            .detach_generation(&node, generation, DetachCause::Panicked(message))
+                            .await;
+                    }
+                }
+            });
+        }
+        // Also covers a panic outside the borrowed command loop, including failed cleanup.
         {
             let router = Arc::downgrade(&self.inner);
             let node = node.clone();
@@ -3559,9 +3684,13 @@ impl Router {
                 let end = ActorEnd::of(actor).await;
                 let _ = ended_tx.send(true);
                 if let ActorEnd::Panicked(message) = end {
-                    eprintln!("vox daemon: node {node} stopped: its actor panicked: {message}");
                     if let Some(inner) = router.upgrade() {
-                        inner.metrics.node_panics.fetch_add(1, Ordering::Relaxed);
+                        if !panic_reported.swap(true, Ordering::AcqRel) {
+                            eprintln!(
+                                "vox daemon: node {node} stopped: its actor panicked: {message}"
+                            );
+                            inner.metrics.node_panics.fetch_add(1, Ordering::Relaxed);
+                        }
                         Router { inner }
                             .detach_generation(&node, generation, DetachCause::Panicked(message))
                             .await;
@@ -3609,6 +3738,12 @@ impl Router {
             stop_actor_fully(&handle, ended.clone()).await;
             return Err(refusal);
         }
+        let Some((computer_deadline, startup_identity)) = handle.startup_computer_boundary() else {
+            stop_actor_fully(&handle, ended.clone()).await;
+            return Err(failed(
+                "its successful startup exposed no computer-trust boundary".into(),
+            ));
+        };
         for line in rooms {
             crate::app::open_rooms_by_line(&handle, line).await;
         }
@@ -3620,24 +3755,29 @@ impl Router {
         let tasks = anchor
             .is_none()
             .then(|| NodeTasks::start(&self.inner.rt, &handle, &paths));
-        let fingerprint = anchor.or_else(|| handle.view().identity.map(|i| i.fingerprint));
-        Ok(Box::new(Attached {
-            handle,
-            paths,
-            generation,
-            implicit: true,
-            unprotected: anchor.is_some() || pass.is_empty(),
-            keep: None,
-            holders: 0,
-            sessions: BTreeSet::new(),
-            tasks,
-            detached: watch::channel(false).0,
-            notes,
-            ended,
-            session_retirements: Some(session_retirements),
-            fingerprint,
-            anchor: anchor.is_some(),
-        }))
+        let fingerprint = Some(startup_identity);
+        Ok((
+            Box::new(Attached {
+                handle,
+                paths,
+                generation,
+                computer_reconciliation: None,
+                implicit: true,
+                unprotected: anchor.is_some() || pass.is_empty(),
+                keep: None,
+                holders: 0,
+                sessions: BTreeSet::new(),
+                tasks,
+                detached: watch::channel(false).0,
+                notes,
+                ended,
+                session_retirements: Some(session_retirements),
+                fingerprint,
+                anchor: anchor.is_some(),
+            }),
+            computer_deadline,
+            startup_identity,
+        ))
     }
 
     /// Detach `node` only if it is still the attach `generation` (a panic's detach, which must
@@ -3647,7 +3787,7 @@ impl Router {
             let mut slots = lock(&self.inner.slots);
             match slots.get(node) {
                 Some(Slot::Attached(a)) if a.generation == generation => {
-                    begin_detach(&mut slots, node)
+                    begin_detach(&mut slots, node, &self.inner.defaults.computer)
                 }
                 _ => None,
             }
@@ -3666,6 +3806,7 @@ impl Router {
         done: watch::Sender<DetachOutcome>,
         cause: DetachCause,
     ) -> Result<(), Refusal> {
+        let mut physical_end = a.handle.termination();
         let _ = a.detached.send(true);
         {
             let mut ingress = self.inner.posting.lock().await;
@@ -3692,6 +3833,12 @@ impl Router {
         // bounded (S-1, V210-93): the process leaves then, and its memory with it.
         let stopped = if matches!(cause, DetachCause::DaemonStopping) {
             stop_actor(&a.handle, a.ended.clone(), self.inner.defaults.patience).await
+        } else if matches!(cause, DetachCause::Panicked(_)) {
+            // The borrowed command loop has stopped. Enqueuing Shutdown here would wait for a
+            // command it can no longer service; its existing cleanup owner is already running.
+            let mut ended = a.ended.clone();
+            let _ = ended.wait_for(|ended| *ended).await;
+            true
         } else {
             stop_actor_fully(&a.handle, a.ended.clone()).await;
             true
@@ -3725,6 +3872,21 @@ impl Router {
             }
         }
         drop(a);
+        // This observer owns no profile resources. Releasing host handles first cannot make a
+        // still-live Store/Snapshot/secret worker look physically closed.
+        let physical = if stopped {
+            physical_end.closed().await
+        } else {
+            Err("actual node work did not finish before daemon shutdown".to_owned())
+        };
+        if let Err(why) = physical {
+            let refusal = Refusal::Failed {
+                node: node.clone(),
+                why: format!("node teardown is incomplete: {why}"),
+            };
+            let _ = done.send(Some(Err(refusal.clone())));
+            return Err(refusal);
+        }
         self.inner
             .metrics
             .nodes_attached

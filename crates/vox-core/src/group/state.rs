@@ -520,6 +520,18 @@ impl ReceiverChain {
         self.next_iteration
     }
 
+    /// A locally authenticated self receiver already preserves this sender's backup position
+    /// and full retained history. This compares only bindings, never releases a key remotely.
+    pub(crate) fn recovers_own_sender(&self, sender: &SenderChain) -> bool {
+        self.channel_id == sender.channel_id
+            && self.epoch == sender.epoch
+            && self.author_id == sender.author_id
+            && self.chain_id == sender.chain_id
+            && self.signing_pubkey.to_bytes() == sender.signing_key.public_key().to_bytes()
+            && self.history_iteration == 0
+            && self.next_iteration >= sender.next_iteration
+    }
+
     /// Decrypt+verify an inbound broadcast. Enforces (in order):
     /// 1. `(channelID, epoch, author_id, chain_id)` match this chain's binding
     ///    (cross-group-confusion guard) — else reject.
