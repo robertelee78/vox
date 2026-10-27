@@ -649,7 +649,15 @@ impl Source {
 impl Source {
     /// One bounded, charged scalar inventory. Every page rechecks current room access;
     /// the compact index is read without touching content bodies or walking the archive.
-    pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
+    pub(super) async fn inventory(
+        &self,
+        job: &Job,
+    ) -> Result<
+        Lookup<(
+            Vec<super::HeadHint>,
+            super::super::channel::availability::Token,
+        )>,
+    > {
         let charge = job.reserve_or_pressure(
             crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
         )?;
@@ -676,15 +684,44 @@ impl Source {
             match page.value.next {
                 Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
                 None => {
+                    let peer = self.peer;
+                    let Lookup::Found(token) = self
+                        .read(job, 0, move |room, _| {
+                            Ok(Some(room.availability_peer(peer, None)?.local()))
+                        })
+                        .await?
+                    else {
+                        return Ok(Lookup::Busy);
+                    };
                     return Ok(Lookup::Found(Held {
-                        value: hints,
+                        value: (hints, token.value),
                         _charge: charge,
-                    }))
+                    }));
                 }
                 _ => return Err(Error::MalformedAtRest("inventory cursor did not advance")),
             }
         }
         Err(Error::SizeLimitExceeded("inventory index slice bound"))
+    }
+
+    pub(super) async fn observe_availability(
+        &self,
+        job: &Job,
+        connection: u64,
+        token: super::super::channel::availability::Token,
+    ) -> Result<()> {
+        let peer = self.peer;
+        match self
+            .read(job, 0, move |room, _| {
+                room.availability_peer(peer, None)?
+                    .observe(connection, token);
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            _ => Err(Error::Unreachable("availability room read busy")),
+        }
     }
 
     /// Filter at most 64 already decoded hints using exact accepted/settled local facts.

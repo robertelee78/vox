@@ -1323,6 +1323,30 @@ impl Read<'_> {
             )?
             .is_some())
     }
+    pub(crate) fn payload_present(&self, hash: &Digest32) -> Result<bool> {
+        let Some(at) = self.source().find(
+            self.sek,
+            self.channel,
+            self.directory.active.hash,
+            &hashed(hash),
+        )?
+        else {
+            return Ok(false);
+        };
+        let wire = self
+            .source()
+            .open(self.sek, self.channel, SegmentKind::LogDb, at.log)?
+            .ok_or(invalid("indexed body source absent"))?;
+        let (header, held) = Entry::header_from_wire(&wire)?;
+        if header.entry_hash() != *hash
+            || header.skeleton.channel_id != *self.channel
+            || header.skeleton.author_id != at.author
+            || header.skeleton.seq != at.seq
+        {
+            return Err(invalid("indexed body source identity differs"));
+        }
+        Ok(held)
+    }
     pub(crate) fn log_id(&self, hash: &Digest32) -> Result<Option<u64>> {
         Ok(self
             .source()
@@ -1691,6 +1715,17 @@ impl<'s> Write<'_, 's> {
             self.directory.active.sequence == 0 || self.directory.active.clock != 0;
         self.directory.phase = Phase::Idle;
         Ok(())
+    }
+    /// Strict old-wire inspection in the same Batch as the later exact refill.
+    pub(crate) fn refill_available(&self, entry: &Entry, log: u64) -> Result<bool> {
+        let old_wire = Source::Batch(self.batch)
+            .open(self.sek, self.channel, SegmentKind::LogDb, log)?
+            .ok_or(invalid("indexed refill source absent"))?;
+        let (old, held) = Entry::header_from_wire(&old_wire)?;
+        if old.header_wire() != entry.header_wire() {
+            return Err(invalid("refill header differs"));
+        }
+        Ok(!held && entry.payload.is_some())
     }
     pub(crate) fn put_committed(&mut self, entry: &Entry, log: u64) -> Result<()> {
         if self.directory.phase != Phase::Idle {

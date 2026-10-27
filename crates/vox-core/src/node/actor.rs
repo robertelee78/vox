@@ -1373,8 +1373,8 @@ enum NetEvent {
     /// A bounded worker has prepared an encrypted own-key response; current authority and
     /// the exact connection are checked again before it is sent.
     OwnKeyDonorReady(own_keys::DonorReady),
-    OwnKeyRequestReady(own_keys::RequestReady),
-    OwnKeyResponseReady(own_keys::ResponseReady),
+    OwnKeyRequestReady(Box<own_keys::RequestReady>),
+    OwnKeyResponseReady(Box<own_keys::ResponseReady>),
     OwnKeyRequestFailed {
         request: own_keys::Request,
         peer: Digest32,
@@ -1450,6 +1450,7 @@ enum NetEvent {
         channel_id: Digest32,
         peer: Digest32,
         discovery_connection: Option<u64>,
+        availability: Option<crate::node::channel::availability::Token>,
         instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
         head: crate::node::history_stream::HeadHint,
         epoch: u64,
@@ -5390,6 +5391,7 @@ pub struct Node {
     /// Stable across lock/unlock controller replacement, so every generation's completion wakes
     /// the one actor select that audits its durable result slots.
     bounded_completion_wake: Arc<tokio::sync::Notify>,
+    availability_wake: Arc<tokio::sync::Notify>,
     /// Exact retirement ownership and failures live on the daemon budget, so they survive both
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
@@ -6262,6 +6264,7 @@ impl Node {
             history_demand: history_demand::Controller::default(),
             bounded_sync,
             bounded_completion_wake,
+            availability_wake: Arc::new(tokio::sync::Notify::new()),
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             own_recovery_rooms: BTreeMap::new(),
@@ -6673,6 +6676,7 @@ impl Node {
             };
             tokio::pin!(governance_deadline);
             tokio::select! {
+                () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
                 () = &mut governance_deadline => {
                     // Certificate expiry is its own causal wake. A quiet room does not wait for
                     // the one-second actor tick, a command, or network traffic to invalidate it.
@@ -10329,8 +10333,8 @@ impl Node {
                 self.take_inbound_skdm(stream).await;
             }
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
-            NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(ready),
-            NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(ready),
+            NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
+            NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
             NetEvent::OwnKeyRequestFailed {
                 request,
                 peer,
@@ -11552,6 +11556,7 @@ impl Node {
                 channel_id,
                 peer,
                 discovery_connection,
+                availability,
                 instance,
                 head,
                 epoch,
@@ -11579,7 +11584,10 @@ impl Node {
                                     == Some(generation);
                             let discovered = current
                                 && discovery_connection.is_some_and(|serial| {
-                                    self.net
+                                    self.ports.get(&(channel_id, peer)).is_some_and(|p| {
+                                        p.availability.remote(serial) == availability
+                                    }) && self
+                                        .net
                                         .as_ref()
                                         .and_then(|net| net.manager().existing(&peer))
                                         .is_some_and(|connection| {
@@ -15981,20 +15989,31 @@ impl Node {
     async fn room_ref(
         &self,
         channel_id: &Digest32,
+        peer: &Digest32,
     ) -> Option<(
         crate::node::ports::RoomRef,
         Arc<std::sync::atomic::AtomicU64>,
         u64,
         bool,
+        Arc<crate::node::channel::availability::Peer>,
     )> {
         use crate::node::ports::RoomRef;
         let store = self.log_store()?;
         if let Some(shared) = self.channels.get(channel_id) {
-            let channel = shared.lock().await;
+            let mut channel = shared.lock().await;
+            let availability = channel
+                .availability_peer(*peer, Some(&self.availability_wake))
+                .ok()?;
             let gen = channel.generation();
             let epoch = channel.epoch();
             let sparse = channel.uses_sparse_history(&store).ok()?;
-            return Some((RoomRef::Channel(Arc::downgrade(shared)), gen, epoch, sparse));
+            return Some((
+                RoomRef::Channel(Arc::downgrade(shared)),
+                gen,
+                epoch,
+                sparse,
+                availability,
+            ));
         }
         None
     }
@@ -16037,13 +16056,15 @@ impl Node {
         if !self.shares_room(channel_id, peer).await {
             return false;
         }
-        let Some((room, gen, epoch, sparse)) = self.room_ref(channel_id).await else {
+        let Some((room, gen, epoch, sparse, availability)) = self.room_ref(channel_id, peer).await
+        else {
             return false;
         };
         self.ports.insert(
             (*channel_id, *peer),
-            crate::node::ports::Port::new(room, gen, epoch, sparse),
+            crate::node::ports::Port::new(room, gen, epoch, sparse, availability),
         );
+        self.availability_wake.notify_one();
         self.sched_rooms.insert(*channel_id);
         true
     }
@@ -16142,6 +16163,7 @@ impl Node {
             }
             // **A new connection** raises a request and clears the backoff (ADR-025 D2, D5).
             if fresh_peers.contains(&peer) && existed {
+                self.availability_wake.notify_one();
                 if let Some(port) = self.ports.get_mut(&(room, peer)) {
                     port.raise();
                     port.clear_backoff();
@@ -16150,6 +16172,46 @@ impl Node {
                     c.backoff = None;
                 });
                 self.sched_rooms.insert(room);
+            }
+        }
+    }
+
+    // Only a real postcommit edge or authenticated HAVE wakes this branch. The shared
+    // handles contain scalars; retired rooms cannot mutate replacement ports.
+    fn accept_availability(&mut self) {
+        for ((room, peer), port) in &mut self.ports {
+            let connection = self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(peer));
+            // This capability extends bounded HAVE, never the legacy room protocol.
+            port.availability_enabled = port.sparse
+                && connection
+                    .as_ref()
+                    .is_some_and(|c| c.supports_availability());
+            let Some(connection) = connection.filter(|c| port.sparse && c.supports_availability())
+            else {
+                continue;
+            };
+            if port.availability_connection != Some(connection.serial()) {
+                port.availability_connection = Some(connection.serial());
+                port.availability_acked = None;
+            }
+            if port.availability_acked != Some(port.availability.local()) {
+                self.sched_rooms.insert(*room);
+            }
+            if let Some(token) = port.availability.remote(connection.serial()) {
+                let observed = (connection.serial(), token);
+                if port.availability_seen != Some(observed) {
+                    port.availability_seen = Some(observed);
+                    port.support_discovery_check = true;
+                    port.support_discovery = None;
+                    port.support_discovery_unavailable = None;
+                    port.raise();
+                    port.clear_backoff();
+                    self.governance_work.wake_room(*room);
+                    self.sched_rooms.insert(*room);
+                }
             }
         }
     }
@@ -17566,10 +17628,12 @@ impl Node {
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
         if departure_receipt {
-            if let Some((room, gen, epoch, sparse)) = self.room_ref(&channel_id).await {
-                self.ports
-                    .entry((channel_id, peer))
-                    .or_insert_with(|| crate::node::ports::Port::new(room, gen, epoch, sparse));
+            if let Some((room, gen, epoch, sparse, availability)) =
+                self.room_ref(&channel_id, &peer).await
+            {
+                self.ports.entry((channel_id, peer)).or_insert_with(|| {
+                    crate::node::ports::Port::new(room, gen, epoch, sparse, availability)
+                });
             }
         }
         if !self.ensure_port(&channel_id, &peer).await {
@@ -17631,6 +17695,7 @@ impl Node {
             false,
             crate::node::status::SyncStep::Exchanging,
         );
+        let availability_connection = conn.supports_availability().then_some(conn.serial());
         port.inbound.insert(
             token,
             crate::node::ports::Attempt {
@@ -17660,6 +17725,7 @@ impl Node {
                 fence,
                 inbox,
                 departure_receipt,
+                availability_connection,
             )
             .await;
             let _ = tx

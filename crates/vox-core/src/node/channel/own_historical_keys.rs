@@ -66,8 +66,7 @@ fn decode_release(
     room: &Digest32,
     root: &CompositePublicKey,
     author: &Digest32,
-    epoch: u64,
-    chain: u64,
+    (epoch, chain): (u64, u64),
 ) -> Result<Skdm> {
     let wire = open_segment(sek, KIND, id, sealed)?;
     let release = Skdm::from_wire(&wire)?;
@@ -103,7 +102,7 @@ pub(super) fn lookup(
     let sealed = snapshot
         .get_segment_bounded(room, KIND, id, MAX_BYTES)?
         .ok_or_else(bad)?;
-    let release = decode_release(&sealed, id, sek, room, root, author, epoch, chain)?;
+    let release = decode_release(&sealed, id, sek, room, root, author, (epoch, chain))?;
     Ok(Some(ReceiverChain::from_skdm(&release, root, room, epoch)?))
 }
 
@@ -131,7 +130,7 @@ pub(super) fn lookup_batch(
     let sealed = batch
         .get_segment_bounded(room, KIND, id, MAX_BYTES)?
         .ok_or_else(bad)?;
-    let release = decode_release(&sealed, id, sek, room, root, author, epoch, chain)?;
+    let release = decode_release(&sealed, id, sek, room, root, author, (epoch, chain))?;
     Ok(Some(ReceiverChain::from_skdm(&release, root, room, epoch)?))
 }
 
@@ -164,7 +163,7 @@ pub(super) fn put(
         let sealed = batch
             .get_segment_bounded(room, KIND, id, MAX_BYTES)?
             .ok_or_else(bad)?;
-        let prior = decode_release(&sealed, id, sek, room, root, author, epoch, chain)?;
+        let prior = decode_release(&sealed, id, sek, room, root, author, (epoch, chain))?;
         let existing = ReceiverChain::from_skdm(&prior, root, room, epoch)?;
         let incoming = ReceiverChain::from_skdm(release, root, room, epoch)?;
         let mut check = ReceiverChain::from_state(&existing.to_state())?;

@@ -29,6 +29,7 @@ pub(super) struct Parked {
     chain: u64,
     iteration: u64,
     connection: u64,
+    availability: Option<crate::node::channel::availability::Token>,
 }
 
 type SecretLease = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
@@ -96,13 +97,13 @@ impl Node {
     fn own_key_current(
         &self,
         request: Request,
-        node: Digest32,
-        peer: Digest32,
+        identities: (Digest32, Digest32),
         connection: &Arc<VoxConnection>,
         room: &SharedChannel,
         context: &crate::join::session::JoinContext,
         channel: &ChannelState,
     ) -> bool {
+        let (node, peer) = identities;
         self.locking == 0
             && self.own_key_active.get(&request.room) == Some(&request.id)
             && self.profile.as_ref().is_some_and(|p| p.is_unlocked() && p.fingerprint() == node
@@ -145,6 +146,7 @@ impl Node {
                 chain: request.chain,
                 iteration: request.floor,
                 connection,
+                availability: request.availability,
             },
         );
         // This completion is a real producer edge. The next room turn may choose another donor;
@@ -170,8 +172,14 @@ impl Node {
             self.own_key_wait_for_room(request, node, Arc::clone(&room));
             return;
         };
-        let current =
-            self.own_key_current(request, node, peer, &connection, &room, &context, &channel);
+        let current = self.own_key_current(
+            request,
+            (node, peer),
+            &connection,
+            &room,
+            &context,
+            &channel,
+        );
         if !current {
             if self.own_key_active.get(&request.room) == Some(&request.id) {
                 self.own_key_active.remove(&request.room);
@@ -207,7 +215,7 @@ impl Node {
                 };
                 let ready = ResponseReady { request, node, peer, connection, room: room_for_network, context,
                     release: result, _credit: credit, _output: output, _secret: secret };
-                let _ = tx.send(NetEvent::OwnKeyResponseReady(ready)).await;
+                let _ = tx.send(NetEvent::OwnKeyResponseReady(Box::new(ready))).await;
             });
         });
         if authorized.is_none() {
@@ -270,8 +278,7 @@ impl Node {
         };
         if !self.own_key_current(
             request,
-            ready.node,
-            ready.peer,
+            (ready.node, ready.peer),
             &ready.connection,
             &ready.room,
             &ready.context,
@@ -380,7 +387,7 @@ impl Node {
         self.own_key_parked
             .retain(|(room, peer), _| self.ports.contains_key(&(*room, *peer)));
         let mut selected = None;
-        for ((r, peer), _) in &self.ports {
+        for ((r, peer), port) in &self.ports {
             if *r != room_id
                 || !channel.is_member(peer)
                 || channel.has_left(peer)
@@ -402,6 +409,7 @@ impl Node {
                 chain,
                 iteration,
                 connection: connection.serial(),
+                availability: port.availability.remote(connection.serial()),
             };
             if self.own_key_parked.get(&(room_id, *peer)) == Some(&parked) {
                 continue;
@@ -439,6 +447,10 @@ impl Node {
             target,
             chain,
             floor: iteration,
+            availability: self
+                .ports
+                .get(&(room_id, peer))
+                .and_then(|p| p.availability.remote(connection.serial())),
         };
         let Ok(secret) = self.secret_work.clone().try_read_owned() else {
             return;
@@ -462,8 +474,8 @@ impl Node {
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
-                    _ = epoch_changed.changed() => return,
-                    _ = room_cancel.changed() => return,
+                    _ = epoch_changed.changed() => (),
+                    _ = room_cancel.changed() => (),
                     result = async {
                         let node = node_jobs.acquire_owned().await.ok()?;
                         let peer = peer_jobs.acquire_owned().await.ok()?;
@@ -585,7 +597,7 @@ impl Node {
                 output,
                 secret,
             };
-            let _ = tx.send(NetEvent::OwnKeyRequestReady(ready)).await;
+            let _ = tx.send(NetEvent::OwnKeyRequestReady(Box::new(ready))).await;
         });
     }
 
@@ -862,6 +874,8 @@ pub(super) struct Request {
     pub(super) target: Digest32,
     pub(super) chain: u64,
     pub(super) floor: u64,
+    // Local request provenance only; never encoded or accepted from a peer.
+    availability: Option<crate::node::channel::availability::Token>,
 }
 impl Request {
     pub(super) fn encode(self) -> Vec<u8> {
@@ -910,6 +924,7 @@ impl Request {
             target,
             chain,
             floor,
+            availability: None,
         })
     }
 }
@@ -1098,7 +1113,15 @@ pub(super) fn decode_response(
         return Err(Error::SizeLimitExceeded("own-key response"));
     }
     let mut d = Decoder::new(bytes);
-    if d.array()? != 4 || d.uint()? != 1 || Request::decode(d.bytes()?)? != request {
+    if d.array()? != 4 || d.uint()? != 1 {
+        return Err(Error::MalformedBundle("own-key response binding"));
+    }
+    // Availability is local admission provenance, not part of the echoed wire request.
+    let expected = Request {
+        availability: None,
+        ..request
+    };
+    if Request::decode(d.bytes()?)? != expected {
         return Err(Error::MalformedBundle("own-key response binding"));
     }
     let status = d.uint()?;

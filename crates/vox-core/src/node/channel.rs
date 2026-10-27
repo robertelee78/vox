@@ -60,8 +60,9 @@ mod local_history;
 pub(crate) use legacy_sync::LegacySync;
 mod private_session;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
-mod own_history;
+pub(crate) mod availability;
 mod own_historical_keys;
+mod own_history;
 mod proof_range;
 mod receiver_overlay;
 mod receiver_releases;
@@ -1140,6 +1141,7 @@ pub struct ChannelState {
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
     own_recovery: own_history::Recovery,
+    availability: availability::State,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
@@ -2082,6 +2084,7 @@ impl ChannelState {
             ))),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
+            availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
@@ -2871,6 +2874,7 @@ impl ChannelState {
             consent_facts,
             own_behind,
             own_recovery,
+            availability: availability::State::new()?,
             presence,
             sparse_applied_tips,
             sparse_contiguous_pending,
@@ -3144,6 +3148,7 @@ impl ChannelState {
             ))),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
+            availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
@@ -4091,6 +4096,7 @@ impl ChannelState {
                 batch.commit()?;
                 self.entries.committed();
                 if done {
+                    self.flush_available(store)?;
                     self.history_publication_changed.notify_waiters();
                     let read = self.entries.read(store, &self.sek, &self.channel_id)?;
                     self.dag.set_order_revision(
@@ -7676,7 +7682,11 @@ impl ChannelState {
         let slot = (author, chain.chain_id());
         // The existing receiver index is chain-keyed, not epoch-keyed. Never replace or
         // merge a different epoch's live chain under the same slot.
-        if self.receivers.get(&slot).is_some_and(|existing| existing.epoch() != key_epoch) {
+        if self
+            .receivers
+            .get(&slot)
+            .is_some_and(|existing| existing.epoch() != key_epoch)
+        {
             return Err(Error::OwnHistoryBehind);
         }
         // Prepare without changing the live map: release retention can wait on bounded
@@ -7691,6 +7701,7 @@ impl ChannelState {
             }
             (chain, true)
         };
+        let mut release_retained = false;
         let saved = (|| -> Result<bool> {
             let mut batch = store.batch()?;
             if own_recovery && changed {
@@ -7715,9 +7726,9 @@ impl ChannelState {
                 self.receivers.get(&slot),
                 &candidate,
             )?;
-            match retained {
+            match &retained {
                 receiver_releases::Remember::Busy { changed } => {
-                    if changed {
+                    if *changed {
                         batch.commit()?;
                     }
                     return Ok(false);
@@ -7761,6 +7772,7 @@ impl ChannelState {
                 writer.seal()?;
             }
             batch.commit()?;
+            release_retained = matches!(retained, receiver_releases::Remember::Retained);
             Ok(true)
         })();
         match saved {
@@ -7773,6 +7785,9 @@ impl ChannelState {
                 self.poison(&error);
                 return Err(error);
             }
+        }
+        if release_retained {
+            self.note_available(store, author)?;
         }
         if !changed {
             return Ok(AcceptedSkdm {

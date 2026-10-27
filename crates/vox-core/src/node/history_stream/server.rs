@@ -95,10 +95,15 @@ pub(super) async fn answer(
             Read::End => return Err(Error::MalformedBundle("inventory closed before HAVE")),
         };
         credit.charge_overhead(incoming.wire_len())?;
-        let Frame::Have(hints) = incoming.frame()? else {
+        let Frame::Have(hints, token) = incoming.frame()? else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
         };
         let work_job = incoming.job();
+        if let (Some(connection), Some(token)) = (io.availability_connection, token) {
+            source
+                .observe_availability(&work_job, connection, token)
+                .await?;
+        }
         for slice in hints.chunks(64) {
             let offered = source
                 .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
@@ -183,7 +188,18 @@ async fn respond(
             let Lookup::Found(inventory) = source.inventory(&job).await? else {
                 return Ok((Status::Busy, None));
             };
-            let status = match send(source, io, credit, Frame::Have(inventory.value), 0).await? {
+            let status = match send(
+                source,
+                io,
+                credit,
+                Frame::Have(
+                    inventory.value.0,
+                    io.availability_connection.map(|_| inventory.value.1),
+                ),
+                0,
+            )
+            .await?
+            {
                 Sent::Yes => Status::Complete,
                 Sent::Busy | Sent::Full => Status::Busy,
             };

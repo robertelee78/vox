@@ -111,6 +111,7 @@ pub(crate) async fn serve(
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
     inbox: std::sync::Arc<HintInbox>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    availability_connection: Option<u64>,
 ) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(
@@ -123,7 +124,8 @@ pub(crate) async fn serve(
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
-    let mut io = transport::Transport::new(send, recv, job, fence, deadline);
+    let mut io =
+        transport::Transport::new(send, recv, job, fence, deadline, availability_connection);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
     // Whether the round moved anything: an inventory exchange that added no hint on this side
@@ -593,7 +595,7 @@ pub enum Object<'a> {
 
 pub enum Frame<'a> {
     Hello(u8),
-    Have(Vec<HeadHint>),
+    Have(Vec<HeadHint>, Option<super::channel::availability::Token>),
     Want {
         request: RequestId,
         query: Query,
@@ -657,7 +659,7 @@ impl<'a> Frame<'a> {
         let maximum = match self {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
-            Self::Have(hints) => HAVE_FRAME_FIXED_BYTES
+            Self::Have(hints, _) => (HAVE_FRAME_FIXED_BYTES + 20)
                 .checked_add(
                     hints
                         .len()
@@ -698,9 +700,15 @@ impl<'a> Frame<'a> {
                 e.uint(u64::from(*bitmap));
                 0x01
             }
-            Self::Have(hints) => {
+            Self::Have(hints, availability) => {
                 if hints.len() > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
+                }
+                if let Some(token) = availability {
+                    if token.open == 0 {
+                        return Err(invalid("availability lifetime"));
+                    }
+                    e.array(2).array(2).uint(token.open).uint(token.revision);
                 }
                 e.array(hints.len());
                 let mut previous = None;
@@ -714,7 +722,11 @@ impl<'a> Frame<'a> {
                         .uint(hint.size)
                         .bytes(&hint.head);
                 }
-                0x02
+                if availability.is_some() {
+                    0x0B
+                } else {
+                    0x02
+                }
             }
             Self::Want { request, query } => {
                 e.array(2).bytes(request);
@@ -839,7 +851,21 @@ impl<'a> Frame<'a> {
             0x01 => {
                 Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
             }
-            0x02 => {
+            0x02 | 0x0B => {
+                let availability = if id == 0x0B {
+                    arity(&mut d, 2)?;
+                    arity(&mut d, 2)?;
+                    let open = d.uint()?;
+                    if open == 0 {
+                        return Err(invalid("availability lifetime"));
+                    }
+                    Some(super::channel::availability::Token {
+                        open,
+                        revision: d.uint()?,
+                    })
+                } else {
+                    None
+                };
                 let count = d.array()?;
                 if count > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
@@ -860,7 +886,7 @@ impl<'a> Frame<'a> {
                         head: digest(&mut d)?,
                     });
                 }
-                Self::Have(hints)
+                Self::Have(hints, availability)
             }
             0x03 => {
                 arity(&mut d, 2)?;

@@ -665,6 +665,15 @@ impl Entry {
     /// re-encoded signing input is byte-identical to the author's — the precondition
     /// for signature verification.
     pub fn from_wire(bytes: &[u8]) -> Result<Self> {
+        Self::decode_wire(bytes, true).map(|(entry, _)| entry)
+    }
+
+    /// Validate the complete stored wire while borrowing its payload, returning only its header.
+    pub(crate) fn header_from_wire(bytes: &[u8]) -> Result<(Self, bool)> {
+        Self::decode_wire(bytes, false)
+    }
+
+    fn decode_wire(bytes: &[u8], retain_payload: bool) -> Result<(Self, bool)> {
         let parsed = parse_frame(bytes)?;
         if parsed.tag != StructTag::LogEntry {
             return Err(Error::MalformedBundle("log-entry wrong struct tag"));
@@ -705,7 +714,12 @@ impl Entry {
                         "log-entry payload length != signed payload_len",
                     ));
                 }
-                Some(slice.to_vec())
+                if !retain_payload && sha256(slice) != skeleton.payload_hash {
+                    return Err(Error::MalformedBundle(
+                        "log-entry payload hash/len mismatch",
+                    ));
+                }
+                retain_payload.then(|| slice.to_vec())
             }
             (0, false) => None,
             _ => {
@@ -725,7 +739,7 @@ impl Entry {
         if entry.skeleton.v2.is_some() && entry.header_wire().len() > MAX_HEADER_BYTES {
             return Err(Error::SizeLimitExceeded("v2 entry header"));
         }
-        Ok(entry)
+        Ok((entry, present == 1))
     }
 }
 
