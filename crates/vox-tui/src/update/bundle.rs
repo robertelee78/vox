@@ -56,6 +56,8 @@ const PUBLISHING: &str = ".Vox.app.publishing";
 const TRANSITION_STATE: &str = "state";
 /// Incomplete records are never interpreted as committed transitions.
 const TRANSITION_STATE_PARTIAL: &str = "state.partial";
+/// Journal name written by the currently released updater.
+const LEGACY_TRANSITION_VERSION: &str = "version";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransitionKind {
@@ -1078,6 +1080,9 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let kept = journal.join(BUNDLE);
     require_optional_bundle(&kept, "the journal's retained bundle")?;
     let Some(transition) = read_transition(&journal)? else {
+        if path_exists(&journal.join(LEGACY_TRANSITION_VERSION))? {
+            return recover_legacy_publish(apps, &mut repaired);
+        }
         // The directory can reach disk before its state file. No bundle mutation is permitted
         // until that state file is flushed, so this is unambiguously before the exchange.
         // Only our incomplete record may be present. Refuse ambiguous files and staging rather
@@ -1301,6 +1306,96 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
         )));
     }
     Ok(repaired)
+}
+
+/// Finish a version-only publication written by the released updater. Preserve ambiguous or
+/// malformed journals; the old format cannot identify arbitrary bundles by inode and digest.
+fn recover_legacy_publish(apps: &Path, repaired: &mut Recovery) -> Result<Recovery, AppError> {
+    let journal = apps.join(PUBLISHING);
+    let version_path = journal.join(LEGACY_TRANSITION_VERSION);
+    require_optional_file(&version_path, "legacy transition version")?;
+    let metadata = fs::metadata(&version_path).map_err(AppError::Io)?;
+    if metadata.len() == 0 || metadata.len() > 128 {
+        return Err(transition_conflict(
+            &journal,
+            "legacy version record is incomplete",
+        ));
+    }
+    let version = fs::read_to_string(&version_path).map_err(AppError::Io)?;
+    let version = version.trim();
+    semver::Version::parse(version)
+        .map_err(|_| transition_conflict(&journal, "legacy version record is invalid"))?;
+    for entry in fs::read_dir(&journal).map_err(AppError::Io)? {
+        let entry = entry.map_err(AppError::Io)?;
+        if entry.file_name() != LEGACY_TRANSITION_VERSION && entry.file_name() != BUNDLE {
+            return Err(transition_conflict(
+                &journal,
+                "unexpected item in legacy journal",
+            ));
+        }
+    }
+    let active = apps.join(BUNDLE);
+    let staged = apps.join(PARTIAL);
+    let previous = apps.join(PREVIOUS);
+    let older = journal.join(BUNDLE);
+    require_bundle(&active, BUNDLE)?;
+    require_optional_bundle(&staged, PARTIAL)?;
+    require_optional_bundle(&previous, PREVIOUS)?;
+    require_optional_bundle(&older, "legacy journal's retained bundle")?;
+    let published = require_active_app_version(&active)? == version;
+    if path_exists(&staged)? {
+        if published {
+            if path_exists(&previous)? {
+                return Err(transition_conflict(
+                    &journal,
+                    "both displaced bundle paths are occupied",
+                ));
+            }
+            repaired.previous_set_aside |= set_aside(&staged)?;
+            fs::rename(&staged, &previous).map_err(AppError::Io)?;
+            sync_dir(apps)?;
+        } else {
+            if require_active_app_version(&staged)? != version {
+                return Err(transition_conflict(
+                    &journal,
+                    "unpublished candidate does not match its record",
+                ));
+            }
+            clear(&staged)?;
+        }
+    }
+    if published && !path_exists(&previous)? {
+        return Err(transition_conflict(
+            &journal,
+            "published app has no displaced bundle",
+        ));
+    }
+    if path_exists(&older)? {
+        if path_exists(&previous)? {
+            if !published {
+                return Err(transition_conflict(
+                    &journal,
+                    "two prior bundles are present before publication",
+                ));
+            }
+            retire(apps, &older)?;
+        } else {
+            fs::rename(&older, &previous).map_err(AppError::Io)?;
+            sync_dir(&journal)?;
+            sync_dir(apps)?;
+        }
+    }
+    if path_exists(&previous)? {
+        repaired.previous_set_aside |= set_aside(&previous)?;
+    }
+    launch_services(true, &active).map_err(usage)?;
+    finish_transition(apps)?;
+    repaired.interrupted_transition = Some(if published {
+        InterruptedTransition::Published(version.to_owned())
+    } else {
+        InterruptedTransition::BeforePublish(version.to_owned())
+    });
+    Ok(std::mem::take(repaired))
 }
 
 fn transition_conflict(journal: &Path, detail: &str) -> AppError {
