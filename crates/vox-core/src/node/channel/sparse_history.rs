@@ -940,16 +940,37 @@ impl HistoryEffectCursor {
             rendered: false,
         }
     }
+    pub(crate) fn with_rendered(hash: Digest32, rendered: bool) -> Self {
+        Self {
+            hash,
+            next: 0,
+            rendered,
+        }
+    }
 }
 
 pub(crate) enum HistoryEffectProgress {
     Progress,
-    RefillPending { governance: bool },
+    /// This exact staged entry was admitted, but contiguous feed work remains.
+    AdmittedProgress {
+        rendered: bool,
+    },
+    RefillPending {
+        governance: bool,
+    },
     BodyUnavailable,
-    ControlPending { head: Digest32, through: u64 },
+    ControlPending {
+        head: Digest32,
+        through: u64,
+    },
     GovernancePending,
-    CheckpointPending { author: Digest32, seq: u64 },
-    Complete { rendered: bool },
+    CheckpointPending {
+        author: Digest32,
+        seq: u64,
+    },
+    Complete {
+        rendered: bool,
+    },
     Busy,
 }
 
@@ -1119,7 +1140,13 @@ impl ChannelState {
                 return Ok(HistoryEffectProgress::RefillPending { governance: false });
             }
             if contiguous_pending {
-                return Ok(HistoryEffectProgress::Progress);
+                return Ok(if body_expected {
+                    HistoryEffectProgress::AdmittedProgress {
+                        rendered: cursor.rendered,
+                    }
+                } else {
+                    HistoryEffectProgress::Progress
+                });
             }
             return Ok(HistoryEffectProgress::Complete {
                 rendered: cursor.rendered,
@@ -1424,7 +1451,13 @@ impl ChannelState {
             });
         }
         if contiguous_more {
-            return Ok(HistoryEffectProgress::Progress);
+            return Ok(if body_expected {
+                HistoryEffectProgress::AdmittedProgress {
+                    rendered: cursor.rendered,
+                }
+            } else {
+                HistoryEffectProgress::Progress
+            });
         }
         Ok(HistoryEffectProgress::Complete {
             rendered: cursor.rendered,
@@ -1664,7 +1697,11 @@ impl ChannelState {
             } else if deferred {
                 HistoryEffectProgress::RefillPending { governance: true }
             } else if contiguous_more {
-                HistoryEffectProgress::Progress
+                if settled {
+                    HistoryEffectProgress::AdmittedProgress { rendered }
+                } else {
+                    HistoryEffectProgress::Progress
+                }
             } else if settled {
                 HistoryEffectProgress::Complete { rendered }
             } else {

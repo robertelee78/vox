@@ -1629,6 +1629,14 @@ impl Receiver {
         let effect_result = |progress| -> LocalResult {
             match progress {
                 Effect::Progress => LocalResult::next(step),
+                Effect::AdmittedProgress { .. } => LocalResult::next(LocalStep::Entry {
+                    request,
+                    head,
+                    seq,
+                    body: false,
+                    role_header: false,
+                    phase,
+                }),
                 Effect::RefillPending { governance: true } => {
                     LocalResult::wait(step, LocalNeed::Governance)
                 }
@@ -1853,6 +1861,18 @@ impl Receiver {
                 match value.value.1 {
                     complete @ Effect::Complete { .. } => effect_result(complete),
                     Effect::Progress => LocalResult::next(next(EntryPhase::Effect(None))),
+                    Effect::AdmittedProgress { rendered } => LocalResult::next(LocalStep::Entry {
+                        request,
+                        head,
+                        seq,
+                        body: false,
+                        role_header: false,
+                        phase: EntryPhase::Effect(Some(
+                            crate::node::channel::HistoryEffectCursor::with_rendered(
+                                hash, rendered,
+                            ),
+                        )),
+                    }),
                     Effect::RefillPending { governance: true } => {
                         LocalResult::wait(step, LocalNeed::Governance)
                     }
@@ -1877,8 +1897,18 @@ impl Receiver {
                     });
                 }
                 let mut result = effect_result(progress);
-                if result.next.is_some() {
-                    result.next = Some(next(EntryPhase::Effect(Some(cursor))));
+                if let Some(LocalStep::Entry {
+                    body, role_header, ..
+                }) = result.next
+                {
+                    result.next = Some(LocalStep::Entry {
+                        request,
+                        head,
+                        seq,
+                        body,
+                        role_header,
+                        phase: EntryPhase::Effect(Some(cursor)),
+                    });
                 }
                 result
             }
