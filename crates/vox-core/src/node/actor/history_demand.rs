@@ -28,6 +28,8 @@ pub(super) struct Dispatch {
     pub query: Query,
     pub staging: Staging,
     pub fence: Arc<Fence>,
+    /// Set only after the actor checks the current connected donor's room membership.
+    eligible: bool,
 }
 
 struct PrivateDispatch {
@@ -283,20 +285,42 @@ impl Controller {
         self.ready
             .as_ref()
             .filter(|dispatch| {
-                dispatch.room == room && dispatch.peer == peer && !dispatch.fence.is_retired()
+                dispatch.room == room
+                    && dispatch.peer == peer
+                    && dispatch.eligible
+                    && !dispatch.fence.is_retired()
             })
             .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
+    }
+
+    /// Identify an unconsumed dispatch even while its membership check is pending.
+    pub(super) fn unstarted_binding(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+    ) -> Option<(RequestId, Digest32)> {
+        self.ready
+            .as_ref()
+            .filter(|dispatch| {
+                dispatch.room == room
+                    && dispatch.peer == peer
+                    && !dispatch.fence.is_retired()
+                    && self.owns_running_fence(
+                        dispatch.request,
+                        dispatch.generation,
+                        &dispatch.fence,
+                    )
+            })
+            .map(|dispatch| (dispatch.request, dispatch.generation))
     }
 
     pub(super) fn take_legacy_cleanup(&mut self) -> Option<(Digest32, LegacyProvisionalOwner)> {
         self.cancelled_legacy.take()
     }
     pub(super) fn take_ready(&mut self, room: Digest32, peer: Digest32) -> Option<Dispatch> {
-        if self
-            .ready
-            .as_ref()
-            .is_some_and(|d| d.room == room && d.peer == peer && !d.fence.is_retired())
-        {
+        if self.ready.as_ref().is_some_and(|d| {
+            d.room == room && d.peer == peer && d.eligible && !d.fence.is_retired()
+        }) {
             self.ready.take()
         } else {
             None
@@ -628,9 +652,7 @@ impl Node {
                 .and_then(|net| net.manager().existing(&candidate))
                 .filter(|conn| conn.quinn().close_reason().is_none())
         };
-        if connected(peer).is_some() {
-            return;
-        }
+        let original_connected = connected(peer).is_some();
         let mut candidates: Vec<_> = self
             .ports
             .keys()
@@ -642,7 +664,12 @@ impl Node {
             })
             .collect();
         candidates.sort_unstable();
-        if candidates.is_empty() {
+        if !original_connected && candidates.is_empty() {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            if let Some(dispatch) = self.history_demand.ready.as_mut() {
+                dispatch.eligible = false;
+            }
             self.history_demand.route_lock_wait = None;
             if let Some(status) = self.history_demand.owner_status.as_mut().filter(|status| {
                 status.room == room
@@ -653,12 +680,22 @@ impl Node {
             }
             return;
         }
+        let was_eligible = self
+            .history_demand
+            .ready
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.eligible);
         let Some(shared) = self.channels.get(&room).cloned() else {
             return;
         };
         let ch = match shared.try_lock() {
             Ok(ch) => ch,
             Err(_) => {
+                if let Some(dispatch) = self.history_demand.ready.as_mut() {
+                    dispatch.eligible = false;
+                }
+                self.bounded_sync
+                    .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
                 let needs_wait = self
                     .history_demand
                     .route_lock_wait
@@ -688,12 +725,35 @@ impl Node {
                 return;
             }
         };
+        let original_member =
+            original_connected && ch.history_inventory_incarnation(&peer).is_some();
         let candidates: Vec<_> = candidates
             .into_iter()
             .map(|(peer, serial)| (peer, serial, ch.history_inventory_incarnation(&peer)))
             .collect();
         drop(ch);
         self.history_demand.route_lock_wait = None;
+        if original_member {
+            if let Some(dispatch) = self.history_demand.ready.as_mut() {
+                dispatch.eligible = true;
+            }
+            if !was_eligible {
+                self.sched_rooms.insert(room);
+            }
+            if let Some(status) = self.history_demand.owner_status.as_mut().filter(|status| {
+                status.room == room
+                    && status.instance == instance
+                    && status.request == Some(request)
+            }) {
+                status.detail = "One bounded history quantum is queued. Further history requires an explicit resume.".into();
+            }
+            return;
+        }
+        if let Some(dispatch) = self.history_demand.ready.as_mut() {
+            dispatch.eligible = false;
+        }
+        self.bounded_sync
+            .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
         if !candidates
             .iter()
             .any(|(_, _, incarnation)| incarnation.is_some())
@@ -2328,6 +2388,7 @@ fn prepare(
             active: Arc::new(StdMutex::new(active)),
         },
         fence,
+        eligible: false,
     });
     Ok(answer)
 }
