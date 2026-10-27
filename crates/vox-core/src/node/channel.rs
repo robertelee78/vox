@@ -1654,9 +1654,30 @@ pub(crate) fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, Composite
 /// [`ReceiverChain::to_state`] blob (which carries its own author/chain binding).
 /// Secret-bearing, so the assembled buffer zeroizes on drop.
 fn receivers_bytes(receivers: &BTreeMap<(Digest32, u64), ReceiverChain>) -> Zeroizing<Vec<u8>> {
+    receivers_bytes_with(receivers, None)
+}
+
+/// Serialize a candidate without publishing it in memory before the receiver/backfill commit.
+fn receivers_bytes_with(
+    receivers: &BTreeMap<(Digest32, u64), ReceiverChain>,
+    replacement: Option<(&(Digest32, u64), &ReceiverChain)>,
+) -> Zeroizing<Vec<u8>> {
+    let count = receivers.len()
+        + usize::from(replacement.is_some_and(|(slot, _)| !receivers.contains_key(slot)));
     let mut e = Encoder::for_secrets();
-    e.array(2).uint(RECEIVERS_VERSION).array(receivers.len());
-    for chain in receivers.values() {
+    e.array(2).uint(RECEIVERS_VERSION).array(count);
+    let mut pending = replacement;
+    for (slot, chain) in receivers {
+        if let Some((new_slot, new_chain)) = pending.filter(|(new_slot, _)| *new_slot <= slot) {
+            e.bytes(&new_chain.to_state());
+            pending = None;
+            if new_slot == slot {
+                continue;
+            }
+        }
+        e.bytes(&chain.to_state());
+    }
+    if let Some((_, chain)) = pending {
         e.bytes(&chain.to_state());
     }
     Zeroizing::new(e.finish())
@@ -2531,7 +2552,13 @@ impl ChannelState {
             .is_none();
         // A profile seen to be behind its own history here stays so across reopen (ADR-037 R5).
         let own_recovery = store
-            .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?
+            .snapshot()?
+            .get_segment_bounded(
+                channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_OWN_BEHIND,
+                crate::log::history::MAX_HEADER_BYTES + 64,
+            )?
             .map(|segment| {
                 own_history::Recovery::parse(&open_segment(
                     &sek,
@@ -7605,7 +7632,10 @@ impl ChannelState {
     ) -> Result<usize> {
         self.legacy_cache_trusted = Some(trusted.clone());
         let before = self.receivers.len();
-        self.receivers.retain(|(a, _), _| trusted.contains(a));
+        let me = self.me();
+        // Locally authenticated own-history receivers are not third-party trust grants.
+        self.receivers
+            .retain(|(a, _), _| *a == me || trusted.contains(a));
         let dropped = before - self.receivers.len();
         if dropped > 0 {
             self.persist_receivers(store)?;
@@ -8616,6 +8646,11 @@ impl ChannelState {
             }
         }
         let Some(chain) = self.receivers.get_mut(&slot) else {
+            if author == me && self.own_behind {
+                // Retaining ciphertext is not readable recovery. A generation minted after
+                // the backup may have no local origin; never give it a role-complete receipt.
+                return Ok(ContentProjection::Unavailable);
+            }
             // Park on the missing fact. Installing or widening an SKDM queues this author in
             // the same durable transaction as the receiver chain. ChannelState is serialized,
             // so a key cannot commit and drain between this check and this row's acceptance.

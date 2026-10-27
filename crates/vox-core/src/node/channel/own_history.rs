@@ -301,6 +301,74 @@ impl ChannelState {
         }))
     }
 
+    /// Seed only a locally retained generation, using its backup live position plus its
+    /// authenticated origin as the history floor. No remote key is minted or released.
+    pub(crate) fn prepare_own_recovery_receiver(&mut self, profile: &Profile) -> Result<bool> {
+        if !self.own_behind || !matches!(self.own_recovery, Recovery::Head(_)) {
+            return Ok(false);
+        }
+        let me = self.me();
+        let slot = (me, self.sender.chain_id());
+        if self
+            .receivers
+            .get(&slot)
+            .is_some_and(|chain| chain.recovers_own_sender(&self.sender))
+        {
+            return Ok(false);
+        }
+        if !self.origins.has(&self.channel_id, self.epoch, slot.1)
+            || (!self.receivers.contains_key(&slot) && self.receivers.len() >= MAX_RECEIVER_CHAINS)
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let signer = profile.signer()?;
+        let root = self.authors.get(&me).ok_or(Error::OwnHistoryBehind)?;
+        let (iteration, key) = self.sender.current_position();
+        let current = self.sender.skdm_for(signer, iteration, key)?;
+        let live = ReceiverChain::from_skdm(&current, root, &self.channel_id, self.epoch)?;
+        let origin =
+            self.origins
+                .full_history_skdm(signer, &self.channel_id, self.epoch, slot.1)?;
+        let floor = ReceiverChain::from_skdm(&origin, root, &self.channel_id, self.epoch)?;
+        let mut candidate = if let Some(existing) = self
+            .receivers
+            .get(&slot)
+            .filter(|existing| existing.next_iteration() >= live.next_iteration())
+        {
+            let mut existing = ReceiverChain::from_state(&existing.to_state())?;
+            existing.retain_history_release(&live)?;
+            existing
+        } else {
+            live
+        };
+        candidate.retain_history_release(&floor)?;
+        if !candidate.recovers_own_sender(&self.sender) {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let segment = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_RECEIVERS,
+            &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
+        )?;
+        let mut batch = profile.store().batch()?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_RECEIVERS,
+            &segment,
+        )?;
+        let mut index = self
+            .entries
+            .write(&mut batch, &self.sek, &self.channel_id)?;
+        index.queue_backfill(me, Some(1))?;
+        index.seal()?;
+        batch.commit()?;
+        self.entries.committed();
+        self.receivers.insert(slot, candidate);
+        Ok(true)
+    }
+
     pub(super) fn require_own_recovery_complete(&self, store: &Store) -> Result<()> {
         if !self.own_behind || !self.is_member(&self.me()) {
             return Err(Error::OwnHistoryBehind);
@@ -319,6 +387,13 @@ impl ChannelState {
         if through < target.root.leaves
             || !read.history_head_accepted(&target.id(), target.binding)?
             || read.history_range(target.binding, 1, target.root.leaves)? != Some(target.root)
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        if self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?
+            .author_backfill_pending(&self.me())?
         {
             return Err(Error::OwnHistoryBehind);
         }

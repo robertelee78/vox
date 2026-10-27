@@ -524,7 +524,7 @@ impl Node {
         };
         let store = profile.store_handle();
         let now = self.now_ms();
-        let (changed, completed, key, discovery) = {
+        let (changed, completed, receiver_changed, key, discovery) = {
             let Ok(mut channel) = shared.try_lock() else {
                 // A read-only holder need not publish another event. Retain this exact room's
                 // release edge off actor; no other room or command waits on this mutex.
@@ -547,15 +547,25 @@ impl Node {
                     return;
                 }
             };
-            let completed = match self
-                .with_current_computer_authority(|| channel.complete_own_recovery(profile, now))
-            {
-                Some(Ok(done)) => done,
+            let (completed, receiver_changed) = match self.with_current_computer_authority(|| {
+                let receiver_changed = channel.prepare_own_recovery_receiver(profile)?;
+                channel
+                    .complete_own_recovery(profile, now)
+                    .map(|done| (done, receiver_changed))
+                    .or_else(|error| {
+                        if matches!(error, crate::error::Error::OwnHistoryBehind) {
+                            Ok((false, receiver_changed))
+                        } else {
+                            Err(error)
+                        }
+                    })
+            }) {
+                Some(Ok(result)) => result,
                 Some(Err(error)) => {
                     channel.poison(&error);
-                    false
+                    (false, false)
                 }
-                None => false,
+                None => (false, false),
             };
             let key = match channel.own_recovery_key(&store) {
                 Ok(key) => key,
@@ -575,8 +585,12 @@ impl Node {
             } else {
                 None
             };
-            (changed, completed, key, discovery)
+            (changed, completed, receiver_changed, key, discovery)
         };
+        if receiver_changed {
+            // The committed key/cursor is the producer for ordinary bounded backfill.
+            self.governance_work.wake_room(room);
+        }
         if completed {
             self.note_local_governance_append(&room);
         }
