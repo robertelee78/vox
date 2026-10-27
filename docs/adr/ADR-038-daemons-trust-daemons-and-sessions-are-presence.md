@@ -568,9 +568,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   is a flush. No commit's flush runs while the room's lock is held. A new post stays pending while
   its own save can still complete and reports success only after that save is durable, as FX-30
   requires. If its save definitively fails, the post reports failure and MUST NOT be reported as
-  saved. Vox MUST report pending recovery truthfully. The 2026-10-27 decider ruling supersedes
-  the earlier promise that every post completes while an earlier flush is held; no fixed elapsed
-  cutoff or new capacity limit determines this behavior. The existing real-binary journey may
+  saved. Any surface that reports save or recovery state MUST report it truthfully. The
+  2026-10-27 decider ruling supersedes the earlier promise that every post completes while an
+  earlier flush is held; no fixed elapsed cutoff or new capacity limit determines this behavior.
+  The existing real-binary journey may
   hold a flush using the `test-knobs` build to show that unrelated work progresses, then release
   it and verify that the post completes durably. Measured cause, the same daemon: every commit
   ran inside `history_write` with the room mutex held (the `read_charged` closure owns the
