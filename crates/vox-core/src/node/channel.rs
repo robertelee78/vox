@@ -68,6 +68,7 @@ pub(crate) use proof_range::{ProofRangeRestore, ProofRangeStep};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
+pub(crate) use own_history::OwnReadability;
 pub(crate) use own_history::OwnRecoveryPage;
 pub(crate) use sparse_history::{
     HistoryDeclineResult, HistoryEffectCursor, HistoryEffectProgress, HistoryPayload,
@@ -264,6 +265,9 @@ const SEG_UNSETTLED: u64 = 13;
 // 18 is the legacy Session announcement cursor; it was also used by older recovery markers.
 const SEG_OLD_OWN_BEHIND: u64 = 18;
 const SEG_OWN_BEHIND: u64 = 25;
+/// Target-bound progress for checking that recovered own content is actually readable.
+// KeyMaterial slots 21 and 23 belong to the key-package queue and private pulls.
+const SEG_OWN_READABILITY: u64 = 24;
 
 /// How far each member's node holds this identity's feed here, as that node last said in a sync
 /// (ADR-028 R-6, #482), within [`SegmentKind::KeyMaterial`]: what "on N of M members' nodes" is
@@ -6905,6 +6909,11 @@ impl ChannelState {
             }
             if recover_own {
                 batch.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?;
+                batch.delete_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_OWN_READABILITY,
+                )?;
             }
             self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()

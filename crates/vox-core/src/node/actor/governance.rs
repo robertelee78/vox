@@ -552,7 +552,7 @@ impl Node {
         };
         let store = profile.store_handle();
         let now = self.now_ms();
-        let (changed, completed, receiver_changed, key) = {
+        let (changed, completed, receiver_changed, audit, key) = {
             let Ok(mut channel) = shared.try_lock() else {
                 // A read-only holder need not publish another event. Retain this exact room's
                 // release edge off actor; no other room or command waits on this mutex.
@@ -575,32 +575,45 @@ impl Node {
                     return;
                 }
             };
-            let (completed, receiver_changed) = match self.with_current_computer_authority(|| {
-                let receiver_changed = channel.prepare_own_recovery_receiver(profile)?;
-                channel
-                    .complete_own_recovery(profile, now)
-                    .map(|done| (done, receiver_changed))
-                    .or_else(|error| {
-                        if matches!(error, crate::error::Error::OwnHistoryBehind) {
-                            Ok((false, receiver_changed))
-                        } else {
-                            Err(error)
-                        }
-                    })
-            }) {
-                Some(Ok(result)) => result,
-                Some(Err(error)) if ChannelState::receiver_release_cleanup_waiting(&error) => {
-                    // The seed persisted its exact retry bit. Park on bounded physical GC,
-                    // whose freed-slot result is the producer for another attempt.
-                    self.governance_work.wake_room(room);
-                    (false, false)
-                }
-                Some(Err(error)) => {
-                    channel.poison(&error);
-                    (false, false)
-                }
-                None => (false, false),
-            };
+            let (completed, receiver_changed, audit) =
+                match self.with_current_computer_authority(|| {
+                    let receiver_changed = match channel.prepare_own_recovery_receiver(profile) {
+                        Ok(changed) => changed,
+                        Err(crate::error::Error::OwnHistoryBehind) => false,
+                        Err(error) => return Err(error),
+                    };
+                    let audit = channel.audit_own_readability(&store, now)?;
+                    if audit != crate::node::channel::OwnReadability::Complete {
+                        return Ok((false, receiver_changed, audit));
+                    }
+                    channel
+                        .complete_own_recovery(profile, now)
+                        .map(|done| (done, receiver_changed, audit))
+                        .or_else(|error| {
+                            if matches!(error, crate::error::Error::OwnHistoryBehind) {
+                                Ok((
+                                    false,
+                                    receiver_changed,
+                                    crate::node::channel::OwnReadability::Waiting,
+                                ))
+                            } else {
+                                Err(error)
+                            }
+                        })
+                }) {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) if ChannelState::receiver_release_cleanup_waiting(&error) => {
+                        // The seed persisted its exact retry bit. Park on bounded physical GC,
+                        // whose freed-slot result is the producer for another attempt.
+                        self.governance_work.wake_room(room);
+                        (false, false, crate::node::channel::OwnReadability::Waiting)
+                    }
+                    Some(Err(error)) => {
+                        channel.poison(&error);
+                        (false, false, crate::node::channel::OwnReadability::Waiting)
+                    }
+                    None => (false, false, crate::node::channel::OwnReadability::Waiting),
+                };
             let key = match channel.own_recovery_key(&store) {
                 Ok(key) => key,
                 Err(error) => {
@@ -608,8 +621,11 @@ impl Node {
                     return;
                 }
             };
-            (changed, completed, receiver_changed, key)
+            (changed, completed, receiver_changed, audit, key)
         };
+        if matches!(audit, crate::node::channel::OwnReadability::Runnable) {
+            self.governance_work.wake_room(room);
+        }
         if receiver_changed {
             // The committed key/cursor is the producer for ordinary bounded backfill.
             self.governance_work.wake_room(room);
