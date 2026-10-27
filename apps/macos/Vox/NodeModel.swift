@@ -4248,7 +4248,8 @@ extension NodeModel {
             // The daemon uses this refusal for both a changed room instance and a changed
             // Session projection. Neither authorizes the old room page or its controls.
             if case let VoxError.Failed(reason) = error,
-               reason == "the room's Sessions changed; refresh the listing" {
+               (reason == "the room's Sessions changed; refresh the listing"
+                || reason == "stream refused: the room's Session activity changed; refresh the page") {
                 await stopped(.sessionChanged)
                 return
             }
