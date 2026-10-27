@@ -36,39 +36,7 @@ impl ChannelState {
                     SEG_LEGACY_ANNOUNCED,
                     &segment,
                 )?;
-                let mut d = Decoder::new(&bytes);
-                let (arity, version) = (d.array()?, d.uint()?);
-                if !matches!((arity, version), (3, 1) | (4, 2)) || d.bytes()? != self.me() {
-                    return Err(Error::MalformedAtRest("legacy Session announcement cursor"));
-                }
-                let through = d.uint()?;
-                let mut readers = BTreeMap::new();
-                if version == 2 {
-                    let count = d.array()?;
-                    if count > AUTHORS_HARD_LIMIT {
-                        return Err(Error::MalformedAtRest(
-                            "legacy Session announcement readers",
-                        ));
-                    }
-                    for _ in 0..count {
-                        if d.array()? != 5 {
-                            return Err(Error::MalformedAtRest(
-                                "legacy Session announcement reader",
-                            ));
-                        }
-                        let peer: Digest32 = d.bytes()?.try_into().map_err(|_| {
-                            Error::MalformedAtRest("legacy Session announcement reader")
-                        })?;
-                        let grant = (d.uint()?, d.uint()?, d.uint()?, d.uint()?);
-                        if readers.insert(peer, grant).is_some() {
-                            return Err(Error::MalformedAtRest(
-                                "duplicate Session announcement reader",
-                            ));
-                        }
-                    }
-                }
-                d.finish()?;
-                Announcements { through, readers }
+                Announcements::parse(&bytes, &self.me())?
             }
         };
         self.legacy_announced = Some(state.clone());
@@ -274,5 +242,43 @@ impl ChannelState {
             self.finish_entry_publication(profile.store())?;
         }
         Ok(count)
+    }
+}
+
+impl Announcements {
+    /// Parse the complete cursor before distinguishing it from the former own-history slot.
+    pub(super) fn parse(bytes: &[u8], me: &Digest32) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        let (arity, version) = (d.array()?, d.uint()?);
+        if !matches!((arity, version), (3, 1) | (4, 2)) || d.bytes()? != me {
+            return Err(Error::MalformedAtRest("legacy Session announcement cursor"));
+        }
+        let through = d.uint()?;
+        let mut readers = BTreeMap::new();
+        if version == 2 {
+            let count = d.array()?;
+            if count > AUTHORS_HARD_LIMIT {
+                return Err(Error::MalformedAtRest(
+                    "legacy Session announcement readers",
+                ));
+            }
+            for _ in 0..count {
+                if d.array()? != 5 {
+                    return Err(Error::MalformedAtRest("legacy Session announcement reader"));
+                }
+                let peer: Digest32 = d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("legacy Session announcement reader"))?;
+                let grant = (d.uint()?, d.uint()?, d.uint()?, d.uint()?);
+                if readers.insert(peer, grant).is_some() {
+                    return Err(Error::MalformedAtRest(
+                        "duplicate Session announcement reader",
+                    ));
+                }
+            }
+        }
+        d.finish()?;
+        Ok(Self { through, readers })
     }
 }

@@ -259,7 +259,9 @@ const FORKS_VERSION: u64 = 1;
 const SEG_UNSETTLED: u64 = 13;
 /// Present while a member was seen holding entries of this node's own feed that this node does
 /// not hold (ADR-037 R5): a restored older profile. The room refuses this node's writes.
-const SEG_OWN_BEHIND: u64 = 18;
+// 18 is the legacy Session announcement cursor; it was also used by older recovery markers.
+const SEG_OLD_OWN_BEHIND: u64 = 18;
+const SEG_OWN_BEHIND: u64 = 25;
 
 /// How far each member's node holds this identity's feed here, as that node last said in a sync
 /// (ADR-028 R-6, #482), within [`SegmentKind::KeyMaterial`]: what "on N of M members' nodes" is
@@ -2553,8 +2555,8 @@ impl ChannelState {
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?
             .is_none();
         // A profile seen to be behind its own history here stays so across reopen (ADR-037 R5).
-        let own_recovery = store
-            .snapshot()?
+        let snapshot = store.snapshot()?;
+        let mut own_recovery = snapshot
             .get_segment_bounded(
                 channel_id,
                 SegmentKind::KeyMaterial,
@@ -2570,6 +2572,54 @@ impl ChannelState {
                 )?)
             })
             .transpose()?;
+        // A valid legacy cursor holds at most one bounded reader tuple per admitted author.
+        // Each tuple has a 32-byte fingerprint and four CBOR u64 values; 128 bytes per
+        // tuple also leaves room for its headers and the enclosing cursor.
+        if let Some(segment) = snapshot.get_segment_bounded(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_OLD_OWN_BEHIND,
+            AUTHORS_HARD_LIMIT * 128 + 128,
+        )? {
+            let old = open_segment(&sek, SegmentKind::KeyMaterial, SEG_OLD_OWN_BEHIND, &segment)?;
+            // Current non-sparse rooms may have a real legacy Session cursor in this slot.
+            // Validate its complete original format and leave it untouched. Sparse rooms never
+            // publish this cursor, so an invalid recovery marker there remains a hard error.
+            if entry_read.sparse_enabled()
+                || legacy_session_sender::Announcements::parse(&old, &me).is_err()
+            {
+                let recovery = own_history::Recovery::parse(&old)?;
+                if own_recovery.is_some() {
+                    return Err(Error::MalformedAtRest(
+                        "duplicate own history recovery markers",
+                    ));
+                }
+                // Segment authentication binds its numeric ID. Re-seal under the new ID and
+                // remove the old marker atomically; never copy ciphertext to another slot.
+                let moved = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_OWN_BEHIND, &old)?;
+                let mut batch = store.batch()?;
+                let current = batch
+                    .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_OLD_OWN_BEHIND)?
+                    .ok_or(Error::MalformedAtRest(
+                        "own history recovery marker changed",
+                    ))?;
+                if open_segment(&sek, SegmentKind::KeyMaterial, SEG_OLD_OWN_BEHIND, &current)?
+                    != old
+                    || batch
+                        .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?
+                        .is_some()
+                {
+                    return Err(Error::MalformedAtRest(
+                        "own history recovery marker changed",
+                    ));
+                }
+                batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND, &moved)?;
+                batch.delete_segment(channel_id, SegmentKind::KeyMaterial, SEG_OLD_OWN_BEHIND)?;
+                batch.commit()?;
+                own_recovery = Some(recovery);
+            }
+        }
+        drop(snapshot);
         let own_behind = own_recovery.is_some();
         let own_recovery = own_recovery.unwrap_or(own_history::Recovery::UnknownBehind);
         // The fork proofs this room kept (V210-63), each checked as a new one would be: a proof
