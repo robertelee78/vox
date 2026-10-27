@@ -2168,6 +2168,15 @@ impl Node {
         let Some(request) = flow.archive_request else {
             return false;
         };
+        let Some(fence) = flow.request_fence.as_ref() else {
+            return false;
+        };
+        if !self
+            .history_demand
+            .owns_running_fence(request, flow.generation, fence)
+        {
+            return false;
+        }
         if let Some(status) = flow.archive_status.take() {
             if self.history_demand.completed_current(
                 flow.room,
@@ -2707,9 +2716,7 @@ impl Node {
                 let cancelled = error
                     == crate::error::Error::Profile(crate::node::history_demand::CANCELLED)
                         .to_string();
-                if let Some(request) = flow.archive_request {
-                    self.history_demand.failed(request, flow.generation, &error);
-                }
+                self.settle_archive_exit(&mut flow, &error);
 
                 if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
@@ -2948,10 +2955,22 @@ impl Node {
                     }
                 }
                 if !flow.automatic_own_recovery {
-                    if let Some(status) = flow.archive_status.take() {
-                        if let Some(request) = status.request {
-                            self.history_demand
-                                .completed(request, flow.generation, status);
+                    if let (Some(request), Some(fence)) =
+                        (flow.archive_request, flow.request_fence.as_ref())
+                    {
+                        if self
+                            .history_demand
+                            .owns_running_fence(request, flow.generation, fence)
+                        {
+                            if let Some(status) = flow.archive_status.take() {
+                                self.history_demand.completed_current(
+                                    flow.room,
+                                    flow.instance,
+                                    request,
+                                    flow.generation,
+                                    status,
+                                );
+                            }
                         }
                     }
                 }
