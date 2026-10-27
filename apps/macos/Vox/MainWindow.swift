@@ -185,7 +185,7 @@ private struct Sidebar: View {
                 HStack {
                     NodeIdentity(name: model.node, status: model.nodeStatus)
                         .copyMenu([("Copy Name", model.node)])
-                        .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
+                        .accessibilityIdentifier(model.nodeStatus == nil ? "node-status-unknown" : (model.nodes.first(where: { $0.name == model.node })?.state == "attached" ? "attached" : "detached"))
                     Spacer()
                     RoomsAdd(model: model)
                 }
@@ -442,7 +442,7 @@ private struct NodeIdentity: View {
     let name: String
     /// The daemon supplies Ready or Locked; unavailable remains distinct.
     var status: String? = nil
-    private var state: String { status ?? "unavailable" }
+    private var state: String { status ?? "state unknown" }
 
     var body: some View {
         HStack(alignment: .center, spacing: Space.s8) {

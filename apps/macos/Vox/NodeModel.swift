@@ -3733,7 +3733,12 @@ final class NodeModel: ObservableObject {
         await refresh()
     }
 
-    fileprivate func stopped(_ text: String) async {
+    fileprivate enum ObservationStop {
+        case ended
+        case roomChanged
+    }
+
+    fileprivate func stopped(_ reason: ObservationStop) async {
         observationNeedsRestart = true
         waitingLedger = nil
         nodeObservationEpoch = UUID()
@@ -3753,10 +3758,17 @@ final class NodeModel: ObservableObject {
         }
         // An observer ending is not a daemon verdict on the node. Keep the last visible
         // snapshot, suspend actions, and let readFacts establish the current node state.
-        ended = "Connection to node \(node) ended. Checking its state."
+        let notice: String
+        switch reason {
+        case .ended:
+            notice = "Node observation ended. Checking its state."
+            daemonReachable = false
+            daemonFailure = notice
+        case .roomChanged:
+            notice = "The saved room changed. Refreshing its history and observation."
+        }
+        ended = notice
         machineStateKnown = false
-        daemonReachable = false
-        daemonFailure = "Connection to node \(node) ended. Checking its state."
         // Resubscribing aborts the old Rust observer, which is awaiting this callback.
         // Read readiness here; the existing follow loop (or an independent user action)
         // performs the pending restart and authoritative refresh outside that callback.
@@ -3860,7 +3872,7 @@ private final class Listener: ClientListener {
     func onMessage(room: String, instance: Data, message: RoomMessage) async -> Bool {
         guard let model = current() else { return false }
         guard model.acceptsArrivalInstance(instance, room: room) else {
-            await model.stopped("The saved room changed; refreshing its history and restarting observation.")
+            await model.stopped(.roomChanged)
             return false
         }
         readLog.debug("follow: event message \(message.id, privacy: .public) in \(room, privacy: .public)")
@@ -3877,7 +3889,7 @@ private final class Listener: ClientListener {
 
     func onEnded(text: String) async {
         guard let model = current() else { return }
-        await model.stopped(text)
+        await model.stopped(.ended)
     }
 
     func onSessions(room: String) async -> Bool {
