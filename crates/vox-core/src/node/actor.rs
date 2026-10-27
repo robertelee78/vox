@@ -16182,10 +16182,13 @@ impl Node {
                 .net
                 .as_ref()
                 .and_then(|net| net.manager().existing(peer));
-            port.availability_enabled = connection
-                .as_ref()
-                .is_some_and(|c| c.supports_availability());
-            let Some(connection) = connection.filter(|c| c.supports_availability()) else {
+            // This capability extends bounded HAVE, never the legacy room protocol.
+            port.availability_enabled = port.sparse
+                && connection
+                    .as_ref()
+                    .is_some_and(|c| c.supports_availability());
+            let Some(connection) = connection.filter(|c| port.sparse && c.supports_availability())
+            else {
                 continue;
             };
             if port.availability_connection != Some(connection.serial()) {
