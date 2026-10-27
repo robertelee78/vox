@@ -17,7 +17,9 @@ use super::source::{Lookup, PreparedRead, Source};
 use super::transport::{Read, Transport};
 use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
 
-const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024;
+// Includes the actual maximum descriptor trace capacity, overlapping the verifier,
+// generated contexts and Directory scratch under the existing 12-MiB record job.
+const VERIFY_ENVELOPE: usize = 4 * 1024 * 1024 + crate::log::history::PROOF_RANGE_BYTES;
 const RECORD_METADATA_WORK: usize = 64 * 1024;
 const ENTRY_VALIDATION_WORK: usize = 512 * 1024;
 // One atomic metadata object, or one selected staged body, per receiver handoff.

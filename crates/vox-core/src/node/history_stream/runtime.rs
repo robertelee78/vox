@@ -807,8 +807,18 @@ impl Flow {
         author: Digest32,
         head: Digest32,
     ) -> Result<bool> {
+        // A metadata root is a separate operation from the old ambiguous body/inventory
+        // decision. Retain one exact disposition for its whole immutable verification chain.
+        let (author, head) = if self.local_own_verification {
+            let hint = self
+                .hint
+                .ok_or(Error::Profile("own metadata refusal root missing"))?;
+            (hint.author, hint.head)
+        } else {
+            (author, head)
+        };
         let remembered = match source
-            .remember_decline(job, author, head, self.request)
+            .remember_decline(job, author, head, self.request, self.local_own_verification)
             .await
         {
             Ok(super::source::DeclineResult::Stored {

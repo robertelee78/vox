@@ -398,10 +398,31 @@ pub(super) fn advance(
         overlay.generated.borrow_mut().push((step.hash(), step));
     };
     let generated = overlay.generated.into_inner();
+    // Only completed verifiers expose their exact input/reconstructed ranges. These
+    // objects are serving-only: a signed proof is not a consistency/authority verdict.
+    let ranges = match (&result, &mut cursor) {
+        (ResultStep::Included(_), HistoryVerifier::Inclusion(v)) => v.take_verified_ranges()?,
+        (ResultStep::Prefix(_), HistoryVerifier::Consistency(v)) => v.take_verified_ranges()?,
+        (ResultStep::Controls(_), HistoryVerifier::ControlRange(v)) => v.take_verified_ranges()?,
+        (ResultStep::Missing(_), _) => Vec::new(),
+        _ => return Err(invalid("completed proof range kind")),
+    };
     drop(input);
     let keep_generated = |index: &mut entry_store::Write<'_, '_>| -> Result<()> {
         for (_, context) in &generated {
             index.keep_history_context(context)?;
+        }
+        for (start, descriptor) in &ranges {
+            index.keep_history_proof_range(
+                binding.head,
+                crate::log::history::TreeBinding {
+                    room: binding.room,
+                    scope: LogScope::Public,
+                    author: binding.author,
+                },
+                *start,
+                *descriptor,
+            )?;
         }
         Ok(())
     };

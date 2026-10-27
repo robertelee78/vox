@@ -2,7 +2,7 @@
 //! envelope before these methods; every pinned store read is dropped before network I/O.
 
 use super::*;
-use crate::log::history::{ControlContext, Descriptor, LogScope, SignedHead, TreeBinding};
+use crate::log::history::{ControlContext, LogScope, SignedHead};
 use crate::node::store::Batch;
 
 /// Exact signed header and the length bound governing payload continuations.
@@ -86,10 +86,10 @@ impl ChannelState {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
-        authorization: (Digest32, Digest32),
+        authorization: (Digest32, Digest32, bool),
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<HistoryDeclineResult> {
-        let (node, expected_authorization) = authorization;
+        let (node, expected_authorization, metadata) = authorization;
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
                 .ok_or(Error::MalformedGovernance(
@@ -118,7 +118,12 @@ impl ChannelState {
             return Ok(HistoryDeclineResult::AuthorizationChanged { current });
         }
         let mut index = self.entries.write(&mut batch, &self.sek, &room)?;
-        if index.history_declined_head(&peer, &author)?
+        let prior = if metadata {
+            index.history_declined_metadata(&peer, &author)?
+        } else {
+            index.history_declined_head(&peer, &author)?
+        };
+        if prior
             == Some((
                 head,
                 expected_authorization,
@@ -131,14 +136,25 @@ impl ChannelState {
                 current,
             });
         }
-        index.keep_history_declined_head(
-            peer,
-            author,
-            head,
-            expected_authorization,
-            peer_incarnation,
-            author_incarnation,
-        )?;
+        if metadata {
+            index.keep_history_declined_metadata(
+                peer,
+                author,
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            )?;
+        } else {
+            index.keep_history_declined_head(
+                peer,
+                author,
+                head,
+                expected_authorization,
+                peer_incarnation,
+                author_incarnation,
+            )?;
+        }
         index.seal()?;
         batch.commit()?;
         self.entries.committed();
@@ -453,17 +469,6 @@ impl ChannelState {
                 })
             })
             .transpose()
-    }
-
-    pub(crate) fn history_tree_range(
-        &self,
-        store: &Store,
-        binding: TreeBinding,
-        start: u64,
-        leaves: u64,
-    ) -> Result<Option<Descriptor>> {
-        self.history_read(store)?
-            .history_range(binding, start, leaves)
     }
 
     /// Decode and authenticate one body once under the caller's large-record envelope.

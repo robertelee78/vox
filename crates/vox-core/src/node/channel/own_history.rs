@@ -236,7 +236,9 @@ impl ChannelState {
 
     /// Derive one exact local verification root at ordinary foreground admission. No scalar
     /// inbox insertion is required, and a donor's role receipt cannot suppress local proof debt.
-    /// A durable exact refusal remains parked until its real authority/incarnation changes.
+    /// A durable exact metadata refusal remains parked until its real authority/incarnation
+    /// changes. Old whole-head refusals still suppress ordinary/body inventory; they cannot
+    /// assert that this new exact metadata-verification operation was ever attempted.
     pub(crate) fn own_recovery_discovery_hint(
         &self,
         store: &Store,
@@ -259,7 +261,7 @@ impl ChannelState {
             return Ok(None);
         }
         if let Some((refused, grant, peer_life, author_life)) =
-            read.history_declined_head(peer, &self.me())?
+            read.history_declined_metadata(peer, &self.me())?
         {
             if refused == head.id()
                 && grant == authorization

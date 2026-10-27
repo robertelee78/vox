@@ -13,8 +13,7 @@ use crate::hash::Digest32;
 use crate::log::entry::Entry;
 use crate::log::history::{
     consistency_ranges, inclusion_ranges, split, ConsistencyProof, ControlRangeProof, ControlToken,
-    Descriptor, InclusionProof, SignedHead, TreeBinding, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS,
-    MAX_TREE_DEPTH,
+    Descriptor, InclusionProof, SignedHead, MAX_CONTROL_HEADERS, MAX_PROOF_TOKENS, MAX_TREE_DEPTH,
 };
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::{BufferCharge, Job};
@@ -147,6 +146,7 @@ impl Source {
         author: Digest32,
         head: Digest32,
         request: RequestId,
+        metadata: bool,
     ) -> Result<DeclineResult> {
         // The marker is apparatus only: it proves that a real shipped flow carrying its captured
         // authorization has reached the durability edge before a proof changes trust.
@@ -163,7 +163,7 @@ impl Source {
                     peer,
                     author,
                     head,
-                    authorization,
+                    (authorization.0, authorization.1, metadata),
                     &committed,
                 )?))
             })
@@ -433,14 +433,51 @@ impl Source {
     async fn range(
         &self,
         job: &Job,
-        binding: TreeBinding,
+        head: &SignedHead,
         start: u64,
         leaves: u64,
     ) -> Result<Lookup<Descriptor>> {
-        self.read(job, 64 * 1024, move |room, store| {
-            room.history_tree_range(store, binding, start, leaves)
-        })
-        .await
+        let mut cursor = crate::node::channel::ProofRangeRestore::new(head, start, leaves)?;
+        loop {
+            self.current()?;
+            let ledger = self.commit_ledger();
+            let peer = self.peer;
+            // One bounded physical step: Directory scratch is separately reserved by read;
+            // this envelope covers the two contexts/join/encoded context and scalar DFS.
+            let step = self
+                .read(
+                    job,
+                    crate::node::channel::ProofRangeRestore::WORK_BYTES,
+                    move |room, store| {
+                        let step = room.restore_proof_range(store, peer, &mut cursor, &ledger)?;
+                        Ok(Some((cursor, step)))
+                    },
+                )
+                .await?;
+            let Lookup::Found(step) = step else {
+                return Ok(match step {
+                    Lookup::Busy => Lookup::Busy,
+                    _ => Lookup::Missing,
+                });
+            };
+            let (next, outcome) = step.value;
+            cursor = next;
+            match outcome {
+                crate::node::channel::ProofRangeStep::Complete(value) => {
+                    return Ok(Lookup::Found(Held {
+                        value,
+                        _charge: step._charge,
+                    }))
+                }
+                crate::node::channel::ProofRangeStep::Missing => return Ok(Lookup::Missing),
+                crate::node::channel::ProofRangeStep::Busy => return Ok(Lookup::Busy),
+                crate::node::channel::ProofRangeStep::Progress => {}
+            }
+            // The worker, RoomMutex, snapshot and decode buffers have actually dropped.
+            // Same request/Job remains owned; this is not a second admission or a timer retry.
+            drop(step._charge);
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Proof construction reads only indexed canonical ranges, never a content archive. The
@@ -484,10 +521,7 @@ impl Source {
             let mut descriptors = Vec::with_capacity(ranges.len());
             for range in ranges {
                 self.current()?;
-                match self
-                    .range(job, head.binding, range.start, range.leaves)
-                    .await?
-                {
+                match self.range(job, head, range.start, range.leaves).await? {
                     Lookup::Found(found) => descriptors.push(found.value),
                     Lookup::Busy => return Ok(Lookup::Busy),
                     Lookup::Missing => return Ok(Lookup::Missing),
@@ -505,7 +539,7 @@ impl Source {
                     let prefix = if from == 0 {
                         Descriptor::empty(head.binding)
                     } else {
-                        match self.range(job, head.binding, 1, from).await? {
+                        match self.range(job, head, 1, from).await? {
                             Lookup::Found(found) => found.value,
                             Lookup::Busy => return Ok(Lookup::Busy),
                             Lookup::Missing => return Ok(Lookup::Missing),
@@ -550,7 +584,7 @@ impl Source {
                 if pending.len() > MAX_TREE_DEPTH || tokens.len() >= MAX_PROOF_TOKENS {
                     return Err(Error::SizeLimitExceeded("served control proof"));
                 }
-                let descriptor = match self.range(job, head.binding, start, leaves).await? {
+                let descriptor = match self.range(job, head, start, leaves).await? {
                     Lookup::Found(found) => found.value,
                     Lookup::Busy => return Ok(Lookup::Busy),
                     Lookup::Missing => return Ok(Lookup::Missing),

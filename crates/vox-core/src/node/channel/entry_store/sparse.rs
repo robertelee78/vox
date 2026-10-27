@@ -189,11 +189,14 @@ pub(crate) enum ObjectKind {
     InclusionReceipt = 6,
     PrefixReceipt = 7,
     PendingHeader = 8,
+    // Exact-head proof-serving cache only; never used by acceptance or authored appends.
+    ProofRange = 9,
 }
 impl ObjectKind {
     pub(crate) const fn limit(self) -> usize {
         match self {
             Self::Context => MAX_CONTEXT_BYTES,
+            Self::ProofRange => STATE_BYTES,
             Self::Head | Self::Header | Self::PendingHeader => MAX_HEADER_BYTES,
             Self::Verifier => MAX_FRAME_BYTES + 12 * MAX_HEADER_BYTES + 512,
             Self::ParentReceipt | Self::InclusionReceipt | Self::PrefixReceipt => {
@@ -211,6 +214,15 @@ fn declined_head_key(peer: &Digest32, author: &Digest32) -> Key {
     let mut key = [0; 64];
     key[..32].copy_from_slice(peer);
     key[32..].copy_from_slice(author);
+    key
+}
+fn metadata_decline_key(peer: &Digest32, author: &Digest32) -> Key {
+    let mut bytes = b"vox/own-metadata-refusal/v1".to_vec();
+    bytes.extend_from_slice(peer);
+    bytes.extend_from_slice(author);
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(peer);
+    key[32..].copy_from_slice(&sha256(&bytes));
     key
 }
 fn author_key(author: &Digest32, scope: LogScope) -> Key {
@@ -232,6 +244,43 @@ fn range_key(binding: TreeBinding, start: u64, leaves: u64) -> Result<Key> {
     key[48] = binding.scope as u8;
     Ok(key)
 }
+fn proof_range_key(
+    head: &Digest32,
+    binding: TreeBinding,
+    start: u64,
+    leaves: u64,
+) -> Result<Digest32> {
+    let _ = range_key(binding, start, leaves)?;
+    let mut e = Encoder::new();
+    e.array(5).bytes(b"vox/proof-serving-range/v1").bytes(head);
+    binding.encode(&mut e);
+    e.uint(start).uint(leaves);
+    Ok(sha256(&e.finish()))
+}
+fn decode_proof_range(
+    bytes: &[u8],
+    head: &Digest32,
+    binding: TreeBinding,
+    start: u64,
+    leaves: u64,
+) -> Result<Descriptor> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 5
+        || d.uint()? != 1
+        || d.bytes()? != head
+        || TreeBinding::decode(&mut d)? != binding
+        || d.uint()? != start
+    {
+        return Err(invalid("proof-serving range binding"));
+    }
+    let value = Descriptor::decode(&mut d)?;
+    d.finish()?;
+    if value.leaves != leaves {
+        return Err(invalid("proof-serving range length"));
+    }
+    Ok(value)
+}
+
 fn hash_option(e: &mut Encoder, value: Option<Digest32>) {
     match value {
         Some(hash) => {
@@ -699,6 +748,9 @@ impl Source<'_> {
 }
 
 impl Read<'_> {
+    pub(crate) fn sparse_history_instance(&self) -> [u8; 16] {
+        self.directory.history_instance
+    }
     /// The exact inventory head this source refused for this author, and the authorization plus
     /// two membership incarnations that scope that decision. One indexed scalar exists per real
     /// relationship.
@@ -707,7 +759,26 @@ impl Read<'_> {
         peer: &Digest32,
         author: &Digest32,
     ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        let key = declined_head_key(peer, author);
+        self.history_declined_in_domain(peer, author, false)
+    }
+    pub(crate) fn history_declined_metadata(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        self.history_declined_in_domain(peer, author, true)
+    }
+    fn history_declined_in_domain(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+        metadata: bool,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        let key = if metadata {
+            metadata_decline_key(peer, author)
+        } else {
+            declined_head_key(peer, author)
+        };
         let Some(id) = self.source().number(
             self.sek,
             self.channel,
@@ -1063,6 +1134,23 @@ impl Read<'_> {
             })
             .transpose()
     }
+    /// Head-scoped serving material is deliberately separate from canonical prefix ranges.
+    /// A verified proof may name a signed head whose consistency is still unresolved.
+    pub(crate) fn history_proof_range(
+        &self,
+        head: &Digest32,
+        binding: TreeBinding,
+        start: u64,
+        leaves: u64,
+    ) -> Result<Option<Descriptor>> {
+        if binding.room != *self.channel {
+            return Err(invalid("proof-serving range room"));
+        }
+        let key = proof_range_key(head, binding, start, leaves)?;
+        self.history_object(ObjectKind::ProofRange, &key)?
+            .map(|bytes| decode_proof_range(&bytes, head, binding, start, leaves))
+            .transpose()
+    }
     pub(crate) fn history_range(
         &self,
         binding: TreeBinding,
@@ -1129,7 +1217,26 @@ impl Write<'_, '_> {
         peer: &Digest32,
         author: &Digest32,
     ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
-        let key = declined_head_key(peer, author);
+        self.history_declined_in_domain(peer, author, false)
+    }
+    pub(crate) fn history_declined_metadata(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        self.history_declined_in_domain(peer, author, true)
+    }
+    fn history_declined_in_domain(
+        &self,
+        peer: &Digest32,
+        author: &Digest32,
+        metadata: bool,
+    ) -> Result<Option<(Digest32, Digest32, u64, u64)>> {
+        let key = if metadata {
+            metadata_decline_key(peer, author)
+        } else {
+            declined_head_key(peer, author)
+        };
         let Some(id) = Source::Batch(self.batch).number(
             self.sek,
             self.channel,
@@ -1173,8 +1280,52 @@ impl Write<'_, '_> {
         peer_incarnation: u64,
         author_incarnation: u64,
     ) -> Result<()> {
+        self.keep_history_declined_in_domain(
+            peer,
+            author,
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+            false,
+        )
+    }
+    pub(crate) fn keep_history_declined_metadata(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+        authorization: Digest32,
+        peer_incarnation: u64,
+        author_incarnation: u64,
+    ) -> Result<()> {
+        self.keep_history_declined_in_domain(
+            peer,
+            author,
+            head,
+            authorization,
+            peer_incarnation,
+            author_incarnation,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Existing exact refusal tuple plus private domain.
+    fn keep_history_declined_in_domain(
+        &mut self,
+        peer: Digest32,
+        author: Digest32,
+        head: Digest32,
+        authorization: Digest32,
+        peer_incarnation: u64,
+        author_incarnation: u64,
+        metadata: bool,
+    ) -> Result<()> {
         self.require_sparse_idle()?;
-        let key = declined_head_key(&peer, &author);
+        let key = if metadata {
+            metadata_decline_key(&peer, &author)
+        } else {
+            declined_head_key(&peer, &author)
+        };
         let root = self.directory.active.sparse.declined_heads;
         let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
         let mut e = Encoder::new();
@@ -1871,6 +2022,41 @@ impl Write<'_, '_> {
         self.directory.active.sparse.ranges =
             self.change_value(root, key, Some(Value::Number(id)))?;
         Ok(())
+    }
+    /// Cache only a fully verified proof node or a deterministic reconstruction from
+    /// independently committed canonical sources. This does not change prefix acceptance.
+    pub(crate) fn keep_history_proof_range(
+        &mut self,
+        head: Digest32,
+        binding: TreeBinding,
+        start: u64,
+        descriptor: Descriptor,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        if binding.room != *self.channel {
+            return Err(invalid("proof-serving range room"));
+        }
+        descriptor.validate()?;
+        let key = proof_range_key(&head, binding, start, descriptor.leaves)?;
+        if let Some(id) = Source::Batch(self.batch).number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.objects,
+            &object_key(ObjectKind::ProofRange, &key),
+        )? {
+            let bytes =
+                Source::Batch(self.batch).sparse_record(self.sek, self.channel, id, STATE_BYTES)?;
+            if decode_proof_range(&bytes, &head, binding, start, descriptor.leaves)? != descriptor {
+                return Err(invalid("conflicting proof-serving range"));
+            }
+            return Ok(());
+        }
+        let mut e = Encoder::new();
+        e.array(5).uint(1).bytes(&head);
+        binding.encode(&mut e);
+        e.uint(start);
+        descriptor.encode(&mut e);
+        self.save_history_object(ObjectKind::ProofRange, key, &e.finish())
     }
     fn save_sparse_author(&mut self, binding: TreeBinding, state: AuthorState) -> Result<()> {
         if binding.room != *self.channel {
