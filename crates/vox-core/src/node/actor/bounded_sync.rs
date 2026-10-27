@@ -2858,6 +2858,13 @@ impl Node {
                         // inventory and recreates the feedback churn the bounded inbox removed.
                         port.req_done = port.req_done.max(work.request);
                     }
+                    if flow.local_own_after_inventory {
+                        // This completed inventory was the producer that deferred an eligible
+                        // local metadata root. Refused/equal roots never set this scalar, so
+                        // ordinary inventories cannot turn parked debt into periodic reoffers.
+                        port.raise();
+                        raised = true;
+                    }
                     if self
                         .bounded_sync
                         .ready
@@ -3507,6 +3514,9 @@ impl Node {
                         ) {
                             Ok(mut flow) => {
                                 flow.reason = reason;
+                                flow.local_own_after_inventory = flow.inventory
+                                    && announce_first
+                                    && (own_verification.is_some() || own_discovery.is_some());
                                 if let Some(at) = required_at {
                                     let _ = self.bounded_sync.required.remove(at);
                                 }
@@ -3592,6 +3602,9 @@ impl Node {
                     ) {
                         Ok(mut flow) => {
                             flow.reason = reason;
+                            flow.local_own_after_inventory = flow.inventory
+                                && announce_first
+                                && (own_verification.is_some() || own_discovery.is_some());
                             if let Some(at) = required_at {
                                 let _ = self.bounded_sync.required.remove(at);
                             }

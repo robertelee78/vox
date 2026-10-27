@@ -195,6 +195,9 @@ pub(crate) struct Flow {
     /// Canonical local recovery proof root, not a consumed advisory inbox item.
     pub(crate) local_own_verification: bool,
     pub(crate) local_own_discovery: bool,
+    /// A newly constructed inventory took precedence over an already eligible local probe.
+    /// Its real completion owns exactly one subsequent port request.
+    pub(crate) local_own_after_inventory: bool,
     discovery_reply: Option<(super::HeadHint, u64)>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
@@ -424,6 +427,7 @@ impl Flow {
             hint,
             local_own_verification,
             local_own_discovery,
+            local_own_after_inventory: false,
             discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
@@ -584,6 +588,7 @@ impl Flow {
             hint: None,
             local_own_verification: false,
             local_own_discovery: false,
+            local_own_after_inventory: false,
             discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
