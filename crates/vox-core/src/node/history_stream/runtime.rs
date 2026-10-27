@@ -303,7 +303,7 @@ pub(crate) struct Flow {
     retirement_request: RequestId,
     request: RequestId,
     cleanup_store: Arc<Store>,
-    failed_settlement: Option<crate::node::store::ReceivedDebt>,
+    failed_settlement: Option<crate::node::store::ReceivedSettlement>,
     cleanup_budget: Arc<crate::node::history_budget::Budget>,
     actor_incarnation: Option<u64>,
     cleanup_after: Option<[u8; 64]>,
@@ -1121,9 +1121,33 @@ impl Flow {
             self.cancel();
             return Ok(RetirementStep::Done);
         }
-        let debt = self.received.debt(&self.cleanup_store)?;
-        if let Err(error) = self.settle_received(Arc::clone(&self.cleanup_store)).await {
-            self.failed_settlement = debt;
+        let store = Arc::clone(&self.cleanup_store);
+        let received = self.received.clone();
+        let target = tokio::task::spawn_blocking(move || store.received_settlement(&received))
+            .await
+            .map_err(|_| Error::Unreachable("history settlement snapshot worker stopped"))?;
+        let result = if let Some(debt) = target.debt.clone() {
+            self.settle_received_debt(Arc::clone(&self.cleanup_store), debt)
+                .await
+        } else if target.replacement_pending {
+            let store = Arc::clone(&self.cleanup_store);
+            tokio::task::spawn_blocking(move || store.finish_received_replacement())
+                .await
+                .map_err(|_| Error::Unreachable("history replacement worker stopped"))?
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            let store = Arc::clone(&self.cleanup_store);
+            let received = self.received.clone();
+            let mut failed =
+                tokio::task::spawn_blocking(move || store.received_settlement(&received))
+                    .await
+                    .map_err(|_| {
+                        Error::Unreachable("history settlement snapshot worker stopped")
+                    })?;
+            failed.debt = target.debt;
+            self.failed_settlement = Some(failed);
             return Err(error);
         }
         // A published current body queues only local exact-request reclamation. If its peer
@@ -1329,11 +1353,10 @@ impl Flow {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
         let shared = Arc::clone(&self.shared);
         let settlement = self.failed_settlement.clone();
-        let store = Arc::clone(&self.cleanup_store);
         Box::pin(async move {
-            if let Some(debt) = settlement {
+            if let Some(settlement) = settlement {
                 tokio::select! {
-                    () = store.wait_received_settled(debt) => return,
+                    () = settlement.settled() => return,
                     () = async {
                         loop {
                             let wake = {
@@ -1397,6 +1420,14 @@ impl Flow {
         let Some(debt) = self.received.debt(&store)? else {
             return Ok(());
         };
+        self.settle_received_debt(store, debt).await
+    }
+
+    async fn settle_received_debt(
+        &self,
+        store: Arc<Store>,
+        debt: crate::node::store::ReceivedDebt,
+    ) -> Result<()> {
         let room = self.room;
         let peer = self.peer;
         tokio::task::spawn_blocking(move || {

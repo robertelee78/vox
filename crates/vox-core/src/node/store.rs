@@ -252,7 +252,6 @@ fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
 #[derive(Debug)]
 struct ReceivedOwner {
     room: Digest32,
-    settled: Arc<tokio::sync::Notify>,
 }
 
 /// One exact flow's latest received transaction. Pointer identity distinguishes concurrent lanes,
@@ -263,7 +262,6 @@ struct PendingReceived {
     through: u64,
 }
 
-#[derive(Default)]
 struct Epochs {
     /// Identity for every transaction. Exhaustion is rejected before commit, never after it.
     next_transaction: u64,
@@ -273,6 +271,50 @@ struct Epochs {
     /// yet been synced. This debt survives reopen or directory-sync failure and gates every
     /// later write and acknowledgement until the exact replacement becomes durable.
     replacement: bool,
+    replacement_generation: u64,
+    replacement_completed: u64,
+    durable_changed: tokio::sync::watch::Sender<(u64, u64)>,
+}
+
+impl Default for Epochs {
+    fn default() -> Self {
+        Self {
+            next_transaction: 0,
+            durable_through: 0,
+            pending: Vec::new(),
+            replacement: false,
+            replacement_generation: 0,
+            replacement_completed: 0,
+            durable_changed: tokio::sync::watch::channel((0, 0)).0,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ReceivedSettlement {
+    pub(crate) debt: Option<ReceivedDebt>,
+    pub(crate) replacement_pending: bool,
+    replacement: u64,
+    changed: tokio::sync::watch::Receiver<(u64, u64)>,
+}
+
+impl ReceivedSettlement {
+    pub(crate) async fn settled(mut self) {
+        loop {
+            let (through, replacement) = *self.changed.borrow_and_update();
+            if self
+                .debt
+                .as_ref()
+                .is_none_or(|debt| through >= debt.through)
+                && replacement >= self.replacement
+            {
+                return;
+            }
+            if self.changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// An exact room/flow/transaction durability obligation. A stale token is a no-op; it can never
@@ -404,10 +446,7 @@ pub(crate) struct ReceivedFlow {
 impl ReceivedFlow {
     pub(crate) fn new(room: Digest32) -> Self {
         Self {
-            owner: Arc::new(ReceivedOwner {
-                room,
-                settled: Arc::new(tokio::sync::Notify::new()),
-            }),
+            owner: Arc::new(ReceivedOwner { room }),
         }
     }
 
@@ -781,6 +820,14 @@ impl Store {
             let _ = std::fs::remove_file(&fresh_path);
             return Err(e);
         }
+        let replacement_generation =
+            epochs
+                .replacement_generation
+                .checked_add(1)
+                .ok_or(Error::Storage {
+                    op: "replace store",
+                    detail: "store replacement generation exhausted".into(),
+                })?;
         // Release the old file, then replace it.
         drop(std::mem::replace(&mut *backing, Backing::Closed));
         if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
@@ -798,6 +845,7 @@ impl Store {
         // backing closed; a failed directory sync leaves it writable; both refuse a false peer
         // acknowledgement and are retried by the next writer.
         epochs.replacement = true;
+        epochs.replacement_generation = replacement_generation;
         *backing =
             Backing::Writable(self.keep_profile(open_database(&self.path).map_err(open_error)?));
         drop(backing);
@@ -831,6 +879,7 @@ impl Store {
         // writer and every pending-received acknowledgement comes back through this exact step.
         super::paths::sync_dir(&self.path)?;
         epochs.replacement = false;
+        epochs.replacement_completed = epochs.replacement_generation;
         Self::settle_durable_through(epochs, epochs.next_transaction);
         Ok(true)
     }
@@ -1276,22 +1325,30 @@ impl Store {
         }))
     }
 
-    /// Wait for a successful durable commit to cover this exact captured debt.
-    pub(crate) async fn wait_received_settled(&self, debt: ReceivedDebt) {
-        loop {
-            let mut wake = Box::pin(Arc::clone(&debt.owner.settled).notified_owned());
-            wake.as_mut().enable();
-            if self
-                .writer
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .durable_through
-                >= debt.through
-            {
-                return;
-            }
-            wake.await;
+    /// Capture without attempting fallible replacement completion. The returned watch is
+    /// subscribed under the same writer that publishes successful durability changes.
+    pub(crate) fn received_settlement(&self, flow: &ReceivedFlow) -> ReceivedSettlement {
+        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let debt = epochs
+            .pending
+            .iter()
+            .find(|pending| Arc::ptr_eq(&pending.owner, &flow.owner))
+            .map(|pending| ReceivedDebt {
+                owner: Arc::clone(&pending.owner),
+                through: pending.through,
+            });
+        ReceivedSettlement {
+            debt,
+            replacement_pending: epochs.replacement,
+            replacement: epochs.replacement_generation,
+            changed: epochs.durable_changed.subscribe(),
         }
+    }
+
+    pub(crate) fn finish_received_replacement(&self) -> Result<()> {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
+        Ok(())
     }
 
     /// Flush one exact receive-owned transaction. If another durable commit already covered
@@ -1383,9 +1440,9 @@ impl Store {
 
     fn settle_durable_through(epochs: &mut Epochs, through: u64) {
         epochs.durable_through = epochs.durable_through.max(through);
-        for pending in &epochs.pending {
-            pending.owner.settled.notify_waiters();
-        }
+        epochs
+            .durable_changed
+            .send_replace((epochs.durable_through, epochs.replacement_completed));
         epochs
             .pending
             .retain(|pending| pending.through > epochs.durable_through);
