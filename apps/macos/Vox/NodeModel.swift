@@ -3929,8 +3929,19 @@ final class NodeModel: ObservableObject {
     /// Resume the same window after its owner has unlocked the node. Credentials and
     /// the unlock mutation belong to AppModel; this only restores observation.
     func resumeAfterUnlock(currentOwner: @MainActor () -> Bool) async throws -> Bool {
+        guard currentOwner(), !Task.isCancelled else { return false }
+        // Reattachment can arrive without an observer-end callback (for example, forgetting
+        // a passphraseless node). Retire old private authority before the first await.
+        observationNeedsRestart = true
+        ended = "Refreshing node \(node) after unlock."
+        peerStateKnown = false
+        nodeObservationEpoch = UUID()
+        roomReadGeneration = UUID()
+        let snapshot = showingSession ? [] : messages
+        releaseHistoryViews()
+        messages = snapshot
+        if case .room = selection { roomNeedsPage = true } else { roomNeedsPage = false }
         let epoch = nodeObservationEpoch
-        guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
         let fresh = try await client.nodes()
         guard currentOwner(), nodeObservationEpoch == epoch, !Task.isCancelled else { return false }
         guard fresh.first(where: { $0.name == node })?.status == "Ready" else { return false }
@@ -4123,6 +4134,12 @@ extension NodeModel {
         }
     }
 
+    private func sessionProjectionChanged(_ error: Error) -> Bool {
+        guard case let VoxError.Failed(reason) = error else { return false }
+        return reason == "the room's Sessions changed; refresh the listing"
+            || reason == "stream refused: the room's Session activity changed; refresh the page"
+    }
+
     /// A failed protected read cannot authorize old bodies. Losing a loaded window also
     /// invalidates its paging, independently of which read reported the refusal.
     private func discardSessionWindow(after error: Error, requiresReload: Bool = false) {
@@ -4247,9 +4264,7 @@ extension NodeModel {
             guard current() else { return }
             // The daemon uses this refusal for both a changed room instance and a changed
             // Session projection. Neither authorizes the old room page or its controls.
-            if case let VoxError.Failed(reason) = error,
-               (reason == "the room's Sessions changed; refresh the listing"
-                || reason == "stream refused: the room's Session activity changed; refresh the page") {
+            if sessionProjectionChanged(error) {
                 await stopped(.sessionChanged)
                 return
             }
@@ -4310,6 +4325,10 @@ extension NodeModel {
                   ended == nil, !observationNeedsRestart, !roomNeedsPage,
                   shownSession?.nodeFingerprint == s.nodeFingerprint,
                   shownSession?.sessionId == s.sessionId, shownSession?.opening == s.opening else { return }
+            if sessionProjectionChanged(error) {
+                await stopped(.sessionChanged)
+                return
+            }
             discardSessionWindow(after: error, requiresReload: true)
         }
     }
@@ -4364,6 +4383,10 @@ extension NodeModel {
             }
         } catch {
             guard currentContext() else { return }
+            if sessionProjectionChanged(error) {
+                await stopped(.sessionChanged)
+                return
+            }
             selectedEarlierRequest = nil
             reportBackground(error)
         }
