@@ -213,7 +213,7 @@ pub struct Cursor {
 }
 
 /// The exact entry already admitted to the room, retained through staging cleanup.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AdmittedEntry {
     pub entry: Digest32,

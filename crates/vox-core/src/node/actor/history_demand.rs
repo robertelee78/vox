@@ -8,7 +8,7 @@ use crate::node::api::{
 };
 use crate::node::channel::legacy_provisional::LegacyProvisionalOwner;
 use crate::node::channel::{entry_store::sparse::ObjectKind, ChannelState};
-use crate::node::history_budget::{BytePressure, Job, Lane, Ticket};
+use crate::node::history_budget::{Job, Lane, Ticket};
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
 use crate::node::history_stream::{self as stream, Query, RequestId, Staging};
 use crate::node::store::Store;
@@ -126,6 +126,7 @@ struct ResumeOwed {
     wake_fence: Option<Arc<Fence>>,
     waiting_bytes: bool,
     private: Option<bool>,
+    local_admitted: Option<demand::AdmittedEntry>,
 }
 
 impl Drop for ResumeOwed {
@@ -156,6 +157,33 @@ impl Drop for RouteLockWait {
     }
 }
 
+struct AutoProbe {
+    room: Digest32,
+    shared: Weak<Mutex<ChannelState>>,
+    intent: u64,
+    fence: Arc<Fence>,
+    result: Arc<
+        StdMutex<
+            Option<
+                Result<
+                    Option<([u8; 16], RequestId, demand::AdmittedEntry)>,
+                    (Option<[u8; 16]>, String),
+                >,
+            >,
+        >,
+    >,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+struct AutoWait {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for AutoWait {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Controller {
     next: u64,
@@ -176,6 +204,11 @@ pub(super) struct Controller {
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
     resume_owed: Option<ResumeOwed>,
     route_lock_wait: Option<RouteLockWait>,
+    auto_intent: u64,
+    auto_pending: std::collections::BTreeMap<Digest32, u64>,
+    auto_ticket: Option<Ticket>,
+    auto_wait: Option<AutoWait>,
+    auto_probe: Option<AutoProbe>,
 }
 impl Controller {
     /// Retire only the exact unstarted page when its captured trust generation changes.
@@ -201,6 +234,16 @@ impl Controller {
             "Authorization changed. Request this history page again under current access.",
         )
         .then_some((room, peer, instance, request, generation))
+    }
+
+    fn cancel_auto_recovery(&mut self) {
+        self.auto_intent = self.auto_intent.wrapping_add(1);
+        self.auto_pending.clear();
+        self.auto_ticket = None;
+        self.auto_wait = None;
+        if let Some(probe) = &self.auto_probe {
+            probe.fence.retire();
+        }
     }
 
     fn clear_resume_owed(&mut self) {
@@ -231,6 +274,7 @@ impl Controller {
             wake_fence: None,
             waiting_bytes: false,
             private: None,
+            local_admitted: None,
         });
     }
 
@@ -464,6 +508,15 @@ impl Controller {
         true
     }
     pub(super) fn retire_room(&mut self, room: Digest32) {
+        self.auto_pending.remove(&room);
+        if let Some(probe) = self.auto_probe.as_ref().filter(|probe| probe.room == room) {
+            probe.fence.retire();
+        }
+        if self.auto_pending.is_empty() && self.auto_probe.is_none() {
+            self.auto_ticket = None;
+            self.auto_wait = None;
+        }
+
         if self
             .resume_owed
             .as_ref()
@@ -524,6 +577,9 @@ impl Controller {
 
     /// Stop admission synchronously; the lock settling task then owns and retires this controller.
     pub(super) fn fence(&self) {
+        if let Some(probe) = &self.auto_probe {
+            probe.fence.retire();
+        }
         if let Some(fence) = self
             .resume_owed
             .as_ref()
@@ -543,6 +599,12 @@ impl Controller {
 
     /// Called before lock/shutdown reports completion. No queued event owns a secret context.
     pub(super) async fn retire(&mut self) {
+        self.cancel_auto_recovery();
+        if let Some(mut probe) = self.auto_probe.take() {
+            if let Some(task) = probe.task.take() {
+                let _ = task.await;
+            }
+        }
         self.clear_resume_owed();
         if let Some(running) = self.running.take() {
             running.fence.retire();
@@ -633,6 +695,277 @@ pub(crate) fn saved_status(
 }
 
 impl Node {
+    /// Inspect the single saved archive slot once for each newly opened room.
+    pub(super) fn request_admitted_recovery(&mut self, room: Digest32) {
+        self.history_demand
+            .auto_pending
+            .insert(room, self.history_demand.auto_intent);
+    }
+
+    fn wait_admitted_recovery(
+        &mut self,
+        wait: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::clone(&done);
+        let wake = Arc::clone(&self.bounded_completion_wake);
+        let task = tokio::spawn(async move {
+            wait.await;
+            finished.store(true, std::sync::atomic::Ordering::Release);
+            wake.notify_one();
+        });
+        self.history_demand.auto_wait = Some(AutoWait { done, task });
+    }
+
+    /// Report an admission error against the room instance without waiting on the actor.
+    fn report_admitted_recovery_error(
+        &mut self,
+        room: Digest32,
+        shared: Arc<Mutex<ChannelState>>,
+        store: Arc<Store>,
+        intent: u64,
+        reason: String,
+    ) {
+        let fence = Fence::new();
+        let worker_fence = Arc::clone(&fence);
+        let weak = Arc::downgrade(&shared);
+        let result = Arc::new(StdMutex::new(None));
+        let output = Arc::clone(&result);
+        let wake = Arc::clone(&self.bounded_completion_wake);
+        let task = tokio::spawn(async move {
+            let channel = tokio::select! {
+                biased;
+                () = worker_fence.retired() => { if let Ok(mut out) = output.lock() { *out = Some(Ok(None)); } wake.notify_one(); return; },
+                channel = shared.lock() => channel,
+            };
+            let instance = channel.history_instance(&store).ok();
+            if let Ok(mut out) = output.lock() {
+                *out = Some(Err((instance, reason)));
+            }
+            drop(channel);
+            wake.notify_one();
+        });
+        self.history_demand.auto_pending.remove(&room);
+        self.history_demand.auto_probe = Some(AutoProbe {
+            room,
+            shared: weak,
+            intent,
+            fence,
+            result,
+            task: Some(task),
+        });
+    }
+
+    /// Accept an exact local recovery or admit one bounded off-actor inspection.
+    pub(super) fn advance_admitted_recovery(&mut self) {
+        if let Some(probe) = self.history_demand.auto_probe.as_ref() {
+            if !probe.fence.is_retired()
+                && probe.intent == self.history_demand.auto_intent
+                && (self.history_demand.preparing.is_some()
+                    || self.history_demand.running.is_some()
+                    || self.history_demand.ready.is_some()
+                    || self.history_demand.private_work.is_some()
+                    || self.history_demand.resume_owed.is_some())
+            {
+                return;
+            }
+            let result = probe
+                .result
+                .lock()
+                .ok()
+                .and_then(|mut result| result.take());
+            let Some(result) = result else {
+                return;
+            };
+            let room = probe.room;
+            let current_probe =
+                !probe.fence.is_retired() && probe.intent == self.history_demand.auto_intent;
+            let old_room = probe.shared.upgrade();
+            self.history_demand.auto_probe = None;
+            let current = self.channels.get(&room);
+            if current_probe
+                && old_room
+                    .as_ref()
+                    .zip(current)
+                    .is_some_and(|(old, current)| Arc::ptr_eq(old, current))
+                && self.history_demand.preparing.is_none()
+                && self.history_demand.running.is_none()
+                && self.history_demand.ready.is_none()
+                && self.history_demand.private_work.is_none()
+                && self.history_demand.resume_owed.is_none()
+            {
+                match result {
+                    Ok(Some((instance, request, admitted))) => {
+                        let mut pending = status(
+                            room,
+                            instance,
+                            Phase::Preparing,
+                            "Recovering the admitted history entry locally.",
+                        );
+                        pending.request = Some(request);
+                        self.history_demand.owner_status = Some(pending);
+                        self.history_demand.owe_resume(room, instance, request);
+                        if let Some(owed) = self.history_demand.resume_owed.as_mut() {
+                            owed.private = Some(false);
+                            owed.local_admitted = Some(admitted);
+                        }
+                        self.retry_owed_history_resume();
+                    }
+                    Ok(None) => {}
+                    Err((Some(instance), reason)) => {
+                        let detail =
+                            format!("Saved history recovery could not be inspected: {reason}");
+                        self.history_demand.observation =
+                            Some(status(room, instance, Phase::Unavailable, &detail));
+                        self.history_demand.observation_unread = true;
+                    }
+                    Err((None, reason)) => {
+                        eprintln!("vox: saved history recovery could not be inspected: {reason}");
+                    }
+                }
+            }
+        }
+        if self.history_demand.auto_probe.is_some()
+            || self.history_demand.auto_pending.is_empty()
+            || self.history_demand.preparing.is_some()
+            || self.history_demand.running.is_some()
+            || self.history_demand.ready.is_some()
+            || self.history_demand.private_work.is_some()
+            || self.history_demand.resume_owed.is_some()
+        {
+            return;
+        }
+        if let Some(wait) = self.history_demand.auto_wait.as_ref() {
+            if !wait.done.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            self.history_demand.auto_wait = None;
+        }
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        let node = profile.fingerprint();
+        let store = profile.store_handle();
+        let Some((&room, &intent)) = self.history_demand.auto_pending.first_key_value() else {
+            return;
+        };
+        let Some(shared) = self.channels.get(&room).cloned() else {
+            self.history_demand.auto_pending.remove(&room);
+            self.bounded_completion_wake.notify_one();
+            return;
+        };
+        if self.history_demand.auto_ticket.is_none() {
+            self.history_demand.auto_ticket =
+                Some(self.history_budget.enqueue(node, Lane::Control));
+        }
+        let ticket = self
+            .history_demand
+            .auto_ticket
+            .as_mut()
+            .expect("ticket was installed");
+        let wake = ticket.wake();
+        let Some(job) = ticket.try_admit() else {
+            self.wait_admitted_recovery(wake);
+            return;
+        };
+        self.history_demand.auto_ticket = None;
+        let charge = match demand::AdmissionCharge::reserve(&job) {
+            Ok(charge) => charge,
+            Err(crate::error::Error::HistoryCapacity(pressure)) => {
+                drop(job);
+                self.wait_admitted_recovery(async move { (*pressure).released().await });
+                return;
+            }
+            Err(error) => {
+                self.report_admitted_recovery_error(room, shared, store, intent, error.to_string());
+                return;
+            }
+        };
+        let secret = match self.secret_work.clone().try_read_owned() {
+            Ok(secret) => Arc::new(secret),
+            Err(_) => {
+                drop(charge);
+                drop(job);
+                let secret = self.secret_work.clone();
+                self.wait_admitted_recovery(async move {
+                    drop(secret.read_owned().await);
+                });
+                return;
+            }
+        };
+        let context = match Context::unlocked(profile, secret) {
+            Ok(context) => Arc::new(context),
+            Err(error) => {
+                self.report_admitted_recovery_error(room, shared, store, intent, error.to_string());
+                return;
+            }
+        };
+        let weak = Arc::downgrade(&shared);
+        let fence = Fence::new();
+        let worker_fence = Arc::clone(&fence);
+        let result = Arc::new(StdMutex::new(None));
+        let output = Arc::clone(&result);
+        let wake = Arc::clone(&self.bounded_completion_wake);
+        let task = tokio::spawn(async move {
+            let inspected = tokio::task::spawn_blocking(move || {
+                let saved = demand::inspect_precharged(&context, charge)
+                    .map_err(|error| error.to_string())?;
+                let value = saved.as_ref().and_then(|saved| {
+                    let state = saved.state();
+                    (state.binding.room == room
+                        && !matches!(
+                            state.progress(None),
+                            demand::Progress::Complete | demand::Progress::Cancelled
+                        ))
+                    .then_some((
+                        state.binding.instance,
+                        state.request,
+                        state.admitted?,
+                    ))
+                });
+                drop(saved);
+                drop(job);
+                Ok::<_, String>(value)
+            })
+            .await
+            .map_err(|_| "History recovery inspection stopped.".to_owned())
+            .and_then(|result| result);
+            let checked = match inspected {
+                Ok(None) => Ok(None),
+                inspected => {
+                    let channel = tokio::select! {
+                        biased;
+                        () = worker_fence.retired() => { if let Ok(mut out) = output.lock() { *out = Some(Ok(None)); } wake.notify_one(); return; },
+                        channel = shared.lock() => channel,
+                    };
+                    match (channel.history_instance(&store), inspected) {
+                        (Ok(current), Ok(Some((instance, request, admitted))))
+                            if current == instance =>
+                        {
+                            Ok(Some((instance, request, admitted)))
+                        }
+                        (Ok(_), Ok(_)) => Ok(None),
+                        (Ok(current), Err(error)) => Err((Some(current), error)),
+                        (Err(error), _) => Err((None, error.to_string())),
+                    }
+                }
+            };
+            if let Ok(mut out) = output.lock() {
+                *out = Some(checked);
+            }
+            wake.notify_one();
+        });
+        self.history_demand.auto_pending.remove(&room);
+        self.history_demand.auto_probe = Some(AutoProbe {
+            room,
+            shared: weak,
+            intent,
+            fence,
+            result,
+            task: Some(task),
+        });
+    }
+
     /// Move an unstarted public page to a connected trusted room member without replacing
     /// its exact request, authorization, staging or bounds. No physical Flow has consumed it.
     pub(super) fn reroute_unstarted_history(&mut self) {
@@ -862,7 +1195,7 @@ impl Node {
             // A stale selector cannot cancel the exact accepted action already waiting here.
             return Err("The requested resume does not match the retained history request.".into());
         }
-        self.begin_history_demand_with_job(room, instance, action, None, None)
+        self.begin_history_demand_with_job(room, instance, action, None, None, None)
     }
 
     fn begin_history_demand_with_job(
@@ -872,6 +1205,7 @@ impl Node {
         action: Action,
         admitted: Option<Job>,
         resume_private: Option<bool>,
+        local_admitted: Option<demand::AdmittedEntry>,
     ) -> Result<Status, String> {
         self.accept_history_demand();
         if matches!(action, Action::Status) {
@@ -1047,12 +1381,14 @@ impl Node {
                 Ok(()) => {}
                 Err(crate::error::Error::HistoryCapacity(pressure)) => {
                     drop(job);
-                    return Ok(self.retain_resume_bytes(
+                    return Ok(self.retain_resume_wait(
                         room,
                         instance,
                         request,
                         resume_private,
-                        pressure,
+                        local_admitted,
+                        Box::pin(async move { (*pressure).released().await }),
+                        "Waiting for local history preparation buffer capacity.",
                     ));
                 }
                 Err(error) => return Err(error.to_string()),
@@ -1091,12 +1427,28 @@ impl Node {
         } else {
             None
         };
-        let secret_work = Arc::new(
-            self.secret_work
-                .clone()
-                .try_read_owned()
-                .map_err(|_| "Node secret work is settling; history was not started.")?,
-        );
+        let secret_work = match self.secret_work.clone().try_read_owned() {
+            Ok(guard) => Arc::new(guard),
+            Err(_) => {
+                if let (Action::Resume { request }, Some(expected)) = (action, local_admitted) {
+                    drop(resume_admission);
+                    drop(job);
+                    let secret = self.secret_work.clone();
+                    return Ok(self.retain_resume_wait(
+                        room,
+                        instance,
+                        request,
+                        resume_private,
+                        Some(expected),
+                        Box::pin(async move {
+                            drop(secret.read_owned().await);
+                        }),
+                        "Waiting for the node's local history access.",
+                    ));
+                }
+                return Err("Node secret work is settling; history was not started.".into());
+            }
+        };
         let context = Arc::new(Context::unlocked(profile, secret_work).map_err(|e| e.to_string())?);
         let store = profile.store_handle();
         let prior_private = if let Some(request) = cancel_request {
@@ -1156,6 +1508,7 @@ impl Node {
                                 let state = saved.state();
                                 state.request == request && state.binding.room == room
                                     && state.binding.instance == instance && state.admitted.is_some()
+                                    && local_admitted.is_none_or(|expected| state.admitted == Some(expected))
                                     && !matches!(state.progress(None), demand::Progress::Cancelled | demand::Progress::Complete)
                             });
                             drop(saved);
@@ -1194,7 +1547,7 @@ impl Node {
                     }
                     let answer = match (room_guard, resume_inspect) {
                         (_, Some(credit)) => classify_resume(node, room, instance, action, context, credit),
-                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, connected_peers, weak, read_fence.clone(), now, deadline, selection_after, resume_admission),
+                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, connected_peers, weak, read_fence.clone(), now, deadline, selection_after, resume_admission, local_admitted),
                         (None, None) => prepare_local(
                             node,
                             room,
@@ -1238,6 +1591,9 @@ impl Node {
         // so they cannot relabel an old result as the newer attempted action.
         if !matches!(action, Action::Status) {
             // Only this fully admitted replacement action may retire an older exact waiter.
+            if local_admitted.is_none() {
+                self.history_demand.cancel_auto_recovery();
+            }
             self.history_demand.clear_resume_owed();
         }
         let origin = if matches!(action, Action::Status) {
@@ -1265,13 +1621,15 @@ impl Node {
 
     /// A refused complete Resume admission retains only identity and a resource dependency.
     /// No Context, room lock, Job or allocation can cross into this waiter.
-    fn retain_resume_bytes(
+    fn retain_resume_wait(
         &mut self,
         room: Digest32,
         instance: [u8; 16],
         request: RequestId,
         private: Option<bool>,
-        pressure: Box<BytePressure>,
+        local_admitted: Option<demand::AdmittedEntry>,
+        wait: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        detail: &str,
     ) -> Status {
         self.history_demand.clear_resume_owed();
         let mut pending = self
@@ -1287,7 +1645,7 @@ impl Node {
             .unwrap_or_else(|| status(room, instance, Phase::Preparing, ""));
         pending.request = Some(request);
         pending.phase = Phase::Preparing;
-        pending.detail = "Waiting for local history preparation buffer capacity.".into();
+        pending.detail = detail.into();
         self.history_demand.owner_status = Some(pending.clone());
         self.history_demand.observation = None;
         self.history_demand.observation_unread = false;
@@ -1298,7 +1656,7 @@ impl Node {
             tokio::select! {
                 biased;
                 () = wake_fence.retired() => return,
-                () = (*pressure).released() => {}
+                () = wait => {}
             }
             let _ = tx
                 .send(NetEvent::HistoryResumeReady {
@@ -1318,6 +1676,7 @@ impl Node {
             wake_fence: Some(fence),
             waiting_bytes: true,
             private,
+            local_admitted,
         });
         pending
     }
@@ -1369,6 +1728,7 @@ impl Node {
                 },
                 Some(job),
                 owed.private,
+                owed.local_admitted,
             );
             if self.history_demand.preparing.is_none() && self.history_demand.resume_owed.is_none()
             {
@@ -2104,6 +2464,7 @@ fn prepare(
     deadline: tokio::time::Instant,
     selection_after: Option<Digest32>,
     mut resume_admission: Option<demand::ResumeAdmission>,
+    local_admitted: Option<demand::AdmittedEntry>,
 ) -> Result<Prepared, String> {
     let id = room.channel_id();
     if room.history_instance(store).map_err(|e| e.to_string())? != instance
@@ -2175,6 +2536,16 @@ fn prepare(
         {
             cancel_exact(&context, state.request, job, &fence, deadline)?;
             saved = None;
+        }
+    }
+    if let Some(expected) = local_admitted {
+        if !saved.as_ref().is_some_and(|saved| {
+            saved.state().admitted == Some(expected)
+                && matches!(action, Action::Resume { request } if saved.state().request == request)
+                && saved.state().binding.room == id
+                && saved.state().binding.instance == instance
+        }) {
+            return Err("The local history recovery selection changed.".into());
         }
     }
     if let Some(saved) = saved.as_ref() {
