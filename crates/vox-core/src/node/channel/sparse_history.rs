@@ -890,8 +890,20 @@ impl ChannelState {
         let late = read.child_after(&hash, None)?.is_some();
         drop(read);
         let mut batch = store.received_batch(received)?;
-        // Received source entries, promoted (ADR-038 FX-30): flushed before this node
-        // acknowledges them; their semantic effects follow in `advance_history_effect`.
+        // The source publication can immediately update the in-memory consent projection,
+        // before a later history-effect turn. Persist the ruled control/key entry with that
+        // publication so a crash cannot undo a consent the room has already observed.
+        if entry.skeleton.v2.as_ref().is_some_and(|v2| {
+            matches!(
+                v2.kind,
+                crate::log::history::SignedEntryKind::Governance
+                    | crate::log::history::SignedEntryKind::StepPolicy
+                    | crate::log::history::SignedEntryKind::KeyPackage
+            )
+        }) {
+            batch.ruled();
+        }
+        // Other received entries remain owned by this flow and are flushed before ACK.
         on_publish(&mut batch)?;
         let mut index = self
             .entries
