@@ -17,7 +17,7 @@ use crate::log::history::{
 };
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::{BufferCharge, Job};
-use crate::node::store::Store;
+use crate::node::store::{ReceivedDebt, Store};
 use crate::transport::stream_transport::Fence;
 
 use super::{Proof, ProofKind, RequestId};
@@ -82,6 +82,7 @@ enum ReadBoundary {
 
 #[derive(Clone)]
 pub(super) struct Source {
+    room_id: Digest32,
     pub(super) room: Arc<Mutex<ChannelState>>,
     pub(super) store: Arc<Store>,
     pub(super) epoch: u64,
@@ -98,6 +99,30 @@ pub(super) struct Source {
 }
 
 impl Source {
+    /// The exact user-visible received-entry acknowledgement armed by the FX-30 crash journey.
+    /// A two-field flow gate is not enough: only `<room> <peer> <entry>` can suppress inventory
+    /// and bind the mutant to the head receipt for that entry.
+    pub(super) fn received_ack_probe(&self) -> Option<(std::path::PathBuf, String)> {
+        #[cfg(feature = "test-knobs")]
+        {
+            let gate = std::path::PathBuf::from(std::env::var_os(
+                "VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE",
+            )?);
+            let armed = std::fs::read_to_string(&gate).ok()?;
+            let mut fields = armed.split_whitespace();
+            let room = fields.next()?;
+            let peer = fields.next()?;
+            let entry = fields.next()?.to_owned();
+            if fields.next().is_none()
+                && room == crate::node::link::b32_encode(&self.room_id)
+                && peer == crate::node::link::b32_encode(&self.peer)
+            {
+                return Some((gate, entry));
+            }
+        }
+        None
+    }
+
     #[cfg(feature = "test-knobs")]
     async fn hold_decline_for_proof(&self, author: Digest32, head: Digest32, request: RequestId) {
         const VARIABLE: &str = "VOX_TEST_HOLD_HISTORY_DECLINE_FILE";
@@ -193,6 +218,7 @@ impl Source {
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
+        room_id: Digest32,
         room: Arc<Mutex<ChannelState>>,
         store: Arc<Store>,
         epoch: u64,
@@ -203,6 +229,7 @@ impl Source {
         work_committed: Arc<AtomicBool>,
     ) -> Self {
         Self {
+            room_id,
             room,
             store,
             epoch,
@@ -647,6 +674,139 @@ impl Source {
 }
 
 impl Source {
+    /// Flush every exact received transaction fenced by the room snapshot which is about to be
+    /// acknowledged. The debts and advertised head are captured under the same room lock;
+    /// neither a stale source nor a later flow in this room can substitute its bytes for that
+    /// snapshot.
+    pub(super) async fn flush_received_before_ack(
+        &self,
+        debts: Vec<ReceivedDebt>,
+        _boundary: Option<Digest32>,
+    ) -> Result<()> {
+        if debts.is_empty() {
+            #[cfg(feature = "test-knobs")]
+            if std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("sparse-owner-not-recorded") {
+                if let (Some((gate, expected)), Some(boundary)) =
+                    (self.received_ack_probe(), _boundary)
+                {
+                    if crate::node::link::b32_encode(&boundary) == expected {
+                        let staged = std::fs::read_to_string(gate.with_extension("reached"))
+                            .map_err(|error| Error::Storage {
+                                op: "read sparse owner mutant boundary",
+                                detail: error.to_string(),
+                            })?;
+                        let mut fields = staged.split_whitespace();
+                        let room = crate::node::link::b32_encode(&self.room_id);
+                        let peer = crate::node::link::b32_encode(&self.peer);
+                        let staged_room = fields.next().unwrap_or_default();
+                        let staged_peer = fields.next().unwrap_or_default();
+                        let transaction = fields
+                            .next()
+                            .and_then(|field| field.parse::<u64>().ok())
+                            .filter(|transaction| *transaction > 0);
+                        if staged_room != room
+                            || staged_peer != peer
+                            || transaction.is_none()
+                            || fields.next().is_some()
+                        {
+                            return Err(Error::MalformedAtRest(
+                                "sparse owner mutant boundary differs from exact flow",
+                            ));
+                        }
+                        let Some(transaction) = transaction else {
+                            return Err(Error::MalformedAtRest(
+                                "sparse owner mutant transaction missing",
+                            ));
+                        };
+                        let store = Arc::clone(&self.store);
+                        let room_id = self.room_id;
+                        let peer_id = self.peer;
+                        tokio::task::spawn_blocking(move || {
+                            store.hold_unowned_received_ack(
+                                transaction,
+                                || {
+                                    std::fs::write(
+                                        gate.with_extension("ack-reached"),
+                                        format!("{room} {peer} {transaction} {expected}\n"),
+                                    )
+                                    .map_err(|error| {
+                                        Error::Storage {
+                                            op: "mark omitted sparse-owner acknowledgement",
+                                            detail: error.to_string(),
+                                        }
+                                    })
+                                },
+                                || {
+                                    crate::node::store::hold_after_received_flow_transaction(
+                                        transaction,
+                                        room_id,
+                                        peer_id,
+                                    )
+                                },
+                            )
+                        })
+                        .await
+                        .map_err(|_| Error::Unreachable("history flush worker stopped"))??;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let store = Arc::clone(&self.store);
+        let room = self.room_id;
+        let peer = self.peer;
+        let _probe = self.received_ack_probe();
+        tokio::task::spawn_blocking(move || {
+            for debt in debts {
+                store.flush_received_through_with(
+                    debt,
+                    |_debt| {
+                        #[cfg(feature = "test-knobs")]
+                        {
+                            if let Some((gate, expected)) = &_probe {
+                                let exact = format!(
+                                    "{} {}",
+                                    crate::node::link::b32_encode(&room),
+                                    crate::node::link::b32_encode(&peer)
+                                );
+                                let boundary = _boundary
+                                    .map(|hash| crate::node::link::b32_encode(&hash))
+                                    .unwrap_or_else(|| "-".to_owned());
+                                if boundary == *expected {
+                                    let reached = gate.with_extension("ack-reached");
+                                    std::fs::write(
+                                        &reached,
+                                        format!("{exact} {} {boundary}\n", _debt.transaction()),
+                                    )
+                                    .map_err(|error| {
+                                        Error::Storage {
+                                            op: "mark received acknowledgement boundary",
+                                            detail: error.to_string(),
+                                        }
+                                    })?;
+                                    if std::env::var("VOX_TEST_FX30_MUTANT").as_deref()
+                                        == Ok("received-ack-not-flushed")
+                                    {
+                                        // Isolated mutant: only this exact acknowledged transaction
+                                        // commits its empty flush boundary at Durability::None. The
+                                        // common post-commit hold lets the proof retain that exact
+                                        // crash image before any later writer can rescue it.
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(true)
+                    },
+                    |debt| crate::node::store::hold_after_received_flow_flush(debt, room, peer),
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Unreachable("history flush worker stopped"))?
+    }
+
     /// One bounded, charged scalar inventory. Every page rechecks current room access;
     /// the compact index is read without touching content bodies or walking the archive.
     pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
@@ -654,32 +814,55 @@ impl Source {
             crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
         )?;
         let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
+        let mut debts = Vec::new();
         let mut after = None;
         for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {
             self.current()?;
+            let exact_head_probe = self.received_ack_probe().is_some();
             let page = self
                 .read(job, 64 * 1024, move |room, store| {
-                    room.history_head_hints(store, after).map(Some)
+                    let page = room.history_head_hints(store, after)?;
+                    let page_debts = if !exact_head_probe {
+                        page.heads
+                            .iter()
+                            .map(|hint| room.received_debts_for_current(store, &hint.author))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
+                            .flatten()
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Some((page, page_debts)))
                 })
                 .await?;
             let Lookup::Found(page) = page else {
                 return Ok(Lookup::Busy);
             };
-            if hints.len() + page.value.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
+            let (page, page_debts) = page.value;
+            debts.extend(page_debts);
+            if hints.len() + page.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
                 return Err(Error::SizeLimitExceeded("inventory author bound"));
             }
-            hints.extend(page.value.heads.iter().map(|hint| super::HeadHint {
+            hints.extend(page.heads.iter().map(|hint| super::HeadHint {
                 author: hint.author,
                 size: hint.leaves,
                 head: hint.head,
             }));
-            match page.value.next {
+            match page.next {
                 Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
                 None => {
+                    // The exact acknowledgement proof needs the entry-bound Head response, not
+                    // an inventory hint that could settle the same debt first. Returning Busy is
+                    // causal staging compiled out of packaged builds; it publishes no verdict.
+                    if exact_head_probe {
+                        return Ok(Lookup::Busy);
+                    }
+                    self.flush_received_before_ack(debts, None).await?;
                     return Ok(Lookup::Found(Held {
                         value: hints,
                         _charge: charge,
-                    }))
+                    }));
                 }
                 _ => return Err(Error::MalformedAtRest("inventory cursor did not advance")),
             }

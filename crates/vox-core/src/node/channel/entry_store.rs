@@ -2490,6 +2490,7 @@ impl EntryIndex {
         let mut after = None;
         loop {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             if !writer.directory.active.sparse.enabled {
                 break;
@@ -2534,6 +2535,7 @@ impl EntryIndex {
             // durable Rebuilding directory throughout, never an apparently complete empty index.
             loop {
                 let mut batch = store.batch()?;
+                batch.derived();
                 let mut removed = 0;
                 for _ in 0..PROMOTION_ENTRIES {
                     let Some((id, _)) =
@@ -2558,6 +2560,7 @@ impl EntryIndex {
             let mut after = None;
             loop {
                 let mut batch = store.batch()?;
+                batch.derived();
                 let mut writer = self.write(&mut batch, sek, channel)?;
                 let mut bytes = 0usize;
                 let mut complete = false;
@@ -2591,6 +2594,7 @@ impl EntryIndex {
                 }
             }
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             writer.finish_rebuild()?;
             writer.seal()?;
@@ -2615,6 +2619,7 @@ impl EntryIndex {
     ) -> Result<Preparation> {
         let hidden = self.provisional_hidden.get();
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         let (current_ready, changed) = if hidden {
             match writer.directory.phase {
@@ -2988,6 +2993,7 @@ impl EntryIndex {
             return Err(invalid("legacy provisional cleanup pending"));
         }
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         if let Some(state) = writer.directory.legacy_provisional {
             if state.owner != owner {
@@ -3086,6 +3092,7 @@ impl EntryIndex {
         owner: LegacyProvisionalOwner,
     ) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         if writer
             .directory
@@ -3136,6 +3143,7 @@ impl EntryIndex {
         owner: LegacyProvisionalOwner,
     ) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         match writer.directory.legacy_provisional {
             None => return Ok(true),
@@ -3184,6 +3192,7 @@ impl EntryIndex {
         publication: Publication<'_>,
     ) -> Result<()> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         let state = writer
             .directory
@@ -3211,6 +3220,7 @@ impl EntryIndex {
         owner: LegacyProvisionalOwner,
     ) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         if writer
             .directory
@@ -3622,6 +3632,7 @@ impl EntryRead for Staging<'_> {
 impl EntryWrite for Staging<'_> {
     fn put(&mut self, entry: &Entry) -> Result<()> {
         let mut batch = self.store.batch()?;
+        batch.derived();
         let mut writer = self.index.write(&mut batch, self.sek, self.channel)?;
         writer.stage(entry)?;
         writer.seal()?;
@@ -3631,6 +3642,7 @@ impl EntryWrite for Staging<'_> {
     }
     fn remove(&mut self, author: &Digest32, seq: u64) -> Result<()> {
         let mut batch = self.store.batch()?;
+        batch.derived();
         let mut writer = self.index.write(&mut batch, self.sek, self.channel)?;
         writer.remove_staged(author, seq)?;
         writer.seal()?;

@@ -350,6 +350,9 @@ impl ChannelState {
             return Err(self.save_failure());
         }
         let mut batch = store.batch()?;
+        // The lane's writes are derived: heads, headers, contexts, cursors, receipts, windows,
+        // rebuilt from the proofs and the peers after a crash (ADR-038 FX-30).
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -445,6 +448,110 @@ impl ChannelState {
             return Ok(None);
         };
         read.history_head(&id)
+    }
+
+    /// Durability debts for every exact live flow which contributed a semantic effect for this
+    /// author's current history. Source-only work never enters this set. Each returned token
+    /// retains its creating Arc identity; no same-room lane can substitute for it.
+    pub(crate) fn received_debts_for_current(
+        &mut self,
+        store: &Store,
+        author: &Digest32,
+    ) -> Result<Vec<crate::node::store::ReceivedDebt>> {
+        let Some(owners) = self.received_tip_owners.remove(author) else {
+            return Ok(Vec::new());
+        };
+        let mut owners = owners.into_iter();
+        let mut pending = Vec::new();
+        let mut debts = Vec::new();
+        while let Some(owner) = owners.next() {
+            match owner.debt(store) {
+                Ok(Some(debt)) => {
+                    pending.push(owner);
+                    debts.push(debt);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    pending.push(owner);
+                    pending.extend(owners);
+                    self.received_tip_owners.insert(*author, pending);
+                    return Err(error);
+                }
+            }
+        }
+        if !pending.is_empty() {
+            self.received_tip_owners.insert(*author, pending);
+        }
+        Ok(debts)
+    }
+
+    /// Record one semantic receive under the exact flow which committed it. Repeated effects in
+    /// one bounded flow share one Store debt, so retain one Arc capability per author/flow.
+    pub(super) fn record_received_semantic_owner(
+        &mut self,
+        store: &Store,
+        author: Digest32,
+        owner: &crate::node::store::ReceivedFlow,
+    ) -> Result<()> {
+        // Terminal flow settlement often covers an earlier owner before this author is served.
+        // Prune those stale Arcs at the next semantic commit so a never-served author retains only
+        // concurrently live debts, not one handle per historical sync.
+        drop(self.received_debts_for_current(store, &author)?);
+        if owner.debt(store)?.is_none() {
+            return Ok(());
+        }
+        let owners = self.received_tip_owners.entry(author).or_default();
+        if !owners.iter().any(|known| known.same_owner(owner)) {
+            owners.push(owner.clone());
+        }
+        Ok(())
+    }
+
+    /// Sparse publication's semantic boundary. The proof marker identifies this exact source
+    /// entry and creating transaction; the isolated mutant removes only the owner publication.
+    pub(super) fn record_sparse_received_semantic_owner(
+        &mut self,
+        _store: &Store,
+        author: Digest32,
+        _hash: Digest32,
+        owner: &crate::node::store::ReceivedFlow,
+    ) -> Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if let Some(gate) = std::env::var_os("VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE") {
+            let gate = std::path::PathBuf::from(gate);
+            let armed = std::fs::read_to_string(&gate).unwrap_or_default();
+            let mut fields = armed.split_whitespace();
+            let room = fields.next().unwrap_or_default();
+            let _peer = fields.next();
+            let expected = fields.next().unwrap_or_default();
+            if fields.next().is_none()
+                && room == crate::node::link::b32_encode(&self.channel_id)
+                && expected == crate::node::link::b32_encode(&_hash)
+            {
+                let transaction = owner
+                    .debt(_store)?
+                    .ok_or(Error::MalformedAtRest("sparse semantic owner has no debt"))?
+                    .transaction();
+                std::fs::write(
+                    gate.with_extension("sparse-owner-reached"),
+                    format!(
+                        "{} {} {} {transaction}\n",
+                        room,
+                        crate::node::link::b32_encode(&author),
+                        expected
+                    ),
+                )
+                .map_err(|error| Error::Storage {
+                    op: "mark sparse received owner boundary",
+                    detail: error.to_string(),
+                })?;
+            }
+        }
+        #[cfg(feature = "test-knobs")]
+        if std::env::var("VOX_TEST_FX30_MUTANT").as_deref() == Ok("sparse-owner-not-recorded") {
+            return Ok(());
+        }
+        self.record_received_semantic_owner(_store, author, owner)
     }
 
     pub(crate) fn history_context(
@@ -763,6 +870,7 @@ impl ChannelState {
         committed: &std::sync::atomic::AtomicBool,
         entry: &Entry,
         now: crate::time::Ms,
+        received: &crate::node::store::ReceivedFlow,
         on_publish: impl FnOnce(&mut Batch<'_>) -> Result<()>,
     ) -> Result<()> {
         if self.poisoned {
@@ -781,7 +889,8 @@ impl ChannelState {
         }
         let late = read.child_after(&hash, None)?.is_some();
         drop(read);
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
+        // Other received source entries remain owned by this flow and flush before ACK.
         on_publish(&mut batch)?;
         let mut index = self
             .entries
@@ -810,6 +919,21 @@ impl ChannelState {
             entry,
             late,
         )?;
+        // Current consent/presence may become visible immediately at source publication, before
+        // the later effect turn. A newer current input can also change the causal sequence or
+        // historical revocation even when its displayed value stays the same. Keep those facts
+        // durable; duplicate, superseded and other-recipient key headers do not qualify.
+        // A consent target can be unknown at publication and become known through a later
+        // derived admission without an intervening flush. Its already-authenticated current
+        // input must therefore be durable before that admission can make it visible.
+        let durable_current = accepted.current_advanced
+            && matches!(
+                GovEntry::body_bound_to(entry),
+                Ok(GovBody::ConsentGrant(_) | GovBody::ConsentRevocation(_) | GovBody::Presence(_))
+            );
+        if durable_current {
+            batch.ruled();
+        }
         batch.commit()?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
@@ -891,6 +1015,7 @@ impl ChannelState {
             return Ok((false, after));
         }
         let mut batch = store.batch()?;
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -1065,6 +1190,7 @@ impl ChannelState {
         now: crate::time::Ms,
         body_expected: bool,
         historical: bool,
+        received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -1213,7 +1339,11 @@ impl ChannelState {
             }
             Err(error) => return Err(error),
         }
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
+        // The source transaction owns this entry's one received durability debt. Its semantic
+        // indexes/rendering rebuild from that durable source after a crash; only a governance or
+        // key-package effect below upgrades this batch to independently ruled durability.
+        batch.derived();
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
@@ -1253,10 +1383,24 @@ impl ChannelState {
                 kind,
                 SignedEntryKind::Governance | SignedEntryKind::StepPolicy
             ) {
+                // Current consent inputs were classified and, when they advanced, made durable
+                // in their source publication. Their later effect is derived bookkeeping; in
+                // particular a superseded older grant must not force a second full flush.
+                // Other governance can change authority in this turn and stays conservative.
+                if !matches!(
+                    GovEntry::body_bound_to(&entry),
+                    Ok(GovBody::ConsentGrant(_) | GovBody::ConsentRevocation(_))
+                ) {
+                    batch.ruled();
+                }
                 self.observe_governance_into(store, &mut batch, &entry, log)?;
             }
-            // The source publication has already recorded the governance hash, so the
-            // observer treats it as known. Publish presence at semantic settlement instead.
+            if kind == SignedEntryKind::KeyPackage && key_package_for(&entry, &self.me()) {
+                batch.ruled();
+            }
+            // Source publication has already recorded this governance hash, so the later
+            // `observe_governance_into` call treats it as known. Presence still needs its own
+            // semantic effect and restart index after this exact sparse position is finished.
             let presence_after = if let Ok(GovBody::Presence(presence)) =
                 GovEntry::body_bound_to(&entry)
             {
@@ -1389,7 +1533,15 @@ impl ChannelState {
         })();
         let (rendered, refill_pending, projection_deferred, body_unavailable, contiguous) =
             match applied {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    self.record_sparse_received_semantic_owner(
+                        store,
+                        entry.skeleton.author_id,
+                        *hash,
+                        received,
+                    )?;
+                    outcome
+                }
                 Err(error) => {
                     self.poison(&error);
                     #[cfg(feature = "test-knobs")]
@@ -1448,6 +1600,7 @@ impl ChannelState {
             return Ok(self.sparse_contiguous_pending.contains(author));
         }
         let mut batch = store.batch()?;
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -1518,6 +1671,7 @@ impl ChannelState {
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
         historical: bool,
+        received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -1566,10 +1720,19 @@ impl ChannelState {
                 Err(error) => return Err(error),
             }
         }
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
+        // A received body (ADR-038 FX-30): flushed before this node acknowledges it, at once
+        // when it is a key package or governance.
+        if matches!(
+            kind,
+            SignedEntryKind::Governance | SignedEntryKind::StepPolicy
+        ) || (kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me()))
+        {
+            batch.ruled();
+        }
         let applied = (|| -> Result<HistoryEffectProgress> {
             let mut index = self
                 .entries
@@ -1672,7 +1835,17 @@ impl ChannelState {
             })
         })();
         match applied {
-            Ok(progress) => Ok(progress),
+            Ok(progress) => {
+                if settled {
+                    self.record_sparse_received_semantic_owner(
+                        store,
+                        entry.skeleton.author_id,
+                        hash,
+                        received,
+                    )?;
+                }
+                Ok(progress)
+            }
             Err(error) => {
                 self.poison(&error);
                 Err(error)

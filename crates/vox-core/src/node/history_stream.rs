@@ -114,6 +114,7 @@ pub(crate) async fn serve(
 ) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(
+        preamble.room,
         room,
         store,
         preamble.epoch,

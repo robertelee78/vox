@@ -190,16 +190,45 @@ async fn respond(
             Ok((status, None))
         }
         Query::Head(author) => {
-            // Control requests retain their role-complete receipt semantics. Live Head
-            // is signed commitment discovery only; it conveys no held-through claim.
+            // Only a Control Head is a role receipt; Live Head is commitment discovery.
             let receipt = preamble.purpose == Purpose::Control && author == source.peer;
+            let exact_ack = source.received_ack_probe().map(|(_, entry)| entry);
+            if exact_ack.is_some() && !receipt {
+                return Ok((Status::Busy, None));
+            }
             let found = source
                 .read(&job, 128 * 1024, move |room, store| {
-                    if receipt {
-                        room.history_role_head(store, &author)
+                    let Some(head) = (if receipt {
+                        room.history_role_head(store, &author)?
                     } else {
-                        room.history_head(store, &author)
+                        room.history_head(store, &author)?
+                    }) else {
+                        return Ok(None);
+                    };
+                    let boundary = if receipt && head.root.leaves != 0 {
+                        let read = room.history_read(store)?;
+                        let Some(included) =
+                            read.history_inclusion_receipt(&head.id(), &author, head.root.leaves)?
+                        else {
+                            return Ok(None);
+                        };
+                        Some(included.header().entry().entry_hash())
+                    } else {
+                        None
+                    };
+                    if exact_ack.as_deref().is_some_and(|expected| {
+                        boundary
+                            .as_ref()
+                            .is_none_or(|hash| crate::node::link::b32_encode(hash) != expected)
+                    }) {
+                        return Ok(None);
                     }
+                    let debts = if receipt {
+                        room.received_debts_for_current(store, &author)?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Some((head, debts, boundary)))
                 })
                 .await?;
             let held = match found {
@@ -207,7 +236,11 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let wire = held.value.to_wire();
+            let (head, debts, boundary) = held.value;
+            if receipt {
+                source.flush_received_before_ack(debts, boundary).await?;
+            }
+            let wire = head.to_wire();
             let status = match send_object(
                 source,
                 io,

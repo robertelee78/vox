@@ -92,6 +92,7 @@ impl EntryIndex {
     ) -> Result<()> {
         loop {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, room)?;
             if writer.directory.packages_ready {
                 return Ok(());

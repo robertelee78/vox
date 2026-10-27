@@ -556,8 +556,24 @@ lessons. It changes neither this record's decision status nor any requirement or
   node's own.
   Any other received entry commits with the derived state that admitted it and reaches disk
   with the next durable commit, before this node acknowledges holding it to its sender (ADR-028
-  R-6), so a crash in between loses only what the sender has not yet seen acknowledged and
-  offers again. Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
+  R-6). Each live receive flow owns its debt by exact capability identity; pending debt never
+  blocks another flow, room or ordinary writer, while any durable commit advances the store's
+  durable frontier and retires every debt it covered. Every flow that commits a semantic sparse
+  effect is retained under its exact Arc owner until covered; an acknowledgement snapshots and
+  flushes all still-pending exact owners for the author, never a room-selected substitute. A
+  terminal settlement failure retains that Arc independently of the room mutex, retries through
+  it, and preserves the earlier absorption error if both operations failed. Thus a crash in
+  between loses only what the sender has not yet seen acknowledged and offers again.
+
+  Composition with the accepted multi-lane work in #1028/#1021 remains an explicit integration
+  prerequisite, not a claim of this branch: after those changes land, each foreground,
+  archive/sparse, control and private lane must carry its own `ReceivedFlow` across successful
+  partial turns, settle or retain it only at that lane's terminal boundary, and capture the
+  author-to-owner vector while holding the same room snapshot used for Head/Inventory. No lane
+  may introduce a store-global wait or recover debt by room id. The integration candidate must be
+  reviewed after that rebase.
+
+  Measured cause, the same daemon: every `Batch::commit` is redb `Durability::Immediate` →
   `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.

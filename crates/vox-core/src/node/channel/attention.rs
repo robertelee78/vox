@@ -182,6 +182,7 @@ impl ChannelState {
         let cutoff = self.pause_resume_after();
         let result = (|| -> Result<Reply> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)?;
             let reply = match operation {
                 Operation::Resolve { .. } => {
@@ -452,6 +453,7 @@ impl ChannelState {
         };
         let result = (|| -> Result<Reply> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut ledger =
                 Ledger::open(&mut batch, &self.sek, self.channel_id, recipient.instance)?;
             ledger.availability(recipient, wait, route)?;
@@ -550,6 +552,7 @@ impl ChannelState {
         }
         let result = (|| -> Result<Reply> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut ledger = Ledger::open(&mut batch, &self.sek, self.channel_id, instance)?;
             for (recipient, source, closed) in expired {
                 if let Some(source) = source {
@@ -632,6 +635,7 @@ impl ChannelState {
         }
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut ledger =
                 Ledger::open(&mut batch, &self.sek, self.channel_id, recipient.instance)?;
             for source in expired {

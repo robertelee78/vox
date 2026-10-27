@@ -56,6 +56,39 @@
 //!   APPARATUS. Mutation: the background detector removed (a peer's higher own head not compared
 //!   with the local own feed) — her post is accepted and signed at a taken place; red on the
 //!   refusal's assertion.
+//!
+//! - (e) **a member whose daemon crashes keeps what it was told it has** (ADR-038 FX-30, #1022).
+//!   Only what a person would lose is flushed to disk; derived sync state is not, and is rebuilt
+//!   after a crash. Each record of the ruled set is either the last thing written before a
+//!   SIGKILL by PID or retained in an exact writer-held crash image, so nothing flushed later can
+//!   carry it, and after every restart the whole set staged so far is read back as a person
+//!   would: the room open in `vox room list`, the own rows, bob's real post rendered under the
+//!   key he released, `vox trust list`, and `vox room sessions --json`. Alice: (1) `vox trust add carol`, then
+//!   the kill; (2) her Session opened through the shipped hook and listed, then the kill; (3)
+//!   bob's first sender-key batch committed at an exact test-only hold (compiled out of packaged
+//!   Vox), its crash image retained there, then the live processes establish that Bob completed
+//!   delivery before he is frozen and Alice restarts from the image;
+//!   (4) [`CRASH_POSTS`] own posts, then the kill. Bob: (5) alice posts once more and the proof
+//!   parks the exact receive flow's owned fallback flush, then waits until her own row says it is
+//!   held on his node (`vox room read --json`'s `held`, ADR-028 R-6: bob's own word in a sync,
+//!   which the design flushes before). Alice is frozen so she cannot re-offer it, then his daemon
+//!   is killed; back on his port his room is open, he reads it, and his trust and alice's key are
+//!   there. Carol: (6) trusted before alice's [`CRASH_BACKLOG`] posts, she joins cold; once her
+//!   read shows some of them and not all, the exact receive owner marks its post-flush boundary
+//!   while still holding the store writer. Her daemon is frozen there (SIGSTOP, `ps` state `T`),
+//!   her data root copied, her daemon resumed and killed; with alice frozen a daemon started from
+//!   the copy on carol's port opens the room, lists some of the posts and not all (else the image
+//!   was not mid-fetch: APPARATUS), none twice, alice's trust and key; alice resumed, and before
+//!   the proof's apparatus watchdog it shows every post exactly once, the cursors and heads the
+//!   copy lost rebuilt from her. The marker is causal apparatus, not a store counter or PRODUCT
+//!   proxy: the verdict is only the rows shown by shipped `vox`. Independent
+//!   mutations make the trust, Session, received key, own-entry and acknowledged-received-entry
+//!   durability promises red at (1), (2), (3), (4) and (5), respectively; each mutation changes
+//!   only the persistence path for the promise whose product assertion it must trip. The two
+//!   receive-specific executable mutants are `VOX_FX30_MUTANT=received-key-not-durable`,
+//!   `VOX_FX30_MUTANT=received-ack-not-flushed` and
+//!   `VOX_FX30_MUTANT=sparse-owner-not-recorded`, and
+//!   `VOX_FX30_MUTANT=legacy-retry-owner-dropped`; each reaches its own labelled PRODUCT verdict.
 
 #![cfg(unix)]
 
@@ -78,6 +111,10 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "an identity passphrase";
 const ROOMPASS: &str = "the room passphrase";
+/// A proof-process ceiling only. FX-30 gives eventual recovery no product deadline, so expiry
+/// is APPARATUS (no verdict), never a copied product timeout. Product timing claims below use
+/// their own named contracts instead.
+const APPARATUS_WATCHDOG: Duration = Duration::from_secs(120);
 /// How soon after the restarted node answers both sides must have each other's message.
 const WITHIN: Duration = Duration::from_secs(10);
 /// (d): rows alice posts before her data directory is copied, and after.
@@ -181,27 +218,37 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         let (ok, shown) = typed::keyring(&cmd);
         return (ok, shown.clone(), shown);
     }
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: cannot spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: vox has no stdin pipe")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: cannot write vox stdin");
         drop(child.stdin.take());
     }
     // Bounded: a node that stops answering must fail this proof by name, not hang it.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while child.try_wait().expect("try_wait").is_none() {
+    let deadline = Instant::now() + APPARATUS_WATCHDOG;
+    while child
+        .try_wait()
+        .expect("APPARATUS: cannot inspect vox process")
+        .is_none()
+    {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("`vox {}` got no answer in 120 s", args.join(" "));
+            panic!(
+                "APPARATUS: `vox {}` outlived the proof-process watchdog {APPARATUS_WATCHDOG:?}; \
+                 no product verdict",
+                args.join(" ")
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: cannot collect vox output");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -227,8 +274,10 @@ fn daemon(
     listen: &str,
     env: &[(&str, String)],
 ) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: cannot create daemon stdout log");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: cannot create daemon stderr log");
     let mut cmd = Command::new(VOX);
     cmd.args(["daemon", "--listen", listen])
         .env("VOX_DATA_DIR", dir)
@@ -240,12 +289,16 @@ fn daemon(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes()).unwrap();
+    let mut child = cmd.spawn().expect("APPARATUS: cannot spawn vox daemon");
+    let mut pipe = child
+        .stdin
+        .take()
+        .expect("APPARATUS: daemon has no stdin pipe");
+    pipe.write_all(stdin_lines.as_bytes())
+        .expect("APPARATUS: cannot write daemon stdin");
     drop(pipe);
     let d = Daemon(child);
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + APPARATUS_WATCHDOG;
     loop {
         if vox(dir, &["room", "list"], None).0 {
             return d;
@@ -259,7 +312,8 @@ fn daemon(
         );
         assert!(
             Instant::now() < deadline,
-            "{tag}'s daemon never answered: {}",
+            "APPARATUS: {tag}'s daemon did not answer before {APPARATUS_WATCHDOG:?}; no product \
+             verdict: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -268,16 +322,16 @@ fn daemon(
 
 fn identity(tmp: &Path, name: &str) -> (PathBuf, String) {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: cannot create profile directories");
     let (ok, out, err) = vox(&dir, &["id"], None);
-    assert!(ok, "vox id {name}: {err}");
+    assert!(ok, "PRODUCT: `vox id` for {name} failed: {err}");
     (dir, out.trim().to_owned())
 }
 
 /// The texts `vox room read` returns.
 fn read(dir: &Path, room: &str) -> Vec<String> {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    assert!(ok, "vox room read: {err}");
+    assert!(ok, "PRODUCT: `vox room read` failed: {err}");
     out.lines()
         .filter_map(|l| l.splitn(3, ' ').nth(2).map(str::to_owned))
         .collect()
@@ -289,12 +343,12 @@ fn count(texts: &[String], prefix: &str) -> usize {
 
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
-    assert!(ok, "vox room post {text:?}: {err}");
+    assert!(ok, "PRODUCT: `vox room post` {text:?} failed: {err}");
 }
 
 fn trust(dir: &Path, fp: &str, name: &str) {
     let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-    assert!(ok, "vox trust add {name}: {err}");
+    assert!(ok, "PRODUCT: `vox trust add` {name} failed: {err}");
 }
 
 /// `creator` makes a room; returns its short id as `vox room list` prints it.
@@ -304,36 +358,40 @@ fn create(creator: &Path) -> String {
         &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
     let (_, listed, _) = vox(creator, &["room", "list"], None);
     listed
         .split_whitespace()
         .next()
-        .expect("a room id")
+        .expect("PRODUCT: `vox room list` has no created room id")
         .to_owned()
 }
 
 fn join(creator: &Path, joiner: &Path, room: &str) {
     let (ok, link, err) = vox(creator, &["room", "link", room], None);
-    assert!(ok, "vox room link: {err}");
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
     let (ok, _, err) = vox(
         joiner,
         &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "PRODUCT: `vox room join` failed: {err}");
 }
 
 /// `author` posts a probe until every one of `readers` shows one: from then on they read it.
 fn until_readable(author: &Path, readers: &[&Path], room: &str) {
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + APPARATUS_WATCHDOG;
     loop {
         post(author, room, "probe");
         std::thread::sleep(Duration::from_millis(500));
         if readers.iter().all(|r| count(&read(r, room), "probe") > 0) {
             return;
         }
-        assert!(Instant::now() < deadline, "a reader never read the author");
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: initial readability was not staged before {APPARATUS_WATCHDOG:?}; no \
+             product verdict"
+        );
     }
 }
 
@@ -365,7 +423,7 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
     watchdog::arm();
     test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
     let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
-    let t = tempfile::tempdir().unwrap();
+    let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
     let mut alice_d = Some(daemon(
@@ -545,6 +603,1001 @@ fn until_reads(reader: &Path, room: &str, text: &str, within: Duration) -> bool 
         std::thread::sleep(Duration::from_millis(250));
     }
     false
+}
+
+/// Rows alice posts before her daemon is killed (e, 4).
+const CRASH_POSTS: usize = 3;
+/// Alice's backlog that carol's daemon is fetching when its data root is copied (e, 6): under
+/// one `vox room read` page (64 rows), so a plain read sees it whole.
+const CRASH_BACKLOG: usize = 60;
+
+/// What a crashed member must still show of the ruled set, as staged so far (e).
+#[derive(Default, Clone)]
+struct Ruled {
+    /// Own posts `kept 1..=kept`.
+    kept: usize,
+    /// Bob's exact post, readable only under the sender key he released.
+    from_bob: Option<&'static str>,
+    /// Names `vox trust list` names.
+    trusted: Vec<&'static str>,
+    /// The Session ids `vox room sessions --json` lists.
+    sessions: Vec<String>,
+}
+
+/// (e) — see the module doc.
+#[test]
+#[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
+fn a_member_whose_daemon_crashes_keeps_what_it_was_told_it_has() {
+    watchdog::arm();
+    test_knobs::require(&[
+        "VOX_TEST_NO_NEARBY",
+        "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
+        "VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE",
+        "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+        "VOX_TEST_FX30_LEGACY_RETRY_FILE",
+        "VOX_TEST_FX30_MUTANT",
+    ]);
+    let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let key_hold = t.path().join("hold-after-received-key");
+    let key_reached = key_hold.with_extension("reached");
+    let key_fault = key_hold.with_extension("fault");
+    let received_flush_hold = t.path().join("hold-received-flow-flush");
+    let received_flush_reached = received_flush_hold.with_extension("reached");
+    let received_ack_reached = received_flush_hold.with_extension("ack-reached");
+    let sparse_owner_reached = received_flush_hold.with_extension("sparse-owner-reached");
+    let ack_decision_hold = t.path().join("hold-after-ack-flush-decision");
+    let ack_decision_reached = ack_decision_hold.with_extension("reached");
+    let legacy_retry = t.path().join("legacy-retry");
+    let legacy_absorption_failed = legacy_retry.with_extension("absorption-failed");
+    let legacy_settlement_failed = legacy_retry.with_extension("settlement-failed");
+    let legacy_retry_observed = legacy_retry.with_extension("retry-observed");
+    let durable_flow_hold = t.path().join("hold-after-received-flow-flush");
+    let durable_flow_reached = durable_flow_hold.with_extension("reached");
+    let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
+    let mutant = std::env::var("VOX_FX30_MUTANT").ok();
+    assert!(
+        mutant.as_deref().is_none_or(|mode| matches!(
+            mode,
+            "received-key-not-durable"
+                | "received-ack-not-flushed"
+                | "sparse-owner-not-recorded"
+                | "legacy-retry-owner-dropped"
+        )),
+        "APPARATUS: VOX_FX30_MUTANT names no exact FX-30 mutant: {mutant:?}"
+    );
+    let mut alice_env = vec![
+        ("VOX_TEST_NO_NEARBY", "1".to_owned()),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_KEY_FILE",
+            key_hold.to_string_lossy().into_owned(),
+        ),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+            durable_flow_hold.to_string_lossy().into_owned(),
+        ),
+    ];
+    if mutant.as_deref() == Some("received-key-not-durable") {
+        alice_env.push(("VOX_TEST_FX30_MUTANT", mutant.clone().unwrap()));
+    }
+    let mut bob_env = vec![
+        ("VOX_TEST_NO_NEARBY", "1".to_owned()),
+        (
+            "VOX_TEST_HOLD_RECEIVED_FLOW_FLUSH_FILE",
+            received_flush_hold.to_string_lossy().into_owned(),
+        ),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+            ack_decision_hold.to_string_lossy().into_owned(),
+        ),
+        (
+            "VOX_TEST_FX30_LEGACY_RETRY_FILE",
+            legacy_retry.to_string_lossy().into_owned(),
+        ),
+    ];
+    if matches!(
+        mutant.as_deref(),
+        Some(
+            "received-ack-not-flushed" | "sparse-owner-not-recorded" | "legacy-retry-owner-dropped"
+        )
+    ) {
+        bob_env.push(("VOX_TEST_FX30_MUTANT", mutant.clone().unwrap()));
+    }
+    let (alice, alice_fp) = identity(t.path(), "alice");
+    let (bob, bob_fp) = identity(t.path(), "bob");
+    let (carol, carol_fp) = identity(t.path(), "carol");
+    let work = t.path().join("work");
+    std::fs::create_dir_all(&work).expect("APPARATUS: cannot make the work directory");
+    let alice_d = daemon(
+        &alice,
+        "alice",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &alice_env,
+    );
+    let alice_at = listening(&alice);
+    let bob_d = daemon(
+        &bob,
+        "bob",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &bob_env,
+    );
+    let bob_at = listening(&bob);
+    let room = create(&alice);
+    join(&alice, &bob, &room);
+    trust(&alice, &bob_fp, "bob");
+    trust(&bob, &alice_fp, "alice");
+    // Alice's probes reach bob; bob posts nothing yet, so his key reaches alice only in (3).
+    until_readable(&alice, &[&bob], &room);
+    // Carol trusts alice now; alice's trust in carol is the record (1) stages last.
+    trust(&carol, &alice_fp, "alice");
+    let mut ruled = Ruled {
+        trusted: vec!["bob"],
+        ..Ruled::default()
+    };
+    // Each record of the ruled set is the last thing written before a SIGKILL of alice's
+    // daemon, so nothing flushed after it can carry it to disk; after every restart the whole
+    // set staged so far is read back.
+
+    // ---- (1) a trust decision, last ------------------------------------------------------------
+    trust(&alice, &carol_fp, "carol");
+    ruled.trusted.push("carol");
+    let alice_d = crash_and_restart(
+        alice_d,
+        &alice,
+        "alice-1",
+        &alice_at,
+        &alice_env,
+        &room,
+        "`vox trust add carol` returned",
+    );
+    ruled_set_intact(
+        &alice,
+        "alice-1",
+        &room,
+        &ruled,
+        "(1) a trust decision was the last write",
+    );
+
+    // ---- (2) a Session record, last ------------------------------------------------------------
+    hook(&alice, &room, &work, "a word from alice");
+    let listed_at = Instant::now();
+    ruled.sessions = loop {
+        let sessions = sessions_of(&alice, &room);
+        if !sessions.is_empty() {
+            break sessions;
+        }
+        assert!(
+            listed_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, `vox room sessions --json` listed no \
+             Session of alice's, so Session durability was not staged; no product verdict"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let alice_d = crash_and_restart(
+        alice_d,
+        &alice,
+        "alice-2",
+        &alice_at,
+        &alice_env,
+        &room,
+        "her Session was listed",
+    );
+    ruled_set_intact(
+        &alice,
+        "alice-2",
+        &room,
+        &ruled,
+        "(2) a Session record was the last write",
+    );
+
+    // ---- (3) a received key, last: exact post-commit hold; bob frozen through the restart -----
+    // This fresh room has not rotated Bob's sender chain: its first and only generation is 0.
+    // Bind the apparatus to that exact author/generation rather than accepting any later package.
+    let expected_generation = 0;
+    std::fs::write(&key_hold, format!("{bob_fp} {expected_generation}\n"))
+        .expect("APPARATUS: cannot arm the exact received-key crash boundary");
+    post(&bob, &room, "from bob");
+    let staged_at = Instant::now();
+    while !key_reached.exists() {
+        if key_fault.exists() {
+            panic!(
+                "APPARATUS: the exact received-key transaction committed, but its crash-boundary \
+                 marker could not be published while that transaction still owned the writer: {}",
+                std::fs::read_to_string(&key_fault).unwrap_or_default()
+            );
+        }
+        assert!(
+            staged_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice did not mark the exact committed \
+             received-key boundary; received-key durability was not staged, so no product verdict"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let marker = std::fs::read_to_string(&key_reached)
+        .expect("APPARATUS: cannot read the reached received-key boundary");
+    let mut marker_fields = marker.split_whitespace();
+    let marked_author = marker_fields.next().unwrap_or_default();
+    let marked_generation = marker_fields
+        .next()
+        .and_then(|generation| generation.parse::<u64>().ok());
+    let marked_transaction = marker_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        marked_author == bob_fp
+            && marked_generation == Some(expected_generation)
+            && marked_transaction.is_some_and(|transaction| transaction > 0)
+            && marker_fields.next().is_none(),
+        "APPARATUS: the received-key boundary was not bob's exact sender generation: \
+         expected {bob_fp} generation {expected_generation} and one nonzero transaction, got \
+         {marker:?}"
+    );
+    // Preserve the exact disk image while this transaction still owns the writer. Then let the
+    // live process answer Bob and wait for his own shipped row to say Alice holds the post. That
+    // causally proves Bob recorded delivery before he is frozen; restarting the preserved image
+    // cannot be rescued by a replacement key or by any later flush in the live process.
+    let alice_pid = alice_d.0.id();
+    signal(alice_pid, rustix::process::Signal::STOP, true);
+    let alice_key_crash = t.path().join("alice-key-crash");
+    copy_dir(&alice, &alice_key_crash);
+    signal(alice_pid, rustix::process::Signal::CONT, false);
+    std::fs::remove_file(&key_hold)
+        .expect("APPARATUS: cannot release the received-key hold after copying its exact image");
+    let delivered_at = Instant::now();
+    loop {
+        let rendered = read(&alice, &room).iter().any(|row| row == "from bob");
+        let held = held_on(&bob, &room, "from bob");
+        if rendered && held.as_ref().is_some_and(|(count, _, _)| *count >= 1) {
+            break;
+        }
+        assert!(
+            delivered_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, the live alice did not render bob's key \
+             probe and acknowledge its exact post, so bob's completed key delivery was not \
+             established (rendered {rendered}, bob row {held:?})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    drop(alice_d);
+    println!(
+        "[proof] alice-3: restarted from the exact received-key commit image after bob's shipped \
+         row established completed delivery; bob frozen"
+    );
+    let alice_d = daemon(
+        &alice_key_crash,
+        "alice-3",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &alice_at,
+        &alice_env,
+    );
+    let alice = alice_key_crash;
+    ruled_set_intact(
+        &alice,
+        "alice-3",
+        &room,
+        &ruled,
+        "(3) a received key was the last write before the round's generic flush, bob frozen",
+    );
+    // Exercise the recovered key itself, not a status counter. Bob's live sender already recorded
+    // generation 0 as delivered before this crash; this new content does not carry a replacement
+    // key. Its exact receive flow publishes a post-flush boundary whether rendering succeeded or
+    // not, so the mutant reaches the shipped read assertion instead of a timing verdict.
+    std::fs::write(&durable_flow_hold, format!("{room} {bob_fp}\n"))
+        .expect("APPARATUS: cannot arm the recovered-key effect boundary");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    let key_effect = "from bob after alice's key crash";
+    post(&bob, &room, key_effect);
+    let key_effect_at = Instant::now();
+    while !durable_flow_reached.exists() {
+        assert!(
+            key_effect_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice did not reach bob's exact \
+             post-flush receive-flow boundary after her restart, so the recovered-key effect was \
+             not staged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let key_effect_marker = std::fs::read_to_string(&durable_flow_reached)
+        .expect("APPARATUS: cannot read the recovered-key effect boundary");
+    let mut key_effect_fields = key_effect_marker.split_whitespace();
+    let effect_room = key_effect_fields.next().unwrap_or_default();
+    let effect_peer = key_effect_fields.next().unwrap_or_default();
+    let effect_transaction = key_effect_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        effect_room == room
+            && effect_peer == bob_fp
+            && effect_transaction.is_some_and(|transaction| transaction > 0)
+            && key_effect_fields.next().is_none(),
+        "APPARATUS: the recovered-key effect boundary was not bob's exact receive flow: \
+         expected `{room} {bob_fp} <transaction>`, got {key_effect_marker:?}"
+    );
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let after_key_crash = read(&alice, &room);
+    assert!(
+        after_key_crash.iter().any(|row| row == key_effect),
+        "PRODUCT [FX30 received-key]: alice could not render bob's real post after the crash, so \
+         the received sender key was lost (ADR-038 FX-30, #1022): she reads {after_key_crash:?}"
+    );
+    ruled.from_bob = Some(key_effect);
+    std::fs::remove_file(&durable_flow_hold)
+        .expect("APPARATUS: cannot release the recovered-key effect boundary");
+    std::fs::remove_file(&durable_flow_reached)
+        .expect("APPARATUS: cannot clear the recovered-key effect marker");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+
+    // ---- (4) own posts, last -------------------------------------------------------------------
+    for i in 1..=CRASH_POSTS {
+        post(&alice, &room, &format!("kept {i}"));
+    }
+    ruled.kept = CRASH_POSTS;
+    let alice_d = crash_and_restart(
+        alice_d,
+        &alice,
+        "alice-4",
+        &alice_at,
+        &alice_env,
+        &room,
+        "`vox room post kept 3` returned",
+    );
+    ruled_set_intact(
+        &alice,
+        "alice-4",
+        &room,
+        &ruled,
+        "(4) own posts were the last write",
+    );
+
+    // ---- terminal absorption+settlement failure retains its exact retry owner ----------------
+    // Stop Bob before the post so the gate can name the exact shipped entry. The apparatus then
+    // fails after semantic absorption committed and fails that flow's first terminal settlement.
+    // Production retries solely through the retained Arc registry; the mutant drops that Arc.
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let retry_text = "received through a failed terminal settlement";
+    post(&alice, &room, retry_text);
+    let retry_local_at = Instant::now();
+    let retry_entry = loop {
+        if let Some((_, _, entry)) = held_on(&alice, &room, retry_text) {
+            break entry;
+        }
+        assert!(
+            retry_local_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: alice's accepted retry-stage post did not appear in her shipped read"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::write(&legacy_retry, format!("{room} {retry_entry}\n"))
+        .expect("APPARATUS: cannot arm the exact absorption/settlement failure boundary");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    let retry_stage_at = Instant::now();
+    while !legacy_absorption_failed.exists()
+        || !legacy_settlement_failed.exists()
+        || !legacy_retry_observed.exists()
+    {
+        assert!(
+            retry_stage_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, bob did not cross the exact post-commit \
+             absorption failure, pre-flush settlement failure, and retained-owner retry boundary"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let absorbed_marker = std::fs::read_to_string(&legacy_absorption_failed)
+        .expect("APPARATUS: cannot read the absorption-failure marker");
+    let settled_marker = std::fs::read_to_string(&legacy_settlement_failed)
+        .expect("APPARATUS: cannot read the settlement-failure marker");
+    let retried_marker = std::fs::read_to_string(&legacy_retry_observed)
+        .expect("APPARATUS: cannot read the retained-owner retry marker");
+    let marker_transaction = |marker: &str, expected_middle: &str| {
+        let fields = marker.split_whitespace().collect::<Vec<_>>();
+        assert!(
+            fields.len() == 3 && fields[0] == room && fields[1] == expected_middle,
+            "APPARATUS: malformed exact retry marker: {marker:?}"
+        );
+        fields[2]
+            .parse::<u64>()
+            .expect("APPARATUS: retry marker transaction is not an integer")
+    };
+    let absorption_transaction = marker_transaction(&absorbed_marker, &retry_entry);
+    let settlement_transaction = marker_transaction(&settled_marker, &retry_entry);
+    let retry_transaction = marker_transaction(&retried_marker, &alice_fp);
+    assert!(
+        absorption_transaction == settlement_transaction
+            && settlement_transaction == retry_transaction,
+        "APPARATUS: absorption, settlement and retry did not name the same exact flow transaction: \
+         {absorbed_marker:?}, {settled_marker:?}, {retried_marker:?}"
+    );
+    // Alice cannot re-offer the row to the restarted image and rescue the omitted-owner mutant.
+    let alice_pid = alice_d.0.id();
+    signal(alice_pid, rustix::process::Signal::STOP, true);
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let bob_retry_crash = t.path().join("bob-retry-crash");
+    copy_dir(&bob, &bob_retry_crash);
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    drop(bob_d);
+    std::fs::remove_file(&legacy_retry)
+        .expect("APPARATUS: cannot clear the absorption/settlement failure gate");
+    let bob_d = daemon(
+        &bob_retry_crash,
+        "bob-after-retry",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &bob_at,
+        &bob_env,
+    );
+    let bob = bob_retry_crash;
+    assert!(
+        room_answers(&bob, &room, APPARATUS_WATCHDOG),
+        "APPARATUS: bob's room did not answer from the exact terminal-retry crash image"
+    );
+    assert!(
+        read(&bob, &room).iter().any(|row| row == retry_text),
+        "PRODUCT [FX30 legacy-retry]: a semantically received post was lost after absorption and \
+         settlement both failed, so the exact creating owner was not retained for retry \
+         (ADR-038 FX-30, #1022)"
+    );
+    signal(alice_pid, rustix::process::Signal::CONT, false);
+
+    // ---- (5) a post bob's node said it holds, last before bob's SIGKILL ------------------------
+    let exact_received_flow = format!("{room} {alice_fp}");
+    // Stop Bob before Alice commits the post, so no inventory or head response can acknowledge
+    // it before the gate carries that row's exact shipped entry id.
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    post(&alice, &room, "acked");
+    let local_at = Instant::now();
+    let acked_entry = loop {
+        if let Some((_, _, entry)) = held_on(&alice, &room, "acked") {
+            break entry;
+        }
+        assert!(
+            local_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: alice's accepted `acked` post did not appear in her shipped read, so its \
+             exact acknowledgement boundary could not be armed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::fs::write(
+        &received_flush_hold,
+        format!("{exact_received_flow} {acked_entry}\n"),
+    )
+    .expect("APPARATUS: cannot arm bob's exact received-entry acknowledgement boundary");
+    std::fs::write(&ack_decision_hold, format!("{exact_received_flow}\n"))
+        .expect("APPARATUS: cannot arm bob's exact post-ACK flush-decision boundary");
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    let flow_staged_at = Instant::now();
+    while !received_flush_reached.exists() {
+        assert!(
+            flow_staged_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, bob did not reach the receive-flow-owned \
+             flush boundary for alice's post, so acknowledgement durability was not staged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let marked_flow = std::fs::read_to_string(&received_flush_reached)
+        .expect("APPARATUS: cannot read bob's received-flow flush marker");
+    let mut flow_fields = marked_flow.split_whitespace();
+    let flow_room = flow_fields.next().unwrap_or_default();
+    let flow_peer = flow_fields.next().unwrap_or_default();
+    let flow_transaction = flow_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        flow_room == room
+            && flow_peer == alice_fp
+            && flow_transaction.is_some_and(|transaction| transaction > 0)
+            && flow_fields.next().is_none(),
+        "APPARATUS: the parked received-flow flush was not alice's exact nonzero transaction in \
+         this room: expected `{exact_received_flow} <transaction>`, got {marked_flow:?}"
+    );
+    let sparse_at = Instant::now();
+    while !sparse_owner_reached.exists() {
+        assert!(
+            sparse_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, bob did not publish alice's exact sparse \
+             semantic owner, so the sparse ACK-ownership boundary was not staged"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sparse_marker = std::fs::read_to_string(&sparse_owner_reached)
+        .expect("APPARATUS: cannot read bob's sparse semantic-owner marker");
+    let mut sparse_fields = sparse_marker.split_whitespace();
+    let sparse_room = sparse_fields.next().unwrap_or_default();
+    let sparse_author = sparse_fields.next().unwrap_or_default();
+    let sparse_entry = sparse_fields.next().unwrap_or_default();
+    let sparse_transaction = sparse_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        sparse_room == room
+            && sparse_author == alice_fp
+            && sparse_entry == acked_entry
+            && sparse_transaction == flow_transaction
+            && sparse_fields.next().is_none(),
+        "APPARATUS: bob's sparse semantic owner was not alice's exact parked entry/transaction: \
+         flow {marked_flow:?}, sparse owner {sparse_marker:?}"
+    );
+    let decision_at = Instant::now();
+    while !ack_decision_reached.exists() {
+        assert!(
+            decision_at.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: before {APPARATUS_WATCHDOG:?}, bob did not reach the exact post-ACK \
+             flush-decision boundary for alice's post"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let decision_marker = std::fs::read_to_string(&ack_decision_reached)
+        .expect("APPARATUS: cannot read bob's post-ACK flush-decision marker");
+    let mut decision_fields = decision_marker.split_whitespace();
+    let decision_room = decision_fields.next().unwrap_or_default();
+    let decision_peer = decision_fields.next().unwrap_or_default();
+    let decision_transaction = decision_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    assert!(
+        decision_room == room
+            && decision_peer == alice_fp
+            && decision_transaction == flow_transaction
+            && decision_fields.next().is_none(),
+        "APPARATUS: bob's post-ACK boundary was not the exact parked receive transaction: \
+         fallback {marked_flow:?}, decision {decision_marker:?}"
+    );
+    // Stop the whole process at the common post-commit boundary and retain that exact crash
+    // image. The healthy image contains the Immediate flush; the isolated mutant contains the
+    // same empty transaction at Durability::None. Later activity cannot rescue either image.
+    let bob_pid = bob_d.0.id();
+    signal(bob_pid, rustix::process::Signal::STOP, true);
+    let bob_crash = t.path().join("bob-ack-crash");
+    copy_dir(&bob, &bob_crash);
+    signal(bob_pid, rustix::process::Signal::CONT, false);
+    std::fs::remove_file(&ack_decision_hold)
+        .expect("APPARATUS: cannot release bob's post-ACK flush-decision boundary");
+    let asked = Instant::now();
+    let held_on_bob = loop {
+        match held_on(&alice, &room, "acked") {
+            Some((held, _, entry)) if held >= 1 && entry == acked_entry => break asked.elapsed(),
+            seen => {
+                assert!(
+                    asked.elapsed() < APPARATUS_WATCHDOG,
+                    "APPARATUS: before {APPARATUS_WATCHDOG:?}, alice's own row never showed as held \
+                     on bob's node (`vox room read --json` held/others: {seen:?}; bob reads {:?}), \
+                     so bob's acknowledgement could not be staged; no product verdict\nalice's \
+                     daemon said:\n{}\nbob's daemon said:\n{}",
+                    read(&bob, &room),
+                    daemon_said(&alice, "alice-4"),
+                    daemon_said(&bob, "bob")
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    };
+    let ack_marker = std::fs::read_to_string(&received_ack_reached).unwrap_or_else(|error| {
+        panic!(
+            "APPARATUS: alice observed bob's acknowledgement, but its exact durability-boundary \
+             marker was absent: {error}"
+        )
+    });
+    let mut ack_fields = ack_marker.split_whitespace();
+    let ack_room = ack_fields.next().unwrap_or_default();
+    let ack_peer = ack_fields.next().unwrap_or_default();
+    let ack_transaction = ack_fields
+        .next()
+        .and_then(|transaction| transaction.parse::<u64>().ok());
+    let ack_boundary = ack_fields.next().unwrap_or_default();
+    assert!(
+        ack_room == room
+            && ack_peer == alice_fp
+            && ack_transaction == flow_transaction
+            && ack_boundary == acked_entry
+            && ack_fields.next().is_none(),
+        "APPARATUS: bob's shipped acknowledgement was not causally bound to the exact parked \
+         transaction and alice post: fallback {marked_flow:?}, acknowledgement {ack_marker:?}, \
+         row entry {acked_entry:?}"
+    );
+    // The exact flow-owned fallback remains parked. Freeze Alice before Bob dies so neither a
+    // resend nor a different lane can replace the acknowledgement whose durability is asserted.
+    let alice_pid = alice_d.0.id();
+    signal(alice_pid, rustix::process::Signal::STOP, true);
+    drop(bob_d);
+    std::fs::remove_file(&received_flush_hold)
+        .expect("APPARATUS: cannot release bob's received-flow flush hold after SIGKILL");
+    println!(
+        "[proof] bob-2: killed after his shipped acknowledgement while its exact flow-owned \
+         fallback flush was parked and alice was frozen ({held_on_bob:?} after her post)"
+    );
+    let _bob_d = daemon(
+        &bob_crash,
+        "bob-2",
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &bob_at,
+        &bob_env,
+    );
+    let bob = bob_crash;
+    assert!(
+        room_answers(&bob, &room, APPARATUS_WATCHDOG),
+        "APPARATUS: bob's room did not answer after the exact acknowledged-entry crash boundary"
+    );
+    let bobs = Ruled {
+        kept: 0,
+        from_bob: None,
+        trusted: vec!["alice"],
+        sessions: Vec::new(),
+    };
+    ruled_set_intact(
+        &bob,
+        "bob-2",
+        &room,
+        &bobs,
+        "(5) an acknowledged received post was the last write",
+    );
+    let his = read(&bob, &room);
+    let received_claim = if mutant.as_deref() == Some("sparse-owner-not-recorded") {
+        "FX30 sparse-owner"
+    } else {
+        "FX30 received-ack"
+    };
+    assert!(
+        his.iter().any(|t| t == "acked"),
+        "PRODUCT [{received_claim}]: a post bob's node had acknowledged holding (alice's row showed held on 1 \
+         node) was lost by a crash of his daemon (ADR-038 FX-30, #1022): bob reads {his:?}"
+    );
+    println!("[proof] (5) after the crash bob reads the acknowledged post");
+    signal(alice_pid, rustix::process::Signal::CONT, false);
+
+    // ---- (6) a data root copied mid-fetch reopens whole and syncs on ----------------------------
+    for i in 1..=CRASH_BACKLOG {
+        post(&alice, &room, &format!("post {i}"));
+    }
+    let exact_carol_flow = format!("{room} {alice_fp}");
+    let carol_env = vec![
+        ("VOX_TEST_NO_NEARBY", "1".to_owned()),
+        (
+            "VOX_TEST_HOLD_AFTER_RECEIVED_FLOW_FLUSH_FILE",
+            durable_flow_hold.to_string_lossy().into_owned(),
+        ),
+    ];
+    let carol_d = daemon(
+        &carol,
+        "carol",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &carol_env,
+    );
+    let carol_at = listening(&carol);
+    join(&alice, &carol, &room);
+    // Arm only after `vox room join` returns: the boundary is for the background history fetch,
+    // never a writer that the join command itself still needs in order to answer.
+    std::fs::write(&durable_flow_hold, format!("{exact_carol_flow}\n"))
+        .expect("APPARATUS: cannot arm carol's post-flush receive-flow boundary");
+    let joined = Instant::now();
+    // Caught under way at an exact owner boundary: the marker is written after that owner's
+    // flush commits and while it still holds the writer, so the copied bytes contain the shown
+    // prefix and no later flow or ordinary writer can change the image before SIGSTOP.
+    let (partial, durable_transaction) = loop {
+        let n = holds(&read(&carol, &room), "post", CRASH_BACKLOG);
+        let marker = std::fs::read_to_string(&durable_flow_reached).ok();
+        let transaction = marker.as_deref().and_then(|marker| {
+            let mut fields = marker.split_whitespace();
+            let marked_room = fields.next()?;
+            let marked_peer = fields.next()?;
+            let transaction = fields.next()?.parse::<u64>().ok()?;
+            (marked_room == room
+                && marked_peer == alice_fp
+                && transaction > 0
+                && fields.next().is_none())
+            .then_some(transaction)
+        });
+        if (1..CRASH_BACKLOG).contains(&n) && transaction.is_some() {
+            break (n, transaction.unwrap_or_default());
+        }
+        assert!(
+            joined.elapsed() < APPARATUS_WATCHDOG,
+            "APPARATUS: staging not achieved: before {APPARATUS_WATCHDOG:?} after her join carol's \
+             read never showed some but not all of the {CRASH_BACKLOG} posts at alice's exact \
+             post-flush receive-flow boundary (last: {n} posts, marker {marker:?}), so no causal \
+             copy could be taken mid-fetch"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let pid = carol_d.0.id();
+    signal(pid, rustix::process::Signal::STOP, true);
+    let copy = t.path().join("carol-copy");
+    copy_dir(&carol, &copy);
+    signal(pid, rustix::process::Signal::CONT, false);
+    drop(carol_d);
+    std::fs::remove_file(&durable_flow_hold)
+        .expect("APPARATUS: cannot release carol's durable receive-flow boundary after SIGKILL");
+    println!(
+        "[proof] (6) carol's data root copied {:?} after her join after the kernel reported her stopped, \
+         {partial} of {CRASH_BACKLOG} posts read at exact durable transaction {durable_transaction}",
+        joined.elapsed()
+    );
+    // Alice frozen while the copy's daemon reads what it holds: no row or key can come from her.
+    let alice_pid = alice_d.0.id();
+    signal(alice_pid, rustix::process::Signal::STOP, true);
+    std::fs::create_dir_all(copy.join("cfg"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}: {e}", copy.display()));
+    let tag = "carol-copy";
+    let _carol_copy_d = daemon(
+        &copy,
+        tag,
+        &format!("{IDENTITY}\n{ROOMPASS}\n"),
+        &carol_at,
+        &unheard,
+    );
+    let opened = room_answers(&copy, &room, APPARATUS_WATCHDOG);
+    let (listed, at_reopen, copy_trusted) = if opened {
+        (
+            room_list_line(&copy, &room),
+            read(&copy, &room),
+            vox(&copy, &["trust", "list"], None).1,
+        )
+    } else {
+        (String::new(), Vec::new(), String::new())
+    };
+    signal(alice_pid, rustix::process::Signal::CONT, false);
+    assert!(
+        opened,
+        "APPARATUS: before {APPARATUS_WATCHDOG:?}, the daemon started from a data root copied \
+         during a fetch did not open the room, so the recovery assertion was not reached; no \
+         product verdict: {}\nits daemon said:\n{}",
+        vox(&copy, &["room", "read", &room], None).2,
+        daemon_said(&copy, tag)
+    );
+    assert_open_line(
+        &listed,
+        &room,
+        "the room reopened from a copy taken during a fetch",
+    );
+    let held_at_reopen = holds(&at_reopen, "post", CRASH_BACKLOG);
+    assert!(
+        (1..CRASH_BACKLOG).contains(&held_at_reopen),
+        "APPARATUS: the image was not mid-fetch: reopened from the copy, the room lists \
+         {held_at_reopen} of {CRASH_BACKLOG} posts (some and not all were expected; {partial} were \
+         read before the freeze); it reads {at_reopen:?}"
+    );
+    let twice = not_once_each(&at_reopen, "post", CRASH_BACKLOG)
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .collect::<Vec<_>>();
+    assert!(
+        twice.is_empty(),
+        "PRODUCT: the room reopened from a copy taken during a fetch shows a row more than once \
+         (ADR-038 FX-30, #1022): (post, times) {twice:?}; it reads {at_reopen:?}"
+    );
+    assert!(
+        copy_trusted.contains("alice"),
+        "PRODUCT: a trust decision is missing from the room reopened from a copy (ADR-038 FX-30, \
+         #1022): `vox trust list` says {copy_trusted}"
+    );
+    let synced_on = Instant::now();
+    assert!(
+        until_holds(&copy, &room, "post", CRASH_BACKLOG, APPARATUS_WATCHDOG),
+        "APPARATUS: before {APPARATUS_WATCHDOG:?}, recovery had not reached the FX-30 assertion; \
+         no product verdict: the room reopened from a copy held {held_at_reopen} of \
+         {CRASH_BACKLOG} posts and now holds {}; it reads {:?}\nits daemon said:\n{}\nalice's \
+         daemon said:\n{}",
+        holds(&read(&copy, &room), "post", CRASH_BACKLOG),
+        read(&copy, &room),
+        daemon_said(&copy, tag),
+        daemon_said(&alice, "alice-4")
+    );
+    let whole = read(&copy, &room);
+    let not_once = not_once_each(&whole, "post", CRASH_BACKLOG);
+    assert!(
+        not_once.is_empty(),
+        "PRODUCT: after syncing on, the room reopened from a copy does not show every post \
+         exactly once (ADR-038 FX-30, #1022): (post, times) {not_once:?}; it reads {whole:?}"
+    );
+    println!(
+        "[proof] (6) the copy held {held_at_reopen} of {CRASH_BACKLOG} posts, alice's key and the \
+         trust at reopen, with alice frozen, and every post exactly once {:?} after she was resumed",
+        synced_on.elapsed()
+    );
+    drop(alice_d);
+}
+
+/// SIGKILL `d` by its PID the moment `what` happened, start the member again on `at`, and wait
+/// for its room to answer; the new daemon.
+fn crash_and_restart(
+    d: Daemon,
+    dir: &Path,
+    tag: &str,
+    at: &str,
+    env: &[(&str, String)],
+    room: &str,
+    what: &str,
+) -> Daemon {
+    drop(d);
+    println!("[proof] {tag}: the daemon killed the moment {what}");
+    let restarted = daemon(dir, tag, &format!("{IDENTITY}\n{ROOMPASS}\n"), at, env);
+    assert!(
+        room_answers(dir, room, APPARATUS_WATCHDOG),
+        "APPARATUS: before {APPARATUS_WATCHDOG:?}, {tag}'s room did not answer `vox room read` \
+         after a SIGKILL, so the durability assertion was not reached; no product verdict: \
+         {}\nits daemon said:\n{}",
+        vox(dir, &["room", "read", room], None).2,
+        daemon_said(dir, tag)
+    );
+    restarted
+}
+
+/// Everything of the ruled set staged so far, read back as a person would after the crash (e):
+/// the room open in `vox room list`, the own and received rows, the trust, the Session, the key.
+fn ruled_set_intact(dir: &Path, tag: &str, room: &str, ruled: &Ruled, when: &str) {
+    let listed = room_list_line(dir, room);
+    assert_open_line(&listed, room, &format!("{tag}, after the crash ({when})"));
+    let rows = read(dir, room);
+    assert!(
+        holds(&rows, "kept", ruled.kept) == ruled.kept,
+        "PRODUCT: a post `vox room post` had accepted was lost by a crash of the daemon (ADR-038 \
+         FX-30, #1022; {when}): {tag} should read kept 1..={} and reads {rows:?}",
+        ruled.kept
+    );
+    if let Some(from_bob) = ruled.from_bob {
+        assert!(
+            rows.iter().any(|t| t == from_bob),
+            "PRODUCT: a received post, or the key it is read under, was lost by a crash of the \
+             daemon (ADR-038 FX-30, #1022; {when}): {tag} reads {rows:?}, and not {from_bob:?}"
+        );
+    }
+    let (ok, trusted, err) = vox(dir, &["trust", "list"], None);
+    for name in &ruled.trusted {
+        assert!(
+            ok && trusted.contains(name),
+            "PRODUCT: a trust decision was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
+             {when}): `vox trust list` after {tag}'s restart does not name {name}: {trusted}{err}"
+        );
+    }
+    let sessions = sessions_of(dir, room);
+    assert!(
+        sessions == ruled.sessions,
+        "PRODUCT: a Session record was lost by a crash of the daemon (ADR-038 FX-30, #1022; \
+         {when}): `vox room sessions --json` listed {:?} before the crash and {sessions:?} after \
+         {tag}'s restart",
+        ruled.sessions
+    );
+    println!(
+        "[proof] {tag}: after the crash ({when}) the room is open, it reads {rows:?}, trusts {:?}, \
+         and lists Sessions {sessions:?}",
+        ruled.trusted
+    );
+}
+
+/// `line`, the `vox room list` line for `room`, MUST be there and show the room open.
+fn assert_open_line(line: &str, room: &str, when: &str) {
+    assert!(
+        !line.is_empty(),
+        "PRODUCT: {when}: `vox room list` does not list the room {room} (ADR-038 FX-30, #1022)"
+    );
+    assert!(
+        !line.contains("[preparing") && !line.contains("closed"),
+        "PRODUCT: {when}: the room is not open (ADR-038 FX-30, #1022): `vox room list` says \
+         {line:?}"
+    );
+}
+
+/// Signal a proof daemon and consume that exact child-state transition before continuing.
+fn signal(pid: u32, signal: rustix::process::Signal, stopped: bool) {
+    let pid = rustix::process::Pid::from_raw(pid as _)
+        .unwrap_or_else(|| panic!("APPARATUS: daemon has invalid pid {pid}"));
+    rustix::process::kill_process(pid, signal)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not send {signal:?} to daemon {pid}: {e}"));
+    let options = if stopped {
+        rustix::process::WaitOptions::UNTRACED
+    } else {
+        rustix::process::WaitOptions::CONTINUED
+    };
+    let (_, state) = rustix::process::waitpid(Some(pid), options)
+        .unwrap_or_else(|e| {
+            panic!("APPARATUS: could not observe daemon {pid} after {signal:?}: {e}")
+        })
+        .unwrap_or_else(|| panic!("APPARATUS: daemon {pid} had no state after {signal:?}"));
+    assert!(
+        if stopped {
+            state.stopped()
+        } else {
+            state.continued()
+        },
+        "APPARATUS: daemon {pid} reported {state:?}, not the requested {signal:?} transition"
+    );
+}
+
+/// The `vox room list` line naming `room` as `dir`, or an empty string.
+fn room_list_line(dir: &Path, room: &str) -> String {
+    let (_, out, _) = vox(dir, &["room", "list"], None);
+    out.lines()
+        .find(|l| l.contains(room))
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
+/// Every `"<prefix> <i>"` for `i` in `1..=n` that `texts` does not show exactly once: `(i,
+/// times shown)`.
+fn not_once_each(texts: &[String], prefix: &str, n: usize) -> Vec<(usize, usize)> {
+    (1..=n)
+        .map(|i| {
+            let want = format!("{prefix} {i}");
+            (i, texts.iter().filter(|t| **t == want).count())
+        })
+        .filter(|(_, times)| *times != 1)
+        .collect()
+}
+
+/// The ids `vox room sessions --json` lists for `room` as `dir`, in order.
+fn sessions_of(dir: &Path, room: &str) -> Vec<String> {
+    let (ok, out, err) = vox(dir, &["room", "sessions", room, "--json"], None);
+    assert!(ok, "PRODUCT: `vox room sessions --json` failed: {err}");
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// One run of the shipped harness hook (`vox agent hook`) for `dir`'s node in `room`, fed a
+/// Claude Code `UserPromptSubmit` event: it opens the node's Session in the room.
+fn hook(dir: &Path, room: &str, work: &Path, prompt: &str) {
+    let event = serde_json::json!({
+        "session_id": "crash-proof",
+        "transcript_path": work.join("transcript.jsonl").display().to_string(),
+        "cwd": work.display().to_string(),
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": prompt,
+    })
+    .to_string();
+    let mut child = Command::new(VOX)
+        .args(["agent", "hook", "--node", "default", "--room", room])
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_NODE")
+        .current_dir(work)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox agent hook`: {e}"));
+    if let Some(mut pipe) = child.stdin.take() {
+        let _ = pipe.write_all(event.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: `vox agent hook`: {e}"));
+    assert!(
+        out.status.success(),
+        "PRODUCT (staging): `vox agent hook` exited non-zero: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `vox room read --json` of `room` as `dir`: the own row with `text`'s `held`/`others` footer
+/// (ADR-028 R-6, on how many other members' nodes it is held), `None` while the row or its
+/// footer is not shown.
+fn held_on(dir: &Path, room: &str, text: &str) -> Option<(u64, u64, String)> {
+    let (ok, out, _) = vox(
+        dir,
+        &["room", "read", room, "--json", "--limit", "64"],
+        None,
+    );
+    if !ok {
+        return None;
+    }
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|row| row["text"].as_str() == Some(text))
+        .and_then(|row| {
+            Some((
+                row["held"].as_u64()?,
+                row["others"].as_u64()?,
+                row["entry_hash"].as_str()?.to_owned(),
+            ))
+        })
 }
 
 /// (d) — see the module doc.
