@@ -988,8 +988,14 @@ fn restore(bundle: &Path) -> Result<(), AppError> {
     }
     if kept.is_file() {
         fs::rename(&kept, live).map_err(AppError::Io)?;
-        sync_dir(&bundle.join("Contents"))?;
+    } else if !live.is_file() {
+        return Err(usage(format!(
+            "{} has neither a live nor kept Info.plist; it was not changed",
+            bundle.display()
+        )));
     }
+    // The live plist may be the result of an earlier rename whose directory sync failed.
+    sync_dir(&bundle.join("Contents"))?;
     Ok(())
 }
 
