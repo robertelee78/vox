@@ -524,7 +524,7 @@ impl Node {
         };
         let store = profile.store_handle();
         let now = self.now_ms();
-        let (changed, completed, receiver_changed, key, discovery) = {
+        let (changed, completed, receiver_changed, key) = {
             let Ok(mut channel) = shared.try_lock() else {
                 // A read-only holder need not publish another event. Retain this exact room's
                 // release edge off actor; no other room or command waits on this mutex.
@@ -574,18 +574,7 @@ impl Node {
                     return;
                 }
             };
-            let discovery = if key.is_some_and(|(_, _, accepted)| !accepted) {
-                match channel.own_recovery_discovery_hint(&store) {
-                    Ok(hint) => hint,
-                    Err(error) => {
-                        channel.poison(&error);
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-            (changed, completed, receiver_changed, key, discovery)
+            (changed, completed, receiver_changed, key)
         };
         if receiver_changed {
             // The committed key/cursor is the producer for ordinary bounded backfill.
@@ -602,9 +591,6 @@ impl Node {
             }
         };
         if progress {
-            if let Some(hint) = discovery {
-                self.offer_own_head(&room, Some(hint), self.connected_peers());
-            }
             for ((r, _), port) in &mut self.ports {
                 if *r == room {
                     port.raise();

@@ -11510,6 +11510,7 @@ impl Node {
                             }
                         };
                         self.settle_sparse_room(&channel_id).await;
+                        self.advance_own_recovery(channel_id).await;
                         // Head promotion advances the shared room generation inside the disk
                         // worker. Touch the room here so schedule observes it immediately and
                         // advertises the newly committed head back to its author.

@@ -234,29 +234,42 @@ impl ChannelState {
         }
     }
 
+    /// Derive one exact local verification root at ordinary foreground admission. No scalar
+    /// inbox insertion is required, and a donor's role receipt cannot suppress local proof debt.
+    /// A durable exact refusal remains parked until its real authority/incarnation changes.
     pub(crate) fn own_recovery_discovery_hint(
         &self,
         store: &Store,
+        peer: &Digest32,
+        authorization: Digest32,
     ) -> Result<Option<(Digest32, Digest32, u64)>> {
-        if !self.own_behind {
+        if !self.own_behind || !self.is_member(peer) || self.dag.is_frozen(&self.me()) {
             return Ok(None);
         }
-        let read = self.history_read(store)?;
-        let head = match &self.own_recovery {
-            Recovery::Head(head) => Some(head.clone()),
-            Recovery::UnknownBehind => read
-                .sparse_author(&self.me(), LogScope::Public)?
-                .and_then(|state| state.committed.or(state.observed))
-                .map(|id| read.history_head(&id))
-                .transpose()?
-                .flatten(),
-            Recovery::Fork => None,
+        let Recovery::Head(head) = &self.own_recovery else {
+            return Ok(None);
         };
-        if let Some(head) = head {
-            self.checked_own_head(&head)?;
-            return Ok(Some((self.me(), head.id(), head.root.leaves)));
+        self.checked_own_head(head)?;
+        let read = self.history_read(store)?;
+        if read
+            .sparse_author(&self.me(), LogScope::Public)?
+            .is_some_and(|state| state.observed_conflict.is_some())
+            || read.history_head_accepted(&head.id(), head.binding)?
+        {
+            return Ok(None);
         }
-        Ok(None)
+        if let Some((refused, grant, peer_life, author_life)) =
+            read.history_declined_head(peer, &self.me())?
+        {
+            if refused == head.id()
+                && grant == authorization
+                && self.history_inventory_incarnation(peer) == Some(peer_life)
+                && self.history_author_inventory_incarnation(&self.me()) == Some(author_life)
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((self.me(), head.id(), head.root.leaves)))
     }
 
     pub(crate) fn own_recovery_page(

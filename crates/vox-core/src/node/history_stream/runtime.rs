@@ -192,6 +192,8 @@ pub(crate) struct Flow {
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
     pub(crate) hint: Option<super::HeadHint>,
+    /// Canonical local recovery proof root, not a consumed advisory inbox item.
+    pub(crate) local_own_verification: bool,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
     pub(crate) hint_peer: Digest32,
@@ -399,6 +401,7 @@ impl Flow {
             required_root: required,
             state_charge: None,
             hint,
+            local_own_verification: false,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
@@ -536,6 +539,7 @@ impl Flow {
             required_root: None,
             state_charge: None,
             hint: None,
+            local_own_verification: false,
             hint_peer: peer,
             authenticated_head: None,
             mine_held: None,
@@ -815,7 +819,9 @@ impl Flow {
                 return Ok(false);
             }
         };
-        inbox.finish(self.room, source.peer, author, head);
+        if !self.local_own_verification {
+            inbox.finish(self.room, source.peer, author, head);
+        }
         self.declined = self.declined.saturating_add(u64::from(remembered));
         Ok(true)
     }
