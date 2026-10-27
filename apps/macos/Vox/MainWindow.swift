@@ -468,6 +468,17 @@ private struct OnThisMachine: View {
     let nodes: [NodeSummary]
     var known = true
 
+    private func stateWords(_ node: NodeSummary) -> String {
+        guard known else { return "state unknown" }
+        switch node.state {
+        case "attached": return node.status ?? "attached"
+        case "detached": return node.status == "Locked" ? "Locked" : "detached"
+        case "attaching": return "attaching"
+        case "detaching": return "detaching"
+        default: return "state unknown"
+        }
+    }
+
     static func copy(_ words: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(words, forType: .string)
@@ -487,10 +498,10 @@ private struct OnThisMachine: View {
                     HStack {
                         Text(node.name)
                         Spacer()
-                        Text(known ? (node.status ?? "unavailable") : "unavailable").secondaryText()
+                        Text(stateWords(node)).secondaryText()
                     }
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(node.name) \(known ? (node.status ?? "unavailable") : "unavailable")")
+                    .accessibilityLabel("\(node.name) \(stateWords(node))")
                     .contextMenu {
                         Button("Copy Name") { Self.copy(node.name) }
                         if !node.fingerprint.isEmpty {
@@ -2212,7 +2223,7 @@ private struct NodeStopped: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             StateMark(kind: .danger, words: model.daemonReachable
-                      ? (model.ended ?? "Node \(model.node) is unavailable.")
+                      ? (model.ended ?? "Node \(model.node) state is unknown.")
                       : (model.daemonFailure ?? "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting."))
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")

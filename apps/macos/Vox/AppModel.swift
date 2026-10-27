@@ -550,7 +550,7 @@ final class AppModel: ObservableObject {
                     guard ownsNodeRequest(client, generation), self.node === shown,
                           signedInAs == name else { return }
                     guard resumed else {
-                        throw VoxError.Detached(reason: "The node is unavailable after forgetting it. Try Again.")
+                        throw VoxError.Detached(reason: "The node state changed while reconnecting after forgetting it. Try Again.")
                     }
                     phase = .attached(node: name, fingerprint: fingerprint)
                 } else {
