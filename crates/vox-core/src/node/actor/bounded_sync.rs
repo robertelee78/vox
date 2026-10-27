@@ -971,6 +971,12 @@ impl Controller {
     ) -> bool {
         self.release_local_admission_kind(token, room, node, LocalAdmissionKind::Room)
     }
+    pub(super) fn cancel_own_recovery_admission(&mut self, room: Digest32, node: Digest32) {
+        if self.local_admission.get(&(room, node)).is_some_and(|entry| entry.kind == LocalAdmissionKind::Room) {
+            self.cancel_local_admission(room, node);
+        }
+    }
+
     /// One actual room-lock release edge, coalesced in the existing cancellable admission
     /// owner. The self-node key cannot collide with a remote peer's secret admission.
     pub(super) fn wait_for_own_recovery_room(

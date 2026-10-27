@@ -5402,6 +5402,7 @@ pub struct Node {
     own_key_active: BTreeMap<Digest32, [u8; 16]>,
     own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
     own_key_pending: BTreeMap<Digest32, own_keys::ResponseReady>,
+    own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -6268,6 +6269,7 @@ impl Node {
             own_key_active: BTreeMap::new(),
             own_key_parked: BTreeMap::new(),
             own_key_pending: BTreeMap::new(),
+            own_key_room_cancel: BTreeMap::new(),
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -20614,6 +20616,7 @@ impl Node {
 
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
         self.channels.remove(channel_id);
@@ -21557,6 +21560,7 @@ impl Node {
         }
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
@@ -22193,6 +22197,7 @@ impl Node {
         let mut name = String::new();
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);

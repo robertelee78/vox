@@ -67,6 +67,26 @@ fn refuse(mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
 }
 
 impl Node {
+    fn own_key_room_watch(&mut self, room: Digest32) -> tokio::sync::watch::Receiver<bool> {
+        self.own_key_room_cancel
+            .entry(room)
+            .or_insert_with(|| tokio::sync::watch::channel(false).0)
+            .subscribe()
+    }
+
+    pub(super) fn cancel_own_key_room(&mut self, room: Digest32) {
+        if let Some(profile) = self.profile.as_ref() {
+            self.bounded_sync
+                .cancel_own_recovery_admission(room, profile.fingerprint());
+        }
+        if let Some(cancel) = self.own_key_room_cancel.remove(&room) {
+            cancel.send_replace(true);
+        }
+        self.own_key_active.remove(&room);
+        self.own_key_pending.remove(&room);
+        self.own_key_parked.retain(|(id, _), _| *id != room);
+    }
+
     fn own_key_current(
         &self,
         request: Request,
@@ -159,6 +179,7 @@ impl Node {
         };
         let tx = self.net_tx.clone();
         let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let mut room_cancel = self.own_key_room_watch(request.room);
         let clock = Arc::clone(&self.clock);
         let room_for_network = Arc::clone(&room);
         let mut launch = Some((session, frame, queue, credit, output, secret));
@@ -170,6 +191,7 @@ impl Node {
                 let result = tokio::select! {
                     biased;
                     _ = epoch_changed.changed() => return,
+                    _ = room_cancel.changed() => return,
                     result = async {
                         let mut recv = crate::node::pairwise_stream::write_pairwise(&connection, &[frame]).await?;
                         let frame = crate::node::pairwise_stream::recv_pairwise(&mut recv).await?
@@ -192,9 +214,22 @@ impl Node {
         if self.own_key_active.get(&request.room) != Some(&request.id) {
             return;
         }
-        if !matches!(&ready.release, Ok(Some(_))) {
-            self.fail_own_key_request(request, ready.peer, ready.connection.serial());
-            return;
+        match &ready.release {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.fail_own_key_request(request, ready.peer, ready.connection.serial());
+                return;
+            }
+            Err(error) => {
+                self.own_key_active.remove(&request.room);
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!(
+                        "room {}: own history key request failed: {error}",
+                        crate::node::link::b32_encode(&request.room)
+                    ),
+                });
+                return;
+            }
         }
         self.own_key_pending.insert(request.room, ready);
         self.try_install_own_key(request.room);
@@ -409,11 +444,13 @@ impl Node {
             let queue = out.queue.clone();
             let tx = self.net_tx.clone();
             let mut epoch_changed = self.pairwise_epoch.subscribe();
+            let mut room_cancel = self.own_key_room_watch(room_id);
             self.own_key_active.insert(room_id, id);
             tokio::spawn(async move {
                 tokio::select! {
                     biased;
                     _ = epoch_changed.changed() => return,
+                    _ = room_cancel.changed() => return,
                     result = async {
                         let node = node_jobs.acquire_owned().await.ok()?;
                         let peer = peer_jobs.acquire_owned().await.ok()?;
@@ -436,6 +473,7 @@ impl Node {
         let budget = Arc::clone(&self.history_budget);
         let tx = self.net_tx.clone();
         let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let mut room_cancel = self.own_key_room_watch(room_id);
         let worker_secret = Arc::clone(&secret);
         let connection_serial = connection.serial();
         tokio::spawn(async move {
@@ -443,6 +481,7 @@ impl Node {
                 let job = tokio::select! {
                     biased;
                     _ = epoch_changed.changed() => return,
+                    _ = room_cancel.changed() => return,
                     job = budget.admit_job(node, Lane::LargeControl) => job,
                 };
                 let envelope = Lane::LargeControl.buffer_limit() / 4;
@@ -450,7 +489,7 @@ impl Node {
                     Ok(work) => break (job, work),
                     Err(Error::HistoryCapacity(pressure)) => {
                         drop(job);
-                        tokio::select! { biased; _ = epoch_changed.changed() => return, _ = pressure.released() => {} }
+                        tokio::select! { biased; _ = epoch_changed.changed() => return, _ = room_cancel.changed() => return, _ = pressure.released() => {} }
                     }
                     Err(_) => {
                         let _ = tx
@@ -517,7 +556,7 @@ impl Node {
                     .await;
                 return;
             };
-            if epoch_changed.has_changed().unwrap_or(true) {
+            if epoch_changed.has_changed().unwrap_or(true) || *room_cancel.borrow() {
                 return;
             }
             let ready = RequestReady {
@@ -618,6 +657,7 @@ impl Node {
         let worker_room = Arc::clone(&room);
         let now = self.now_ms().get();
         let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let mut room_cancel = self.own_key_room_watch(channel_id);
         tokio::spawn(async move {
             // A queued request owns only its bounded peer admission while waiting. A worker or
             // byte release, rather than a timer, permits the next admission attempt. The node's
@@ -626,6 +666,7 @@ impl Node {
                 let job = tokio::select! {
                     biased;
                     _ = epoch_changed.changed() => { refuse(send, recv); return; }
+                    _ = room_cancel.changed() => { refuse(send, recv); return; }
                     job = budget.admit_job(node, Lane::LargeControl) => job,
                 };
                 // A quarter of the existing foreground envelope covers the bounded prekey
@@ -637,6 +678,7 @@ impl Node {
                         tokio::select! {
                             biased;
                             _ = epoch_changed.changed() => { refuse(send, recv); return; }
+                            _ = room_cancel.changed() => { refuse(send, recv); return; }
                             _ = pressure.released() => {}
                         }
                     }
@@ -663,9 +705,9 @@ impl Node {
                         now,
                     )?;
                     drop(ring);
-                    let channel = worker_room.blocking_lock();
+                    let mut channel = worker_room.blocking_lock();
                     let frame = prepare_donor_reply(
-                        &channel,
+                        &mut channel,
                         &store,
                         peer,
                         &context,
@@ -693,7 +735,7 @@ impl Node {
                 refuse(send, recv);
                 return;
             };
-            if epoch_changed.has_changed().unwrap_or(true) {
+            if epoch_changed.has_changed().unwrap_or(true) || *room_cancel.borrow() {
                 refuse(send, recv);
                 return;
             }
@@ -757,11 +799,21 @@ impl Node {
             refuse(send, recv);
             return;
         };
+        if channel.is_poisoned() {
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!(
+                    "room {}: cannot read a retained history key: {}",
+                    crate::node::link::b32_encode(&context.channel_id),
+                    channel.save_failure()
+                ),
+            });
+        }
         if !current {
             refuse(send, recv);
             return;
         }
         let mut pending = Some((send, recv, credit, output, frame));
+        let mut room_cancel = self.own_key_room_watch(context.channel_id);
         let admitted = self.with_current_computer_authority(|| {
             let Some((mut send, recv, credit, output, frame)) = pending.take() else {
                 return;
@@ -772,6 +824,7 @@ impl Node {
                 tokio::select! {
                     biased;
                     _ = epoch_changed.changed() => {},
+                    _ = room_cancel.changed() => {},
                     written = crate::transport::framing::write_frame(&mut send, &frame) => {
                         if written.is_ok() { let _ = send.finish(); }
                     }
@@ -969,7 +1022,7 @@ pub(super) fn accept_initial(
 /// no network I/O and must be called under the room's current-scope guard; the caller checks that
 /// the originating connection and room instance are still current before sending the reply.
 pub(super) fn prepare_donor_reply(
-    channel: &ChannelState,
+    channel: &mut ChannelState,
     store: &crate::node::store::Store,
     peer: Digest32,
     context: &crate::join::session::JoinContext,
@@ -983,14 +1036,25 @@ pub(super) fn prepare_donor_reply(
         ));
     }
     let request = open_request(session, sealed, context.channel_id, context.epoch, now)?;
-    let release = channel.own_original_release(
-        store,
-        peer,
-        request.key_epoch,
-        request.chain,
-        request.floor,
-    )?;
-    seal_response(session, request, release.as_ref())
+    match channel.own_original_release(store, peer, request.key_epoch, request.chain, request.floor)
+    {
+        Ok(release) => seal_response(session, request, release.as_ref()),
+        Err(error @ (Error::Storage { .. } | Error::Path { .. } | Error::MalformedAtRest(_))) => {
+            channel.poison(&error);
+            let mut e = Encoder::for_secrets();
+            e.array(4)
+                .uint(1)
+                .bytes(&request.encode())
+                .uint(2)
+                .bytes(&[]);
+            let sealed = session.encrypt(&Zeroizing::new(e.finish()))?.to_wire();
+            Ok(crate::node::pairwise_stream::PairwiseFrame::RecoveryReply {
+                channel_id: request.room,
+                sealed,
+            })
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The response repeats the entire immutable query. The only successful key is still verified
@@ -1027,6 +1091,11 @@ pub(super) fn decode_response(
     let wire = d.bytes()?;
     let result = match status {
         0 if wire.is_empty() => None,
+        2 if wire.is_empty() => {
+            return Err(Error::Unreachable(
+                "peer could not read its retained history key due to a storage error",
+            ))
+        }
         1 => {
             let release = crate::group::skdm::Skdm::from_wire(wire)?;
             if release.body.channel_id != request.room
