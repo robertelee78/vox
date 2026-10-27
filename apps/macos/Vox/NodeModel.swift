@@ -451,6 +451,7 @@ final class NodeModel: ObservableObject {
     @Published private var sessionsHistoryAfter: String?
     var sessionsHistoryPaged: Bool { sessionsHistoryAfter != nil }
     private var sessionsMetadataRead = UUID()
+    private var selectedSessionRead = UUID()
     @Published private(set) var selectedSessionMetadata: FfiSession?
     @Published private(set) var selectedSessionMetadataKnown = false
     /// Only the selected Session's current owner is observed; no historical/per-peer cache.
@@ -4080,20 +4081,29 @@ extension NodeModel {
     /// Exact selected metadata stays independent of the bounded tab/history pages.
     func readSelectedSessionMetadata(whileRecovering: Bool = false) async {
         guard ended == nil, !roomNeedsPage, !observationNeedsRestart || whileRecovering else { return }
-        guard let room = roomOnScreen, case let .session(node, id) = showing else {
+        guard let room = roomOnScreen, let instance = roomInstance,
+              case let .session(node, id) = showing else {
+            selectedSessionRead = UUID()
             selectedSessionMetadata = nil
             selectedSessionMetadataKnown = false
             return
         }
-        let epoch = nodeObservationEpoch, generation = roomReadGeneration
+        let epoch = nodeObservationEpoch, generation = roomReadGeneration, token = UUID()
+        selectedSessionRead = token
         func current() -> Bool {
-            roomOnScreen == room && showing == .session(node: node, id: id)
-                && epoch == nodeObservationEpoch && generation == roomReadGeneration
+            roomOnScreen == room && roomInstance == instance && showing == .session(node: node, id: id)
+                && selectedSessionRead == token && epoch == nodeObservationEpoch && generation == roomReadGeneration
                 && ended == nil && !roomNeedsPage && (!observationNeedsRestart || whileRecovering)
         }
         do {
             let found = try await client.session(room: room, node: node, sessionId: id)
             guard current() else { return }
+            if let old = shownSession, let found, old.opening != found.opening {
+                sessionPages.clear()
+                sessionWindowRevision = UUID()
+                selectedEarlierRequest = nil
+                sessionReloadNeeded = !timelineFollowingNewest
+            }
             selectedSessionMetadata = found
             selectedSessionMetadataKnown = true
             // Only this successful exact lookup can revoke the selected tab. Its absence
@@ -4159,7 +4169,8 @@ extension NodeModel {
         guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty else { return }
         guard !reloadNewest || timelineFollowingNewest else { return }
         if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
-        guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
+        guard let room = roomOnScreen, let instance = roomInstance,
+              let s = shownSession, s.canDrive else {
             sessionPages.clear()
             selectedEarlierRequest = nil
             if sessionNote != nil { sessionNote = nil }
@@ -4173,9 +4184,9 @@ extension NodeModel {
         let heldIDs = sessionEntries.map(\.id)
         let heldInstance = sessionPages.instance
         func current() -> Bool {
-            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
-                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
-                && revision == sessionWindowRevision && following == timelineFollowingNewest
+            roomOnScreen == room && roomInstance == instance && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.opening == s.opening
+                && shownSession?.canDrive == true && revision == sessionWindowRevision && following == timelineFollowingNewest
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
                 && ended == nil && !roomNeedsPage && (!observationNeedsRestart || whileRecovering)
         }
@@ -4183,6 +4194,9 @@ extension NodeModel {
             let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
                                                     sessionId: s.sessionId)
             guard current() else { return }
+            guard read.instance == instance else {
+                throw VoxError.Failed(reason: "The saved room changed while reading Session activity.")
+            }
             var retained: FfiSessionRead?
             if !follows, !heldIDs.isEmpty, let heldInstance {
                 guard heldInstance == read.instance else {
@@ -4253,7 +4267,8 @@ extension NodeModel {
     /// The page of the Session on screen's entries before those held (ADR-034 FR-4): read when
     /// the person scrolls up to the top, or asks, and put before them. One page at a time.
     func readOlderSession() async {
-        guard !sessionReloadNeeded, let room = roomOnScreen, let s = shownSession, s.canDrive,
+        guard ended == nil, !observationNeedsRestart, !roomNeedsPage, !sessionReloadNeeded,
+              let room = roomOnScreen, let instance = roomInstance, let s = shownSession, s.canDrive,
               let before = sessionBefore, !sessionReadingOlder else { return }
         timelineFollowingNewest = false
         let revision = sessionWindowRevision
@@ -4263,10 +4278,13 @@ extension NodeModel {
         do {
             let read = try await client.sessionReadOlder(room: room, node: s.nodeFingerprint,
                                                          sessionId: s.sessionId, before: before)
-            guard roomOnScreen == room, let now = shownSession, now.nodeFingerprint == s.nodeFingerprint,
-                  now.sessionId == s.sessionId, now.canDrive, sessionBefore == before,
+            guard roomOnScreen == room, roomInstance == instance, ended == nil,
+                  !observationNeedsRestart, !roomNeedsPage, epoch == nodeObservationEpoch,
+                  generation == roomReadGeneration, let now = shownSession,
+                  now.nodeFingerprint == s.nodeFingerprint, now.sessionId == s.sessionId,
+                  now.opening == s.opening, now.canDrive, sessionBefore == before,
                   revision == sessionWindowRevision else { return }
-            guard sessionPages.instance == read.instance else {
+            guard sessionPages.instance == instance, read.instance == instance else {
                 throw VoxError.Failed(reason: "The saved room changed while loading older Session activity.")
             }
             guard sessionPages.older(read, asked: before) else { return }
@@ -4274,9 +4292,10 @@ extension NodeModel {
             await refreshSessionRequests(room: room, session: now)
         } catch {
             guard revision == sessionWindowRevision, epoch == nodeObservationEpoch,
-                  generation == roomReadGeneration, roomOnScreen == room,
+                  generation == roomReadGeneration, roomOnScreen == room, roomInstance == instance,
+                  ended == nil, !observationNeedsRestart, !roomNeedsPage,
                   shownSession?.nodeFingerprint == s.nodeFingerprint,
-                  shownSession?.sessionId == s.sessionId else { return }
+                  shownSession?.sessionId == s.sessionId, shownSession?.opening == s.opening else { return }
             discardSessionWindow(after: error, requiresReload: true)
         }
     }
@@ -4287,11 +4306,12 @@ extension NodeModel {
         let selected = selectedRequest
         let revision = sessionWindowRevision
         let epoch = nodeObservationEpoch, generation = roomReadGeneration
-        let instance = sessionPages.instance
+        guard let instance = roomInstance, sessionPages.instance == instance else { return }
         func currentContext() -> Bool {
-            roomOnScreen == room && shownSession?.nodeFingerprint == s.nodeFingerprint
-                && shownSession?.sessionId == s.sessionId && shownSession?.canDrive == true
-                && selectedRequest == selected && revision == sessionWindowRevision
+            roomOnScreen == room && roomInstance == instance && ended == nil && !roomNeedsPage
+                && shownSession?.nodeFingerprint == s.nodeFingerprint
+                && shownSession?.sessionId == s.sessionId && shownSession?.opening == s.opening
+                && shownSession?.canDrive == true && selectedRequest == selected && revision == sessionWindowRevision
                 && epoch == nodeObservationEpoch && generation == roomReadGeneration
         }
         var references = Set(sessionEntries.compactMap { $0.request?.reference })
@@ -4308,7 +4328,7 @@ extension NodeModel {
                 let page = try await client.sessionRequestsPage(room: room, node: s.nodeFingerprint,
                     sessionId: s.sessionId, reference: reference, before: nil)
                 guard currentContext() else { return }
-                if let instance, page.instance != instance {
+                if page.instance != instance {
                     throw VoxError.Failed(reason: "The saved room changed while refreshing its requests.")
                 }
                 if let row = page.entries.last(where: { $0.request?.reference == reference }) {

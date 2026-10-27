@@ -262,6 +262,7 @@ struct RequestView: View {
     @ObservedObject var model: NodeModel
     /// The room it was drawn in: Approve, Reject and an answer go there and to `session` (D3).
     let room: String
+    let instance: Data?
     let session: FfiSession
     let request: FfiRequest
     /// What the request asks, as its entry's line says it: its buttons name it to VoiceOver.
@@ -278,6 +279,7 @@ struct RequestView: View {
          showsQuestionText: Bool = true) {
         self.model = model
         self.room = room
+        self.instance = model.selectedRoomInstance
         self.session = session
         self.request = request
         self.about = about
@@ -366,7 +368,7 @@ struct RequestView: View {
     }
 
     private func act(_ action: DriveAction) {
-        guard !busy, let instance = model.selectedRoomInstance else { return }
+        guard !busy, let instance, model.selectedRoomInstance == instance else { return }
         busy = true
         said = ""
         Task {
