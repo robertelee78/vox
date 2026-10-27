@@ -54,6 +54,8 @@ const HELPER_IDENTIFIER: &str = "us.vox.cli";
 const PUBLISHING: &str = ".Vox.app.publishing";
 /// In [`PUBLISHING`]: the fully flushed transition record.
 const TRANSITION_STATE: &str = "state";
+/// Incomplete records are never interpreted as committed transitions.
+const TRANSITION_STATE_PARTIAL: &str = "state.partial";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TransitionKind {
@@ -491,11 +493,12 @@ fn begin_transition(apps: &Path, transition: &Transition) -> Result<(), AppError
         TransitionKind::Rollback => "rollback",
     };
     transition_failure!("journal-state-synced")?;
+    let partial = journal.join(TRANSITION_STATE_PARTIAL);
     let state = journal.join(TRANSITION_STATE);
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&state)
+        .open(&partial)
         .map_err(AppError::Io)?;
     write!(
         file,
@@ -508,6 +511,7 @@ fn begin_transition(apps: &Path, transition: &Transition) -> Result<(), AppError
     )
     .map_err(AppError::Io)?;
     file.sync_all().map_err(AppError::Io)?;
+    fs::rename(&partial, &state).map_err(AppError::Io)?;
     sync_dir(&journal)?;
     sync_dir(apps)?;
     transition_succeeded!("journal-state-synced");
@@ -948,6 +952,28 @@ fn recover(apps: &Path) -> Result<Recovery, AppError> {
     let Some(transition) = read_transition(&journal)? else {
         // The directory can reach disk before its state file. No bundle mutation is permitted
         // until that state file is flushed, so this is unambiguously before the exchange.
+        // Only our incomplete record may be present. Refuse ambiguous files and staging rather
+        // than deleting a bundle or following a link in an unrecorded journal.
+        if path_exists(&rollback_staged)? || path_exists(&kept)? {
+            return Err(transition_conflict(
+                &journal,
+                "bundle staging exists without a committed transition record",
+            ));
+        }
+        for entry in fs::read_dir(&journal).map_err(AppError::Io)? {
+            let entry = entry.map_err(AppError::Io)?;
+            let meta = fs::symlink_metadata(entry.path()).map_err(AppError::Io)?;
+            if entry.file_name() != TRANSITION_STATE_PARTIAL
+                || !meta.is_file()
+                || meta.file_type().is_symlink()
+                || meta.nlink() != 1
+            {
+                return Err(transition_conflict(
+                    &journal,
+                    "unexpected item in unrecorded transition journal",
+                ));
+            }
+        }
         if path_exists(&staged)? {
             clear(&staged)?;
         }
