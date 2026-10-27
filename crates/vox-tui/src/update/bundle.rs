@@ -967,10 +967,18 @@ fn launch_services_path_absent(bundle: &Path) -> Result<bool, String> {
     for line in dump.lines() {
         if let Some(value) = line.trim().strip_prefix("path:") {
             paths += 1;
-            let value = value
-                .trim()
-                .split_once(" (0x")
-                .map_or(value.trim(), |(path, _)| path);
+            let value = value.trim();
+            // LaunchServices appends an address in parentheses. Strip only a final valid
+            // address: a person's directory name may itself contain " (0x".
+            let value = value.rsplit_once(" (0x").map_or(value, |(path, suffix)| {
+                if suffix.strip_suffix(')').is_some_and(|hex| {
+                    !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                }) {
+                    path
+                } else {
+                    value
+                }
+            });
             let path = Path::new(value);
             if path == wanted || fs::canonicalize(path).is_ok_and(|actual| actual == wanted) {
                 return Ok(false);
@@ -981,6 +989,78 @@ fn launch_services_path_absent(bundle: &Path) -> Result<bool, String> {
         return Err("LaunchServices records contain no recognizable paths".to_owned());
     }
     Ok(true)
+}
+
+/// Release only the extension paths belonging to the displaced app. PluginKit can retain an
+/// extension independently of its outer LaunchServices record.
+fn release_disarmed_extensions(bundle: &Path) -> Result<(), AppError> {
+    let plugins = bundle.join("Contents/PlugIns");
+    require_optional_dir(&plugins, "displaced app PlugIns")?;
+    if !path_exists(&plugins)? {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&plugins).map_err(AppError::Io)? {
+        let path = entry.map_err(AppError::Io)?.path();
+        if path.extension().is_none_or(|ext| ext != "appex") {
+            continue;
+        }
+        require_bundle(&path, "displaced app extension")?;
+        let status = Command::new("/usr/bin/pluginkit")
+            .arg("-r")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(AppError::Io)?;
+        if status.success() {
+            continue;
+        }
+        let wanted = fs::canonicalize(&path).map_err(AppError::Io)?;
+        let output = Command::new("/usr/bin/pluginkit")
+            .args(["-m", "-A", "-D", "-v"])
+            .output()
+            .map_err(AppError::Io)?;
+        if !output.status.success() {
+            return Err(usage(format!(
+                "PluginKit could not list extensions ({})",
+                output.status
+            )));
+        }
+        let listing = std::str::from_utf8(&output.stdout)
+            .map_err(|_| usage("PluginKit extension listing is not UTF-8"))?;
+        let mut parsed = 0usize;
+        for line in listing.lines() {
+            if let Some((_, value)) = line.rsplit_once('\t') {
+                let candidate = Path::new(value.trim());
+                if !candidate.is_absolute() {
+                    continue;
+                }
+                parsed += 1;
+                if candidate == wanted
+                    || fs::canonicalize(candidate).is_ok_and(|actual| actual == wanted)
+                {
+                    return Err(usage(format!(
+                        "PluginKit did not remove {} ({status}); its registration remains",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        if parsed == 0 && !listing.contains("(0 plug-ins)") {
+            return Err(usage(
+                "PluginKit extension listing contains no recognizable paths",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn release_disarmed(bundle: &Path) -> Result<(), AppError> {
+    let outer = launch_services(false, bundle).map_err(usage);
+    let extensions = release_disarmed_extensions(bundle);
+    outer?;
+    extensions
 }
 
 /// A set-aside bundle's `Info.plist`, kept under this name until a rollback restores it. Without
@@ -1004,9 +1084,7 @@ fn set_aside(bundle: &Path) -> Result<bool, AppError> {
             // An earlier attempt may have renamed the plist but failed before its directory
             // fence. Complete that fence before relying on it to make the bundle unlaunchable.
             sync_dir(&bundle.join("Contents"))?;
-            launch_services(false, bundle)
-                .map_err(usage)
-                .map(|()| false)
+            release_disarmed(bundle).map(|()| false)
         } else {
             Err(usage(format!(
                 "{} has neither a live nor kept Info.plist; it was not removed",
@@ -1027,7 +1105,7 @@ fn set_aside(bundle: &Path) -> Result<bool, AppError> {
         ))
     })?;
     sync_dir(&bundle.join("Contents"))?;
-    launch_services(false, bundle).map_err(usage).map(|()| true)
+    release_disarmed(bundle).map(|()| true)
 }
 
 /// Make a set-aside bundle an application again, for the swap that brings it back.
