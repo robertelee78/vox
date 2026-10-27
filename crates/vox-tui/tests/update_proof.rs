@@ -797,6 +797,8 @@ fn product_app_bundle_as(
             .expect("APPARATUS: the bundled vox path has a parent"),
     )
     .unwrap_or_else(|e| panic!("APPARATUS: could not make Contents/Helpers: {e}"));
+    std::fs::remove_file(&bundled_vox)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not replace scratch-only helper: {e}"));
     copy(helper, &bundled_vox);
     make_executable(&bundled_vox);
     let signed = Command::new("/usr/bin/codesign")
@@ -1536,44 +1538,65 @@ impl LaunchServicesCleanup {
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 impl Drop for LaunchServicesCleanup {
     fn drop(&mut self) {
-        let mut failures = Vec::new();
         self.extensions.sort();
         self.extensions.dedup();
-        for extension in &self.extensions {
-            match Command::new("/usr/bin/pluginkit")
-                .arg("-r")
-                .arg(extension)
-                .output()
-            {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => failures.push(format!(
-                    "pluginkit -r {} exited {}: {}",
-                    extension.display(),
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )),
-                Err(e) => failures.push(format!(
-                    "could not run pluginkit -r {}: {e}",
-                    extension.display()
-                )),
-            }
-        }
         self.bundles.sort();
         self.bundles.dedup();
-        for bundle in &self.bundles {
-            if let Err(why) = lsregister("-u", bundle) {
-                failures.push(why);
-            }
+        for extension in &self.extensions {
+            let _ = Command::new("/usr/bin/pluginkit")
+                .arg("-r")
+                .arg(extension)
+                .output();
         }
-        if !failures.is_empty() {
-            let said = format!(
-                "APPARATUS: LaunchServices cleanup failed: {}",
-                failures.join("; ")
-            );
+        for bundle in &self.bundles {
+            let _ = lsregister("-u", bundle);
+        }
+        // Both tools return nonzero for an already absent path. Determine cleanup from their
+        // databases rather than treating that exit status as evidence a registration remains.
+        let plugins = Command::new("/usr/bin/pluginkit")
+            .args(["-m", "-A", "-D", "-v"])
+            .output();
+        let records = Command::new(LSREGISTER).arg("-dump").output();
+        let check =
+            |out: std::io::Result<Output>, paths: &[PathBuf], label: &str| -> Result<(), String> {
+                let out = out.map_err(|e| format!("{label}: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("{label}: query exited {}", out.status));
+                }
+                let text = String::from_utf8(out.stdout)
+                    .map_err(|_| format!("{label}: non-UTF-8 output"))?;
+                for path in paths {
+                    let logical = path.to_string_lossy();
+                    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
+                        let value = logical.as_ref();
+                        if value.starts_with("/var/") {
+                            PathBuf::from(format!("/private{value}"))
+                        } else {
+                            path.clone()
+                        }
+                    });
+                    if text.lines().any(|line| {
+                        line.contains(logical.as_ref())
+                            || line.contains(canonical.to_string_lossy().as_ref())
+                    }) {
+                        return Err(format!(
+                            "{label}: scratch path {} remains registered",
+                            path.display()
+                        ));
+                    }
+                }
+                Ok(())
+            };
+        let problems = [
+            check(plugins, &self.extensions, "pluginkit"),
+            check(records, &self.bundles, "LaunchServices"),
+        ];
+        for problem in problems.into_iter().filter_map(Result::err) {
+            let message = format!("APPARATUS: cleanup not confirmed: {problem}");
             if std::thread::panicking() {
-                eprintln!("{said}");
+                eprintln!("{message}");
             } else {
-                panic!("{said}");
+                panic!("{message}");
             }
         }
     }
@@ -1611,7 +1634,7 @@ fn opened_bundle(
 import AppKit
 import Darwin
 
-let wanted = CommandLine.arguments.last!
+let wanted = ProcessInfo.processInfo.environment["VOX_PROOF_OBSERVER_IDENTIFIER"]!
 let center = NSWorkspace.shared.notificationCenter
 var token: NSObjectProtocol?
 token = center.addObserver(
@@ -1636,7 +1659,8 @@ fflush(stdout)
 withExtendedLifetime(token) { RunLoop.main.run() }
 "#;
     let mut observer = Command::new("/usr/bin/swift")
-        .args(["-e", OBSERVER, "--", identifier])
+        .args(["-e", OBSERVER])
+        .env("VOX_PROOF_OBSERVER_IDENTIFIER", identifier)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1999,6 +2023,14 @@ fn stage_transition(journal: &Path, kind: &str, active: &Path, target: &Path, ve
     );
 }
 
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn app_qe_tmpdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("vox-app-proof-")
+        .tempdir_in("/Users/Shared")
+        .expect("APPARATUS: could not create a visible scratch app directory")
+}
+
 /// ADR-014 M-29a: real scratch updates and rollbacks through the shipped `vox`, with
 /// LaunchServices asked exactly as Finder/Dock/Spotlight ask it. Fully optional QE: ignored even
 /// when compiled, absent from every CI and release gate.
@@ -2016,7 +2048,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     ]);
     let mut claims = Vec::new();
     let mut receipts = BTreeMap::new();
-    let identity = tmpdir();
+    let identity = app_qe_tmpdir();
     let nonce: String = identity
         .path()
         .file_name()
@@ -2060,8 +2092,8 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             && shipped_notarized(&previous_shipped_app).is_ok(),
         "APPARATUS: supplied apps must be exact signed/notarized us.vox.app releases with candidate {candidate_version} newer than prior {previous_version}; identifiers {exact_identifier:?}/{prior_identifier:?}"
     );
-    let tree = tmpdir();
-    let newer = tmpdir();
+    let tree = app_qe_tmpdir();
+    let newer = app_qe_tmpdir();
     let newer_vox = newer.path().join("vox");
     version_stub(&newer_vox, NEWER);
     let newer_app =
@@ -2069,7 +2101,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     bundle_release_app(tree.path(), NEWER, &newer_app, &[("stable", None)]);
     let server = release_server::serve(tree.path())
         .unwrap_or_else(|why| panic!("APPARATUS: the scratch release server: {why}"));
-    let no_daemon = tmpdir();
+    let no_daemon = app_qe_tmpdir();
     let no_data = no_daemon.path().join("data");
     let no_config = no_daemon.path().join("config");
     let base = [
@@ -2085,7 +2117,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         ),
     ];
 
-    let exact_tree = tmpdir();
+    let exact_tree = app_qe_tmpdir();
     bundle_release_app(
         exact_tree.path(),
         &candidate_version,
@@ -2094,7 +2126,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     );
     let exact_server = release_server::serve(exact_tree.path())
         .unwrap_or_else(|why| panic!("APPARATUS: exact release server: {why}"));
-    let prior_tree = tmpdir();
+    let prior_tree = app_qe_tmpdir();
     bundle_release_app(
         prior_tree.path(),
         &previous_version,
@@ -2115,7 +2147,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             "APPARATUS: exact shipped identifier {exact_identifier} already has records; use the isolated macOS proof guest, do not unregister a person's app: {preexisting:?}"
         );
 
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let exact_helper = bundle_install_exact_product(home, "stable", &previous_shipped_app);
         let apps = home.join("Apps");
@@ -2133,6 +2165,13 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let mut registrations = LaunchServicesCleanup::new();
         registrations.remember(&active);
         registrations.remember(&previous);
+        registrations.remember(&apps.join(".Vox.app.partial"));
+        registrations
+            .extensions
+            .push(apps.join(".Vox.app.partial/Contents/PlugIns/ShareExtension.appex"));
+        registrations
+            .extensions
+            .push(apps.join(".Vox.app.previous/Contents/PlugIns/ShareExtension.appex"));
         let updated = vox(Path::new(VOX), home, &["update"], &exact_base);
         let updated_open = opened_bundle(
             &exact_identifier,
@@ -2171,11 +2210,13 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
                 && rollback_open.ok
                 && rollback_open.path.as_deref() == Some(active.as_path()),
             format!(
-                "candidate={candidate_version}, prior={previous_version}; update={} active={updated_version:?} signature={updated_signature:?} open={:?}; rollback={} active={active_version:?} kept={kept_version:?} signature={rollback_signature:?} open={:?}; exact helper {}",
+                "candidate={candidate_version}, prior={previous_version}; update={} active={updated_version:?} signature={updated_signature:?} open={:?} error={:?}; rollback={} active={active_version:?} kept={kept_version:?} signature={rollback_signature:?} open={:?} error={:?}; exact helper {}",
                 updated.status,
                 updated_open.path,
+                updated_open.error,
                 rollback.status,
                 rollback_open.path,
+                rollback_open.error,
                 exact_helper.display()
             ),
         ));
@@ -2188,7 +2229,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     // Info.plist rename in `set_aside` for the non-application claim; and direct the identifier's
     // final registration to the displaced bundle for the independent open-selection claim.
     {
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let link = bundle_install_product(
             home,
@@ -2295,7 +2336,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
 
     // A repair-only update needs a record for this build, so it takes the `is current` path after
     // recovery. The active bundle's inode is the causal no-swap observation.
-    let current_tree = tmpdir();
+    let current_tree = app_qe_tmpdir();
     bundle_release_of_as(
         current_tree.path(),
         VERSION,
@@ -2332,7 +2373,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let mut boundary_ok = true;
         let mut boundary_evidence = Vec::new();
         for mode in ["abort", "fail"] {
-            let tmp = tmpdir();
+            let tmp = app_qe_tmpdir();
             let home = tmp.path();
             let _link = bundle_install_exact_product(home, "stable", &previous_shipped_app);
             let apps = home.join("Apps");
@@ -2462,7 +2503,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let mut boundary_ok = true;
         let mut boundary_evidence = Vec::new();
         for mode in ["abort", "fail"] {
-            let tmp = tmpdir();
+            let tmp = app_qe_tmpdir();
             let home = tmp.path();
             let _link = bundle_install_exact_product(home, "stable", &previous_shipped_app);
             let apps = home.join("Apps");
@@ -2586,7 +2627,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
             "info-plist-alias",
             "kept-info-plist-alias",
         ] {
-            let tmp = tmpdir();
+            let tmp = app_qe_tmpdir();
             let home = tmp.path();
             let link = bundle_install_as(
                 home,
@@ -2666,7 +2707,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     // Mutant seam: remove the under-lock active-app version revalidation in `update`.
     {
         use std::os::unix::fs::MetadataExt as _;
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let link = bundle_install_product(
             home,
@@ -2713,7 +2754,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     // Mutant seam: omit the rollback-before-exchange arm in `recover`.
     {
         use std::os::unix::fs::MetadataExt as _;
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let link = bundle_install_as(
             home,
@@ -2768,7 +2809,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     // Mutant seam: omit the rollback-after-exchange arm in `recover`.
     {
         use std::os::unix::fs::MetadataExt as _;
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let link = bundle_install_product(
             home,
@@ -2861,7 +2902,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let mut evidence = Vec::new();
         let mut all_repaired = true;
         for prior in ["unversioned", "none", "unmoved", "journalled"] {
-            let tmp = tmpdir();
+            let tmp = app_qe_tmpdir();
             let home = tmp.path();
             let link = bundle_install_as(
                 home,
@@ -2934,7 +2975,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     // Mutant seam: omit the published-version branch in `recover`.
     {
         use std::os::unix::fs::MetadataExt as _;
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let link = bundle_install_as(
             home,
@@ -2990,7 +3031,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let mut evidence = Vec::new();
         let mut all_repaired = true;
         for already_set_aside in [false, true] {
-            let tmp = tmpdir();
+            let tmp = app_qe_tmpdir();
             let home = tmp.path();
             let link = bundle_install_as(
                 home,
@@ -3068,7 +3109,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     // Mutant seam: omit the no-journal previous-bundle `set_aside` retry in `recover`.
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let link = bundle_install_as(
             home,
@@ -3080,7 +3121,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         );
         let apps = home.join("Apps");
         let active = apps.join("Vox.app");
-        let previous_work = tmpdir();
+        let previous_work = app_qe_tmpdir();
         let previous = app_bundle_as(
             previous_work.path(),
             "0.4.8",
@@ -3144,7 +3185,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
     {
         use std::io::{BufRead as _, Write as _};
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let tmp = tmpdir();
+        let tmp = app_qe_tmpdir();
         let home = tmp.path();
         let link = bundle_install_as(
             home,
@@ -3156,7 +3197,7 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         );
         let apps = home.join("Apps");
         let active = apps.join("Vox.app");
-        let work = tmpdir();
+        let work = app_qe_tmpdir();
         let fixture = app_bundle_as(
             work.path(),
             "0.4.8",
