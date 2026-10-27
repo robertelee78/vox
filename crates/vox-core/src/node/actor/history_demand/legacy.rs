@@ -78,6 +78,7 @@ pub(super) fn prepare_legacy(
             .legacy_required_page(store, None, 1)
             .map_err(|e| e.to_string())?;
         let Some(required) = required.first() else {
+            answer.accepted_selection = true;
             answer.status=status(room.channel_id(),instance,Phase::Cached,
                 "No authenticated legacy prefix gap is currently known. Cached history remains available.");
             return Ok(answer);
@@ -103,9 +104,7 @@ pub(super) fn prepare_legacy(
         let remaining = usize::try_from(plan.through.saturating_sub(base)).unwrap_or(usize::MAX);
         (plan, bounds, active, remaining)
     };
-    if resume_admission.is_some() {
-        answer.local_boundary = LocalBoundary::Durable;
-    }
+    answer.local_boundary = LocalBoundary::Durable;
     let request = active.request();
     // A publication-only Resume can proceed without a connected donor. The worker checks
     // its sealed cursor first; only a network quantum needs the selected peer online.

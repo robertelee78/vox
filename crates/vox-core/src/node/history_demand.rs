@@ -888,7 +888,10 @@ fn start_plan(
         cleanup: None,
     };
     put(&mut batch, key, &scope, &state)?;
-    commit_context(batch, context)?;
+    // Once the start is committed its durable owner exists. A later cancellation must not
+    // turn that completed mutation into an error that conceals the new request.
+    context.check()?;
+    batch.commit()?;
     Ok(Active {
         node: context.fingerprint(),
         scope,

@@ -66,6 +66,8 @@ struct Prepared {
     local_boundary: LocalBoundary,
     /// A locally recovered exact request durably reached Complete without a dispatch.
     terminal_checkpoint: bool,
+    /// A validated explicit selection can complete locally without a durable request.
+    accepted_selection: bool,
     selection_after: Option<Option<Digest32>>,
     /// Sizing only. Classification owns no authority or durable mutation.
     resume_kind: Option<bool>,
@@ -76,7 +78,7 @@ struct Prepared {
 fn committed_resume_failure(mut prepared: Prepared, error: impl std::fmt::Display) -> Prepared {
     prepared.local_boundary = LocalBoundary::Durable;
     prepared.status.phase = Phase::Unavailable;
-    prepared.status.detail = format!("History resume committed; {error}")
+    prepared.status.detail = format!("History operation committed; {error}")
         .chars()
         .take(128)
         .collect();
@@ -2004,6 +2006,7 @@ impl Node {
                             && status.instance == target_instance
                             && status.request == prepared.status.request
                     });
+            let mut same_room = false;
             let valid = target_matches
                 && if prepared.local_only {
                     self.profile
@@ -2013,14 +2016,14 @@ impl Node {
                     let Ok(room) = shared.try_lock() else {
                         return false;
                     };
-                    prepared
+                    same_room = prepared
                         .room
                         .upgrade()
                         .is_some_and(|old| Arc::ptr_eq(&old, shared))
                         && room.epoch() == prepared.epoch
                         && room.history_instance(profile.store()).ok()
-                            == Some(prepared.status.instance)
-                        && (committed_terminal
+                            == Some(prepared.status.instance);
+                    same_room && (committed_terminal
                             || (room.is_member(&prepared.node)
                                 && !room.has_left(&prepared.node)
                                 && room.ended(self.now_ms().get()).is_none()
@@ -2037,6 +2040,12 @@ impl Node {
                     false
                 };
             if !valid {
+                // A later authorization change must prevent dispatch, but it cannot undo a
+                // newer action already committed in this same room. Retire an older recovery
+                // probe before it can replace that action's status.
+                let committed_intent = user_intent
+                    && same_room
+                    && prepared.local_boundary == LocalBoundary::Durable;
                 if let Some(Ok(prepared)) = result.take() {
                     if let Some(dispatch) = prepared.dispatch {
                         dispatch.fence.retire();
@@ -2045,6 +2054,9 @@ impl Node {
                 }
                 drop(result);
                 self.history_demand.preparing = None;
+                if committed_intent {
+                    self.history_demand.cancel_auto_recovery();
+                }
                 let status = match origin {
                     PreparationOrigin::Explicit => self.history_demand.owner_status.as_mut(),
                     PreparationOrigin::Observation => self.history_demand.observation.as_mut(),
@@ -2100,7 +2112,11 @@ impl Node {
                             || prepared.legacy.is_some()
                     }
                     Action::Newest | Action::Older { .. } | Action::PrivateRecover { .. } => {
-                        !matches!(prepared.status.phase, Phase::Unavailable | Phase::Busy)
+                        prepared.local_boundary == LocalBoundary::Durable
+                            || prepared.accepted_selection
+                            || prepared.dispatch.is_some()
+                            || prepared.private.is_some()
+                            || prepared.legacy.is_some()
                     }
                     Action::Status => false,
                 };
@@ -2408,6 +2424,7 @@ fn prepare_local(
         local_only: true,
         local_boundary: LocalBoundary::Observed,
         terminal_checkpoint: false,
+        accepted_selection: false,
         selection_after: None,
         resume_kind: None,
     };
@@ -2514,6 +2531,7 @@ fn classify_resume(
         local_only: true,
         local_boundary: LocalBoundary::Observed,
         terminal_checkpoint: false,
+        accepted_selection: false,
         selection_after: None,
         resume_kind: Some(state.private.is_some()),
     })
@@ -2568,6 +2586,7 @@ fn prepare(
         local_only: false,
         local_boundary: LocalBoundary::Observed,
         terminal_checkpoint: false,
+        accepted_selection: false,
         selection_after: None,
         resume_kind: None,
     };
@@ -2837,10 +2856,19 @@ fn prepare(
             peer,
         )
     } else {
-        // An explicit new ask is the person's newer intent: it ends a paused earlier quantum
-        // instead of being turned away by it; `--history resume` continues one on purpose.
-        // Measured before this: a newcomer paging back was told "A saved request exists" for
-        // 60 s after one quantum paused, and the page below his window never came.
+        // Validate the user's new selection and reserve its follow-up before retiring any
+        // saved request. A stale cursor must not cancel the recovery it failed to replace.
+        let selected = select(room, store, action, &fence, deadline, selection_after)
+            .map_err(|e| e.to_string())?;
+        if matches!(action, Action::Newest) {
+            answer.selection_after = Some(selected.after);
+        }
+        let fresh = if let Some((bounds, author)) = selected.found {
+            let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
+            Some((bounds, author, request, admit_peer()?))
+        } else {
+            None
+        };
         let paused = saved
             .as_ref()
             .map(|previous| previous.state())
@@ -2852,14 +2880,42 @@ fn prepare(
             })
             .map(|state| state.request);
         if let Some(request) = paused {
-            cancel_exact(&context, request, job, &fence, deadline)?;
+            let charge =
+                demand::AdmissionCharge::reserve(job).map_err(|error| error.to_string())?;
+            match cancel_owned_precharged(&context, request, &charge, &fence)? {
+                CancelCompletion::Cancelled => {
+                    answer.local_boundary = LocalBoundary::Durable;
+                }
+                CancelCompletion::Complete => {
+                    answer.local_boundary = LocalBoundary::Durable;
+                    loop {
+                        match demand::reclaim_precharged(&context, request, &charge) {
+                            Ok(true) => break,
+                            Ok(false) => std::thread::yield_now(),
+                            Err(error) => {
+                                answer.status.phase = Phase::Unavailable;
+                                answer.status.detail = format!("The completed history request still has cleanup pending: {error}");
+                                return Ok(answer);
+                            }
+                        }
+                    }
+                }
+                CancelCompletion::CleanupPending(error) => {
+                    answer.local_boundary = LocalBoundary::Durable;
+                    answer.status.phase = Phase::Unavailable;
+                    answer.status.detail = format!(
+                        "The previous history request was cancelled; cleanup remains: {error}"
+                    );
+                    return Ok(answer);
+                }
+                CancelCompletion::Superseded => {
+                    answer.local_boundary = LocalBoundary::Superseded;
+                    return Ok(answer);
+                }
+            }
         }
-        let selected = select(room, store, action, &fence, deadline, selection_after)
-            .map_err(|e| e.to_string())?;
-        if matches!(action, Action::Newest) {
-            answer.selection_after = Some(selected.after);
-        }
-        let Some((bounds, author)) = selected.found else {
+        let Some((bounds, author, request, peer)) = fresh else {
+            answer.accepted_selection = true;
             answer.status = if selected.more {
                 status(id, instance, Phase::More, "This bounded scan is cached. Request newest again to check the next authors; unchecked history remains.")
             } else {
@@ -2867,10 +2923,16 @@ fn prepare(
             };
             return Ok(answer);
         };
-        let request = crate::identity::rng::random_array::<16>().map_err(|e| e.to_string())?;
-        let peer = admit_peer()?;
-        let active =
-            demand::start(&context, request, binding, bounds, job).map_err(|e| e.to_string())?;
+        let active = match demand::start(&context, request, binding, bounds, job) {
+            Ok(active) => active,
+            Err(error) if answer.local_boundary == LocalBoundary::Durable => {
+                return Ok(committed_resume_failure(
+                    answer,
+                    format!("new history request outcome is unknown: {error}"),
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        };
         let query = Query::Page {
             head: bounds.head,
             lo: bounds.lo,
@@ -2880,28 +2942,28 @@ fn prepare(
         };
         (bounds, author, query, active, bounds.entries, peer)
     };
-    if resume_admission.is_some() {
-        answer.local_boundary = LocalBoundary::Durable;
-    }
+    answer.local_boundary = LocalBoundary::Durable;
     let request = active.request();
+    answer.status.request = Some(request);
+    answer.status.head = Some(bounds.head);
+    answer.status.author = Some(author);
+    answer.status.remaining = remaining;
     let peer = match peer {
         PeerAdmission::Available(peer) => peer,
         PeerAdmission::Unavailable(credit) => {
             let mut active = active;
-            let credit = credit
-                .as_ref()
-                .or_else(|| {
-                    resume_admission
-                        .as_ref()
-                        .map(|admission| admission.mutation())
-                })
-                .ok_or("History pause admission is missing.")?;
+            let Some(credit) = credit.as_ref().or_else(|| {
+                resume_admission
+                    .as_ref()
+                    .map(|admission| admission.mutation())
+            }) else {
+                return Ok(committed_resume_failure(
+                    answer,
+                    "History pause admission is missing.",
+                ));
+            };
             if let Err(error) = demand::pause_precharged(&context, &mut active, credit) {
-                return if resume_admission.is_some() {
-                    Ok(committed_resume_failure(answer, error))
-                } else {
-                    Err(error.to_string())
-                };
+                return Ok(committed_resume_failure(answer, error));
             }
             answer.status = status(
                 id,
@@ -3053,6 +3115,7 @@ fn prepare_private(
             after = after.max(prior.bounds.hi);
         }
         if after >= boundary.after {
+            answer.accepted_selection = true;
             answer.status = status(room.channel_id(), instance, Phase::Cached, "The currently advertised private interval has been examined; this is not proof of donor completeness.");
             return Ok(answer);
         }
@@ -3078,9 +3141,14 @@ fn prepare_private(
             .map_err(|e| e.to_string())?;
         (bounds, plan, active, inspect_credit, pause_credit)
     };
-    if resume_admission.is_some() {
-        answer.local_boundary = LocalBoundary::Durable;
-    }
+    answer.local_boundary = LocalBoundary::Durable;
+    answer.status.request = Some(active.request());
+    answer.status.head = Some(bounds.head);
+    answer.status.remaining = if matches!(action, Action::Resume { .. }) {
+        saved.map_or(bounds.entries, |state| state.remaining)
+    } else {
+        bounds.entries
+    };
     let snapshot = match demand::inspect_precharged(&context, inspect_credit) {
         Ok(Some(snapshot)) => snapshot,
         result => {
@@ -3088,29 +3156,23 @@ fn prepare_private(
                 Err(error) => error.to_string(),
                 Ok(_) => "Private history state disappeared.".into(),
             };
-            return if resume_admission.is_some() {
-                Ok(committed_resume_failure(answer, detail))
-            } else {
-                Err(detail)
-            };
+            return Ok(committed_resume_failure(answer, detail));
         }
     };
     answer.status = saved_status(snapshot.state(), None, Some(&active));
     if donor_unavailable {
-        let credit = pause_credit
-            .as_ref()
-            .or_else(|| {
-                resume_admission
-                    .as_ref()
-                    .map(|admission| admission.mutation())
-            })
-            .ok_or("Private pause admission is missing.")?;
+        let Some(credit) = pause_credit.as_ref().or_else(|| {
+            resume_admission
+                .as_ref()
+                .map(|admission| admission.mutation())
+        }) else {
+            return Ok(committed_resume_failure(
+                answer,
+                "Private pause admission is missing.",
+            ));
+        };
         if let Err(error) = demand::pause_precharged(&context, &mut active, credit) {
-            return if resume_admission.is_some() {
-                Ok(committed_resume_failure(answer, error))
-            } else {
-                Err(error.to_string())
-            };
+            return Ok(committed_resume_failure(answer, error));
         }
         answer.status.phase = Phase::Paused;
         answer.status.detail =
