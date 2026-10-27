@@ -97,7 +97,7 @@ impl ChannelState {
             ));
         }
         cursor.scope = Some(scope);
-        if cursor.binding.room != self.channel_id || self.dag.is_frozen(&cursor.binding.author) {
+        if cursor.binding.room != self.channel_id {
             return Ok(ProofRangeStep::Missing);
         }
         let target = read
@@ -106,13 +106,11 @@ impl ChannelState {
         if target.binding != cursor.binding || target.root != cursor.root {
             return Err(Error::MalformedAtRest("proof repair target changed"));
         }
-        let target_committed = read.history_head_committed(&cursor.head, cursor.binding)?;
-        if read
-            .sparse_author(&cursor.binding.author, cursor.binding.scope)?
-            .is_some_and(|state| state.observed_conflict.is_some())
-        {
-            return Ok(ProofRangeStep::Missing);
-        }
+        let reconstruction_allowed = read.history_head_committed(&cursor.head, cursor.binding)?
+            && !self.dag.is_frozen(&cursor.binding.author)
+            && read
+                .sparse_author(&cursor.binding.author, cursor.binding.scope)?
+                .is_none_or(|state| state.observed_conflict.is_none());
         loop {
             let Some(task) = cursor.tasks.last().cloned() else {
                 let [result] = cursor.values.as_slice() else {
@@ -155,8 +153,9 @@ impl ChannelState {
                     }
                     // Existing verified serving material may satisfy a local verifier even
                     // before promotion. Only NEW reconstruction requires independently
-                    // committed target/source roots; no cache is acceptance evidence.
-                    if !target_committed {
+                    // committed, nonforked target/source roots; no cache is acceptance
+                    // evidence. A known fork does not invalidate existing historical math.
+                    if !reconstruction_allowed {
                         return Ok(ProofRangeStep::Missing);
                     }
                     if range.leaves != 1 {
