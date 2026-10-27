@@ -835,6 +835,7 @@ impl ChannelState {
             .cleanup_publication(store, &self.sek, &self.channel_id)?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         if done {
+            self.flush_available(store)?;
             self.history_publication_changed.notify_waiters();
             let read = self.history_read(store)?;
             self.dag.set_order_revision(
@@ -1541,6 +1542,7 @@ impl ChannelState {
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
+            let newly_available = index.refill_available(entry, log)?;
             index.put_committed(entry, log)?;
             if kind == SignedEntryKind::KeyPackage {
                 index.finish_history_obligation(&entry_store::sparse::Obligation {
@@ -1618,6 +1620,10 @@ impl ChannelState {
             self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let rendered = !rows.is_empty();
             self.place_committed(store, rows, &expired)?;
+            let serveable = newly_available && self.history_read(store)?.payload_present(&hash)?;
+            if serveable {
+                self.note_available(store, entry.skeleton.author_id)?;
+            }
             let contiguous_more = contiguous.as_ref().is_some_and(|progress| progress.more);
             if let Some(progress) = contiguous {
                 self.note_contiguous_advance(entry.skeleton.author_id, progress)?;

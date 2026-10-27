@@ -21,6 +21,7 @@ const DECODE_ENVELOPE: usize = 1024 * 1024;
 
 pub(super) struct Incoming {
     bytes: Vec<u8>,
+    availability: bool,
     _charge: BufferCharge,
 }
 
@@ -30,7 +31,13 @@ impl Incoming {
     }
 
     pub(super) fn frame(&self) -> Result<Frame<'_>> {
-        Frame::decode(&self.bytes)
+        let frame = Frame::decode(&self.bytes)?;
+        if matches!(&frame, Frame::Have(_, token) if token.is_some() != self.availability) {
+            return Err(Error::MalformedBundle(
+                "inventory availability not negotiated",
+            ));
+        }
+        Ok(frame)
     }
 
     pub(super) fn wire_len(&self) -> usize {
@@ -57,6 +64,7 @@ pub(super) struct Transport {
     fence: Arc<Fence>,
     deadline: Instant,
     send_finished: bool,
+    pub(super) availability_connection: Option<u64>,
 }
 
 impl Transport {
@@ -66,6 +74,7 @@ impl Transport {
         job: Job,
         fence: Arc<Fence>,
         deadline: Instant,
+        availability_connection: Option<u64>,
     ) -> Self {
         Self {
             send,
@@ -74,6 +83,7 @@ impl Transport {
             fence,
             deadline,
             send_finished: false,
+            availability_connection,
         }
     }
 
@@ -175,7 +185,7 @@ impl Transport {
             () = fence.retired() => Err(Error::Unreachable("history request cancelled")),
             result = tokio::time::timeout_at(
                 until,
-                read_charged(&mut self.recv, maximum, charge, expected_tags),
+                read_charged(&mut self.recv, maximum, charge, expected_tags, self.availability_connection.is_some()),
             ) => {
                 result.unwrap_or(Err(Error::Unreachable("history frame deadline elapsed")))
             }
@@ -251,6 +261,7 @@ async fn read_charged(
     maximum: usize,
     charge: BufferCharge,
     expected_tags: Option<&[u8]>,
+    availability: bool,
 ) -> Result<Read> {
     let mut prefix = [0; 4];
     match recv.read_exact(&mut prefix).await {
@@ -268,6 +279,7 @@ async fn read_charged(
         return Err(Error::MalformedBundle("history unexpected fixed frame"));
     }
     Ok(Read::Frame(Incoming {
+        availability,
         bytes,
         _charge: charge,
     }))

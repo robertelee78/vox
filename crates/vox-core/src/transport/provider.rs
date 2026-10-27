@@ -46,6 +46,7 @@ pub const X25519MLKEM768_CODE_POINT: u16 = 0x11EC;
 pub const VOX_ALPN: &[u8] = b"vox/2";
 /// Explicit opt-in to the authenticated self-author key-recovery exchange.
 pub const VOX_OWN_RECOVERY_ALPN: &[u8] = b"vox/2-own-recovery";
+pub(crate) const VOX_AVAILABILITY_ALPN: &[u8] = b"vox/2-own-availability";
 
 /// Build the Vox crypto provider: the `aws-lc-rs` provider with `kx_groups`
 /// restricted to exactly the X25519MLKEM768 hybrid group, so there is no classical
@@ -113,7 +114,11 @@ fn client_config_for(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_cert_resolver(single_cert_resolver(client_cert_chain, client_key)?);
-    cfg.alpn_protocols = vec![VOX_OWN_RECOVERY_ALPN.to_vec(), alpn.to_vec()];
+    cfg.alpn_protocols = vec![
+        VOX_AVAILABILITY_ALPN.to_vec(),
+        VOX_OWN_RECOVERY_ALPN.to_vec(),
+        alpn.to_vec(),
+    ];
     // Never offer 0-RTT early data (ADR-011).
     cfg.enable_early_data = false;
     Ok(cfg)
@@ -152,7 +157,11 @@ fn server_config_for(
         .with_client_cert_verifier(verifier)
         .with_single_cert(server_cert_chain, server_key)
         .map_err(|_| Error::MalformedBundle("tls server certificate setup"))?;
-    cfg.alpn_protocols = vec![VOX_OWN_RECOVERY_ALPN.to_vec(), alpn.to_vec()];
+    cfg.alpn_protocols = vec![
+        VOX_AVAILABILITY_ALPN.to_vec(),
+        VOX_OWN_RECOVERY_ALPN.to_vec(),
+        alpn.to_vec(),
+    ];
     // Belt-and-suspenders 0-RTT disable: no early data, and issue no resumption
     // tickets at all (a ticket is a prerequisite for 0-RTT) — ADR-011.
     cfg.max_early_data_size = 0;

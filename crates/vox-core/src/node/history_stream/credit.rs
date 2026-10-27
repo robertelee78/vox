@@ -147,7 +147,7 @@ impl Response {
             return Err(Error::SizeLimitExceeded("history response quantum"));
         }
         match frame {
-            Frame::Have(_) if matches!(self.query, Query::Inventory) && !self.inventory_seen => {
+            Frame::Have(..) if matches!(self.query, Query::Inventory) && !self.inventory_seen => {
                 self.inventory_seen = true;
             }
             Frame::Meta { request, object } if *request == self.request => {

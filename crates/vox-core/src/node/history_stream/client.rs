@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::{entry_store::sparse::CursorBinding, ChannelState};
+use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Active, Context};
 use crate::node::store::Store;
 use crate::wire::WireError;
@@ -77,6 +78,7 @@ pub(crate) enum LocalProof {
 /// All results are bounded scheduling information, not permission to fetch another page.
 pub(crate) struct Received {
     pub(crate) status: Status,
+    pub(crate) offered_availability: Option<super::super::channel::availability::Token>,
     pub(crate) continuation: Option<Continuation>,
     pub(crate) needs: Vec<Query>,
     pub(crate) verifiers: Vec<CursorBinding>,
@@ -97,6 +99,7 @@ impl Received {
     fn pending(status: Status) -> Self {
         Self {
             status,
+            offered_availability: None,
             continuation: None,
             needs: Vec::new(),
             verifiers: Vec::new(),
@@ -160,8 +163,24 @@ impl Receiver {
     pub(super) async fn inventory(
         &self,
         job: &crate::node::history_budget::Job,
-    ) -> Result<Lookup<Vec<super::HeadHint>>> {
+    ) -> Result<
+        Lookup<(
+            Vec<super::HeadHint>,
+            super::super::channel::availability::Token,
+        )>,
+    > {
         self.source.inventory(job).await
+    }
+
+    pub(super) async fn observe_availability(
+        &self,
+        job: &Job,
+        connection: u64,
+        token: super::super::channel::availability::Token,
+    ) -> Result<()> {
+        self.source
+            .observe_availability(job, connection, token)
+            .await
     }
 
     /// Build an exact control proof from this node's own canonical history and admit it through
@@ -337,7 +356,7 @@ impl Receiver {
                 }
                 match frame {
                     Frame::Meta { .. } => Action::Meta,
-                    Frame::Have(hints) => Action::Inventory(hints),
+                    Frame::Have(hints, token) => Action::Inventory(hints, token),
                     Frame::Chunk {
                         entry,
                         offset,
@@ -356,7 +375,11 @@ impl Receiver {
                 }
             };
             match action {
-                Action::Inventory(hints) => {
+                Action::Inventory(hints, token) => {
+                    if let (Some(connection), Some(token)) = (io.availability_connection, token) {
+                        self.observe_availability(io.job(), connection, token)
+                            .await?;
+                    }
                     let charge = io.job().reserve_or_pressure(
                         hints.capacity() * std::mem::size_of::<super::HeadHint>(),
                     )?;
@@ -771,9 +794,15 @@ impl Receiver {
 }
 
 enum Action {
-    Inventory(Vec<super::HeadHint>),
+    Inventory(
+        Vec<super::HeadHint>,
+        Option<super::super::channel::availability::Token>,
+    ),
     Meta,
-    Chunk { entry: Digest32, next: u64 },
+    Chunk {
+        entry: Digest32,
+        next: u64,
+    },
     Done(Status, Option<Continuation>),
 }
 

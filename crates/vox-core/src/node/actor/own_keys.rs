@@ -29,6 +29,7 @@ pub(super) struct Parked {
     chain: u64,
     iteration: u64,
     connection: u64,
+    availability: Option<crate::node::channel::availability::Token>,
 }
 
 type SecretLease = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
@@ -119,6 +120,7 @@ impl Node {
                 chain: request.chain,
                 iteration: request.floor,
                 connection,
+                availability: request.availability,
             },
         );
         // This completion is a real producer edge. The next room turn may choose another donor;
@@ -354,6 +356,10 @@ impl Node {
                 chain,
                 iteration,
                 connection: connection.serial(),
+                availability: self
+                    .ports
+                    .get(&(room_id, *peer))
+                    .and_then(|p| p.availability.remote(connection.serial())),
             };
             if self.own_key_parked.get(&(room_id, *peer)) == Some(&parked) {
                 continue;
@@ -391,6 +397,10 @@ impl Node {
             target,
             chain,
             floor: iteration,
+            availability: self
+                .ports
+                .get(&(room_id, peer))
+                .and_then(|p| p.availability.remote(connection.serial())),
         };
         let Ok(secret) = self.secret_work.clone().try_read_owned() else {
             return;
@@ -795,6 +805,8 @@ pub(super) struct Request {
     pub(super) target: Digest32,
     pub(super) chain: u64,
     pub(super) floor: u64,
+    // Local request provenance only; never encoded or accepted from a peer.
+    availability: Option<crate::node::channel::availability::Token>,
 }
 impl Request {
     pub(super) fn encode(self) -> Vec<u8> {
@@ -843,6 +855,7 @@ impl Request {
             target,
             chain,
             floor,
+            availability: None,
         })
     }
 }
@@ -1020,7 +1033,15 @@ pub(super) fn decode_response(
         return Err(Error::SizeLimitExceeded("own-key response"));
     }
     let mut d = Decoder::new(bytes);
-    if d.array()? != 4 || d.uint()? != 1 || Request::decode(d.bytes()?)? != request {
+    if d.array()? != 4 || d.uint()? != 1 {
+        return Err(Error::MalformedBundle("own-key response binding"));
+    }
+    // Availability is local admission provenance, not part of the echoed wire request.
+    let expected = Request {
+        availability: None,
+        ..request
+    };
+    if Request::decode(d.bytes()?)? != expected {
         return Err(Error::MalformedBundle("own-key response binding"));
     }
     let status = d.uint()?;
