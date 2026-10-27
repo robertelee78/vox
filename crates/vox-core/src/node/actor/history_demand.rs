@@ -2690,20 +2690,22 @@ fn prepare(
                 continuation.as_ref(),
                 admission.mutation(),
             ) {
-                return Ok(committed_resume_failure(answer, error));
+                return Ok(committed_resume_failure(
+                    answer,
+                    format!("history checkpoint outcome is unknown: {error}"),
+                ));
             }
-            let finished = match demand::inspect(&context, job) {
-                Ok(Some(finished)) => finished,
-                Ok(None) => {
-                    return Ok(committed_resume_failure(
-                        answer,
-                        "The recovered history request disappeared.",
-                    ))
-                }
-                Err(error) => return Ok(committed_resume_failure(answer, error)),
+            // The committed checkpoint only changes progress and the cursor; the exact request,
+            // bounds and remaining count were checked above and cannot be changed by this commit.
+            // Report that durable outcome without a second, fallible memory admission.
+            answer.status.phase = if continuation.is_some() {
+                Phase::More
+            } else {
+                Phase::Complete
             };
-            answer.status =
-                saved_status(finished.state(), Some(head.binding.author), Some(&active));
+            answer.status.offset = 0;
+            answer.status.detail =
+                "This operation covers only its selected bounded history interval.".into();
             answer.local_boundary = LocalBoundary::Durable;
             return Ok(answer);
         }
