@@ -890,20 +890,7 @@ impl ChannelState {
         let late = read.child_after(&hash, None)?.is_some();
         drop(read);
         let mut batch = store.received_batch(received)?;
-        // The source publication can immediately update the in-memory consent projection,
-        // before a later history-effect turn. Persist the ruled control/key entry with that
-        // publication so a crash cannot undo a consent the room has already observed.
-        if entry.skeleton.v2.as_ref().is_some_and(|v2| {
-            matches!(
-                v2.kind,
-                crate::log::history::SignedEntryKind::Governance
-                    | crate::log::history::SignedEntryKind::StepPolicy
-                    | crate::log::history::SignedEntryKind::KeyPackage
-            )
-        }) {
-            batch.ruled();
-        }
-        // Other received entries remain owned by this flow and are flushed before ACK.
+        // Other received source entries remain owned by this flow and flush before ACK.
         on_publish(&mut batch)?;
         let mut index = self
             .entries
@@ -932,6 +919,25 @@ impl ChannelState {
             entry,
             late,
         )?;
+        // Current consent/presence may become visible immediately at source publication, before
+        // the later effect turn. Flush only a verified current input which changes that mirror;
+        // duplicate, superseded, same-value and other-recipient key headers do not qualify.
+        let mirrored_change = accepted.current_advanced
+            && accepted.work_changed
+            && self.authors.contains_key(&entry.skeleton.author_id)
+            && match GovEntry::body_bound_to(entry) {
+                Ok(GovBody::ConsentGrant(grant)) => {
+                    self.authors.contains_key(&grant.body.target_id)
+                }
+                Ok(GovBody::ConsentRevocation(revoke)) => {
+                    self.authors.contains_key(&revoke.body.target_id)
+                }
+                Ok(GovBody::Presence(_)) => true,
+                _ => false,
+            };
+        if mirrored_change {
+            batch.ruled();
+        }
         batch.commit()?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
@@ -1384,7 +1390,7 @@ impl ChannelState {
                 batch.ruled();
                 self.observe_governance_into(store, &mut batch, &entry, log)?;
             }
-            if kind == SignedEntryKind::KeyPackage {
+            if kind == SignedEntryKind::KeyPackage && key_package_for(&entry, &self.me()) {
                 batch.ruled();
             }
             let mut expired = Vec::new();
@@ -1683,8 +1689,9 @@ impl ChannelState {
         // when it is a key package or governance.
         if matches!(
             kind,
-            SignedEntryKind::Governance | SignedEntryKind::StepPolicy | SignedEntryKind::KeyPackage
-        ) {
+            SignedEntryKind::Governance | SignedEntryKind::StepPolicy
+        ) || (kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me()))
+        {
             batch.ruled();
         }
         let applied = (|| -> Result<HistoryEffectProgress> {
