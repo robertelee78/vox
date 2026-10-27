@@ -4189,7 +4189,8 @@ extension NodeModel {
         // offered. That refresh must not acknowledge reload or replace the held window.
         guard !sessionReloadNeeded || reloadNewest || !sessionEntries.isEmpty else { return }
         guard !reloadNewest || timelineFollowingNewest else { return }
-        if showingSession && selectedSessionMetadataKnown && selectedSessionMetadata == nil { return }
+        // A cached page descriptor is not authority while an exact lookup is pending.
+        if showingSession && (!selectedSessionMetadataKnown || selectedSessionMetadata == nil) { return }
         guard let room = roomOnScreen, let instance = roomInstance,
               let s = shownSession, s.canDrive else {
             sessionPages.clear()
@@ -4535,6 +4536,16 @@ extension NodeModel {
             invalidateSessionPause()
             invalidateSessionAttention()
             clearPrivateJoinCaptions()
+            // This signal also carries drive revocation. Withhold the previous grant and
+            // private rows before the first await; older reads must not republish them.
+            selectedSessionRead = UUID()
+            selectedSessionMetadata = nil
+            selectedSessionMetadataKnown = false
+            sessionPages.clear()
+            sessionWindowRevision = UUID()
+            selectedEarlierRequest = nil
+            sessionReloadNeeded = sessionReloadNeeded || (showingSession && !timelineFollowingNewest)
+            sessionLoading = false
         }
         let epoch = nodeObservationEpoch
         let count = try? await client.sessionsWaiting(room: room)
