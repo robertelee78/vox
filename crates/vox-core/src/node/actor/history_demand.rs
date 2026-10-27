@@ -64,6 +64,8 @@ struct Prepared {
     legacy_cancelled: Option<LegacyProvisionalOwner>,
     local_only: bool,
     local_boundary: LocalBoundary,
+    /// A locally recovered exact request durably reached Complete without a dispatch.
+    terminal_checkpoint: bool,
     selection_after: Option<Option<Digest32>>,
     /// Sizing only. Classification owns no authority or durable mutation.
     resume_kind: Option<bool>,
@@ -1983,6 +1985,25 @@ impl Node {
                         .get(&prepared.status.room)
                         .map(|room| (profile, room))
                 });
+            // A completed local checkpoint is an outcome, not authority to dispatch. Preserve
+            // it across a later trust edit only while the exact current request and room still
+            // own this result; the normal current-authority checks remain mandatory for work.
+            let committed_terminal = prepared.terminal_checkpoint
+                && prepared.local_boundary == LocalBoundary::Durable
+                && prepared.status.phase == Phase::Complete
+                && prepared.dispatch.is_none()
+                && prepared.private.is_none()
+                && prepared.legacy.is_none()
+                && matches!(action, Action::Resume { request } if prepared.status.request == Some(request))
+                && self
+                    .history_demand
+                    .owner_status
+                    .as_ref()
+                    .is_some_and(|status| {
+                        status.room == target_room
+                            && status.instance == target_instance
+                            && status.request == prepared.status.request
+                    });
             let valid = target_matches
                 && if prepared.local_only {
                     self.profile
@@ -1999,18 +2020,19 @@ impl Node {
                         && room.epoch() == prepared.epoch
                         && room.history_instance(profile.store()).ok()
                             == Some(prepared.status.instance)
-                        && room.is_member(&prepared.node)
-                        && !room.has_left(&prepared.node)
-                        && room.ended(self.now_ms().get()).is_none()
-                        && stream::authorization_generation(
-                            profile.store(),
-                            prepared.node,
-                            prepared.status.room,
-                            prepared.status.instance,
-                            prepared.epoch,
-                        )
-                        .ok()
-                            == Some(prepared.generation)
+                        && (committed_terminal
+                            || (room.is_member(&prepared.node)
+                                && !room.has_left(&prepared.node)
+                                && room.ended(self.now_ms().get()).is_none()
+                                && stream::authorization_generation(
+                                    profile.store(),
+                                    prepared.node,
+                                    prepared.status.room,
+                                    prepared.status.instance,
+                                    prepared.epoch,
+                                )
+                                .ok()
+                                    == Some(prepared.generation)))
                 } else {
                     false
                 };
@@ -2385,6 +2407,7 @@ fn prepare_local(
         legacy_cancelled: None,
         local_only: true,
         local_boundary: LocalBoundary::Observed,
+        terminal_checkpoint: false,
         selection_after: None,
         resume_kind: None,
     };
@@ -2490,6 +2513,7 @@ fn classify_resume(
         legacy_cancelled: None,
         local_only: true,
         local_boundary: LocalBoundary::Observed,
+        terminal_checkpoint: false,
         selection_after: None,
         resume_kind: Some(state.private.is_some()),
     })
@@ -2543,6 +2567,7 @@ fn prepare(
         legacy_cancelled: None,
         local_only: false,
         local_boundary: LocalBoundary::Observed,
+        terminal_checkpoint: false,
         selection_after: None,
         resume_kind: None,
     };
@@ -2758,6 +2783,7 @@ fn prepare(
             } else {
                 Phase::Complete
             };
+            answer.terminal_checkpoint = continuation.is_none();
             answer.status.offset = 0;
             answer.status.detail =
                 "This operation covers only its selected bounded history interval.".into();
