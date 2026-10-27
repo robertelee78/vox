@@ -95,6 +95,8 @@ pub enum SegmentKind {
     SessionAttention,
     /// One explicit node-wide archive demand and its bounded provisional body pages.
     HistoryDemand,
+    /// Exact original signed sender releases, indexed independently of history publication.
+    ReceiverReleases,
 }
 
 impl SegmentKind {
@@ -116,6 +118,7 @@ impl SegmentKind {
             SegmentKind::SessionIngress => b"vox/seg/session-ingress/v1",
             SegmentKind::SessionAttention => b"vox/seg/session-attention/v1",
             SegmentKind::HistoryDemand => b"vox/seg/history-demand/v1",
+            SegmentKind::ReceiverReleases => b"vox/seg/receiver-releases/v1",
         }
     }
 }

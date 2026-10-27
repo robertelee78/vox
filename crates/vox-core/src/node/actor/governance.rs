@@ -356,6 +356,22 @@ impl Node {
             self.governance_work.again = true;
             return;
         };
+        // Receiver access narrowed in its original transaction. Its independent index can
+        // retire one exact stale object per turn even while history/governance is rebuilding.
+        match channel.advance_receiver_release_cleanup(&store) {
+            Ok((more, retry_ready)) => {
+                self.governance_work.again |= more;
+                if retry_ready {
+                    // A physically freed slot, not a periodic retry, replays packages which
+                    // could not retain their authenticated key at the earlier admission.
+                    self.key_package_rooms.entry(room).or_insert(false);
+                }
+            }
+            Err(error) => {
+                channel.poison(&error);
+                return;
+            }
+        }
         let (governance_ready, governance_pending, governance_changed) =
             if self.governance_work.settled.contains(&room) {
                 (true, false, false)

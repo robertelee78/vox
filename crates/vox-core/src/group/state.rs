@@ -348,6 +348,22 @@ impl core::fmt::Debug for ReceiverChain {
 }
 
 impl ReceiverChain {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// An original root-signed release may be retained only for this exact installed floor.
+    /// This exposes no key bytes and never substitutes peer state for a root signature.
+    pub(crate) fn matches_history_release(&self, release: &Skdm) -> bool {
+        self.channel_id == release.body.channel_id
+            && self.epoch == release.body.epoch
+            && self.author_id == release.body.author_id
+            && self.chain_id == release.body.chain_id
+            && self.history_iteration == release.body.iteration
+            && self.history_key.bytes() == release.body.chain_key.bytes()
+            && self.signing_pubkey.to_bytes() == release.body.signing_pubkey
+    }
+
     /// An iteration at or after the verified key release, or an older one whose skipped key
     /// is still held. No iteration before the release can be derived from this chain.
     pub(crate) fn can_open_iteration(&self, iteration: u64) -> bool {

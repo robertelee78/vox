@@ -232,6 +232,7 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::SessionIngress => 13,
         SegmentKind::SessionAttention => 16,
         SegmentKind::HistoryDemand => 17,
+        SegmentKind::ReceiverReleases => 18,
     }
 }
 

@@ -62,6 +62,7 @@ mod private_session;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
 mod own_history;
 mod proof_range;
+mod receiver_releases;
 pub(crate) use proof_range::{ProofRangeRestore, ProofRangeStep};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
@@ -5380,6 +5381,7 @@ impl ChannelState {
                 | Error::Profile(crate::node::history_demand::CANCELLED)
                 | Error::OwnHistoryBehind
                 | Error::RoomNotSynced
+                | Error::StreamRefused(receiver_releases::CLEANUP_PENDING)
         ) || governance::refreshing(e)
             || Self::legacy_classification_refreshing(e)
             || Self::authorization_refreshing(e)
@@ -7597,63 +7599,73 @@ impl ChannelState {
         }
         let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
         let slot = (author, chain.chain_id());
-        // A second SKDM for a generation we already hold would rewind the chain
-        // head and re-enable consumed iterations; keep the live one. An earlier authenticated
-        // history release widens only the separate history floor. Persist that floor with the
-        // bounded rendering obligation so an upgraded v1 profile can recover old cache rows.
-        if let Some(existing) = self.receivers.get_mut(&slot) {
-            let widened = existing.retain_history_release(&chain)?;
-            if !widened {
-                return Ok(AcceptedSkdm {
-                    rendered: 0,
-                    changed: false,
-                });
+        // Prepare without changing the live map: release retention can wait on bounded
+        // cleanup, and neither a refused capacity attempt nor a failed commit rewinds a ratchet.
+        let (candidate, changed) = if let Some(existing) = self.receivers.get(&slot) {
+            let mut candidate = ReceiverChain::from_state(&existing.to_state())?;
+            let changed = candidate.retain_history_release(&chain)?;
+            (candidate, changed)
+        } else {
+            if self.receivers.len() >= MAX_RECEIVER_CHAINS {
+                return Err(Error::SizeLimitExceeded("room receiver chains"));
             }
-            let saved = (|| -> Result<()> {
-                let mut batch = store.batch()?;
-                self.queue_receivers(&mut batch)?;
+            (chain, true)
+        };
+        let saved = (|| -> Result<bool> {
+            let mut batch = store.batch()?;
+            let retained = receiver_releases::remember(
+                &mut batch,
+                &self.sek,
+                &self.channel_id,
+                &key,
+                skdm,
+                &candidate,
+            )?;
+            match retained {
+                receiver_releases::Remember::Busy => {
+                    batch.commit()?;
+                    return Ok(false);
+                }
+                receiver_releases::Remember::Unchanged if !changed => return Ok(true),
+                _ => {}
+            }
+            if changed {
+                let sealed = seal_segment(
+                    &self.sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_RECEIVERS,
+                    &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
+                )?;
+                batch.put_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_RECEIVERS,
+                    &sealed,
+                )?;
                 let mut writer = self
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
                 writer.queue_backfill(author, Some(1))?;
                 writer.seal()?;
-                batch.commit()
-            })();
-            if let Err(error) = saved {
+            }
+            batch.commit()?;
+            Ok(true)
+        })();
+        match saved {
+            Ok(false) => return Err(Error::StreamRefused(receiver_releases::CLEANUP_PENDING)),
+            Ok(true) => {}
+            Err(error) => {
                 self.poison(&error);
                 return Err(error);
             }
-            self.entries.committed();
-            return self
-                .backfill(store, &author, now_ms)
-                .map(|rendered| AcceptedSkdm {
-                    rendered,
-                    changed: true,
-                });
         }
-        if self.receivers.len() >= MAX_RECEIVER_CHAINS {
-            return Err(Error::SizeLimitExceeded("room receiver chains"));
+        if !changed {
+            return Ok(AcceptedSkdm {
+                rendered: 0,
+                changed: false,
+            });
         }
-        self.receivers.insert(slot, chain);
-        // The key and the durable rendering cursor are one crash boundary. Startup already
-        // drains this bounded cursor; it must never reopen with a held key and no obligation to
-        // retry ciphertext accepted before the key arrived.
-        let queued = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            self.queue_receivers(&mut batch)?;
-            {
-                let mut writer = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                writer.queue_backfill(author, Some(1))?;
-                writer.seal()?;
-            }
-            batch.commit()
-        })();
-        if let Err(error) = queued {
-            self.poison(&error);
-            return Err(error);
-        }
+        self.receivers.insert(slot, candidate);
         self.entries.committed();
         self.drain_backfill(store, now_ms)
             .map(|rendered| AcceptedSkdm {
@@ -8175,26 +8187,45 @@ impl ChannelState {
 
     /// Persist the receiver chains, poisoning the channel if sealing or writing fails.
     fn persist_receivers(&mut self, store: &Store) -> Result<()> {
-        let saved = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &receivers_bytes(&self.receivers),
-        )
-        .and_then(|seg| {
-            store.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_RECEIVERS,
-                &seg,
-            )
-        });
-        if let Err(e) = saved {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
+        let saved = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            self.queue_receivers(&mut batch)?;
+            // All callers of this helper have removed receiver slots. Permission and the
+            // bounded physical retirement debt change atomically; no history publication gate.
+            receiver_releases::retire(&mut batch, &self.sek, &self.channel_id)?;
+            batch.commit()
+        })();
+        if let Err(error) = saved {
+            self.poison(&error);
+            return Err(error);
         }
         Ok(())
+    }
+
+    pub(crate) fn advance_receiver_release_cleanup(
+        &mut self,
+        store: &Store,
+    ) -> Result<(bool, bool)> {
+        let mut batch = store.batch()?;
+        let progress =
+            receiver_releases::advance(&mut batch, &self.sek, &self.channel_id, &self.receivers)?;
+        if let Some((more, retry_ready)) = progress {
+            let replay = if retry_ready {
+                Some(
+                    self.key_packages
+                        .capacity_retry(&mut batch, &self.sek, &self.channel_id)?,
+                )
+            } else {
+                None
+            };
+            batch.commit()?;
+            if let Some(replay) = replay {
+                self.key_packages = replay;
+            }
+            Ok((more, retry_ready))
+        } else {
+            Ok((false, false))
+        }
     }
 
     /// How many generations of other members' sender keys this node holds here: what `vox
