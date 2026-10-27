@@ -1929,7 +1929,13 @@ fn take_foreground_hint(
     node: Digest32,
     parked_receipt: Option<Digest32>,
 ) -> Option<stream::HeadHint> {
-    while let Some(hint) = inbox.take(room, peer, node) {
+    // Inbound producers may replenish the inbox while this scalar selection runs.
+    // Bound this turn by the existing inventory quantum; remaining hints keep their
+    // ordinary inbox/port-queue ownership and their producer's completion wake.
+    for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
+        let Some(hint) = inbox.take(room, peer, node) else {
+            return None;
+        };
         if hint.author == node && parked_receipt == Some(hint.head) {
             inbox.finish(room, peer, hint.author, hint.head);
         } else {
