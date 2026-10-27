@@ -271,6 +271,8 @@ struct Epochs {
     /// yet been synced. This debt survives reopen or directory-sync failure and gates every
     /// later write and acknowledgement until the exact replacement becomes durable.
     replacement: bool,
+    /// Rename failed after the original handle was closed; the original path still owns data.
+    reopen_original: bool,
     replacement_generation: u64,
     replacement_completed: u64,
     durable_changed: tokio::sync::watch::Sender<(u64, u64)>,
@@ -283,6 +285,7 @@ impl Default for Epochs {
             durable_through: 0,
             pending: Vec::new(),
             replacement: false,
+            reopen_original: false,
             replacement_generation: 0,
             replacement_completed: 0,
             durable_changed: tokio::sync::watch::channel((0, 0)).0,
@@ -729,6 +732,8 @@ impl Store {
     /// [`Error::ProfileBusy`] if another process took the profile in between, or a storage
     /// error — in which case the store stays readable as it was.
     pub fn make_writable(&self) -> Result<()> {
+        // Use the same lock order as rewrite and repair an interrupted original reopen first.
+        let _epochs = self.writer()?;
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         if matches!(*backing, Backing::Writable(_)) {
             return Ok(());
@@ -772,6 +777,23 @@ impl Store {
         // Serialize the complete snapshot and replacement with every such transaction, or one
         // can commit to the old inode after the snapshot and disappear at the rename.
         let mut epochs = self.writer()?;
+        if !epochs.pending.is_empty() {
+            // Closing redb can fail to flush without reporting that failure. Settle all exact
+            // received owners while the old database is still installed, before copying or
+            // closing it, so failed rename/reopen cannot turn a lost row into an ACK.
+            let txn = {
+                let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
+                let Backing::Writable(db) = &*backing else {
+                    return Err(Error::Storage {
+                        op: "rewrite store",
+                        detail: "the store is not open for writing".into(),
+                    });
+                };
+                db.begin_write()
+                    .map_err(storage("begin pre-rewrite flush"))?
+            };
+            self.commit_flushed(txn, &mut epochs, "pre-rewrite flush")?;
+        }
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(old) = &*backing else {
             return Err(Error::Storage {
@@ -832,9 +854,13 @@ impl Store {
         drop(std::mem::replace(&mut *backing, Backing::Closed));
         if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
             let _ = std::fs::remove_file(&fresh_path);
-            *backing = Backing::Writable(
-                self.keep_profile(open_database(&self.path).map_err(open_error)?),
-            );
+            epochs.reopen_original = true;
+            drop(backing);
+            if let Err(reopen_error) = self.reopen_original(&mut epochs) {
+                eprintln!(
+                    "vox: original store reopen after failed rename is pending: {reopen_error}"
+                );
+            }
             return Err(Error::Path {
                 op: "replace store",
                 detail: format!("{}: {e}", self.path.display()),
@@ -857,6 +883,7 @@ impl Store {
     /// debt. Returns whether this call made the replacement durable (and therefore flushed its
     /// captured received debt).
     fn finish_replacement(&self, epochs: &mut Epochs) -> Result<bool> {
+        self.reopen_original(epochs)?;
         if !epochs.replacement {
             return Ok(false);
         }
@@ -884,8 +911,33 @@ impl Store {
         Ok(true)
     }
 
+    fn reopen_original(&self, epochs: &mut Epochs) -> Result<()> {
+        if !epochs.reopen_original {
+            return Ok(());
+        }
+        let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*backing, Backing::Closed) {
+            return Err(Error::Storage {
+                op: "reopen original store",
+                detail: "store ownership changed while reopening".into(),
+            });
+        }
+        let db = open_database(&self.path).map_err(open_error)?;
+        super::paths::set_private_file_mode(&self.path)?;
+        *backing = Backing::Writable(self.keep_profile(db));
+        epochs.reopen_original = false;
+        Ok(())
+    }
+
     /// Begin a read transaction on whichever handle is open.
     fn begin_read(&self) -> Result<Cached<redb::ReadTransaction>> {
+        let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
+        if !matches!(*backing, Backing::Closed) {
+            return backing.begin_read();
+        }
+        // Never wait for the writer with a DB guard: rewrite acquires them in the other order.
+        drop(backing);
+        let _epochs = self.writer()?;
         self.db
             .read()
             .unwrap_or_else(PoisonError::into_inner)
