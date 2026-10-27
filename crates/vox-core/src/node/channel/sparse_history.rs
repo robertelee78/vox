@@ -1255,6 +1255,36 @@ impl ChannelState {
             ) {
                 self.observe_governance_into(store, &mut batch, &entry, log)?;
             }
+            // The source publication has already recorded the governance hash, so the
+            // observer treats it as known. Publish presence at semantic settlement instead.
+            let presence_after = if let Ok(GovBody::Presence(presence)) =
+                GovEntry::body_bound_to(&entry)
+            {
+                let author = entry.skeleton.author_id;
+                let old = self.presence.get(&author).copied();
+                let mut state = old.unwrap_or(governance::Presence {
+                    last: (entry.skeleton.seq, presence.body.here),
+                    back: None,
+                });
+                if entry.skeleton.seq >= state.last.0 {
+                    state.last = (entry.skeleton.seq, presence.body.here);
+                }
+                if presence.body.here
+                    && state.back.is_none_or(|(seq, _)| seq < entry.skeleton.seq)
+                {
+                    state.back = Some((entry.skeleton.seq, entry.skeleton.claimed_ms));
+                }
+                if old.is_none_or(|old| old.last != state.last || old.back != state.back) {
+                    let mut index = self.entries.write(&mut batch, &self.sek, &self.channel_id)?;
+                    index.note_presence(author, state)?;
+                    index.seal()?;
+                    Some((author, state))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let mut expired = Vec::new();
             let mut rows = Vec::new();
             let refill_pending =
@@ -1327,6 +1357,9 @@ impl ChannelState {
             batch.commit()?;
             committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
+            if let Some((author, state)) = presence_after {
+                self.presence.insert(author, state);
+            }
             // The settled-tip index and presence update are now durable in the same Batch.
             // A source-only entry cannot change membership, and a late earlier effect must
             // not move the applied tail backward past a later return/content statement.
