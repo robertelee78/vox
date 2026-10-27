@@ -2766,12 +2766,31 @@ final class NodeModel: ObservableObject {
         let operation = "leave"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard roomMutationCurrent(.leave, ticket: ticket), let id = roomOnScreen else {
+        guard roomMutationCurrent(.leave, ticket: ticket), let id = roomOnScreen,
+              let instance = roomInstance else {
             return "The room changed or is being refreshed. Open the confirmation again."
         }
         do {
             if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
-            guard roomMutationCurrent(.leave, ticket: ticket) else { return "The room changed while the request was pending." }
+            guard roomMutationCurrent(.leave, ticket: ticket) else {
+                // Closing the confirmation does not cancel a request already sent to the
+                // daemon. Reconcile its actual result without closing a newer sheet or
+                // treating another room incarnation as the one that was left.
+                let refreshed = await refresh()
+                guard selection == .room(id), roomInstance == instance else { return nil }
+                guard refreshed else {
+                    // A failed inventory read cannot leave the old room actionable after
+                    // the daemon has confirmed this operation completed.
+                    if ended == nil { await stopped(.roomActionCompleted) }
+                    return nil
+                }
+                if !rooms.contains(where: { $0.id == id && $0.open }) {
+                    selection = nil
+                } else if ended == nil {
+                    await stopped(.roomActionCompleted)
+                }
+                return nil
+            }
             report(operation: operation, done: endingIt ? "The room is ended for everyone." : "You left the room.")
             sheet = nil
             selection = nil
@@ -3845,6 +3864,7 @@ final class NodeModel: ObservableObject {
         case ended
         case roomChanged
         case sessionChanged
+        case roomActionCompleted
     }
 
     fileprivate func stopped(_ reason: ObservationStop) async {
@@ -3878,6 +3898,8 @@ final class NodeModel: ObservableObject {
             notice = "The saved room changed. Refreshing its history and observation."
         case .sessionChanged:
             notice = "Session state changed. Refreshing the room and observation."
+        case .roomActionCompleted:
+            notice = "Room action completed. Refreshing its state."
         }
         ended = notice
         machineStateKnown = false
