@@ -133,6 +133,134 @@ macro_rules! transition_succeeded {
     }};
 }
 
+/// Install the already downloaded app under the updater's lock and recovery journal.
+pub(super) fn install_app(
+    apps: &Path,
+    source: &Path,
+    version: &str,
+    channel: &str,
+) -> Result<(), AppError> {
+    if !apps.is_absolute() || !source.is_absolute() {
+        return Err(usage("installer paths must be absolute"));
+    }
+    semver::Version::parse(version).map_err(|_| usage("installer version is not SemVer"))?;
+    if channel.is_empty()
+        || !channel
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(usage("invalid install channel"));
+    }
+    fs::create_dir_all(apps).map_err(AppError::Io)?;
+    let _lock = InstallLock::acquire(apps)?;
+    let apps_real = fs::canonicalize(apps).map_err(AppError::Io)?;
+    let source_real = fs::canonicalize(source).map_err(AppError::Io)?;
+    if source_real.starts_with(&apps_real) {
+        return Err(usage(
+            "installer source must be outside the applications directory",
+        ));
+    }
+    let active = apps.join(BUNDLE);
+    let staged = apps.join(PARTIAL);
+    let marker = apps.join(super::MARKER_NAME);
+    let marker_partial = apps.join(".marker.partial");
+    require_optional_file(&marker, "installer marker")?;
+    require_optional_bundle(&active, BUNDLE)?;
+    if path_exists(&active)? {
+        if !path_exists(&marker)? {
+            return Err(usage(
+                "Vox.app exists without its installer marker; no transition was attempted",
+            ));
+        }
+        let repaired = recover(apps)?;
+        repaired.say_before_transition();
+        if let Some(error) = repaired.later_error {
+            return Err(error);
+        }
+    } else {
+        // An absent active bundle with retained transition data is ambiguous, not a fresh install.
+        for name in [
+            PUBLISHING,
+            PREVIOUS,
+            ROLLBACK_PARTIAL,
+            ".Vox.install.rollback.partial",
+        ] {
+            if path_exists(&apps.join(name))? {
+                return Err(usage(format!(
+                    "{} exists without Vox.app; no transition was attempted",
+                    apps.join(name).display()
+                )));
+            }
+        }
+        require_optional_dir(&staged, PARTIAL)?;
+        clear(&staged)?;
+    }
+    require_bundle(source, "installer source")?;
+    if require_active_app_version(source)? != version {
+        return Err(usage(
+            "downloaded Vox.app version differs from installer release",
+        ));
+    }
+    let copied = Command::new("/usr/bin/ditto")
+        .arg(source)
+        .arg(&staged)
+        .status()
+        .map_err(AppError::Io)?;
+    if !copied.success() {
+        return Err(usage("could not copy Vox.app to its staging path"));
+    }
+    require_bundle(&staged, PARTIAL)?;
+    if require_active_app_version(&staged)? != version
+        || bundle_digest(source)? != bundle_digest(&staged)?
+    {
+        return Err(usage(
+            "copied Vox.app does not match the downloaded release",
+        ));
+    }
+    if apple_required() {
+        verify_apple(
+            if path_exists(&active)? {
+                &active
+            } else {
+                source
+            },
+            &staged,
+        )?;
+    }
+    sync_tree(&staged)?;
+    sync_dir(apps)?;
+
+    require_optional_file(&marker_partial, "installer marker staging")?;
+    clear(&marker_partial)?;
+    let mut marker_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_partial)
+        .map_err(AppError::Io)?;
+    serde_json::to_writer(&mut marker_file, &serde_json::json!({"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":channel}))
+        .map_err(|e| usage(format!("cannot encode install marker: {e}")))?;
+    marker_file.sync_all().map_err(AppError::Io)?;
+    let replacing = path_exists(&active)?;
+    if !replacing {
+        fs::rename(&marker_partial, &marker).map_err(AppError::Io)?;
+        sync_dir(apps)?;
+    }
+    if replacing {
+        if let Some(error) = publish(apps, version)? {
+            return Err(error);
+        }
+    } else {
+        fs::rename(&staged, &active).map_err(AppError::Io)?;
+        sync_dir(apps)?;
+        launch_services(true, &active).map_err(usage)?;
+    }
+    if replacing {
+        fs::rename(&marker_partial, &marker).map_err(AppError::Io)?;
+    }
+    sync_dir(apps)?;
+    Ok(())
+}
+
 /// `vox update [--check]` for the Vox.app in `apps`.
 ///
 /// # Errors

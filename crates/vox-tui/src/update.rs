@@ -41,6 +41,15 @@ use crate::app::AppError;
 
 #[cfg(target_os = "macos")]
 mod bundle;
+#[cfg(target_os = "macos")]
+pub(crate) fn install_app(
+    apps: &Path,
+    source: &Path,
+    version: &str,
+    channel: &str,
+) -> Result<(), AppError> {
+    bundle::install_app(apps, source, version, channel)
+}
 pub(crate) mod restart;
 
 /// The repository releases are published from.

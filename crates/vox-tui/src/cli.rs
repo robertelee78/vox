@@ -2512,6 +2512,15 @@ enum Cmd {
         #[arg(long, conflicts_with = "check")]
         rollback: bool,
     },
+    /// Internal installer publication; the downloaded app supplies this command.
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    InstallApp {
+        apps: PathBuf,
+        source: PathBuf,
+        version: String,
+        channel: String,
+    },
     /// Print shell completions for SHELL to stdout.
     Completions {
         /// The shell to generate completions for (bash, zsh, fish, …).
@@ -3803,6 +3812,19 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        #[cfg(target_os = "macos")]
+        Cmd::InstallApp {
+            apps,
+            source,
+            version,
+            channel,
+        } => match crate::update::install_app(&apps, &source, &version, &channel) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("vox: {e}");
