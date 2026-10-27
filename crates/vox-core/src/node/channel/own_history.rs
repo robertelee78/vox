@@ -1,6 +1,52 @@
 //! Own-feed recovery is a durable write fence, not authority supplied by an inventory hint.
 use super::*;
-use crate::log::history::{HistoryStep, LogScope, SignedHead, WorkBudget};
+use crate::log::history::{
+    inclusion_ranges, ContextSource, ControlContext, Descriptor, HistoryStep, LocalAppendBudget,
+    LogScope, SignedHead, TreeBinding, TreeRange, TreeRangeSource, WorkBudget,
+};
+
+/// Serving-cache descriptors are only verification inputs here. They never become an
+/// authored lookup fallback: the whole forest must reproduce the already committed signed root
+/// before a separate canonical-index transaction can publish any missing subtree.
+struct AppendForest<'a, 'read> {
+    read: &'a entry_store::Read<'read>,
+    target: &'a SignedHead,
+    joined: Option<ControlContext>,
+}
+impl ContextSource for AppendForest<'_, '_> {
+    fn context(&self, hash: &Digest32) -> Result<Option<ControlContext>> {
+        if let Some(context) = self
+            .joined
+            .as_ref()
+            .filter(|context| context.hash() == *hash)
+        {
+            return Ok(Some(context.clone()));
+        }
+        self.read.history_context(hash)
+    }
+}
+impl TreeRangeSource for AppendForest<'_, '_> {
+    fn range(&self, binding: TreeBinding, range: TreeRange) -> Result<Option<Descriptor>> {
+        if binding != self.target.binding
+            || range.start == 0
+            || range.leaves == 0
+            || range
+                .start
+                .checked_add(range.leaves - 1)
+                .is_none_or(|end| end > self.target.root.leaves)
+        {
+            return Err(Error::MalformedAtRest("own append forest range binding"));
+        }
+        if let Some(descriptor) = self
+            .read
+            .history_range(binding, range.start, range.leaves)?
+        {
+            return Ok(Some(descriptor));
+        }
+        self.read
+            .history_proof_range(&self.target.id(), binding, range.start, range.leaves)
+    }
+}
 
 pub(super) enum Recovery {
     UnknownBehind,
@@ -458,6 +504,87 @@ impl ChannelState {
         Ok(())
     }
 
+    /// Recover the bounded append frontier only after the own prefix is role-complete.
+    /// This is mathematical preparation for the existing local append, not new head/source
+    /// admission. Missing serving metadata keeps the exact recovery debt instead of poisoning
+    /// a room whose restored canonical prefix legitimately lacks subtree indices.
+    fn prepare_own_append_ranges(&mut self, store: &Store) -> Result<()> {
+        let Recovery::Head(target) = &self.own_recovery else {
+            return Err(Error::OwnHistoryBehind);
+        };
+        let target = target.clone();
+        let read = self.history_read(store)?;
+        if !read.history_head_committed(&target.id(), target.binding)? {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let next = target
+            .root
+            .leaves
+            .checked_add(1)
+            .ok_or(Error::OwnHistoryBehind)?;
+        let coordinates = inclusion_ranges(next, next)?;
+        let mut forest = Vec::with_capacity(coordinates.len());
+        let mut source = AppendForest {
+            read: &read,
+            target: &target,
+            joined: None,
+        };
+        let mut budget = LocalAppendBudget::new();
+        for range in &coordinates {
+            let descriptor = budget
+                .range(&source, target.binding, *range)?
+                .ok_or(Error::OwnHistoryBehind)?;
+            if descriptor.leaves != range.leaves {
+                return Err(Error::MalformedAtRest("own append forest span differs"));
+            }
+            forest.push((range.start, descriptor));
+        }
+        let Some(&(mut start, mut root)) = forest.first() else {
+            return Err(Error::OwnHistoryBehind);
+        };
+        for &(left_start, left) in &forest[1..] {
+            if left_start.checked_add(left.leaves) != Some(start) {
+                return Err(Error::MalformedAtRest(
+                    "own append forest is not contiguous",
+                ));
+            }
+            match budget.join_ranges(target.binding, left, root, &source)? {
+                HistoryStep::Complete((joined, context)) => {
+                    root = joined;
+                    start = left_start;
+                    source.joined = Some(context);
+                }
+                HistoryStep::MissingContext(_) => return Err(Error::OwnHistoryBehind),
+                _ => return Err(Error::SizeLimitExceeded("own append forest work quota")),
+            }
+        }
+        if start != 1 || root != target.root {
+            return Err(Error::MalformedAtRest(
+                "own append forest differs from signed root",
+            ));
+        }
+        let root_context = budget
+            .context(&source, &root.frontier)?
+            .ok_or(Error::OwnHistoryBehind)?;
+        drop(source);
+        drop(read);
+        // Room serialization plus the current Computer fence are held by recovery's caller.
+        // Recheck its exact durable marker in this same batch before making any index visible.
+        let mut batch = store.batch()?;
+        self.check_own_recovery_marker_in(&batch)?;
+        let mut index = self
+            .entries
+            .write(&mut batch, &self.sek, &self.channel_id)?;
+        index.keep_history_context(&root_context)?;
+        for (start, descriptor) in forest {
+            index.keep_history_range(target.binding, start, descriptor)?;
+        }
+        index.seal()?;
+        batch.commit()?;
+        self.entries.committed();
+        Ok(())
+    }
+
     /// The marker, signed return Presence and fresh sender/origins share the effects Batch.
     /// Ordinary append guards never observe a clear-first intermediate state.
     pub(crate) fn complete_own_recovery(
@@ -469,6 +596,7 @@ impl ChannelState {
             return Ok(false);
         }
         self.require_own_recovery_complete(profile.store())?;
+        self.prepare_own_append_ranges(profile.store())?;
         let me = self.me();
         let used = self.dag.verified_head(&me);
         let next_id = used

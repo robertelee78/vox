@@ -506,6 +506,29 @@ impl LocalAppendBudget {
     ) -> Result<HistoryStep<ConsistentPrefix>> {
         verifier.advance(source, &mut self.work)
     }
+    pub(crate) fn context(
+        &mut self,
+        source: &impl ContextSource,
+        hash: &Digest32,
+    ) -> Result<Option<ControlContext>> {
+        if !self.work.take_context_load() {
+            return Err(Error::SizeLimitExceeded("local append context quota"));
+        }
+        source.context(hash)
+    }
+
+    /// One bounded right-fold step while verifying a recovered local append forest.
+    /// The same trusted-local quota covers all range/context loads and joins in that pass.
+    pub(crate) fn join_ranges(
+        &mut self,
+        binding: TreeBinding,
+        left: Descriptor,
+        right: Descriptor,
+        source: &impl ContextSource,
+    ) -> Result<HistoryStep<(Descriptor, ControlContext)>> {
+        join_descriptors(binding, left, right, source, &mut self.work)
+    }
+
     pub(crate) fn range(
         &mut self,
         source: &impl TreeRangeSource,
