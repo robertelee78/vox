@@ -126,6 +126,7 @@ pub(crate) enum OwnReadability {
         target: Digest32,
         seq: u64,
         entry_hash: Digest32,
+        epoch: u64,
         chain: u64,
         iteration: u64,
     },
@@ -288,6 +289,7 @@ impl ChannelState {
                             target: target.id(),
                             seq,
                             entry_hash: hash,
+                            epoch: message.header.epoch,
                             chain: message.header.chain_id,
                             iteration: message.header.iteration,
                         };
