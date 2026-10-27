@@ -149,6 +149,9 @@ struct State {
     deny: u64,
     head_grant: Option<Grant>,
     projection: Digest32,
+    /// A format-1 cursor predates the semantic projection fingerprint. Its partially
+    /// folded state cannot be resumed with a guessed fingerprint.
+    legacy: bool,
 }
 impl State {
     fn note_deadline(&mut self, grant: Grant) {
@@ -183,6 +186,7 @@ impl State {
             deny: 1,
             head_grant: None,
             projection: writer.projection(),
+            legacy: false,
         }
     }
     fn load(writer: &Write<'_, '_>) -> Result<Option<Self>> {
@@ -190,7 +194,8 @@ impl State {
             return Ok(None);
         };
         let mut d = Decoder::new(&bytes);
-        if d.array()? != 17 || d.uint()? != 2 {
+        let (arity, version) = (d.array()?, d.uint()?);
+        if !matches!((arity, version), (16, 1) | (17, 2)) {
             return Err(invalid("governance fold cursor format"));
         }
         let phase = d.uint()?;
@@ -212,10 +217,15 @@ impl State {
         let after_cert = read_option(&mut d)?;
         let deny = d.uint()?;
         let head_grant = read_grant(&mut d)?;
-        let projection = d
-            .bytes()?
-            .try_into()
-            .map_err(|_| invalid("governance fold projection"))?;
+        let projection = if version == 2 {
+            d.bytes()?
+                .try_into()
+                .map_err(|_| invalid("governance fold projection"))?
+        } else {
+            // The caller restarts this validated legacy cursor from the sealed index before
+            // using or publishing its projection; it never resumes the partial old fold.
+            writer.projection()
+        };
         d.finish()?;
         if phase > DONE || from == 0 || generation == 0 || !(1..=5).contains(&deny) {
             return Err(invalid("governance fold cursor bounds"));
@@ -237,6 +247,7 @@ impl State {
             deny,
             head_grant,
             projection,
+            legacy: version == 1,
         }))
     }
     fn save(&self, writer: &mut Write<'_, '_>) -> Result<()> {
@@ -326,6 +337,13 @@ pub(super) fn advance(
     }
     writer.expire_authority(now)?;
     let mut state = match State::load(writer)? {
+        Some(state) if state.legacy => {
+            // Format 1 did not record the fingerprint of its partially applied work. Start
+            // a fresh, bounded fold of the sealed index; persist its new cursor and generation
+            // in the same transaction as the first step, rather than guessing that state.
+            writer.authority_changed()?;
+            State::new(writer, now)
+        }
         Some(state)
             if state.generation == writer.authority_generation()
                 && state.ordered == writer.ordered() =>
