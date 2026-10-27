@@ -3751,11 +3751,12 @@ final class NodeModel: ObservableObject {
             messages = snapshot
             roomNeedsPage = true
         }
-        ended = "Node \(node) is unavailable."
+        // An observer ending is not a daemon verdict on the node. Keep the last visible
+        // snapshot, suspend actions, and let readFacts establish the current node state.
+        ended = "Connection to node \(node) ended. Checking its state."
         machineStateKnown = false
-        daemonReachable = text.localizedCaseInsensitiveContains("detached")
-            || text.localizedCaseInsensitiveContains("Locked")
-        if !daemonReachable { daemonFailure = text }
+        daemonReachable = false
+        daemonFailure = "Connection to node \(node) ended. Checking its state."
         // Resubscribing aborts the old Rust observer, which is awaiting this callback.
         // Read readiness here; the existing follow loop (or an independent user action)
         // performs the pending restart and authoritative refresh outside that callback.
