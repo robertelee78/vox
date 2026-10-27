@@ -541,6 +541,9 @@ impl Node {
     /// New targets, real role-prefix progress and reopen are producer edges. Equal observations
     /// leave the existing immutable owner alone; a missing donor does not make a polling loop.
     pub(super) async fn advance_own_recovery(&mut self, room: Digest32) {
+        // A decrypted response owns its peer credit and secret lease until its exact room can
+        // accept it. A real room-release edge reaches this same continuation.
+        self.try_install_own_key(room);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -626,6 +629,16 @@ impl Node {
         if matches!(audit, crate::node::channel::OwnReadability::Runnable) {
             self.governance_work.wake_room(room);
         }
+        if let crate::node::channel::OwnReadability::KeyDebt {
+            target,
+            epoch,
+            chain,
+            iteration,
+            ..
+        } = audit
+        {
+            self.start_own_key_request(room, target, epoch, chain, iteration);
+        }
         if receiver_changed {
             // The committed key/cursor is the producer for ordinary bounded backfill.
             self.governance_work.wake_room(room);
@@ -633,6 +646,18 @@ impl Node {
         if completed {
             self.note_local_governance_append(&room);
         }
+        let debt = match audit {
+            crate::node::channel::OwnReadability::BodyDebt {
+                target,
+                seq,
+                entry_hash,
+            } => Some((target, seq, entry_hash)),
+            _ => None,
+        };
+        let debt_changed = match debt {
+            Some(debt) => self.own_recovery_body_debts.insert(room, debt) != Some(debt),
+            None => self.own_recovery_body_debts.remove(&room).is_some(),
+        };
         let progress = match key {
             Some(key) => self.own_recovery_rooms.insert(room, key) != Some(key),
             None => {
@@ -640,7 +665,7 @@ impl Node {
                 false
             }
         };
-        if progress {
+        if progress || debt_changed {
             for ((r, _), port) in &mut self.ports {
                 if *r == room {
                     port.raise();

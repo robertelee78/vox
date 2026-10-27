@@ -31,7 +31,10 @@ impl Header {
             });
         };
         let bytes = open_segment(sek, KIND, HEADER, &sealed)?;
-        let mut d = Decoder::new(&bytes);
+        Self::decode(&bytes)
+    }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
         if d.array()? != 7 || d.uint()? != 1 {
             return Err(Error::MalformedAtRest("receiver release index version"));
         }
@@ -144,7 +147,10 @@ impl Descriptor {
                 "receiver release descriptor missing",
             ))?;
         let bytes = open_segment(sek, KIND, id, &sealed)?;
-        let mut d = Decoder::new(&bytes);
+        Self::decode(&bytes, header, key, id)
+    }
+    fn decode(bytes: &[u8], header: &Header, key: &ReleaseKey, id: u64) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
         if d.array()? != 7 || d.uint()? != 1 {
             return Err(Error::MalformedAtRest(
                 "receiver release descriptor version",
@@ -377,4 +383,48 @@ pub(super) fn advance(
     }
     header.seal(batch, sek, room)?;
     Ok(Some((header.cleanup, retry_ready)))
+}
+
+/// Exact serving lookup. Check the currently installed receiver before even opening an
+/// auxiliary artifact, and validate its descriptor before opening any retained chain key.
+pub(super) fn lookup(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+    receiver: &ReceiverChain,
+    root: &CompositePublicKey,
+    needed_iteration: u64,
+) -> Result<Option<Skdm>> {
+    let snapshot = store.snapshot()?;
+    let Some(sealed) = snapshot.get_segment_bounded(room, KIND, HEADER, HEADER_BYTES)? else {
+        return Ok(None);
+    };
+    let header = Header::decode(&open_segment(sek, KIND, HEADER, &sealed)?)?;
+    let key = key(&receiver.author_id(), receiver.epoch(), receiver.chain_id());
+    let Some(id) =
+        session_tree::Read::snapshot(&snapshot, sek, room, KIND).find(header.root, &key)?
+    else {
+        return Ok(None);
+    };
+    let sealed = snapshot
+        .get_segment_bounded(room, KIND, id, DESCRIPTOR_BYTES)?
+        .ok_or(Error::MalformedAtRest(
+            "receiver release descriptor missing",
+        ))?;
+    let descriptor = Descriptor::decode(&open_segment(sek, KIND, id, &sealed)?, &header, &key, id)?;
+    if !descriptor.current(Some(receiver)) || descriptor.floor > needed_iteration {
+        return Ok(None);
+    }
+    let sealed = snapshot
+        .get_segment_bounded(room, KIND, descriptor.body, RELEASE_BYTES)?
+        .ok_or(Error::MalformedAtRest("receiver release source missing"))?;
+    let bytes = open_segment(sek, KIND, descriptor.body, &sealed)?;
+    let release = Skdm::from_wire(&bytes)?;
+    release.verify(root, room, receiver.epoch())?;
+    if !receiver.matches_history_release(&release)
+        || crate::hash::sha256(&release.body.canonical_body()) != descriptor.digest
+    {
+        return Err(Error::MalformedAtRest("receiver release source binding"));
+    }
+    Ok(Some(release))
 }

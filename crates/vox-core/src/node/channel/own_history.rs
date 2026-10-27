@@ -278,10 +278,11 @@ impl ChannelState {
                         return Err(Error::MalformedAtRest("own readability room binding"));
                     }
                     let slot = (self.me(), message.header.chain_id);
-                    let plaintext = self
-                        .receivers
-                        .get(&slot)
-                        .filter(|chain| chain.epoch() == message.header.epoch)
+                    let historical = if message.header.epoch < self.epoch {
+                        let root = self.authors.get(&self.me()).ok_or(Error::MalformedGovernance("own history author missing"))?;
+                        own_historical_keys::lookup(&snapshot, &self.sek, &self.channel_id, root, &self.me(), message.header.epoch, message.header.chain_id)?
+                    } else { None };
+                    let plaintext = historical.as_ref().or_else(|| self.receivers.get(&slot).filter(|chain| chain.epoch() == message.header.epoch))
                         .and_then(|chain| chain.decrypt_retained(&message).ok())
                         .map(Zeroizing::new);
                     let Some(plaintext) = plaintext else {
@@ -571,6 +572,7 @@ impl ChannelState {
         &self,
         store: &Store,
         peer: &Digest32,
+        body_debt: Option<(Digest32, u64, Digest32)>,
     ) -> Result<Option<OwnRecoveryPage>> {
         if !self.own_behind || self.dag.is_frozen(&self.me()) {
             return Ok(None);
@@ -591,7 +593,28 @@ impl ChannelState {
             .history_held_through(&self.me())
             .map_or(0, |(seq, _)| seq);
         let donor_through = self.held_through(peer).unwrap_or(0);
-        if held >= head.root.leaves || !self.is_member(peer) || donor_through <= held {
+        if !self.is_member(peer) {
+            return Ok(None);
+        }
+        if let Some((target, seq, entry_hash)) = body_debt {
+            if target == head.id() && seq <= head.root.leaves && donor_through >= seq {
+                if let Some((_, header)) = read.history_validated_header(&self.me(), seq)? {
+                    if header.entry_hash() == entry_hash
+                        && !read
+                            .history_entry(&entry_hash)?
+                            .is_some_and(|entry| entry.payload.is_some())
+                    {
+                        return Ok(Some(OwnRecoveryPage {
+                            head: target,
+                            lo: seq,
+                            hi: seq,
+                            donor_through,
+                        }));
+                    }
+                }
+            }
+        }
+        if held >= head.root.leaves || donor_through <= held {
             return Ok(None);
         }
         let lo = held.checked_add(1).ok_or(Error::OwnHistoryBehind)?;
@@ -679,6 +702,32 @@ impl ChannelState {
         Ok(true)
     }
 
+    /// This path is exclusively an original author's authenticated recovery response, not a
+    /// trust grant from its transport peer. The ordinary inbound-SKDM trust gate is unchanged.
+    pub(crate) fn accept_own_recovery_release(
+        &mut self,
+        store: &Store,
+        target: Digest32,
+        release: &crate::group::skdm::Skdm,
+        now: crate::time::Ms,
+    ) -> Result<super::AcceptedSkdm> {
+        if !self.own_behind
+            || release.body.author_id != self.me()
+            || release.body.channel_id != self.channel_id
+            || release.body.epoch > self.epoch
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        if !matches!(&self.own_recovery, Recovery::Head(head) if head.id() == target) {
+            return Err(Error::OwnHistoryBehind);
+        }
+        match self.own_recovery_evidence(store)? {
+            Some(Recovery::Head(current)) if current.id() == target => {}
+            _ => return Err(Error::OwnHistoryBehind),
+        }
+        self.accept_skdm_mode(store, release, now, true)
+    }
+
     pub(super) fn require_own_recovery_complete(&self, store: &Store) -> Result<()> {
         if !self.own_behind || !self.is_member(&self.me()) {
             return Err(Error::OwnHistoryBehind);
@@ -739,10 +788,13 @@ impl ChannelState {
             }
             None => return Err(Error::OwnHistoryBehind),
         };
-        if generation != self.sender.chain_id() {
-            // Earlier code could count opaque own ciphertext as role-complete. That receipt
-            // cannot certify keys for a generation minted after this backup. Recovery of those
-            // keys remains separate owed work; never clear the fence on this old receipt alone.
+        // A restored sender may be older than the latest authenticated Presence. The
+        // target-bound audit above proves the required own content is readable before we
+        // mint a fresh sender; the old sender itself must never be used to write again.
+        // A Presence outside this signed prefix, or behind the retained sender, cannot
+        // establish a consistent generation for recovery.
+        if generation < self.sender.chain_id() || generation > target.root.leaves.saturating_add(1)
+        {
             return Err(Error::OwnHistoryBehind);
         }
         Ok(())

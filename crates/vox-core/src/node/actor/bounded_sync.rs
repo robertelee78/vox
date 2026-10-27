@@ -3420,7 +3420,11 @@ impl Node {
                                     && self.bounded_sync.ready[1].is_none()
                                     && self.bounded_sync.running[1].is_none()
                                 {
-                                    match channel.own_recovery_page(&store, &peer) {
+                                    match channel.own_recovery_page(
+                                        &store,
+                                        &peer,
+                                        self.own_recovery_body_debts.get(&room).copied(),
+                                    ) {
                                         Ok(page) => page.map(|p| (instance, p)),
                                         Err(_) => return false,
                                     }

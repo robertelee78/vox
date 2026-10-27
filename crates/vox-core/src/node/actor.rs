@@ -50,6 +50,7 @@ mod computer;
 mod governance;
 mod history_demand;
 mod local_trust;
+mod own_keys;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
@@ -695,6 +696,11 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinRequest { .. } => "answering somebody's join",
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
+        NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
+        NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
+        NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
+        NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
+        NetEvent::OwnKeyCapacityReady { .. } => "resuming own-key recovery after capacity release",
         NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
         NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
         NetEvent::Stream { .. } => "serving a stream",
@@ -1364,6 +1370,19 @@ enum NetEvent {
     },
     /// A peer's pairwise stream, its frames **already read** off the actor (V210-71).
     Pairwise(PairwiseIn),
+    /// A bounded worker has prepared an encrypted own-key response; current authority and
+    /// the exact connection are checked again before it is sent.
+    OwnKeyDonorReady(own_keys::DonorReady),
+    OwnKeyRequestReady(own_keys::RequestReady),
+    OwnKeyResponseReady(own_keys::ResponseReady),
+    OwnKeyRequestFailed {
+        request: own_keys::Request,
+        peer: Digest32,
+        connection: u64,
+    },
+    OwnKeyCapacityReady {
+        request: own_keys::Request,
+    },
     /// A stream that carried this node's hello to `peer` could not be written: the peer does not
     /// hold the session, so the next delivery must carry the hello again.
     HelloUndelivered {
@@ -2286,11 +2305,15 @@ async fn serve_typed(
         // pairwise streams is load-bearing: a hello and the key that follows it can be separate
         // streams, and reordering them is the race F12 was. So a silent stream holds back only
         // the pairwise streams its own peer opened after it.
-        Ok(Inbound::Pairwise { peer, send, recv }) => {
+        Ok(Inbound::Pairwise {
+            peer: _,
+            send,
+            recv,
+        }) => {
             state.failures = 0;
             let queue = state.pairwise.get_or_insert_with(|| {
                 let (q, rx) = mpsc::channel(PAIRWISE_QUEUE);
-                tokio::spawn(read_pairwise_streams(peer, rx, tx.clone()));
+                tokio::spawn(read_pairwise_streams(Arc::clone(&conn), rx, tx.clone()));
                 q
             });
             // Back-pressure on this peer's own connection only: a full queue means this peer has
@@ -2594,11 +2617,12 @@ const PAIRWISE_QUEUE: usize = 32;
 /// `framing::FRAME_PATIENCE`; a stream that sends nothing usable is dropped here, as the actor
 /// dropped it before.
 async fn read_pairwise_streams(
-    peer: Digest32,
+    conn: Arc<VoxConnection>,
     mut streams: mpsc::Receiver<(quinn::SendStream, quinn::RecvStream)>,
     tx: mpsc::Sender<NetEvent>,
 ) {
     use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
+    let peer = conn.peer_id();
     while let Some((mut send, mut recv)) = streams.recv().await {
         let first = match recv_pairwise(&mut recv).await {
             Ok(Some(first)) => first,
@@ -2614,6 +2638,15 @@ async fn read_pairwise_streams(
                 continue;
             }
         };
+        if matches!(first, PairwiseFrame::RecoveryReply { .. })
+            || (matches!(first, PairwiseFrame::RecoveryOpen { .. })
+                && !conn.supports_own_recovery())
+        {
+            let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
+            let _ = send.reset(why);
+            let _ = recv.stop(why);
+            continue;
+        }
         // A hello is followed on the same stream by the frame it opens the session for, written
         // without waiting for anything, so it is read now too.
         let second = if matches!(first, PairwiseFrame::Hello { .. }) {
@@ -2622,6 +2655,7 @@ async fn read_pairwise_streams(
             None
         };
         let stream = PairwiseIn {
+            conn: Arc::clone(&conn),
             peer,
             first,
             second,
@@ -2636,6 +2670,7 @@ async fn read_pairwise_streams(
 
 /// A pairwise stream whose frames have been read off the actor.
 struct PairwiseIn {
+    conn: Arc<VoxConnection>,
     /// The authenticated peer.
     peer: Digest32,
     /// The stream's first frame.
@@ -5361,6 +5396,12 @@ pub struct Node {
     history_hints: Arc<crate::node::history_stream::HintInbox>,
     /// Scalar scheduling identities only. Durable targets and pages remain in the room/store.
     own_recovery_rooms: BTreeMap<Digest32, (Digest32, u64, bool)>,
+    /// The exact authenticated own message whose body the readability audit still needs.
+    own_recovery_body_debts: BTreeMap<Digest32, (Digest32, u64, Digest32)>,
+    /// At most one exact self-author key request is physically in flight per room.
+    own_key_active: BTreeMap<Digest32, [u8; 16]>,
+    own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
+    own_key_pending: BTreeMap<Digest32, own_keys::ResponseReady>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -6223,6 +6264,10 @@ impl Node {
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             own_recovery_rooms: BTreeMap::new(),
+            own_recovery_body_debts: BTreeMap::new(),
+            own_key_active: BTreeMap::new(),
+            own_key_parked: BTreeMap::new(),
+            own_key_pending: BTreeMap::new(),
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -10280,6 +10325,22 @@ impl Node {
             }
             NetEvent::Pairwise(stream) => {
                 self.take_inbound_skdm(stream).await;
+            }
+            NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
+            NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(ready),
+            NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(ready),
+            NetEvent::OwnKeyRequestFailed {
+                request,
+                peer,
+                connection,
+            } => {
+                self.fail_own_key_request(request, peer, connection);
+            }
+            NetEvent::OwnKeyCapacityReady { request } => {
+                if self.own_key_active.get(&request.room) == Some(&request.id) {
+                    self.own_key_active.remove(&request.room);
+                    self.governance_work.wake_room(request.room);
+                }
             }
             NetEvent::HelloUndelivered {
                 channel_id,
@@ -19197,7 +19258,9 @@ impl Node {
             PairwiseFrame::Skdm { channel_id, .. }
             | PairwiseFrame::Open { channel_id, .. }
             | PairwiseFrame::Hello { channel_id, .. }
-            | PairwiseFrame::RotationHello { channel_id, .. } => *channel_id,
+            | PairwiseFrame::RotationHello { channel_id, .. }
+            | PairwiseFrame::RecoveryOpen { channel_id, .. }
+            | PairwiseFrame::RecoveryReply { channel_id, .. } => *channel_id,
         };
         // **Held, not dropped, while this node is still joining that room.** The join runs off the
         // actor now, so the responder's key — sent the moment it admits us — can arrive before the
@@ -19239,12 +19302,20 @@ impl Node {
 
     /// [`Self::handle_pairwise`], unboxed: see [`Boxed`].
     async fn handle_pairwise_unboxed(&mut self, stream: PairwiseIn) {
+        if matches!(
+            stream.first,
+            crate::node::pairwise_stream::PairwiseFrame::RecoveryOpen { .. }
+        ) {
+            self.start_own_key_donor(stream);
+            return;
+        }
         let PairwiseIn {
             peer,
             first,
             second,
             mut send,
             recv,
+            ..
         } = stream;
         #[cfg(feature = "test-knobs")]
         if self.end_key_unanswered_for_proof(
@@ -19334,6 +19405,9 @@ impl Node {
         // against our own prekey ring, exactly as the join responder does, then read
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
+            PairwiseFrame::RecoveryOpen { .. } | PairwiseFrame::RecoveryReply { .. } => {
+                return Some(Err(KeyRefusal::NotAccepted));
+            }
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
             // A key delivery in a session of its own (ADR-030 W-1), opened under that session alone
             // and never filed (W-2).
@@ -19764,6 +19838,11 @@ impl Node {
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.pairwise_epoch.send_replace(self.delivery_epoch);
+        self.own_key_active.clear();
+        self.own_key_parked.clear();
+        self.own_key_pending.clear();
+        self.own_recovery_rooms.clear();
+        self.own_recovery_body_debts.clear();
         self.history_in_flight.clear();
         // What the boards held was learnt over the network that goes down with the lock; an address
         // asked for meanwhile is not handed out by a locked node (V210-96).
@@ -20535,6 +20614,8 @@ impl Node {
 
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
         self.cancel_private_pulls(Some(*channel_id));
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -21476,6 +21557,8 @@ impl Node {
         }
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
@@ -22110,6 +22193,8 @@ impl Node {
         let mut name = String::new();
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;

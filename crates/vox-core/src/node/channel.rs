@@ -61,6 +61,7 @@ pub(crate) use legacy_sync::LegacySync;
 mod private_session;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
 mod own_history;
+mod own_historical_keys;
 mod proof_range;
 mod receiver_overlay;
 mod receiver_releases;
@@ -7614,6 +7615,19 @@ impl ChannelState {
         skdm: &Skdm,
         now: crate::time::Ms,
     ) -> Result<AcceptedSkdm> {
+        self.accept_skdm_mode(store, skdm, now, false)
+    }
+
+    fn accept_skdm_mode(
+        &mut self,
+        store: &Store,
+        skdm: &Skdm,
+        now: crate::time::Ms,
+        own_recovery: bool,
+    ) -> Result<AcceptedSkdm> {
+        if own_recovery && skdm.body.author_id != self.me() {
+            return Err(Error::OwnHistoryBehind);
+        }
         self.require_legacy_current(store)?;
         let now_ms = now.get();
         if self.poisoned {
@@ -7630,8 +7644,41 @@ impl ChannelState {
         if skdm.body.channel_id == drive_channel(&self.channel_id) {
             return self.accept_drive_skdm(store, skdm, &key, now_ms);
         }
-        let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
+        // Current peer authorization stays tied to this room's epoch. A self-author
+        // recovery release may instead name the authenticated epoch of older content.
+        let key_epoch = if own_recovery { skdm.body.epoch } else { self.epoch };
+        if key_epoch > self.epoch {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, key_epoch)?;
+        if own_recovery && key_epoch < self.epoch {
+            let saved = (|| -> Result<bool> {
+                let mut batch = store.batch()?;
+                let changed = own_historical_keys::put(&mut batch, &self.sek, &self.channel_id, &key, &author, skdm)?;
+                if changed {
+                    let mut writer = self.entries.write(&mut batch, &self.sek, &self.channel_id)?;
+                    writer.queue_backfill(author, Some(1))?;
+                    writer.seal()?;
+                    batch.commit()?;
+                }
+                Ok(changed)
+            })();
+            let changed = match saved {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.poison(&error);
+                    return Err(error);
+                }
+            };
+            if changed { self.entries.committed(); }
+            return Ok(AcceptedSkdm { rendered: 0, changed });
+        }
         let slot = (author, chain.chain_id());
+        // The existing receiver index is chain-keyed, not epoch-keyed. Never replace or
+        // merge a different epoch's live chain under the same slot.
+        if self.receivers.get(&slot).is_some_and(|existing| existing.epoch() != key_epoch) {
+            return Err(Error::OwnHistoryBehind);
+        }
         // Prepare without changing the live map: release retention can wait on bounded
         // cleanup, and neither a refused capacity attempt nor a failed commit rewinds a ratchet.
         let (candidate, changed) = if let Some(existing) = self.receivers.get(&slot) {
@@ -7646,6 +7693,19 @@ impl ChannelState {
         };
         let saved = (|| -> Result<bool> {
             let mut batch = store.batch()?;
+            if own_recovery && changed {
+                if let Some(changed) = receiver_overlay::capacity(
+                    &mut batch,
+                    &self.sek,
+                    &self.channel_id,
+                    candidate.chain_id(),
+                )? {
+                    if changed {
+                        batch.commit()?;
+                    }
+                    return Ok(false);
+                }
+            }
             let retained = receiver_releases::remember(
                 &mut batch,
                 &self.sek,
@@ -7666,19 +7726,34 @@ impl ChannelState {
                 _ => {}
             }
             if changed {
-                let sealed = seal_segment(
-                    &self.sek,
-                    SegmentKind::KeyMaterial,
-                    SEG_RECEIVERS,
-                    &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
-                )?;
-                receiver_overlay::rewrite(
-                    &mut batch,
-                    &self.sek,
-                    &self.channel_id,
-                    &sealed,
-                    self.receiver_persistence.next_normal()?,
-                )?;
+                if own_recovery {
+                    let stored = receiver_overlay::put(
+                        &mut batch,
+                        &self.sek,
+                        &self.channel_id,
+                        &self.me(),
+                        key_epoch,
+                        self.receiver_persistence.base,
+                        &candidate,
+                    )?;
+                    if !matches!(stored, receiver_overlay::Put::Stored) {
+                        return Err(Error::MalformedAtRest("own receiver reserved slot changed"));
+                    }
+                } else {
+                    let sealed = seal_segment(
+                        &self.sek,
+                        SegmentKind::KeyMaterial,
+                        SEG_RECEIVERS,
+                        &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
+                    )?;
+                    receiver_overlay::rewrite(
+                        &mut batch,
+                        &self.sek,
+                        &self.channel_id,
+                        &sealed,
+                        self.receiver_persistence.next_normal()?,
+                    )?;
+                }
                 let mut writer = self
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -7706,8 +7781,17 @@ impl ChannelState {
             });
         }
         self.receivers.insert(slot, candidate);
-        self.receiver_persistence.advance_normal()?;
+        if !own_recovery {
+            self.receiver_persistence.advance_normal()?;
+        }
         self.entries.committed();
+        if own_recovery {
+            // Existing bounded maintenance owns the queued author cursor, not this install.
+            return Ok(AcceptedSkdm {
+                rendered: 0,
+                changed: true,
+            });
+        }
         self.drain_backfill(store, now_ms)
             .map(|rendered| AcceptedSkdm {
                 rendered,
@@ -8239,6 +8323,37 @@ impl ChannelState {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Only the authenticated original author can receive its own retained release. Ordinary
+    /// third-party key acceptance, consent and delivery ledgers are not involved.
+    pub(crate) fn own_original_release(
+        &self,
+        store: &Store,
+        author: Digest32,
+        key_epoch: u64,
+        chain: u64,
+        floor: u64,
+    ) -> Result<Option<Skdm>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        self.require_legacy_current(store)?;
+        self.current_governance(store)?;
+        if !self.is_member(&author) || self.has_left(&self.me()) {
+            return Ok(None);
+        }
+        let Some(receiver) = self.receivers.get(&(author, chain)) else {
+            return Ok(None);
+        };
+        if receiver.epoch() != key_epoch || key_epoch > self.epoch {
+            return Ok(None);
+        }
+        let root = self
+            .authors
+            .get(&author)
+            .ok_or(Error::MalformedAtRest("own release author missing"))?;
+        receiver_releases::lookup(store, &self.sek, &self.channel_id, receiver, root, floor)
     }
 
     pub(crate) fn receiver_release_cleanup_waiting(error: &Error) -> bool {
@@ -8797,7 +8912,14 @@ impl ChannelState {
                 return Ok(ContentProjection::Applied);
             }
         }
-        let Some(chain) = self.receivers.get_mut(&slot) else {
+        let mut historical_own = if own && msg.header.epoch < self.epoch {
+            let root = self.authors.get(&author).ok_or(Error::MalformedGovernance("own history author missing"))?;
+            own_historical_keys::lookup_batch(batch, &self.sek, &self.channel_id, root, &author, msg.header.epoch, msg.header.chain_id)?
+        } else { None };
+        let chain = historical_own.as_mut().or_else(|| {
+            self.receivers.get_mut(&slot).filter(|chain| chain.epoch() == msg.header.epoch)
+        });
+        let Some(chain) = chain else {
             if author == me && self.own_behind {
                 // Retaining ciphertext is not readable recovery. A generation minted after
                 // the backup may have no local origin; never give it a role-complete receipt.

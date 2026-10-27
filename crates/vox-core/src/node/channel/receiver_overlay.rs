@@ -456,3 +456,30 @@ pub(super) fn pending(
 ) -> Result<bool> {
     Ok(Header::load(batch, sek, room)?.cleanup)
 }
+
+/// Capacity preflight for an install that also retains a signed release. Neither auxiliary
+/// object may commit alone when the other index is full. The caller holds this same Batch.
+pub(super) fn capacity(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    chain: u64,
+) -> Result<Option<bool>> {
+    let mut h = Header::load(batch, sek, room)?;
+    if session_tree::Read::batch(batch, sek, room, KIND)
+        .find(h.root, &key(chain))?
+        .is_some()
+        || h.count < MAX_RECEIVER_CHAINS
+    {
+        return Ok(None);
+    }
+    if !h.cleanup {
+        return Err(invalid());
+    }
+    let changed = !h.retry_owed;
+    if changed {
+        h.retry_owed = true;
+        h.seal(batch, sek, room)?;
+    }
+    Ok(Some(changed))
+}
