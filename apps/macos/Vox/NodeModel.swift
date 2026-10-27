@@ -142,6 +142,7 @@ final class NodeModel: ObservableObject {
     }
     private var roomReadGeneration = UUID() {
         didSet {
+            invalidateRoomMutationSheet()
             invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
@@ -240,6 +241,7 @@ final class NodeModel: ObservableObject {
     private var roomInstance: Data? {
         didSet {
             if oldValue != roomInstance {
+                invalidateRoomMutationSheet()
                 invalidateMemberRoles()
                 roomHistoryPoll?.cancel()
                 roomHistoryPoll = nil
@@ -725,9 +727,41 @@ final class NodeModel: ObservableObject {
         return page
     }
 
+    private struct RoomMutationSheetScope: Equatable {
+        let room: String
+        let instance: Data
+        let epoch: UUID
+        let generation: UUID
+        let editor: UUID
+    }
+    private var roomMutationSheetScope: RoomMutationSheetScope?
     private var sheetInstance = UUID()
     @Published var sheet: NodeSheet? {
-        didSet { if oldValue != sheet { sheetInstance = UUID() } }
+        didSet {
+            guard oldValue != sheet else { return }
+            sheetInstance = UUID()
+            roomMutationSheetScope = nil
+            if isRoomMutationSheet(sheet), let room = roomOnScreen, let instance = roomInstance {
+                roomMutationSheetScope = RoomMutationSheetScope(room: room, instance: instance,
+                    epoch: nodeObservationEpoch, generation: roomReadGeneration, editor: sheetInstance)
+            }
+        }
+    }
+    private func isRoomMutationSheet(_ value: NodeSheet?) -> Bool {
+        switch value {
+        case .leave, .end, .retention, .rename: return true
+        default: return false
+        }
+    }
+    private func invalidateRoomMutationSheet() {
+        if isRoomMutationSheet(sheet) { sheet = nil }
+    }
+    private func roomMutationCurrent(_ expected: NodeSheet) -> Bool {
+        guard let scope = roomMutationSheetScope, sheet == expected, sheetInstance == scope.editor,
+              ended == nil, daemonReachable, machineStateKnown, !observationNeedsRestart,
+              !roomNeedsPage, roomOnScreen == scope.room, roomInstance == scope.instance,
+              nodeObservationEpoch == scope.epoch, roomReadGeneration == scope.generation else { return false }
+        return !Task.isCancelled
     }
     /// Whether the room's inspector shows (View > Hide Inspector, ⌥⌘I), kept across launches.
     @Published var inspectorShown = Columns.inspectorShown {
@@ -919,6 +953,7 @@ final class NodeModel: ObservableObject {
     @Published private(set) var daemonReachable = true
     private var nodeObservationEpoch = UUID() {
         didSet {
+            invalidateRoomMutationSheet()
             invalidateHistoryObservation()
             cancelSidebarSelection()
             invalidateSessionPause()
@@ -2713,9 +2748,12 @@ final class NodeModel: ObservableObject {
         let operation = "leave"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return "No room is on screen to leave." }
+        guard roomMutationCurrent(.leave), let id = roomOnScreen else {
+            return "The room changed or is being refreshed. Open the confirmation again."
+        }
         do {
             if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
+            guard roomMutationCurrent(.leave) else { return "The room changed while the request was pending." }
             report(operation: operation, done: endingIt ? "The room is ended for everyone." : "You left the room.")
             selection = nil
             await refresh()
@@ -2731,9 +2769,10 @@ final class NodeModel: ObservableObject {
         let operation = "retention"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return false }
+        guard roomMutationCurrent(.retention), let id = roomOnScreen else { return false }
         do {
             try await client.setRetention(room: id, ttlSecs: seconds)
+            guard roomMutationCurrent(.retention) else { return false }
             report(operation: operation, done: seconds == 0 ? "Messages here are kept for good."
                 : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere.")
             return true
@@ -2902,15 +2941,16 @@ final class NodeModel: ObservableObject {
     }
 
     func setStepRetention(_ seconds: UInt64) async -> Bool {
-        guard let id = roomOnScreen else { return false }
+        guard roomMutationCurrent(.retention), let id = roomOnScreen else { return false }
         let operation = "step-retention"
         let attempt = begin(operation)
         defer { end(attempt) }
         do {
             try await AppRequest.run("Setting Session step retention") { [client] in
+                guard self.roomMutationCurrent(.retention) else { throw CancellationError() }
                 try await client.setStepRetention(room: id, seconds: seconds)
             }
-            guard roomOnScreen == id else { return true }
+            guard roomMutationCurrent(.retention) else { return false }
             // A read started before the setter must not overwrite the new rule.
             stepRetentionRead = UUID()
             stepRetentionLoading = false
@@ -2930,9 +2970,10 @@ final class NodeModel: ObservableObject {
         let operation = "rename"
         let attempt = begin(operation)
         defer { end(attempt) }
-        guard let id = roomOnScreen else { return false }
+        guard roomMutationCurrent(.rename), let id = roomOnScreen else { return false }
         do {
             let entry = try await client.renameRoom(room: id, name: name)
+            guard roomMutationCurrent(.rename) else { return false }
             report(
                 operation: operation,
                 done: "The room is now \(name) for every member. Entry \(entry).")
@@ -2960,12 +3001,13 @@ final class NodeModel: ObservableObject {
     /// Bind an ending permission read to the same room and acting node throughout.
     func canEndRoom(_ room: String) async throws -> Bool {
         let epoch = nodeObservationEpoch, actor = me, generation = roomReadGeneration, editor = sheetInstance
-        guard roomOnScreen == room, sheet == .end, ended == nil else {
+        guard roomOnScreen == room, roomMutationCurrent(.end) else {
             throw VoxError.Failed(reason: "The room to end is no longer selected.")
         }
         let admin = try await client.isAdmin(room: room, member: actor)
         guard !Task.isCancelled, nodeObservationEpoch == epoch, me == actor,
-              roomReadGeneration == generation, roomOnScreen == room, sheet == .end, sheetInstance == editor, ended == nil else {
+              roomReadGeneration == generation, roomOnScreen == room, sheetInstance == editor,
+              roomMutationCurrent(.end) else {
             throw VoxError.Failed(reason: "The room or acting node changed while checking who may end it.")
         }
         return admin
@@ -2979,7 +3021,7 @@ final class NodeModel: ObservableObject {
         func current() -> Bool {
             !Task.isCancelled && nodeObservationEpoch == epoch && me == actor
                 && roomReadGeneration == generation && roomOnScreen == room
-                && sheet == .end && sheetInstance == editor && ended == nil
+                && sheetInstance == editor && roomMutationCurrent(.end)
         }
         guard current() else { return nil }
         do {
