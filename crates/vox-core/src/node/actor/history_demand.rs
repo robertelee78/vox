@@ -2496,10 +2496,12 @@ impl Controller {
             Some("preparing")
         } else if self.private_work.is_some() {
             Some("private_work")
+        } else if self.ready.is_some() {
+            // An unstarted public dispatch already has logical running ownership,
+            // but it has not been consumed by a physical archive Flow yet.
+            Some("ready")
         } else if self.running.is_some() {
             Some("running")
-        } else if self.ready.is_some() {
-            Some("ready")
         } else {
             None
         };
