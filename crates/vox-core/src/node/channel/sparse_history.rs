@@ -450,16 +450,17 @@ impl ChannelState {
         read.history_head(&id)
     }
 
-    /// Durability debts for every exact live flow which contributed a semantic effect for this
-    /// author's current history. Source-only work never enters this set. Each returned token
-    /// retains its creating Arc identity; no same-room lane can substitute for it.
+    /// Durability debts for the exact live flows in this room. The Store also retains owners
+    /// whose ChannelState was erased by lock; their bytes must be settled before a reopened
+    /// room can acknowledge any of its received history.
     pub(crate) fn received_debts_for_current(
         &mut self,
         store: &Store,
         author: &Digest32,
     ) -> Result<Vec<crate::node::store::ReceivedDebt>> {
+        let room_debts = store.received_debts_for_room(self.channel_id)?;
         let Some(owners) = self.received_tip_owners.remove(author) else {
-            return Ok(Vec::new());
+            return Ok(room_debts);
         };
         let mut owners = owners.into_iter();
         let mut pending = Vec::new();
@@ -482,6 +483,7 @@ impl ChannelState {
         if !pending.is_empty() {
             self.received_tip_owners.insert(*author, pending);
         }
+        debts.extend(room_debts);
         Ok(debts)
     }
 

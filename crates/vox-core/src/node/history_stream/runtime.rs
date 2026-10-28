@@ -1117,10 +1117,8 @@ impl Flow {
     pub(crate) async fn retire_slice(&mut self) -> Result<RetirementStep> {
         self.publication_owner_wait = None;
         self.failed_settlement = None;
-        if !self.initialized || self.shared.lock().await.history_retirement_locked() {
-            self.cancel();
-            return Ok(RetirementStep::Done);
-        }
+        let room_unavailable =
+            !self.initialized || self.shared.lock().await.history_retirement_locked();
         let store = Arc::clone(&self.cleanup_store);
         let received = self.received.clone();
         let target = tokio::task::spawn_blocking(move || store.received_settlement(&received))
@@ -1138,6 +1136,13 @@ impl Flow {
             Ok(())
         };
         if let Err(error) = result {
+            if room_unavailable {
+                // Store retains the exact debt after this flow drops. Reopened-room receipts
+                // collect that debt before acknowledging; key erasure must not wedge teardown.
+                eprintln!("vox: received history remains unflushed after room lock: {error}");
+                self.cancel();
+                return Ok(RetirementStep::Done);
+            }
             let store = Arc::clone(&self.cleanup_store);
             let received = self.received.clone();
             match tokio::task::spawn_blocking(move || store.received_settlement(&received)).await {
@@ -1153,6 +1158,10 @@ impl Flow {
                 }
             }
             return Err(error);
+        }
+        if room_unavailable {
+            self.cancel();
+            return Ok(RetirementStep::Done);
         }
         // A published current body queues only local exact-request reclamation. If its peer
         // departs before the next network turn, finish that bounded cleanup here; membership is
@@ -1555,6 +1564,11 @@ impl Flow {
         // retirement, which retries this same debt instead of lending it to a later transaction.
         if result.is_err() || self.authorization_changed || self.done() {
             let settlement = self.settle_received(store).await;
+            if settlement.is_err() {
+                // A stale actor callback must not publish a saved archive completion whose
+                // received bytes did not cross their durable boundary.
+                self.archive_status = None;
+            }
             if result.is_ok() {
                 settlement?;
             }

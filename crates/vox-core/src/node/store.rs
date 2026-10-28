@@ -1185,6 +1185,23 @@ impl Store {
         }))
     }
 
+    /// Capture every still-pending exact owner for a room, including flows whose former
+    /// ChannelState was erased by lock. A reopened room must not acknowledge bytes while
+    /// those owners remain unflushed.
+    pub(crate) fn received_debts_for_room(&self, room: Digest32) -> Result<Vec<ReceivedDebt>> {
+        let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        self.finish_replacement(&mut epochs)?;
+        Ok(epochs
+            .pending
+            .iter()
+            .filter(|pending| pending.owner.room == room)
+            .map(|pending| ReceivedDebt {
+                owner: Arc::clone(&pending.owner),
+                through: pending.through,
+            })
+            .collect())
+    }
+
     /// Capture without attempting fallible replacement completion. The returned watch is
     /// subscribed under the same writer that publishes successful durability changes.
     pub(crate) fn received_settlement(&self, flow: &ReceivedFlow) -> ReceivedSettlement {
