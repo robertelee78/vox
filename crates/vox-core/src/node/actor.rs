@@ -1407,10 +1407,12 @@ enum NetEvent {
         instance: SharedChannel,
         owner: Arc<()>,
         from_wait: bool,
+        _secret: own_keys::SecretLease,
     },
     OwnKeyDonorReady(own_keys::DonorReady),
     OwnKeyWriterInterrupted(own_keys::InterruptedReady),
     OwnKeyUnlockReady {
+        _secret: own_keys::SecretLease,
         owner: Arc<()>,
         rooms: Vec<(Digest32, SharedChannel)>,
         transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
@@ -1424,6 +1426,7 @@ enum NetEvent {
         owner: Arc<()>,
     },
     OwnKeyComputerReady {
+        _secret: own_keys::SecretLease,
         owner: Arc<()>,
         rooms: Vec<(Digest32, SharedChannel)>,
         transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
@@ -1435,6 +1438,7 @@ enum NetEvent {
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
     },
     OwnKeyUntrustReady {
+        _secret: own_keys::SecretLease,
         owner: Arc<()>,
         rooms: Vec<(Digest32, SharedChannel)>,
         transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
@@ -1442,6 +1446,7 @@ enum NetEvent {
         reply: oneshot::Sender<Outcome>,
     },
     OwnKeyLeaveReady {
+        _secret: own_keys::SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
@@ -1449,6 +1454,7 @@ enum NetEvent {
         reply: oneshot::Sender<Outcome>,
     },
     OwnKeyCloseReady {
+        _secret: own_keys::SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
@@ -1456,6 +1462,7 @@ enum NetEvent {
         reply: oneshot::Sender<Outcome>,
     },
     OwnKeyPublicationRejectReady {
+        _secret: own_keys::SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
@@ -1463,6 +1470,7 @@ enum NetEvent {
         waiting: RoomPublication,
     },
     OwnKeyLeftPurgeReady {
+        _secret: own_keys::SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
@@ -1470,6 +1478,7 @@ enum NetEvent {
         purpose: LeftPurgePurpose,
     },
     OwnKeyEndedPurgeReady {
+        _secret: own_keys::SecretLease,
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
@@ -10746,10 +10755,12 @@ impl Node {
                 instance,
                 owner,
                 from_wait,
+                _secret,
             } => self.finish_own_key_donor_busy(room, peer, connection, instance, owner, from_wait),
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
             NetEvent::OwnKeyWriterInterrupted(ready) => self.finish_own_key_interruption(ready),
             NetEvent::OwnKeyUnlockReady {
+                _secret,
                 owner,
                 rooms,
                 transitions,
@@ -10831,6 +10842,7 @@ impl Node {
                 self.start_own_key_computer_drain();
             }
             NetEvent::OwnKeyComputerReady {
+                _secret,
                 owner,
                 rooms,
                 transitions,
@@ -10890,6 +10902,7 @@ impl Node {
                 }
             }
             NetEvent::OwnKeyUntrustReady {
+                _secret,
                 owner,
                 rooms,
                 transitions,
@@ -10928,6 +10941,7 @@ impl Node {
                 }
             }
             NetEvent::OwnKeyLeaveReady {
+                _secret,
                 room,
                 instance,
                 owner,
@@ -10964,6 +10978,7 @@ impl Node {
                 }
             }
             NetEvent::OwnKeyCloseReady {
+                _secret,
                 room,
                 instance,
                 owner,
@@ -10998,6 +11013,7 @@ impl Node {
                 }
             }
             NetEvent::OwnKeyPublicationRejectReady {
+                _secret,
                 room,
                 instance,
                 owner,
@@ -11094,6 +11110,7 @@ impl Node {
                 }
             }
             NetEvent::OwnKeyLeftPurgeReady {
+                _secret,
                 room,
                 instance,
                 owner,
@@ -11116,8 +11133,9 @@ impl Node {
                         purpose.fail(Fault::ChannelNotOpen);
                     } else {
                         match Arc::clone(&instance).try_lock_owned() {
-                            Err(_) => self
-                                .wait_own_key_left_room(room, instance, owner, transition, purpose),
+                            Err(_) => self.wait_own_key_left_room(
+                                room, instance, owner, transition, purpose, _secret,
+                            ),
                             Ok(channel) if !channel.has_left(&channel.me()) => {
                                 drop(channel);
                                 drop(transition);
@@ -11173,6 +11191,7 @@ impl Node {
                 }
             }
             NetEvent::OwnKeyEndedPurgeReady {
+                _secret,
                 room,
                 instance,
                 owner,
@@ -11234,7 +11253,9 @@ impl Node {
                                     self.discover_rooms.insert(room);
                                 }
                                 Err(_) => {
-                                    self.wait_own_key_ended_room(room, instance, owner, transition);
+                                    self.wait_own_key_ended_room(
+                                        room, instance, owner, transition, _secret,
+                                    );
                                 }
                             }
                         } else {
@@ -21231,6 +21252,10 @@ impl Node {
         // physical blocking read retains its own secret guard until it actually exits.
         self.key_body_scan = key_body_scan::Controller::default();
         self.own_key_room_set_changed.send_replace(());
+        let busy: Vec<_> = self.own_key_donor_busy.keys().copied().collect();
+        for key in busy {
+            self.retire_own_key_donor_busy(key);
+        }
         for (_, cancel) in std::mem::take(&mut self.own_key_room_cancel) {
             cancel.send_replace(true);
         }
@@ -23185,6 +23210,11 @@ impl Node {
         mut reply: oneshot::Sender<Outcome>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_unlock_pending.push(Arc::clone(&owner));
         let rooms: Vec<_> = self
@@ -23242,6 +23272,7 @@ impl Node {
             let transitions = (transitions.len() == rooms.len()).then_some(transitions);
             let _ = tx
                 .send(NetEvent::OwnKeyUnlockReady {
+                    _secret: secret,
                     owner,
                     rooms,
                     transitions,
@@ -23295,6 +23326,11 @@ impl Node {
                 continue;
             }
             work.targets.sort_unstable();
+            let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+                let _ = work.reply.send(Err(Error::AtRestLocked));
+                continue;
+            };
+            let secret = Arc::new(secret);
             let owner = Arc::clone(&work.owner);
             let fence = crate::transport::stream_transport::Fence::new();
             self.own_key_computer_flight = Some(OwnKeyPolicyFlight {
@@ -23359,6 +23395,7 @@ impl Node {
                 let transitions = (transitions.len() == rooms.len()).then_some(transitions);
                 let _ = tx
                     .send(NetEvent::OwnKeyComputerReady {
+                        _secret: secret,
                         owner,
                         rooms,
                         transitions,
@@ -23390,6 +23427,11 @@ impl Node {
                 return;
             }
         };
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_untrust_pending = Some(Arc::clone(&owner));
         let rooms: Vec<_> = self
@@ -23447,6 +23489,7 @@ impl Node {
             let transitions = (transitions.len() == rooms.len()).then_some(transitions);
             let _ = tx
                 .send(NetEvent::OwnKeyUntrustReady {
+                    _secret: secret,
                     owner,
                     rooms,
                     transitions,
@@ -23464,6 +23507,7 @@ impl Node {
         owner: Arc<()>,
         transition: crate::node::channel::own_writer_gate::Transition,
         mut purpose: LeftPurgePurpose,
+        secret: own_keys::SecretLease,
     ) {
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
@@ -23478,6 +23522,7 @@ impl Node {
             };
             let _ = tx
                 .send(NetEvent::OwnKeyLeftPurgeReady {
+                    _secret: secret,
                     room,
                     instance,
                     owner,
@@ -23500,6 +23545,11 @@ impl Node {
             purpose.fail(Fault::RoomChangePending);
             return;
         }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            purpose.fail(Fault::Locked);
+            return;
+        };
+        let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_ended_pending.insert(room, Arc::clone(&owner));
         if let Err(error) = self.retire_bounded_room(room).await {
@@ -23546,6 +23596,7 @@ impl Node {
             };
             let _ = tx
                 .send(NetEvent::OwnKeyLeftPurgeReady {
+                    _secret: secret,
                     room,
                     instance,
                     owner,
@@ -23562,6 +23613,7 @@ impl Node {
         instance: SharedChannel,
         owner: Arc<()>,
         transition: crate::node::channel::own_writer_gate::Transition,
+        secret: own_keys::SecretLease,
     ) {
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
@@ -23575,6 +23627,7 @@ impl Node {
             };
             let _ = tx
                 .send(NetEvent::OwnKeyEndedPurgeReady {
+                    _secret: secret,
                     room,
                     instance,
                     owner,
@@ -23590,6 +23643,10 @@ impl Node {
         {
             return;
         }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            return;
+        };
+        let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_ended_pending.insert(room, Arc::clone(&owner));
         if let Err(error) = self.retire_bounded_room(room).await {
@@ -23628,6 +23685,7 @@ impl Node {
             };
             let _ = tx
                 .send(NetEvent::OwnKeyEndedPurgeReady {
+                    _secret: secret,
                     room,
                     instance,
                     owner,
@@ -23651,6 +23709,11 @@ impl Node {
             self.publish_waiters.insert(room, waiting);
             return;
         }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            self.fail_room_publication(room, waiting, Fault::Locked);
+            return;
+        };
+        let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_leave_pending.insert(room, Arc::clone(&owner));
         let mut room_cancel = self.own_key_room_watch(room);
@@ -23675,6 +23738,7 @@ impl Node {
             };
             let _ = tx
                 .send(NetEvent::OwnKeyPublicationRejectReady {
+                    _secret: secret,
                     room,
                     instance,
                     owner,
@@ -23696,6 +23760,11 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
         }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_leave_pending.insert(room, Arc::clone(&owner));
         let mut room_cancel = self.own_key_room_watch(room);
@@ -23722,6 +23791,7 @@ impl Node {
             };
             let _ = tx
                 .send(NetEvent::OwnKeyCloseReady {
+                    _secret: secret,
                     room,
                     instance,
                     owner,
@@ -23742,6 +23812,11 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
         }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_leave_pending.insert(room, Arc::clone(&owner));
         let mut room_cancel = self.own_key_room_watch(room);
@@ -23768,6 +23843,7 @@ impl Node {
             };
             let _ = tx
                 .send(NetEvent::OwnKeyLeaveReady {
+                    _secret: secret,
                     room,
                     instance,
                     owner,

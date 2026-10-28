@@ -28,6 +28,7 @@ pub(super) struct DonorReady {
     credit: PairwiseCredit,
     output: crate::node::history_budget::OutputCharge,
     input_credit: Option<OwnedSemaphorePermit>,
+    secret: SecretLease,
 }
 
 pub(super) struct DonorBusy {
@@ -37,6 +38,7 @@ pub(super) struct DonorBusy {
     ready: bool,
     waiting: bool,
     cancel: tokio::sync::watch::Sender<bool>,
+    secret: SecretLease,
 }
 
 pub(super) struct InterruptedReady {
@@ -46,6 +48,7 @@ pub(super) struct InterruptedReady {
     room: SharedChannel,
     context: crate::join::session::JoinContext,
     interruption: crate::node::channel::own_writer_gate::Interrupted,
+    _secret: SecretLease,
 }
 
 /// One unavailable donor is parked only for this exact authenticated connection and debt.
@@ -61,7 +64,7 @@ pub(super) struct Parked {
     availability: Option<crate::node::channel::availability::Token>,
 }
 
-type SecretLease = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
+pub(super) type SecretLease = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
 
 pub(super) struct ActiveAttempt {
     pub(super) request: Request,
@@ -75,7 +78,7 @@ pub(super) struct OpenReady {
     node: Digest32,
     peer: Digest32,
     connection: Arc<VoxConnection>,
-    room: SharedChannel,
+    room: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
     context: crate::join::session::JoinContext,
     bundle: crate::identity::keyagreement::PrekeyBundlePublic,
     send: quinn::SendStream,
@@ -767,7 +770,7 @@ impl Node {
                     request: id,
                 });
             let failure_lease = Arc::clone(&lease);
-            let room = Arc::clone(&room);
+            let room = Arc::downgrade(&room);
             let context = context.clone();
             let tx = self.net_tx.clone();
             let mut epoch_changed = self.pairwise_epoch.subscribe();
@@ -845,18 +848,24 @@ impl Node {
     pub(super) fn finish_own_key_open(&mut self, ready: OpenReady) {
         use crate::node::history_budget::Lane;
         use crate::node::pairwise_stream::MAX_PAIRWISE_FRAME;
-        let room_lock = Arc::clone(&ready.room);
+        let Some(room_lock) = ready.room.upgrade() else {
+            return;
+        };
         let Ok(channel) = room_lock.try_lock() else {
             let request = ready.request;
             let failure_lease = Arc::clone(&ready.lease);
             let mut cancel = ready.cancel.clone();
-            let room = Arc::clone(&ready.room);
+            let room = Arc::clone(&room_lock);
+            let Ok(room_secret) = self.secret_work.clone().try_read_owned() else {
+                return;
+            };
             let connection = Arc::clone(&ready.connection);
             let peer = ready.peer;
             let tx = self.net_tx.clone();
             let mut epoch_changed = self.pairwise_epoch.subscribe();
             let mut room_cancel = self.own_key_room_watch(request.room);
             tokio::spawn(async move {
+                let _room_secret = room_secret;
                 let available = tokio::select! {
                     biased;
                     _ = epoch_changed.changed() => false,
@@ -882,7 +891,7 @@ impl Node {
             ready.request,
             (ready.node, ready.peer),
             &ready.connection,
-            &ready.room,
+            &room_lock,
             &ready.context,
             &channel,
         ) {
@@ -903,7 +912,7 @@ impl Node {
             node,
             peer,
             connection,
-            room,
+            room: room_weak,
             context,
             bundle,
             send,
@@ -955,6 +964,18 @@ impl Node {
                     _ = cancel.changed() => return,
                 _ = connection.quinn().closed() => { drop((credit, queue)); let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection_serial }).await; return; },
                 secret = secret_work.read_owned() => Arc::new(secret),
+            };
+            let Some(room) = room_weak.upgrade() else {
+                drop((secret, credit, queue));
+                let _ = tx
+                    .send(NetEvent::OwnKeyRequestFailed {
+                        _lease: Arc::clone(&failure_lease),
+                        request,
+                        peer,
+                        connection: connection_serial,
+                    })
+                    .await;
+                return;
             };
             let Some(ring) = ring.upgrade() else {
                 drop((secret, credit, queue));
@@ -1127,6 +1148,10 @@ impl Node {
         {
             return;
         }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            return;
+        };
+        let secret = Arc::new(secret);
         self.retire_own_key_donor_busy((room, peer));
         let owner = Arc::new(());
         let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
@@ -1139,6 +1164,7 @@ impl Node {
                 ready: false,
                 waiting: false,
                 cancel,
+                secret: Arc::clone(&secret),
             },
         );
         let mut room_cancel = self.own_key_room_watch(room);
@@ -1160,7 +1186,7 @@ impl Node {
                     _ = cancelled.changed() => {},
                     _ = epoch_changed.changed() => {},
                     _ = connection.quinn().closed() => {},
-                    _ = tx.send(NetEvent::OwnKeyDonorAvailable { room, peer, connection: Arc::clone(&connection), instance, owner, from_wait: false }) => {},
+                    _ = tx.send(NetEvent::OwnKeyDonorAvailable { room, peer, connection: Arc::clone(&connection), instance, owner, from_wait: false, _secret: secret }) => {},
                 }
             }
         });
@@ -1186,6 +1212,10 @@ impl Node {
                 return;
             }
         }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            return;
+        };
+        let secret = Arc::new(secret);
         self.retire_own_key_donor_busy(key);
         let owner = Arc::new(());
         let (cancel, _) = tokio::sync::watch::channel(false);
@@ -1198,6 +1228,7 @@ impl Node {
                 ready: true,
                 waiting: false,
                 cancel,
+                secret,
             },
         );
         self.finish_own_key_donor_busy(room, peer, connection, instance, owner, false);
@@ -1257,6 +1288,7 @@ impl Node {
                 }
                 busy.waiting = true;
             }
+            let secret = Arc::clone(&self.own_key_donor_busy[&key].secret);
             let mut cancelled = self.own_key_donor_busy[&key].cancel.subscribe();
             let mut room_cancel = self.own_key_room_watch(room);
             let mut epoch_changed = self.pairwise_epoch.subscribe();
@@ -1270,7 +1302,7 @@ impl Node {
                     _ = connection.quinn().closed() => {},
                     channel = instance.lock() => {
                         drop(channel);
-                        let event = NetEvent::OwnKeyDonorAvailable { room, peer, connection: Arc::clone(&connection), instance: Arc::clone(&instance), owner, from_wait: true };
+                        let event = NetEvent::OwnKeyDonorAvailable { room, peer, connection: Arc::clone(&connection), instance: Arc::clone(&instance), owner, from_wait: true, _secret: secret };
                         tokio::select! {
                             biased;
                             _ = room_cancel.changed() => {},
@@ -1326,9 +1358,18 @@ impl Node {
 
     fn wait_own_key_donor(&mut self, mut stream: PairwiseIn, room: Digest32, wait: DonorWait) {
         let tx = self.net_tx.clone();
+        let room_secret = if matches!(wait, DonorWait::Room(_)) {
+            match self.secret_work.clone().try_read_owned() {
+                Ok(secret) => Some(secret),
+                Err(_) => return,
+            }
+        } else {
+            None
+        };
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
         tokio::spawn(async move {
+            let _room_secret = room_secret;
             let conn = Arc::clone(&stream.conn);
             let stopped = stream.send.stopped();
             tokio::pin!(stopped);
@@ -1502,6 +1543,8 @@ impl Node {
             refuse(send, recv);
             return;
         };
+        let secret = Arc::new(secret);
+        let worker_secret = Arc::clone(&secret);
         let budget = Arc::clone(&self.history_budget);
         let tx = self.net_tx.clone();
         let worker_room = Arc::clone(&room);
@@ -1549,7 +1592,7 @@ impl Node {
                 return;
             };
             let worker = tokio::task::spawn_blocking(move || {
-                let _secret = secret;
+                let _secret = worker_secret;
                 let result = (|| {
                     let mut ring = ring.blocking_lock();
                     let mut session = accept_initial(
@@ -1608,6 +1651,7 @@ impl Node {
                 credit,
                 output,
                 input_credit,
+                secret,
             };
             tokio::select! {
                 biased;
@@ -1635,6 +1679,7 @@ impl Node {
             credit,
             output,
             input_credit,
+            secret,
         } = ready;
         let current = self.locking == 0
             && self
@@ -1664,6 +1709,7 @@ impl Node {
                 credit,
                 output,
                 input_credit,
+                secret,
             });
             return;
         };
@@ -1709,7 +1755,7 @@ impl Node {
                     _ = gate.wait_open() => {
                         let connection_watch = Arc::clone(&connection);
                         let ready = DonorReady { peer, node, connection, room, context,
-                            frame: Ok(frame), send, recv, credit, output, input_credit };
+                            frame: Ok(frame), send, recv, credit, output, input_credit, secret };
                         tokio::select! {
                             biased;
                             _ = room_cancel.changed() => {},
@@ -1810,6 +1856,7 @@ impl Node {
                         room: response_room,
                         context: response_context,
                         interruption,
+                        _secret: secret,
                     };
                     let connection = Arc::clone(&ready.connection);
                     tokio::select! {
