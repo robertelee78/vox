@@ -1672,8 +1672,13 @@ impl ChannelState {
                 let mut index = self
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.finish_history_effect(&entry, &finished, self.me())?;
+                let catalog_advanced = index.finish_history_effect(&entry, &finished, self.me())?;
                 index.seal()?;
+                if catalog_advanced {
+                    // A peer can persist this catalog position after our notification. Its
+                    // allocation must survive a crash before that position is advertised.
+                    batch.ruled();
+                }
             }
             session_projection::private_index::observe_public(
                 &mut batch,
@@ -1786,8 +1791,11 @@ impl ChannelState {
                     let mut index = self
                         .entries
                         .write(&mut batch, &self.sek, &self.channel_id)?;
-                    index.finish_history_effect(&entry, &finished, self.me())?;
+                    let catalog_advanced = index.finish_history_effect(&entry, &finished, self.me())?;
                     index.seal()?;
+                    if catalog_advanced {
+                        batch.ruled();
+                    }
                 }
                 on_admitted(&mut batch, *hash)?;
             }

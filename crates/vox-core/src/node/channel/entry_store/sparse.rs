@@ -1847,10 +1847,11 @@ impl Write<'_, '_> {
         entry: &Entry,
         finished: &super::super::sparse_history::FinishedHistoryEffect,
         local_id: Digest32,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if finished.entry_hash() != entry.entry_hash() {
             return Err(invalid("sparse effect token differs"));
         }
+        let previous_package = self.directory.next_package;
         self.finish_history_effect_bookkeeping(entry, None)?;
         // A recipient-scoped package is satisfied for every other member by its authenticated
         // header and completed semantic dispatch. Its private body is neither owed nor fetched.
@@ -1859,7 +1860,7 @@ impl Write<'_, '_> {
         if !body_owed_to(entry, &local_id) {
             self.set_missing(&entry.skeleton.author_id, entry.skeleton.seq, false)?;
         }
-        Ok(())
+        Ok(self.directory.next_package != previous_package)
     }
 
     /// Consume only the opaque token returned by this exact local publication. The caller has

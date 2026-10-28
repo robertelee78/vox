@@ -117,6 +117,7 @@ impl EntryIndex {
             if writer.directory.packages_ready {
                 return Ok(());
             }
+            let previous_package = writer.directory.next_package;
             let mut bytes = 0;
             let mut done = false;
             for _ in 0..PROMOTION_ENTRIES {
@@ -145,7 +146,12 @@ impl EntryIndex {
                 writer.directory.packages_ready = true;
                 writer.directory.packages_cursor = None;
             }
+            let catalog_advanced = writer.directory.next_package != previous_package;
             writer.seal()?;
+            if catalog_advanced {
+                // An advertised catalog cursor must not be reused after a crash.
+                batch.ruled();
+            }
             batch.commit()?;
             self.committed();
             if done {
