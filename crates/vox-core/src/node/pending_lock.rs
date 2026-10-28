@@ -78,6 +78,11 @@ impl PendingLocks {
             .collect()
     }
 
+    /// Forget one completed room/member withdrawal without disturbing other debts.
+    pub(crate) fn clear(&mut self, room: &Digest32, member: &Digest32) -> bool {
+        self.entries.remove(&(*room, *member))
+    }
+
     /// `room` has acted on its records: forget them. Whether any were held.
     pub fn clear_room(&mut self, room: &Digest32) -> bool {
         let before = self.entries.len();

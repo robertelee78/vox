@@ -14707,6 +14707,25 @@ impl Node {
         if !next.untrust(fingerprint) {
             return Outcome::Failed(Fault::NotConsented);
         }
+        // Reserve the exact open rooms without waiting for network or another room's worker.
+        // Keeping these guards through the synchronous policy decision and withdrawals prevents
+        // sparse publication from entering between a successful preflight and the narrowing.
+        let mut candidates: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(id, room)| (*id, Arc::clone(room)))
+            .collect();
+        candidates.sort_by_key(|(id, _)| *id);
+        let mut reserved = Vec::with_capacity(candidates.len());
+        for (room, shared) in candidates {
+            let Ok(channel) = shared.try_lock_owned() else {
+                return Outcome::Failed(Fault::RoomChangePending);
+            };
+            if let Err(error) = channel.ensure_local_append_available(profile.store()) {
+                return Outcome::Failed(fault_of(&error));
+            }
+            reserved.push((room, channel));
+        }
         // A consent decided for this identity and not yet delivered is withdrawn with the trust
         // it came from, in every room, open or not: a later re-trust takes a key of its own
         // moment, never this one's (V210-30).
@@ -14735,20 +14754,100 @@ impl Node {
             return Outcome::Failed(Fault::ComputerPolicy);
         };
         let durable = authority.publish(|| -> crate::error::Result<()> {
-            if pending.forget(fingerprint) {
-                pending.save(profile.store(), signer)?;
+            let pending_changed = pending.forget(fingerprint);
+            let mut batch = profile.store().batch()?;
+            if pending_changed {
+                pending.queue_save(&mut batch, signer)?;
             }
-            // The order entry, durable narrowing debt and keyring are one policy decision. No
-            // stale actor projection may commit any of them after its Computer revision moved.
-            crate::node::consent_order::forget_trust(profile.store(), signer, fingerprint)?;
-            locks.save(profile.store(), signer)?;
-            next.save(profile.store(), signer)
+            crate::node::consent_order::ConsentOrder::queue_policy(
+                &mut batch,
+                signer,
+                &[*fingerprint],
+                &[],
+                0,
+            )?;
+            locks.queue_save(&mut batch, signer)?;
+            next.queue_save(&mut batch, signer)?;
+            batch.commit()
         });
         match durable {
             Some(Ok(())) => {}
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        // The keyring decision is durable. Finish each open-room withdrawal synchronously
+        // under its reservation; preserve the exact generation for post-lock notifications.
+        let mut completed = Vec::new();
+        let mut incomplete = false;
+        let trusted = next.trusted();
+        for (room, channel) in &mut reserved {
+            if incomplete {
+                channel.poison(&Error::Profile(
+                    "trust withdrawal is incomplete; reopen this room",
+                ));
+                continue;
+            }
+            match authority
+                .publish(|| channel.withdraw_consent(profile, *fingerprint, self.now_ms()))
+            {
+                Some(Ok(revocation)) => {
+                    if let Some(revocation) = revocation {
+                        completed.push((*room, revocation.body.new_chain_id));
+                    }
+                    // Key deletion is part of this room's durable withdrawal, not a
+                    // best-effort step after its debt was cleared.
+                    match authority
+                        .publish(|| channel.forget_keys_except(profile.store(), &trusted))
+                    {
+                        Some(Ok(_)) => {
+                            locks.clear(room, fingerprint);
+                        }
+                        Some(Err(error)) => {
+                            channel.poison(&error);
+                            channel.poison(&Error::Profile(
+                                "trust withdrawal is incomplete; reopen this room",
+                            ));
+                            incomplete = true;
+                        }
+                        None => {
+                            channel.poison(&Error::Profile(
+                                "trust withdrawal is incomplete; reopen this room",
+                            ));
+                            incomplete = true;
+                        }
+                    }
+                }
+                Some(Err(error)) => {
+                    channel.poison(&error);
+                    // Even a normally retryable refusal must keep this room fail-closed after
+                    // the keyring decision until its durable withdrawal is replayed.
+                    channel.poison(&Error::Profile(
+                        "trust withdrawal is incomplete; reopen this room",
+                    ));
+                    incomplete = true;
+                }
+                None => {
+                    channel.poison(&Error::Profile(
+                        "trust withdrawal is incomplete; reopen this room",
+                    ));
+                    incomplete = true;
+                }
+            }
+        }
+        // Clear only completed room/member debts, durably, while these exact rooms are still
+        // reserved. Failure leaves the original debt for restart and keeps the rooms closed.
+        match authority.publish(|| locks.save(profile.store(), signer)) {
+            Some(Ok(())) => {}
+            _ => {
+                for (_, channel) in &mut reserved {
+                    channel.poison(&Error::Profile(
+                        "trust withdrawal is incomplete; reopen this room",
+                    ));
+                }
+                incomplete = true;
+            }
+        }
+        drop(reserved);
         self.consent_keys = pending;
         if let Some((room, peer, instance, request, generation)) =
             self.history_demand.note_route_trust_change()
@@ -14766,69 +14865,32 @@ impl Node {
         self.key_delivery_settling
             .retain(|(_, peer)| peer != fingerprint);
         self.note_capability(*fingerprint, had_drive);
-        // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
-        // nothing it posts from now opens on this node. A closed room drops them, and changes its
-        // lock, when it opens (recorded above). What was already read stays read. A re-trust is
-        // offered its key again, as any member whose key this node does not hold.
-        let trusted = self.trust.trusted();
-        let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
-        for ch in shared {
-            let _ = ch
-                .lock()
-                .await
-                .forget_keys_except(profile.store(), &trusted);
+        // Receiver and Drive key deletion completed under each room's reservation before its
+        // debt was cleared; incomplete rooms remain fail-closed and replay on preparation.
+        for (room, generation) in completed {
+            self.note_completed_untrust(room, *fingerprint, generation);
         }
         // Before the rotation, not after: rotation talks to the network and may be slow,
         // and the removal must bite the moment it is decided (M17.11).
         self.refresh_reachers().await;
-        let rotation = self.change_the_lock_against(fingerprint).await;
-        self.publish().await;
-        rotation
-    }
-
-    /// Rotate this identity's sender key and re-key everyone still in the ring, in
-    /// **every** room shared with `removed` (ADR-020 §3, "removing a key from the
-    /// ring MUST change the lock").
-    ///
-    /// Read access is a sender key already handed over, so removal cannot take it
-    /// back — it can only stop the removed party reading what comes *next*. That is
-    /// what rotation buys, and it is the honest limit: the history they already
-    /// hold stays theirs, which no protocol can change (ADR-007 enforcement
-    /// honesty).
-    ///
-    /// Only rooms where consent was actually granted are touched. Rotating in a
-    /// room that never granted anything would burn a generation and re-key
-    /// everyone to no effect.
-    ///
-    /// Bounded honestly: the rotation and its log fact land unconditionally, and
-    /// the re-keys are best-effort and retried on the tick for whoever is offline —
-    /// exactly as `revoke` does, because this reuses that machinery rather than
-    /// inventing a second kind of revocation.
-    async fn change_the_lock_against(&mut self, removed: &Digest32) -> Outcome {
-        let channels: Vec<Digest32> = self.channels.keys().copied().collect();
-        for channel_id in channels {
-            let result = self.withdraw_for_untrust(&channel_id, *removed).await;
-            if !result.is_done() {
-                return result;
-            }
-            // And any other consent outside the keyring (V210-148): a key goes only to a member
-            // the owner trusts, so nothing the ring does not name keeps one past this.
-            if let Err(error) = self.act_on_removals_while_closed(&channel_id).await {
-                return Outcome::Failed(fault_of(&error));
+        if incomplete {
+            self.publish().await;
+            return Outcome::Failed(Fault::TrustRemovalIncomplete);
+        }
+        // Reconcile other already-pending removals without replaying the exact withdrawals
+        // completed under the reservations above.
+        let rooms: Vec<_> = self.channels.keys().copied().collect();
+        for room in rooms {
+            if self.act_on_removals_while_closed(&room).await.is_err() {
+                self.publish().await;
+                return Outcome::Failed(Fault::TrustRemovalIncomplete);
             }
         }
+        self.publish().await;
         Outcome::Done
     }
 
-    /// A withdrawal never waits for a historical projection to learn whether consent existed.
-    /// The narrow Channel path rotates conservatively if that fact is not yet known.
-    async fn withdraw_for_untrust(&mut self, room: &Digest32, target: Digest32) -> Outcome {
-        match self.withdraw_for_untrust_result(room, target).await {
-            Ok(()) => Outcome::Done,
-            Err(error) => Outcome::Failed(fault_of(&error)),
-        }
-    }
-
+    /// Apply a retained room withdrawal and publish its exact completion effects.
     async fn withdraw_for_untrust_result(
         &mut self,
         room: &Digest32,
@@ -14857,19 +14919,23 @@ impl Node {
             }
         };
         drop(channel);
+        self.note_completed_untrust(*room, target, generation);
+        Ok(())
+    }
+
+    fn note_completed_untrust(&mut self, room: Digest32, target: Digest32, generation: u64) {
         self.deliveries
-            .retain(|(r, peer, _), _| r != room || *peer != target);
+            .retain(|(r, peer, _), _| r != &room || *peer != target);
         self.delivery_reserved
-            .retain(|(r, peer, _), _| r != room || *peer != target);
-        self.key_waiting.remove(&(*room, target));
-        self.note_local_governance_append(room);
+            .retain(|(r, peer, _), _| r != &room || *peer != target);
+        self.key_waiting.remove(&(room, target));
+        self.note_local_governance_append(&room);
         let _ = self.event_tx.send(NodeEvent::Revoked {
-            channel_id: *room,
+            channel_id: room,
             target,
             generation,
             rekeyed: 0,
         });
-        Ok(())
     }
 
     /// Delete every superseded sender-key generation this node no longer needs
