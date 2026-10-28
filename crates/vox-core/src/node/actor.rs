@@ -702,6 +702,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::OwnKeyWriterInterrupted(..) => "resuming an interrupted own-key response",
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
         NetEvent::OwnKeyCloseReady { .. } => "resuming a room close",
+        NetEvent::OwnKeyPublicationRejectReady { .. } => "retiring an unpublished room",
         NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
         NetEvent::OwnKeyRecoveryReady { .. } => "resuming room recovery",
         NetEvent::OwnKeyComputerReady { .. } => "resuming Computer policy",
@@ -1430,6 +1431,13 @@ enum NetEvent {
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
         reply: oneshot::Sender<Outcome>,
+    },
+    OwnKeyPublicationRejectReady {
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        waiting: RoomPublication,
     },
     OwnKeyRequestReady(Box<own_keys::RequestReady>),
     OwnKeyResponseReady(Box<own_keys::ResponseReady>),
@@ -8791,25 +8799,7 @@ impl Node {
                     self.publish_waiters.insert(room, waiting);
                     return;
                 }
-                // Create/join may already have put this room or member on a board before the
-                // final authority fence discovered the concurrent Computer change. Publish the
-                // narrowing withdrawal first and retain it for later anchors; only then may the
-                // local unpublished room be purged.
-                let scope = if *ownership == RoomPublicationOwnership::Created {
-                    crate::nat::withdraw::WithdrawScope::Room
-                } else {
-                    crate::nat::withdraw::WithdrawScope::Member
-                };
-                if let Err(fault) = self.withdraw_from_boards(&room, scope, authority).await {
-                    self.fail_room_publication(room, waiting, fault);
-                    return;
-                }
-                let outcome =
-                    self.reject_room_publication(&room, *ownership, Fault::ComputerPolicy);
-                self.publish().await;
-                if let Some(reply) = waiting.reply {
-                    let _ = reply.send(outcome);
-                }
+                self.begin_own_key_publication_reject(room, waiting);
                 return;
             }
         }
@@ -10800,6 +10790,10 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                 } else {
                     self.own_key_leave_pending.remove(&room);
+                    if self.publish_waiters.contains_key(&room) {
+                        self.publication_pending = true;
+                        self.publication_again = true;
+                    }
                     if reply.is_closed() {
                         drop(transition);
                     } else if self
@@ -10832,6 +10826,10 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                 } else {
                     self.own_key_leave_pending.remove(&room);
+                    if self.publish_waiters.contains_key(&room) {
+                        self.publication_pending = true;
+                        self.publication_again = true;
+                    }
                     if reply.is_closed() {
                         drop(transition);
                     } else if self
@@ -10844,6 +10842,102 @@ impl Node {
                         let _ = reply.send(outcome);
                     } else {
                         let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    }
+                }
+            }
+            NetEvent::OwnKeyPublicationRejectReady {
+                room,
+                instance,
+                owner,
+                transition,
+                waiting,
+            } => {
+                if !self
+                    .own_key_leave_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    self.fail_room_publication(room, waiting, Fault::ChannelNotOpen);
+                } else {
+                    self.own_key_leave_pending.remove(&room);
+                    if transition.is_none()
+                        || !self
+                            .channels
+                            .get(&room)
+                            .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        self.fail_room_publication(room, waiting, Fault::ChannelNotOpen);
+                    } else if let Some((authority, ownership)) = waiting.authority.as_ref() {
+                        let current = if *ownership == RoomPublicationOwnership::Created {
+                            authority.publish_room_creation(|| ()).is_some()
+                        } else {
+                            authority.current()
+                        };
+                        if current {
+                            drop(transition);
+                            self.publish_waiters.insert(room, waiting);
+                            self.publication_pending = true;
+                            self.publication_again = true;
+                            return;
+                        }
+                        // An unavailable authority may merely be blocked during a save or
+                        // waiting for application at the same revision. Preserve the room
+                        // in that case; only a newer committed revision proves supersession.
+                        let superseded = match authority {
+                            computer::ComputerAuthority::Managed {
+                                computer, applied, ..
+                            } => {
+                                computer.storage_ready().is_ok()
+                                    && computer.policy_revision() > *applied
+                            }
+                            computer::ComputerAuthority::Unmanaged => false,
+                        };
+                        if !superseded {
+                            drop(transition);
+                            self.fail_room_publication(room, waiting, Fault::ComputerPolicy);
+                            return;
+                        }
+                        let scope = if *ownership == RoomPublicationOwnership::Created {
+                            crate::nat::withdraw::WithdrawScope::Room
+                        } else {
+                            crate::nat::withdraw::WithdrawScope::Member
+                        };
+                        if let Err(fault) = self.withdraw_from_boards(&room, scope, authority).await
+                        {
+                            self.fail_room_publication(room, waiting, fault);
+                        } else {
+                            let still_superseded = match authority {
+                                computer::ComputerAuthority::Managed {
+                                    computer, applied, ..
+                                } => {
+                                    computer.storage_ready().is_ok()
+                                        && computer.policy_revision() > *applied
+                                }
+                                computer::ComputerAuthority::Unmanaged => false,
+                            };
+                            if !still_superseded
+                                || !self
+                                    .channels
+                                    .get(&room)
+                                    .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                            {
+                                drop(transition);
+                                self.fail_room_publication(room, waiting, Fault::ComputerPolicy);
+                                return;
+                            }
+                            let outcome = self.reject_room_publication(
+                                &room,
+                                *ownership,
+                                Fault::ComputerPolicy,
+                            );
+                            drop(transition);
+                            self.publish().await;
+                            if let Some(reply) = waiting.reply {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                    } else {
+                        self.fail_room_publication(room, waiting, Fault::ComputerPolicy);
                     }
                 }
             }
@@ -22940,6 +23034,54 @@ impl Node {
                     transitions,
                     command,
                     reply,
+                })
+                .await;
+        });
+    }
+
+    fn begin_own_key_publication_reject(&mut self, room: Digest32, waiting: RoomPublication) {
+        let Some(instance) = self.channels.get(&room).cloned().filter(|instance| {
+            waiting
+                .instance
+                .upgrade()
+                .is_some_and(|old| Arc::ptr_eq(instance, &old))
+        }) else {
+            self.fail_room_publication(room, waiting, Fault::ChannelNotOpen);
+            return;
+        };
+        if self.own_key_leave_pending.contains_key(&room) {
+            self.publish_waiters.insert(room, waiting);
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyPublicationRejectReady {
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    waiting,
                 })
                 .await;
         });
