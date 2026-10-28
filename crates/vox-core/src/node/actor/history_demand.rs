@@ -24,6 +24,7 @@ pub(super) struct Dispatch {
     pub request: RequestId,
     pub generation: Digest32,
     pub query: Query,
+    pub selected_author: (Digest32, Digest32),
     pub staging: Staging,
     pub fence: Arc<Fence>,
     /// Set only after the actor checks the current connected donor's room membership.
@@ -2981,6 +2982,7 @@ fn prepare(
         request,
         generation,
         query,
+        selected_author: (bounds.head, author),
         staging: Staging {
             context,
             active: Arc::new(StdMutex::new(active)),

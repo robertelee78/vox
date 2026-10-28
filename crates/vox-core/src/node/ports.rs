@@ -311,9 +311,10 @@ pub struct Port {
     /// One unavailable startup metadata probe, retired by connection/authority/local-head change.
     pub(crate) support_discovery_unavailable: Option<OwnProbe>,
     pub(crate) own_receipt_lower: Option<OwnProbe>,
-    /// Exact recipient-key body discovered by the bounded local scanner.
+    /// Last unavailable response recorded for this room and peer.
     pub(crate) last_recorded_unavailable_response:
         Option<crate::node::history_stream::runtime::UnavailableResponse>,
+    /// Exact recipient-key body discovered by the bounded local scanner.
     pub(crate) key_body: Option<crate::node::history_stream::KeyBodyNeed>,
     pub(crate) key_body_instance: Option<[u8; 16]>,
     /// The exact scan that selected this body, distinct from a later dirty edge.

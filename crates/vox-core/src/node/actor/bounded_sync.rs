@@ -3704,7 +3704,7 @@ impl Node {
                         .then(|| self.history_demand.take_ready(room, peer))
                         .flatten()
                     {
-                        Flow::archive(
+                        let mut flow = Flow::archive(
                             room,
                             peer,
                             node,
@@ -3721,7 +3721,9 @@ impl Node {
                             store.clone(),
                             Arc::clone(&self.history_budget),
                             actor_incarnation,
-                        )
+                        );
+                        flow.archive_selected_author = Some(dispatch.selected_author);
+                        flow
                     } else {
                         if page_only
                             || self.bounded_sync.ready[0].is_some()

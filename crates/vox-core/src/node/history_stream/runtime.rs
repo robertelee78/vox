@@ -232,6 +232,7 @@ pub(crate) struct Flow {
     pub(crate) key_body_token: Option<Arc<()>>,
     pub(crate) key_body_unavailable: Option<KeyBodyUnavailable>,
     pub(crate) unavailable_response: Option<UnavailableResponse>,
+    pub(crate) archive_selected_author: Option<(Digest32, Digest32)>,
     pub(crate) key_availability_token: Option<Arc<()>>,
     pub(crate) key_availability_result: super::KeyAvailabilityResult,
     key_body_checked: bool,
@@ -483,6 +484,7 @@ impl Flow {
             key_body_token: None,
             key_body_unavailable: None,
             unavailable_response: None,
+            archive_selected_author: None,
             key_availability_token: None,
             key_availability_result: None,
             key_body_checked: false,
@@ -662,6 +664,7 @@ impl Flow {
             key_body_token: None,
             key_body_unavailable: None,
             unavailable_response: None,
+            archive_selected_author: None,
             key_availability_token: None,
             key_availability_result: None,
             key_body_checked: false,
@@ -2552,6 +2555,11 @@ impl Flow {
                         self.authenticated_head
                             .filter(|known| known.head == head)
                             .map(|known| known.author)
+                            .or_else(|| {
+                                self.archive_selected_author
+                                    .filter(|(selected_head, _)| *selected_head == head)
+                                    .map(|(_, author)| author)
+                            })
                     };
                     self.unavailable_response = match &query {
                         Query::Entry { head, seq, .. } => Some(UnavailableResponse {
