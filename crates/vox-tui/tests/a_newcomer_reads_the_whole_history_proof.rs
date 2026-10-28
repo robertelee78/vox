@@ -6667,10 +6667,12 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     assert!(ok, "PRODUCT: Alice's `vox id` failed: {err}");
     let (ok, bob_fp, err) = vox(&bob, &["id"], None);
     assert!(ok, "PRODUCT: Bob's `vox id` failed: {err}");
-    for (dir, fp, name) in [(&bob, alice_fp.trim(), "alice")] {
-        let (ok, out, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "PRODUCT: `vox trust add {name}` failed: {out}{err}");
-    }
+    let (ok, out, err) = vox(
+        &bob,
+        &["trust", "add", alice_fp.trim(), "--name", "alice"],
+        None,
+    );
+    assert!(ok, "PRODUCT: `vox trust add alice` failed: {out}{err}");
     let alice_daemon = daemon_env(
         &alice,
         "alice-consent-last",
