@@ -190,6 +190,7 @@ pub(crate) struct Flow {
     pub(crate) archive_request: Option<RequestId>,
     /// Physical connection used by the most recent worker turn.
     pub(crate) started_connection: Option<(Digest32, u64)>,
+    pub(crate) retired_archive_complete: bool,
     /// Exact required control root removed from the actor queue when this foreground flow was
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
@@ -441,6 +442,7 @@ impl Flow {
             departure_probe,
             archive_request: None,
             started_connection: None,
+            retired_archive_complete: false,
             required_root: required,
             state_charge: None,
             hint,
@@ -611,6 +613,7 @@ impl Flow {
             departure_probe: false,
             archive_request: Some(request),
             started_connection: None,
+            retired_archive_complete: false,
             required_root: None,
             state_charge: None,
             hint: None,
@@ -1195,7 +1198,7 @@ impl Flow {
         let committed = Arc::clone(&self.work_committed);
         enum Slice {
             Gone,
-            Staging(Purpose, bool),
+            Staging(Purpose, bool, bool),
             Source(bool, Option<[u8; 64]>),
             Publication(
                 Option<RequestId>,
@@ -1226,7 +1229,7 @@ impl Flow {
                 let admission = admission
                     .as_ref()
                     .ok_or(Error::Profile("history retirement admission missing"))?;
-                let done = if preserve_public && purpose == Purpose::History {
+                let (done, completed) = if preserve_public && purpose == Purpose::History {
                     demand::retire_admitted_cleanup(
                         &staging.context,
                         &active,
@@ -1234,9 +1237,17 @@ impl Flow {
                         &committed,
                     )?
                 } else {
-                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?
+                    (
+                        demand::retire_staging(
+                            &staging.context,
+                            &mut active,
+                            admission,
+                            &committed,
+                        )?,
+                        false,
+                    )
                 };
-                return Ok(Slice::Staging(purpose, done));
+                return Ok(Slice::Staging(purpose, done, completed));
             }
             let wake = channel.history_publication_wake();
             let publication_owner = channel.history_publication_request(&store)?;
@@ -1257,7 +1268,8 @@ impl Flow {
                 self.cancel();
                 return Ok(RetirementStep::Done);
             }
-            Slice::Staging(purpose, done) => {
+            Slice::Staging(purpose, done, completed) => {
+                self.retired_archive_complete |= completed;
                 if done {
                     if let Some(index) = body_slot(purpose) {
                         if let Some(request) = self.owners[index].take() {
@@ -3174,14 +3186,15 @@ impl Flow {
                     && snapshot.state().body.is_none()
                     && !snapshot.state().reclaiming()
                 {
-                    if let Some(next) = next {
+                    if next.is_some() || snapshot.state().remaining == 0 {
                         // This branch ends More/Complete, so it never needs a subsequent
                         // pause. Prepay only its work and single reload before the commit.
                         let work = demand::AdmissionCharge::reserve(&job)?;
                         let reload = demand::AdmissionCharge::reserve(&job)?;
                         let state = snapshot.state();
-                        let cursor = (next >= state.bounds.lo && state.remaining > 0).then_some(
-                            super::Continuation {
+                        let cursor = next
+                            .filter(|next| *next >= state.bounds.lo && state.remaining > 0)
+                            .map(|next| super::Continuation {
                                 query_kind: 4,
                                 head: state.bounds.head,
                                 lo: state.bounds.lo,
@@ -3190,8 +3203,7 @@ impl Flow {
                                 entry: None,
                                 offset: 0,
                                 entries_remaining: state.remaining,
-                            },
-                        );
+                            });
                         demand::checkpoint_precharged(
                             &staging.context,
                             &mut active,

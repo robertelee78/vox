@@ -525,6 +525,7 @@ struct InterruptedArchive {
     fence: Arc<crate::transport::stream_transport::Fence>,
     room_ref: std::sync::Weak<tokio::sync::Mutex<crate::node::channel::ChannelState>>,
     token: crate::node::history_demand::RetiredPublicToken,
+    completed: bool,
 }
 struct Running {
     room: Digest32,
@@ -1330,7 +1331,8 @@ impl Controller {
                 self.retirement_waiting.remove(&key);
                 self.retirement_failed.remove(&key);
                 clear_retirement_error(&self.retirement_ledger, key);
-                if let Some(interrupted) = self.interrupted_retiring.remove(&key) {
+                if let Some(mut interrupted) = self.interrupted_retiring.remove(&key) {
+                    interrupted.completed = flow.retired_archive_complete;
                     self.interrupted_ready.push_back(interrupted);
                 }
             }
@@ -2337,6 +2339,7 @@ impl Node {
                 fence: Arc::clone(fence),
                 room_ref: Arc::downgrade(&flow.shared),
                 token,
+                completed: false,
             },
         );
         self.dispose_rearming_hint(flow);
@@ -2350,6 +2353,22 @@ impl Node {
                     .get(&interrupted.room)
                     .is_some_and(|current| Arc::ptr_eq(current, &old))
             });
+            if same_room
+                && interrupted.completed
+                && self.history_demand.owns_running_fence(
+                    interrupted.request,
+                    interrupted.generation,
+                    &interrupted.fence,
+                )
+            {
+                self.history_demand.complete_retired(
+                    interrupted.room,
+                    interrupted.instance,
+                    interrupted.request,
+                    interrupted.generation,
+                );
+                continue;
+            }
             if same_room
                 && self.history_demand.can_resume_interrupted()
                 && self.history_demand.owns_running_fence(
@@ -2721,6 +2740,7 @@ impl Node {
                                 fence: Arc::clone(&work.fence),
                                 room_ref: Arc::downgrade(&flow.shared),
                                 token,
+                                completed: false,
                             },
                         );
                         self.dispose_rearming_hint(flow);

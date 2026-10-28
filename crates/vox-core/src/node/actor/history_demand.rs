@@ -429,6 +429,32 @@ impl Controller {
         self.completed(request, generation, status);
         true
     }
+    /// Publish the terminal checkpoint committed by this exact retired worker.
+    pub(super) fn complete_retired(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        generation: Digest32,
+    ) {
+        let Some(mut status) = self
+            .owner_status
+            .as_ref()
+            .filter(|status| {
+                status.room == room
+                    && status.instance == instance
+                    && status.request == Some(request)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        status.phase = Phase::Complete;
+        status.remaining = 0;
+        status.offset = 0;
+        status.detail = "This history interval is complete.".into();
+        self.completed_current(room, instance, request, generation, status);
+    }
     /// A failed quantum leaves its durable request available for an explicit resume.
     pub(super) fn failed(&mut self, request: RequestId, generation: Digest32, detail: &str) {
         if !self

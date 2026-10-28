@@ -1309,7 +1309,33 @@ pub(crate) fn entry_admitted(
     {
         return Err(invalid("history entry is incomplete or changed"));
     }
+    let admitted_seq = state.body.as_ref().ok_or_else(bad)?.seq;
     schedule_cleanup(&mut state);
+    // The admitted body and its cursor disappear together. Preserve the next exact
+    // position in the same transaction, so retirement or a restart cannot replay
+    // the original upper bound after publication.
+    if context.slot == Slot::Archive
+        && state.private.is_none()
+        && state.legacy.is_none()
+        && state.binding.audience == [0; 32]
+        && state.remaining > 0
+    {
+        if let Some(next_seq) = admitted_seq
+            .checked_sub(1)
+            .filter(|next| *next >= state.bounds.lo)
+        {
+            state.cursor = Some(Cursor {
+                query_kind: 4,
+                next_seq,
+                entry: None,
+                offset: 0,
+            });
+        } else {
+            // The authenticated lower bound was admitted; unused entry credit is
+            // not evidence that another entry exists outside this interval.
+            state.remaining = 0;
+        }
+    }
     put(batch, key, &scope, &state)
 }
 
@@ -1723,11 +1749,11 @@ pub(crate) fn retire_admitted_cleanup(
     active: &Active,
     _admission: &AdmissionCharge,
     committed: &std::sync::atomic::AtomicBool,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let scope = scope(context);
     let mut batch = context.store().batch()?;
     let Some(mut state) = load(&batch, &context.key, &scope)? else {
-        return Ok(true);
+        return Ok((true, false));
     };
     if active.node != context.node
         || active.scope != scope
@@ -1735,21 +1761,31 @@ pub(crate) fn retire_admitted_cleanup(
         || state.binding != active.binding
         || state.serial != active.serial
     {
-        return Ok(true);
+        return Ok((true, false));
     }
-    let Some(mut cleanup) = state.cleanup else {
-        return Ok(true);
-    };
-    let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
-    for page in cleanup.next..=end {
-        batch.delete_segment(&scope, KIND, page)?;
+    if let Some(mut cleanup) = state.cleanup {
+        let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+        for page in cleanup.next..=end {
+            batch.delete_segment(&scope, KIND, page)?;
+        }
+        cleanup.next = end + 1;
+        state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
     }
-    cleanup.next = end + 1;
-    state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    if state.cleanup.is_none()
+        && state.body.is_none()
+        && state.remaining == 0
+        && state.progress == Progress::Pending
+    {
+        state.cursor = None;
+        state.progress = Progress::Complete;
+    }
     put(&mut batch, &context.key, &scope, &state)?;
     batch.commit()?;
     committed.store(true, std::sync::atomic::Ordering::Release);
-    Ok(state.cleanup.is_none())
+    Ok((
+        state.cleanup.is_none(),
+        state.progress == Progress::Complete,
+    ))
 }
 
 /// Retirement deletion only. The room owner first holds the room mutex and verifies its
