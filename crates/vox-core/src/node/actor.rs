@@ -10679,6 +10679,7 @@ impl Node {
             NetEvent::ConnectionClosed { peer, serial } => {
                 self.bounded_sync
                     .note_archive_connection_closed(peer, serial);
+                self.retire_parked_closed_archive(peer, serial);
                 let replacement_is_live = self
                     .net
                     .as_ref()

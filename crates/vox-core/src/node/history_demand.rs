@@ -1715,6 +1715,43 @@ pub(crate) fn reclaim_precharged(
     Ok(state.cleanup.is_none())
 }
 
+/// Finish only already-admitted page reclamation for an interrupted public request.
+/// The exact activation identity prevents an old owner touching a replacement. This
+/// does not cancel the request or discard any unfinished body.
+pub(crate) fn retire_admitted_cleanup(
+    context: &Context,
+    active: &Active,
+    _admission: &AdmissionCharge,
+    committed: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, &context.key, &scope)? else {
+        return Ok(true);
+    };
+    if active.node != context.node
+        || active.scope != scope
+        || state.request != active.request
+        || state.binding != active.binding
+        || state.serial != active.serial
+    {
+        return Ok(true);
+    }
+    let Some(mut cleanup) = state.cleanup else {
+        return Ok(true);
+    };
+    let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+    for page in cleanup.next..=end {
+        batch.delete_segment(&scope, KIND, page)?;
+    }
+    cleanup.next = end + 1;
+    state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    put(&mut batch, &context.key, &scope, &state)?;
+    batch.commit()?;
+    committed.store(true, std::sync::atomic::Ordering::Release);
+    Ok(state.cleanup.is_none())
+}
+
 /// Retirement deletion only. The room owner first holds the room mutex and verifies its
 /// unlocked incarnation. Observer cancellation cannot revoke permission to delete this exact
 /// abandoned staging, but a replacement request/binding is always left untouched. This route

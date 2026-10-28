@@ -2293,6 +2293,55 @@ impl Node {
         self.bounded_sync.poll_cleanup();
     }
 
+    /// A close can arrive after a worker returned and before its next turn starts.
+    /// The parked flow still owns the exact request and must retire before it resumes.
+    pub(super) fn retire_parked_closed_archive(&mut self, peer: Digest32, serial: u64) {
+        let matches = self.bounded_sync.ready[1].as_ref().is_some_and(|flow| {
+            flow.started_connection == Some((peer, serial))
+                && flow.archive_status.is_none()
+                && self
+                    .channels
+                    .get(&flow.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+                && flow
+                    .archive_request
+                    .zip(flow.request_fence.as_ref())
+                    .is_some_and(|(request, fence)| {
+                        self.history_demand
+                            .owns_running_fence(request, flow.generation, fence)
+                    })
+                && flow.interrupted_public_token().is_some()
+        });
+        if !matches {
+            return;
+        }
+        let Some(flow) = self.bounded_sync.ready[1].take() else {
+            return;
+        };
+        let (Some(request), Some(token), Some(fence)) = (
+            flow.archive_request,
+            flow.interrupted_public_token(),
+            flow.request_fence.as_ref(),
+        ) else {
+            self.bounded_sync.ready[1] = Some(flow);
+            return;
+        };
+        let key = retirement_key(&flow);
+        self.bounded_sync.interrupted_retiring.insert(
+            key,
+            InterruptedArchive {
+                room: flow.room,
+                instance: flow.instance,
+                request,
+                generation: flow.generation,
+                fence: Arc::clone(fence),
+                room_ref: Arc::downgrade(&flow.shared),
+                token,
+            },
+        );
+        self.dispose_rearming_hint(flow);
+    }
+
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
         while let Some(interrupted) = self.bounded_sync.interrupted_ready.pop_front() {
@@ -2584,6 +2633,39 @@ impl Node {
                 eprintln!("vox: {error}");
                 continue;
             }
+            if flow.published
+                && self
+                    .channels
+                    .get(&work.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            {
+                flow.published = false;
+                // Ordinary content publication has no governance work. The history worker's
+                // signed-kind result names the causal control publication that does.
+                if flow.governance {
+                    self.governance_work.wake_room(work.room);
+                }
+                self.sched_rooms.insert(work.room);
+                // A bounded publication may have made an addressed key-package durable. Its
+                // catalog is authoritative even when the best-effort presentation event below
+                // cannot fit in the actor queue, so make package installation runnable here.
+                // A turn that finds no package is bounded and clears the room again; a crash
+                // between publication and this mark is recovered by the room-open scan.
+                self.key_package_rooms.entry(work.room).or_insert(false);
+                let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
+                    channel_id: work.room,
+                    rendered: flow.rendered,
+                    governance: flow.governance,
+                });
+                flow.rendered = false;
+                flow.governance = false;
+                // A required control finished: the archive's next local slice can recheck its
+                // exact dependency. No archive wire request is created by this wake.
+                if let Some(flow) = self.bounded_sync.ready[1].as_mut() {
+                    flow.waiting = false;
+                    self.sched_rooms.insert(flow.room);
+                }
+            }
             let closure_eligible = returned
                 .failure
                 .as_ref()
@@ -2690,34 +2772,6 @@ impl Node {
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                     channel_id: work.room,
                 });
-            }
-            if flow.published {
-                flow.published = false;
-                // Ordinary content publication has no governance work. The history worker's
-                // signed-kind result names the causal control publication that does.
-                if flow.governance {
-                    self.governance_work.wake_room(work.room);
-                }
-                self.sched_rooms.insert(work.room);
-                // A bounded publication may have made an addressed key-package durable. Its
-                // catalog is authoritative even when the best-effort presentation event below
-                // cannot fit in the actor queue, so make package installation runnable here.
-                // A turn that finds no package is bounded and clears the room again; a crash
-                // between publication and this mark is recovered by the room-open scan.
-                self.key_package_rooms.entry(work.room).or_insert(false);
-                let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
-                    channel_id: work.room,
-                    rendered: flow.rendered,
-                    governance: flow.governance,
-                });
-                flow.rendered = false;
-                flow.governance = false;
-                // A required control finished: the archive's next local slice can recheck its
-                // exact dependency. No archive wire request is created by this wake.
-                if let Some(flow) = self.bounded_sync.ready[1].as_mut() {
-                    flow.waiting = false;
-                    self.sched_rooms.insert(flow.room);
-                }
             }
             if let Some((head, seq)) = flow.external.take() {
                 let need = RequiredOwner {
@@ -4249,6 +4303,7 @@ impl Node {
         // A key to this peer waiting on its bundle makes this round read the peer's board,
         // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.
         flow.wants_board = self.key_waiting.contains_key(&(room, peer));
+        flow.started_connection = Some((peer, conn.serial()));
         let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
         let worker_flow = Arc::clone(&flow);

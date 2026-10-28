@@ -188,6 +188,8 @@ pub(crate) struct Flow {
     pub(crate) wants_board: bool,
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
+    /// Physical connection used by the most recent worker turn.
+    pub(crate) started_connection: Option<(Digest32, u64)>,
     /// Exact required control root removed from the actor queue when this foreground flow was
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
@@ -438,6 +440,7 @@ impl Flow {
             wants_board: false,
             departure_probe,
             archive_request: None,
+            started_connection: None,
             required_root: required,
             state_charge: None,
             hint,
@@ -607,6 +610,7 @@ impl Flow {
             wants_board: false,
             departure_probe: false,
             archive_request: Some(request),
+            started_connection: None,
             required_root: None,
             state_charge: None,
             hint: None,
@@ -1135,11 +1139,17 @@ impl Flow {
             .tasks
             .iter()
             .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
+        let preserve_public = self.archive && !self.automatic_own_recovery;
         let staging = if reclaim_live && self.live.is_some() {
             self.live.clone().map(|stage| (Purpose::Live, stage))
         } else if reclaim_control && self.control.is_some() {
             self.control.clone().map(|stage| (Purpose::Control, stage))
-        } else if self.automatic_own_recovery {
+        } else if self.automatic_own_recovery
+            || self
+                .tasks
+                .iter()
+                .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::History)))
+        {
             self.history.clone().map(|stage| (Purpose::History, stage))
         } else {
             None
@@ -1216,8 +1226,16 @@ impl Flow {
                 let admission = admission
                     .as_ref()
                     .ok_or(Error::Profile("history retirement admission missing"))?;
-                let done =
-                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?;
+                let done = if preserve_public && purpose == Purpose::History {
+                    demand::retire_admitted_cleanup(
+                        &staging.context,
+                        &active,
+                        admission,
+                        &committed,
+                    )?
+                } else {
+                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?
+                };
                 return Ok(Slice::Staging(purpose, done));
             }
             let wake = channel.history_publication_wake();
