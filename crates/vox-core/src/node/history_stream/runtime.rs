@@ -208,6 +208,7 @@ pub(crate) struct Flow {
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
     pub(crate) key_body_root: Option<super::KeyBodyNeed>,
+    pub(crate) key_body_token: Option<Arc<()>>,
     key_body_checked: bool,
     pub(crate) hint: Option<super::HeadHint>,
     /// Canonical local recovery proof root, not a consumed advisory inbox item.
@@ -454,6 +455,7 @@ impl Flow {
             archive_request: None,
             required_root: required,
             key_body_root: None,
+            key_body_token: None,
             key_body_checked: false,
             state_charge: None,
             hint,
@@ -628,6 +630,7 @@ impl Flow {
             archive_request: Some(request),
             required_root: None,
             key_body_root: None,
+            key_body_token: None,
             key_body_checked: false,
             state_charge: None,
             hint: None,
@@ -716,6 +719,7 @@ impl Flow {
         need: super::KeyBodyNeed,
         instance: [u8; 16],
         context: Arc<Context>,
+        token: Arc<()>,
     ) -> Self {
         self.tasks.clear();
         self.tasks.push(Task {
@@ -735,6 +739,7 @@ impl Flow {
         self.instance = instance;
         self.generation = need.authorization;
         self.key_body_root = Some(need);
+        self.key_body_token = Some(token);
         self.control_context = context;
         self
     }

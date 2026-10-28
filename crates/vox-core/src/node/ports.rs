@@ -306,6 +306,8 @@ pub struct Port {
     /// Exact recipient-key body discovered by the bounded local scanner.
     pub(crate) key_body: Option<crate::node::history_stream::KeyBodyNeed>,
     pub(crate) key_body_instance: Option<[u8; 16]>,
+    /// The exact scan that selected this body, distinct from a later dirty edge.
+    pub(crate) key_body_token: Option<std::sync::Arc<()>>,
     /// Scanner continuation in the room's sealed obligations index.
     pub(crate) key_body_after: Option<[u8; 64]>,
     /// False until a causal room/connection edge requests a scan.
@@ -366,6 +368,7 @@ impl Port {
             own_receipt_lower: None,
             key_body: None,
             key_body_instance: None,
+            key_body_token: None,
             key_body_after: None,
             key_body_initialized: false,
             key_body_scan_token: None,

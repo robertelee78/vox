@@ -16196,17 +16196,22 @@ impl Node {
     }
 
     /// A successful keyring save changes the authorization incarnation used by key-body
-    /// refusals. Reconsider the exact trusted peers of current room instances once; ordinary
-    /// room traffic does not cause these scans.
-    fn note_key_body_trust_change(&self) {
-        for (&(room, peer), port) in &self.ports {
-            if !self.trust.is_trusted(&peer)
-                || !self
-                    .current_room(&room)
-                    .is_some_and(|current| port.room.is(&current))
-            {
+    /// refusals. Retire selected logical roots even for a newly untrusted peer; physical
+    /// workers retain their own staging until cleanup. Ordinary room traffic does not do this.
+    fn note_key_body_trust_change(&mut self) {
+        for (&(room, peer), port) in &mut self.ports {
+            let current = self
+                .channels
+                .get(&room)
+                .map(|channel| crate::node::ports::RoomRef::Channel(Arc::downgrade(channel)));
+            if !current.is_some_and(|current| port.room.is(&current)) {
                 continue;
             }
+            port.key_body = None;
+            port.key_body_instance = None;
+            port.key_body_token = None;
+            port.key_body_after = None;
+            port.key_body_initialized = false;
             if let Some(owner) = self.role_wake.owner(room) {
                 owner.mark_key_dirty(peer);
             }

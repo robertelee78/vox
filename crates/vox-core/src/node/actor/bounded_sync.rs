@@ -2417,6 +2417,21 @@ impl Node {
             }
             if flow.authorization_changed {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
+                if let Some(token) = flow.key_body_token.as_ref() {
+                    if let Some(port) = self.ports.get_mut(&(work.room, flow.hint_peer)) {
+                        if port
+                            .key_body_token
+                            .as_ref()
+                            .is_some_and(|owner| Arc::ptr_eq(owner, token))
+                        {
+                            port.key_body = None;
+                            port.key_body_instance = None;
+                            port.key_body_token = None;
+                            port.key_body_after = None;
+                            port.key_body_initialized = false;
+                        }
+                    }
+                }
                 let archive = flow.archive_request.and_then(|request| {
                     let fence = flow.request_fence.as_ref()?;
                     if !self.history_demand.owns_running_fence(request, flow.generation, fence) {
@@ -2970,15 +2985,21 @@ impl Node {
             }
             if flow.done() {
                 if let Some(need) = flow.key_body_root {
-                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                    if let Some(port) = self.ports.get_mut(&(work.room, flow.hint_peer)) {
                         if port.key_body == Some(need)
                             && port.key_body_instance == Some(flow.instance)
+                            && port
+                                .key_body_token
+                                .as_ref()
+                                .zip(flow.key_body_token.as_ref())
+                                .is_some_and(|(owner, token)| Arc::ptr_eq(owner, token))
                         {
                             // The physical Flow and its staging cleanup have both completed.
                             // Continue the same bounded local scan; an older Flow cannot clear
                             // a replacement port's different exact root.
                             port.key_body = None;
                             port.key_body_instance = None;
+                            port.key_body_token = None;
                             port.key_body_initialized = false;
                             self.sched_rooms.insert(work.room);
                         }
@@ -3703,9 +3724,13 @@ impl Node {
                             && own_verification.is_none()
                             && own_discovery.is_none()
                         {
-                            self.ports
-                                .get(&(room, peer))
-                                .and_then(|port| port.key_body.zip(port.key_body_instance))
+                            self.ports.get(&(room, peer)).and_then(|port| {
+                                Some((
+                                    port.key_body?,
+                                    port.key_body_instance?,
+                                    port.key_body_token.clone()?,
+                                ))
+                            })
                         } else {
                             None
                         };
@@ -3780,12 +3805,12 @@ impl Node {
                             actor_incarnation,
                         ) {
                             Ok(mut flow) => {
-                                if let Some((need, instance)) = selected_key_body {
+                                if let Some((need, instance, token)) = selected_key_body {
                                     let context = match crate::node::history_demand::Context::key_body_unlocked(profile, lease.clone()) {
                                         Ok(value) => Arc::new(value),
                                         Err(_) => return false,
                                     };
-                                    flow = flow.with_key_body(need, instance, context);
+                                    flow = flow.with_key_body(need, instance, context, token);
                                 }
                                 flow.reason = reason;
                                 flow.discovery_incarnations = probe_incarnations;
@@ -3841,9 +3866,13 @@ impl Node {
                         && own_verification.is_none()
                         && own_discovery.is_none()
                     {
-                        self.ports
-                            .get(&(room, peer))
-                            .and_then(|port| port.key_body.zip(port.key_body_instance))
+                        self.ports.get(&(room, peer)).and_then(|port| {
+                            Some((
+                                port.key_body?,
+                                port.key_body_instance?,
+                                port.key_body_token.clone()?,
+                            ))
+                        })
                     } else {
                         None
                     };
@@ -3916,7 +3945,7 @@ impl Node {
                         actor_incarnation,
                     ) {
                         Ok(mut flow) => {
-                            if let Some((need, instance)) = selected_key_body {
+                            if let Some((need, instance, token)) = selected_key_body {
                                 let context =
                                     match crate::node::history_demand::Context::key_body_unlocked(
                                         profile,
@@ -3925,7 +3954,7 @@ impl Node {
                                         Ok(value) => Arc::new(value),
                                         Err(_) => return false,
                                     };
-                                flow = flow.with_key_body(need, instance, context);
+                                flow = flow.with_key_body(need, instance, context, token);
                             }
                             flow.reason = reason;
                             flow.discovery_incarnations = probe_incarnations;

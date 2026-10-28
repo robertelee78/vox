@@ -85,6 +85,7 @@ impl Node {
                                 if let Some(need) = need {
                                     port.key_body = Some(need);
                                     port.key_body_instance = Some(instance);
+                                    port.key_body_token = Some(Arc::clone(&running.token));
                                     port.key_body_initialized = true;
                                     port.raise();
                                     self.sched_rooms.insert(running.room);
