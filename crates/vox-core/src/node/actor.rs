@@ -703,6 +703,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
         NetEvent::OwnKeyCloseReady { .. } => "resuming a room close",
         NetEvent::OwnKeyPublicationRejectReady { .. } => "retiring an unpublished room",
+        NetEvent::OwnKeyEndedPurgeReady { .. } => "retiring an ended room",
         NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
         NetEvent::OwnKeyRecoveryReady { .. } => "resuming room recovery",
         NetEvent::OwnKeyComputerReady { .. } => "resuming Computer policy",
@@ -1438,6 +1439,12 @@ enum NetEvent {
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
         waiting: RoomPublication,
+    },
+    OwnKeyEndedPurgeReady {
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
     },
     OwnKeyRequestReady(Box<own_keys::RequestReady>),
     OwnKeyResponseReady(Box<own_keys::ResponseReady>),
@@ -5530,6 +5537,7 @@ pub struct Node {
     own_key_interrupted_pending: BTreeMap<(Digest32, Digest32), own_keys::InterruptedReady>,
     own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
+    own_key_ended_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_untrust_pending: Option<Arc<()>>,
     own_key_room_set_changed: watch::Sender<()>,
     own_key_untrust_transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
@@ -6415,6 +6423,7 @@ impl Node {
             own_key_interrupted_pending: BTreeMap::new(),
             own_key_room_cancel: BTreeMap::new(),
             own_key_leave_pending: BTreeMap::new(),
+            own_key_ended_pending: BTreeMap::new(),
             own_key_untrust_pending: None,
             own_key_room_set_changed: watch::channel(()).0,
             own_key_untrust_transitions: None,
@@ -10941,6 +10950,80 @@ impl Node {
                     }
                 }
             }
+            NetEvent::OwnKeyEndedPurgeReady {
+                room,
+                instance,
+                owner,
+                transition,
+            } => {
+                if self
+                    .own_key_ended_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    if let Some(transition) = transition {
+                        if self
+                            .channels
+                            .get(&room)
+                            .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                        {
+                            match Arc::clone(&instance).try_lock_owned() {
+                                Ok(channel) => {
+                                    let ended = channel.ended(self.now_ms().get()).is_some();
+                                    let pending =
+                                        self.publish_waiters.get(&room).is_some_and(|waiting| {
+                                            waiting.kind != RoomPublicationKind::Open
+                                        });
+                                    if ended && !pending && self.winding.contains_key(&room) {
+                                        let members: Vec<_> = channel
+                                            .members()
+                                            .into_iter()
+                                            .filter(|peer| *peer != channel.me())
+                                            .collect();
+                                        let winding = &self.winding[&room];
+                                        let handed = members
+                                            .iter()
+                                            .filter(|peer| {
+                                                self.ports.get(&(room, **peer)).is_some_and(
+                                                    |port| port.done_gen >= winding.gen,
+                                                )
+                                            })
+                                            .count();
+                                        if handed >= members.len()
+                                            || winding.since.elapsed() >= WIND_DOWN
+                                        {
+                                            self.own_key_ended_pending.remove(&room);
+                                            self.winding.remove(&room);
+                                            let _ = self.event_tx.send(NodeEvent::RoomEnded {
+                                                channel_id: room,
+                                                handed,
+                                                members: members.len(),
+                                            });
+                                            let _ = self
+                                                .purge_room(&room, Some((transition, channel)))
+                                                .await;
+                                            return;
+                                        }
+                                    }
+                                    drop(channel);
+                                    drop(transition);
+                                    self.own_key_ended_pending.remove(&room);
+                                    self.sched_rooms.insert(room);
+                                    self.discover_rooms.insert(room);
+                                }
+                                Err(_) => {
+                                    self.wait_own_key_ended_room(room, instance, owner, transition);
+                                }
+                            }
+                        } else {
+                            self.own_key_ended_pending.remove(&room);
+                        }
+                    } else {
+                        self.own_key_ended_pending.remove(&room);
+                        self.sched_rooms.insert(room);
+                    }
+                }
+            }
             NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
             NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
             NetEvent::OwnKeyRequestFailed {
@@ -14383,7 +14466,7 @@ impl Node {
                 ch.has_left(&ch.me())
             };
             if left {
-                if let Outcome::Failed(f) = self.purge_room(&parsed.channel_id).await {
+                if let Outcome::Failed(f) = self.purge_room(&parsed.channel_id, None).await {
                     let _ = reply.send(Outcome::Failed(f));
                     return;
                 }
@@ -17659,6 +17742,9 @@ impl Node {
     }
 
     async fn start_outbound(&mut self, channel_id: Digest32, peer: Digest32) -> bool {
+        if self.own_key_ended_pending.contains_key(&channel_id) {
+            return false;
+        }
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return false;
         };
@@ -18468,6 +18554,19 @@ impl Node {
         recv: quinn::RecvStream,
     ) {
         use crate::node::syncstream::accept_sync;
+        if self.own_key_ended_pending.contains_key(&channel_id) {
+            let (mut send, mut recv) = (send, recv);
+            if self.owed_a_reason(&channel_id, &peer, epoch) {
+                crate::node::net::refuse_stream_because(
+                    &mut send,
+                    &mut recv,
+                    crate::wire::WireError::SessionBusy,
+                );
+            } else {
+                crate::node::net::refuse_stream(&mut send, &mut recv);
+            }
+            return;
+        }
         // The mutant build's `refuse-sessions` (#85): every inbound session refused, with a reason.
         #[cfg(feature = "mutant-sender")]
         if let Some(code) = crate::log::sync::mutant::refuses() {
@@ -23039,6 +23138,87 @@ impl Node {
         });
     }
 
+    fn wait_own_key_ended_room(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: crate::node::channel::own_writer_gate::Transition,
+    ) {
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let transition = tokio::select! {
+                biased;
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => { drop(channel); Some(transition) },
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyEndedPurgeReady {
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                })
+                .await;
+        });
+    }
+
+    async fn begin_own_key_ended_purge(&mut self, room: Digest32, instance: SharedChannel) {
+        if self.own_key_ended_pending.contains_key(&room)
+            || self.own_key_leave_pending.contains_key(&room)
+        {
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_ended_pending.insert(room, Arc::clone(&owner));
+        if let Err(error) = self.retire_bounded_room(room).await {
+            self.own_key_ended_pending.remove(&room);
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!("ended room cleanup stopped: {error}"),
+            });
+            return;
+        }
+        for ((id, _), port) in &mut self.ports {
+            if *id == room {
+                for (_, attempt) in std::mem::take(&mut port.inbound) {
+                    attempt.retire();
+                }
+            }
+        }
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyEndedPurgeReady {
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                })
+                .await;
+        });
+    }
+
     fn begin_own_key_publication_reject(&mut self, room: Digest32, waiting: RoomPublication) {
         let Some(instance) = self.channels.get(&room).cloned().filter(|instance| {
             waiting
@@ -23279,7 +23459,7 @@ impl Node {
         }
         // Nobody else is in the room: there is nobody to tell.
         if alone {
-            let _ = reply.send(self.purge_room(&channel_id).await);
+            let _ = reply.send(self.purge_room(&channel_id, None).await);
             return;
         }
         self.wait_for_leave(channel_id, gen, Some(reply)).await;
@@ -23351,7 +23531,7 @@ impl Node {
             None => false,
         };
         let outcome = if still_left {
-            self.purge_room(&channel_id).await
+            self.purge_room(&channel_id, None).await
         } else {
             // In the room again: its records go on boards again.
             match self.forget_pending_withdrawal(&channel_id) {
@@ -23727,11 +23907,20 @@ impl Node {
     /// and its key, its place among the rooms reopened at unlock, the consents pending in it,
     /// and then the store is rewritten so none of the deleted bytes stay in the file. A room left
     /// (V210-164) or ended (the decider, 2026-10-03) goes this way.
-    async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
+    async fn purge_room(
+        &mut self,
+        channel_id: &Digest32,
+        ready: Option<(
+            crate::node::channel::own_writer_gate::Transition,
+            tokio::sync::OwnedMutexGuard<ChannelState>,
+        )>,
+    ) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
-        if let Err(error) = self.retire_bounded_room(*channel_id).await {
-            return Outcome::Failed(fault_of(&error));
+        if ready.is_none() {
+            if let Err(error) = self.retire_bounded_room(*channel_id).await {
+                return Outcome::Failed(fault_of(&error));
+            }
         }
         if self
             .session_rooms_retiring
@@ -23789,9 +23978,16 @@ impl Node {
             self.own_key_room_set_changed.send_replace(());
         }
         if let Some(shared) = self.channels.remove(channel_id) {
-            let mut ch = shared.lock().await;
-            name = crate::node::resolver::room_shown(ch.name(), channel_id);
-            ch.lock_now();
+            if let Some((transition, mut ch)) = ready {
+                name = crate::node::resolver::room_shown(ch.name(), channel_id);
+                ch.lock_now();
+                drop(ch);
+                drop(transition);
+            } else {
+                let mut ch = shared.lock().await;
+                name = crate::node::resolver::room_shown(ch.name(), channel_id);
+                ch.lock_now();
+            }
         }
         // The read cursors and held-claim records agent sessions kept for it go too: nothing
         // filed under the room outlives it.
@@ -23895,7 +24091,7 @@ impl Node {
     ///   counts, up to [`WIND_DOWN`] — and is then deleted (the decider, 2026-10-03: "a room the
     ///   admin ended should not need a forget"). A room left is deleted by the leave itself.
     async fn tend_lifecycle(&mut self) -> bool {
-        let mut changed = false;
+        let changed = false;
         let now_ms = (self.millis_clock)();
         let rooms: Vec<(Digest32, Arc<tokio::sync::Mutex<ChannelState>>)> = self
             .channels
@@ -24023,14 +24219,8 @@ impl Node {
             {
                 continue;
             }
-            self.winding.remove(&cid);
-            let _ = self.event_tx.send(NodeEvent::RoomEnded {
-                channel_id: cid,
-                handed,
-                members: members.len(),
-            });
-            let _ = self.purge_room(&cid).await;
-            changed = true;
+            self.begin_own_key_ended_purge(cid, Arc::clone(&shared))
+                .await;
         }
         changed
     }
