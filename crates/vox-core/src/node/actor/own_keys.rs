@@ -527,6 +527,7 @@ impl Node {
                         attempt.cancel.send_replace(true);
                     }
                 }
+                self.own_key_pending.retain(|(room, _), _| *room != room_id);
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {}: own history key could not be saved: {error}",

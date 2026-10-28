@@ -17088,6 +17088,8 @@ impl Node {
                 attempt.cancel.send_replace(true);
             }
         }
+        self.own_key_pending
+            .retain(|(_, peer), _| self.trust.is_trusted(peer));
         let changed: Vec<_> = self
             .own_key_credit_trust
             .iter()
@@ -17218,6 +17220,7 @@ impl Node {
         if let Some(attempt) = self.own_key_active.get(&(*channel_id, *peer)) {
             attempt.cancel.send_replace(true);
         }
+        self.own_key_pending.remove(&(*channel_id, *peer));
         if let Some((request, generation, fence)) = self
             .bounded_sync
             .physical_archive_for_port(*channel_id, *peer)
