@@ -579,6 +579,16 @@ pub struct HeadHint {
     pub head: Digest32,
 }
 
+/// Durable recipient body work, scoped to its authenticated source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyBodyNeed {
+    pub(crate) head: Digest32,
+    pub(crate) seq: u64,
+    pub(crate) hash: Digest32,
+    pub(crate) target: HeadHint,
+    pub(crate) authorization: Digest32,
+}
+
 pub enum Proof {
     Inclusion(InclusionProof),
     Consistency {

@@ -3736,6 +3736,9 @@ impl ChannelState {
         if added {
             self.admission
                 .admit(self.channel_id, self.epoch, fingerprint);
+            if self.is_member(&fingerprint) {
+                self.key_member_became_current(fingerprint);
+            }
             self.owe_private_support();
             self.governance_ready = false;
         }
@@ -3793,6 +3796,9 @@ impl ChannelState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             ConsentFactsState::Building(ConsentFactsBuild::new(&self.authors));
+        if self.is_member(&fingerprint) {
+            self.key_member_became_current(fingerprint);
+        }
         // Capability announcements are live room traffic. A newly admitted member cannot read
         // the announcement that predates its admission, so the next bounded maintenance turn
         // republishes it. The obligation is recreated on open if the process stops here.
@@ -10411,8 +10417,27 @@ impl ChannelState {
     /// join this node answered. It is a member here until its own statement that it is back
     /// reaches the others through this node.
     pub fn readmit(&mut self, who: Digest32) {
+        let was_member = self.is_member(&who);
         if let Some(seq) = self.left_at(&who) {
             self.readmitted.insert(who, seq);
+        }
+        if !was_member && self.is_member(&who) {
+            self.key_member_became_current(who);
+        }
+    }
+
+    fn key_member_became_current(&self, who: Digest32) {
+        if who == self.me() {
+            for peer in self
+                .authors
+                .keys()
+                .copied()
+                .filter(|peer| *peer != who && self.is_member(peer))
+            {
+                self.role_owed.mark_key_dirty(peer);
+            }
+        } else {
+            self.role_owed.mark_key_dirty(who);
         }
     }
 

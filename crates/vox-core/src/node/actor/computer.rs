@@ -1410,6 +1410,7 @@ impl Node {
             self.sched_rooms.insert(room);
         }
         self.trust = next;
+        self.note_key_body_trust_change();
         self.consent_keys = pending;
         let receipt = if expired {
             computer.mark_expired_until(me, revision, deadline)?

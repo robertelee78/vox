@@ -64,6 +64,7 @@ impl Node {
             self.sched_rooms.insert(room);
         }
         self.trust = next;
+        self.note_key_body_trust_change();
         self.decisions.hold_for_local_trust_import(false);
         Ok(())
     }

@@ -2888,6 +2888,33 @@ impl Node {
             // on the same port, and leaving its old Busy backoff intact spaces that real work at
             // the exponential cap even though capacity has just made progress. Transport, policy
             // and no-progress backoffs retain their distinct meaning.
+            if let Some(wake) = flow.slot_wait.take() {
+                let admission = AdmissionWork {
+                    root: flow.root_name(),
+                    lane: crate::node::history_budget::Lane::Control,
+                };
+                let waiting = ByteWait {
+                    owner: Some(ByteOwner::of(&flow)),
+                    port_request: Some(work.request),
+                    wake,
+                };
+                if index == 0 {
+                    self.bounded_sync.deferred.push_back(flow);
+                } else {
+                    self.bounded_sync.ready[index] = Some(flow);
+                }
+                self.bounded_sync
+                    .cancel_byte_admission(work.room, work.peer);
+                self.bounded_sync.wait_for_bytes(
+                    &self.net_tx,
+                    &mut self.next_token,
+                    work.room,
+                    work.peer,
+                    admission,
+                    waiting,
+                );
+                continue;
+            }
             if let Some(pressure) = flow.byte_pressure.take() {
                 let admission = AdmissionWork {
                     root: flow.root_name(),
@@ -2942,6 +2969,21 @@ impl Node {
                 );
             }
             if flow.done() {
+                if let Some(need) = flow.key_body_root {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        if port.key_body == Some(need)
+                            && port.key_body_instance == Some(flow.instance)
+                        {
+                            // The physical Flow and its staging cleanup have both completed.
+                            // Continue the same bounded local scan; an older Flow cannot clear
+                            // a replacement port's different exact root.
+                            port.key_body = None;
+                            port.key_body_instance = None;
+                            port.key_body_initialized = false;
+                            self.sched_rooms.insert(work.room);
+                        }
+                    }
+                }
                 if flow.automatic_own_recovery {
                     if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                         port.req_done = port.req_done.max(work.request);
@@ -3640,7 +3682,7 @@ impl Node {
                         let live = match crate::node::history_demand::Context::current_unlocked(
                             profile,
                             Purpose::Live,
-                            lease,
+                            lease.clone(),
                         ) {
                             Ok(value) => Arc::new(value),
                             Err(_) => return false,
@@ -3655,7 +3697,22 @@ impl Node {
                         let required = required_at
                             .and_then(|at| self.bounded_sync.required.get(at))
                             .map(|required| (required.head, required.seq));
-                        let hint = if announce_first || required.is_some() {
+                        let selected_key_body = if !announce_first
+                            && required.is_none()
+                            && departure_hint.is_none()
+                            && own_verification.is_none()
+                            && own_discovery.is_none()
+                        {
+                            self.ports
+                                .get(&(room, peer))
+                                .and_then(|port| port.key_body.zip(port.key_body_instance))
+                        } else {
+                            None
+                        };
+                        let hint = if announce_first
+                            || required.is_some()
+                            || selected_key_body.is_some()
+                        {
                             None
                         } else {
                             departure_hint
@@ -3677,6 +3734,7 @@ impl Node {
                         };
                         if hint.is_none()
                             && required.is_none()
+                            && selected_key_body.is_none()
                             && !self
                                 .ports
                                 .get(&(room, peer))
@@ -3692,7 +3750,7 @@ impl Node {
                         let reason = foreground_reason(
                             node,
                             hint,
-                            required.is_some(),
+                            required.is_some() || selected_key_body.is_some(),
                             announce_owed,
                             periodic_pending,
                         );
@@ -3722,6 +3780,13 @@ impl Node {
                             actor_incarnation,
                         ) {
                             Ok(mut flow) => {
+                                if let Some((need, instance)) = selected_key_body {
+                                    let context = match crate::node::history_demand::Context::key_body_unlocked(profile, lease.clone()) {
+                                        Ok(value) => Arc::new(value),
+                                        Err(_) => return false,
+                                    };
+                                    flow = flow.with_key_body(need, instance, context);
+                                }
                                 flow.reason = reason;
                                 flow.discovery_incarnations = probe_incarnations;
                                 flow.local_own_after_inventory = flow.inventory
@@ -3754,7 +3819,7 @@ impl Node {
                     let live = match crate::node::history_demand::Context::current_unlocked(
                         profile,
                         Purpose::Live,
-                        lease,
+                        lease.clone(),
                     ) {
                         Ok(value) => Arc::new(value),
                         Err(_) => return false,
@@ -3770,28 +3835,42 @@ impl Node {
                     let required = required_at
                         .and_then(|at| self.bounded_sync.required.get(at))
                         .map(|required| (required.head, required.seq));
-                    let hint = if announce_first || required.is_some() {
-                        None
+                    let selected_key_body = if !announce_first
+                        && required.is_none()
+                        && departure_hint.is_none()
+                        && own_verification.is_none()
+                        && own_discovery.is_none()
+                    {
+                        self.ports
+                            .get(&(room, peer))
+                            .and_then(|port| port.key_body.zip(port.key_body_instance))
                     } else {
-                        departure_hint
-                            .or(own_verification)
-                            .or(own_discovery)
-                            .or_else(|| {
-                                take_foreground_hint(
-                                    &self.history_hints,
-                                    room,
-                                    peer,
-                                    node,
-                                    parked_receipt,
-                                    self.net
-                                        .as_ref()
-                                        .and_then(|net| net.manager().existing(&peer))
-                                        .map(|conn| conn.serial()),
-                                )
-                            })
+                        None
                     };
+                    let hint =
+                        if announce_first || required.is_some() || selected_key_body.is_some() {
+                            None
+                        } else {
+                            departure_hint
+                                .or(own_verification)
+                                .or(own_discovery)
+                                .or_else(|| {
+                                    take_foreground_hint(
+                                        &self.history_hints,
+                                        room,
+                                        peer,
+                                        node,
+                                        parked_receipt,
+                                        self.net
+                                            .as_ref()
+                                            .and_then(|net| net.manager().existing(&peer))
+                                            .map(|conn| conn.serial()),
+                                    )
+                                })
+                        };
                     if hint.is_none()
                         && required.is_none()
+                        && selected_key_body.is_none()
                         && !self
                             .ports
                             .get(&(room, peer))
@@ -3807,7 +3886,7 @@ impl Node {
                     let reason = foreground_reason(
                         node,
                         hint,
-                        required.is_some(),
+                        required.is_some() || selected_key_body.is_some(),
                         announce_owed,
                         periodic_pending,
                     );
@@ -3837,6 +3916,17 @@ impl Node {
                         actor_incarnation,
                     ) {
                         Ok(mut flow) => {
+                            if let Some((need, instance)) = selected_key_body {
+                                let context =
+                                    match crate::node::history_demand::Context::key_body_unlocked(
+                                        profile,
+                                        lease.clone(),
+                                    ) {
+                                        Ok(value) => Arc::new(value),
+                                        Err(_) => return false,
+                                    };
+                                flow = flow.with_key_body(need, instance, context);
+                            }
                             flow.reason = reason;
                             flow.discovery_incarnations = probe_incarnations;
                             flow.local_own_after_inventory = flow.inventory

@@ -48,6 +48,7 @@ enum Operation {
     Local(LocalStep),
     Reclaim(Purpose),
     ReclaimUnavailable,
+    ReclaimKeyUnavailable,
     FinishArchive,
     Governance,
 }
@@ -110,14 +111,17 @@ pub(crate) struct AnnouncementReceipt {
 /// Scalar ownership of the existing fixed body slots. A progressing transfer keeps its slot
 /// across quanta; another deferred flow may advance metadata but cannot reset that body.
 #[derive(Default)]
-pub(crate) struct BodySlots(StdMutex<[Option<RequestId>; 2]>);
+pub(crate) struct BodySlots {
+    owners: StdMutex<[Option<RequestId>; 3]>,
+    key_wake: Arc<tokio::sync::Notify>,
+}
 impl BodySlots {
-    fn claim(&self, purpose: Purpose, request: RequestId) -> bool {
-        let Some(index) = body_slot(purpose) else {
+    fn claim(&self, purpose: Purpose, request: RequestId, key_body: bool) -> bool {
+        let Some(index) = body_slot(purpose, key_body) else {
             return true;
         };
         let mut slots = self
-            .0
+            .owners
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slots[index].is_some_and(|owner| owner != request) {
@@ -126,20 +130,32 @@ impl BodySlots {
         slots[index] = Some(request);
         true
     }
-    fn release(&self, purpose: Purpose, request: RequestId) {
-        let Some(index) = body_slot(purpose) else {
+    fn release(&self, purpose: Purpose, request: RequestId, key_body: bool) {
+        let Some(index) = body_slot(purpose, key_body) else {
             return;
         };
         let mut slots = self
-            .0
+            .owners
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slots[index] == Some(request) {
             slots[index] = None;
+            drop(slots);
+            if index == 2 {
+                self.key_wake.notify_waiters();
+            }
         }
     }
+    fn key_released(&self) -> std::pin::Pin<Box<tokio::sync::futures::OwnedNotified>> {
+        let mut wake = Box::pin(Arc::clone(&self.key_wake).notified_owned());
+        wake.as_mut().enable();
+        wake
+    }
 }
-fn body_slot(purpose: Purpose) -> Option<usize> {
+fn body_slot(purpose: Purpose, key_body: bool) -> Option<usize> {
+    if key_body && purpose == Purpose::Control {
+        return Some(2);
+    }
     match purpose {
         Purpose::Live => Some(0),
         Purpose::Control => Some(1),
@@ -191,6 +207,8 @@ pub(crate) struct Flow {
     /// Exact required control root removed from the actor queue when this foreground flow was
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
+    pub(crate) key_body_root: Option<super::KeyBodyNeed>,
+    key_body_checked: bool,
     pub(crate) hint: Option<super::HeadHint>,
     /// Canonical local recovery proof root, not a consumed advisory inbox item.
     pub(crate) local_own_verification: bool,
@@ -214,6 +232,8 @@ pub(crate) struct Flow {
     pub(crate) reason: crate::node::status::RoundReason,
     pub(crate) waiting: bool,
     pub(crate) byte_pressure: Option<crate::node::history_budget::BytePressure>,
+    pub(crate) slot_wait:
+        Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>>,
     pub(crate) published: bool,
     pub(crate) rendered: bool,
     pub(crate) governance: bool,
@@ -281,7 +301,7 @@ pub(crate) struct Flow {
     /// ordinary continuation. The announcement scalar is deliberately separate provenance.
     peer_busy_retry: bool,
     slots: Arc<BodySlots>,
-    owners: [Option<RequestId>; 2],
+    owners: [Option<RequestId>; 3],
     /// A durable body chunk moved in this flow's last turn: the waiting slice is
     /// progress, not a busy wait, and its port must not grow a Busy backoff.
     pub(crate) body_progress: bool,
@@ -433,6 +453,8 @@ impl Flow {
             departure_probe,
             archive_request: None,
             required_root: required,
+            key_body_root: None,
+            key_body_checked: false,
             state_charge: None,
             hint,
             local_own_verification,
@@ -445,6 +467,7 @@ impl Flow {
             reason: crate::node::status::RoundReason::Request,
             waiting: false,
             byte_pressure: None,
+            slot_wait: None,
             published: false,
             rendered: false,
             governance: false,
@@ -477,7 +500,7 @@ impl Flow {
             ordinary_turn_due: false,
             peer_busy_retry: false,
             slots,
-            owners: [None, None],
+            owners: [None, None, None],
             body_progress: false,
             governance_wait: false,
             publication_wait: false,
@@ -604,6 +627,8 @@ impl Flow {
             departure_probe: false,
             archive_request: Some(request),
             required_root: None,
+            key_body_root: None,
+            key_body_checked: false,
             state_charge: None,
             hint: None,
             local_own_verification: false,
@@ -616,6 +641,7 @@ impl Flow {
             reason: crate::node::status::RoundReason::Page,
             waiting: false,
             byte_pressure: None,
+            slot_wait: None,
             published: false,
             rendered: false,
             governance: false,
@@ -641,7 +667,7 @@ impl Flow {
             received: ReceivedFlow::new(room),
             local_retry: None,
             slots,
-            owners: [None, None],
+            owners: [None, None, None],
             body_progress: false,
             governance_wait: false,
             publication_wait: false,
@@ -684,6 +710,35 @@ impl Flow {
             control_head: None,
         }
     }
+    /// Own one recipient body without consuming the peer's public hint.
+    pub(crate) fn with_key_body(
+        mut self,
+        need: super::KeyBodyNeed,
+        instance: [u8; 16],
+        context: Arc<Context>,
+    ) -> Self {
+        self.tasks.clear();
+        self.tasks.push(Task {
+            request: self.request,
+            purpose: Purpose::Control,
+            operation: Operation::Local(LocalStep::Entry {
+                request: self.request,
+                head: need.head,
+                seq: need.seq,
+                body: true,
+                role_header: false,
+                phase: EntryPhase::Start,
+            }),
+        });
+        self.inventory = false;
+        self.initialized = true;
+        self.instance = instance;
+        self.generation = need.authorization;
+        self.key_body_root = Some(need);
+        self.control_context = context;
+        self
+    }
+
     fn push(&mut self, task: Task) -> Result<()> {
         if self.tasks.len() >= MAX_TASKS {
             return Err(Error::SizeLimitExceeded("history dependency stack"));
@@ -853,6 +908,18 @@ impl Flow {
         author: Digest32,
         head: Digest32,
     ) -> Result<bool> {
+        self.decline_exact(source, job, inbox, author, head, None)
+            .await
+    }
+    async fn decline_exact(
+        &mut self,
+        source: &super::source::Source,
+        job: &Job,
+        inbox: &super::hints::HintInbox,
+        author: Digest32,
+        head: Digest32,
+        key_body: Option<super::KeyBodyNeed>,
+    ) -> Result<bool> {
         if self.local_own_discovery {
             // Startup metadata discovery is scoped to the selected connection, not the old
             // durable receipt/proof operation. Actor retains its unavailable disposition on
@@ -870,7 +937,14 @@ impl Flow {
             (author, head)
         };
         let remembered = match source
-            .remember_decline(job, author, head, self.request, self.local_own_root())
+            .remember_decline(
+                job,
+                author,
+                head,
+                self.request,
+                self.local_own_root(),
+                key_body,
+            )
             .await
         {
             Ok(super::source::DeclineResult::Stored {
@@ -911,7 +985,7 @@ impl Flow {
                 return Ok(false);
             }
         };
-        if !self.local_own_root() {
+        if !self.local_own_root() && key_body.is_none() {
             inbox.finish(self.room, source.peer, author, head);
         }
         self.declined = self.declined.saturating_add(u64::from(remembered));
@@ -1039,6 +1113,7 @@ impl Flow {
                     | Operation::Tail { .. }
                     | Operation::Reclaim(_)
                     | Operation::ReclaimUnavailable
+                    | Operation::ReclaimKeyUnavailable
                     | Operation::FinishArchive
                     | Operation::Governance
             )
@@ -1096,6 +1171,10 @@ impl Flow {
     }
     pub(crate) fn cancel(&self) {
         for (index, owner) in self.owners.iter().enumerate() {
+            // The key slot remains owned until physical retirement or the Flow is dropped.
+            if index == 2 {
+                continue;
+            }
             if let Some(request) = owner {
                 self.slots.release(
                     if index == 0 {
@@ -1104,6 +1183,7 @@ impl Flow {
                         Purpose::Control
                     },
                     *request,
+                    index == 2,
                 );
             }
         }
@@ -1172,10 +1252,12 @@ impl Flow {
                 Operation::Reclaim(Purpose::Live) | Operation::ReclaimUnavailable
             )
         });
-        let reclaim_control = self
-            .tasks
-            .iter()
-            .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
+        let reclaim_control = self.tasks.iter().any(|task| {
+            matches!(
+                task.operation,
+                Operation::Reclaim(Purpose::Control) | Operation::ReclaimKeyUnavailable
+            )
+        });
         let staging = if reclaim_live && self.live.is_some() {
             self.live.clone().map(|stage| (Purpose::Live, stage))
         } else if reclaim_control && self.control.is_some() {
@@ -1282,9 +1364,10 @@ impl Flow {
             }
             Slice::Staging(purpose, done) => {
                 if done {
-                    if let Some(index) = body_slot(purpose) {
+                    if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
                         if let Some(request) = self.owners[index].take() {
-                            self.slots.release(purpose, request);
+                            self.slots
+                                .release(purpose, request, self.key_body_root.is_some());
                         }
                     }
                     match purpose {
@@ -1648,6 +1731,38 @@ impl Flow {
                     return Ok(());
                 }
             }
+        }
+        if let Some(need) = self.key_body_root.filter(|_| !self.key_body_checked) {
+            let found = source
+                .read(job, 64 * 1024, move |room, store| {
+                    let read = room.history_read(store)?;
+                    if read.publication_busy() {
+                        return Ok(Some((true, true, room.history_publication_request(store)?)));
+                    }
+                    Ok(Some((
+                        read.history_key_body_owed(need, room.me())?,
+                        false,
+                        None,
+                    )))
+                })
+                .await?;
+            let Lookup::Found(owed) = found else {
+                self.waiting = true;
+                return Ok(());
+            };
+            let (owed, busy, owner) = owed.value;
+            if busy {
+                self.publication_owner_wait = owner;
+                self.publication_wait = true;
+                self.waiting = true;
+                return Ok(());
+            }
+            if !owed {
+                self.tasks.clear();
+                self.replay = None;
+                return Ok(());
+            }
+            self.key_body_checked = true;
         }
         if self.tasks.is_empty() {
             if let Some(root) = self.replay.take() {
@@ -2503,6 +2618,19 @@ impl Flow {
                         }
                     }
                 }
+                if result.status == Status::BodyNotHeld {
+                    if let Some(debt) = self.key_body_root.filter(|debt| {
+                        matches!(query, Query::Entry { head, seq, .. } if head == debt.head && seq == debt.seq)
+                    }) {
+                        if !self.decline_exact(&source, job, inbox, debt.target.author, debt.target.head, Some(debt)).await? {
+                            return Ok(());
+                        }
+                        self.tasks.clear();
+                        self.replay = None;
+                        self.push(Task { operation: Operation::ReclaimKeyUnavailable, ..task })?;
+                        return Ok(());
+                    }
+                }
                 if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {
                     let Query::Entry { head, seq, .. } = query else {
                         return Err(Error::MalformedBundle(
@@ -2820,6 +2948,15 @@ impl Flow {
             }
             Operation::Local(step) => {
                 let result = receiver.local_step(job, step, crate::time::Ms(now)).await?;
+                if let Some(debt) = self.key_body_root {
+                    if matches!(step, LocalStep::Entry { head, seq, .. } if head == debt.head && seq == debt.seq)
+                        && result.published.is_some_and(|hash| hash != debt.hash)
+                    {
+                        return Err(Error::MalformedAtRest(
+                            "recipient body completion changed entry",
+                        ));
+                    }
+                }
                 // The returned next/need now owns the continuation. Archive finalization
                 // installs its own retry instead of duplicating a next phase pushed below.
                 *retry_task = None;
@@ -2996,6 +3133,11 @@ impl Flow {
                     self.finish_archive_owned(job, &task, retry_task).await?;
                 }
             }
+            Operation::ReclaimKeyUnavailable => {
+                if !self.reclaim_stage(Purpose::Control, job, true).await? {
+                    self.push(task)?;
+                }
+            }
             Operation::ReclaimUnavailable => {
                 if let Some(root) = self.replay.take() {
                     self.push(task)?;
@@ -3061,10 +3203,15 @@ impl Flow {
         seq: u64,
         job: &Job,
     ) -> Result<bool> {
-        if !self.slots.claim(purpose, request) {
+        let is_key = self.key_body_root.is_some() && purpose == Purpose::Control;
+        let wake = is_key.then(|| self.slots.key_released());
+        if !self.slots.claim(purpose, request, is_key) {
+            self.slot_wait = wake.map(|wake| {
+                wake as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>
+            });
             return Ok(false);
         }
-        if let Some(index) = body_slot(purpose) {
+        if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
             self.owners[index] = Some(request);
         }
         if let Some(staging) = self.stage(purpose) {
@@ -3163,9 +3310,10 @@ impl Flow {
         .await
         .map_err(|_| Error::Profile("history reclamation worker stopped"))??;
         if complete {
-            if let Some(index) = body_slot(purpose) {
+            if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
                 if let Some(request) = self.owners[index].take() {
-                    self.slots.release(purpose, request);
+                    self.slots
+                        .release(purpose, request, self.key_body_root.is_some());
                 }
             }
             match purpose {
@@ -3323,6 +3471,9 @@ impl Flow {
 impl Drop for Flow {
     fn drop(&mut self) {
         self.cancel();
+        if let Some(request) = self.owners[2].take() {
+            self.slots.release(Purpose::Control, request, true);
+        }
     }
 }
 
