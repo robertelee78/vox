@@ -2998,6 +2998,7 @@ impl Flow {
                     .local_proof(job, task.request, query.clone())
                     .await?
                 {
+                    LocalProof::AlreadyHeld => {}
                     LocalProof::Verified(binding) => self.push(Task {
                         request: binding.request,
                         purpose: Purpose::Control,

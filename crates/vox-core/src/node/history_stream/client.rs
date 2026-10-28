@@ -71,6 +71,7 @@ pub(crate) struct Receiver {
 }
 
 pub(crate) enum LocalProof {
+    AlreadyHeld,
     Verified(CursorBinding),
     Busy,
     Missing,
@@ -222,6 +223,34 @@ impl Receiver {
         else {
             return Ok(LocalProof::Missing);
         };
+        // A relay may have the body under a different accepted head. Reuse only the
+        // exact locally authenticated inclusion receipt for this key-body request.
+        if let Some(need) = self.key_body.filter(|need| {
+            kind == super::ProofKind::Inclusion
+                && head == need.head
+                && from == need.seq
+                && to == need.seq
+        }) {
+            let held = self
+                .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
+                    let input = room.history_read(store)?;
+                    let Some(receipt) =
+                        input.history_inclusion_receipt(&head, &need.target.author, need.seq)?
+                    else {
+                        return Ok(Some(false));
+                    };
+                    if receipt.header().entry().entry_hash() != need.hash {
+                        return Err(Error::MalformedAtRest("key body inclusion changed entry"));
+                    }
+                    Ok(Some(input.history_head_accepted(&head, receipt.binding())?))
+                })
+                .await?;
+            match held {
+                Lookup::Found(held) if held.value => return Ok(LocalProof::AlreadyHeld),
+                Lookup::Found(_) | Lookup::Missing => {}
+                Lookup::Busy => return Ok(LocalProof::Busy),
+            }
+        }
         let local = self.node;
         let signed = self
             .read(
