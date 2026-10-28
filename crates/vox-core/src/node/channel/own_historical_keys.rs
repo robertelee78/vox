@@ -1,5 +1,5 @@
-//! Bounded, sealed original self-author releases for historical epochs. They never replace a
-//! live receiver. A room purge removes this namespace with the rest of its key material.
+//! Sealed self-author receiver states for historical epochs. They never replace a live receiver.
+//! A room purge removes this namespace with the rest of its key material.
 use super::entry_store::session_tree;
 use super::*;
 
@@ -59,7 +59,7 @@ impl Header {
         batch.put_segment(room, KIND, 0, &seal_segment(sek, KIND, 0, &e.finish())?)
     }
 }
-fn decode_release(
+fn decode_state(
     sealed: &SealedSegment,
     id: u64,
     sek: &Sek,
@@ -67,14 +67,13 @@ fn decode_release(
     root: &CompositePublicKey,
     author: &Digest32,
     (epoch, chain): (u64, u64),
-) -> Result<Skdm> {
-    let wire = open_segment(sek, KIND, id, sealed)?;
-    let release = Skdm::from_wire(&wire)?;
-    release.verify(root, room, epoch)?;
-    if release.body.author_id != *author || release.body.chain_id != chain {
+) -> Result<ReceiverChain> {
+    let state = open_segment(sek, KIND, id, sealed)?;
+    let receiver = ReceiverChain::from_state(&state)?;
+    if root.fingerprint() != *author || !receiver.bound_to(room, epoch, author, chain) {
         return Err(bad());
     }
-    Ok(release)
+    Ok(receiver)
 }
 
 /// Load one exact key without materializing the index; absence is not a claim that a donor has it.
@@ -102,8 +101,15 @@ pub(super) fn lookup(
     let sealed = snapshot
         .get_segment_bounded(room, KIND, id, MAX_BYTES)?
         .ok_or_else(bad)?;
-    let release = decode_release(&sealed, id, sek, room, root, author, (epoch, chain))?;
-    Ok(Some(ReceiverChain::from_skdm(&release, root, room, epoch)?))
+    Ok(Some(decode_state(
+        &sealed,
+        id,
+        sek,
+        room,
+        root,
+        author,
+        (epoch, chain),
+    )?))
 }
 
 pub(super) fn lookup_batch(
@@ -130,8 +136,15 @@ pub(super) fn lookup_batch(
     let sealed = batch
         .get_segment_bounded(room, KIND, id, MAX_BYTES)?
         .ok_or_else(bad)?;
-    let release = decode_release(&sealed, id, sek, room, root, author, (epoch, chain))?;
-    Ok(Some(ReceiverChain::from_skdm(&release, root, room, epoch)?))
+    Ok(Some(decode_state(
+        &sealed,
+        id,
+        sek,
+        room,
+        root,
+        author,
+        (epoch, chain),
+    )?))
 }
 
 /// Retain the earlier verified floor without evicting a potentially needed key. The sealed tree
@@ -163,8 +176,7 @@ pub(super) fn put(
         let sealed = batch
             .get_segment_bounded(room, KIND, id, MAX_BYTES)?
             .ok_or_else(bad)?;
-        let prior = decode_release(&sealed, id, sek, room, root, author, (epoch, chain))?;
-        let existing = ReceiverChain::from_skdm(&prior, root, room, epoch)?;
+        let existing = decode_state(&sealed, id, sek, room, root, author, (epoch, chain))?;
         let incoming = ReceiverChain::from_skdm(release, root, room, epoch)?;
         let mut check = ReceiverChain::from_state(&existing.to_state())?;
         // Also validates the same sender signing key and complete chain binding.
@@ -172,13 +184,14 @@ pub(super) fn put(
             return Ok(false);
         }
     }
-    let wire = Zeroizing::new(release.to_wire());
-    if wire.len() > MAX_BYTES {
-        return Err(Error::SizeLimitExceeded("own historical release"));
+    // The release is verified above; persist only the resulting receiver state.
+    let state = ReceiverChain::from_skdm(release, root, room, epoch)?.to_state();
+    if state.len() > MAX_BYTES {
+        return Err(Error::SizeLimitExceeded("own historical receiver state"));
     }
     let id = h.next;
     h.next = h.next.checked_add(1).ok_or_else(bad)?;
-    batch.put_segment(room, KIND, id, &seal_segment(sek, KIND, id, &wire)?)?;
+    batch.put_segment(room, KIND, id, &seal_segment(sek, KIND, id, &state)?)?;
     {
         let mut tree = session_tree::Write::new(batch, sek, room, KIND, h.next)?;
         h.root = tree.set(h.root, k, Some(id))?;
