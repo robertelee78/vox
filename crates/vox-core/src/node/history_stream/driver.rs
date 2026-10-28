@@ -81,20 +81,31 @@ async fn handshake_and_pull(
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
+    let mut announcement = None;
     if matches!(query, Query::Inventory) {
         let super::source::Lookup::Found(mut held) = receiver.inventory(io.job()).await? else {
             return Err(Error::Unreachable("history inventory buffers busy"));
         };
-        let frame = Frame::Have(std::mem::take(&mut held.value));
+        let frame = Frame::Have {
+            hints: std::mem::take(&mut held.value.0),
+            role: held.value.1.as_ref().map(|notice| notice.head),
+        };
         let encoded = frame.encode_required(io.job())?;
         overhead += encoded.as_slice().len() + 4;
         if overhead + super::DONE_RESERVE > super::MAX_RESPONSE_BYTES {
             return Err(Error::SizeLimitExceeded("inventory handshake quantum"));
         }
         io.write_encoded(&encoded).await?;
+        announcement = held.value.1.take();
         drop(encoded);
         drop(frame);
         drop(held);
     }
-    receiver.pull(io, preamble.request, query, overhead).await
+    let result = receiver.pull(io, preamble.request, query, overhead).await?;
+    if result.status == super::Status::Complete {
+        if let Some(announcement) = announcement {
+            receiver.acknowledge_role(io.job(), announcement).await?;
+        }
+    }
+    Ok(result)
 }

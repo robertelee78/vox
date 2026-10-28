@@ -1964,13 +1964,16 @@ fn take_foreground_hint(
     peer: Digest32,
     node: Digest32,
     parked_receipt: Option<Digest32>,
+    connection: Option<u64>,
 ) -> Option<stream::HeadHint> {
     // Inbound producers may replenish the inbox while this scalar selection runs.
     // Bound this turn by the existing inventory quantum; remaining hints keep their
     // ordinary inbox/port-queue ownership and their producer's completion wake.
     for _ in 0..crate::log::history::MAX_CONTEXT_AUTHORS {
-        let hint = inbox.take(room, peer, node)?;
-        if hint.author == node && parked_receipt == Some(hint.head) {
+        let (hint, role_signal, role_connection) = inbox.take(room, peer, node)?;
+        if (role_signal && role_connection != connection)
+            || (!role_signal && hint.author == node && parked_receipt == Some(hint.head))
+        {
             inbox.finish(room, peer, hint.author, hint.head);
         } else {
             return Some(hint);
@@ -2327,6 +2330,16 @@ impl Node {
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
             if valid {
+                // An older completed inventory cannot clear a newer role obligation. Audit
+                // the current owner after the physical worker exits and keep its port ready.
+                if let Some(owner) = self.role_wake.owner(work.room) {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        port.role_owed = owner.pending(work.peer);
+                        if port.role_owed {
+                            self.sched_rooms.insert(work.room);
+                        }
+                    }
+                }
                 if let Some(hint) = flow.hint {
                     if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                         let scope = |connection| crate::node::ports::SupportDiscovery {
@@ -2719,8 +2732,19 @@ impl Node {
                 self.settle_archive_exit(&mut flow, &error);
 
                 if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
-                    self.history_hints
-                        .finish(work.room, flow.hint_peer, hint.author, hint.head);
+                    if !self.history_hints.retry_role(
+                        work.room,
+                        flow.hint_peer,
+                        hint.author,
+                        hint.head,
+                    ) {
+                        self.history_hints.finish(
+                            work.room,
+                            flow.hint_peer,
+                            hint.author,
+                            hint.head,
+                        );
+                    }
                 }
                 self.bounded_sync.dispose(flow);
                 if cancelled {
@@ -3644,6 +3668,10 @@ impl Node {
                                         peer,
                                         node,
                                         parked_receipt,
+                                        self.net
+                                            .as_ref()
+                                            .and_then(|net| net.manager().existing(&peer))
+                                            .map(|conn| conn.serial()),
                                     )
                                 })
                         };
@@ -3755,6 +3783,10 @@ impl Node {
                                     peer,
                                     node,
                                     parked_receipt,
+                                    self.net
+                                        .as_ref()
+                                        .and_then(|net| net.manager().existing(&peer))
+                                        .map(|conn| conn.serial()),
                                 )
                             })
                     };

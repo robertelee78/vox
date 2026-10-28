@@ -1467,6 +1467,7 @@ impl ChannelState {
                     return Err(error);
                 }
             };
+        self.note_role_progress(entry.skeleton.author_id, 0);
         let contiguous_more = contiguous.more;
         if let Err(error) = self.note_contiguous_advance(entry.skeleton.author_id, contiguous) {
             self.poison(&error);
@@ -1498,6 +1499,22 @@ impl ChannelState {
 }
 
 impl ChannelState {
+    pub(crate) fn role_owed(&self) -> std::sync::Arc<super::role_owed::RoleOwed> {
+        std::sync::Arc::clone(&self.role_owed)
+    }
+
+    /// Keep the exact author runnable after a committed change; the inventory worker
+    /// resolves and authenticates the signed role head separately.
+    pub(crate) fn note_role_progress(&self, author: Digest32, seq: u64) {
+        if !self.is_member(&author) {
+            self.role_owed.clear(author);
+            return;
+        }
+        if author != self.me() && seq != 0 && self.role_cuts.get(&author).copied() == Some(seq) {
+            self.role_owed.mark_dirty(author);
+        }
+    }
+
     /// One bounded page of role-complete successors after semantic publication. A full page
     /// remains explicitly pending; a real sparse hole parks until its own arrival wakes it.
     pub(crate) fn advance_history_contiguous(
@@ -1539,6 +1556,8 @@ impl ChannelState {
     ) -> Result<()> {
         if let Some(state) = progress.state {
             self.dag.restore_contiguous_author(author, &state)?;
+            self.role_cuts.insert(author, state.seq);
+            self.note_role_progress(author, state.seq);
         }
         if progress.more {
             self.sparse_contiguous_pending.insert(author);
@@ -1722,6 +1741,7 @@ impl ChannelState {
             batch.commit()?;
             committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
+            self.note_role_progress(entry.skeleton.author_id, 0);
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
                 self.key_packages.published(self.next_log_id);

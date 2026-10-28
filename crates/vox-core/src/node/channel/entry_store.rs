@@ -2190,6 +2190,16 @@ impl Write<'_, '_> {
         Ok(complete)
     }
 
+    /// Capture the non-sparse promotion's exact restart cut before its batch commits.
+    /// Sparse promotions do not change that cut.
+    pub(crate) fn promotion_role_cut(&self) -> Option<(Digest32, u64)> {
+        let promotion = self.directory.promotion.as_ref()?;
+        if promotion.sparse_head.is_some() {
+            return None;
+        }
+        Some((promotion.author, promotion.accepted.as_ref()?.seq))
+    }
+
     /// Queue the root switch in the same Batch as the witness's ratchet/cache/governance
     /// effects. The caller must not publish the new head or stored credit before commit.
     pub(crate) fn publish_promotion(&mut self) -> Result<(u64, u64)> {

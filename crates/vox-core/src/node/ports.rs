@@ -313,6 +313,8 @@ pub struct Port {
     /// `own_seq` when this port last began an inventory exchange. While `own_seq` is past it,
     /// the port owes the peer an announcement, and a parked hinted continuation waits one round.
     pub announced_seq: u64,
+    /// A role-head announcement has not yet completed its exact inventory exchange.
+    pub(crate) role_owed: bool,
     /// `req_gen` as the periodic request (ADR-025 D7) last left it: while it is the newest
     /// request and unconsumed, a round the port runs for it is a `periodic` round in
     /// `vox status` (ADR-038 FX-15, #996).
@@ -350,6 +352,7 @@ impl Port {
             last_clean_out: None,
             own_seq: 0,
             announced_seq: 0,
+            role_owed: false,
             periodic_req: 0,
             last_start: None,
         }
@@ -360,7 +363,7 @@ impl Port {
     /// peer; a hinted drain of the peer's backlog must not hold that announcement back.
     #[must_use]
     pub fn announce_owed(&self) -> bool {
-        self.own_seq > self.announced_seq
+        self.own_seq > self.announced_seq || self.role_owed
     }
 
     /// Whether the port needs a session (ADR-025 D1).

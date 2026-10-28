@@ -5380,6 +5380,7 @@ pub struct Node {
     /// Stable across lock/unlock controller replacement, so every generation's completion wakes
     /// the one actor select that audits its durable result slots.
     bounded_completion_wake: Arc<tokio::sync::Notify>,
+    role_wake: Arc<crate::node::channel::role_owed::RoleWake>,
     /// Exact retirement ownership and failures live on the daemon budget, so they survive both
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
@@ -5528,6 +5529,7 @@ pub struct Node {
     sched_all: bool,
     /// Peers this node has adopted a connection to; ports are discovered for them.
     connected: std::collections::BTreeSet<Digest32>,
+    role_connection_serials: BTreeMap<Digest32, u64>,
     /// When the periodic request (ADR-025 D7) is next raised on every port, unix milliseconds.
     next_request_at: u64,
     /// The room instance each room's ports were last discovered for.
@@ -6245,6 +6247,7 @@ impl Node {
             history_demand: history_demand::Controller::default(),
             bounded_sync,
             bounded_completion_wake,
+            role_wake: Arc::new(crate::node::channel::role_owed::RoleWake::default()),
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             own_recovery_rooms: BTreeMap::new(),
@@ -6309,6 +6312,7 @@ impl Node {
             sched_rooms: std::collections::BTreeSet::new(),
             sched_all: false,
             connected: std::collections::BTreeSet::new(),
+            role_connection_serials: BTreeMap::new(),
             next_request_at: 0,
             discovered: BTreeMap::new(),
             discover_rooms: std::collections::BTreeSet::new(),
@@ -6634,6 +6638,7 @@ impl Node {
         // this select cannot spin on a dead branch.
         let ingress_wake = Arc::clone(&self.session_ingress_wake);
         let bounded_completion_wake = Arc::clone(&self.bounded_completion_wake);
+        let role_wake = Arc::clone(&self.role_wake);
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Preparation, cleanup, governance and package scans share one select slot. Rotate between
@@ -6938,6 +6943,32 @@ impl Node {
                         self.publish().await;
                         self.schedule().await;
                     }
+                }
+                _ = role_wake.notify.notified() => {
+                    for ((room, peer), owner) in role_wake.take() {
+                        if !self.channels.contains_key(&room) || !role_wake.current(room, &owner) {
+                            continue;
+                        }
+                        let Some(current) = self.current_room(&room) else { continue };
+                        if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                            if !port.room.is(&current) {
+                                self.discover_rooms.insert(room);
+                                self.sched_rooms.insert(room);
+                                continue;
+                            }
+                            let owed = owner.pending(peer);
+                            let newly_owed = owed && !port.role_owed;
+                            port.role_owed = owed;
+                            if newly_owed {
+                                port.raise();
+                                self.sched_rooms.insert(room);
+                            }
+                        } else if owner.pending(peer) {
+                            self.discover_rooms.insert(room);
+                            self.sched_rooms.insert(room);
+                        }
+                    }
+                    self.schedule().await;
                 }
                 _ = bounded_completion_wake.notified() => {
                     // Results were stored before this retained/coalesced edge fired. Audit every
@@ -10727,6 +10758,16 @@ impl Node {
                 // A fresh connection syncs at once (ADR-016): a request on every port it shares,
                 // with any backoff cleared (ADR-025 D2, D5).
                 self.connected.insert(peer);
+                let changed_connection = conn.as_ref().is_some_and(|conn| {
+                    self.role_connection_serials.insert(peer, conn.serial()) != Some(conn.serial())
+                });
+                if changed_connection {
+                    for room in self.channels.keys().copied() {
+                        if let Some(owner) = self.role_wake.owner(room) {
+                            owner.on_connect(peer);
+                        }
+                    }
+                }
                 self.discover_peers.insert(peer);
                 self.probe_older(peer);
                 if let Some(conn) = conn {
@@ -10751,6 +10792,9 @@ impl Node {
                     });
                 if replacement_is_live {
                     return;
+                }
+                if self.role_connection_serials.get(&peer) == Some(&serial) {
+                    self.role_connection_serials.remove(&peer);
                 }
                 self.connected.remove(&peer);
                 self.discover_peers.remove(&peer);
@@ -14062,6 +14106,8 @@ impl Node {
             }
             self.withdrawn = next;
         }
+        self.role_wake
+            .install(parsed.channel_id, &channel.role_owed());
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -16150,6 +16196,15 @@ impl Node {
             (*channel_id, *peer),
             crate::node::ports::Port::new(room, gen, epoch, sparse),
         );
+        if let Some(owner) = self.role_wake.owner(*channel_id) {
+            owner.on_connect(*peer);
+            if owner.pending(*peer) {
+                if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
+                    port.role_owed = true;
+                    port.raise();
+                }
+            }
+        }
         self.sched_rooms.insert(*channel_id);
         true
     }
@@ -16161,6 +16216,9 @@ impl Node {
 
     /// Departure removes this peer's port, but an unconsumed page still owns its request.
     fn drop_departed_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        if let Some(owner) = self.role_wake.owner(*channel_id) {
+            owner.clear(*peer);
+        }
         self.drop_port_inner(channel_id, peer, true);
         self.sched_rooms.insert(*channel_id);
     }
@@ -17813,6 +17871,7 @@ impl Node {
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
         let departure_receipt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connection_serial = conn.serial();
         let running = crate::node::status::Running::start(
             &self.sync_book,
             channel_id,
@@ -17843,6 +17902,7 @@ impl Node {
                 shared,
                 store,
                 peer,
+                connection_serial,
                 preamble,
                 send,
                 recv,
@@ -20182,6 +20242,7 @@ impl Node {
             };
         }
         let inserted = authority.publish_room_creation(|| {
+            self.role_wake.install(id, &ch.role_owed());
             self.channels
                 .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
@@ -21637,6 +21698,7 @@ impl Node {
         crate::node::status::SyncBook::note_set_aside(&self.sync_book, channel_id, ch.set_aside());
         let published = authority.publish(|| {
             self.remember_or_say(&ch);
+            self.role_wake.install(channel_id, &ch.role_owed());
             self.channels
                 .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         });

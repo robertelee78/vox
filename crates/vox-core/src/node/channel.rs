@@ -61,6 +61,7 @@ mod legacy_session;
 mod legacy_session_sender;
 mod local_history;
 mod private_session;
+pub(crate) mod role_owed;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
 mod own_history;
 mod proof_range;
@@ -1212,6 +1213,7 @@ pub struct ChannelState {
     /// Authors whose durable settled suffix still extends beyond the role-complete restart
     /// cursor. One bounded page is advanced per governance turn, fairly across authors.
     sparse_contiguous_pending: BTreeSet<Digest32>,
+    role_cuts: BTreeMap<Digest32, u64>,
     sparse_contiguous_after: Option<Digest32>,
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
@@ -1365,6 +1367,7 @@ pub struct ChannelState {
     local_history: Option<local_history::Prepared>,
     /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
     history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
+    role_owed: std::sync::Arc<role_owed::RoleOwed>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
     /// profile is new — and its earlier entries are with the other members. Writing before they
@@ -2151,6 +2154,7 @@ impl ChannelState {
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
+            role_cuts: BTreeMap::new(),
             sparse_contiguous_after: None,
             sender,
             next_log_id: 1,
@@ -2205,6 +2209,7 @@ impl ChannelState {
             local_content_header: None,
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2595,6 +2600,16 @@ impl ChannelState {
         // reopening never enumerates retained entries or promotes an observed/source head.
         let mut sparse_applied_tips = BTreeMap::new();
         let mut sparse_contiguous_pending = BTreeSet::new();
+        let role_cuts: BTreeMap<_, _> = entry_read
+            .restart_state()
+            .map(|state| {
+                state
+                    .feeds
+                    .iter()
+                    .map(|(author, feed)| (*author, feed.seq))
+                    .collect()
+            })
+            .unwrap_or_default();
         if entry_read.sparse_enabled() {
             for (author, key) in &authors {
                 if let Some(tip) = entry_read.history_settled_tip(author)? {
@@ -2934,6 +2949,7 @@ impl ChannelState {
             presence,
             sparse_applied_tips,
             sparse_contiguous_pending,
+            role_cuts,
             sparse_contiguous_after: None,
             sender,
             next_log_id,
@@ -2992,6 +3008,7 @@ impl ChannelState {
             local_content_header: None,
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3210,6 +3227,7 @@ impl ChannelState {
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
+            role_cuts: BTreeMap::new(),
             sparse_contiguous_after: None,
             sender,
             next_log_id: 1,
@@ -3263,6 +3281,7 @@ impl ChannelState {
             local_content_header: None,
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3710,6 +3729,8 @@ impl ChannelState {
             return Err(error);
         }
         self.authors = authors;
+        self.role_owed
+            .retain_authors(|peer| self.authors.contains_key(peer));
         self.board_kept = board_kept;
         self.now_hint = self.now_hint.max(now.get());
         if added {
@@ -7420,10 +7441,12 @@ impl ChannelState {
                 batch.note_received_author(*author)?;
             }
         }
+        let mut promoted_role_cut = None;
         if promotion.is_some() {
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
+            promoted_role_cut = index.promotion_role_cut();
             index.publish_promotion()?;
             index.seal()?;
         }
@@ -7594,6 +7617,10 @@ impl ChannelState {
             return Err(e);
         }
         self.entries.committed();
+        if let Some((author, seq)) = promoted_role_cut {
+            self.role_cuts.insert(author, seq);
+            self.note_role_progress(author, seq);
+        }
         self.legacy_sessions.committed();
         self.key_packages.published(self.next_log_id);
         for (author, log_id) in packages {

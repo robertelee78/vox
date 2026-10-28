@@ -163,8 +163,21 @@ impl Receiver {
     pub(super) async fn inventory(
         &self,
         job: &crate::node::history_budget::Job,
-    ) -> Result<Lookup<Vec<super::HeadHint>>> {
+    ) -> Result<
+        Lookup<(
+            Vec<super::HeadHint>,
+            Option<super::source::RoleAnnouncement>,
+        )>,
+    > {
         self.source.inventory(job).await
+    }
+
+    pub(super) async fn acknowledge_role(
+        &self,
+        job: &crate::node::history_budget::Job,
+        notice: super::source::RoleAnnouncement,
+    ) -> Result<()> {
+        self.source.acknowledge_role(job, notice).await
     }
 
     /// Build an exact control proof from this node's own canonical history and admit it through
@@ -340,7 +353,7 @@ impl Receiver {
                 }
                 match frame {
                     Frame::Meta { .. } => Action::Meta,
-                    Frame::Have(hints) => Action::Inventory(hints),
+                    Frame::Have { hints, role } => Action::Inventory(hints, role),
                     Frame::Chunk {
                         entry,
                         offset,
@@ -359,12 +372,13 @@ impl Receiver {
                 }
             };
             match action {
-                Action::Inventory(hints) => {
+                Action::Inventory(hints, role) => {
                     let charge = io.job().reserve_or_pressure(
                         hints.capacity() * std::mem::size_of::<super::HeadHint>(),
                     )?;
                     result.inventory = Some(Inventory {
                         hints,
+                        role,
                         _charge: charge,
                     });
                     drop(incoming);
@@ -774,7 +788,7 @@ impl Receiver {
 }
 
 enum Action {
-    Inventory(Vec<super::HeadHint>),
+    Inventory(Vec<super::HeadHint>, Option<super::HeadHint>),
     Meta,
     Chunk { entry: Digest32, next: u64 },
     Done(Status, Option<Continuation>),
@@ -2132,5 +2146,6 @@ impl Receiver {
 /// Charged scalar hints only. They never advance a feed or authorize a body request.
 pub(crate) struct Inventory {
     pub(crate) hints: Vec<super::HeadHint>,
+    pub(crate) role: Option<super::HeadHint>,
     _charge: crate::node::history_budget::BufferCharge,
 }

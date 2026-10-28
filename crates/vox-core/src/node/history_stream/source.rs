@@ -55,6 +55,14 @@ pub(super) struct Held<T> {
     _charge: BufferCharge,
 }
 
+/// Exact local announcement owner. Its token is never carried as peer authority.
+pub(super) struct RoleAnnouncement {
+    pub(super) owner: Arc<crate::node::channel::role_owed::RoleOwed>,
+    pub(super) peer: Digest32,
+    pub(super) token: Arc<()>,
+    pub(super) head: super::HeadHint,
+}
+
 impl<T> Held<T> {
     pub(super) fn job(&self) -> Job {
         self._charge.job()
@@ -669,7 +677,10 @@ impl Source {
 
     /// One bounded, charged scalar inventory. Every page rechecks current room access;
     /// the compact index is read without touching content bodies or walking the archive.
-    pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
+    pub(super) async fn inventory(
+        &self,
+        job: &Job,
+    ) -> Result<Lookup<(Vec<super::HeadHint>, Option<RoleAnnouncement>)>> {
         let charge = job.reserve_or_pressure(
             crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
         )?;
@@ -698,13 +709,43 @@ impl Source {
             match page.next {
                 Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
                 None => {
-                    self.flush_authors_before_ack(
-                        room_id,
-                        hints.iter().map(|hint| hint.author).collect(),
-                    )
-                    .await?;
+                    let peer = self.peer;
+                    let role = match self
+                        .read(job, 128 * 1024, move |room, store| {
+                            let owner = room.role_owed();
+                            let role =
+                                room.history_role_head(store, &peer)?
+                                    .map(|head| super::HeadHint {
+                                        author: peer,
+                                        size: head.root.leaves,
+                                        head: head.id(),
+                                    });
+                            let notice = if let Some(head) = role {
+                                owner.observe(peer, head);
+                                owner.snapshot(peer).map(|(token, head)| RoleAnnouncement {
+                                    owner,
+                                    peer,
+                                    token,
+                                    head,
+                                })
+                            } else {
+                                owner.unavailable(peer);
+                                None
+                            };
+                            Ok(Some(notice))
+                        })
+                        .await?
+                    {
+                        Lookup::Found(role) => role.value,
+                        Lookup::Busy | Lookup::Missing => return Ok(Lookup::Busy),
+                    };
+                    let mut authors: Vec<_> = hints.iter().map(|hint| hint.author).collect();
+                    if role.is_some() && !authors.contains(&peer) {
+                        authors.push(peer);
+                    }
+                    self.flush_authors_before_ack(room_id, authors).await?;
                     return Ok(Lookup::Found(Held {
-                        value: hints,
+                        value: (hints, role),
                         _charge: charge,
                     }));
                 }
@@ -712,6 +753,96 @@ impl Source {
             }
         }
         Err(Error::SizeLimitExceeded("inventory index slice bound"))
+    }
+
+    /// A peer's role advertisement wakes an authenticated query; it is not a receipt.
+    pub(super) async fn offer_role(
+        &self,
+        job: &Job,
+        inbox: &super::HintInbox,
+        generation: u64,
+        room_id: Digest32,
+        connection: u64,
+        role: Option<super::HeadHint>,
+    ) -> Result<super::hints::Offer> {
+        let Some(role) = role else {
+            return Ok(super::hints::Offer::default());
+        };
+        let author = role.author;
+        let peer = self.peer;
+        let epoch = self.epoch;
+        let current = self
+            .read(job, 128, move |room, store| {
+                if room.channel_id() != room_id || room.me() != author {
+                    return Err(Error::MalformedBundle("history role hint binding"));
+                }
+                let Some(incarnations) = room
+                    .history_inventory_incarnation(&peer)
+                    .zip(room.history_author_inventory_incarnation(&author))
+                else {
+                    return Ok(None);
+                };
+                let instance = room.history_instance(store)?;
+                let authorization =
+                    super::authorization_generation(store, author, room_id, instance, epoch)?;
+                let scope = crate::node::ports::SupportDiscovery {
+                    connection,
+                    instance,
+                    epoch,
+                    authorization,
+                };
+                Ok(Some((
+                    room.held_through(&peer).is_none_or(|held| held < role.size),
+                    scope,
+                    incarnations,
+                )))
+            })
+            .await?;
+        let (needed, scope, incarnations) = match current {
+            Lookup::Found(held) => held.value,
+            Lookup::Busy | Lookup::Missing => {
+                return Err(Error::Unreachable("history role hint authority busy"))
+            }
+        };
+        if !needed {
+            return Ok(super::hints::Offer::default());
+        }
+        inbox.offer_role(generation, room_id, self.peer, scope, incarnations, role)
+    }
+
+    /// Complete only the exact notice after the peer processed the inventory and while the
+    /// originating room and trust incarnation are still current.
+    pub(super) async fn acknowledge_role(&self, job: &Job, notice: RoleAnnouncement) -> Result<()> {
+        let authorization = self.authorization;
+        let epoch = self.epoch;
+        match self
+            .read(job, 128, move |room, store| {
+                if !Arc::ptr_eq(&room.role_owed(), &notice.owner) {
+                    return Ok(Some(()));
+                }
+                if let Some((node, expected)) = authorization {
+                    let room_id = room.channel_id();
+                    let current = super::authorization_generation(
+                        store,
+                        node,
+                        room_id,
+                        room.history_instance(store)?,
+                        epoch,
+                    )?;
+                    if current != expected {
+                        return Ok(Some(()));
+                    }
+                }
+                notice.owner.ack(notice.peer, &notice.token);
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            Lookup::Busy | Lookup::Missing => Err(Error::Unreachable(
+                "history role announcement confirmation busy",
+            )),
+        }
     }
 
     /// Filter at most 64 already decoded hints using exact accepted/settled local facts.
