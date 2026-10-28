@@ -32,13 +32,26 @@ pub(crate) async fn exchange(
         biased;
         () = fence.retired() => return Err(Error::Unreachable("history opening cancelled")),
         result = tokio::time::timeout_at(deadline, open_typed(conn, StreamKind::Sync)) => {
-            result.map_err(|_| Error::Unreachable("history opening deadline elapsed"))??
+            let opened = result.map_err(|_| Error::Unreachable("history opening deadline elapsed"))?;
+            match opened {
+                Err(Error::Unreachable("quic stream: the connection is closed"))
+                    if conn.quinn().close_reason().is_some() => return Err(Error::HistoryConnectionClosed),
+                other => other?,
+            }
         }
     };
     let mut io = Transport::new(streams.0, streams.1, job, fence, deadline);
     let kind_bytes = StreamKind::Sync.frame().len() + 4;
     drop(opening);
-    let result = handshake_and_pull(receiver, &mut io, preamble, query, kind_bytes).await;
+    let result = match handshake_and_pull(receiver, &mut io, preamble, query, kind_bytes).await {
+        Err(Error::Unreachable(
+            "history closed before HELLO"
+            | "history response ended before DONE"
+            | "quic stream: closed before the frame was written"
+            | "history stream closed before finish",
+        )) if conn.quinn().close_reason().is_some() => Err(Error::HistoryConnectionClosed),
+        other => other,
+    };
     if let Err(error) = &result {
         io.abort(match error {
             Error::HistoryCapacity(_) => WireError::SessionBusy,

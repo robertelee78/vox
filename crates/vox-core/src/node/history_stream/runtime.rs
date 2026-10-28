@@ -349,6 +349,16 @@ pub(crate) enum Resumed {
 }
 
 impl Flow {
+    /// Capture only scalar identity from the returned public archive owner. No context or key
+    /// survives this snapshot; physical retirement still owns all cleanup.
+    pub(crate) fn interrupted_public_token(&self) -> Option<demand::RetiredPublicToken> {
+        if !self.archive || self.automatic_own_recovery {
+            return None;
+        }
+        let staging = self.history.as_ref()?;
+        let active = staging.active.try_lock().ok()?;
+        (Some(active.request()) == self.archive_request).then(|| active.retired_public_token())
+    }
     pub(crate) fn local_own_root(&self) -> bool {
         self.local_own_verification || self.local_own_discovery
     }

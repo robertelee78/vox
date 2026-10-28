@@ -459,9 +459,16 @@ pub(super) async fn erase_retired_node(ledger: &Arc<RetirementLedger>, node: Dig
 struct ReturnedFailure {
     text: String,
     classification: crate::node::channel::SyncFailure,
+    connection_closed: bool,
+    retired_by_fence: bool,
 }
 impl ReturnedFailure {
     fn from_error(error: Error) -> Self {
+        let connection_closed = matches!(&error, Error::HistoryConnectionClosed);
+        let retired_by_fence = matches!(
+            &error,
+            Error::Unreachable("history request cancelled" | "history opening cancelled")
+        );
         let text = error.to_string();
         let classification = match error {
             Error::PeerRefused(code) => crate::node::channel::SyncFailure::Session(
@@ -472,6 +479,8 @@ impl ReturnedFailure {
         Self {
             text,
             classification,
+            connection_closed,
+            retired_by_fence,
         }
     }
 
@@ -479,6 +488,8 @@ impl ReturnedFailure {
         Self {
             classification: crate::node::channel::SyncFailure::Unreachable(text.clone()),
             text,
+            connection_closed: false,
+            retired_by_fence: false,
         }
     }
 
@@ -486,6 +497,8 @@ impl ReturnedFailure {
         Self {
             text: format!("bounded history worker panicked: {panic}"),
             classification: crate::node::channel::SyncFailure::Panicked,
+            connection_closed: false,
+            retired_by_fence: false,
         }
     }
 
@@ -500,10 +513,24 @@ impl ReturnedFailure {
 }
 struct Returned {
     failure: Option<ReturnedFailure>,
+    /// A failed physical worker observed closure of the exact connection it used.
+    connection_closed: Option<u64>,
+}
+
+struct InterruptedArchive {
+    room: Digest32,
+    instance: [u8; 16],
+    request: stream::RequestId,
+    generation: Digest32,
+    fence: Arc<crate::transport::stream_transport::Fence>,
+    room_ref: std::sync::Weak<tokio::sync::Mutex<crate::node::channel::ChannelState>>,
+    token: crate::node::history_demand::RetiredPublicToken,
 }
 struct Running {
     room: Digest32,
     peer: Digest32,
+    connection_serial: u64,
+    connection_closed: bool,
     token: u64,
     generation: u64,
     request: u64,
@@ -684,6 +711,8 @@ pub(super) struct Controller {
     body_slots: Arc<stream::runtime::BodySlots>,
     required: VecDeque<RequiredOwner>,
     retiring: VecDeque<Flow>,
+    interrupted_retiring: BTreeMap<RetirementKey, InterruptedArchive>,
+    interrupted_ready: VecDeque<InterruptedArchive>,
     cleanup: Option<Cleanup>,
     retirement_waiting: BTreeMap<RetirementKey, RetirementWaiting>,
     retirement_failed: std::collections::BTreeSet<RetirementKey>,
@@ -761,6 +790,13 @@ impl Drop for Controller {
 }
 
 impl Controller {
+    pub(super) fn note_archive_connection_closed(&mut self, peer: Digest32, serial: u64) {
+        for work in self.running.iter_mut().flatten() {
+            if work.peer == peer && work.connection_serial == serial && work.archive.is_some() {
+                work.connection_closed = true;
+            }
+        }
+    }
     pub(super) fn set_completion_wake(&mut self, wake: Arc<tokio::sync::Notify>) {
         self.completion_wake = wake;
     }
@@ -1294,6 +1330,9 @@ impl Controller {
                 self.retirement_waiting.remove(&key);
                 self.retirement_failed.remove(&key);
                 clear_retirement_error(&self.retirement_ledger, key);
+                if let Some(interrupted) = self.interrupted_retiring.remove(&key) {
+                    self.interrupted_ready.push_back(interrupted);
+                }
             }
             Ok(RetirementStep::Progress) => self.retiring.push_back(flow),
             Ok(RetirementStep::Wait(wait)) => {
@@ -1638,6 +1677,19 @@ impl Controller {
             .as_ref()
             .filter(|admission| admission.room == room && admission.peer == peer)
             .map(|admission| (admission.request, admission.generation, admission.instance))
+    }
+
+    pub(super) fn archive_is_running(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        request: stream::RequestId,
+    ) -> bool {
+        self.running.iter().flatten().any(|work| {
+            work.room == room
+                && work.peer == peer
+                && work.archive.is_some_and(|archive| archive.0 == request)
+        })
     }
 
     pub(super) fn retire_port(&mut self, room: Digest32, peer: Digest32) {
@@ -2243,6 +2295,36 @@ impl Node {
 
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
+        while let Some(interrupted) = self.bounded_sync.interrupted_ready.pop_front() {
+            let same_room = interrupted.room_ref.upgrade().is_some_and(|old| {
+                self.channels
+                    .get(&interrupted.room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &old))
+            });
+            if same_room
+                && self.history_demand.can_resume_interrupted()
+                && self.history_demand.owns_running_fence(
+                    interrupted.request,
+                    interrupted.generation,
+                    &interrupted.fence,
+                )
+                && self.history_demand.failed_current(
+                    interrupted.room,
+                    interrupted.instance,
+                    interrupted.request,
+                    interrupted.generation,
+                    "The history connection closed; retaining this request.",
+                )
+            {
+                self.history_demand.owe_interrupted_resume(
+                    interrupted.room,
+                    interrupted.instance,
+                    interrupted.request,
+                    interrupted.token,
+                );
+                self.retry_owed_history_resume();
+            }
+        }
         for index in 0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS {
             let Some(work) = self.bounded_sync.running[index].as_ref() else {
                 continue;
@@ -2501,6 +2583,65 @@ impl Node {
                 }
                 eprintln!("vox: {error}");
                 continue;
+            }
+            let closed_connection = returned.connection_closed.or_else(|| {
+                (work.connection_closed
+                    && returned
+                        .failure
+                        .as_ref()
+                        .is_some_and(|failure| failure.retired_by_fence))
+                .then_some(work.connection_serial)
+            });
+            // A durable result from this exact worker wins even if its connection closed
+            // immediately afterwards. A newer request must never inherit this result.
+            if closed_connection.is_some() && flow.archive_status.is_some() {
+                if let Some(request) = flow.archive_request {
+                    if self
+                        .history_demand
+                        .owns_running_fence(request, flow.generation, &work.fence)
+                    {
+                        self.settle_archive_exit(
+                            &mut flow,
+                            "The history connection closed after a saved result.",
+                        );
+                    }
+                }
+                self.dispose_rearming_hint(flow);
+                continue;
+            }
+            // A physical connection loss may interrupt an accepted public quantum. Keep its
+            // original owner until the worker and its local retirement have both finished.
+            if closed_connection.is_some()
+                && flow.archive_status.is_none()
+                && self
+                    .channels
+                    .get(&work.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            {
+                if let (Some(request), Some(token)) =
+                    (flow.archive_request, flow.interrupted_public_token())
+                {
+                    if self
+                        .history_demand
+                        .owns_running_fence(request, flow.generation, &work.fence)
+                    {
+                        let key = retirement_key(&flow);
+                        self.bounded_sync.interrupted_retiring.insert(
+                            key,
+                            InterruptedArchive {
+                                room: flow.room,
+                                instance: flow.instance,
+                                request,
+                                generation: flow.generation,
+                                fence: Arc::clone(&work.fence),
+                                room_ref: Arc::downgrade(&flow.shared),
+                                token,
+                            },
+                        );
+                        self.dispose_rearming_hint(flow);
+                        continue;
+                    }
+                }
             }
             if !valid {
                 let failure = returned.failure.as_ref().map_or(
@@ -4119,6 +4260,8 @@ impl Node {
         let pstore = profile.store_handle();
         let tx = self.net_tx.clone();
         let authority = self.computer_authority();
+        let result_connection = Arc::clone(&conn);
+        let connection_serial = conn.serial();
         let worker = tokio::spawn(async move {
             let _slot = slot;
             #[cfg(not(feature = "test-knobs"))]
@@ -4185,14 +4328,28 @@ impl Node {
             if let Some(flow) = settlement_flow.lock().await.as_mut() {
                 flow.park();
             }
+            let connection_closed = failure
+                .as_ref()
+                .filter(|failure| failure.connection_closed || failure.retired_by_fence)
+                .and_then(|_| {
+                    result_connection
+                        .quinn()
+                        .close_reason()
+                        .map(|_| connection_serial)
+                });
             if let Ok(mut result) = output.lock() {
-                *result = Some(Returned { failure });
+                *result = Some(Returned {
+                    failure,
+                    connection_closed,
+                });
             }
             completion_wake.notify_one();
         });
         self.bounded_sync.running[index] = Some(Running {
             room,
             peer,
+            connection_serial,
+            connection_closed: false,
             token,
             generation,
             request,

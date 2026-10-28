@@ -290,6 +290,9 @@ pub struct State {
 }
 
 impl State {
+    pub(crate) fn stored_progress(&self) -> Progress {
+        self.progress
+    }
     /// A retained operation is always paused without a live handle from explicit local demand.
     pub fn progress(&self, active: Option<&Active>) -> Progress {
         if self.progress.terminal() || active.is_some_and(|a| a.matches(self)) {
@@ -885,6 +888,109 @@ pub(crate) fn resume_precharged(
         binding,
         cancellation: context.cancellation(),
     })
+}
+
+/// Identity only: retaining this token does not retain the old Context, its key, or its
+/// secret-work lease. The caller may capture it only from the exact returned Flow it owns.
+#[derive(Clone, Copy)]
+pub(crate) struct RetiredPublicToken {
+    node: Digest32,
+    scope: Digest32,
+    request: RequestId,
+    serial: u64,
+    binding: Binding,
+}
+impl RetiredPublicToken {
+    pub(crate) fn matches_state(&self, context: &Context, state: &State, binding: Binding) -> bool {
+        self.node == context.fingerprint()
+            && self.scope == scope(context)
+            && self.request == state.request
+            && self.serial == state.serial
+            && self.binding == binding
+            && state.binding == binding
+            && state.private.is_none()
+            && state.legacy.is_none()
+            && binding.audience == [0; 32]
+    }
+}
+impl Active {
+    pub(crate) fn retired_public_token(&self) -> RetiredPublicToken {
+        RetiredPublicToken {
+            node: self.node,
+            scope: self.scope,
+            request: self.request,
+            serial: self.serial,
+            binding: self.binding,
+        }
+    }
+}
+
+/// Result of observing a retired automatic quantum at the activation boundary.
+pub(crate) enum InterruptedActivation {
+    /// The exact interrupted Pending quantum has been reactivated.
+    Resumed(Active),
+    /// A different durable outcome won; it must be shown without starting another quantum.
+    Finished {
+        progress: Progress,
+        remaining: usize,
+        offset: u64,
+        reclaiming: bool,
+    },
+}
+
+/// Reacquire only the interrupted public Pending quantum. Unlike an explicit Resume, this
+/// cannot turn a committed More or Paused state into another user's unrequested quantum.
+/// Caller owns the exact retired Flow and must fence its room/request lifecycle separately.
+pub(crate) fn resume_interrupted_pending_precharged(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    retired: &RetiredPublicToken,
+    _admission: &AdmissionCharge,
+) -> Result<InterruptedActivation> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
+    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
+    if state.request != request
+        || state.binding != binding
+        || retired.node != context.fingerprint()
+        || retired.scope != scope
+        || retired.request != request
+        || retired.binding != binding
+        || retired.serial != state.serial
+        || state.private.is_some()
+        || state.legacy.is_some()
+        || binding.audience != [0; 32]
+    {
+        return Err(invalid("interrupted history owner changed"));
+    }
+    context.check()?;
+    if state.progress != Progress::Pending || state.cleanup.is_some() {
+        return Ok(InterruptedActivation::Finished {
+            progress: state.progress,
+            remaining: state.remaining,
+            offset: state.body.as_ref().map_or_else(
+                || state.cursor.map_or(0, |cursor| cursor.offset),
+                |body| body.offset,
+            ),
+            reclaiming: state.reclaiming(),
+        });
+    }
+    state.serial = next_serial(state.serial)?;
+    put(&mut batch, key, &scope, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(InterruptedActivation::Resumed(Active {
+        node: context.fingerprint(),
+        scope,
+        request,
+        serial: state.serial,
+        valid: true,
+        binding,
+        cancellation: context.cancellation(),
+    }))
 }
 
 /// Reconstruct deletion ownership after a crash, never a live admission capability.

@@ -274,6 +274,12 @@ async fn read_charged(
 }
 
 fn read_error(error: quinn::ReadExactError) -> Error {
+    if matches!(
+        &error,
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(_))
+    ) {
+        return Error::HistoryConnectionClosed;
+    }
     if let quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) = error {
         if let Some(reason) = u8::try_from(code.into_inner())
             .ok()

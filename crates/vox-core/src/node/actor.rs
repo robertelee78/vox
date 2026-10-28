@@ -10677,6 +10677,8 @@ impl Node {
                 }
             }
             NetEvent::ConnectionClosed { peer, serial } => {
+                self.bounded_sync
+                    .note_archive_connection_closed(peer, serial);
                 let replacement_is_live = self
                     .net
                     .as_ref()
@@ -16073,6 +16075,9 @@ impl Node {
             if self
                 .history_demand
                 .owns_running_fence(request, generation, &fence)
+                && !self
+                    .bounded_sync
+                    .archive_is_running(*channel_id, *peer, request)
             {
                 self.history_demand.failed(
                     request,
@@ -16085,7 +16090,6 @@ impl Node {
             .bounded_sync
             .archive_admission_for_port(*channel_id, *peer)
         {
-            // Preserve only the admission of this exact unconsumed dispatch on peer departure.
             if !preserve_unstarted
                 && self.history_demand.unstarted_binding(*channel_id, *peer)
                     == Some((request, generation, instance))
@@ -16212,6 +16216,9 @@ impl Node {
         }
         self.discover().await;
         self.reroute_unstarted_history();
+        // Discovery can install the connected room port needed by an interrupted request.
+        self.retry_owed_history_resume();
+
         let all = std::mem::take(&mut self.sched_all);
         let rooms = std::mem::take(&mut self.sched_rooms);
         let now = std::time::Instant::now();
