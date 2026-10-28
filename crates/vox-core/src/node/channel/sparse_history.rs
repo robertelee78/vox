@@ -1552,6 +1552,7 @@ impl ChannelState {
                 index.seal()?;
                 progress
             };
+            let was_member = self.is_member(&entry.skeleton.author_id);
             batch.commit()?;
             committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
@@ -1565,6 +1566,9 @@ impl ChannelState {
                 .entry(entry.skeleton.author_id)
                 .and_modify(|seq| *seq = (*seq).max(entry.skeleton.seq))
                 .or_insert(entry.skeleton.seq);
+            if !was_member && self.is_member(&entry.skeleton.author_id) {
+                self.key_member_became_current(entry.skeleton.author_id);
+            }
             self.key_packages.published(self.next_log_id);
             if kind == SignedEntryKind::KeyPackage
                 && entry.payload.is_some()
