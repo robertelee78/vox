@@ -705,6 +705,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::OwnKeyCloseReady { .. } => "resuming a room close",
         NetEvent::OwnKeyPublicationRejectReady { .. } => "retiring an unpublished room",
         NetEvent::OwnKeyEndedPurgeReady { .. } => "retiring an ended room",
+        NetEvent::OwnKeyLeftPurgeReady { .. } => "retiring a departed room",
         NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
         NetEvent::OwnKeyRecoveryReady { .. } => "resuming room recovery",
         NetEvent::OwnKeyComputerReady { .. } => "resuming Computer policy",
@@ -1441,6 +1442,13 @@ enum NetEvent {
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
         waiting: RoomPublication,
+    },
+    OwnKeyLeftPurgeReady {
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        purpose: LeftPurgePurpose,
     },
     OwnKeyEndedPurgeReady {
         room: Digest32,
@@ -5483,6 +5491,38 @@ struct RoomPublication {
     kind: RoomPublicationKind,
     /// The exact Computer projection which authorized creating/joining/opening this incarnation.
     authority: Option<(computer::ComputerAuthority, RoomPublicationOwnership)>,
+}
+
+enum LeftPurgePurpose {
+    Join {
+        link: String,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    },
+    Leave {
+        replies: Vec<oneshot::Sender<Outcome>>,
+    },
+}
+
+impl LeftPurgePurpose {
+    async fn caller_closed(&mut self) {
+        match self {
+            Self::Join { reply, .. } => reply.closed().await,
+            Self::Leave { .. } => std::future::pending::<()>().await,
+        }
+    }
+    fn fail(self, fault: Fault) {
+        match self {
+            Self::Join { reply, .. } => {
+                let _ = reply.send(Outcome::Failed(fault));
+            }
+            Self::Leave { replies } => {
+                for reply in replies {
+                    let _ = reply.send(Outcome::Failed(fault));
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -10979,6 +11019,85 @@ impl Node {
                     }
                 }
             }
+            NetEvent::OwnKeyLeftPurgeReady {
+                room,
+                instance,
+                owner,
+                transition,
+                purpose,
+            } => {
+                if !self
+                    .own_key_ended_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    purpose.fail(Fault::ChannelNotOpen);
+                } else if let Some(transition) = transition {
+                    if !self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        self.own_key_ended_pending.remove(&room);
+                        purpose.fail(Fault::ChannelNotOpen);
+                    } else {
+                        match Arc::clone(&instance).try_lock_owned() {
+                            Err(_) => self
+                                .wait_own_key_left_room(room, instance, owner, transition, purpose),
+                            Ok(channel) if !channel.has_left(&channel.me()) => {
+                                drop(channel);
+                                drop(transition);
+                                self.own_key_ended_pending.remove(&room);
+                                self.sched_rooms.insert(room);
+                                self.discover_rooms.insert(room);
+                                let fault = match self.forget_pending_withdrawal(&room) {
+                                    Ok(()) => Fault::LeaveUndone,
+                                    Err(error) => fault_of(&error),
+                                };
+                                purpose.fail(fault);
+                            }
+                            Ok(channel) => {
+                                self.own_key_ended_pending.remove(&room);
+                                let outcome =
+                                    self.purge_room(&room, Some((transition, channel))).await;
+                                if !outcome.is_done() && self.channels.contains_key(&room) {
+                                    self.sched_rooms.insert(room);
+                                    self.discover_rooms.insert(room);
+                                }
+                                match purpose {
+                                    LeftPurgePurpose::Join {
+                                        link,
+                                        passphrase,
+                                        reply,
+                                    } => {
+                                        if outcome.is_done() {
+                                            self.begin_join_channel(link, passphrase, reply).await;
+                                        } else {
+                                            let _ = reply.send(outcome);
+                                        }
+                                    }
+                                    LeftPurgePurpose::Leave { replies } => {
+                                        for reply in replies {
+                                            let _ = reply.send(outcome);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.own_key_ended_pending.remove(&room);
+                    if self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        self.sched_rooms.insert(room);
+                        self.discover_rooms.insert(room);
+                    }
+                    purpose.fail(Fault::ChannelNotOpen);
+                }
+            }
             NetEvent::OwnKeyEndedPurgeReady {
                 room,
                 instance,
@@ -14510,10 +14629,17 @@ impl Node {
                 ch.has_left(&ch.me())
             };
             if left {
-                if let Outcome::Failed(f) = self.purge_room(&parsed.channel_id, None).await {
-                    let _ = reply.send(Outcome::Failed(f));
-                    return;
-                }
+                self.begin_own_key_left_purge(
+                    parsed.channel_id,
+                    shared,
+                    LeftPurgePurpose::Join {
+                        link,
+                        passphrase,
+                        reply,
+                    },
+                )
+                .await;
+                return;
             }
         }
         // A prior deletion's owner must finish clearing its saved bindings before the same
@@ -23220,6 +23346,105 @@ impl Node {
         });
     }
 
+    fn wait_own_key_left_room(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: crate::node::channel::own_writer_gate::Transition,
+        mut purpose: LeftPurgePurpose,
+    ) {
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let transition = tokio::select! {
+                biased;
+                _ = purpose.caller_closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => { drop(channel); Some(transition) },
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyLeftPurgeReady {
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    purpose,
+                })
+                .await;
+        });
+    }
+
+    async fn begin_own_key_left_purge(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        mut purpose: LeftPurgePurpose,
+    ) {
+        if self.own_key_ended_pending.contains_key(&room)
+            || self.own_key_leave_pending.contains_key(&room)
+        {
+            purpose.fail(Fault::RoomChangePending);
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_ended_pending.insert(room, Arc::clone(&owner));
+        if let Err(error) = self.retire_bounded_room(room).await {
+            self.own_key_ended_pending.remove(&room);
+            if self
+                .channels
+                .get(&room)
+                .is_some_and(|current| Arc::ptr_eq(current, &instance))
+            {
+                self.sched_rooms.insert(room);
+                self.discover_rooms.insert(room);
+            }
+            purpose.fail(fault_of(&error));
+            return;
+        }
+        for ((id, _), port) in &mut self.ports {
+            if *id == room {
+                for (_, attempt) in std::mem::take(&mut port.inbound) {
+                    attempt.retire();
+                }
+            }
+        }
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = purpose.caller_closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = purpose.caller_closed() => None,
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyLeftPurgeReady {
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    purpose,
+                })
+                .await;
+        });
+    }
+
     fn wait_own_key_ended_room(
         &mut self,
         room: Digest32,
@@ -23541,7 +23766,18 @@ impl Node {
         }
         // Nobody else is in the room: there is nobody to tell.
         if alone {
-            let _ = reply.send(self.purge_room(&channel_id, None).await);
+            if let Some(instance) = self.channels.get(&channel_id).cloned() {
+                self.begin_own_key_left_purge(
+                    channel_id,
+                    instance,
+                    LeftPurgePurpose::Leave {
+                        replies: vec![reply],
+                    },
+                )
+                .await;
+            } else {
+                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            }
             return;
         }
         self.wait_for_leave(channel_id, gen, Some(reply)).await;
@@ -23604,25 +23840,19 @@ impl Node {
         if heard.is_empty() {
             return;
         }
-        // Written in the room since — it posted, or said it is back — and so not leaving.
-        let still_left = match self.channels.get(&channel_id) {
-            Some(shared) => {
-                let ch = shared.lock().await;
-                ch.has_left(&ch.me())
-            }
-            None => false,
-        };
-        let outcome = if still_left {
-            self.purge_room(&channel_id, None).await
+        let replies = heard
+            .into_iter()
+            .filter_map(|(_, _, reply, _)| reply)
+            .collect();
+        if let Some(instance) = self.channels.get(&channel_id).cloned() {
+            self.begin_own_key_left_purge(
+                channel_id,
+                instance,
+                LeftPurgePurpose::Leave { replies },
+            )
+            .await;
         } else {
-            // In the room again: its records go on boards again.
-            match self.forget_pending_withdrawal(&channel_id) {
-                Ok(()) => Outcome::Failed(Fault::LeaveUndone),
-                Err(error) => Outcome::Failed(fault_of(&error)),
-            }
-        };
-        for reply in heard.into_iter().filter_map(|(_, _, reply, _)| reply) {
-            let _ = reply.send(outcome);
+            LeftPurgePurpose::Leave { replies }.fail(Fault::ChannelNotOpen);
         }
     }
 
