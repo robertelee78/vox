@@ -26975,9 +26975,6 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile(crate::node::channel::UNSUPPORTED_ROOM_FORMAT) => {
             Fault::UnsupportedRoomFormat
         }
-        Error::Profile(
-            "Legacy history required; resume explicit recovery before posting in this room",
-        ) => Fault::LegacyHistoryRequired,
         Error::Profile("room publication is busy; retry this operation") => {
             Fault::RoomChangePending
         }

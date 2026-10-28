@@ -1,7 +1,6 @@
 //! Explicit archive selection and activation. Cache reads never enter this module.
 
 use super::{NetEvent, Node};
-mod legacy;
 use crate::hash::Digest32;
 use crate::node::api::{
     HistoryDemandAction as Action, HistoryDemandPhase as Phase, HistoryDemandStatus as Status,
@@ -13,7 +12,6 @@ use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
 use crate::node::history_stream::{self as stream, Query, RequestId, Staging};
 use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
-use legacy::LegacyDispatch;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::Mutex;
 
@@ -60,7 +58,6 @@ struct Prepared {
     status: Status,
     dispatch: Option<Dispatch>,
     private: Option<PrivateDispatch>,
-    legacy: Option<LegacyDispatch>,
     legacy_cancelled: Option<LegacyProvisionalOwner>,
     local_only: bool,
     local_boundary: LocalBoundary,
@@ -1673,16 +1670,6 @@ impl Node {
                     self.history_demand.cancelled_legacy = Some((prepared.status.room, owner));
                 }
                 self.history_demand.owner_status = Some(prepared.status);
-                if let Some(dispatch) = prepared.legacy {
-                    self.history_demand.running = Some(Running {
-                        request: dispatch.request,
-                        generation: dispatch.generation,
-                        fence: dispatch.fence.clone(),
-                        cancellation: dispatch.staging.context.cancellation(),
-                        page: None,
-                    });
-                    self.start_legacy_history(dispatch);
-                }
                 if let Some(dispatch) = prepared.private {
                     self.history_demand.running = Some(Running {
                         request: dispatch.request,
@@ -1941,13 +1928,24 @@ fn prepare_local(
         ),
         dispatch: None,
         private: None,
-        legacy: None,
         legacy_cancelled: None,
         local_only: true,
         local_boundary: LocalBoundary::Observed,
         selection_after: None,
         resume_kind: None,
     };
+    let request = match action {
+        Action::Cancel { request } => Some(request),
+        Action::Status => None,
+        _ => return Err("The saved history request changed.".into()),
+    };
+    if demand::obsolete_legacy_request(&context, room, instance, request)
+        .map_err(|error| error.to_string())?
+    {
+        answer.status.phase = Phase::Unavailable;
+        answer.status.detail = crate::node::channel::UNSUPPORTED_ROOM_FORMAT.into();
+        return Ok(answer);
+    }
     let (saved, mutation) = admission.inspect(&context).map_err(|e| e.to_string())?;
     let Some(saved) = saved else {
         return Ok(answer);
@@ -2027,9 +2025,15 @@ fn classify_resume(
     let Action::Resume { request } = action else {
         return Err("History Resume classification action changed.".into());
     };
-    let saved = demand::inspect_precharged(&context, credit)
+    if demand::obsolete_legacy_request(&context, room, instance, Some(request))
         .map_err(|error| error.to_string())?
-        .ok_or("No history request is saved to resume.")?;
+    {
+        return Err(crate::node::channel::UNSUPPORTED_ROOM_FORMAT.into());
+    }
+    let saved = demand::inspect_precharged(&context, credit).map_err(|error| error.to_string())?;
+    let Some(saved) = saved else {
+        return Err("No history request is saved to resume.".into());
+    };
     let state = saved.state();
     if state.request != request || state.binding.room != room || state.binding.instance != instance
     {
@@ -2046,7 +2050,6 @@ fn classify_resume(
         status: pending,
         dispatch: None,
         private: None,
-        legacy: None,
         legacy_cancelled: None,
         local_only: true,
         local_boundary: LocalBoundary::Observed,
@@ -2098,7 +2101,6 @@ fn prepare(
         status: status(id, instance, Phase::Idle, "No history request is saved."),
         dispatch: None,
         private: None,
-        legacy: None,
         legacy_cancelled: None,
         local_only: false,
         local_boundary: LocalBoundary::Observed,
@@ -2174,20 +2176,7 @@ fn prepare(
         );
     }
     if !room.uses_sparse_history(store).map_err(|e| e.to_string())? {
-        return legacy::prepare_legacy(
-            room,
-            store,
-            node,
-            instance,
-            action,
-            context,
-            job,
-            peers,
-            answer,
-            saved.as_ref().map(|s| s.state()),
-            fence,
-            resume_admission,
-        );
+        return Err(crate::node::channel::UNSUPPORTED_ROOM_FORMAT.into());
     }
     // Public pages prefer an already connected peer; private and legacy selection above
     // keep their own donor contracts.
