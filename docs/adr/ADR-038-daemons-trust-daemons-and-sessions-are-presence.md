@@ -199,14 +199,17 @@ lessons. It changes neither this record's decision status nor any requirement or
 
 ### 5. No legacy
 
-- **FX-18.** Rooms from before the v0.4.5 format are not supported: "we're still building vox
-  and have no users -- I want to continue to design freely without overengineering backwards
-  compat." The legacy history recovery flow (ADR-036's "Legacy history required", resume and
-  cancel) MUST be deleted, with its prompts, states and proofs. The refusal and the deletion
-  apply to rooms in the pre-v0.4.5 format only; a current-format room whose requested history
-  is unavailable keeps ADR-036's live and requested-history journeys (H-1–H-8) unchanged. An
-  unsupported room MUST be refused with one sentence naming what to do (leave it and create a
-  new one). Real data MUST NOT be deleted or reset by Vox.
+- **FX-18.** Rooms with signed genesis format 1 or 2 are unsupported; rooms with signed genesis
+  format 3 use authenticated history. The v0.4.4 and v0.4.5 genesis formats are indistinguishable:
+  both create format 2 rooms, so a format 2 room cannot be identified as pre-v0.4.5 from its
+  genesis. The decider waived prior-release compatibility and authorized recreating nodes and
+  rooms when needed; this boundary therefore includes format 2 rooms created by v0.4.5.
+  The legacy history recovery flow (ADR-036's "Legacy history required", resume and cancel)
+  MUST be deleted, with its prompts, states and proofs. A supported format 3 room whose requested
+  history is unavailable keeps ADR-036's live and requested-history journeys (H-1–H-8) unchanged.
+  An unsupported room MUST be refused with one sentence naming what to do (leave it and create a
+  new one). Vox MUST NOT delete or reset stored data, and current-format data integrity, restart,
+  trust and access rules remain in force.
 
 ### 6. How this ships
 
