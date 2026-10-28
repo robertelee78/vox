@@ -10922,7 +10922,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         &self,
     ) -> std::result::Result<(Vec<crate::log::sync::FeedFrontier>, u64), crate::wire::WireError>
     {
-        let mut ch = self.room()?;
+        let ch = self.room()?;
         if self.legacy.is_some() {
             return Ok((
                 Vec::new(),
@@ -10950,20 +10950,20 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         }
         drop(entries);
         let generation = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
-        let mut debts = Vec::new();
-        for frontier in &frontiers {
-            debts.extend(
-                ch.received_debts_for_current(self.store, &frontier.author_id)
-                    .map_err(|_| crate::wire::WireError::TransportFailed)?,
-            );
-        }
-        // Capture the exact owners with the advertised frontiers, then release the room before
-        // the durable flush. A failed flush must never return those frontiers to the peer.
+        let room_id = ch.channel_id();
+        // The captured frontiers name the authors to settle. Do not wait for the
+        // Store writer while holding the room; later debts only make this conservative.
         drop(ch);
-        for debt in debts {
-            self.store
-                .flush_received_through(debt)
+        for frontier in &frontiers {
+            let debts = self
+                .store
+                .received_debts_for_author(room_id, frontier.author_id)
                 .map_err(|_| crate::wire::WireError::TransportFailed)?;
+            for debt in debts {
+                self.store
+                    .flush_received_through(debt)
+                    .map_err(|_| crate::wire::WireError::TransportFailed)?;
+            }
         }
         Ok((frontiers, generation))
     }

@@ -2420,8 +2420,8 @@ pub async fn read(
             let mut row = row_value(&room_key, r, &ops, None);
             let first = footers.remove(&r.entry_hash);
             if let Some(page) = first.filter(|page| page.present) {
+                footer_fields(&mut row, &page);
                 if page.read_after.is_none() && page.pulled_after.is_none() {
-                    footer_fields(&mut row, &page);
                     writeln!(out, "{row}")?;
                 } else {
                     let (mut readers, mut pullers) =

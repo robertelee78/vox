@@ -12006,10 +12006,7 @@ impl Node {
                             Ok(Reply::Agreement(Some(
                                 crate::node::agreestream::Answer::Holds(entries),
                             ))) => {
-                                let (debts, replacement) =
-                                    profile.store().received_semantic_debts_for_room(channel_id);
-                                agreement_debts =
-                                    Some((profile.store_handle(), debts, replacement));
+                                agreement_debts = Some(profile.store_handle());
                                 Ok(Reply::Agreement(Some(
                                     crate::node::agreestream::Answer::Holds(entries),
                                 )))
@@ -12019,12 +12016,24 @@ impl Node {
                     }
                     _ => Err("room not open".into()),
                 };
-                if let Some((store, debts, _)) = agreement_debts
-                    .filter(|(_, debts, replacement)| !debts.is_empty() || *replacement)
-                {
+                if let Some(store) = agreement_debts {
                     // Never hold the actor or room across the disk durability boundary.
+                    let settlement_slot = store.agreement_settlement_slot();
                     tokio::spawn(async move {
+                        let mut reply = reply;
+                        // redb has one writer. At most one agreement settlement waits
+                        // for it; abandoned callers do not queue blocking threads.
+                        let permit = tokio::select! {
+                            biased;
+                            () = reply.closed() => return,
+                            permit = settlement_slot.acquire_owned() => match permit {
+                                Ok(permit) => permit,
+                                Err(_) => return,
+                            },
+                        };
                         let flushed = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            let (debts, _) = store.received_semantic_debts_for_room(channel_id);
                             store.finish_received_replacement()?;
                             for debt in debts {
                                 store.flush_received_through(debt)?;
@@ -17469,12 +17478,12 @@ impl Node {
             let deadline = tokio::time::Instant::now() + crate::node::agreestream::HOLD_PATIENCE;
             let mut fetched = false;
             let a = loop {
-                match listed(&tx, &ask, clock()).await {
-                    Ok(Some(answer)) => break answer,
-                    Ok(None) => {}
-                    // The room's query records/poisons local storage failure. Do not invent
-                    // NotReceived or a held set from a failed local read.
-                    Err(_) => return,
+                match tokio::time::timeout_at(deadline, listed(&tx, &ask, clock())).await {
+                    Ok(Ok(Some(answer))) => break answer,
+                    Ok(Ok(None)) => {}
+                    // A failed or still-running durability settlement is not evidence of
+                    // absence. End this responder while its owned settlement may finish.
+                    Ok(Err(_)) | Err(_) => return,
                 }
                 if !fetched {
                     let _ = tx

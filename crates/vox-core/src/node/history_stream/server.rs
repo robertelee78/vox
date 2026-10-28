@@ -212,12 +212,7 @@ async fn respond(
                     } else {
                         None
                     };
-                    let debts = if receipt {
-                        room.received_debts_for_current(store, &author)?
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(Some((head, debts, boundary)))
+                    Ok(Some((head, boundary)))
                 })
                 .await?;
             let held = match found {
@@ -225,9 +220,11 @@ async fn respond(
                 Lookup::Busy => return Ok((Status::Busy, None)),
                 Lookup::Missing => return Ok((Status::EvidenceUnavailable, None)),
             };
-            let (head, debts, boundary) = held.value;
+            let (head, _boundary) = held.value;
             if receipt {
-                source.flush_received_before_ack(debts, boundary).await?;
+                source
+                    .flush_authors_before_ack(preamble.room, vec![author])
+                    .await?;
             }
             let wire = head.to_wire();
             let status = match send_object(

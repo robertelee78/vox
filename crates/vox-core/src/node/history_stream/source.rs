@@ -17,7 +17,7 @@ use crate::log::history::{
 };
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::{BufferCharge, Job};
-use crate::node::store::{ReceivedDebt, Store};
+use crate::node::store::Store;
 use crate::transport::stream_transport::Fence;
 
 use super::{Proof, ProofKind, RequestId};
@@ -647,22 +647,19 @@ impl Source {
 }
 
 impl Source {
-    /// Flush every exact received transaction fenced by the room snapshot which is about to be
-    /// acknowledged. The debts and advertised head are captured under the same room lock;
-    /// neither a stale source nor a later flow in this room can substitute its bytes for that
-    /// snapshot.
-    pub(super) async fn flush_received_before_ack(
+    /// Settle the advertised authors after releasing the room lock. A newer
+    /// transaction can add a conservative debt; one already removed is durable.
+    pub(super) async fn flush_authors_before_ack(
         &self,
-        debts: Vec<ReceivedDebt>,
-        _boundary: Option<Digest32>,
+        room: Digest32,
+        authors: Vec<Digest32>,
     ) -> Result<()> {
-        if debts.is_empty() {
-            return Ok(());
-        }
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
-            for debt in debts {
-                store.flush_received_through(debt)?;
+            for author in authors {
+                for debt in store.received_debts_for_author(room, author)? {
+                    store.flush_received_through(debt)?;
+                }
             }
             Ok(())
         })
@@ -677,29 +674,19 @@ impl Source {
             crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
         )?;
         let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
-        let mut debts = Vec::new();
         let mut after = None;
         for _ in 0..=crate::log::history::MAX_CONTEXT_AUTHORS / 64 {
             self.current()?;
             let page = self
                 .read(job, 64 * 1024, move |room, store| {
-                    let page = room.history_head_hints(store, after)?;
-                    let page_debts: Vec<_> = page
-                        .heads
-                        .iter()
-                        .map(|hint| room.received_debts_for_current(store, &hint.author))
-                        .collect::<Result<Vec<_>>>()?
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    Ok(Some((page, page_debts)))
+                    room.history_head_hints(store, after)
+                        .map(|page| Some((room.channel_id(), page)))
                 })
                 .await?;
             let Lookup::Found(page) = page else {
                 return Ok(Lookup::Busy);
             };
-            let (page, page_debts) = page.value;
-            debts.extend(page_debts);
+            let (room_id, page) = page.value;
             if hints.len() + page.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
                 return Err(Error::SizeLimitExceeded("inventory author bound"));
             }
@@ -711,7 +698,11 @@ impl Source {
             match page.next {
                 Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
                 None => {
-                    self.flush_received_before_ack(debts, None).await?;
+                    self.flush_authors_before_ack(
+                        room_id,
+                        hints.iter().map(|hint| hint.author).collect(),
+                    )
+                    .await?;
                     return Ok(Lookup::Found(Held {
                         value: hints,
                         _charge: charge,

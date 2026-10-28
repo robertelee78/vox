@@ -476,15 +476,6 @@ impl ChannelState {
         read.history_head(&id)
     }
 
-    /// Preserve exact author/transaction ownership even when this room is locked and reopened.
-    pub(crate) fn received_debts_for_current(
-        &mut self,
-        store: &Store,
-        author: &Digest32,
-    ) -> Result<Vec<crate::node::store::ReceivedDebt>> {
-        store.received_debts_for_author(self.channel_id, *author)
-    }
-
     pub(crate) fn history_context(
         &self,
         store: &Store,

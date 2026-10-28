@@ -407,6 +407,8 @@ pub struct Store {
     /// its received ownership moved while this is held, so the commit's visibility and its mark are one
     /// step to every other holder. redb admits one writer at a time anyway; this names it.
     writer: Mutex<Epochs>,
+    /// One agreement settlement may wait for this store's physical writer at a time.
+    agreement_settlement: Arc<tokio::sync::Semaphore>,
     /// The profile directory's lock, when this store is a profile's (V210-100). Declared after
     /// `db` so it is released only after the database is closed: the store goes with its last
     /// handle, and the lock with it — never before, which let a vox waiting for the lock open a
@@ -468,6 +470,7 @@ impl Store {
             db: RwLock::new(Backing::Writable(db)),
             path: path.to_owned(),
             writer: Mutex::new(Epochs::default()),
+            agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
         };
         store.init_schema()?;
@@ -491,6 +494,7 @@ impl Store {
             db: RwLock::new(Backing::ReadOnly(db)),
             path: path.to_owned(),
             writer: Mutex::new(Epochs::default()),
+            agreement_settlement: Arc::new(tokio::sync::Semaphore::new(1)),
             profile_owner: None,
         };
         if store.schema_is_current()? {
@@ -1208,6 +1212,10 @@ impl Store {
 
     /// Semantic receive owners in one room, for an agreement over its ordered set.
     /// Source-only receive work is deliberately excluded.
+    pub(crate) fn agreement_settlement_slot(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.agreement_settlement)
+    }
+
     pub(crate) fn received_semantic_debts_for_room(
         &self,
         room: Digest32,
