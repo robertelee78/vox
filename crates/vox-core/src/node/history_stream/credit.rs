@@ -35,7 +35,9 @@ impl Response {
                 entries,
                 ..
             } => (wire_bytes, entries),
-            Query::Entry { .. } | Query::Header { .. } => (MAX_RESPONSE_BYTES, 1),
+            Query::Entry { .. } | Query::KeyBody { .. } | Query::Header { .. } => {
+                (MAX_RESPONSE_BYTES, 1)
+            }
             _ => (MAX_RESPONSE_BYTES, 0),
         };
         let metadata_left = match query {
@@ -102,7 +104,10 @@ impl Response {
         persisted: u64,
     ) -> Result<()> {
         if self.done
-            || !matches!(self.query, Query::Entry { .. } | Query::Page { .. })
+            || !matches!(
+                self.query,
+                Query::Entry { .. } | Query::KeyBody { .. } | Query::Page { .. }
+            )
             || length > MAX_PAYLOAD_BYTES as u64
             || persisted > length
             || self
@@ -112,7 +117,7 @@ impl Response {
         {
             return Err(invalid("history body credit state"));
         }
-        if let Query::Entry { offset, .. } = self.query {
+        if let Query::Entry { offset, .. } | Query::KeyBody { offset, .. } = self.query {
             if persisted != offset {
                 return Err(invalid("history body resume offset"));
             }
@@ -150,6 +155,26 @@ impl Response {
             Frame::Have { .. }
                 if matches!(self.query, Query::Inventory) && !self.inventory_seen =>
             {
+                self.inventory_seen = true;
+            }
+            Frame::KeyAvailability {
+                request,
+                instance,
+                page,
+            } if *request == self.request
+                && matches!(self.query, Query::KeyAvailability { .. })
+                && !self.inventory_seen =>
+            {
+                if *instance == [0; 16] {
+                    return Err(invalid("key catalog instance is zero"));
+                }
+                if let (Query::KeyAvailability { after: Some(after) }, Some((cursor, _))) =
+                    (&self.query, page)
+                {
+                    if cursor <= after {
+                        return Err(invalid("key availability cursor did not advance"));
+                    }
+                }
                 self.inventory_seen = true;
             }
             Frame::Meta { request, object } if *request == self.request => {
@@ -205,7 +230,7 @@ impl Response {
                 continuation,
             } if *request == self.request => {
                 if *status == Status::Complete
-                    && matches!(self.query, Query::Inventory)
+                    && matches!(self.query, Query::Inventory | Query::KeyAvailability { .. })
                     && !self.inventory_seen
                 {
                     return Err(invalid("inventory completed without HAVE"));
@@ -293,7 +318,9 @@ impl Response {
     fn check_continuation(&self, cursor: &Continuation) -> Result<()> {
         let (kind, head, lo, hi) = match &self.query {
             Query::Proof { head, from, to, .. } => (2, head, *from, *to),
-            Query::Entry { head, seq, .. } => (3, head, *seq, *seq),
+            Query::Entry { head, seq, .. } | Query::KeyBody { head, seq, .. } => {
+                (3, head, *seq, *seq)
+            }
             Query::Page { head, lo, hi, .. } => (4, head, *lo, *hi),
             _ => return Err(invalid("history continuation for atomic object")),
         };

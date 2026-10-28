@@ -19,6 +19,10 @@ struct Entry {
 pub(crate) struct RoleOwed {
     entries: Mutex<BTreeMap<Digest32, Entry>>,
     key_dirty: Mutex<BTreeMap<Digest32, Arc<()>>>,
+    key_catalogs: Mutex<BTreeMap<Digest32, (u64, [u8; 16], Option<([u8; 16], u64)>)>>,
+    key_catalog_changed: Mutex<BTreeMap<Digest32, Arc<()>>>,
+    provider_prune_dirty: std::sync::atomic::AtomicBool,
+    key_retention_dirty: std::sync::atomic::AtomicBool,
     wake: Mutex<Option<Weak<RoleWake>>>,
     room: Mutex<Option<Digest32>>,
 }
@@ -81,6 +85,133 @@ impl RoleWake {
 }
 
 impl RoleOwed {
+    /// An authenticated inventory hint is a reason to inspect new catalog entries, not
+    /// evidence that a body exists or a grant to fetch it.
+    pub(crate) fn key_catalog_on_connect(
+        &self,
+        peer: Digest32,
+        serial: u64,
+    ) -> crate::error::Result<()> {
+        let mut catalogs = self.key_catalogs.lock().unwrap_or_else(|e| e.into_inner());
+        if catalogs
+            .get(&peer)
+            .is_some_and(|(current, _, _)| *current == serial)
+        {
+            return Ok(());
+        }
+        let incarnation = crate::identity::rng::random_array::<16>()?;
+        catalogs.insert(peer, (serial, incarnation, None));
+        Ok(())
+    }
+    pub(crate) fn key_catalog_connection(&self, peer: Digest32) -> Option<(u64, [u8; 16])> {
+        self.key_catalogs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .map(|(serial, incarnation, _)| (*serial, *incarnation))
+    }
+    pub(crate) fn observe_key_catalog(
+        self: &Arc<Self>,
+        peer: Digest32,
+        instance: [u8; 16],
+        tip: u64,
+        serial: u64,
+    ) {
+        let mut catalogs = self.key_catalogs.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((current, _, previous)) = catalogs.get_mut(&peer) else {
+            return;
+        };
+        if *current != serial {
+            return;
+        }
+        if previous
+            .is_some_and(|(old_instance, old_tip)| old_instance == instance && old_tip >= tip)
+        {
+            return;
+        }
+        *previous = Some((instance, tip));
+        drop(catalogs);
+        self.signal(peer);
+    }
+    /// An actual local acquisition retains an exact inventory obligation until the
+    /// current peer completes the exchange. A later acquisition replaces its token.
+    pub(crate) fn mark_key_catalog_changed(self: &Arc<Self>, peer: Digest32) {
+        self.key_catalog_changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer, Arc::new(()));
+        self.signal(peer);
+    }
+    pub(crate) fn key_catalog_announcement(&self, peer: Digest32) -> Option<Arc<()>> {
+        self.key_catalog_changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .cloned()
+    }
+    pub(crate) fn ack_key_catalog_announcement(
+        self: &Arc<Self>,
+        peer: Digest32,
+        token: &Arc<()>,
+        serial: u64,
+    ) {
+        let catalogs = self.key_catalogs.lock().unwrap_or_else(|e| e.into_inner());
+        if !catalogs
+            .get(&peer)
+            .is_some_and(|(current, _, _)| *current == serial)
+        {
+            return;
+        }
+        let mut entries = self
+            .key_catalog_changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if entries
+            .get(&peer)
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            entries.remove(&peer);
+            drop(entries);
+            drop(catalogs);
+            self.signal(peer);
+        }
+    }
+    pub(crate) fn key_catalog(&self, peer: Digest32) -> Option<([u8; 16], u64)> {
+        self.key_catalogs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .and_then(|(_, _, catalog)| *catalog)
+    }
+
+    pub(crate) fn mark_key_retention_dirty(self: &Arc<Self>, local: Digest32) {
+        self.key_retention_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.signal(local);
+    }
+    pub(crate) fn key_retention_dirty(&self) -> bool {
+        self.key_retention_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn take_key_retention_dirty(&self) -> bool {
+        self.key_retention_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub(crate) fn mark_key_provider_prune(self: &Arc<Self>, peer: Digest32) {
+        self.provider_prune_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.signal(peer);
+    }
+    pub(crate) fn key_provider_prune_pending(&self) -> bool {
+        self.provider_prune_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn take_key_provider_prune(&self) -> bool {
+        self.provider_prune_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
     fn signal(self: &Arc<Self>, peer: Digest32) {
         let wake = self
             .wake
@@ -93,6 +224,7 @@ impl RoleOwed {
             wake.signal(room, peer, self);
         }
     }
+
     /// Retain an exact per-author discovery edge until its bounded scan finishes.
     pub(crate) fn mark_key_dirty(self: &Arc<Self>, peer: Digest32) {
         self.key_dirty
@@ -173,6 +305,13 @@ impl RoleOwed {
         let mut key_dirty = self.key_dirty.lock().unwrap_or_else(|e| e.into_inner());
         key_dirty.retain(|peer, _| keep(peer));
         drop(key_dirty);
+        let mut catalogs = self.key_catalogs.lock().unwrap_or_else(|e| e.into_inner());
+        catalogs.retain(|peer, _| keep(peer));
+        drop(catalogs);
+        self.key_catalog_changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|peer, _| keep(peer));
         for peer in removed {
             self.signal(peer);
         }

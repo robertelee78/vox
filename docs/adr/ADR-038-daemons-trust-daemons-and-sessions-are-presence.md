@@ -210,6 +210,10 @@ lessons. It changes neither this record's decision status nor any requirement or
   An unsupported room MUST be refused with one sentence naming what to do (leave it and create a
   new one). Vox MUST NOT delete or reset stored data, and current-format data integrity, restart,
   trust and access rules remain in force.
+  The decider's v0.4.10 baseline decision also permits recreating existing format 3 rooms:
+  sparse roots with 20, 21, 22 or 23 fields are unsupported and MUST be refused before mutation,
+  with the same recreation guidance. Their stored files remain intact. New 25-field roots MUST
+  retain current-format data integrity, restart, trust and access rules.
 
 ### 6. How this ships
 

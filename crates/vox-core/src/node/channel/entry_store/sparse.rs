@@ -70,6 +70,10 @@ pub(super) struct Roots {
     validated_positions: u64,
     control_intervals: u64,
     obligations: u64,
+    key_body_obligations: u64,
+    key_body_providers: u64,
+    key_body_debt_order: u64,
+    key_body_debt_serial: u64,
     ranges: u64,
     commitments: u64,
     source_heads: u64,
@@ -91,7 +95,7 @@ pub(super) struct Roots {
 
 impl Roots {
     pub(super) fn write(self, e: &mut Encoder) {
-        e.array(21)
+        e.array(25)
             .uint(self.objects)
             .uint(self.authors)
             .uint(self.validated_positions)
@@ -110,13 +114,20 @@ impl Roots {
             .uint(self.settled_tips)
             .uint(self.prior_heads)
             .uint(self.declined_heads)
+            .uint(self.key_body_obligations)
+            .uint(self.key_body_providers)
+            .uint(self.key_body_debt_order)
+            .uint(self.key_body_debt_serial)
             .uint(self.author_count)
             .uint(self.obligation_count)
             .uint(u64::from(self.enabled));
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let arity = d.array()?;
-        if !matches!(arity, 20 | 21) {
+        if matches!(arity, 20 | 21 | 22 | 23) {
+            return Err(Error::Profile(super::super::UNSUPPORTED_ROOM_FORMAT));
+        }
+        if arity != 25 {
             return Err(invalid("sparse roots arity"));
         }
         let mut result = Self {
@@ -125,6 +136,10 @@ impl Roots {
             validated_positions: d.uint()?,
             control_intervals: d.uint()?,
             obligations: d.uint()?,
+            key_body_obligations: 0,
+            key_body_providers: 0,
+            key_body_debt_order: 0,
+            key_body_debt_serial: 0,
             ranges: d.uint()?,
             commitments: d.uint()?,
             source_heads: d.uint()?,
@@ -142,9 +157,17 @@ impl Roots {
             obligation_count: 0,
             enabled: false,
         };
-        if arity == 21 {
+        if arity >= 21 {
             result.declined_heads = d.uint()?;
         }
+        if arity >= 22 {
+            result.key_body_obligations = d.uint()?;
+        }
+        if arity >= 23 {
+            result.key_body_providers = d.uint()?;
+        }
+        result.key_body_debt_order = d.uint()?;
+        result.key_body_debt_serial = d.uint()?;
         result.author_count = d.uint()?;
         result.obligation_count = d.uint()?;
         result.enabled = flag(d)?;
@@ -170,6 +193,9 @@ impl Roots {
             self.settled_tips,
             self.prior_heads,
             self.declined_heads,
+            self.key_body_obligations,
+            self.key_body_providers,
+            self.key_body_debt_order,
         ]
         .iter()
         .all(|root| *root < next)
@@ -467,18 +493,54 @@ impl ObligationKind {
         }
     }
 }
-/// Recipient-body refusals share the existing relationship tree but cannot suppress an
-/// author's public hint or a different owed package. Rows retire with the capped KeyBody.
-pub(crate) fn key_body_decline_key(author: &Digest32, hash: &Digest32) -> Digest32 {
-    let mut e = Encoder::new();
-    e.array(3)
-        .bytes(b"key-body-refusal")
-        .bytes(author)
-        .bytes(hash);
-    sha256(&e.finish())
+
+/// One durable progress cursor per provider. `after` remains before an in-flight body;
+/// a crash then repeats at most that item and cannot skip an uncommitted body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyProviderCursor {
+    pub instance: [u8; 16],
+    pub connection: [u8; 16],
+    pub after: u64,
+    pub local_after: u64,
+    pub evidence_unavailable: bool,
+    pub authorization: Digest32,
+    pub peer_incarnation: u64,
 }
 
-pub(crate) type KeyBodyPage = (Option<[u8; 64]>, Option<Obligation>);
+fn key_provider_cursor_key(peer: &Digest32) -> Key {
+    let prefix = sha256(b"vox/key-provider-cursor/v1");
+    declined_head_key(&prefix, peer)
+}
+
+fn parse_key_provider_cursor(bytes: &[u8], peer: &Digest32) -> Result<KeyProviderCursor> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 9 || d.uint()? != 2 || d.bytes()? != peer {
+        return Err(invalid("key provider cursor binding"));
+    }
+    let instance = d
+        .bytes()?
+        .try_into()
+        .map_err(|_| invalid("key provider cursor instance"))?;
+    let connection = d
+        .bytes()?
+        .try_into()
+        .map_err(|_| invalid("key provider cursor connection"))?;
+    let after = d.uint()?;
+    let local_after = d.uint()?;
+    let evidence_unavailable = flag(&mut d)?;
+    let authorization = read_hash(&mut d)?;
+    let peer_incarnation = d.uint()?;
+    d.finish()?;
+    Ok(KeyProviderCursor {
+        instance,
+        connection,
+        after,
+        local_after,
+        evidence_unavailable,
+        authorization,
+        peer_incarnation,
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Obligation {
@@ -537,8 +599,18 @@ impl Obligation {
     }
     fn key(&self) -> Result<Key> {
         let mut key = [0; 64];
-        key[..32].copy_from_slice(&self.head);
-        key[32..].copy_from_slice(&sha256(&self.bytes()?));
+        let digest = sha256(&self.bytes()?);
+        match self.kind {
+            ObligationKind::KeyBody => {
+                // Key bodies use their own tree and retain the full obligation identity.
+                key[0] = 0;
+                key[1..33].copy_from_slice(&digest);
+            }
+            _ => {
+                key[..32].copy_from_slice(&self.head);
+                key[32..].copy_from_slice(&digest);
+            }
+        }
         Ok(key)
     }
 }
@@ -760,7 +832,186 @@ impl Source<'_> {
     }
 }
 
+fn key_debt_order(serial: u64) -> Key {
+    let mut key = [0; 64];
+    key[0] = 0;
+    key[1..9].copy_from_slice(&serial.to_be_bytes());
+    key
+}
+fn key_debt_reverse(obligation: &Obligation) -> Result<Key> {
+    let mut key = [0; 64];
+    key[0] = 1;
+    key[1..33].copy_from_slice(&sha256(&obligation.key()?));
+    Ok(key)
+}
+
+fn key_debt_expiry(claimed_ms: u64, serial: u64) -> Key {
+    let mut key = [0; 64];
+    key[0] = 2;
+    key[1..9].copy_from_slice(&claimed_ms.to_be_bytes());
+    key[9..17].copy_from_slice(&serial.to_be_bytes());
+    key
+}
+fn key_debt_claim(serial: u64) -> Key {
+    let mut key = [0; 64];
+    key[0] = 3;
+    key[1..9].copy_from_slice(&serial.to_be_bytes());
+    key
+}
+
 impl Read<'_> {
+    pub(crate) fn expired_key_debts(&self, cutoff: u64, limit: usize) -> Result<Vec<Obligation>> {
+        if limit > 16 {
+            return Err(invalid("key debt expiry page limit"));
+        }
+        let source = self.source();
+        let mut seek = key_debt_expiry(0, 0);
+        let mut debts = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            let Some((key, value)) = source.first(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.key_body_debt_order,
+                &seek,
+                0,
+            )?
+            else {
+                break;
+            };
+            if key[0] != 2 {
+                break;
+            }
+            if key[17..].iter().any(|v| *v != 0) {
+                return Err(invalid("key debt expiry key"));
+            }
+            let claimed = u64::from_be_bytes(
+                key[1..9]
+                    .try_into()
+                    .map_err(|_| invalid("key debt claim"))?,
+            );
+            if claimed > cutoff {
+                break;
+            }
+            let Value::Number(id) = value else {
+                return Err(invalid("key debt expiry locator"));
+            };
+            let debt = Obligation::parse(&source.sparse_record(
+                self.sek,
+                self.channel,
+                id,
+                STATE_BYTES,
+            )?)?;
+            if debt.kind != ObligationKind::KeyBody {
+                return Err(invalid("key debt expiry kind"));
+            }
+            debts.push(debt);
+            let Some(next) = dag_facts::successor(key) else {
+                break;
+            };
+            seek = next;
+        }
+        Ok(debts)
+    }
+
+    pub(crate) fn key_provider_cursor(&self, peer: &Digest32) -> Result<Option<KeyProviderCursor>> {
+        let source = self.source();
+        let Some(id) = source.number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.key_body_providers,
+            &key_provider_cursor_key(peer),
+        )?
+        else {
+            return Ok(None);
+        };
+        parse_key_provider_cursor(
+            &source.sparse_record(self.sek, self.channel, id, STATE_BYTES)?,
+            peer,
+        )
+        .map(Some)
+    }
+    /// One durable, monotonically ordered exact body debt, or true end of the index.
+    pub(crate) fn history_key_debt_after(
+        &self,
+        after: Option<u64>,
+    ) -> Result<Option<(u64, Obligation)>> {
+        let Some(next) = after.unwrap_or(0).checked_add(1) else {
+            return Ok(None);
+        };
+        let source = self.source();
+        let Some((key, value)) = source.first(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.key_body_debt_order,
+            &key_debt_order(next),
+            0,
+        )?
+        else {
+            return Ok(None);
+        };
+        if key[0] != 0 {
+            return Ok(None);
+        }
+        if key[9..].iter().any(|v| *v != 0) {
+            return Err(invalid("key debt order key"));
+        }
+        let serial = u64::from_be_bytes(
+            key[1..9]
+                .try_into()
+                .map_err(|_| invalid("key debt serial"))?,
+        );
+        let Value::Number(id) = value else {
+            return Err(invalid("key debt order locator"));
+        };
+        let obligation =
+            Obligation::parse(&source.sparse_record(self.sek, self.channel, id, STATE_BYTES)?)?;
+        if obligation.kind != ObligationKind::KeyBody {
+            return Err(invalid("key debt order kind"));
+        }
+        Ok(Some((serial, obligation)))
+    }
+
+    /// Enumerate one provider cursor in the dedicated prefix, never body-scoped rows.
+    pub(crate) fn key_provider_cursor_after(
+        &self,
+        after: Option<Digest32>,
+    ) -> Result<Option<Digest32>> {
+        let prefix = sha256(b"vox/key-provider-cursor/v1");
+        let mut seek = declined_head_key(&prefix, &after.unwrap_or([0; 32]));
+        if after.is_some() {
+            let Some(next) = dag_facts::successor(seek) else {
+                return Ok(None);
+            };
+            seek = next;
+        }
+        let Some((key, value)) = self.source().first(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.key_body_providers,
+            &seek,
+            0,
+        )?
+        else {
+            return Ok(None);
+        };
+        if key[..32] != prefix {
+            return Ok(None);
+        }
+        let Value::Number(id) = value else {
+            return Err(invalid("key provider cursor locator"));
+        };
+        let peer: Digest32 = key[32..]
+            .try_into()
+            .map_err(|_| invalid("key provider cursor peer"))?;
+        parse_key_provider_cursor(
+            &self
+                .source()
+                .sparse_record(self.sek, self.channel, id, STATE_BYTES)?,
+            &peer,
+        )?;
+        Ok(Some(peer))
+    }
+
     pub(crate) fn sparse_history_instance(&self) -> [u8; 16] {
         self.directory.history_instance
     }
@@ -853,7 +1104,7 @@ impl Read<'_> {
     pub(crate) fn history_key_body_owed(
         &self,
         need: crate::node::history_stream::KeyBodyNeed,
-        local: Digest32,
+        _local: Digest32,
     ) -> Result<bool> {
         let obligation = Obligation {
             head: need.head,
@@ -868,7 +1119,7 @@ impl Read<'_> {
             .number(
                 self.sek,
                 self.channel,
-                self.directory.active.sparse.obligations,
+                self.directory.active.sparse.key_body_obligations,
                 &obligation.key()?,
             )?
             .is_none()
@@ -883,72 +1134,14 @@ impl Read<'_> {
             || header.entry_hash() != need.hash
             || !header.skeleton.v2.as_ref().is_some_and(|v| {
                 v.kind == crate::log::history::SignedEntryKind::KeyPackage
-                    && v.recipient == Some(local)
+                    && v.recipient == Some(need.recipient)
             })
         {
             return Err(invalid("key-body captured source changed"));
         }
-        self.missing_contains(&need.target.author, need.seq)
+        Ok(true)
     }
-    /// Sixteen fixed pending-work records per read. The key is source-Head scoped, not
-    /// author scoped, so callers retain the scalar continuation across released read guards.
-    pub(crate) fn history_key_body_page(
-        &self,
-        author: Digest32,
-        mut after: Option<[u8; 64]>,
-        target: Digest32,
-        authorization: Digest32,
-        incarnations: Option<(u64, u64)>,
-    ) -> Result<KeyBodyPage> {
-        for _ in 0..16 {
-            let seek = match after {
-                Some(key) => match dag_facts::successor(key) {
-                    Some(next) => next,
-                    None => return Ok((None, None)),
-                },
-                None => [0; 64],
-            };
-            let source = self.source();
-            let Some((key, value)) = source.first(
-                self.sek,
-                self.channel,
-                self.directory.active.sparse.obligations,
-                &seek,
-                0,
-            )?
-            else {
-                return Ok((None, None));
-            };
-            let Value::Number(id) = value else {
-                return Err(invalid("key-body obligation locator"));
-            };
-            let obligation = Obligation::parse(&source.sparse_record(
-                self.sek,
-                self.channel,
-                id,
-                STATE_BYTES,
-            )?)?;
-            if obligation.key()? != key {
-                return Err(invalid("key-body obligation binding"));
-            }
-            after = Some(key);
-            if obligation.kind == ObligationKind::KeyBody && obligation.author == author {
-                if let Some((head, scope, peer_i, author_i)) = self.history_declined_head(
-                    &author,
-                    &key_body_decline_key(&author, &obligation.object),
-                )? {
-                    if head == target
-                        && scope == authorization
-                        && incarnations == Some((peer_i, author_i))
-                    {
-                        continue;
-                    }
-                }
-                return Ok((after, Some(obligation)));
-            }
-        }
-        Ok((after, None))
-    }
+
     pub(crate) fn history_effect_finished(&self, hash: &Digest32) -> Result<bool> {
         Ok(self.source().find_value(
             self.sek,
@@ -1323,6 +1516,59 @@ pub(crate) enum SourceProgress {
 }
 
 impl Write<'_, '_> {
+    pub(crate) fn key_provider_cursor(&self, peer: &Digest32) -> Result<Option<KeyProviderCursor>> {
+        let source = Source::Batch(self.batch);
+        let Some(id) = source.number(
+            self.sek,
+            self.channel,
+            self.directory.active.sparse.key_body_providers,
+            &key_provider_cursor_key(peer),
+        )?
+        else {
+            return Ok(None);
+        };
+        parse_key_provider_cursor(
+            &source.sparse_record(self.sek, self.channel, id, STATE_BYTES)?,
+            peer,
+        )
+        .map(Some)
+    }
+    /// Replaces only this provider's cursor inside the caller's authority-checked batch.
+    pub(crate) fn keep_key_provider_cursor(
+        &mut self,
+        peer: Digest32,
+        cursor: KeyProviderCursor,
+    ) -> Result<()> {
+        self.require_sparse_idle()?;
+        let key = key_provider_cursor_key(&peer);
+        let root = self.directory.active.sparse.key_body_providers;
+        let old = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)?;
+        let mut e = Encoder::new();
+        e.array(9)
+            .uint(2)
+            .bytes(&peer)
+            .bytes(&cursor.instance)
+            .bytes(&cursor.connection)
+            .uint(cursor.after)
+            .uint(cursor.local_after)
+            .uint(u64::from(cursor.evidence_unavailable))
+            .bytes(&cursor.authorization)
+            .uint(cursor.peer_incarnation);
+        let id = self.save_sparse_record(old, &e.finish(), STATE_BYTES)?;
+        self.directory.active.sparse.key_body_providers =
+            self.change_value(root, key, Some(Value::Number(id)))?;
+        Ok(())
+    }
+    pub(crate) fn forget_key_provider_cursor(&mut self, peer: Digest32) -> Result<()> {
+        self.require_sparse_idle()?;
+        let key = key_provider_cursor_key(&peer);
+        let root = self.directory.active.sparse.key_body_providers;
+        if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
+            self.retire(id)?;
+            self.directory.active.sparse.key_body_providers = self.change_value(root, key, None)?;
+        }
+        Ok(())
+    }
     /// Read one refusal from this writer's transaction. This is deliberately the same batch
     /// that checks the authorization nonce and, when needed, replaces the refusal record.
     pub(crate) fn history_declined_head(
@@ -1743,7 +1989,6 @@ impl Write<'_, '_> {
             first_log,
             received_ms,
             origin,
-            local_id,
         } = publication;
         let included = validated.included();
         let binding = validated.binding();
@@ -1818,25 +2063,11 @@ impl Write<'_, '_> {
             SparsePayloadState::KeyPackagePending { recipient }
                 if v2.kind == SignedEntryKind::KeyPackage
                     && v2.recipient == Some(recipient)
-                    && entry.payload.is_none() =>
-            {
-                if recipient == local_id
-                    && !self.keep_history_obligation(&Obligation {
-                        head: included.head_id(),
-                        kind: ObligationKind::KeyBody,
-                        object: entry.entry_hash(),
-                        author: entry.skeleton.author_id,
-                        from: entry.skeleton.seq,
-                        through: entry.skeleton.seq,
-                    })?
-                {
-                    return Err(invalid("pending key body obligation capacity reached"));
-                }
-            }
+                    && entry.payload.is_none() => {}
             _ => {
                 return Err(invalid(
                     "sparse source body disposition differs from validation",
-                ))
+                ));
             }
         }
         if validated.pre_context().hash() != v2.pre_context
@@ -1890,6 +2121,72 @@ impl Write<'_, '_> {
         });
         self.directory.phase = Phase::Building;
         Ok(())
+    }
+
+    /// Publish the body debt only with the source root switch. An interrupted Building
+    /// promotion must never leave a debt for a header that was not published.
+    pub(crate) fn publish_key_body_debt(
+        &mut self,
+        entry: &Entry,
+        first_seen_ms: u64,
+    ) -> Result<()> {
+        if entry.payload.is_some()
+            || !entry
+                .skeleton
+                .v2
+                .as_ref()
+                .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
+        {
+            return Ok(());
+        }
+        if self.directory.phase != Phase::Switched {
+            return Err(invalid("key debt publication phase"));
+        }
+        let head = self
+            .directory
+            .promotion
+            .as_ref()
+            .and_then(|p| p.sparse_head)
+            .ok_or(invalid("key debt source head missing"))?;
+        self.directory.phase = Phase::Idle;
+        let debt = Obligation {
+            head,
+            kind: ObligationKind::KeyBody,
+            object: entry.entry_hash(),
+            author: entry.skeleton.author_id,
+            from: entry.skeleton.seq,
+            through: entry.skeleton.seq,
+        };
+        let result = (|| -> Result<()> {
+            if !self.keep_history_obligation(&debt)? {
+                return Err(invalid("key debt publication failed"));
+            }
+            let order = self.directory.active.sparse.key_body_debt_order;
+            let serial = Source::Batch(self.batch)
+                .number(self.sek, self.channel, order, &key_debt_reverse(&debt)?)?
+                .ok_or(invalid("key debt reverse locator missing"))?;
+            let id = Source::Batch(self.batch)
+                .number(
+                    self.sek,
+                    self.channel,
+                    self.directory.active.sparse.key_body_obligations,
+                    &debt.key()?,
+                )?
+                .ok_or(invalid("key debt locator missing"))?;
+            let order = self.change_value(
+                order,
+                key_debt_expiry(entry.skeleton.claimed_ms.min(first_seen_ms), serial),
+                Some(Value::Number(id)),
+            )?;
+            self.directory.active.sparse.key_body_debt_order = self.change_value(
+                order,
+                key_debt_claim(serial),
+                Some(Value::Number(entry.skeleton.claimed_ms.min(first_seen_ms))),
+            )?;
+            Ok(())
+        })();
+        self.directory.phase = Phase::Switched;
+        result
     }
 
     pub(super) fn index_sparse_source(
@@ -2806,7 +3103,7 @@ impl Write<'_, '_> {
                 }
             }
             Some((key, _)) if key[..32] == head_id[..] => {
-                return Err(invalid("control source locator"))
+                return Err(invalid("control source locator"));
             }
             _ => (stop, stop == hi),
         };
@@ -2858,6 +3155,8 @@ impl Write<'_, '_> {
         }
         Ok(())
     }
+
+    /// The exact body debt must still exist at the publication transaction boundary.
     pub(crate) fn history_key_body_pending(
         &self,
         need: crate::node::history_stream::KeyBodyNeed,
@@ -2874,7 +3173,7 @@ impl Write<'_, '_> {
             .number(
                 self.sek,
                 self.channel,
-                self.directory.active.sparse.obligations,
+                self.directory.active.sparse.key_body_obligations,
                 &obligation.key()?,
             )?
             .is_some())
@@ -2883,36 +3182,89 @@ impl Write<'_, '_> {
     pub(crate) fn keep_history_obligation(&mut self, obligation: &Obligation) -> Result<bool> {
         self.require_sparse_idle()?;
         let key = obligation.key()?;
-        let root = self.directory.active.sparse.obligations;
+        let key_body = obligation.kind == ObligationKind::KeyBody;
+        let root = if key_body {
+            self.directory.active.sparse.key_body_obligations
+        } else {
+            self.directory.active.sparse.obligations
+        };
         if Source::Batch(self.batch)
             .number(self.sek, self.channel, root, &key)?
             .is_some()
         {
             return Ok(true);
         }
-        if self.directory.active.sparse.obligation_count == MAX_OBLIGATIONS {
+        if !key_body && self.directory.active.sparse.obligation_count == MAX_OBLIGATIONS {
             return Ok(false);
         }
         let id = self.save_sparse_record(None, &obligation.bytes()?, STATE_BYTES)?;
-        self.directory.active.sparse.obligations =
-            self.change_value(root, key, Some(Value::Number(id)))?;
-        self.directory.active.sparse.obligation_count += 1;
+        let next = self.change_value(root, key, Some(Value::Number(id)))?;
+        if key_body {
+            self.directory.active.sparse.key_body_obligations = next;
+            if obligation.kind == ObligationKind::KeyBody {
+                let serial = self
+                    .directory
+                    .active
+                    .sparse
+                    .key_body_debt_serial
+                    .checked_add(1)
+                    .ok_or(invalid("key debt serial exhausted"))?;
+                let order = self.directory.active.sparse.key_body_debt_order;
+                let order =
+                    self.change_value(order, key_debt_order(serial), Some(Value::Number(id)))?;
+                let order = self.change_value(
+                    order,
+                    key_debt_reverse(obligation)?,
+                    Some(Value::Number(serial)),
+                )?;
+                self.directory.active.sparse.key_body_debt_order = order;
+                self.directory.active.sparse.key_body_debt_serial = serial;
+            }
+        } else {
+            self.directory.active.sparse.obligations = next;
+            self.directory.active.sparse.obligation_count += 1;
+        }
         Ok(true)
     }
     pub(crate) fn finish_history_obligation(&mut self, obligation: &Obligation) -> Result<()> {
         self.require_sparse_idle()?;
         let key = obligation.key()?;
-        let root = self.directory.active.sparse.obligations;
+        let key_body = obligation.kind == ObligationKind::KeyBody;
+        let root = if key_body {
+            self.directory.active.sparse.key_body_obligations
+        } else {
+            self.directory.active.sparse.obligations
+        };
         if let Some(id) = Source::Batch(self.batch).number(self.sek, self.channel, root, &key)? {
             self.retire(id)?;
-            self.directory.active.sparse.obligations = self.change_value(root, key, None)?;
-            self.directory.active.sparse.obligation_count = self
-                .directory
-                .active
-                .sparse
-                .obligation_count
-                .checked_sub(1)
-                .ok_or(invalid("sparse obligation counter"))?;
+            let next = self.change_value(root, key, None)?;
+            if key_body {
+                self.directory.active.sparse.key_body_obligations = next;
+                if obligation.kind == ObligationKind::KeyBody {
+                    let order = self.directory.active.sparse.key_body_debt_order;
+                    let reverse = key_debt_reverse(obligation)?;
+                    let serial = Source::Batch(self.batch)
+                        .number(self.sek, self.channel, order, &reverse)?
+                        .ok_or(invalid("key debt reverse locator missing"))?;
+                    let claimed = Source::Batch(self.batch)
+                        .number(self.sek, self.channel, order, &key_debt_claim(serial))?
+                        .ok_or(invalid("key debt claim missing"))?;
+                    let order = self.change_value(order, key_debt_expiry(claimed, serial), None)?;
+                    let order = self.change_value(order, key_debt_claim(serial), None)?;
+                    let order = self.change_value(order, key_debt_order(serial), None)?;
+                    self.directory.active.sparse.key_body_debt_order =
+                        self.change_value(order, reverse, None)?;
+                }
+            } else {
+                self.directory.active.sparse.obligations = next;
+                self.directory.active.sparse.obligation_count = self
+                    .directory
+                    .active
+                    .sparse
+                    .obligation_count
+                    .checked_sub(1)
+                    .ok_or(invalid("sparse obligation counter"))?;
+            }
         }
         Ok(())
     }

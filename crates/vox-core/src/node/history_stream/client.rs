@@ -66,6 +66,7 @@ pub(crate) struct Receiver {
     received: ReceivedFlow,
     staging: Option<Staging>,
     historical: bool,
+    key_body: Option<super::KeyBodyNeed>,
     own_head_observed: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -87,6 +88,7 @@ pub(crate) struct Received {
     pub(crate) role_ready: Option<(Digest32, u64, Digest32)>,
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
+    pub(crate) key_availability: Option<([u8; 16], Option<(u64, Option<super::KeyBodyAvailable>)>)>,
     pub(crate) heads: Vec<super::HeadHint>,
     pub(crate) own_head_incarnations: Option<(u64, u64)>,
     pub(crate) departure_receipt: Option<super::HeadHint>,
@@ -105,6 +107,7 @@ impl Received {
             role_ready: None,
             body_progress: false,
             inventory: None,
+            key_availability: None,
             heads: Vec::new(),
             own_head_incarnations: None,
             departure_receipt: None,
@@ -135,6 +138,7 @@ impl Receiver {
         received: ReceivedFlow,
         staging: Option<Staging>,
         historical: bool,
+        key_body: Option<super::KeyBodyNeed>,
         fence: Arc<crate::transport::stream_transport::Fence>,
         deadline: tokio::time::Instant,
         work_committed: Arc<std::sync::atomic::AtomicBool>,
@@ -156,6 +160,7 @@ impl Receiver {
             received,
             staging,
             historical,
+            key_body,
             own_head_observed,
         }
     }
@@ -167,6 +172,8 @@ impl Receiver {
         Lookup<(
             Vec<super::HeadHint>,
             Option<super::source::RoleAnnouncement>,
+            Option<([u8; 16], u64)>,
+            Option<super::source::CatalogAnnouncement>,
         )>,
     > {
         self.source.inventory(job).await
@@ -178,6 +185,17 @@ impl Receiver {
         notice: super::source::RoleAnnouncement,
     ) -> Result<()> {
         self.source.acknowledge_role(job, notice).await
+    }
+
+    pub(super) async fn acknowledge_key_catalog(
+        &self,
+        job: &crate::node::history_budget::Job,
+        notice: super::source::CatalogAnnouncement,
+        connection_serial: u64,
+    ) -> Result<()> {
+        self.source
+            .acknowledge_key_catalog(job, notice, connection_serial)
+            .await
     }
 
     /// Build an exact control proof from this node's own canonical history and admit it through
@@ -258,7 +276,7 @@ impl Receiver {
                 _ => {
                     return Err(Error::MalformedAtRest(
                         "local control proof produced unrelated staging",
-                    ))
+                    ));
                 }
             },
             Lookup::Busy => LocalProof::Busy,
@@ -353,7 +371,14 @@ impl Receiver {
                 }
                 match frame {
                     Frame::Meta { .. } => Action::Meta,
-                    Frame::Have { hints, role } => Action::Inventory(hints, role),
+                    Frame::Have {
+                        hints,
+                        role,
+                        key_catalog,
+                    } => Action::Inventory(hints, role, key_catalog),
+                    Frame::KeyAvailability { instance, page, .. } => {
+                        Action::KeyAvailability(instance, page)
+                    }
                     Frame::Chunk {
                         entry,
                         offset,
@@ -372,15 +397,20 @@ impl Receiver {
                 }
             };
             match action {
-                Action::Inventory(hints, role) => {
+                Action::Inventory(hints, role, key_catalog) => {
                     let charge = io.job().reserve_or_pressure(
                         hints.capacity() * std::mem::size_of::<super::HeadHint>(),
                     )?;
                     result.inventory = Some(Inventory {
                         hints,
                         role,
+                        key_catalog,
                         _charge: charge,
                     });
+                    drop(incoming);
+                }
+                Action::KeyAvailability(instance, page) => {
+                    result.key_availability = Some((instance, page));
                     drop(incoming);
                 }
                 Action::Meta => {
@@ -509,7 +539,7 @@ impl Receiver {
                             if !body_allowed {
                                 unexpected_body = Some(entry.entry_hash());
                             }
-                            if !body_allowed {
+                            if !body_allowed && !matches!(query, Query::KeyBody { .. }) {
                                 if result
                                     .role_ready
                                     .replace((*head, seq, entry.entry_hash()))
@@ -534,7 +564,9 @@ impl Receiver {
                             let job = io.job().clone();
                             let head = *head;
                             let expected_offset = match query {
-                                Query::Entry { offset, .. } => offset,
+                                Query::Entry { offset, .. } | Query::KeyBody { offset, .. } => {
+                                    offset
+                                }
                                 _ => 0,
                             };
                             let fence = self.source.fence.clone();
@@ -788,9 +820,17 @@ impl Receiver {
 }
 
 enum Action {
-    Inventory(Vec<super::HeadHint>, Option<super::HeadHint>),
+    KeyAvailability([u8; 16], Option<(u64, Option<super::KeyBodyAvailable>)>),
+    Inventory(
+        Vec<super::HeadHint>,
+        Option<super::HeadHint>,
+        Option<([u8; 16], u64)>,
+    ),
     Meta,
-    Chunk { entry: Digest32, next: u64 },
+    Chunk {
+        entry: Digest32,
+        next: u64,
+    },
     Done(Status, Option<Continuation>),
 }
 
@@ -1016,7 +1056,10 @@ impl Receiver {
         hint: Option<Continuation>,
         admission: Option<(demand::AdmissionCharge, demand::AdmissionCharge)>,
     ) -> Result<Option<Continuation>> {
-        if !matches!(query, Query::Entry { .. } | Query::Page { .. }) {
+        if !matches!(
+            query,
+            Query::Entry { .. } | Query::KeyBody { .. } | Query::Page { .. }
+        ) {
             return Ok(hint);
         }
         let staging = self
@@ -1031,6 +1074,12 @@ impl Receiver {
                 head,
                 seq,
                 offset: 0,
+            }
+            | Query::KeyBody {
+                head,
+                seq,
+                offset: 0,
+                ..
             } => Some((*head, *seq)),
             _ => None,
         };
@@ -1345,6 +1394,11 @@ impl Receiver {
         let staging = self.staging.clone();
         let grant = self.grant();
         let historical = self.historical;
+        let key_body = self.key_body.filter(|need| {
+            need.target.author == record.entry.skeleton.author_id
+                && need.seq == record.entry.skeleton.seq
+                && need.hash == record.entry.entry_hash()
+        });
         let received = self.received.clone();
         let committed = self.source.commit_ledger();
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
@@ -1370,6 +1424,7 @@ impl Receiver {
                 &body,
                 now,
                 historical,
+                key_body,
                 &received,
                 |batch| grant.check_batch(batch, room_id, instance, epoch),
                 |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
@@ -1452,6 +1507,7 @@ pub(crate) enum EntryPhase {
 pub(crate) enum LocalNeed {
     /// Resume only through the existing operation's exact persisted body cursor.
     StagedBody,
+    KeyBodyRetired,
     Wire(Query),
     Entry {
         head: Digest32,
@@ -1669,6 +1725,7 @@ impl Receiver {
                 }
                 Effect::RefillPending { governance: false } => LocalResult::next(step),
                 Effect::BodyUnavailable => LocalResult::wait(step, LocalNeed::StagedBody),
+                Effect::KeyBodyRetired => LocalResult::wait(step, LocalNeed::KeyBodyRetired),
                 Effect::ControlPending { head, through } => LocalResult::wait(
                     step,
                     LocalNeed::Control {
@@ -2063,7 +2120,7 @@ impl Receiver {
             (SourceProgress::PendingEffect { .. }, None) => {
                 return Err(Error::MalformedAtRest(
                     "pending history effect header missing",
-                ))
+                ));
             }
         })
     }
@@ -2177,5 +2234,6 @@ impl Receiver {
 pub(crate) struct Inventory {
     pub(crate) hints: Vec<super::HeadHint>,
     pub(crate) role: Option<super::HeadHint>,
+    pub(crate) key_catalog: Option<([u8; 16], u64)>,
     _charge: crate::node::history_budget::BufferCharge,
 }

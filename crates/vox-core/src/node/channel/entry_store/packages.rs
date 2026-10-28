@@ -44,6 +44,23 @@ impl Read<'_> {
     }
 }
 impl Write<'_, '_> {
+    /// Clear only this log's old locator before a genuine missing-to-held transition.
+    pub(super) fn forget_package_index(&mut self, mut roots: Roots, log: u64) -> Result<Roots> {
+        if let Some(value) = Source::Batch(self.batch).find_value(
+            self.sek,
+            self.channel,
+            roots.key_latest,
+            &key(log),
+        )? {
+            let Value::Number(old) = value else {
+                return Err(invalid("key-package latest locator"));
+            };
+            roots.key_packages = self.change_value(roots.key_packages, key(old), None)?;
+            roots.key_latest = self.change_value(roots.key_latest, key(log), None)?;
+        }
+        Ok(roots)
+    }
+
     pub(super) fn index_package(
         &mut self,
         mut roots: Roots,
@@ -66,7 +83,10 @@ impl Write<'_, '_> {
             let Value::Number(old) = value else {
                 return Err(invalid("key-package latest locator"));
             };
-            roots.key_packages = self.change_value(roots.key_packages, key(old), None)?;
+            // The same held body was already indexed; replaying its effect is not a new
+            // availability incarnation. A genuine refill clears this old index first.
+            let _ = old;
+            return Ok(roots);
         }
         let at = self.directory.next_package;
         self.directory.next_package = at

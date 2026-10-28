@@ -189,6 +189,12 @@ impl OwnRecoveryCheckpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyBodyUnavailable {
+    Body,
+    Evidence,
+}
+
 pub(crate) struct Flow {
     pub(crate) room: Digest32,
     pub(crate) peer: Digest32,
@@ -215,6 +221,10 @@ pub(crate) struct Flow {
     pub(crate) required_root: Option<(Digest32, u64)>,
     pub(crate) key_body_root: Option<super::KeyBodyNeed>,
     pub(crate) key_body_token: Option<Arc<()>>,
+    pub(crate) key_body_unavailable: Option<KeyBodyUnavailable>,
+    pub(crate) key_availability_token: Option<Arc<()>>,
+    pub(crate) key_availability_result:
+        Option<([u8; 16], Option<(u64, Option<super::KeyBodyAvailable>)>)>,
     key_body_checked: bool,
     pub(crate) hint: Option<super::HeadHint>,
     /// Canonical local recovery proof root, not a consumed advisory inbox item.
@@ -462,6 +472,9 @@ impl Flow {
             required_root: required,
             key_body_root: None,
             key_body_token: None,
+            key_body_unavailable: None,
+            key_availability_token: None,
+            key_availability_result: None,
             key_body_checked: false,
             state_charge: None,
             hint,
@@ -637,6 +650,9 @@ impl Flow {
             required_root: None,
             key_body_root: None,
             key_body_token: None,
+            key_body_unavailable: None,
+            key_availability_token: None,
+            key_availability_result: None,
             key_body_checked: false,
             state_charge: None,
             hint: None,
@@ -747,6 +763,19 @@ impl Flow {
         self.key_body_root = Some(need);
         self.key_body_token = Some(token);
         self.control_context = context;
+        self
+    }
+
+    /// An exact receiver-owned cursor asks for one provider catalog page.
+    pub(crate) fn with_key_availability(mut self, after: Option<u64>, token: Arc<()>) -> Self {
+        self.tasks.clear();
+        self.tasks.push(Task {
+            request: self.request,
+            purpose: Purpose::Control,
+            operation: Operation::Wire(Query::KeyAvailability { after }),
+        });
+        self.inventory = false;
+        self.key_availability_token = Some(token);
         self
     }
 
@@ -919,8 +948,7 @@ impl Flow {
         author: Digest32,
         head: Digest32,
     ) -> Result<bool> {
-        self.decline_exact(source, job, inbox, author, head, None)
-            .await
+        self.decline_exact(source, job, inbox, author, head).await
     }
     async fn decline_exact(
         &mut self,
@@ -929,7 +957,6 @@ impl Flow {
         inbox: &super::hints::HintInbox,
         author: Digest32,
         head: Digest32,
-        key_body: Option<super::KeyBodyNeed>,
     ) -> Result<bool> {
         if self.local_own_discovery {
             // Startup metadata discovery is scoped to the selected connection, not the old
@@ -948,14 +975,7 @@ impl Flow {
             (author, head)
         };
         let remembered = match source
-            .remember_decline(
-                job,
-                author,
-                head,
-                self.request,
-                self.local_own_root(),
-                key_body,
-            )
+            .remember_decline(job, author, head, self.request, self.local_own_root())
             .await
         {
             Ok(super::source::DeclineResult::Stored {
@@ -996,7 +1016,7 @@ impl Flow {
                 return Ok(false);
             }
         };
-        if !self.local_own_root() && key_body.is_none() {
+        if !self.local_own_root() {
             inbox.finish(self.room, source.peer, author, head);
         }
         self.declined = self.declined.saturating_add(u64::from(remembered));
@@ -1245,7 +1265,9 @@ impl Flow {
                     // The attempted settlement error is the primary failure. Without a fresh
                     // snapshot we cannot know which replacement must complete, so retain the
                     // existing explicit recovery/erasure wait instead of claiming a wake.
-                    eprintln!("vox: history settlement recovery snapshot worker stopped: {snapshot_error}");
+                    eprintln!(
+                        "vox: history settlement recovery snapshot worker stopped: {snapshot_error}"
+                    );
                 }
             }
             return Err(error);
@@ -1302,7 +1324,7 @@ impl Flow {
         let mut charge = match cleanup_job.reserve_or_pressure(envelope) {
             Ok(charge) => charge,
             Err(Error::HistoryCapacity(pressure)) => {
-                return Ok(RetirementStep::Wait(RetirementWait::Bytes(*pressure)))
+                return Ok(RetirementStep::Wait(RetirementWait::Bytes(*pressure)));
             }
             Err(error) => return Err(error),
         };
@@ -1515,6 +1537,7 @@ impl Flow {
             self.received.clone(),
             self.stage(purpose),
             purpose == Purpose::History,
+            self.key_body_root,
             fence,
             deadline,
             Arc::clone(&self.work_committed),
@@ -2463,6 +2486,19 @@ impl Flow {
                         query = Query::Entry { head, seq, offset };
                     }
                 }
+                if let (Some(need), Query::Entry { head, seq, offset }) =
+                    (self.key_body_root, &query)
+                {
+                    if *head == need.head && *seq == need.seq {
+                        query = Query::KeyBody {
+                            head: *head,
+                            author: need.target.author,
+                            hash: need.hash,
+                            seq: *seq,
+                            offset: *offset,
+                        };
+                    }
+                }
                 let receiver = self.receiver(store.clone(), task.purpose, fence.clone(), deadline);
                 let wire_request = if body {
                     self.stage(task.purpose)
@@ -2494,6 +2530,9 @@ impl Flow {
                 .await?;
                 self.body_progress |= result.body_progress;
                 if let Some(inventory) = result.inventory.as_ref() {
+                    source
+                        .offer_key_catalog(job, inventory.key_catalog, conn.serial())
+                        .await?;
                     let offered = source
                         .offer_role(
                             job,
@@ -2623,6 +2662,11 @@ impl Flow {
                         }
                     }
                 }
+                if matches!(query, Query::KeyAvailability { .. })
+                    && result.status == Status::Complete
+                {
+                    self.key_availability_result = result.key_availability;
+                }
                 if let Some(inventory) = result.inventory {
                     for page in inventory.hints.chunks(64) {
                         let offered = source
@@ -2638,18 +2682,20 @@ impl Flow {
                         }
                     }
                 }
-                if result.status == Status::BodyNotHeld {
-                    if let Some(debt) = self.key_body_root.filter(|debt| {
-                        matches!(query, Query::Entry { head, seq, .. } if head == debt.head && seq == debt.seq)
-                    }) {
-                        if !self.decline_exact(&source, job, inbox, debt.target.author, debt.target.head, Some(debt)).await? {
-                            return Ok(());
-                        }
-                        self.tasks.clear();
-                        self.replay = None;
-                        self.push(Task { operation: Operation::ReclaimKeyUnavailable, ..task })?;
-                        return Ok(());
-                    }
+                if matches!(result.status, Status::BodyNotHeld | Status::EvidenceUnavailable)
+                    && self.key_body_root.is_some_and(|debt| {
+                        matches!(query, Query::KeyBody { head, seq, .. } if head == debt.head && seq == debt.seq)
+                    })
+                {
+                    self.key_body_unavailable = Some(if result.status == Status::BodyNotHeld {
+                        KeyBodyUnavailable::Body
+                    } else {
+                        KeyBodyUnavailable::Evidence
+                    });
+                    self.tasks.clear();
+                    self.replay = None;
+                    self.push(Task { operation: Operation::ReclaimKeyUnavailable, ..task })?;
+                    return Ok(());
                 }
                 if result.status == Status::BodyNotHeld && task.purpose == Purpose::Live {
                     let Query::Entry { head, seq, .. } = query else {
@@ -2782,6 +2828,7 @@ impl Flow {
                             Query::Header { head, .. }
                             | Query::Proof { head, .. }
                             | Query::Entry { head, .. }
+                            | Query::KeyBody { head, .. }
                             | Query::Page { head, .. } => {
                                 match source
                                     .read(
@@ -2810,7 +2857,9 @@ impl Flow {
                                     Lookup::Missing => None,
                                 }
                             }
-                            Query::Inventory | Query::Context(_) => None,
+                            Query::Inventory
+                            | Query::KeyAvailability { .. }
+                            | Query::Context(_) => None,
                         };
                         // The peer said it cannot serve this header or proof: the hint that
                         // depends on it is not pulled from that peer again until its inventory
@@ -3076,6 +3125,17 @@ impl Flow {
                             } else {
                                 Operation::Wire(query)
                             },
+                        })?;
+                    }
+                    Some(LocalNeed::KeyBodyRetired) => {
+                        if self.key_body_root.is_none() {
+                            return Err(Error::MalformedAtRest("retired key body has no owner"));
+                        }
+                        self.tasks.clear();
+                        self.replay = None;
+                        self.push(Task {
+                            operation: Operation::ReclaimKeyUnavailable,
+                            ..task
                         })?;
                     }
                     Some(LocalNeed::StagedBody) => {

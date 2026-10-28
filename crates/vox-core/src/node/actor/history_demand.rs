@@ -2019,7 +2019,8 @@ impl Node {
                         && room.epoch() == prepared.epoch
                         && room.history_instance(profile.store()).ok()
                             == Some(prepared.status.instance);
-                    same_room && (committed_terminal
+                    same_room
+                        && (committed_terminal
                             || (room.is_member(&prepared.node)
                                 && !room.has_left(&prepared.node)
                                 && room.ended(self.now_ms().get()).is_none()
@@ -2039,9 +2040,8 @@ impl Node {
                 // A later authorization change must prevent dispatch, but it cannot undo a
                 // newer action already committed in this same room. Retire an older recovery
                 // probe before it can replace that action's status.
-                let committed_intent = user_intent
-                    && same_room
-                    && prepared.local_boundary == LocalBoundary::Durable;
+                let committed_intent =
+                    user_intent && same_room && prepared.local_boundary == LocalBoundary::Durable;
                 if let Some(Ok(prepared)) = result.take() {
                     if let Some(dispatch) = prepared.dispatch {
                         dispatch.fence.retire();

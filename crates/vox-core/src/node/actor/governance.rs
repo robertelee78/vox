@@ -426,6 +426,16 @@ impl Node {
             Ok(pending) => self.governance_work.again |= pending,
             Err(error) => channel.poison(&error),
         }
+        if governance_ready && channel.key_debt_retention_pending() {
+            match channel.prune_expired_key_body_debts(&store, self.now_ms()) {
+                Ok(()) => self.governance_work.again |= channel.key_debt_retention_pending(),
+                Err(error) => channel.poison(&error),
+            }
+        }
+        match channel.advance_key_provider_prune(&store) {
+            Ok(pending) => self.governance_work.again |= pending,
+            Err(error) => channel.poison(&error),
+        }
         // Classification has no authority until governance is current. Continue its
         // bounded sealed scan in this same round-robin room turn; a quiet room must not
         // need another sync to finish, and an unresolved absent target is not busy work.
