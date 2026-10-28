@@ -699,6 +699,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
+        NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
         NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
         NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
         NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
@@ -1376,6 +1377,13 @@ enum NetEvent {
     /// A bounded worker has prepared an encrypted own-key response; current authority and
     /// the exact connection are checked again before it is sent.
     OwnKeyDonorReady(own_keys::DonorReady),
+    OwnKeyUntrustReady {
+        owner: Arc<()>,
+        rooms: Vec<(Digest32, SharedChannel)>,
+        transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+        command: NodeCommand,
+        reply: oneshot::Sender<Outcome>,
+    },
     OwnKeyLeaveReady {
         room: Digest32,
         instance: SharedChannel,
@@ -5442,6 +5450,9 @@ pub struct Node {
     own_key_pending: BTreeMap<Digest32, own_keys::ResponseReady>,
     own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
+    own_key_untrust_pending: Option<Arc<()>>,
+    own_key_room_set_changed: watch::Sender<()>,
+    own_key_untrust_transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -6314,6 +6325,9 @@ impl Node {
             own_key_pending: BTreeMap::new(),
             own_key_room_cancel: BTreeMap::new(),
             own_key_leave_pending: BTreeMap::new(),
+            own_key_untrust_pending: None,
+            own_key_room_set_changed: watch::channel(()).0,
+            own_key_untrust_transitions: None,
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -6915,6 +6929,13 @@ impl Node {
                         }
                         self.note_if_stalled(name, started);
                         self.publish().await;
+                        continue;
+                    }
+                    if matches!(&command, NodeCommand::Untrust { .. })
+                        || matches!(&command, NodeCommand::Proved { change } if matches!(**change, NodeCommand::Untrust { .. }))
+                    {
+                        self.begin_own_key_untrust(command, reply);
+                        self.note_if_stalled(name, started);
                         continue;
                     }
                     // Reserve the room's sole completion before any signed/config write.
@@ -10475,6 +10496,42 @@ impl Node {
                 self.take_inbound_skdm(stream).await;
             }
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
+            NetEvent::OwnKeyUntrustReady {
+                owner,
+                rooms,
+                transitions,
+                command,
+                reply,
+            } => {
+                if !self
+                    .own_key_untrust_pending
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                } else {
+                    self.own_key_untrust_pending = None;
+                    let current = rooms.len() == self.channels.len()
+                        && rooms.iter().all(|(room, instance)| {
+                            self.channels
+                                .get(room)
+                                .is_some_and(|current| Arc::ptr_eq(current, instance))
+                        });
+                    if current {
+                        if let Some(transitions) = transitions {
+                            self.own_key_untrust_transitions = Some(transitions);
+                            let outcome = self.handle(command).await;
+                            self.own_key_untrust_transitions = None;
+                            let _ = reply.send(outcome);
+                        } else {
+                            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                        }
+                    } else {
+                        drop(transitions);
+                        self.begin_own_key_untrust(command, reply);
+                    }
+                }
+            }
             NetEvent::OwnKeyLeaveReady {
                 room,
                 instance,
@@ -14278,6 +14335,7 @@ impl Node {
         }
         self.role_wake
             .install(parsed.channel_id, &channel.role_owed());
+        self.own_key_room_set_changed.send_replace(());
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -15102,6 +15160,9 @@ impl Node {
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        // No old own-key response can remain active after the keyring narrowing commits.
+        // Later withdrawals and board publication do not need to hold writer admission closed.
+        self.own_key_untrust_transitions = None;
         // The keyring decision is durable. Finish each open-room withdrawal synchronously
         // under its reservation; preserve the exact generation for post-lock notifications.
         let mut completed = Vec::new();
@@ -20350,6 +20411,10 @@ impl Node {
         // Retire queued scanner admission and its wake before dropping room ownership. A
         // physical blocking read retains its own secret guard until it actually exits.
         self.key_body_scan = key_body_scan::Controller::default();
+        self.own_key_room_set_changed.send_replace(());
+        for (_, cancel) in std::mem::take(&mut self.own_key_room_cancel) {
+            cancel.send_replace(true);
+        }
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
@@ -20576,6 +20641,7 @@ impl Node {
         }
         let inserted = authority.publish_room_creation(|| {
             self.role_wake.install(id, &ch.role_owed());
+            self.own_key_room_set_changed.send_replace(());
             self.channels
                 .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
@@ -21173,6 +21239,9 @@ impl Node {
         self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
+        if self.channels.contains_key(channel_id) {
+            self.own_key_room_set_changed.send_replace(());
+        }
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -22047,6 +22116,7 @@ impl Node {
         let published = authority.publish(|| {
             self.remember_or_say(&ch);
             self.role_wake.install(channel_id, &ch.role_owed());
+            self.own_key_room_set_changed.send_replace(());
             self.channels
                 .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
@@ -22126,6 +22196,9 @@ impl Node {
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
+        if self.channels.contains_key(channel_id) {
+            self.own_key_room_set_changed.send_replace(());
+        }
         let outcome = match self.channels.remove(channel_id) {
             Some(shared) => {
                 shared.lock().await.lock_now();
@@ -22161,6 +22234,79 @@ impl Node {
             self.publish().await;
         }
         outcome
+    }
+
+    /// Retire sends from all current rooms off actor before committing a keyring removal.
+    fn begin_own_key_untrust(&mut self, command: NodeCommand, mut reply: oneshot::Sender<Outcome>) {
+        if self.own_key_untrust_pending.is_some() {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_untrust_pending = Some(Arc::clone(&owner));
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(room, instance)| (*room, Arc::clone(instance)))
+            .collect();
+        let watches: Vec<_> = rooms
+            .iter()
+            .map(|(room, _)| self.own_key_room_watch(*room))
+            .collect();
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let mut room_set_changed = self.own_key_room_set_changed.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mut transitions = Vec::with_capacity(rooms.len());
+            let mut changes: Vec<_> = watches
+                .into_iter()
+                .map(|mut watch| {
+                    Box::pin(async move {
+                        let _ = watch.changed().await;
+                    })
+                })
+                .collect();
+            let retired = std::future::poll_fn(move |cx| {
+                for change in &mut changes {
+                    if std::future::Future::poll(change.as_mut(), cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                std::task::Poll::Pending
+            });
+            tokio::pin!(retired);
+            for (_, instance) in &rooms {
+                let gate: Option<Arc<crate::node::channel::own_writer_gate::Gate>> = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = &mut retired => None,
+                    channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                };
+                let Some(gate) = gate else { break };
+                let transition = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = &mut retired => None,
+                    transition = gate.transition() => Some(transition),
+                };
+                let Some(transition) = transition else { break };
+                transitions.push(transition);
+            }
+            let transitions = (transitions.len() == rooms.len()).then_some(transitions);
+            let _ = tx
+                .send(NetEvent::OwnKeyUntrustReady {
+                    owner,
+                    rooms,
+                    transitions,
+                    command,
+                    reply,
+                })
+                .await;
+        });
     }
 
     /// Retire physical own-key sends off actor before the leave can commit.
@@ -22814,6 +22960,9 @@ impl Node {
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
+        if self.channels.contains_key(channel_id) {
+            self.own_key_room_set_changed.send_replace(());
+        }
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
             name = crate::node::resolver::room_shown(ch.name(), channel_id);
