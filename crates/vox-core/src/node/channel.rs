@@ -526,8 +526,9 @@ pub const AUTHORS_HARD_LIMIT: usize = 2 * MAX_AUTHORS;
 pub const RENDER_BACKFILL_ROWS_PER_TURN: usize = governance::PAGE_ROWS;
 
 /// **Test-only**: when set, `room admin add` gives the certificate this finite lifetime. The
-/// optional FX-22 journey uses the real shipped command and this source-owned interval to prove
-/// that an otherwise quiet room wakes exactly when its effective authority expires.
+/// optional FX-22 journey uses the shipped command to observe authority becoming effective and
+/// later absent. It does not prove an exact or autonomous expiry wake: if authority never expires,
+/// its wait has no finite PRODUCT red and an apparatus watchdog can only report no result.
 #[cfg(feature = "test-knobs")]
 pub const TEST_EXPIRING_ADMIN_ENV: &str = "VOX_TEST_EXPIRING_ADMIN";
 
