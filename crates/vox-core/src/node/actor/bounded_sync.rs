@@ -2353,6 +2353,16 @@ impl Node {
                     .get(&interrupted.room)
                     .is_some_and(|current| Arc::ptr_eq(current, &old))
             });
+            if !same_room {
+                if self.history_demand.owns_running_fence(
+                    interrupted.request,
+                    interrupted.generation,
+                    &interrupted.fence,
+                ) {
+                    self.history_demand.failed_current(interrupted.room, interrupted.instance, interrupted.request, interrupted.generation, "The room changed while history was retiring; resume the saved request in the current room.");
+                }
+                continue;
+            }
             if same_room
                 && interrupted.completed
                 && self.history_demand.owns_running_fence(

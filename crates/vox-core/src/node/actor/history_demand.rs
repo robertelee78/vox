@@ -924,7 +924,7 @@ impl Node {
             // A stale selector cannot cancel the exact accepted action already waiting here.
             return Err("The requested resume does not match the retained history request.".into());
         }
-        self.begin_history_demand_with_job(room, instance, action, None, None, None)
+        self.begin_history_demand_with_job(room, instance, action, None, None, None, None)
     }
 
     fn begin_history_demand_with_job(
@@ -935,6 +935,7 @@ impl Node {
         admitted: Option<Job>,
         resume_private: Option<bool>,
         interrupted: Option<demand::RetiredPublicToken>,
+        interrupted_room: Option<tokio::sync::OwnedMutexGuard<ChannelState>>,
     ) -> Result<Status, String> {
         self.accept_history_demand();
         if matches!(action, Action::Status) {
@@ -1220,17 +1221,15 @@ impl Node {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 let room_guard = if local_only || resume_inspect.is_some() { None } else {
                     let shared = shared.ok_or("room is not open")?;
-                    Some(tokio::select! {
-                        biased;
-                        () = worker_fence.retired() => return Err("history preparation cancelled".into()),
-                        guard = async {
-                            if automatic_interrupted {
-                                Ok(shared.lock_owned().await)
-                            } else {
-                                tokio::time::timeout_at(deadline, shared.lock_owned()).await.map_err(|_| "history room is busy".to_owned())
-                            }
-                        } => guard?,
-                    })
+                    if automatic_interrupted {
+                        Some(interrupted_room.ok_or("interrupted history room ownership missing")?)
+                    } else {
+                        Some(tokio::select! {
+                            biased;
+                            () = worker_fence.retired() => return Err("history preparation cancelled".into()),
+                            guard = tokio::time::timeout_at(deadline, shared.lock_owned()) => guard.map_err(|_| "history room is busy".to_owned())?,
+                        })
+                    }
                 };
                 let read_fence = worker_fence.clone();
                 // Do not detach this read on cancellation: retire() awaits its bounded completion.
@@ -1487,6 +1486,48 @@ impl Node {
             if let Some(fence) = owed.wake_fence.take() {
                 fence.retire();
             }
+            // Hold the exact room before creating a preparation owner; the earlier
+            // eligibility probe alone does not close the room-lock race.
+            let interrupted_room = if owed.interrupted.is_some() {
+                let Some(shared) = self.channels.get(&owed.room).cloned() else {
+                    drop(job);
+                    self.history_demand.resume_owed = Some(owed);
+                    return;
+                };
+                match shared.clone().try_lock_owned() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        drop(job);
+                        let fence = Fence::new();
+                        let worker_fence = Arc::clone(&fence);
+                        let tx = self.net_tx.clone();
+                        let room = owed.room;
+                        let instance = owed.instance;
+                        let request = owed.request;
+                        owed.wake_fence = Some(fence);
+                        owed.waiting_bytes = true;
+                        owed.wake_task = Some(tokio::spawn(async move {
+                            tokio::select! {
+                                biased;
+                                () = worker_fence.retired() => return,
+                                guard = shared.lock_owned() => drop(guard),
+                            }
+                            let _ = tx
+                                .send(NetEvent::HistoryResumeReady {
+                                    room,
+                                    instance,
+                                    request,
+                                    fence: worker_fence,
+                                })
+                                .await;
+                        }));
+                        self.history_demand.resume_owed = Some(owed);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let result = self.begin_history_demand_with_job(
                 owed.room,
                 owed.instance,
@@ -1496,6 +1537,7 @@ impl Node {
                 Some(job),
                 owed.private,
                 owed.interrupted,
+                interrupted_room,
             );
             if self.history_demand.preparing.is_none() && self.history_demand.resume_owed.is_none()
             {
