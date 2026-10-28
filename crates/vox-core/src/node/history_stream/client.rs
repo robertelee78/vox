@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::{entry_store::sparse::CursorBinding, ChannelState};
+use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Active, Context};
 use crate::node::store::{ReceivedFlow, Store};
 use crate::wire::WireError;
@@ -80,6 +81,7 @@ pub(crate) enum LocalProof {
 /// All results are bounded scheduling information, not permission to fetch another page.
 pub(crate) struct Received {
     pub(crate) status: Status,
+    pub(crate) offered_availability: Option<super::super::channel::availability::Token>,
     pub(crate) continuation: Option<Continuation>,
     pub(crate) needs: Vec<Query>,
     pub(crate) verifiers: Vec<CursorBinding>,
@@ -101,6 +103,7 @@ impl Received {
     fn pending(status: Status) -> Self {
         Self {
             status,
+            offered_availability: None,
             continuation: None,
             needs: Vec::new(),
             verifiers: Vec::new(),
@@ -175,6 +178,7 @@ impl Receiver {
             Option<super::source::RoleAnnouncement>,
             Option<([u8; 16], u64)>,
             Option<super::source::CatalogAnnouncement>,
+            super::super::channel::availability::Token,
         )>,
     > {
         self.source.inventory(job).await
@@ -196,6 +200,17 @@ impl Receiver {
     ) -> Result<()> {
         self.source
             .acknowledge_key_catalog(job, notice, connection_serial)
+            .await
+    }
+
+    pub(super) async fn observe_availability(
+        &self,
+        job: &Job,
+        connection: u64,
+        token: super::super::channel::availability::Token,
+    ) -> Result<()> {
+        self.source
+            .observe_availability(job, connection, token)
             .await
     }
 
@@ -404,7 +419,8 @@ impl Receiver {
                         hints,
                         role,
                         key_catalog,
-                    } => Action::Inventory(hints, role, key_catalog),
+                        availability,
+                    } => Action::Inventory(hints, role, key_catalog, availability),
                     Frame::KeyAvailability { instance, page, .. } => {
                         Action::KeyAvailability(instance, page)
                     }
@@ -426,7 +442,11 @@ impl Receiver {
                 }
             };
             match action {
-                Action::Inventory(hints, role, key_catalog) => {
+                Action::Inventory(hints, role, key_catalog, token) => {
+                    if let (Some(connection), Some(token)) = (io.availability_connection, token) {
+                        self.observe_availability(io.job(), connection, token)
+                            .await?;
+                    }
                     let charge = io.job().reserve_or_pressure(
                         hints.capacity() * std::mem::size_of::<super::HeadHint>(),
                     )?;
@@ -854,6 +874,7 @@ enum Action {
         Vec<super::HeadHint>,
         Option<super::HeadHint>,
         Option<([u8; 16], u64)>,
+        Option<super::super::channel::availability::Token>,
     ),
     Meta,
     Chunk {

@@ -103,6 +103,7 @@ pub(super) async fn answer(
             hints,
             role,
             key_catalog,
+            availability,
         } = incoming.frame()?
         else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
@@ -124,6 +125,11 @@ pub(super) async fn answer(
         *inventory_added |= offered.added != 0;
         if offered.full {
             return Err(Error::Unreachable("history role hint capacity busy"));
+        }
+        if let (Some(connection), Some(token)) = (io.availability_connection, availability) {
+            source
+                .observe_availability(&work_job, connection, token)
+                .await?;
         }
         for slice in hints.chunks(64) {
             let offered = source
@@ -218,6 +224,7 @@ async fn respond(
                     hints: inventory.value.0,
                     role: inventory.value.1.as_ref().map(|notice| notice.head),
                     key_catalog: inventory.value.2,
+                    availability: io.availability_connection.map(|_| inventory.value.4),
                 },
                 0,
             )

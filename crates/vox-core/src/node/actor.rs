@@ -51,6 +51,7 @@ mod governance;
 mod history_demand;
 mod key_body_scan;
 mod local_trust;
+mod own_keys;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
@@ -696,6 +697,11 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinRequest { .. } => "answering somebody's join",
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
+        NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
+        NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
+        NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
+        NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
+        NetEvent::OwnKeyCapacityReady { .. } => "resuming own-key recovery after capacity release",
         NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
         NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
         NetEvent::Stream { .. } => "serving a stream",
@@ -1366,6 +1372,19 @@ enum NetEvent {
     },
     /// A peer's pairwise stream, its frames **already read** off the actor (V210-71).
     Pairwise(PairwiseIn),
+    /// A bounded worker has prepared an encrypted own-key response; current authority and
+    /// the exact connection are checked again before it is sent.
+    OwnKeyDonorReady(own_keys::DonorReady),
+    OwnKeyRequestReady(Box<own_keys::RequestReady>),
+    OwnKeyResponseReady(Box<own_keys::ResponseReady>),
+    OwnKeyRequestFailed {
+        request: own_keys::Request,
+        peer: Digest32,
+        connection: u64,
+    },
+    OwnKeyCapacityReady {
+        request: own_keys::Request,
+    },
     /// A stream that carried this node's hello to `peer` could not be written: the peer does not
     /// hold the session, so the next delivery must carry the hello again.
     HelloUndelivered {
@@ -1433,6 +1452,7 @@ enum NetEvent {
         channel_id: Digest32,
         peer: Digest32,
         discovery_connection: Option<u64>,
+        availability: Option<crate::node::channel::availability::Token>,
         instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
         head: crate::node::history_stream::HeadHint,
         epoch: u64,
@@ -2296,11 +2316,15 @@ async fn serve_typed(
         // pairwise streams is load-bearing: a hello and the key that follows it can be separate
         // streams, and reordering them is the race F12 was. So a silent stream holds back only
         // the pairwise streams its own peer opened after it.
-        Ok(Inbound::Pairwise { peer, send, recv }) => {
+        Ok(Inbound::Pairwise {
+            peer: _,
+            send,
+            recv,
+        }) => {
             state.failures = 0;
             let queue = state.pairwise.get_or_insert_with(|| {
                 let (q, rx) = mpsc::channel(PAIRWISE_QUEUE);
-                tokio::spawn(read_pairwise_streams(peer, rx, tx.clone()));
+                tokio::spawn(read_pairwise_streams(Arc::clone(&conn), rx, tx.clone()));
                 q
             });
             // Back-pressure on this peer's own connection only: a full queue means this peer has
@@ -2604,11 +2628,12 @@ const PAIRWISE_QUEUE: usize = 32;
 /// `framing::FRAME_PATIENCE`; a stream that sends nothing usable is dropped here, as the actor
 /// dropped it before.
 async fn read_pairwise_streams(
-    peer: Digest32,
+    conn: Arc<VoxConnection>,
     mut streams: mpsc::Receiver<(quinn::SendStream, quinn::RecvStream)>,
     tx: mpsc::Sender<NetEvent>,
 ) {
     use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
+    let peer = conn.peer_id();
     while let Some((mut send, mut recv)) = streams.recv().await {
         let first = match recv_pairwise(&mut recv).await {
             Ok(Some(first)) => first,
@@ -2624,6 +2649,15 @@ async fn read_pairwise_streams(
                 continue;
             }
         };
+        if matches!(first, PairwiseFrame::RecoveryReply { .. })
+            || (matches!(first, PairwiseFrame::RecoveryOpen { .. })
+                && !conn.supports_own_recovery())
+        {
+            let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
+            let _ = send.reset(why);
+            let _ = recv.stop(why);
+            continue;
+        }
         // A hello is followed on the same stream by the frame it opens the session for, written
         // without waiting for anything, so it is read now too.
         let second = if matches!(first, PairwiseFrame::Hello { .. }) {
@@ -2632,6 +2666,7 @@ async fn read_pairwise_streams(
             None
         };
         let stream = PairwiseIn {
+            conn: Arc::clone(&conn),
             peer,
             first,
             second,
@@ -2646,6 +2681,7 @@ async fn read_pairwise_streams(
 
 /// A pairwise stream whose frames have been read off the actor.
 struct PairwiseIn {
+    conn: Arc<VoxConnection>,
     /// The authenticated peer.
     peer: Digest32,
     /// The stream's first frame.
@@ -5383,12 +5419,20 @@ pub struct Node {
     bounded_completion_wake: Arc<tokio::sync::Notify>,
     role_wake: Arc<crate::node::channel::role_owed::RoleWake>,
     key_body_scan: key_body_scan::Controller,
+    availability_wake: Arc<tokio::sync::Notify>,
     /// Exact retirement ownership and failures live on the daemon budget, so they survive both
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
     /// Scalar scheduling identities only. Durable targets and pages remain in the room/store.
     own_recovery_rooms: BTreeMap<Digest32, (Digest32, u64, bool)>,
+    /// The exact authenticated own message whose body the readability audit still needs.
+    own_recovery_body_debts: BTreeMap<Digest32, (Digest32, u64, Digest32)>,
+    /// At most one exact self-author key request is physically in flight per room.
+    own_key_active: BTreeMap<Digest32, [u8; 16]>,
+    own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
+    own_key_pending: BTreeMap<Digest32, own_keys::ResponseReady>,
+    own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -6251,9 +6295,15 @@ impl Node {
             bounded_completion_wake,
             role_wake: Arc::new(crate::node::channel::role_owed::RoleWake::default()),
             key_body_scan: key_body_scan::Controller::default(),
+            availability_wake: Arc::new(tokio::sync::Notify::new()),
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             own_recovery_rooms: BTreeMap::new(),
+            own_recovery_body_debts: BTreeMap::new(),
+            own_key_active: BTreeMap::new(),
+            own_key_parked: BTreeMap::new(),
+            own_key_pending: BTreeMap::new(),
+            own_key_room_cancel: BTreeMap::new(),
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -6659,6 +6709,7 @@ impl Node {
             };
             tokio::pin!(governance_deadline);
             tokio::select! {
+                () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
                 () = &mut governance_deadline => {
                     // Certificate expiry is its own causal wake. A quiet room does not wait for
                     // the one-second actor tick, a command, or network traffic to invalidate it.
@@ -10413,6 +10464,22 @@ impl Node {
             NetEvent::Pairwise(stream) => {
                 self.take_inbound_skdm(stream).await;
             }
+            NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
+            NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
+            NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
+            NetEvent::OwnKeyRequestFailed {
+                request,
+                peer,
+                connection,
+            } => {
+                self.fail_own_key_request(request, peer, connection);
+            }
+            NetEvent::OwnKeyCapacityReady { request } => {
+                if self.own_key_active.get(&request.room) == Some(&request.id) {
+                    self.own_key_active.remove(&request.room);
+                    self.governance_work.wake_room(request.room);
+                }
+            }
             NetEvent::HelloUndelivered {
                 channel_id,
                 peer,
@@ -11657,6 +11724,7 @@ impl Node {
                 channel_id,
                 peer,
                 discovery_connection,
+                availability,
                 instance,
                 head,
                 epoch,
@@ -11684,7 +11752,10 @@ impl Node {
                                     == Some(generation);
                             let discovered = current
                                 && discovery_connection.is_some_and(|serial| {
-                                    self.net
+                                    self.ports.get(&(channel_id, peer)).is_some_and(|p| {
+                                        p.availability.remote(serial) == availability
+                                    }) && self
+                                        .net
                                         .as_ref()
                                         .and_then(|net| net.manager().existing(&peer))
                                         .is_some_and(|connection| {
@@ -12095,17 +12166,18 @@ impl Node {
                         use crate::node::channel::history::Reply;
                         let mut room = shared.lock().await;
                         let trusted = self.trust.trusted();
-                        let result = room
-                            .forget_keys_except(profile.store(), &trusted)
-                            .map_err(|error| error.to_string())
-                            .and_then(|_| {
-                                room.history_query(
-                                    profile.store(),
-                                    query,
-                                    crate::node::ipc::rows_budget(),
-                                    (self.clock)(),
-                                )
-                            });
+                        let removed = room.forget_keys_except(profile.store(), &trusted);
+                        if removed.as_ref().is_ok_and(|count| *count > 0) {
+                            self.governance_work.wake_room(channel_id);
+                        }
+                        let result = removed.map_err(|error| error.to_string()).and_then(|_| {
+                            room.history_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                                (self.clock)(),
+                            )
+                        });
                         match result {
                             Ok(Reply::DisplayRevision(revision)) => {
                                 use sha2::{Digest, Sha256};
@@ -14700,9 +14772,13 @@ impl Node {
             let trusted = self.trust.trusted();
             {
                 let mut channel = shared.lock().await;
-                if let Err(error) = channel.forget_keys_except(profile.store(), &trusted) {
-                    channel.poison(&error);
-                    return Err(error);
+                match channel.forget_keys_except(profile.store(), &trusted) {
+                    Ok(count) if count > 0 => self.governance_work.wake_room(*channel_id),
+                    Ok(_) => {}
+                    Err(error) => {
+                        channel.poison(&error);
+                        return Err(error);
+                    }
                 }
             }
             let signer = profile.signer()?;
@@ -15173,16 +15249,20 @@ impl Node {
             .collect();
         let trusted: BTreeSet<Digest32> = self.trust.trusted().into_iter().collect();
         let now_ms = self.now_ms();
-        for shared in self.channels.values() {
+        for (room, shared) in &self.channels {
             // A room mid-session is skipped, not waited for; the next tick comes round.
             let Ok(mut channel) = shared.try_lock() else {
                 continue;
             };
             // Other members' generations this node has read to the end go too (R14 on the
             // receiving side), whatever this node still owes with its own.
-            pruned |= channel
+            let receiver_pruned = channel
                 .prune_superseded_receivers(&store)
                 .is_ok_and(|n| n > 0);
+            pruned |= receiver_pruned;
+            if receiver_pruned {
+                self.governance_work.wake_room(*room);
+            }
             // A refreshing or unreadable consent projection cannot prove that old keys are
             // no longer owed. Preserve them until a later bounded governance turn settles it.
             if channel.key_generations() <= 1
@@ -16194,20 +16274,31 @@ impl Node {
     async fn room_ref(
         &self,
         channel_id: &Digest32,
+        peer: &Digest32,
     ) -> Option<(
         crate::node::ports::RoomRef,
         Arc<std::sync::atomic::AtomicU64>,
         u64,
         bool,
+        Arc<crate::node::channel::availability::Peer>,
     )> {
         use crate::node::ports::RoomRef;
         let store = self.log_store()?;
         if let Some(shared) = self.channels.get(channel_id) {
-            let channel = shared.lock().await;
+            let mut channel = shared.lock().await;
+            let availability = channel
+                .availability_peer(*peer, Some(&self.availability_wake))
+                .ok()?;
             let gen = channel.generation();
             let epoch = channel.epoch();
             let sparse = channel.uses_sparse_history(&store).ok()?;
-            return Some((RoomRef::Channel(Arc::downgrade(shared)), gen, epoch, sparse));
+            return Some((
+                RoomRef::Channel(Arc::downgrade(shared)),
+                gen,
+                epoch,
+                sparse,
+                availability,
+            ));
         }
         None
     }
@@ -16282,12 +16373,13 @@ impl Node {
         if !self.shares_room(channel_id, peer).await {
             return false;
         }
-        let Some((room, gen, epoch, sparse)) = self.room_ref(channel_id).await else {
+        let Some((room, gen, epoch, sparse, availability)) = self.room_ref(channel_id, peer).await
+        else {
             return false;
         };
         self.ports.insert(
             (*channel_id, *peer),
-            crate::node::ports::Port::new(room, gen, epoch, sparse),
+            crate::node::ports::Port::new(room, gen, epoch, sparse, availability),
         );
         if let Some(owner) = self.role_wake.owner(*channel_id) {
             owner.on_connect(*peer);
@@ -16311,6 +16403,7 @@ impl Node {
                 }
             }
         }
+        self.availability_wake.notify_one();
         self.sched_rooms.insert(*channel_id);
         true
     }
@@ -16450,6 +16543,7 @@ impl Node {
             }
             // **A new connection** raises a request and clears the backoff (ADR-025 D2, D5).
             if fresh_peers.contains(&peer) && existed {
+                self.availability_wake.notify_one();
                 if let Some(port) = self.ports.get_mut(&(room, peer)) {
                     port.raise();
                     port.clear_backoff();
@@ -16458,6 +16552,46 @@ impl Node {
                     c.backoff = None;
                 });
                 self.sched_rooms.insert(room);
+            }
+        }
+    }
+
+    // Only a real postcommit edge or authenticated HAVE wakes this branch. The shared
+    // handles contain scalars; retired rooms cannot mutate replacement ports.
+    fn accept_availability(&mut self) {
+        for ((room, peer), port) in &mut self.ports {
+            let connection = self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(peer));
+            // This capability extends bounded HAVE, never the legacy room protocol.
+            port.availability_enabled = port.sparse
+                && connection
+                    .as_ref()
+                    .is_some_and(|c| c.supports_availability());
+            let Some(connection) = connection.filter(|c| port.sparse && c.supports_availability())
+            else {
+                continue;
+            };
+            if port.availability_connection != Some(connection.serial()) {
+                port.availability_connection = Some(connection.serial());
+                port.availability_acked = None;
+            }
+            if port.availability_acked != Some(port.availability.local()) {
+                self.sched_rooms.insert(*room);
+            }
+            if let Some(token) = port.availability.remote(connection.serial()) {
+                let observed = (connection.serial(), token);
+                if port.availability_seen != Some(observed) {
+                    port.availability_seen = Some(observed);
+                    port.support_discovery_check = true;
+                    port.support_discovery = None;
+                    port.support_discovery_unavailable = None;
+                    port.raise();
+                    port.clear_backoff();
+                    self.governance_work.wake_room(*room);
+                    self.sched_rooms.insert(*room);
+                }
             }
         }
     }
@@ -17936,10 +18070,12 @@ impl Node {
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
         if departure_receipt {
-            if let Some((room, gen, epoch, sparse)) = self.room_ref(&channel_id).await {
-                self.ports
-                    .entry((channel_id, peer))
-                    .or_insert_with(|| crate::node::ports::Port::new(room, gen, epoch, sparse));
+            if let Some((room, gen, epoch, sparse, availability)) =
+                self.room_ref(&channel_id, &peer).await
+            {
+                self.ports.entry((channel_id, peer)).or_insert_with(|| {
+                    crate::node::ports::Port::new(room, gen, epoch, sparse, availability)
+                });
             }
         }
         if !self.ensure_port(&channel_id, &peer).await {
@@ -18002,6 +18138,7 @@ impl Node {
             false,
             crate::node::status::SyncStep::Exchanging,
         );
+        let availability_connection = conn.supports_availability().then_some(conn.serial());
         port.inbound.insert(
             token,
             crate::node::ports::Attempt {
@@ -18032,6 +18169,7 @@ impl Node {
                 fence,
                 inbox,
                 departure_receipt,
+                availability_connection,
             )
             .await;
             let _ = tx
@@ -18630,6 +18768,12 @@ impl Node {
                 // retained cursor or observes that it is already empty.
                 if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
+                }
+                if installed
+                    .as_ref()
+                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                {
+                    self.governance_work.wake_room(*channel_id);
                 }
                 installed
             };
@@ -19626,7 +19770,9 @@ impl Node {
             PairwiseFrame::Skdm { channel_id, .. }
             | PairwiseFrame::Open { channel_id, .. }
             | PairwiseFrame::Hello { channel_id, .. }
-            | PairwiseFrame::RotationHello { channel_id, .. } => *channel_id,
+            | PairwiseFrame::RotationHello { channel_id, .. }
+            | PairwiseFrame::RecoveryOpen { channel_id, .. }
+            | PairwiseFrame::RecoveryReply { channel_id, .. } => *channel_id,
         };
         // **Held, not dropped, while this node is still joining that room.** The join runs off the
         // actor now, so the responder's key — sent the moment it admits us — can arrive before the
@@ -19668,12 +19814,20 @@ impl Node {
 
     /// [`Self::handle_pairwise`], unboxed: see [`Boxed`].
     async fn handle_pairwise_unboxed(&mut self, stream: PairwiseIn) {
+        if matches!(
+            stream.first,
+            crate::node::pairwise_stream::PairwiseFrame::RecoveryOpen { .. }
+        ) {
+            self.start_own_key_donor(stream);
+            return;
+        }
         let PairwiseIn {
             peer,
             first,
             second,
             mut send,
             recv,
+            ..
         } = stream;
         #[cfg(feature = "test-knobs")]
         if self.end_key_unanswered_for_proof(
@@ -19763,6 +19917,9 @@ impl Node {
         // against our own prekey ring, exactly as the join responder does, then read
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
+            PairwiseFrame::RecoveryOpen { .. } | PairwiseFrame::RecoveryReply { .. } => {
+                return Some(Err(KeyRefusal::NotAccepted));
+            }
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
             // A key delivery in a session of its own (ADR-030 W-1), opened under that session alone
             // and never filed (W-2).
@@ -19927,11 +20084,17 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                let installed = channel.accept_skdm(profile.store(), skdm, now_ms).ok();
-                if installed.as_ref().is_some_and(|accepted| accepted.changed) {
+                let installed = channel.accept_skdm(profile.store(), skdm, now_ms);
+                if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
                 }
-                installed
+                if installed
+                    .as_ref()
+                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                {
+                    self.governance_work.wake_room(channel_id);
+                }
+                installed.ok()
             }
             _ => None,
         };
@@ -20190,6 +20353,11 @@ impl Node {
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.pairwise_epoch.send_replace(self.delivery_epoch);
+        self.own_key_active.clear();
+        self.own_key_parked.clear();
+        self.own_key_pending.clear();
+        self.own_recovery_rooms.clear();
+        self.own_recovery_body_debts.clear();
         self.history_in_flight.clear();
         // What the boards held was learnt over the network that goes down with the lock; an address
         // asked for meanwhile is not handed out by a locked node (V210-96).
@@ -20962,6 +21130,9 @@ impl Node {
 
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -21492,6 +21663,12 @@ impl Node {
         prepared: &mut RoomPreparation,
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
+        if let Some(profile) = self.profile.as_ref() {
+            let (more, _, _) = ch.advance_receiver_release_cleanup(profile.store())?;
+            // Existing preparation remains runnable after actual bounded progress. A ready
+            // room still publishes now; its ordinary maintenance inherits the durable debt.
+            prepared.progressed |= more;
+        }
         if ch.legacy_startup_cleanup_blocks_current() {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let Some(cleaned) = self.with_current_computer_authority(|| {
@@ -21585,6 +21762,12 @@ impl Node {
                                 let installed = ch.accept_skdm(profile.store(), &skdm, now);
                                 if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                                     self.governance_work.pending = true;
+                                }
+                                if installed
+                                    .as_ref()
+                                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                                {
+                                    self.governance_work.wake_room(ch.channel_id());
                                 }
                                 installed.map(|_| ())
                             }
@@ -21830,6 +22013,9 @@ impl Node {
         if published.is_none() {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
+        // Retire request/response owners from any replaced room instance before processing
+        // further actor events. Existing physical blocking workers still join on their own task.
+        self.cancel_own_key_room(channel_id);
         // Reopening replaces the room instance. Never inherit a settled marker retained for the
         // prior instance while it was absent from the open-room map.
         self.governance_work.wake_room(channel_id);
@@ -21893,6 +22079,9 @@ impl Node {
         }
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
@@ -22012,6 +22201,8 @@ impl Node {
                 return;
             }
         };
+        // The departure is durable; no response prepared for the former membership may escape.
+        self.cancel_own_key_room(channel_id);
         if let Err(fault) = self
             .withdraw_from_boards(
                 &channel_id,
@@ -22527,6 +22718,9 @@ impl Node {
         let mut name = String::new();
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;

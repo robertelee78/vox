@@ -110,7 +110,274 @@ pub(crate) struct OwnRecoveryPage {
     pub donor_through: u64,
 }
 
+/// One bounded step toward certifying the actual content in the retained signed prefix.
+/// Debts are parked until the exact body, key or authority changes; they are not a timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnReadability {
+    Complete,
+    Runnable,
+    Waiting,
+    BodyDebt {
+        target: Digest32,
+        seq: u64,
+        entry_hash: Digest32,
+    },
+    KeyDebt {
+        target: Digest32,
+        seq: u64,
+        entry_hash: Digest32,
+        epoch: u64,
+        chain: u64,
+        iteration: u64,
+    },
+}
+
+/// A cursor is meaningful only for one exact authenticated recovery target. Legacy markers
+/// have no cursor and start at one; a changed target is conservatively checked from one again.
+struct ReadabilityCursor {
+    target: Digest32,
+    next: u64,
+}
+impl ReadabilityCursor {
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        if d.array()? != 3 || d.uint()? != 1 {
+            return Err(Error::MalformedAtRest("own readability cursor"));
+        }
+        let target = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("own readability target"))?;
+        let next = d.uint()?;
+        d.finish()?;
+        if next == 0 {
+            return Err(Error::MalformedAtRest("own readability position"));
+        }
+        Ok(Self { target, next })
+    }
+    fn bytes(&self) -> Vec<u8> {
+        let mut e = Encoder::new();
+        e.array(3).uint(1).bytes(&self.target).uint(self.next);
+        e.finish()
+    }
+}
+
 impl ChannelState {
+    /// Check one bounded chunk of the exact own-author prefix. An already-settled receipt
+    /// alone is not evidence that ciphertext from a later sender generation can be read.
+    pub(crate) fn audit_own_readability(
+        &mut self,
+        store: &Store,
+        now: crate::time::Ms,
+    ) -> Result<OwnReadability> {
+        if !self.own_behind {
+            return Ok(OwnReadability::Waiting);
+        }
+        let Recovery::Head(target) = &self.own_recovery else {
+            return Ok(OwnReadability::Waiting);
+        };
+        let target = target.clone();
+        self.checked_own_head(&target)?;
+        let read = self.history_read(store)?;
+        if read.publication_busy() || !read.history_head_accepted(&target.id(), target.binding)? {
+            return Ok(OwnReadability::Waiting);
+        }
+        let snapshot = store.snapshot()?;
+        let stored = snapshot.get_segment_bounded(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_OWN_READABILITY,
+            128,
+        )?;
+        let mut initialize = stored.is_none();
+        let mut cursor = match stored {
+            Some(segment) => ReadabilityCursor::parse(&open_segment(
+                &self.sek,
+                SegmentKind::KeyMaterial,
+                SEG_OWN_READABILITY,
+                &segment,
+            )?)?,
+            None => ReadabilityCursor {
+                target: target.id(),
+                next: 1,
+            },
+        };
+        if cursor.target != target.id() {
+            cursor = ReadabilityCursor {
+                target: target.id(),
+                next: 1,
+            };
+            initialize = true;
+        }
+        if cursor.next > target.root.leaves.saturating_add(1) {
+            return Err(Error::MalformedAtRest(
+                "own readability cursor exceeds target",
+            ));
+        }
+        let start = cursor.next;
+        let rendered = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        if rendered.author_backfill_pending(&self.me())? {
+            return Ok(OwnReadability::Waiting);
+        }
+        let mut outcome = OwnReadability::Runnable;
+        let mut render_from = None;
+        for _ in 0..RENDER_BACKFILL_ROWS_PER_TURN {
+            if cursor.next > target.root.leaves {
+                outcome = OwnReadability::Complete;
+                break;
+            }
+            let seq = cursor.next;
+            let Some((_source, header)) = read.history_validated_header(&self.me(), seq)? else {
+                outcome = OwnReadability::Waiting;
+                break;
+            };
+            let hash = header.entry_hash();
+            let effect_finished = read.history_effect_finished(&hash)?;
+            let kind = header
+                .skeleton
+                .v2
+                .as_ref()
+                .ok_or(Error::OwnHistoryBehind)?
+                .kind;
+            if kind == crate::log::history::SignedEntryKind::Content
+                && rendered.fact(&hash)?.is_none()
+            {
+                let entry = read.history_entry(&hash)?;
+                let payload = entry.as_ref().and_then(|entry| entry.payload.as_deref());
+                let Some(payload) = payload else {
+                    // The signed claim is sufficient only if both possible retention classes
+                    // have expired; zero retention is unlimited and cannot discharge this debt.
+                    let ms = header.skeleton.claimed_ms;
+                    if effect_finished
+                        && self.governance_display_current(now.get())
+                        && expired_at(ms, now.get(), self.effective_retention())
+                        && expired_at(ms, now.get(), self.effective_step_retention())
+                    {
+                        cursor.next += 1;
+                        continue;
+                    }
+                    outcome = OwnReadability::BodyDebt {
+                        target: target.id(),
+                        seq,
+                        entry_hash: hash,
+                    };
+                    break;
+                };
+                let message = GroupMessage::from_wire(payload)?;
+                if message.header.author_id != self.me()
+                    || message.header.epoch != header.skeleton.epoch
+                {
+                    return Err(Error::MalformedAtRest("own readability message binding"));
+                }
+                // Session payloads use the drive receiver and are accounted for by their own
+                // already-settled effects; they are not ordinary sender-chain messages.
+                if message.header.channel_id != drive_channel(&self.channel_id) {
+                    if message.header.channel_id != self.channel_id {
+                        return Err(Error::MalformedAtRest("own readability room binding"));
+                    }
+                    let slot = (self.me(), message.header.chain_id);
+                    let historical = if message.header.epoch < self.epoch {
+                        let root = self
+                            .authors
+                            .get(&self.me())
+                            .ok_or(Error::MalformedGovernance("own history author missing"))?;
+                        own_historical_keys::lookup(
+                            &snapshot,
+                            &self.sek,
+                            &self.channel_id,
+                            root,
+                            &self.me(),
+                            message.header.epoch,
+                            message.header.chain_id,
+                        )?
+                    } else {
+                        None
+                    };
+                    let plaintext = historical
+                        .as_ref()
+                        .or_else(|| {
+                            self.receivers
+                                .get(&slot)
+                                .filter(|chain| chain.epoch() == message.header.epoch)
+                        })
+                        .and_then(|chain| chain.decrypt_retained(&message).ok())
+                        .map(Zeroizing::new);
+                    let Some(plaintext) = plaintext else {
+                        outcome = OwnReadability::KeyDebt {
+                            target: target.id(),
+                            seq,
+                            entry_hash: hash,
+                            epoch: message.header.epoch,
+                            chain: message.header.chain_id,
+                            iteration: message.header.iteration,
+                        };
+                        break;
+                    };
+                    if let Ok(Decoded::Text(content)) = crate::node::content::decode(&plaintext) {
+                        let Some(entry) = entry.as_ref() else {
+                            return Err(Error::MalformedAtRest("own readable entry missing"));
+                        };
+                        if !self.already_expired_entry(
+                            Transaction::Snapshot(&snapshot),
+                            entry,
+                            content.created_millis,
+                            now.get(),
+                        )? {
+                            // A prior opaque receipt may already have drained the ordinary
+                            // cursor. Queue the exact now-readable position and recheck after
+                            // the normal projection has committed its user-visible row.
+                            render_from = Some(seq);
+                            break;
+                        }
+                    }
+                }
+            }
+            if !effect_finished {
+                outcome = OwnReadability::Waiting;
+                break;
+            }
+            cursor.next = cursor
+                .next
+                .checked_add(1)
+                .ok_or(Error::MalformedAtRest("own readability overflow"))?;
+        }
+        if cursor.next > target.root.leaves {
+            outcome = OwnReadability::Complete;
+        }
+        drop(rendered);
+        drop(read);
+        drop(snapshot);
+        if cursor.next != start || initialize || render_from.is_some() {
+            let mut batch = store.batch()?;
+            self.check_own_recovery_marker_in(&batch)?;
+            if let Some(seq) = render_from {
+                let mut index = self
+                    .entries
+                    .write(&mut batch, &self.sek, &self.channel_id)?;
+                index.queue_backfill(self.me(), Some(seq))?;
+                index.seal()?;
+            }
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_OWN_READABILITY,
+                &seal_segment(
+                    &self.sek,
+                    SegmentKind::KeyMaterial,
+                    SEG_OWN_READABILITY,
+                    &cursor.bytes(),
+                )?,
+            )?;
+            batch.commit()?;
+            if render_from.is_some() {
+                self.entries.committed();
+            }
+        }
+        Ok(outcome)
+    }
+
     /// An authenticated high observation fences the next append even before the actor has
     /// persisted its scheduling target. This read is the append's existing canonical view.
     pub(super) fn require_own_history_safe_in(&self, read: &entry_store::Read<'_>) -> Result<()> {
@@ -324,6 +591,7 @@ impl ChannelState {
         &self,
         store: &Store,
         peer: &Digest32,
+        body_debt: Option<(Digest32, u64, Digest32)>,
     ) -> Result<Option<OwnRecoveryPage>> {
         if !self.own_behind || self.dag.is_frozen(&self.me()) {
             return Ok(None);
@@ -344,7 +612,28 @@ impl ChannelState {
             .history_held_through(&self.me())
             .map_or(0, |(seq, _)| seq);
         let donor_through = self.held_through(peer).unwrap_or(0);
-        if held >= head.root.leaves || !self.is_member(peer) || donor_through <= held {
+        if !self.is_member(peer) {
+            return Ok(None);
+        }
+        if let Some((target, seq, entry_hash)) = body_debt {
+            if target == head.id() && seq <= head.root.leaves && donor_through >= seq {
+                if let Some((_, header)) = read.history_validated_header(&self.me(), seq)? {
+                    if header.entry_hash() == entry_hash
+                        && read
+                            .history_entry(&entry_hash)?
+                            .is_none_or(|entry| entry.payload.is_none())
+                    {
+                        return Ok(Some(OwnRecoveryPage {
+                            head: target,
+                            lo: seq,
+                            hi: seq,
+                            donor_through,
+                        }));
+                    }
+                }
+            }
+        }
+        if held >= head.root.leaves || donor_through <= held {
             return Ok(None);
         }
         let lo = held.checked_add(1).ok_or(Error::OwnHistoryBehind)?;
@@ -405,19 +694,22 @@ impl ChannelState {
         if !candidate.recovers_own_sender(&self.sender) {
             return Err(Error::OwnHistoryBehind);
         }
-        let segment = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
-        )?;
         let mut batch = profile.store().batch()?;
-        batch.put_segment(
+        let stored = receiver_overlay::put(
+            &mut batch,
+            &self.sek,
             &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &segment,
+            &me,
+            self.epoch,
+            self.receiver_persistence.base,
+            &candidate,
         )?;
+        if let receiver_overlay::Put::Busy { changed } = stored {
+            if changed {
+                batch.commit()?;
+            }
+            return Err(Error::StreamRefused(receiver_overlay::CLEANUP_PENDING));
+        }
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -427,6 +719,32 @@ impl ChannelState {
         self.entries.committed();
         self.receivers.insert(slot, candidate);
         Ok(true)
+    }
+
+    /// This path is exclusively an original author's authenticated recovery response, not a
+    /// trust grant from its transport peer. The ordinary inbound-SKDM trust gate is unchanged.
+    pub(crate) fn accept_own_recovery_release(
+        &mut self,
+        store: &Store,
+        target: Digest32,
+        release: &crate::group::skdm::Skdm,
+        now: crate::time::Ms,
+    ) -> Result<super::AcceptedSkdm> {
+        if !self.own_behind
+            || release.body.author_id != self.me()
+            || release.body.channel_id != self.channel_id
+            || release.body.epoch > self.epoch
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        if !matches!(&self.own_recovery, Recovery::Head(head) if head.id() == target) {
+            return Err(Error::OwnHistoryBehind);
+        }
+        match self.own_recovery_evidence(store)? {
+            Some(Recovery::Head(current)) if current.id() == target => {}
+            _ => return Err(Error::OwnHistoryBehind),
+        }
+        self.accept_skdm_mode(store, release, now, true)
     }
 
     pub(super) fn require_own_recovery_complete(&self, store: &Store) -> Result<()> {
@@ -457,6 +775,24 @@ impl ChannelState {
         {
             return Err(Error::OwnHistoryBehind);
         }
+        let snapshot = store.snapshot()?;
+        let segment = snapshot
+            .get_segment_bounded(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_OWN_READABILITY,
+                128,
+            )?
+            .ok_or(Error::OwnHistoryBehind)?;
+        let audit = ReadabilityCursor::parse(&open_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_OWN_READABILITY,
+            &segment,
+        )?)?;
+        if audit.target != target.id() || audit.next != target.root.leaves.saturating_add(1) {
+            return Err(Error::OwnHistoryBehind);
+        }
         self.require_legacy_current(store)?;
         let governance = self.current_governance(store)?;
         let generation = match governance.presence_sender_generation(&self.me())? {
@@ -471,10 +807,13 @@ impl ChannelState {
             }
             None => return Err(Error::OwnHistoryBehind),
         };
-        if generation != self.sender.chain_id() {
-            // Earlier code could count opaque own ciphertext as role-complete. That receipt
-            // cannot certify keys for a generation minted after this backup. Recovery of those
-            // keys remains separate owed work; never clear the fence on this old receipt alone.
+        // A restored sender may be older than the latest authenticated Presence. The
+        // target-bound audit above proves the required own content is readable before we
+        // mint a fresh sender; the old sender itself must never be used to write again.
+        // A Presence outside this signed prefix, or behind the retained sender, cannot
+        // establish a consistent generation for recovery.
+        if generation < self.sender.chain_id() || generation > target.root.leaves.saturating_add(1)
+        {
             return Err(Error::OwnHistoryBehind);
         }
         Ok(())

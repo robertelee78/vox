@@ -95,6 +95,12 @@ pub enum SegmentKind {
     SessionAttention,
     /// One explicit node-wide archive demand and its bounded provisional body pages.
     HistoryDemand,
+    /// Exact original signed sender releases, indexed independently of history publication.
+    ReceiverReleases,
+    /// Bounded own-author receiver slot overrides, bound to the sealed base receiver map.
+    ReceiverStates,
+    /// Root-signed own-author historical sender releases, indexed by epoch and chain.
+    OwnHistoricalKeys,
 }
 
 impl SegmentKind {
@@ -116,6 +122,9 @@ impl SegmentKind {
             SegmentKind::SessionIngress => b"vox/seg/session-ingress/v1",
             SegmentKind::SessionAttention => b"vox/seg/session-attention/v1",
             SegmentKind::HistoryDemand => b"vox/seg/history-demand/v1",
+            SegmentKind::ReceiverReleases => b"vox/seg/receiver-releases/v1",
+            SegmentKind::ReceiverStates => b"vox/seg/receiver-states/v1",
+            SegmentKind::OwnHistoricalKeys => b"vox/seg/own-historical-keys/v1",
         }
     }
 }
