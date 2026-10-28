@@ -2652,12 +2652,11 @@ impl Node {
                 flow.route_origin_brought = flow.brought;
                 flow.brought = false;
                 flow.route_complete = false;
-                debug_assert!(self.bounded_sync.ready[0].is_none());
-                if self.bounded_sync.ready[0].is_some() {
-                    self.dispose_rearming_hint(flow);
-                    continue;
-                }
-                self.bounded_sync.ready[0] = Some(flow);
+                // The author can be offline. Keep the exact continuation in the
+                // peer-selectable deferred queue rather than occupying the single live
+                // slot while no connection can run it. A current author port promotes
+                // this same flow; unrelated connected peers keep their foreground turn.
+                self.bounded_sync.deferred.push_back(flow);
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
                     work.room,
