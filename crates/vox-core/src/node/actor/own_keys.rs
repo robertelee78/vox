@@ -838,6 +838,28 @@ impl Node {
             refuse(send, recv);
             return;
         }
+        let gate = Arc::clone(&channel.own_writer_gate);
+        let Some(writer) = gate.try_writer() else {
+            drop(channel);
+            let tx = self.net_tx.clone();
+            let mut room_cancel = self.own_key_room_watch(context.channel_id);
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => {},
+                    _ = gate.wait_open() => {
+                        let ready = DonorReady { peer, node, connection, room, context,
+                            frame: Ok(frame), send, recv, credit, output };
+                        tokio::select! {
+                            biased;
+                            _ = room_cancel.changed() => {},
+                            _ = tx.send(NetEvent::OwnKeyDonorReady(ready)) => {},
+                        }
+                    }
+                }
+            });
+            return;
+        };
         let mut pending = Some((send, recv, credit, output, frame));
         let mut room_cancel = self.own_key_room_watch(context.channel_id);
         let admitted = self.with_current_computer_authority(|| {
@@ -847,13 +869,27 @@ impl Node {
             let mut epoch_changed = self.pairwise_epoch.subscribe();
             tokio::spawn(async move {
                 let (_recv, _credit, _output) = (recv, credit, output);
-                tokio::select! {
+                let mut writer = writer;
+                let written = tokio::select! {
                     biased;
-                    _ = epoch_changed.changed() => {},
-                    _ = room_cancel.changed() => {},
-                    written = crate::transport::framing::write_frame(&mut send, &frame) => {
-                        if written.is_ok() { let _ = send.finish(); }
+                    _ = writer.cancel.changed() => false,
+                    _ = epoch_changed.changed() => false,
+                    _ = room_cancel.changed() => false,
+                    written = crate::transport::framing::write_frame(&mut send, &frame) => written.is_ok(),
+                };
+                let acknowledged = if written && send.finish().is_ok() {
+                    tokio::select! {
+                        biased;
+                        _ = writer.cancel.changed() => false,
+                        _ = epoch_changed.changed() => false,
+                        _ = room_cancel.changed() => false,
+                        stopped = send.stopped() => matches!(stopped, Ok(None)),
                     }
+                } else {
+                    false
+                };
+                if !acknowledged {
+                    let _ = send.reset(crate::node::pairwise_stream::KeyRefusal::NotAccepted.code());
                 }
             });
         });

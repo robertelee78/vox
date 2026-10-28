@@ -66,6 +66,7 @@ pub(crate) use private_session::{SessionAdvance, SessionRefresh};
 pub(crate) mod availability;
 mod own_historical_keys;
 mod own_history;
+pub(crate) mod own_writer_gate;
 mod proof_range;
 mod receiver_overlay;
 mod receiver_releases;
@@ -1385,6 +1386,7 @@ pub struct ChannelState {
     /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
     history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
     role_owed: std::sync::Arc<role_owed::RoleOwed>,
+    pub(crate) own_writer_gate: std::sync::Arc<own_writer_gate::Gate>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
     /// profile is new — and its earlier entries are with the other members. Writing before they
@@ -2236,6 +2238,7 @@ impl ChannelState {
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3057,6 +3060,7 @@ impl ChannelState {
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3339,6 +3343,7 @@ impl ChannelState {
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),

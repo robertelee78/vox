@@ -1412,7 +1412,52 @@ impl Receiver {
         let historical = self.historical;
         let received = self.received.clone();
         let committed = self.source.commit_ledger();
+        // A staged record may contain only a header. Inspect the authenticated stored body
+        // off actor so unrelated governance does not cancel an active key response.
+        let governance =
+            record.entry.skeleton.v2.as_ref().is_some_and(|header| {
+                header.kind == crate::log::history::SignedEntryKind::Governance
+            });
+        let needs_transition = if governance {
+            let classified = self.read_precharged(&job, 64 * 1024, Arc::clone(&record),
+                move |room, store, record| {
+                    let input = room.history_read(store)?;
+                    let hash = record.entry.entry_hash();
+                    if input.publication_busy() { return Ok(None); }
+                    if input.history_effect_finished(&hash)? { return Ok(Some(false)); }
+                    let entry = input.history_entry(&hash)?.ok_or(Error::MalformedAtRest(
+                        "pending history body record missing"))?;
+                    // If classification cannot prove another kind, gate conservatively.
+                    Ok(Some(!matches!(crate::governance::entry::GovEntry::body_bound_to(&entry),
+                        Ok(body) if !matches!(body, crate::governance::entry::GovBody::Presence(_)))))
+                }).await?;
+            match classified {
+                Lookup::Found(held) => held.value.1,
+                Lookup::Busy => return Ok(Lookup::Busy),
+                Lookup::Missing => return Ok(Lookup::Missing),
+            }
+        } else {
+            false
+        };
+        let transition = if needs_transition {
+            let gate = {
+                let room = tokio::select! {
+                    biased;
+                    () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                    room = self.source.room.lock() => room,
+                };
+                Arc::clone(&room.own_writer_gate)
+            };
+            Some(tokio::select! {
+                biased;
+                () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                transition = gate.transition() => transition,
+            })
+        } else {
+            None
+        };
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
+            let _transition = transition;
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();
