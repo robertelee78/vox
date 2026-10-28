@@ -189,6 +189,15 @@ impl OwnRecoveryCheckpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UnavailableResponse {
+    pub(crate) author: Option<Digest32>,
+    pub(crate) head: Digest32,
+    pub(crate) lo: u64,
+    pub(crate) hi: u64,
+    pub(crate) reason: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyBodyUnavailable {
     Body,
@@ -222,6 +231,8 @@ pub(crate) struct Flow {
     pub(crate) key_body_root: Option<super::KeyBodyNeed>,
     pub(crate) key_body_token: Option<Arc<()>>,
     pub(crate) key_body_unavailable: Option<KeyBodyUnavailable>,
+    pub(crate) unavailable_response: Option<UnavailableResponse>,
+    pub(crate) archive_selected_author: Option<(Digest32, Digest32)>,
     pub(crate) key_availability_token: Option<Arc<()>>,
     pub(crate) key_availability_result: super::KeyAvailabilityResult,
     key_body_checked: bool,
@@ -472,6 +483,8 @@ impl Flow {
             key_body_root: None,
             key_body_token: None,
             key_body_unavailable: None,
+            unavailable_response: None,
+            archive_selected_author: None,
             key_availability_token: None,
             key_availability_result: None,
             key_body_checked: false,
@@ -650,6 +663,8 @@ impl Flow {
             key_body_root: None,
             key_body_token: None,
             key_body_unavailable: None,
+            unavailable_response: None,
+            archive_selected_author: None,
             key_availability_token: None,
             key_availability_result: None,
             key_body_checked: false,
@@ -2527,6 +2542,52 @@ impl Flow {
                     deadline,
                 )
                 .await?;
+                if matches!(
+                    result.status,
+                    Status::BodyNotHeld | Status::EvidenceUnavailable
+                ) {
+                    let reason = if result.status == Status::BodyNotHeld {
+                        "body_not_held"
+                    } else {
+                        "evidence_unavailable"
+                    };
+                    let known_author = |head| {
+                        self.authenticated_head
+                            .filter(|known| known.head == head)
+                            .map(|known| known.author)
+                            .or_else(|| {
+                                self.archive_selected_author
+                                    .filter(|(selected_head, _)| *selected_head == head)
+                                    .map(|(_, author)| author)
+                            })
+                    };
+                    self.unavailable_response = match &query {
+                        Query::Entry { head, seq, .. } => Some(UnavailableResponse {
+                            author: known_author(*head),
+                            head: *head,
+                            lo: *seq,
+                            hi: *seq,
+                            reason,
+                        }),
+                        Query::Page { head, lo, hi, .. } => Some(UnavailableResponse {
+                            author: known_author(*head),
+                            head: *head,
+                            lo: *lo,
+                            hi: *hi,
+                            reason,
+                        }),
+                        Query::KeyBody {
+                            head, author, seq, ..
+                        } => Some(UnavailableResponse {
+                            author: Some(*author),
+                            head: *head,
+                            lo: *seq,
+                            hi: *seq,
+                            reason,
+                        }),
+                        _ => None,
+                    };
+                }
                 self.body_progress |= result.body_progress;
                 if let Some(inventory) = result.inventory.as_ref() {
                     source

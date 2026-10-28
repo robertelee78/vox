@@ -185,6 +185,13 @@ member. It does not mean missing trust or a bad signature.
 **Fix:** get the members who hold the message online. If no member holds it, it cannot be
 recovered: there is no server.
 
+**Check:** `vox status --json` lists each room and peer under `lanes.ports`. Its
+`last_recorded_unavailable_response`, when present, identifies a history request that peer
+could not serve and whether it lacked the body or source evidence. The requested bounds
+identify the request; for a page they do not identify a particular missing entry. This is a
+past observation, not a statement of what the peer or other members hold now. It is kept
+only while the port exists and is cleared when the node restarts.
+
 **Confirm:** the message's text replaces the placeholder.
 
 ## The service is unreachable
