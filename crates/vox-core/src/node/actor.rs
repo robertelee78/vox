@@ -3942,6 +3942,15 @@ impl Joiner {
                 Err(lost) => return Err(lost),
             }
         };
+        // The board's signed genesis names the exact room format. Refuse before
+        // publishing a pre-join record or creating any local room state.
+        if !set
+            .genesis
+            .as_ref()
+            .is_some_and(|genesis| genesis.body.authenticated_history())
+        {
+            return Err(JoinerLost::of(Fault::UnsupportedRoomFormat));
+        }
         let short = crate::node::network::short_id;
         let prejoin_wire = {
             let signer: &crate::atrest::vault::VaultRootSigner = &self.signer;
@@ -3966,6 +3975,13 @@ impl Joiner {
         // A board that takes no pre-join record is another board's turn too (C2).
         let mut refused: Vec<String> = Vec::new();
         loop {
+            if !set
+                .genesis
+                .as_ref()
+                .is_some_and(|genesis| genesis.body.authenticated_history())
+            {
+                return Err(JoinerLost::of(Fault::UnsupportedRoomFormat));
+            }
             let t = std::time::Instant::now();
             self.begin(format!(
                 "announcing this joiner to board {}",
@@ -26835,6 +26851,9 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::Profile("computer policy changed before the room mutation") => Fault::ComputerPolicy,
+        Error::Profile(crate::node::channel::UNSUPPORTED_ROOM_FORMAT) => {
+            Fault::UnsupportedRoomFormat
+        }
         Error::Profile(
             "Legacy history required; resume explicit recovery before posting in this room",
         ) => Fault::LegacyHistoryRequired,

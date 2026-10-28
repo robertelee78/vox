@@ -53,6 +53,10 @@ pub(crate) mod governance;
 pub(crate) mod history;
 pub(crate) mod key_package_queue;
 pub(crate) mod legacy_provisional;
+
+/// Older signed room formats cannot be opened; existing data remains untouched.
+pub(crate) const UNSUPPORTED_ROOM_FORMAT: &str =
+    "This room uses an unsupported older format; leave it and create a new one.";
 mod legacy_session;
 mod legacy_session_sender;
 mod legacy_sync;
@@ -2267,6 +2271,9 @@ impl ChannelState {
         if genesis.channel_id() != *channel_id {
             return Err(Error::MalformedAtRest("room manifest genesis mismatch"));
         }
+        if !genesis.body.authenticated_history() {
+            return Err(Error::Profile(UNSUPPORTED_ROOM_FORMAT));
+        }
 
         // The admitted authors (M14.5). A channel created before this segment
         // existed has only its creator, which is exactly what it had.
@@ -3026,6 +3033,9 @@ impl ChannelState {
             return Err(Error::MalformedGovernance(
                 "genesis hash is not the room id joined with",
             ));
+        }
+        if !genesis.body.authenticated_history() {
+            return Err(Error::Profile(UNSUPPORTED_ROOM_FORMAT));
         }
         if profile.store().get_sek_wrap(channel_id)?.is_some() {
             return Err(Error::Profile("this room is already on this node"));
