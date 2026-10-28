@@ -2776,6 +2776,7 @@ impl Computer {
         self.storage_failed
             .store(true, std::sync::atomic::Ordering::Release);
         self.block_own_key_authority();
+        self.own_key_settled.send_replace(());
         self.invalidate_reachers();
     }
 

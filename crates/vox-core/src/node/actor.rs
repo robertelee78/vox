@@ -700,6 +700,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
+        NetEvent::OwnKeyDonorBusy { .. } | NetEvent::OwnKeyDonorAvailable { .. } => {
+            "resuming own-key donor capacity"
+        }
         NetEvent::OwnKeyWriterInterrupted(..) => "resuming an interrupted own-key response",
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
         NetEvent::OwnKeyCloseReady { .. } => "resuming a room close",
@@ -712,7 +715,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::OwnKeyComputerCancelled { .. } => "retiring Computer policy",
         NetEvent::OwnKeyUnlockReady { .. } => "resuming identity unlock",
         NetEvent::OwnKeyOpenReady(..) => "starting an own-key recovery stream",
-        NetEvent::OwnKeyPolicyReady { .. } => "resuming own-key recovery after Computer policy",
+        NetEvent::OwnKeyPolicyReady { .. } | NetEvent::OwnKeyPolicyFailed { .. } => {
+            "resuming own-key recovery after Computer policy"
+        }
         NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
         NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
         NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
@@ -1389,6 +1394,20 @@ enum NetEvent {
     Pairwise(PairwiseIn),
     /// A bounded worker has prepared an encrypted own-key response; current authority and
     /// the exact connection are checked again before it is sent.
+    OwnKeyDonorBusy {
+        room: Digest32,
+        peer: Digest32,
+        connection: Arc<VoxConnection>,
+        slots: Arc<Semaphore>,
+    },
+    OwnKeyDonorAvailable {
+        room: Digest32,
+        peer: Digest32,
+        connection: Arc<VoxConnection>,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        from_wait: bool,
+    },
     OwnKeyDonorReady(own_keys::DonorReady),
     OwnKeyWriterInterrupted(own_keys::InterruptedReady),
     OwnKeyUnlockReady {
@@ -1459,6 +1478,11 @@ enum NetEvent {
     OwnKeyPolicyReady {
         room: Digest32,
         owner: Arc<()>,
+    },
+    OwnKeyPolicyFailed {
+        room: Digest32,
+        owner: Arc<()>,
+        error: String,
     },
     OwnKeyOpenReady(Box<own_keys::OpenReady>),
     OwnKeyRequestReady(Box<own_keys::RequestReady>),
@@ -2718,6 +2742,9 @@ async fn read_pairwise_streams(
 ) {
     use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
     let peer = conn.peer_id();
+    // The existing per-connection queue allowance also bounds recovery requests retained
+    // beyond actor dequeue while they wait on a real local admission edge.
+    let recovery_slots = Arc::new(Semaphore::new(PAIRWISE_QUEUE));
     while let Some((mut send, mut recv)) = streams.recv().await {
         let first = match recv_pairwise(&mut recv).await {
             Ok(Some(first)) => first,
@@ -2749,7 +2776,35 @@ async fn read_pairwise_streams(
         } else {
             None
         };
+        let recovery_credit = if let PairwiseFrame::RecoveryOpen { channel_id, .. } = &first {
+            match Arc::clone(&recovery_slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let room = *channel_id;
+                    let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
+                    let _ = send.reset(why);
+                    let _ = recv.stop(why);
+                    if tx
+                        .send(NetEvent::OwnKeyDonorBusy {
+                            room,
+                            peer,
+                            connection: Arc::clone(&conn),
+                            slots: Arc::clone(&recovery_slots),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let stream = PairwiseIn {
+            recovery_credit,
+            donor_admission: None,
             conn: Arc::clone(&conn),
             peer,
             first,
@@ -2765,6 +2820,8 @@ async fn read_pairwise_streams(
 
 /// A pairwise stream whose frames have been read off the actor.
 struct PairwiseIn {
+    recovery_credit: Option<OwnedSemaphorePermit>,
+    donor_admission: Option<PairwiseAdmission>,
     conn: Arc<VoxConnection>,
     /// The authenticated peer.
     peer: Digest32,
@@ -5584,6 +5641,7 @@ pub struct Node {
     own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
     own_key_pending: BTreeMap<(Digest32, Digest32), own_keys::ResponseReady>,
     own_key_interrupted_pending: BTreeMap<(Digest32, Digest32), own_keys::InterruptedReady>,
+    own_key_donor_busy: BTreeMap<(Digest32, Digest32), own_keys::DonorBusy>,
     own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_ended_pending: BTreeMap<Digest32, Arc<()>>,
@@ -6474,6 +6532,7 @@ impl Node {
             own_key_parked: BTreeMap::new(),
             own_key_pending: BTreeMap::new(),
             own_key_interrupted_pending: BTreeMap::new(),
+            own_key_donor_busy: BTreeMap::new(),
             own_key_room_cancel: BTreeMap::new(),
             own_key_leave_pending: BTreeMap::new(),
             own_key_ended_pending: BTreeMap::new(),
@@ -10674,6 +10733,20 @@ impl Node {
             NetEvent::Pairwise(stream) => {
                 self.take_inbound_skdm(stream).await;
             }
+            NetEvent::OwnKeyDonorBusy {
+                room,
+                peer,
+                connection,
+                slots,
+            } => self.begin_own_key_donor_busy(room, peer, connection, slots),
+            NetEvent::OwnKeyDonorAvailable {
+                room,
+                peer,
+                connection,
+                instance,
+                owner,
+                from_wait,
+            } => self.finish_own_key_donor_busy(room, peer, connection, instance, owner, from_wait),
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
             NetEvent::OwnKeyWriterInterrupted(ready) => self.finish_own_key_interruption(ready),
             NetEvent::OwnKeyUnlockReady {
@@ -10739,6 +10812,7 @@ impl Node {
                         Ok(()) => {
                             self.reopen_remembered().await;
                             self.resume_own_key_interruptions();
+                            self.resume_own_key_donor_busy();
                             self.resume_own_key_policy_waiting();
                             self.publish().await;
                             let _ = reply.send(Outcome::Done);
@@ -11181,7 +11255,29 @@ impl Node {
                     self.own_key_policy_waiting.remove(&room);
                     if self.channels.contains_key(&room) {
                         self.governance_work.wake_room(room);
+                        self.resume_own_key_donor_busy();
                     }
+                }
+            }
+            NetEvent::OwnKeyPolicyFailed { room, owner, error } => {
+                if self
+                    .own_key_policy_waiting
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    self.own_key_policy_waiting.remove(&room);
+                    let keys: Vec<_> = self
+                        .own_key_donor_busy
+                        .keys()
+                        .filter(|(id, _)| *id == room)
+                        .copied()
+                        .collect();
+                    for key in keys {
+                        self.retire_own_key_donor_busy(key);
+                    }
+                    let _ = self.event_tx.send(NodeEvent::NodeNote {
+                        note: format!("own-key recovery stopped: {error}"),
+                    });
                 }
             }
             NetEvent::OwnKeyOpenReady(ready) => self.finish_own_key_open(*ready),
@@ -17090,6 +17186,15 @@ impl Node {
         }
         self.own_key_pending
             .retain(|(_, peer), _| self.trust.is_trusted(peer));
+        let revoked: Vec<_> = self
+            .own_key_donor_busy
+            .keys()
+            .filter(|(_, peer)| !self.trust.is_trusted(peer))
+            .copied()
+            .collect();
+        for key in revoked {
+            self.retire_own_key_donor_busy(key);
+        }
         let changed: Vec<_> = self
             .own_key_credit_trust
             .iter()
@@ -17221,6 +17326,7 @@ impl Node {
             attempt.cancel.send_replace(true);
         }
         self.own_key_pending.remove(&(*channel_id, *peer));
+        self.retire_own_key_donor_busy((*channel_id, *peer));
         if let Some((request, generation, fence)) = self
             .bounded_sync
             .physical_archive_for_port(*channel_id, *peer)
@@ -21312,6 +21418,7 @@ impl Node {
         }
         if outcome.is_done() {
             self.resume_own_key_interruptions();
+            self.resume_own_key_donor_busy();
             self.resume_own_key_policy_waiting();
         }
         // Publish identity, trust and room preparation before acknowledging Ready.
@@ -23167,6 +23274,7 @@ impl Node {
                 if result.is_ok() {
                     self.governance_work.resume_after_computer_policy();
                     self.resume_own_key_interruptions();
+                    self.resume_own_key_donor_busy();
                     self.resume_own_key_policy_waiting();
                 }
                 let _ = work.reply.send(result);
