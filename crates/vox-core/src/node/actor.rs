@@ -9772,16 +9772,40 @@ impl Node {
                 epoch,
                 peer,
                 room,
-                reply,
+                mut reply,
             } => {
-                let current = match (self.channels.get(&channel_id), room.upgrade()) {
-                    (Some(current), Some(original)) if Arc::ptr_eq(current, &original) => {
-                        let channel = current.lock().await;
-                        channel.epoch() == epoch && channel.members().contains(&peer)
-                    }
-                    _ => false,
+                let Some(original) = room.upgrade().filter(|original| {
+                    self.channels
+                        .get(&channel_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, original))
+                }) else {
+                    let _ = reply.send(false);
+                    return;
                 };
-                let _ = reply.send(current);
+                if let Ok(channel) = original.try_lock() {
+                    let _ =
+                        reply.send(channel.epoch() == epoch && channel.members().contains(&peer));
+                    return;
+                }
+                let tx = self.net_tx.clone();
+                tokio::spawn(async move {
+                    let channel = tokio::select! {
+                        _ = reply.closed() => return,
+                        channel = original.lock_owned() => channel,
+                    };
+                    drop(channel);
+                    let permit = tokio::select! {
+                        _ = reply.closed() => return,
+                        permit = tx.reserve() => match permit { Ok(permit) => permit, Err(_) => return },
+                    };
+                    permit.send(NetEvent::AgreeCurrent {
+                        channel_id,
+                        epoch,
+                        peer,
+                        room,
+                        reply,
+                    });
+                });
             }
             NetEvent::SeatReserve {
                 channel_id,
@@ -17513,23 +17537,34 @@ impl Node {
         send: quinn::SendStream,
     ) {
         use crate::node::agreestream::{answer, Answer};
-        let shared = self.channels.get(&ask.channel_id).map(Arc::clone);
-        let member = match shared.as_ref() {
-            Some(shared) => {
-                let c = shared.lock().await;
-                c.epoch() == ask.epoch && c.members().contains(&peer)
-            }
-            None => false,
-        };
-        if !member {
+        let Some(shared) = self.channels.get(&ask.channel_id).map(Arc::clone) else {
             tokio::spawn(async move { answer(send, &Answer::NotHeld).await });
             return;
-        }
+        };
         let mut view = self.view_tx.subscribe();
-        let room = Arc::downgrade(shared.as_ref().expect("member requires an open room"));
+        let room = Arc::downgrade(&shared);
         let clock = Arc::clone(&self.millis_clock);
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
+            let (reply, current) = oneshot::channel();
+            tokio::select! {
+                _ = send.stopped() => return,
+                sent = tx.send(NetEvent::AgreeCurrent {
+                    channel_id: ask.channel_id,
+                    epoch: ask.epoch,
+                    peer,
+                    room: room.clone(),
+                    reply,
+                }) => if sent.is_err() { return; },
+            }
+            let current = tokio::select! {
+                _ = send.stopped() => return,
+                current = current => current,
+            };
+            if !matches!(current, Ok(true)) {
+                answer(send, &Answer::NotHeld).await;
+                return;
+            }
             // The existing hold window applies after the node has actually observed the
             // entry missing. Disk settlement has its own physical owner and no deadline.
             let mut deadline = None;
