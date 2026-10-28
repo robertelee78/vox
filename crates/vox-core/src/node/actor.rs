@@ -10737,6 +10737,7 @@ impl Node {
                     .collect();
                 for room in support_rooms {
                     self.advance_support_discovery(room);
+                    self.sched_rooms.insert(room);
                 }
                 #[cfg(feature = "test-knobs")]
                 let cancel_admissions =
@@ -14701,6 +14702,13 @@ impl Node {
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        if let Some((room, peer, instance, request, generation)) =
+            self.history_demand.note_route_trust_change()
+        {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            self.sched_rooms.insert(room);
+        }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);
         if let Some(decision) = decision {
@@ -14922,6 +14930,13 @@ impl Node {
         }
         drop(reserved);
         self.consent_keys = pending;
+        if let Some((room, peer, instance, request, generation)) =
+            self.history_demand.note_route_trust_change()
+        {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            self.sched_rooms.insert(room);
+        }
         self.trust = next;
         self.deliveries
             .retain(|(_, peer, _), _| peer != fingerprint);
@@ -16117,13 +16132,51 @@ impl Node {
 
     /// Retire a port's attempts and forget it (its room is gone or held again).
     fn drop_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
-        if let Some((request, generation)) = self.bounded_sync.archive_for_port(*channel_id, *peer)
+        self.drop_port_inner(channel_id, peer, false);
+    }
+
+    /// Departure removes this peer's port, but an unconsumed page still owns its request.
+    fn drop_departed_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
+        self.drop_port_inner(channel_id, peer, true);
+        self.sched_rooms.insert(*channel_id);
+    }
+
+    fn drop_port_inner(
+        &mut self,
+        channel_id: &Digest32,
+        peer: &Digest32,
+        preserve_unstarted: bool,
+    ) {
+        if let Some((request, generation, fence)) = self
+            .bounded_sync
+            .physical_archive_for_port(*channel_id, *peer)
         {
-            self.history_demand.failed(
-                request,
-                generation,
-                "History peer or room retired; resume explicitly when available.",
-            );
+            if self
+                .history_demand
+                .owns_running_fence(request, generation, &fence)
+            {
+                self.history_demand.failed(
+                    request,
+                    generation,
+                    "History peer or room retired; resume explicitly when available.",
+                );
+            }
+        }
+        if let Some((request, generation, instance)) = self
+            .bounded_sync
+            .archive_admission_for_port(*channel_id, *peer)
+        {
+            // Preserve only the admission of this exact unconsumed dispatch on peer departure.
+            if !preserve_unstarted
+                && self.history_demand.unstarted_binding(*channel_id, *peer)
+                    == Some((request, generation, instance))
+            {
+                self.history_demand.failed(
+                    request,
+                    generation,
+                    "History peer or room retired; resume explicitly when available.",
+                );
+            }
         }
         self.bounded_sync.retire_port(*channel_id, *peer);
         self.history_hints.retire_port(*channel_id, *peer);
@@ -16239,6 +16292,7 @@ impl Node {
             return false;
         }
         self.discover().await;
+        self.reroute_unstarted_history();
         let all = std::mem::take(&mut self.sched_all);
         let rooms = std::mem::take(&mut self.sched_rooms);
         let now = std::time::Instant::now();
@@ -16320,7 +16374,8 @@ impl Node {
                     && (port.needs()
                         || self.bounded_sync.needs_port(key.0, key.1)
                         || self.history_hints.pending(key.0, key.1)
-                        || self.history_demand.ready_binding(key.0, key.1).is_some())
+                        || (self.trust.is_trusted(&key.1)
+                            && self.history_demand.unstarted_dial_binding(key.0, key.1)))
                     && (!port.backing_off(now) || port.busy_bypass(now))
                     && !self.publishing.contains(*key)
                     && self
@@ -25919,6 +25974,13 @@ impl Node {
             Some(Ok(())) => {}
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
+        }
+        if let Some((room, peer, instance, request, generation)) =
+            self.history_demand.note_route_trust_change()
+        {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            self.sched_rooms.insert(room);
         }
         self.trust = next;
         self.note_capability(fingerprint, had_drive);

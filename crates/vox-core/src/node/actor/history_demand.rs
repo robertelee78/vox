@@ -28,6 +28,10 @@ pub(super) struct Dispatch {
     pub query: Query,
     pub staging: Staging,
     pub fence: Arc<Fence>,
+    /// Set only after the actor checks the current connected donor's room membership.
+    eligible: bool,
+    /// A disconnected current member still owns a reconnect need.
+    dial_eligible: bool,
 }
 
 struct PrivateDispatch {
@@ -141,6 +145,17 @@ fn page_of(query: &Query) -> Option<(Digest32, u64, u64)> {
         _ => None,
     }
 }
+struct RouteLockWait {
+    fence: Arc<Fence>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for RouteLockWait {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Controller {
     next: u64,
@@ -160,8 +175,34 @@ pub(super) struct Controller {
     observation_unread: bool,
     selection: Option<(Digest32, [u8; 16], Option<Digest32>)>,
     resume_owed: Option<ResumeOwed>,
+    route_lock_wait: Option<RouteLockWait>,
 }
 impl Controller {
+    /// Retire only the exact unstarted page when its captured trust generation changes.
+    pub(super) fn note_route_trust_change(
+        &mut self,
+    ) -> Option<(Digest32, Digest32, [u8; 16], RequestId, Digest32)> {
+        let dispatch = self.ready.as_ref()?;
+        let (room, peer, instance, request, generation) = (
+            dispatch.room,
+            dispatch.peer,
+            dispatch.instance,
+            dispatch.request,
+            dispatch.generation,
+        );
+        if !self.owns_running_fence(request, generation, &dispatch.fence) {
+            return None;
+        }
+        self.failed_current(
+            room,
+            instance,
+            request,
+            generation,
+            "Authorization changed. Request this history page again under current access.",
+        )
+        .then_some((room, peer, instance, request, generation))
+    }
+
     fn clear_resume_owed(&mut self) {
         if let Some(mut owed) = self.resume_owed.take() {
             if let Some(task) = owed.wake_task.take() {
@@ -220,6 +261,30 @@ impl Controller {
         true
     }
 
+    pub(super) fn owns_running_fence(
+        &self,
+        request: RequestId,
+        generation: Digest32,
+        fence: &Arc<Fence>,
+    ) -> bool {
+        self.running.as_ref().is_some_and(|running| {
+            running.request == request
+                && running.generation == generation
+                && Arc::ptr_eq(&running.fence, fence)
+        })
+    }
+
+    pub(super) fn has_other_resume(
+        &self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+    ) -> bool {
+        self.resume_owed.as_ref().is_some_and(|owed| {
+            owed.room != room || owed.instance != instance || owed.request != request
+        })
+    }
+
     fn resume_owed_matches(&self, room: Digest32, instance: [u8; 16], request: RequestId) -> bool {
         self.resume_owed.as_ref().is_some_and(|owed| {
             owed.room == room && owed.instance == instance && owed.request == request
@@ -234,20 +299,52 @@ impl Controller {
         self.ready
             .as_ref()
             .filter(|dispatch| {
-                dispatch.room == room && dispatch.peer == peer && !dispatch.fence.is_retired()
+                dispatch.room == room
+                    && dispatch.peer == peer
+                    && dispatch.eligible
+                    && !dispatch.fence.is_retired()
             })
             .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
+    }
+
+    /// Identify an unconsumed dispatch even while its membership check is pending.
+    pub(super) fn unstarted_binding(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+    ) -> Option<(RequestId, Digest32, [u8; 16])> {
+        self.ready
+            .as_ref()
+            .filter(|dispatch| {
+                dispatch.room == room
+                    && dispatch.peer == peer
+                    && !dispatch.fence.is_retired()
+                    && self.owns_running_fence(
+                        dispatch.request,
+                        dispatch.generation,
+                        &dispatch.fence,
+                    )
+            })
+            .map(|dispatch| (dispatch.request, dispatch.generation, dispatch.instance))
+    }
+
+    pub(super) fn unstarted_dial_binding(&self, room: Digest32, peer: Digest32) -> bool {
+        self.ready.as_ref().is_some_and(|dispatch| {
+            dispatch.room == room
+                && dispatch.peer == peer
+                && dispatch.dial_eligible
+                && !dispatch.fence.is_retired()
+                && self.owns_running_fence(dispatch.request, dispatch.generation, &dispatch.fence)
+        })
     }
 
     pub(super) fn take_legacy_cleanup(&mut self) -> Option<(Digest32, LegacyProvisionalOwner)> {
         self.cancelled_legacy.take()
     }
     pub(super) fn take_ready(&mut self, room: Digest32, peer: Digest32) -> Option<Dispatch> {
-        if self
-            .ready
-            .as_ref()
-            .is_some_and(|d| d.room == room && d.peer == peer && !d.fence.is_retired())
-        {
+        if self.ready.as_ref().is_some_and(|d| {
+            d.room == room && d.peer == peer && d.eligible && !d.fence.is_retired()
+        }) {
             self.ready.take()
         } else {
             None
@@ -536,6 +633,175 @@ pub(crate) fn saved_status(
 }
 
 impl Node {
+    /// Move an unstarted public page to a connected trusted room member without replacing
+    /// its exact request, authorization, staging or bounds. No physical Flow has consumed it.
+    pub(super) fn reroute_unstarted_history(&mut self) {
+        let Some(dispatch) = self.history_demand.ready.as_ref() else {
+            self.history_demand.route_lock_wait = None;
+            return;
+        };
+        let dispatch_fence = Arc::clone(&dispatch.fence);
+        let (room, instance, request, generation, peer) = (
+            dispatch.room,
+            dispatch.instance,
+            dispatch.request,
+            dispatch.generation,
+            dispatch.peer,
+        );
+        if dispatch.fence.is_retired()
+            || !self
+                .history_demand
+                .owns_running_fence(request, generation, &dispatch.fence)
+            || self
+                .history_demand
+                .has_other_resume(room, instance, request)
+        {
+            return;
+        }
+        let Some(current) = self.current_room(&room) else {
+            return;
+        };
+        let connected = |candidate: Digest32| {
+            if !self.trust.is_trusted(&candidate)
+                || !self
+                    .ports
+                    .get(&(room, candidate))
+                    .is_some_and(|port| port.room.is(&current))
+            {
+                return None;
+            }
+            self.net
+                .as_ref()
+                .and_then(|net| net.manager().existing(&candidate))
+                .filter(|conn| conn.quinn().close_reason().is_none())
+        };
+        let original_connected = connected(peer).is_some();
+        let mut candidates: Vec<_> = self
+            .ports
+            .keys()
+            .filter_map(|(r, candidate)| {
+                if *r != room || *candidate == peer {
+                    return None;
+                }
+                connected(*candidate).map(|conn| (*candidate, conn.serial()))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let was_eligible = self
+            .history_demand
+            .ready
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.eligible);
+        let Some(shared) = self.channels.get(&room).cloned() else {
+            return;
+        };
+        let ch = match shared.try_lock() {
+            Ok(ch) => ch,
+            Err(_) => {
+                if let Some(dispatch) = self.history_demand.ready.as_mut() {
+                    dispatch.eligible = false;
+                    dispatch.dial_eligible = false;
+                }
+                self.bounded_sync
+                    .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+                let needs_wait = self
+                    .history_demand
+                    .route_lock_wait
+                    .as_ref()
+                    .is_none_or(|wait| {
+                        !Arc::ptr_eq(&wait.fence, &dispatch_fence)
+                            || wait.done.load(std::sync::atomic::Ordering::Acquire)
+                    });
+                if needs_wait {
+                    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let finished = Arc::clone(&done);
+                    let fence = Arc::clone(&dispatch_fence);
+                    let worker_fence = Arc::clone(&fence);
+                    let wake = Arc::clone(&self.bounded_completion_wake);
+                    let waiting_room = Arc::clone(&shared);
+                    let task = tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            () = worker_fence.retired() => return,
+                            guard = waiting_room.lock_owned() => drop(guard),
+                        }
+                        finished.store(true, std::sync::atomic::Ordering::Release);
+                        wake.notify_one();
+                    });
+                    self.history_demand.route_lock_wait = Some(RouteLockWait { fence, done, task });
+                }
+                return;
+            }
+        };
+        let original_member = self.trust.is_trusted(&peer)
+            && self
+                .ports
+                .get(&(room, peer))
+                .is_some_and(|port| port.room.is(&current))
+            && ch.history_inventory_incarnation(&peer).is_some();
+        let original_ready = original_connected && original_member;
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .map(|(peer, serial)| (peer, serial, ch.history_inventory_incarnation(&peer)))
+            .collect();
+        drop(ch);
+        self.history_demand.route_lock_wait = None;
+        if let Some(dispatch) = self.history_demand.ready.as_mut() {
+            dispatch.dial_eligible = original_member;
+        }
+        if original_ready {
+            if let Some(dispatch) = self.history_demand.ready.as_mut() {
+                dispatch.eligible = true;
+            }
+            if !was_eligible {
+                self.sched_rooms.insert(room);
+            }
+            if let Some(status) = self.history_demand.owner_status.as_mut().filter(|status| {
+                status.room == room
+                    && status.instance == instance
+                    && status.request == Some(request)
+            }) {
+                status.detail = "One bounded history quantum is queued. Further history requires an explicit resume.".into();
+            }
+            return;
+        }
+        if let Some(dispatch) = self.history_demand.ready.as_mut() {
+            dispatch.eligible = false;
+        }
+        self.bounded_sync
+            .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+        if !candidates
+            .iter()
+            .any(|(_, _, incarnation)| incarnation.is_some())
+        {
+            if let Some(status) = self.history_demand.owner_status.as_mut().filter(|status| {
+                status.room == room
+                    && status.instance == instance
+                    && status.request == Some(request)
+            }) {
+                status.detail = "History is waiting for a trusted connected room member.".into();
+            }
+            return;
+        }
+        // The public page binding is independent of its transport donor. Move the same
+        // unconsumed dispatch and exact activation, rather than retiring it for a fallible
+        // asynchronous Resume which could lose the request if this peer disconnects.
+        let Some((next, _, _)) = candidates.into_iter().find(|(_, _, life)| life.is_some()) else {
+            return;
+        };
+        if let Some(dispatch) = self.history_demand.ready.as_mut() {
+            dispatch.peer = next;
+            dispatch.eligible = true;
+            dispatch.dial_eligible = true;
+        }
+        if let Some(status) = self.history_demand.owner_status.as_mut().filter(|status| {
+            status.room == room && status.instance == instance && status.request == Some(request)
+        }) {
+            status.detail = "One bounded history quantum is queued with a connected member.".into();
+        }
+        self.sched_rooms.insert(room);
+    }
+
     /// Whether the running quantum's page already covers the position below `before`.
     fn running_page_covers(&self, room: Digest32, before: &Digest32) -> bool {
         let Some((head, lo, hi)) = self.history_demand.running.as_ref().and_then(|r| r.page) else {
@@ -848,6 +1114,16 @@ impl Node {
             .filter(|(r, p)| *r == room && *p != node && self.trust.is_trusted(p))
             .map(|(_, p)| *p)
             .collect();
+        let connected_peers: std::collections::BTreeSet<_> = peers
+            .iter()
+            .copied()
+            .filter(|peer| {
+                self.net
+                    .as_ref()
+                    .and_then(|net| net.manager().existing(peer))
+                    .is_some_and(|conn| conn.quinn().close_reason().is_none())
+            })
+            .collect();
         self.history_demand.next = self
             .history_demand
             .next
@@ -886,7 +1162,7 @@ impl Node {
                     }
                     let answer = match (room_guard, resume_inspect) {
                         (_, Some(credit)) => classify_resume(node, room, instance, action, context, credit),
-                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, weak, read_fence.clone(), now, deadline, selection_after, resume_admission),
+                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, connected_peers, weak, read_fence.clone(), now, deadline, selection_after, resume_admission),
                         (None, None) => prepare_local(
                             node,
                             room,
@@ -1788,7 +2064,8 @@ fn prepare(
     action: Action,
     context: Arc<Context>,
     job: &Job,
-    peers: Vec<Digest32>,
+    mut peers: Vec<Digest32>,
+    connected_peers: std::collections::BTreeSet<Digest32>,
     weak: Weak<Mutex<ChannelState>>,
     fence: Arc<Fence>,
     now: u64,
@@ -1912,6 +2189,9 @@ fn prepare(
             resume_admission,
         );
     }
+    // Public pages prefer an already connected peer; private and legacy selection above
+    // keep their own donor contracts.
+    peers.sort_by_key(|peer| !connected_peers.contains(peer));
     // This immutable room snapshot determines whether activation must be followed by
     // a durable pause. Reserve that follow-up before start/resume can commit an Active;
     // cached/no-selection paths never acquire an unnecessary pause credit.
@@ -2100,6 +2380,8 @@ fn prepare(
             active: Arc::new(StdMutex::new(active)),
         },
         fence,
+        eligible: false,
+        dial_eligible: false,
     });
     Ok(answer)
 }
