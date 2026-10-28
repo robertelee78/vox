@@ -74,7 +74,10 @@ fn refuse(mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
 }
 
 impl Node {
-    fn own_key_room_watch(&mut self, room: Digest32) -> tokio::sync::watch::Receiver<bool> {
+    pub(super) fn own_key_room_watch(
+        &mut self,
+        room: Digest32,
+    ) -> tokio::sync::watch::Receiver<bool> {
         self.own_key_room_cancel
             .entry(room)
             .or_insert_with(|| tokio::sync::watch::channel(false).0)

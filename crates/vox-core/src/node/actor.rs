@@ -698,6 +698,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
+        NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
         NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
         NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
         NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
@@ -1375,6 +1376,13 @@ enum NetEvent {
     /// A bounded worker has prepared an encrypted own-key response; current authority and
     /// the exact connection are checked again before it is sent.
     OwnKeyDonorReady(own_keys::DonorReady),
+    OwnKeyLeaveReady {
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        reply: oneshot::Sender<Outcome>,
+    },
     OwnKeyRequestReady(Box<own_keys::RequestReady>),
     OwnKeyResponseReady(Box<own_keys::ResponseReady>),
     OwnKeyRequestFailed {
@@ -5433,6 +5441,7 @@ pub struct Node {
     own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
     own_key_pending: BTreeMap<Digest32, own_keys::ResponseReady>,
     own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
+    own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -6304,6 +6313,7 @@ impl Node {
             own_key_parked: BTreeMap::new(),
             own_key_pending: BTreeMap::new(),
             own_key_room_cancel: BTreeMap::new(),
+            own_key_leave_pending: BTreeMap::new(),
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -6879,7 +6889,7 @@ impl Node {
                     // **A leave is answered once another member has the departure** (V210-164):
                     // see `begin_leave`.
                     if let NodeCommand::LeaveRoom { channel_id } = command {
-                        self.begin_leave(channel_id, reply).await;
+                        self.begin_own_key_leave(channel_id, reply).await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
                         self.schedule().await;
@@ -10465,6 +10475,36 @@ impl Node {
                 self.take_inbound_skdm(stream).await;
             }
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
+            NetEvent::OwnKeyLeaveReady {
+                room,
+                instance,
+                owner,
+                transition,
+                reply,
+            } => {
+                if !self
+                    .own_key_leave_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                } else {
+                    self.own_key_leave_pending.remove(&room);
+                    if self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        if let Some(transition) = transition {
+                            self.begin_leave(room, reply, Some(transition)).await;
+                        } else {
+                            let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                        }
+                    } else {
+                        let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    }
+                }
+            }
             NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
             NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
             NetEvent::OwnKeyRequestFailed {
@@ -22123,12 +22163,63 @@ impl Node {
         outcome
     }
 
+    /// Retire physical own-key sends off actor before the leave can commit.
+    async fn begin_own_key_leave(&mut self, room: Digest32, mut reply: oneshot::Sender<Outcome>) {
+        let Some(instance) = self.channels.get(&room).cloned() else {
+            self.begin_leave(room, reply, None).await;
+            return;
+        };
+        if self.own_key_leave_pending.contains_key(&room) {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate: Option<Arc<crate::node::channel::own_writer_gate::Gate>> = tokio::select! {
+                biased;
+                _ = reply.closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition() => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyLeaveReady {
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    reply,
+                })
+                .await;
+        });
+    }
+
     /// Leave a room (V210-164): write this identity's departure into it, take this identity's
     /// records off boards (V030-14), push the departure to the room's other members, and answer
     /// once one of them has it — then the room is deleted from this node
     /// ([`Self::finish_leave_if_heard`]). Waiting is what makes the leave seen: a room deleted
     /// first would take the only copy of the departure with it.
-    async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
+    async fn begin_leave(
+        &mut self,
+        channel_id: Digest32,
+        reply: oneshot::Sender<Outcome>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    ) {
         self.history_demand.retire_room(channel_id);
         self.history_hints.retire_room(channel_id);
         if let Err(error) = self.retire_bounded_room(channel_id).await {
@@ -22201,7 +22292,8 @@ impl Node {
                 return;
             }
         };
-        // The departure is durable; no response prepared for the former membership may escape.
+        // The departure is durable. Release the gate before network/board work.
+        drop(transition);
         self.cancel_own_key_room(channel_id);
         if let Err(fault) = self
             .withdraw_from_boards(
