@@ -700,6 +700,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
         NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
+        NetEvent::OwnKeyRecoveryReady { .. } => "resuming room recovery",
         NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
         NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
         NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
@@ -1377,6 +1378,11 @@ enum NetEvent {
     /// A bounded worker has prepared an encrypted own-key response; current authority and
     /// the exact connection are checked again before it is sent.
     OwnKeyDonorReady(own_keys::DonorReady),
+    OwnKeyRecoveryReady {
+        room: Digest32,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    },
     OwnKeyUntrustReady {
         owner: Arc<()>,
         rooms: Vec<(Digest32, SharedChannel)>,
@@ -5287,11 +5293,20 @@ fn read_pending_withdrawals(
 
 /// An opened room stays private until one bounded recovery/retention turn completes.
 /// Only its original caller is held; no transcript-sized task or waiter list is retained.
+enum RecoveryWriterGate {
+    Waiting {
+        owner: Arc<()>,
+        fence: Arc<crate::transport::stream_transport::Fence>,
+    },
+    Ready(crate::node::channel::own_writer_gate::Transition),
+}
+
 struct RoomPreparation {
     channel: tokio::sync::Mutex<ChannelState>,
     reply: Option<oneshot::Sender<Outcome>>,
     reopening: bool,
     recovery: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+    recovery_writer_gate: Option<RecoveryWriterGate>,
     // Current trust is checked again between bounded preparation turns. A later decision
     // restarts both cursors before this room can become visible or serve a peer.
     trusted: Option<BTreeSet<Digest32>>,
@@ -10496,6 +10511,20 @@ impl Node {
                 self.take_inbound_skdm(stream).await;
             }
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
+            NetEvent::OwnKeyRecoveryReady {
+                room,
+                owner,
+                transition,
+            } => {
+                if let Some(prepared) = self.preparing_rooms.get_mut(&room) {
+                    if matches!(&prepared.recovery_writer_gate, Some(RecoveryWriterGate::Waiting { owner: current, .. }) if Arc::ptr_eq(current, &owner))
+                    {
+                        prepared.recovery_writer_gate = transition.map(RecoveryWriterGate::Ready);
+                        prepared.legacy_cleanup_due = None;
+                        self.preparation_after = None;
+                    }
+                }
+            }
             NetEvent::OwnKeyUntrustReady {
                 owner,
                 rooms,
@@ -10517,7 +10546,9 @@ impl Node {
                                 .get(room)
                                 .is_some_and(|current| Arc::ptr_eq(current, instance))
                         });
-                    if current {
+                    if reply.is_closed() {
+                        drop(transitions);
+                    } else if current {
                         if let Some(transitions) = transitions {
                             self.own_key_untrust_transitions = Some(transitions);
                             let outcome = self.handle(command).await;
@@ -10547,7 +10578,9 @@ impl Node {
                     let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                 } else {
                     self.own_key_leave_pending.remove(&room);
-                    if self
+                    if reply.is_closed() {
+                        drop(transition);
+                    } else if self
                         .channels
                         .get(&room)
                         .is_some_and(|current| Arc::ptr_eq(current, &instance))
@@ -20388,6 +20421,10 @@ impl Node {
         }
         self.opening_rooms.clear();
         for (_, mut prepared) in std::mem::take(&mut self.preparing_rooms) {
+            if let Some(RecoveryWriterGate::Waiting { fence, .. }) = &prepared.recovery_writer_gate
+            {
+                fence.retire();
+            }
             prepared.channel.get_mut().lock_now();
             if let Some(reply) = prepared.reply {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
@@ -21484,6 +21521,7 @@ impl Node {
                 reply,
                 reopening,
                 recovery: None,
+                recovery_writer_gate: None,
                 trusted: None,
                 removal_after: None,
                 consent_after: None,
@@ -21494,7 +21532,10 @@ impl Node {
     fn room_preparation_work_ready(&self) -> bool {
         self.publication_pending
             || self.preparing_rooms.values().any(|prepared| {
-                prepared
+                !matches!(
+                    prepared.recovery_writer_gate,
+                    Some(RecoveryWriterGate::Waiting { .. })
+                ) && prepared
                     .legacy_cleanup_due
                     .is_none_or(|due| std::time::Instant::now() >= due)
             })
@@ -21612,6 +21653,9 @@ impl Node {
         let Some(mut prepared) = self.preparing_rooms.remove(id) else {
             return opening || publishing;
         };
+        if let Some(RecoveryWriterGate::Waiting { fence, .. }) = &prepared.recovery_writer_gate {
+            fence.retire();
+        }
         prepared.channel.get_mut().lock_now();
         if let Some(reply) = prepared.reply {
             let _ = reply.send(Outcome::Failed(fault));
@@ -21631,13 +21675,23 @@ impl Node {
             .and_then(|after| {
                 self.preparing_rooms
                     .range((Excluded(after), Unbounded))
-                    .find(|(_, prepared)| prepared.legacy_cleanup_due.is_none_or(|due| now >= due))
+                    .find(|(_, prepared)| {
+                        !matches!(
+                            prepared.recovery_writer_gate,
+                            Some(RecoveryWriterGate::Waiting { .. })
+                        ) && prepared.legacy_cleanup_due.is_none_or(|due| now >= due)
+                    })
                     .map(|(id, _)| *id)
             })
             .or_else(|| {
                 self.preparing_rooms
                     .iter()
-                    .find(|(_, prepared)| prepared.legacy_cleanup_due.is_none_or(|due| now >= due))
+                    .find(|(_, prepared)| {
+                        !matches!(
+                            prepared.recovery_writer_gate,
+                            Some(RecoveryWriterGate::Waiting { .. })
+                        ) && prepared.legacy_cleanup_due.is_none_or(|due| now >= due)
+                    })
                     .map(|(id, _)| *id)
             });
         let Some(id) = id else { return };
@@ -21645,107 +21699,177 @@ impl Node {
         let Some(mut prepared) = self.preparing_rooms.remove(&id) else {
             return;
         };
-        let outcome =
-            if !self.profile.as_ref().is_some_and(Profile::is_unlocked) || self.locking != 0 {
-                Outcome::Failed(Fault::Locked)
-            } else if prepared.recovery.as_ref().is_some_and(|original| {
-                !self
-                    .channels
-                    .get(&id)
-                    .zip(original.upgrade())
-                    .is_some_and(|(a, b)| Arc::ptr_eq(a, &b))
-            }) {
-                Outcome::Failed(Fault::ChannelNotOpen)
-            } else if prepared.recovery.is_none() && self.channels.contains_key(&id) {
-                Outcome::Done
-            } else if prepared.reopening && !self.reopening.contains(&id) {
-                Outcome::Failed(Fault::ChannelNotOpen)
-            } else {
-                let waited_before = prepared.waiting.clone();
-                match self.retention_before_publication(&mut prepared).await {
-                    Ok(false) => {
-                        if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due = Some(
-                                std::time::Instant::now()
-                                    + prepared.retry_after(waited_before.as_ref()),
-                            );
-                        }
-                        if let Some((what, since)) = &prepared.waiting {
-                            let now = self.now_ms().get();
-                            if !prepared.waiting_noted
-                                && now.saturating_sub(*since) >= PREPARE_WAIT_NOTED_AFTER_MS
-                            {
-                                prepared.waiting_noted = true;
-                                let _ = self.event_tx.send(NodeEvent::NodeNote {
-                                    note: format!(
-                                        "room {} is still preparing: it waits for {what}, {}",
-                                        crate::node::link::b32_encode(&id),
-                                        crate::node::status::since_text(*since)
-                                    ),
-                                });
-                            }
-                        }
-                        // A wait that changed is published at once: the room list, the status
-                        // and the app say it without waiting for another event (#991).
-                        let changed = prepared.waiting != waited_before;
-                        self.preparing_rooms.insert(id, prepared);
-                        if changed {
-                            self.publish().await;
-                        }
-                        return;
+        let outcome = if !self.profile.as_ref().is_some_and(Profile::is_unlocked)
+            || self.locking != 0
+        {
+            Outcome::Failed(Fault::Locked)
+        } else if prepared.recovery.as_ref().is_some_and(|original| {
+            !self
+                .channels
+                .get(&id)
+                .zip(original.upgrade())
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, &b))
+        }) {
+            Outcome::Failed(Fault::ChannelNotOpen)
+        } else if prepared.recovery.is_none() && self.channels.contains_key(&id) {
+            Outcome::Done
+        } else if prepared.reopening && !self.reopening.contains(&id) {
+            Outcome::Failed(Fault::ChannelNotOpen)
+        } else {
+            let waited_before = prepared.waiting.clone();
+            match self.retention_before_publication(&mut prepared).await {
+                Ok(false) => {
+                    if matches!(
+                        prepared.recovery_writer_gate,
+                        Some(RecoveryWriterGate::Ready(_))
+                    ) {
+                        prepared.recovery_writer_gate = None;
                     }
-                    Err(error)
-                        if ChannelState::governance_refreshing(&error)
-                            || ChannelState::legacy_classification_refreshing(&error) =>
-                    {
-                        // Current policy and classification are prerequisites for private
-                        // retention/publication. Pending replay keeps this room unpublished.
-                        prepared.wait_on(
-                            "its governance records being refreshed",
-                            self.now_ms().get(),
+                    if prepared.legacy_cleanup_due.is_none() {
+                        prepared.legacy_cleanup_due = Some(
+                            std::time::Instant::now()
+                                + prepared.retry_after(waited_before.as_ref()),
                         );
-                        if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due = Some(
-                                std::time::Instant::now()
-                                    + prepared.retry_after(waited_before.as_ref()),
-                            );
-                        }
-                        // A wait that changed is published at once: the room list, the status
-                        // and the app say it without waiting for another event (#991).
-                        let changed = prepared.waiting != waited_before;
-                        self.preparing_rooms.insert(id, prepared);
-                        if changed {
-                            self.publish().await;
-                        }
-                        return;
                     }
-                    Ok(true) => {
-                        if prepared.recovery.is_some() {
-                            self.complete_store_recovery(id, Ok(prepared.channel.into_inner()))
-                                .await;
-                            Outcome::Done
-                        } else {
-                            self.publish_open_channel(prepared.channel.into_inner())
-                                .await
+                    if let Some((what, since)) = &prepared.waiting {
+                        let now = self.now_ms().get();
+                        if !prepared.waiting_noted
+                            && now.saturating_sub(*since) >= PREPARE_WAIT_NOTED_AFTER_MS
+                        {
+                            prepared.waiting_noted = true;
+                            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                                note: format!(
+                                    "room {} is still preparing: it waits for {what}, {}",
+                                    crate::node::link::b32_encode(&id),
+                                    crate::node::status::since_text(*since)
+                                ),
+                            });
                         }
                     }
-                    Err(error) => {
-                        let fault = fault_of(&error);
-                        if prepared.recovery.is_some() {
-                            self.complete_store_recovery(id, Err(error)).await;
-                            self.publish().await;
-                            return;
-                        }
-                        let _ = self.event_tx.send(NodeEvent::NodeNote {
-                            note: format!(
-                                "room {} could not finish opening: {error}; it stays closed",
-                                crate::node::link::b32_encode(&id)
-                            ),
-                        });
-                        Outcome::Failed(fault)
+                    // A wait that changed is published at once: the room list, the status
+                    // and the app say it without waiting for another event (#991).
+                    let changed = prepared.waiting != waited_before;
+                    self.preparing_rooms.insert(id, prepared);
+                    if changed {
+                        self.publish().await;
+                    }
+                    return;
+                }
+                Err(error)
+                    if ChannelState::governance_refreshing(&error)
+                        || ChannelState::legacy_classification_refreshing(&error) =>
+                {
+                    if matches!(
+                        prepared.recovery_writer_gate,
+                        Some(RecoveryWriterGate::Ready(_))
+                    ) {
+                        prepared.recovery_writer_gate = None;
+                    }
+                    // Current policy and classification are prerequisites for private
+                    // retention/publication. Pending replay keeps this room unpublished.
+                    prepared.wait_on(
+                        "its governance records being refreshed",
+                        self.now_ms().get(),
+                    );
+                    if prepared.legacy_cleanup_due.is_none() {
+                        prepared.legacy_cleanup_due = Some(
+                            std::time::Instant::now()
+                                + prepared.retry_after(waited_before.as_ref()),
+                        );
+                    }
+                    // A wait that changed is published at once: the room list, the status
+                    // and the app say it without waiting for another event (#991).
+                    let changed = prepared.waiting != waited_before;
+                    self.preparing_rooms.insert(id, prepared);
+                    if changed {
+                        self.publish().await;
+                    }
+                    return;
+                }
+                Ok(true) => {
+                    if prepared.recovery.is_some() {
+                        let transition = match prepared.recovery_writer_gate.take() {
+                            Some(RecoveryWriterGate::Ready(transition)) => transition,
+                            Some(waiting @ RecoveryWriterGate::Waiting { .. }) => {
+                                prepared.recovery_writer_gate = Some(waiting);
+                                self.preparing_rooms.insert(id, prepared);
+                                return;
+                            }
+                            None => {
+                                let Some(old) =
+                                    prepared.recovery.as_ref().and_then(|old| old.upgrade())
+                                else {
+                                    self.preparing_rooms.insert(id, prepared);
+                                    return;
+                                };
+                                let owner = Arc::new(());
+                                let fence = crate::transport::stream_transport::Fence::new();
+                                prepared.recovery_writer_gate = Some(RecoveryWriterGate::Waiting {
+                                    owner: Arc::clone(&owner),
+                                    fence: Arc::clone(&fence),
+                                });
+                                self.preparing_rooms.insert(id, prepared);
+                                let tx = self.net_tx.clone();
+                                let mut room_cancel = self.own_key_room_watch(id);
+                                let mut epoch_changed = self.pairwise_epoch.subscribe();
+                                tokio::spawn(async move {
+                                    let gate = tokio::select! {
+                                        biased;
+                                        () = fence.retired() => None,
+                                        _ = room_cancel.changed() => None,
+                                        _ = epoch_changed.changed() => None,
+                                        channel = old.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                                    };
+                                    let transition = if let Some(gate) = gate {
+                                        tokio::select! {
+                                            biased;
+                                            () = fence.retired() => None,
+                                            _ = room_cancel.changed() => None,
+                                            _ = epoch_changed.changed() => None,
+                                            transition = gate.transition() => Some(transition),
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let _ = tx
+                                        .send(NetEvent::OwnKeyRecoveryReady {
+                                            room: id,
+                                            owner,
+                                            transition,
+                                        })
+                                        .await;
+                                });
+                                return;
+                            }
+                        };
+                        self.complete_store_recovery(
+                            id,
+                            Ok(prepared.channel.into_inner()),
+                            Some(transition),
+                        )
+                        .await
+                    } else {
+                        self.publish_open_channel(prepared.channel.into_inner(), None)
+                            .await
                     }
                 }
-            };
+                Err(error) => {
+                    let fault = fault_of(&error);
+                    if prepared.recovery.is_some() {
+                        self.complete_store_recovery(id, Err(error), None).await;
+                        self.publish().await;
+                        return;
+                    }
+                    let _ = self.event_tx.send(NodeEvent::NodeNote {
+                        note: format!(
+                            "room {} could not finish opening: {error}; it stays closed",
+                            crate::node::link::b32_encode(&id)
+                        ),
+                    });
+                    Outcome::Failed(fault)
+                }
+            }
+        };
         if outcome.is_done() {
             self.queue_room_publication(
                 id,
@@ -22101,7 +22225,11 @@ impl Node {
     }
 
     /// Publish a room only after both shared and local retention have been applied durably.
-    async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
+    async fn publish_open_channel(
+        &mut self,
+        ch: ChannelState,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    ) -> Outcome {
         let channel_id = ch.channel_id();
         let governance_deadline = ch.governance_deadline();
         let Some(authority) = self.computer_authority() else {
@@ -22123,6 +22251,7 @@ impl Node {
         if published.is_none() {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
+        drop(transition);
         // Retire request/response owners from any replaced room instance before processing
         // further actor events. Existing physical blocking workers still join on their own task.
         self.cancel_own_key_room(channel_id);
