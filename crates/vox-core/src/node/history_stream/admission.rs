@@ -108,9 +108,15 @@ pub(super) fn stage(
             drop(input);
             let brought = !(retained && observed_already);
             if brought {
-                let conflict = room.history_write_tracked(store, committed, |index| {
-                    index.observe_history_head(&verified)
-                })?;
+                let conflict = if *author == room.me() && !observed_already {
+                    room.history_write_own_head_tracked(store, committed, |index| {
+                        index.observe_history_head(&verified)
+                    })?
+                } else {
+                    room.history_write_tracked(store, committed, |index| {
+                        index.observe_history_head(&verified)
+                    })?
+                };
                 if *author == room.me() && !observed_already {
                     // Set inside the physical callback AFTER commit, even if the following
                     // proof, wire exchange, cancellation or conflict exit never completes.
@@ -612,9 +618,15 @@ pub(super) fn promote_head(
         return Ok(Advanced::Busy);
     };
     drop(input);
-    let conflict = room.history_write_tracked(store, committed, |index| {
-        index.commit_history_head(&verified, &prefix)
-    })?;
+    let conflict = if signed.binding.author == room.me() {
+        room.history_write_own_head_tracked(store, committed, |index| {
+            index.commit_history_head(&verified, &prefix)
+        })?
+    } else {
+        room.history_write_tracked(store, committed, |index| {
+            index.commit_history_head(&verified, &prefix)
+        })?
+    };
     if conflict {
         return Err(invalid("conflicting authenticated heads retained"));
     }

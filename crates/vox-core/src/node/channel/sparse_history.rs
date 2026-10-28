@@ -346,13 +346,26 @@ impl ChannelState {
         store: &Store,
         operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
     ) -> Result<T> {
+        self.history_write_classified(store, false, operation)
+    }
+
+    fn history_write_classified<T>(
+        &self,
+        store: &Store,
+        durable: bool,
+        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
         if self.poisoned {
             return Err(self.save_failure());
         }
         let mut batch = store.batch()?;
         // The lane's writes are derived: heads, headers, contexts, cursors, receipts, windows,
         // rebuilt from the proofs and the peers after a crash (ADR-038 FX-30).
-        batch.derived();
+        if durable {
+            batch.ruled();
+        } else {
+            batch.derived();
+        }
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -373,6 +386,19 @@ impl ChannelState {
         operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
     ) -> Result<T> {
         let result = self.history_write(store, operation)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(result)
+    }
+
+    /// Safety-narrowing evidence about this node's own signed feed must survive a crash
+    /// before later actor maintenance has written the recovery fence.
+    pub(crate) fn history_write_own_head_tracked<T>(
+        &self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        let result = self.history_write_classified(store, true, operation)?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         Ok(result)
     }
