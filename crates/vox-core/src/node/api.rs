@@ -1402,6 +1402,8 @@ pub enum Fault {
     RoomPreparing,
     /// Explicit legacy recovery must resume before this room accepts a new post.
     LegacyHistoryRequired,
+    /// The room's signed history format is no longer supported.
+    UnsupportedRoomFormat,
     /// An input exceeded its bound (name or text length).
     TooLong,
     /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
@@ -1650,6 +1652,7 @@ impl Fault {
             Fault::LegacyHistoryRequired => {
                 "Legacy history required; resume explicit recovery before posting in this room"
             }
+            Fault::UnsupportedRoomFormat => crate::node::channel::UNSUPPORTED_ROOM_FORMAT,
             Fault::ChannelNotOpen => {
                 "that room is not open on this node\n       open it with its passphrase: a line holding the room's id and its passphrase to `vox daemon`, or in `vox tui`"
             }
@@ -1928,6 +1931,7 @@ fault_names!(
     ChannelNotOpen,
     RoomPreparing,
     LegacyHistoryRequired,
+    UnsupportedRoomFormat,
     TooLong,
     KeyringFull,
     ServiceOffersFull,
