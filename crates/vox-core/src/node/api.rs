@@ -1400,8 +1400,6 @@ pub enum Fault {
     ChannelNotOpen,
     /// Identity is Ready; this room is still preparing its saved state.
     RoomPreparing,
-    /// Explicit legacy recovery must resume before this room accepts a new post.
-    LegacyHistoryRequired,
     /// The room's signed history format is no longer supported.
     UnsupportedRoomFormat,
     /// An input exceeded its bound (name or text length).
@@ -1648,9 +1646,6 @@ impl Fault {
             }
             Fault::RoomPreparing => {
                 "that room is preparing its saved history; the node is Ready, and the room will become available when preparation finishes — no passphrase is needed"
-            }
-            Fault::LegacyHistoryRequired => {
-                "Legacy history required; resume explicit recovery before posting in this room"
             }
             Fault::UnsupportedRoomFormat => crate::node::channel::UNSUPPORTED_ROOM_FORMAT,
             Fault::ChannelNotOpen => {
@@ -1930,7 +1925,6 @@ fault_names!(
     UnknownChannel,
     ChannelNotOpen,
     RoomPreparing,
-    LegacyHistoryRequired,
     UnsupportedRoomFormat,
     TooLong,
     KeyringFull,

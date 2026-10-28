@@ -110,9 +110,25 @@ impl Context {
     ) -> Result<Self> {
         let key = crate::atrest::seal::sek(profile.signer()?, b"vox/history-demand-sek/v1")?;
         let node = profile.fingerprint();
+        let mut scope = node_scope(node, slot);
+        if slot == Slot::Archive {
+            let snapshot = profile.store().snapshot()?;
+            let alternate = current_archive_scope(node);
+            let alternate_exists = snapshot
+                .get_segment_bounded(&alternate, KIND, HEADER, STATE_BYTES)?
+                .is_some();
+            let old_legacy = snapshot
+                .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
+                .map(|segment| decode(&key, &scope, &segment))
+                .transpose()?
+                .is_some_and(|state| state.legacy.is_some());
+            if alternate_exists || old_legacy {
+                scope = alternate;
+            }
+        }
         Ok(Self {
             node,
-            scope: node_scope(node, slot),
+            scope,
             slot,
             store: profile.store_handle(),
             key,
@@ -589,6 +605,40 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
     sha256(&bytes)
 }
 
+/// A new archive owner can coexist with an untouched obsolete legacy request.
+fn current_archive_scope(node: Digest32) -> Digest32 {
+    let mut bytes = b"vox/history-demand-current-archive/v1".to_vec();
+    bytes.extend_from_slice(&node);
+    sha256(&bytes)
+}
+
+/// Identify the exact obsolete request without changing or reclaiming its saved bytes.
+pub(crate) fn obsolete_legacy_request(
+    context: &Context,
+    room: Digest32,
+    instance: [u8; 16],
+    request: Option<RequestId>,
+) -> Result<bool> {
+    if context.slot != Slot::Archive || context.scope == node_scope(context.node, Slot::Archive) {
+        return Ok(false);
+    }
+    context.check()?;
+    let scope = node_scope(context.node, Slot::Archive);
+    let Some(segment) =
+        context
+            .store()
+            .snapshot()?
+            .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
+    else {
+        return Ok(false);
+    };
+    let state = decode(key(context)?, &scope, &segment)?;
+    Ok(state.legacy.is_some()
+        && state.binding.room == room
+        && state.binding.instance == instance
+        && request.is_none_or(|request| state.request == request))
+}
+
 fn own_recovery_scope(node: Digest32, room: Digest32) -> Digest32 {
     let mut bytes = b"vox/history-demand-own-recovery-scope/v1".to_vec();
     bytes.extend_from_slice(&node);
@@ -761,7 +811,7 @@ pub fn start(
     bounds: Bounds,
     job: &Job,
 ) -> Result<Active> {
-    start_plan(context, request, binding, bounds, None, None, job)
+    start_plan(context, request, binding, bounds, None, job)
 }
 
 pub(crate) fn start_private(
@@ -774,23 +824,7 @@ pub(crate) fn start_private(
 ) -> Result<Active> {
     bounds.validate()?;
     plan.validate(bounds)?;
-    start_plan(context, request, binding, bounds, Some(plan), None, job)
-}
-
-pub(crate) fn start_legacy(
-    context: &Context,
-    request: RequestId,
-    binding: Binding,
-    bounds: Bounds,
-    plan: LegacyPlan,
-    job: &Job,
-) -> Result<Active> {
-    bounds.validate()?;
-    plan.validate(bounds)?;
-    if context.slot != Slot::Archive {
-        return Err(invalid("legacy recovery requires explicit archive demand"));
-    }
-    start_plan(context, request, binding, bounds, None, Some(plan), job)
+    start_plan(context, request, binding, bounds, Some(plan), job)
 }
 fn start_plan(
     context: &Context,
@@ -798,7 +832,6 @@ fn start_plan(
     binding: Binding,
     bounds: Bounds,
     private: Option<PrivatePlan>,
-    legacy: Option<LegacyPlan>,
     job: &Job,
 ) -> Result<Active> {
     let _charge = charge(job, STATE_WORK)?;
@@ -826,13 +859,11 @@ fn start_plan(
         request,
         binding,
         bounds,
-        remaining: legacy.map_or(Ok(bounds.entries), |plan| {
-            usize::try_from(plan.through - plan.expected_base).map_err(|_| bad())
-        })?,
+        remaining: bounds.entries,
         body: None,
         cursor: None,
         private,
-        legacy,
+        legacy: None,
         progress: Progress::Pending,
         serial,
         cleanup: None,
@@ -1406,42 +1437,6 @@ pub(crate) fn checkpoint_private(
         return Err(invalid("private history checkpoint binding"));
     }
     state.private = Some(next);
-    state.remaining = remaining;
-    state.progress = progress;
-    put(&mut batch, key, &scope, &state)?;
-    commit(batch, active, context)?;
-    if progress.terminal() {
-        active.valid = false;
-    }
-    Ok(())
-}
-
-/// A legacy worker acknowledges only already-durable accepted prefix progress. Unsigned
-/// staging and building never decrease remaining; signed publication does. Each explicit
-/// quantum has its separate fixed bounds.entries cap, without resetting the original count.
-pub(crate) fn checkpoint_legacy(
-    context: &Context,
-    active: &mut Active,
-    expected: &LegacyPlan,
-    remaining: usize,
-    progress: Progress,
-    job: &Job,
-) -> Result<()> {
-    let _charge = charge(job, STATE_WORK)?;
-    let key = key(context)?;
-    let scope = scope(context);
-    let mut batch = context.store().batch()?;
-    let mut state = live(&batch, key, &scope, context, active)?;
-    if state.legacy.as_ref() != Some(expected)
-        || remaining > state.remaining
-        || (progress == Progress::Complete && remaining != 0)
-        || !matches!(
-            progress,
-            Progress::More | Progress::Complete | Progress::Unavailable
-        )
-    {
-        return Err(invalid("legacy history checkpoint binding"));
-    }
     state.remaining = remaining;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;

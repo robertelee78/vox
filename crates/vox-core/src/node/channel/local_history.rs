@@ -146,9 +146,7 @@ impl ChannelState {
         }
         let read = self.entries.read(store, &self.sek, &self.channel_id)?;
         if read.legacy_provisional().is_some() || read.legacy_required_any() {
-            return Err(Error::Profile(
-                "Legacy history required; resume explicit recovery before posting in this room",
-            ));
+            return Err(Error::Profile(super::UNSUPPORTED_ROOM_FORMAT));
         }
         if !recover_own && read.sparse_enabled() {
             self.require_own_history_safe_in(&read)?;
