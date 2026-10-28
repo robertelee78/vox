@@ -16886,10 +16886,24 @@ impl Node {
                         ))
                         .collect::<Vec<_>>()
                 });
+                let unavailable = port.last_recorded_unavailable_response.map_or_else(
+                    || "null".to_owned(),
+                    |response| {
+                        let author = response.author.map_or_else(
+                            || "null".to_owned(),
+                            |author| format!("\"{}\"", b32_encode(&author)),
+                        );
+                        format!(
+                            "{{\"author\":{},\"head\":\"{}\",\"requested_lo\":{},\"requested_hi\":{},\"reason\":\"{}\"}}",
+                            author, b32_encode(&response.head), response.lo, response.hi, response.reason
+                        )
+                    },
+                );
                 format!(
-                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],{}}}",
+                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"last_recorded_unavailable_response\":{},\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],{}}}",
                     b32_encode(room),
                     b32_encode(peer),
+                    unavailable,
                     port.needs(),
                     port.queued,
                     port.out

@@ -2330,6 +2330,11 @@ impl Node {
                     .get(&work.room)
                     .is_some_and(|room| Arc::ptr_eq(room, &flow.shared));
             if valid {
+                if let Some(response) = flow.unavailable_response.take() {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        port.last_recorded_unavailable_response = Some(response);
+                    }
+                }
                 // An older completed inventory cannot clear a newer role obligation. Audit
                 // the current owner after the physical worker exits and keep its port ready.
                 if let Some(owner) = self.role_wake.owner(work.room) {

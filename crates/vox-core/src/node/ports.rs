@@ -312,6 +312,8 @@ pub struct Port {
     pub(crate) support_discovery_unavailable: Option<OwnProbe>,
     pub(crate) own_receipt_lower: Option<OwnProbe>,
     /// Exact recipient-key body discovered by the bounded local scanner.
+    pub(crate) last_recorded_unavailable_response:
+        Option<crate::node::history_stream::runtime::UnavailableResponse>,
     pub(crate) key_body: Option<crate::node::history_stream::KeyBodyNeed>,
     pub(crate) key_body_instance: Option<[u8; 16]>,
     /// The exact scan that selected this body, distinct from a later dirty edge.
@@ -393,6 +395,7 @@ impl Port {
             support_discovery: None,
             support_discovery_unavailable: None,
             own_receipt_lower: None,
+            last_recorded_unavailable_response: None,
             key_body: None,
             key_body_instance: None,
             key_body_token: None,
