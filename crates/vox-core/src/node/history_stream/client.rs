@@ -1419,18 +1419,37 @@ impl Receiver {
                 header.kind == crate::log::history::SignedEntryKind::Governance
             });
         let needs_transition = if governance {
-            let classified = self.read_precharged(&job, 64 * 1024, Arc::clone(&record),
-                move |room, store, record| {
-                    let input = room.history_read(store)?;
-                    let hash = record.entry.entry_hash();
-                    if input.publication_busy() { return Ok(None); }
-                    if input.history_effect_finished(&hash)? { return Ok(Some(false)); }
-                    let entry = input.history_entry(&hash)?.ok_or(Error::MalformedAtRest(
-                        "pending history body record missing"))?;
-                    // If classification cannot prove another kind, gate conservatively.
-                    Ok(Some(!matches!(crate::governance::entry::GovEntry::body_bound_to(&entry),
-                        Ok(body) if !matches!(body, crate::governance::entry::GovBody::Presence(_)))))
-                }).await?;
+            let classified = self
+                .read_precharged(
+                    &job,
+                    64 * 1024,
+                    Arc::clone(&record),
+                    move |room, store, record| {
+                        let input = room.history_read(store)?;
+                        let hash = record.entry.entry_hash();
+                        if input.publication_busy() {
+                            return Ok(None);
+                        }
+                        if input.history_effect_finished(&hash)? {
+                            return Ok(Some(false));
+                        }
+                        let entry = input.history_entry(&hash)?.ok_or(Error::MalformedAtRest(
+                            "pending history body record missing",
+                        ))?;
+                        // A join cannot narrow membership. If classification fails, gate
+                        // conservatively until the effect verifies or rejects the body.
+                        Ok(Some(
+                            match crate::governance::entry::GovEntry::body_bound_to(&entry) {
+                                Ok(crate::governance::entry::GovBody::Presence(presence)) => {
+                                    !presence.body.here
+                                }
+                                Ok(_) => false,
+                                Err(_) => true,
+                            },
+                        ))
+                    },
+                )
+                .await?;
             match classified {
                 Lookup::Found(held) => held.value.1,
                 Lookup::Busy => return Ok(Lookup::Busy),
@@ -1451,7 +1470,7 @@ impl Receiver {
             Some(tokio::select! {
                 biased;
                 () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-                transition = gate.transition() => transition,
+                transition = gate.transition(Some(std::slice::from_ref(&record.entry.skeleton.author_id))) => transition,
             })
         } else {
             None

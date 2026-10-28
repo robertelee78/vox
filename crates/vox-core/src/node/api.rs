@@ -1026,6 +1026,12 @@ pub enum NodeCommand {
         /// The identity passphrase.
         passphrase: Secret,
     },
+    /// Internal bounded ownership for an accepted unlock while policy work is pending.
+    #[doc(hidden)]
+    UnlockAdmitted {
+        passphrase: Secret,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
     /// Create a channel (needs the unlocked identity).
     CreateChannel {
         /// The room's shared name, one DNS label (ADR-028 R-1, R-2).

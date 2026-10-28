@@ -19,6 +19,15 @@ pub(super) struct DonorReady {
     output: crate::node::history_budget::OutputCharge,
 }
 
+pub(super) struct InterruptedReady {
+    node: Digest32,
+    peer: Digest32,
+    connection: Arc<VoxConnection>,
+    room: SharedChannel,
+    context: crate::join::session::JoinContext,
+    interruption: crate::node::channel::own_writer_gate::Interrupted,
+}
+
 /// One unavailable donor is parked only for this exact authenticated connection and debt.
 /// A replacement connection or a changed target/key request is new work, not a timed retry.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,6 +103,8 @@ impl Node {
         }
         self.own_key_active.remove(&room);
         self.own_key_pending.remove(&room);
+        self.own_key_interrupted_pending
+            .retain(|(id, _), _| *id != room);
         self.own_key_parked.retain(|(id, _), _| *id != room);
     }
 
@@ -842,7 +853,7 @@ impl Node {
             return;
         }
         let gate = Arc::clone(&channel.own_writer_gate);
-        let Some(writer) = gate.try_writer() else {
+        let Some(writer) = gate.try_writer(peer, &connection) else {
             drop(channel);
             let tx = self.net_tx.clone();
             let mut room_cancel = self.own_key_room_watch(context.channel_id);
@@ -865,6 +876,10 @@ impl Node {
         };
         let mut pending = Some((send, recv, credit, output, frame));
         let mut room_cancel = self.own_key_room_watch(context.channel_id);
+        let response_room = Arc::clone(&room);
+        let response_connection = Arc::clone(&connection);
+        let response_context = context.clone();
+        let tx = self.net_tx.clone();
         let admitted = self.with_current_computer_authority(|| {
             let Some((mut send, recv, credit, output, frame)) = pending.take() else {
                 return;
@@ -873,9 +888,10 @@ impl Node {
             tokio::spawn(async move {
                 let (_recv, _credit, _output) = (recv, credit, output);
                 let mut writer = writer;
+                let mut interrupted = false;
                 let written = tokio::select! {
                     biased;
-                    _ = writer.cancel.changed() => false,
+                    _ = writer.cancel.changed() => { interrupted = true; false },
                     _ = epoch_changed.changed() => false,
                     _ = room_cancel.changed() => false,
                     written = crate::transport::framing::write_frame(&mut send, &frame) => written.is_ok(),
@@ -883,16 +899,29 @@ impl Node {
                 let acknowledged = if written && send.finish().is_ok() {
                     tokio::select! {
                         biased;
-                        _ = writer.cancel.changed() => false,
+                        _ = writer.cancel.changed() => { interrupted = true; false },
                         _ = epoch_changed.changed() => false,
                         _ = room_cancel.changed() => false,
                         stopped = send.stopped() => matches!(stopped, Ok(None)),
                     }
-                } else {
-                    false
-                };
+                } else { false };
                 if !acknowledged {
                     let _ = send.reset(crate::node::pairwise_stream::KeyRefusal::NotAccepted.code());
+                }
+                let interruption = interrupted.then(|| writer.interrupted()).flatten();
+                drop(writer);
+                drop((_recv, _credit, _output));
+                if let Some(interruption) = interruption {
+                    let ready = InterruptedReady { node, peer, connection: response_connection,
+                        room: response_room, context: response_context, interruption };
+                    let connection = Arc::clone(&ready.connection);
+                    tokio::select! {
+                        biased;
+                        _ = room_cancel.changed() => {},
+                        _ = epoch_changed.changed() => {},
+                        _ = connection.quinn().closed() => {},
+                        _ = tx.send(NetEvent::OwnKeyWriterInterrupted(ready)) => {},
+                    }
                 }
             });
         });
@@ -901,6 +930,87 @@ impl Node {
                 refuse(send, recv);
             }
         }
+    }
+    pub(super) fn resume_own_key_interruptions(&mut self) {
+        let pending = std::mem::take(&mut self.own_key_interrupted_pending);
+        for (_, ready) in pending {
+            self.finish_own_key_interruption(ready);
+        }
+    }
+
+    pub(super) fn finish_own_key_interruption(&mut self, ready: InterruptedReady) {
+        let room_id = ready.context.channel_id;
+        let current = self.locking == 0
+            && self.profile.as_ref().is_some_and(|profile| {
+                profile.is_unlocked() && profile.fingerprint() == ready.node
+            })
+            && self.trust.is_trusted(&ready.peer)
+            && self
+                .channels
+                .get(&room_id)
+                .is_some_and(|room| Arc::ptr_eq(room, &ready.room))
+            && self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(&ready.peer))
+                .is_some_and(|connection| {
+                    Arc::ptr_eq(&connection, &ready.connection)
+                        && connection.quinn().close_reason().is_none()
+                });
+        if !current {
+            return;
+        }
+        let Ok(mut channel) = ready.room.try_lock() else {
+            self.wait_own_key_interruption(ready, false);
+            return;
+        };
+        let Some(_admission) = ready.interruption.gate.try_open() else {
+            drop(channel);
+            self.wait_own_key_interruption(ready, true);
+            return;
+        };
+        if channel.has_left(&ready.node)
+            || !channel.is_member(&ready.peer)
+            || !channel
+                .join_context()
+                .is_ok_and(|context| context == ready.context)
+        {
+            return;
+        }
+        let published =
+            self.with_current_computer_authority(|| channel.note_own_response_resumed(ready.peer));
+        match published {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!("own-history retry signal failed: {error}"),
+                });
+            }
+            None => {
+                drop(_admission);
+                drop(channel);
+                self.own_key_interrupted_pending
+                    .insert((room_id, ready.peer), ready);
+            }
+        }
+    }
+
+    fn wait_own_key_interruption(&mut self, ready: InterruptedReady, gate: bool) {
+        let tx = self.net_tx.clone();
+        let mut room_cancel = self.own_key_room_watch(ready.context.channel_id);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        tokio::spawn(async move {
+            let connection = Arc::clone(&ready.connection);
+            if gate {
+                tokio::select! { biased; _ = room_cancel.changed() => return, _ = epoch_changed.changed() => return,
+                _ = connection.quinn().closed() => return, _ = ready.interruption.gate.wait_open() => {} }
+            } else {
+                tokio::select! { biased; _ = room_cancel.changed() => return, _ = epoch_changed.changed() => return,
+                _ = connection.quinn().closed() => return, channel = ready.room.lock() => drop(channel) }
+            }
+            tokio::select! { biased; _ = room_cancel.changed() => {}, _ = epoch_changed.changed() => {},
+            _ = connection.quinn().closed() => {}, _ = tx.send(NetEvent::OwnKeyWriterInterrupted(ready)) => {} }
+        });
     }
 }
 

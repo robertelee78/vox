@@ -44,7 +44,7 @@ impl Peer {
             wake.notify_one();
         }
     }
-    fn changed(&self) -> Result<()> {
+    pub(super) fn changed(&self) -> Result<()> {
         self.revision
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |r| r.checked_add(1))
             .map_err(|_| Error::SizeLimitExceeded("author availability revision"))?;
@@ -121,6 +121,11 @@ impl super::ChannelState {
         }
         Ok(peer)
     }
+    /// A physically interrupted reply may be requested again once current authority permits it.
+    pub(crate) fn note_own_response_resumed(&mut self, peer: Digest32) -> Result<()> {
+        self.availability_peer(peer, None)?.changed()
+    }
+
     /// Called only after the batch which made a formerly absent body or original release serveable.
     pub(super) fn note_available(&mut self, store: &super::Store, author: Digest32) -> Result<()> {
         self.availability_peer(author, None)?

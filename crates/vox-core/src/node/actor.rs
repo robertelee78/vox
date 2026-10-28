@@ -47,6 +47,7 @@ use crate::node::paths::Paths;
 
 mod bounded_sync;
 mod computer;
+pub use computer::PolicySupersession;
 mod governance;
 mod history_demand;
 mod key_body_scan;
@@ -684,7 +685,7 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::Serve { .. } => "publishing a service",
         NodeCommand::Up { .. } => "bringing the proxy up",
         NodeCommand::Forward { .. } => "opening a forward",
-        NodeCommand::Unlock { .. } => "unlocking the identity",
+        NodeCommand::Unlock { .. } | NodeCommand::UnlockAdmitted { .. } => "unlocking the identity",
         NodeCommand::LeaveRoom { .. } => "leaving a room",
         NodeCommand::EndRoom { .. } => "ending a room",
         _ => "a client command",
@@ -698,9 +699,13 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
+        NetEvent::OwnKeyWriterInterrupted(..) => "resuming an interrupted own-key response",
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
         NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
         NetEvent::OwnKeyRecoveryReady { .. } => "resuming room recovery",
+        NetEvent::OwnKeyComputerReady { .. } => "resuming Computer policy",
+        NetEvent::OwnKeyComputerCancelled { .. } => "retiring Computer policy",
+        NetEvent::OwnKeyUnlockReady { .. } => "resuming identity unlock",
         NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
         NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
         NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
@@ -1249,6 +1254,7 @@ enum NetEvent {
     ComputerPolicy {
         guard: computer::ComputerPolicyGuard,
         reply: oneshot::Sender<crate::error::Result<()>>,
+        permit: tokio::sync::OwnedSemaphorePermit,
     },
     TrustLocalNode {
         fingerprint: Digest32,
@@ -1378,6 +1384,26 @@ enum NetEvent {
     /// A bounded worker has prepared an encrypted own-key response; current authority and
     /// the exact connection are checked again before it is sent.
     OwnKeyDonorReady(own_keys::DonorReady),
+    OwnKeyWriterInterrupted(own_keys::InterruptedReady),
+    OwnKeyUnlockReady {
+        owner: Arc<()>,
+        rooms: Vec<(Digest32, SharedChannel)>,
+        transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+        targets: Vec<Digest32>,
+        boundary: (std::time::Instant, Digest32),
+        generation: u64,
+        reply: oneshot::Sender<Outcome>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    OwnKeyComputerCancelled {
+        owner: Arc<()>,
+    },
+    OwnKeyComputerReady {
+        owner: Arc<()>,
+        rooms: Vec<(Digest32, SharedChannel)>,
+        transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+        work: computer::OwnKeyPolicyWork,
+    },
     OwnKeyRecoveryReady {
         room: Digest32,
         owner: Arc<()>,
@@ -4473,6 +4499,7 @@ pub struct NodeHandle {
     /// Posts waiting for one room's bounded publication owner to yield. The command queue does
     /// not bound sleeping client futures, so their retained text has its own fixed node budget.
     post_slots: Arc<Semaphore>,
+    computer_policy_slots: Arc<Semaphore>,
     view_rx: watch::Receiver<NodeView>,
     /// Kept so a client may subscribe at any time after the node started.
     event_tx: broadcast::Sender<NodeEvent>,
@@ -5066,6 +5093,21 @@ impl NodeHandle {
     /// actor has stopped.
     pub async fn apply(&self, command: NodeCommand) -> Outcome {
         match command {
+            NodeCommand::Unlock { passphrase } => {
+                let permit = match Arc::clone(&self.computer_policy_slots)
+                    .acquire_owned()
+                    .await
+                {
+                    Ok(permit) => permit,
+                    Err(_) => return Outcome::Failed(Fault::ShuttingDown),
+                };
+                apply_command(
+                    &self.cmd_tx,
+                    NodeCommand::UnlockAdmitted { passphrase, permit },
+                )
+                .await
+            }
+            NodeCommand::UnlockAdmitted { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::SendText { channel_id, text } => {
                 apply_post_command(&self.cmd_tx, &self.post_slots, channel_id, text, None).await
             }
@@ -5301,6 +5343,12 @@ enum RecoveryWriterGate {
     Ready(crate::node::channel::own_writer_gate::Transition),
 }
 
+struct OwnKeyPolicyFlight {
+    owner: Arc<()>,
+    guard: computer::ComputerPolicyGuard,
+    fence: Arc<crate::transport::stream_transport::Fence>,
+}
+
 struct RoomPreparation {
     channel: tokio::sync::Mutex<ChannelState>,
     reply: Option<oneshot::Sender<Outcome>>,
@@ -5463,11 +5511,17 @@ pub struct Node {
     own_key_active: BTreeMap<Digest32, [u8; 16]>,
     own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
     own_key_pending: BTreeMap<Digest32, own_keys::ResponseReady>,
+    own_key_interrupted_pending: BTreeMap<(Digest32, Digest32), own_keys::InterruptedReady>,
     own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
     own_key_untrust_pending: Option<Arc<()>>,
     own_key_room_set_changed: watch::Sender<()>,
     own_key_untrust_transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+    own_key_computer_transitions: Option<computer::OwnKeyComputerTransitions>,
+    own_key_computer_pending: std::collections::VecDeque<computer::OwnKeyPolicyWork>,
+    own_key_computer_flight: Option<OwnKeyPolicyFlight>,
+    own_key_unlock_drain: Option<Vec<Digest32>>,
+    own_key_unlock_pending: Vec<Arc<()>>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -5719,7 +5773,11 @@ pub struct Node {
     locking: usize,
     /// Unlocks asked for while locking, run once it has settled: an unlock in between would
     /// start new work beside threads still holding the old secrets.
-    unlock_after_lock: Vec<(Secret, oneshot::Sender<Outcome>)>,
+    unlock_after_lock: Vec<(
+        Secret,
+        oneshot::Sender<Outcome>,
+        tokio::sync::OwnedSemaphorePermit,
+    )>,
     /// The last `refresh_network_view` gave up on a busy room, so the view is behind and the tick
     /// rebuilds it. Atomic only because the refresh takes `&self`.
     view_stale: std::sync::atomic::AtomicBool,
@@ -6338,11 +6396,17 @@ impl Node {
             own_key_active: BTreeMap::new(),
             own_key_parked: BTreeMap::new(),
             own_key_pending: BTreeMap::new(),
+            own_key_interrupted_pending: BTreeMap::new(),
             own_key_room_cancel: BTreeMap::new(),
             own_key_leave_pending: BTreeMap::new(),
             own_key_untrust_pending: None,
             own_key_room_set_changed: watch::channel(()).0,
             own_key_untrust_transitions: None,
+            own_key_computer_transitions: None,
+            own_key_computer_pending: std::collections::VecDeque::new(),
+            own_key_computer_flight: None,
+            own_key_unlock_drain: None,
+            own_key_unlock_pending: Vec::new(),
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -6629,6 +6693,7 @@ impl Node {
             startup_computer_boundary,
             cmd_tx,
             post_slots,
+            computer_policy_slots: Arc::new(Semaphore::new(NET_QUEUE)),
             view_rx,
             event_tx: handle_event_tx,
             events: Arc::new(Mutex::new(event_rx)),
@@ -6693,7 +6758,7 @@ impl Node {
             }
             return;
         }
-        for (_, reply) in std::mem::take(&mut self.unlock_after_lock) {
+        for (_, reply, _permit) in std::mem::take(&mut self.unlock_after_lock) {
             let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
         }
         self.settle_lock().await;
@@ -6936,11 +7001,11 @@ impl Node {
                     // reopen off the actor so the node answers everyone meanwhile, but a caller
                     // told `Done` — `vox daemon`, which then opens its control socket — must not
                     // find a room it held still closed.
-                    if let NodeCommand::Unlock { passphrase } = command {
+                    if let NodeCommand::UnlockAdmitted { passphrase, permit } = command {
                         if self.locking > 0 {
-                            self.unlock_after_lock.push((passphrase, reply));
+                            self.unlock_after_lock.push((passphrase, reply, permit));
                         } else {
-                            self.unlock_and_answer(&passphrase, reply).await;
+                            self.unlock_and_answer(&passphrase, reply, permit).await;
                         }
                         self.note_if_stalled(name, started);
                         self.publish().await;
@@ -7259,6 +7324,7 @@ impl Node {
             }
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
+            NodeCommand::UnlockAdmitted { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::SetAnchors { anchors } => {
                 if self.anchors == anchors {
                     return Outcome::Done;
@@ -7754,6 +7820,10 @@ impl Node {
                     return Outcome::Failed(fault_of(&e));
                 }
                 if let Err(e) = self.start_network() {
+                    if let Error::OwnKeyWriterDrainRequired(targets) = e {
+                        self.own_key_unlock_drain = Some(targets);
+                        return Outcome::Failed(Fault::RoomChangePending);
+                    }
                     drop(self.lock_all().await);
                     eprintln!("vox node: identity unlock could not start networking: {e}");
                     return Outcome::Failed(fault_of(&e));
@@ -7771,6 +7841,13 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
+        self.start_network_with_boundary(None)
+    }
+
+    fn start_network_with_boundary(
+        &mut self,
+        boundary: Option<(std::time::Instant, Digest32)>,
+    ) -> crate::error::Result<()> {
         let identity = self.profile.as_ref().map(Profile::fingerprint).or_else(|| {
             self.headless
                 .as_ref()
@@ -7784,8 +7861,15 @@ impl Node {
         // and every daemon Ready reconciliation. A miss does not cancel accepted valid work;
         // actual policy movement retries under this same original observation end. The identity
         // travels with it so headless actors do not depend on a vault projection in `NodeView`.
-        let deadline =
-            std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
+        let deadline = match boundary {
+            Some((deadline, owner)) if owner == identity => deadline,
+            Some(_) => {
+                return Err(Error::Profile(
+                    "startup identity changed during policy settlement",
+                ))
+            }
+            None => std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN,
+        };
         *self
             .startup_computer_boundary
             .lock()
@@ -10511,6 +10595,131 @@ impl Node {
                 self.take_inbound_skdm(stream).await;
             }
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
+            NetEvent::OwnKeyWriterInterrupted(ready) => self.finish_own_key_interruption(ready),
+            NetEvent::OwnKeyUnlockReady {
+                owner,
+                rooms,
+                transitions,
+                mut targets,
+                boundary,
+                generation,
+                reply,
+                permit,
+            } => {
+                let Some(position) = self
+                    .own_key_unlock_pending
+                    .iter()
+                    .position(|current| Arc::ptr_eq(current, &owner))
+                else {
+                    let _ = reply.send(Outcome::Failed(Fault::Locked));
+                    return;
+                };
+                self.own_key_unlock_pending.remove(position);
+                let same_identity = self.locking == 0
+                    && *self.pairwise_epoch.borrow() == generation
+                    && self.profile.as_ref().is_some_and(|profile| {
+                        profile.is_unlocked() && profile.fingerprint() == boundary.1
+                    });
+                let current = rooms.len() == self.channels.len()
+                    && rooms.iter().all(|(id, old)| {
+                        self.channels
+                            .get(id)
+                            .is_some_and(|current| Arc::ptr_eq(current, old))
+                    });
+                if reply.is_closed() {
+                    drop(transitions);
+                } else if !same_identity {
+                    let _ = reply.send(Outcome::Failed(Fault::Locked));
+                } else if !current || transitions.is_none() {
+                    drop(transitions);
+                    self.begin_own_key_unlock(targets, boundary, generation, reply, permit);
+                } else if let Some(transitions) = transitions {
+                    targets.sort_unstable();
+                    self.own_key_computer_transitions = Some(computer::OwnKeyComputerTransitions {
+                        rooms: rooms
+                            .iter()
+                            .map(|(id, room)| (*id, Arc::downgrade(room)))
+                            .collect(),
+                        removed: targets,
+                        transitions,
+                    });
+                    let result = self.start_network_with_boundary(Some(boundary));
+                    self.own_key_computer_transitions = None;
+                    match result {
+                        Err(Error::OwnKeyWriterDrainRequired(targets)) => {
+                            self.begin_own_key_unlock(targets, boundary, generation, reply, permit)
+                        }
+                        Err(error) => {
+                            drop(self.lock_all().await);
+                            eprintln!(
+                                "vox node: identity unlock could not start networking: {error}"
+                            );
+                            let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                        }
+                        Ok(()) => {
+                            self.reopen_remembered().await;
+                            self.resume_own_key_interruptions();
+                            self.publish().await;
+                            let _ = reply.send(Outcome::Done);
+                        }
+                    }
+                }
+            }
+            NetEvent::OwnKeyComputerCancelled { owner } => {
+                self.own_key_computer_pending
+                    .retain(|work| !Arc::ptr_eq(&work.owner, &owner));
+                if let Some(flight) = &self.own_key_computer_flight {
+                    if Arc::ptr_eq(&flight.owner, &owner) {
+                        flight.fence.retire();
+                    }
+                }
+                self.start_own_key_computer_drain();
+            }
+            NetEvent::OwnKeyComputerReady {
+                owner,
+                rooms,
+                transitions,
+                mut work,
+            } => {
+                if self
+                    .own_key_computer_flight
+                    .as_ref()
+                    .is_some_and(|flight| Arc::ptr_eq(&flight.owner, &owner))
+                {
+                    self.own_key_computer_flight = None;
+                    let current = rooms.len() == self.channels.len()
+                        && rooms.iter().all(|(id, old)| {
+                            self.channels
+                                .get(id)
+                                .is_some_and(|current| Arc::ptr_eq(current, old))
+                        });
+                    if work.reply.is_closed() {
+                        drop(transitions);
+                    } else if let Err(error) = work.guard.active(self.computer.as_ref()) {
+                        let _ = work.reply.send(Err(error));
+                    } else if current {
+                        if let Some(transitions) = transitions {
+                            work.targets.sort_unstable();
+                            self.own_key_computer_transitions =
+                                Some(computer::OwnKeyComputerTransitions {
+                                    rooms: rooms
+                                        .iter()
+                                        .map(|(id, room)| (*id, Arc::downgrade(room)))
+                                        .collect(),
+                                    removed: work.targets.clone(),
+                                    transitions,
+                                });
+                            self.apply_owned_computer_policy(work).await;
+                        } else {
+                            self.own_key_computer_pending.push_front(work);
+                        }
+                    } else {
+                        drop(transitions);
+                        self.own_key_computer_pending.push_front(work);
+                    }
+                    self.start_own_key_computer_drain();
+                }
+            }
             NetEvent::OwnKeyRecoveryReady {
                 room,
                 owner,
@@ -12403,29 +12612,51 @@ impl Node {
                 .await;
                 let _ = reply.send(result);
             }
-            NetEvent::ComputerPolicy { guard, reply } => {
+            NetEvent::ComputerPolicy {
+                guard,
+                mut reply,
+                permit,
+            } => {
                 #[cfg(feature = "test-knobs")]
                 self.hold_computer_policy_for_proof(&guard).await;
                 #[cfg(feature = "test-knobs")]
                 let reply_delay = self.hold_computer_policy_reply_for_proof();
-                let result = match self.prepare_computer_binding_guarded(&guard) {
-                    Ok(()) => self.apply_computer_keyring_guarded(&guard).await,
-                    Err(e) => Err(e),
-                };
-                if result.is_ok() {
-                    self.governance_work.resume_after_computer_policy();
+                if reply.is_closed() {
+                    return;
                 }
-                #[cfg(feature = "test-knobs")]
-                if let Some(delay) = reply_delay {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = reply.send(result);
-                    });
-                } else {
-                    let _ = reply.send(result);
+                if let Some(flight) = &self.own_key_computer_flight {
+                    if flight.guard.active(self.computer.as_ref()).is_err() {
+                        flight.fence.retire();
+                    }
                 }
-                #[cfg(not(feature = "test-knobs"))]
-                let _ = reply.send(result);
+                let owner = Arc::new(());
+                let cancel_owner = Arc::clone(&owner);
+                let tx = self.net_tx.clone();
+                let (completion, finished) = oneshot::channel();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = reply.closed() => {
+                            let _ = tx.send(NetEvent::OwnKeyComputerCancelled { owner: cancel_owner }).await;
+                        }
+                        result = finished => {
+                            if let Ok(result) = result {
+                                #[cfg(feature = "test-knobs")]
+                                if let Some(delay) = reply_delay { tokio::time::sleep(delay).await; }
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
+                    drop(permit);
+                });
+                self.apply_owned_computer_policy(computer::OwnKeyPolicyWork {
+                    owner,
+                    guard,
+                    reply: completion,
+                    targets: Vec::new(),
+                })
+                .await;
+                self.start_own_key_computer_drain();
             }
             NetEvent::LocalTrustBlacklist(reply) => {
                 let _ = reply.send(self.local_trust_blacklist());
@@ -20498,6 +20729,7 @@ impl Node {
         self.own_key_active.clear();
         self.own_key_parked.clear();
         self.own_key_pending.clear();
+        self.own_key_interrupted_pending.clear();
         self.own_recovery_rooms.clear();
         self.own_recovery_body_debts.clear();
         self.history_in_flight.clear();
@@ -20605,16 +20837,37 @@ impl Node {
         }
         // The view first: whoever is told the lock is done reads a locked view.
         self.publish().await;
-        for (passphrase, reply) in std::mem::take(&mut self.unlock_after_lock) {
-            self.unlock_and_answer(&passphrase, reply).await;
+        for (passphrase, reply, permit) in std::mem::take(&mut self.unlock_after_lock) {
+            self.unlock_and_answer(&passphrase, reply, permit).await;
         }
     }
 
     /// Ready authenticates the identity and starts its network, independently of saved history.
     /// Each remembered room stays unavailable until its own verification, governance and
     /// retention preparation finishes; the view reports that work explicitly.
-    async fn unlock_and_answer(&mut self, passphrase: &Secret, reply: oneshot::Sender<Outcome>) {
+    async fn unlock_and_answer(
+        &mut self,
+        passphrase: &Secret,
+        reply: oneshot::Sender<Outcome>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let outcome = self.unlock(passphrase).await;
+        if let Some(targets) = self.own_key_unlock_drain.take() {
+            let boundary = *self
+                .startup_computer_boundary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(boundary) = boundary {
+                let generation = *self.pairwise_epoch.borrow();
+                self.begin_own_key_unlock(targets, boundary, generation, reply, _permit);
+            } else {
+                let _ = reply.send(Outcome::Failed(Fault::Internal));
+            }
+            return;
+        }
+        if outcome.is_done() {
+            self.resume_own_key_interruptions();
+        }
         // Publish identity, trust and room preparation before acknowledging Ready.
         self.publish().await;
         let _ = reply.send(outcome);
@@ -21826,7 +22079,7 @@ impl Node {
                                             () = fence.retired() => None,
                                             _ = room_cancel.changed() => None,
                                             _ = epoch_changed.changed() => None,
-                                            transition = gate.transition() => Some(transition),
+                                            transition = gate.transition(None) => Some(transition),
                                         }
                                     } else {
                                         None
@@ -22365,12 +22618,217 @@ impl Node {
         outcome
     }
 
+    fn begin_own_key_unlock(
+        &mut self,
+        targets: Vec<Digest32>,
+        boundary: (std::time::Instant, Digest32),
+        generation: u64,
+        mut reply: oneshot::Sender<Outcome>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let owner = Arc::new(());
+        self.own_key_unlock_pending.push(Arc::clone(&owner));
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(id, room)| (*id, Arc::clone(room)))
+            .collect();
+        let watches: Vec<_> = rooms
+            .iter()
+            .map(|(id, _)| self.own_key_room_watch(*id))
+            .collect();
+        let mut room_set_changed = self.own_key_room_set_changed.subscribe();
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mut changes: Vec<_> = watches
+                .into_iter()
+                .map(|mut watch| {
+                    Box::pin(async move {
+                        let _ = watch.changed().await;
+                    })
+                })
+                .collect();
+            let retired = std::future::poll_fn(move |cx| {
+                for change in &mut changes {
+                    if std::future::Future::poll(change.as_mut(), cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                std::task::Poll::Pending
+            });
+            tokio::pin!(retired);
+            let mut transitions = Vec::with_capacity(rooms.len());
+            for (_, room) in &rooms {
+                let gate = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = &mut retired => None,
+                    channel = room.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                };
+                let Some(gate) = gate else { break };
+                let transition = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = &mut retired => None,
+                    transition = gate.transition(Some(&targets)) => Some(transition),
+                };
+                let Some(transition) = transition else { break };
+                transitions.push(transition);
+            }
+            let transitions = (transitions.len() == rooms.len()).then_some(transitions);
+            let _ = tx
+                .send(NetEvent::OwnKeyUnlockReady {
+                    owner,
+                    rooms,
+                    transitions,
+                    targets,
+                    boundary,
+                    generation,
+                    reply,
+                    permit,
+                })
+                .await;
+        });
+    }
+
+    async fn apply_owned_computer_policy(&mut self, mut work: computer::OwnKeyPolicyWork) {
+        if work.reply.is_closed() {
+            self.own_key_computer_transitions = None;
+            return;
+        }
+        let result = match self.prepare_computer_binding_guarded(&work.guard) {
+            Ok(()) => self.apply_computer_keyring_guarded(&work.guard).await,
+            Err(error) => Err(error),
+        };
+        self.own_key_computer_transitions = None;
+        match result {
+            Err(Error::OwnKeyWriterDrainRequired(targets)) => {
+                work.targets = targets;
+                self.own_key_computer_pending.push_back(work);
+            }
+            result => {
+                if result.is_ok() {
+                    self.governance_work.resume_after_computer_policy();
+                    self.resume_own_key_interruptions();
+                }
+                let _ = work.reply.send(result);
+            }
+        }
+    }
+
+    fn start_own_key_computer_drain(&mut self) {
+        if self.own_key_computer_flight.is_some() {
+            return;
+        }
+        while let Some(mut work) = self.own_key_computer_pending.pop_front() {
+            if work.reply.is_closed() {
+                continue;
+            }
+            if let Err(error) = work.guard.active(self.computer.as_ref()) {
+                let _ = work.reply.send(Err(error));
+                continue;
+            }
+            work.targets.sort_unstable();
+            let owner = Arc::clone(&work.owner);
+            let fence = crate::transport::stream_transport::Fence::new();
+            self.own_key_computer_flight = Some(OwnKeyPolicyFlight {
+                owner: Arc::clone(&owner),
+                guard: work.guard.clone(),
+                fence: Arc::clone(&fence),
+            });
+            let rooms: Vec<_> = self
+                .channels
+                .iter()
+                .map(|(id, room)| (*id, Arc::clone(room)))
+                .collect();
+            let watches: Vec<_> = rooms
+                .iter()
+                .map(|(id, _)| self.own_key_room_watch(*id))
+                .collect();
+            let mut room_set_changed = self.own_key_room_set_changed.subscribe();
+            let mut epoch_changed = self.pairwise_epoch.subscribe();
+            let tx = self.net_tx.clone();
+            tokio::spawn(async move {
+                let mut changes: Vec<_> = watches
+                    .into_iter()
+                    .map(|mut watch| {
+                        Box::pin(async move {
+                            let _ = watch.changed().await;
+                        })
+                    })
+                    .collect();
+                let retired = std::future::poll_fn(move |cx| {
+                    for change in &mut changes {
+                        if std::future::Future::poll(change.as_mut(), cx).is_ready() {
+                            return std::task::Poll::Ready(());
+                        }
+                    }
+                    std::task::Poll::Pending
+                });
+                tokio::pin!(retired);
+                let mut transitions = Vec::with_capacity(rooms.len());
+                for (_, room) in &rooms {
+                    let gate = tokio::select! {
+                        biased;
+                        () = fence.retired() => None,
+                        _ = work.reply.closed() => None,
+                        _ = room_set_changed.changed() => None,
+                        _ = epoch_changed.changed() => None,
+                        _ = &mut retired => None,
+                        channel = room.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                    };
+                    let Some(gate) = gate else { break };
+                    let transition = tokio::select! {
+                        biased;
+                        () = fence.retired() => None,
+                        _ = work.reply.closed() => None,
+                        _ = room_set_changed.changed() => None,
+                        _ = epoch_changed.changed() => None,
+                        _ = &mut retired => None,
+                        transition = gate.transition(Some(&work.targets)) => Some(transition),
+                    };
+                    let Some(transition) = transition else { break };
+                    transitions.push(transition);
+                }
+                let transitions = (transitions.len() == rooms.len()).then_some(transitions);
+                let _ = tx
+                    .send(NetEvent::OwnKeyComputerReady {
+                        owner,
+                        rooms,
+                        transitions,
+                        work,
+                    })
+                    .await;
+            });
+            break;
+        }
+    }
+
     /// Retire sends from all current rooms off actor before committing a keyring removal.
     fn begin_own_key_untrust(&mut self, command: NodeCommand, mut reply: oneshot::Sender<Outcome>) {
         if self.own_key_untrust_pending.is_some() {
             let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
             return;
         }
+        let target = match &command {
+            NodeCommand::Untrust { fingerprint } => *fingerprint,
+            NodeCommand::Proved { change } => match change.as_ref() {
+                NodeCommand::Untrust { fingerprint } => *fingerprint,
+                _ => {
+                    let _ = reply.send(Outcome::Failed(Fault::Internal));
+                    return;
+                }
+            },
+            _ => {
+                let _ = reply.send(Outcome::Failed(Fault::Internal));
+                return;
+            }
+        };
         let owner = Arc::new(());
         self.own_key_untrust_pending = Some(Arc::clone(&owner));
         let rooms: Vec<_> = self
@@ -22420,7 +22878,7 @@ impl Node {
                     _ = epoch_changed.changed() => None,
                     _ = room_set_changed.changed() => None,
                     _ = &mut retired => None,
-                    transition = gate.transition() => Some(transition),
+                    transition = gate.transition(Some(std::slice::from_ref(&target))) => Some(transition),
                 };
                 let Some(transition) = transition else { break };
                 transitions.push(transition);
@@ -22467,7 +22925,7 @@ impl Node {
                     _ = reply.closed() => None,
                     _ = room_cancel.changed() => None,
                     _ = epoch_changed.changed() => None,
-                    transition = gate.transition() => Some(transition),
+                    transition = gate.transition(None) => Some(transition),
                 }
             } else {
                 None
