@@ -234,6 +234,7 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
         return Ok(false);
     }
     let mut batch = store.batch()?;
+    batch.derived();
     let mut index = Write::open(&mut batch, &ch.sek, &ch.channel_id)?;
     if retire {
         super::activity_pending::advance(&mut index, 32)?;

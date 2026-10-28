@@ -686,6 +686,7 @@ impl ChannelState {
     /// True means another turn is needed; unresolved absent targets do not spin a finished pass.
     pub(super) fn reconcile_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let more = self.reconcile_legacy_sessions_in(&mut batch, now_ms)?;
         if self.legacy_sessions.dirty() {
             batch.commit()?;
@@ -709,6 +710,7 @@ impl ChannelState {
     /// Continue existing work without requesting another pass. No Store or snapshot is retained.
     pub(crate) fn advance_legacy_sessions(&mut self, store: &Store, now_ms: u64) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut header = self.legacy_header(Transaction::Batch(&batch))?;
         if !header.initialized && !header.active {
             self.request_legacy_pass(&batch, &mut header)?;
@@ -917,6 +919,7 @@ impl ChannelState {
     /// bounded reconciliation turn; reopening never materializes the retained classification set.
     pub(super) fn restore_legacy_sessions(&mut self, store: &Store, _now_ms: u64) -> Result<()> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut header = self.legacy_header(Transaction::Batch(&batch))?;
         self.request_legacy_pass(&batch, &mut header)?;
         self.legacy_sessions.display_revision = header.revision;

@@ -502,6 +502,7 @@ pub(super) fn advance(ch: &ChannelState, store: &Store, now: u64) -> Result<bool
         .map(|read| read.header.clone())
         .unwrap_or_default();
     let mut batch = store.batch()?;
+    batch.derived();
     let mut index = Write::open(&mut batch, &ch.sek, &ch.channel_id)?;
     let current = (public, header.private_generation);
     if let Some(work) = &mut index.header.building {

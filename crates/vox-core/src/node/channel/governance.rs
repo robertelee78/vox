@@ -41,6 +41,7 @@ fn advance_frontiers(
 ) -> Result<bool> {
     let input = entries.read(store, sek, room)?;
     let mut batch = store.batch()?;
+    batch.derived();
     let mut writer = facts::Write::open(&mut batch, sek, room)?;
     writer.set_control_only(input.sparse_enabled());
     let mut remaining = CAUSAL_WORK;
@@ -363,6 +364,7 @@ fn advance_source(
 ) -> Result<bool> {
     let input = entries.read(store, sek, room)?;
     let mut batch = store.batch()?;
+    batch.derived();
     let mut writer = facts::Write::open(&mut batch, sek, room)?;
     writer.set_control_only(input.sparse_enabled());
     writer.discover_source()?;
@@ -437,6 +439,7 @@ pub(super) fn prepare(store: &Store, sek: &Sek, room: &Digest32) -> Result<()> {
         };
         if previous {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = facts::Write::open(&mut batch, sek, room)?;
             let mut after = None;
             while let Some((key, log, _hash)) = writer.pending_after(after)? {
@@ -451,6 +454,7 @@ pub(super) fn prepare(store: &Store, sek: &Sek, room: &Digest32) -> Result<()> {
     }
     if store.get_segment(room, GovernanceIndex, 0)?.is_none() {
         let mut batch = store.batch()?;
+        batch.derived();
         facts::Write::open(&mut batch, sek, room)?.seal()?;
         batch.commit()?;
     }
@@ -565,6 +569,7 @@ pub(super) fn advance(
     {
         let input = entries.read(store, sek, room)?;
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = facts::Write::open(&mut batch, sek, room)?;
         writer.set_control_only(input.sparse_enabled());
         // Canonical ordering cannot mutate anything before causal settlement.

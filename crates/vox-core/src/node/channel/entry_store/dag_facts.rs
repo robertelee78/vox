@@ -417,6 +417,7 @@ impl EntryIndex {
     ) -> Result<()> {
         loop {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             let done = writer.fact_chunk()?;
             writer.seal()?;
@@ -752,6 +753,7 @@ impl EntryIndex {
         publication: SparsePublication<'_>,
     ) -> Result<()> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         writer.begin_sparse_publication(publication)?;
         writer.seal()?;
@@ -769,6 +771,7 @@ impl EntryIndex {
         channel: &Digest32,
     ) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         let promotion = writer
             .directory
@@ -798,6 +801,7 @@ impl EntryIndex {
         channel: &Digest32,
     ) -> Result<bool> {
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         let done = writer.cleanup_chunk()?;
         writer.seal()?;
@@ -815,6 +819,7 @@ impl EntryIndex {
     ) -> Result<()> {
         {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             writer.begin_promotion(publication)?;
             writer.seal()?;
@@ -822,6 +827,7 @@ impl EntryIndex {
         }
         loop {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             let done = writer.promotion_chunk()?;
             writer.seal()?;
@@ -857,6 +863,7 @@ impl EntryIndex {
         drop(read);
         {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             if writer.directory.phase != Phase::Idle {
                 return Err(invalid("DAG rebuild during publication"));
@@ -880,6 +887,7 @@ impl EntryIndex {
         let mut remaining = heads.len();
         while remaining != 0 {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self.write(&mut batch, sek, channel)?;
             let mut count = 0usize;
             let mut bytes = 0usize;
@@ -929,6 +937,7 @@ impl EntryIndex {
         }
         self.finish_fact_work(store, sek, channel)?;
         let mut batch = store.batch()?;
+        batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
         writer.finish_rebuild()?;
         // An empty verified DAG can coexist with stored set-aside rows.

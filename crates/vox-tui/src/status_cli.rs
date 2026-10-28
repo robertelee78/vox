@@ -223,6 +223,17 @@ fn render(v: &Value) -> Result<String, AppError> {
         "{}",
         crate::ui::keyring_label(v.get("keyring_open_secs").and_then(Value::as_u64))
     );
+    // What the store committed and how much of it was flushed to disk (ADR-038 FX-30): only
+    // what a person would lose is flushed, so a quiet daemon's flushes stand still.
+    if let Some(store) = v.get("store") {
+        let n = |k: &str| store.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let _ = writeln!(
+            o,
+            "store: {} commits, {} flushed to disk",
+            n("commits"),
+            n("flushes")
+        );
+    }
     let unhealthy = arr("unhealthy");
     if unhealthy.is_empty() {
         let _ = writeln!(o, "healthy: nothing needs attention");
