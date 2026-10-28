@@ -228,6 +228,14 @@ pub struct Cursor {
     pub offset: u64,
 }
 
+/// The exact entry already admitted to the room, retained through staging cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmittedEntry {
+    pub entry: Digest32,
+    pub seq: u64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Cleanup {
@@ -297,6 +305,8 @@ pub struct State {
     pub body: Option<Body>,
     pub cursor: Option<Cursor>,
     #[serde(default)]
+    pub(crate) admitted: Option<AdmittedEntry>,
+    #[serde(default)]
     pub(crate) private: Option<PrivatePlan>,
     #[serde(default)]
     pub(crate) legacy: Option<LegacyPlan>,
@@ -341,6 +351,16 @@ impl State {
         })?;
         if self.serial == 0 || self.remaining > maximum_remaining {
             return Err(bad());
+        }
+        if let Some(admitted) = self.admitted {
+            if admitted.seq < self.bounds.lo
+                || admitted.seq > self.bounds.hi
+                || self.body.is_some()
+                || self.private.is_some()
+                || self.legacy.is_some()
+            {
+                return Err(bad());
+            }
         }
         if let Some(body) = &self.body {
             if body.seq < self.bounds.lo
@@ -803,6 +823,38 @@ pub(crate) fn inspect_precharged(
         .transpose()
 }
 
+/// Inspect an exact admitted locator using a borrowed mutation workspace. The decoded state
+/// is dropped before the workspace can be reused for a reclamation slice.
+pub(crate) fn has_admitted_recovery(
+    context: &Context,
+    _workspace: &AdmissionCharge,
+    room: Digest32,
+    instance: [u8; 16],
+    request: RequestId,
+    expected: Option<AdmittedEntry>,
+) -> Result<bool> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let Some(segment) =
+        context
+            .store()
+            .snapshot()?
+            .get_segment_bounded(&scope, KIND, HEADER, STATE_BYTES)?
+    else {
+        return Ok(false);
+    };
+    let state = decode(key, &scope, &segment)?;
+    Ok(state.request == request
+        && state.binding.room == room
+        && state.binding.instance == instance
+        && state.admitted.is_some()
+        && expected.is_none_or(|expected| state.admitted == Some(expected))
+        && !matches!(
+            state.progress(None),
+            Progress::Cancelled | Progress::Complete
+        ))
+}
+
 /// Start only after an explicit local request and current authorization. No abandoned namespaces.
 pub fn start(
     context: &Context,
@@ -862,6 +914,7 @@ fn start_plan(
         remaining: bounds.entries,
         body: None,
         cursor: None,
+        admitted: None,
         private,
         legacy: None,
         progress: Progress::Pending,
@@ -869,7 +922,10 @@ fn start_plan(
         cleanup: None,
     };
     put(&mut batch, key, &scope, &state)?;
-    commit_context(batch, context)?;
+    // Once the start is committed its durable owner exists. A later cancellation must not
+    // turn that completed mutation into an error that conceals the new request.
+    context.check()?;
+    batch.commit()?;
     Ok(Active {
         node: context.fingerprint(),
         scope,
@@ -882,8 +938,10 @@ fn start_plan(
 }
 
 /// The caller prepaid this mutation and supplies freshly rechecked authority. Bounds and
-/// remaining count come only from disk. Precommit authorization/cancellation checks remain;
-/// postcommit observer cancellation cannot replace a successful activation with failure.
+/// remaining count come only from disk. Public archive demand may renew its activation's trust
+/// nonce after current authorization is checked, without changing its selected scope. Private
+/// grants and legacy recovery retain exact-binding semantics. Precommit authorization/cancellation
+/// checks remain; postcommit observer cancellation cannot replace successful activation with failure.
 pub(crate) fn resume_precharged(
     context: &Context,
     request: RequestId,
@@ -895,7 +953,22 @@ pub(crate) fn resume_precharged(
     let mut batch = context.store().batch()?;
     authorize_in(&batch, context, binding)?;
     let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
-    if state.request != request || state.binding != binding || state.progress.terminal() {
+    // A durable public selection is not an old worker's authorization lease. An unrelated trust
+    // edit fences that worker, but explicit Resume (or its retained same-quantum handoff) checks
+    // current authority above and may activate the SAME selection under the current nonce.
+    // Private audience/grant changes and legacy recovery still require the exact old binding.
+    let same_public_scope = context.slot == Slot::Archive
+        && state.private.is_none()
+        && state.legacy.is_none()
+        && binding.audience == [0; 32]
+        && state.binding.room == binding.room
+        && state.binding.instance == binding.instance
+        && state.binding.epoch == binding.epoch
+        && state.binding.audience == binding.audience;
+    if state.request != request
+        || (state.binding != binding && !same_public_scope)
+        || state.progress.terminal()
+    {
         return Err(invalid(
             "history demand authority changed or operation ended",
         ));
@@ -903,6 +976,9 @@ pub(crate) fn resume_precharged(
     if state.cleanup.is_some() {
         return Err(invalid("history staging reclamation is pending"));
     }
+    // Commit the fresh binding with the serial: no handle from the earlier activation can
+    // match this record, and the selected bounds, body, cursor and remaining work stay intact.
+    state.binding = binding;
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Pending;
     put(&mut batch, key, &scope, &state)?;
@@ -1023,6 +1099,7 @@ pub fn begin_body(
         ));
     }
     state.remaining -= 1;
+    state.admitted = None;
     state.body = Some(Body {
         entry,
         seq,
@@ -1237,7 +1314,14 @@ pub(crate) fn entry_admitted(
     {
         return Err(invalid("history entry is incomplete or changed"));
     }
+    let admitted_seq = state.body.as_ref().expect("validated body").seq;
     schedule_cleanup(&mut state);
+    if context.slot == Slot::Archive && state.private.is_none() && state.legacy.is_none() {
+        state.admitted = Some(AdmittedEntry {
+            entry,
+            seq: admitted_seq,
+        });
+    }
     put(batch, key, &scope, &state)
 }
 
@@ -1304,6 +1388,7 @@ pub(crate) fn role_header_admitted(
     {
         return Err(invalid("role-complete history header changed"));
     }
+    state.admitted = None;
     state.remaining -= 1;
     if state.remaining == 0 {
         state.cursor = None;
@@ -1387,7 +1472,7 @@ pub(crate) fn checkpoint_precharged(
     } else {
         None
     };
-    if state.progress == progress && state.cursor == next_cursor {
+    if state.progress == progress && state.cursor == next_cursor && state.admitted.is_none() {
         // Exact Active, current authority and all cursor/credit invariants were checked in
         // this serialized batch. An identical checkpoint has no durable work to commit.
         let result = context.check();
@@ -1397,6 +1482,7 @@ pub(crate) fn checkpoint_precharged(
         return result;
     }
     state.cursor = next_cursor;
+    state.admitted = None;
     state.progress = progress;
     put(&mut batch, key, &scope, &state)?;
     commit(batch, active, context)?;
@@ -1488,6 +1574,7 @@ pub(crate) fn cancel_precharged(
     }
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Cancelled;
+    state.admitted = None;
     schedule_cleanup(&mut state);
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)
@@ -1524,6 +1611,7 @@ pub(crate) fn cancel_owned_precharged(
     }
     state.serial = next_serial(state.serial)?;
     state.progress = Progress::Cancelled;
+    state.admitted = None;
     schedule_cleanup(&mut state);
     put(&mut batch, key, &scope, &state)?;
     // Preserve the lifecycle fence until the commit's linearization point. A later observation

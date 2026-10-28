@@ -14115,6 +14115,7 @@ impl Node {
         // A close followed by a join can reuse the same room id before a maintenance sweep has
         // pruned its old instance. The new instance must establish its own checked fold.
         self.governance_work.wake_room(parsed.channel_id);
+        self.request_admitted_recovery(parsed.channel_id);
         // Every board route was retained before its pre-join announcement, before the successful
         // exchange and off-actor seal. Every exit above can therefore withdraw without first
         // installing the room or relying on a live connection surviving until cleanup.
@@ -16364,6 +16365,7 @@ impl Node {
     /// started.
     async fn schedule(&mut self) -> bool {
         self.accept_history_demand();
+        self.advance_admitted_recovery();
         self.queue_cancelled_legacy_cleanup();
         self.accept_bounded_sync();
         self.retry_owed_history_resume();
@@ -21708,6 +21710,7 @@ impl Node {
         // Reopening replaces the room instance. Never inherit a settled marker retained for the
         // prior instance while it was absent from the open-room map.
         self.governance_work.wake_room(channel_id);
+        self.request_admitted_recovery(channel_id);
         self.governance_work
             .set_deadline(channel_id, governance_deadline);
         // Preparation established current decisions and completed all pending narrowing.
