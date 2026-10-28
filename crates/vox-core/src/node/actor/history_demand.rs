@@ -1365,17 +1365,28 @@ impl Node {
             return;
         }
         let Some(node) = self.profile.as_ref().map(|profile| profile.fingerprint()) else {
+            owed.ticket = None;
             self.history_demand.resume_owed = Some(owed);
             return;
         };
         if owed.interrupted.is_some() {
             let Some(shared) = self.channels.get(&owed.room).cloned() else {
+                owed.ticket = None;
                 self.history_demand.resume_owed = Some(owed);
                 return;
             };
             let room = match shared.try_lock() {
                 Ok(room) => room,
                 Err(_) => {
+                    // A room lock wait is not runnable Control work. Release its queued
+                    // ticket before waiting so it cannot pin other work at the FIFO head.
+                    owed.ticket = None;
+                    if let Some(task) = owed.wake_task.take() {
+                        task.abort();
+                    }
+                    if let Some(fence) = owed.wake_fence.take() {
+                        fence.retire();
+                    }
                     if owed.wake_task.is_none() {
                         let fence = Fence::new();
                         let worker_fence = Arc::clone(&fence);
@@ -1419,6 +1430,14 @@ impl Node {
             });
             drop(room);
             if !connected {
+                // A disconnected donor owns no runnable Control turn.
+                owed.ticket = None;
+                if let Some(task) = owed.wake_task.take() {
+                    task.abort();
+                }
+                if let Some(fence) = owed.wake_fence.take() {
+                    fence.retire();
+                }
                 self.history_demand.resume_owed = Some(owed);
                 return;
             }

@@ -2584,14 +2584,17 @@ impl Node {
                 eprintln!("vox: {error}");
                 continue;
             }
-            let closed_connection = returned.connection_closed.or_else(|| {
-                (work.connection_closed
-                    && returned
-                        .failure
-                        .as_ref()
-                        .is_some_and(|failure| failure.retired_by_fence))
-                .then_some(work.connection_serial)
-            });
+            let closure_eligible = returned
+                .failure
+                .as_ref()
+                .is_none_or(|failure| failure.connection_closed || failure.retired_by_fence);
+            let closed_connection = closure_eligible
+                .then(|| {
+                    returned
+                        .connection_closed
+                        .or_else(|| work.connection_closed.then_some(work.connection_serial))
+                })
+                .flatten();
             // A durable result from this exact worker wins even if its connection closed
             // immediately afterwards. A newer request must never inherit this result.
             if closed_connection.is_some() && flow.archive_status.is_some() {
@@ -4328,15 +4331,10 @@ impl Node {
             if let Some(flow) = settlement_flow.lock().await.as_mut() {
                 flow.park();
             }
-            let connection_closed = failure
-                .as_ref()
-                .filter(|failure| failure.connection_closed || failure.retired_by_fence)
-                .and_then(|_| {
-                    result_connection
-                        .quinn()
-                        .close_reason()
-                        .map(|_| connection_serial)
-                });
+            let connection_closed = result_connection
+                .quinn()
+                .close_reason()
+                .map(|_| connection_serial);
             if let Ok(mut result) = output.lock() {
                 *result = Some(Returned {
                     failure,

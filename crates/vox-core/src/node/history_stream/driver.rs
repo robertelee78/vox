@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::node::history_budget::Job;
 use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
-use crate::transport::streams::{open_typed, StreamKind};
+use crate::transport::streams::StreamKind;
 use crate::wire::WireError;
 
 use super::client::{Received, Receiver};
@@ -31,27 +31,18 @@ pub(crate) async fn exchange(
     let streams = tokio::select! {
         biased;
         () = fence.retired() => return Err(Error::Unreachable("history opening cancelled")),
-        result = tokio::time::timeout_at(deadline, open_typed(conn, StreamKind::Sync)) => {
-            let opened = result.map_err(|_| Error::Unreachable("history opening deadline elapsed"))?;
-            match opened {
-                Err(Error::Unreachable("quic stream: the connection is closed"))
-                    if conn.quinn().close_reason().is_some() => return Err(Error::HistoryConnectionClosed),
-                other => other?,
-            }
+        result = tokio::time::timeout_at(deadline, async {
+            let (mut send, recv) = conn.open_history_stream().await?;
+            crate::transport::framing::write_history_frame(&mut send, &StreamKind::Sync.frame()).await?;
+            Ok::<_, Error>((send, recv))
+        }) => {
+            result.map_err(|_| Error::Unreachable("history opening deadline elapsed"))??
         }
     };
     let mut io = Transport::new(streams.0, streams.1, job, fence, deadline);
     let kind_bytes = StreamKind::Sync.frame().len() + 4;
     drop(opening);
-    let result = match handshake_and_pull(receiver, &mut io, preamble, query, kind_bytes).await {
-        Err(Error::Unreachable(
-            "history closed before HELLO"
-            | "history response ended before DONE"
-            | "quic stream: closed before the frame was written"
-            | "history stream closed before finish",
-        )) if conn.quinn().close_reason().is_some() => Err(Error::HistoryConnectionClosed),
-        other => other,
-    };
+    let result = handshake_and_pull(receiver, &mut io, preamble, query, kind_bytes).await;
     if let Err(error) = &result {
         io.abort(match error {
             Error::HistoryCapacity(_) => WireError::SessionBusy,

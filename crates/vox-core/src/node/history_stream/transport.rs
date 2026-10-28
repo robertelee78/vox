@@ -11,7 +11,7 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::node::history_budget::{BufferCharge, Job};
-use crate::transport::framing::write_frame;
+use crate::transport::framing::write_history_frame as write_frame;
 use crate::transport::stream_transport::{Fence, SYNC_FRAME_TIMEOUT};
 use crate::wire::WireError;
 
