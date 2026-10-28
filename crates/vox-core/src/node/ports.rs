@@ -330,7 +330,6 @@ pub struct Port {
     pub(crate) key_provider_remote_turn: bool,
     pub(crate) key_debt_selected: Option<u64>,
     pub(crate) key_debt_advance: Option<u64>,
-    pub(crate) key_evidence_advance: bool,
     pub(crate) key_provider_cursor:
         Option<crate::node::channel::entry_store::sparse::KeyProviderCursor>,
     pub(crate) key_provider_expected:
@@ -405,7 +404,6 @@ impl Port {
             key_provider_remote_turn: false,
             key_debt_selected: None,
             key_debt_advance: None,
-            key_evidence_advance: false,
             key_provider_cursor: None,
             key_provider_expected: None,
             key_catalog_seen: None,

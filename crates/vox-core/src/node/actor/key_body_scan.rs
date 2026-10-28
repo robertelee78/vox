@@ -163,7 +163,6 @@ impl Node {
                                 port.key_provider_cursor = Some(cursor);
                                 port.key_provider_expected = Some(cursor);
                                 port.key_debt_advance = None;
-                                port.key_evidence_advance = false;
                                 port.key_remote_advance = None;
                                 port.key_availability_page = None;
                                 port.key_body_initialized = false;
@@ -194,7 +193,6 @@ impl Node {
                             }
                             ScanResult::Superseded => {
                                 port.key_debt_advance = None;
-                                port.key_evidence_advance = false;
                                 port.key_remote_advance = None;
                                 port.key_availability_page = None;
                                 port.key_provider_cursor = None;
@@ -284,7 +282,6 @@ impl Node {
                     connection,
                     shared,
                     port.key_debt_advance,
-                    port.key_evidence_advance,
                     port.key_remote_advance,
                     port.key_availability_page,
                     port.key_provider_cursor,
@@ -310,7 +307,6 @@ impl Node {
             connection,
             shared,
             advance,
-            evidence_advance,
             remote_advance,
             remote_page,
             held_cursor,
@@ -421,7 +417,6 @@ impl Node {
                         if cursor.connection != connection.1 {
                             return Ok(ScanResult::Superseded);
                         }
-                        cursor.evidence_unavailable |= evidence_advance;
                         if let Some(serial) = advance {
                             if serial <= cursor.local_after {
                                 return Ok(ScanResult::Superseded);

@@ -3016,11 +3016,12 @@ impl Node {
                         {
                             // The physical Flow and its staging cleanup have both completed.
                             // Continue the same bounded local scan; an older Flow cannot clear
-                            // a replacement port's different exact root.
+                            // a replacement port's different exact root. A missing body or
+                            // source remains an outstanding local debt; a later acquisition
+                            // announces its exact catalog entry without rewinding other work.
                             port.key_body = None;
                             port.key_body_instance = None;
                             port.key_body_token = None;
-                            port.key_evidence_advance = matches!(flow.key_body_unavailable, Some(crate::node::history_stream::runtime::KeyBodyUnavailable::Evidence));
                             port.key_debt_advance = port.key_debt_selected.take();
                             port.key_remote_advance = port.key_remote_selected.take();
                             port.key_body_initialized = false;
