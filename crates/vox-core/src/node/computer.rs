@@ -2533,6 +2533,9 @@ pub struct Computer {
     /// Fail closed across the gap between staging a policy replacement and publishing its new
     /// in-memory snapshot. Status reads do not consult this flag and therefore never wedge on I/O.
     authority_blocked: std::sync::atomic::AtomicBool,
+    own_key_writers:
+        Mutex<Vec<std::sync::Weak<crate::node::channel::own_writer_gate::RevocableSend>>>,
+    own_key_settled: tokio::sync::watch::Sender<()>,
     pub(crate) signer: Arc<dyn RootSigner + Send + Sync>,
     /// Serialize replacement-state transactions without making readers wait for their disk I/O.
     /// `state` is held only to take and publish a snapshot; `changes` keeps two writers from
@@ -2708,6 +2711,56 @@ impl Computer {
         }
     }
 
+    /// Register while `publish_with_current_authority` holds the state lock.
+    pub(crate) fn register_own_key_writer(
+        &self,
+        writer: &Arc<crate::node::channel::own_writer_gate::RevocableSend>,
+    ) -> bool {
+        let mut writers = lock(&self.own_key_writers);
+        if self
+            .authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.storage_ready().is_err()
+        {
+            return false;
+        }
+        writers.retain(|writer| writer.strong_count() != 0);
+        writers.push(Arc::downgrade(writer));
+        true
+    }
+
+    fn block_own_key_authority(&self) {
+        let owners = {
+            let mut writers = lock(&self.own_key_writers);
+            self.authority_blocked
+                .store(true, std::sync::atomic::Ordering::Release);
+            writers.retain(|writer| writer.strong_count() != 0);
+            writers
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        for owner in owners {
+            owner.revoke();
+        }
+    }
+
+    fn unblock_own_key_authority(&self) {
+        let _writers = lock(&self.own_key_writers);
+        self.authority_blocked
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.own_key_settled.send_replace(());
+    }
+
+    pub(crate) fn own_key_authority_blocked(&self) -> bool {
+        self.authority_blocked
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn own_key_settled(&self) -> tokio::sync::watch::Receiver<()> {
+        self.own_key_settled.subscribe()
+    }
+
     pub(crate) fn invalidate_reachers(&self) {
         lock(&self.reachers).retain(|weak| {
             if let Some(gate) = weak.upgrade() {
@@ -2722,6 +2775,7 @@ impl Computer {
     fn storage_failure(&self) {
         self.storage_failed
             .store(true, std::sync::atomic::Ordering::Release);
+        self.block_own_key_authority();
         self.invalidate_reachers();
     }
 
@@ -3711,6 +3765,8 @@ impl Computer {
                 path,
                 storage_failed: std::sync::atomic::AtomicBool::new(false),
                 authority_blocked: std::sync::atomic::AtomicBool::new(false),
+                own_key_writers: Mutex::new(Vec::new()),
+                own_key_settled: tokio::sync::watch::channel(()).0,
                 signer,
                 changes: Mutex::new(()),
                 state: Mutex::new(state),
@@ -3782,6 +3838,8 @@ impl Computer {
             path,
             storage_failed: std::sync::atomic::AtomicBool::new(false),
             authority_blocked: std::sync::atomic::AtomicBool::new(false),
+            own_key_writers: Mutex::new(Vec::new()),
+            own_key_settled: tokio::sync::watch::channel(()).0,
             signer: Arc::new(root),
             changes: Mutex::new(()),
             state: Mutex::new(state),
@@ -3950,8 +4008,7 @@ impl Computer {
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
             if authorization_changed {
-                self.authority_blocked
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.block_own_key_authority();
             }
             #[cfg(feature = "test-knobs")]
             let mutant_state_guard =
@@ -3978,8 +4035,7 @@ impl Computer {
                 {
                     self.storage_failure();
                 }
-                self.authority_blocked
-                    .store(false, std::sync::atomic::Ordering::Release);
+                self.unblock_own_key_authority();
                 #[cfg(feature = "test-knobs")]
                 finish_state_commit_for_proof(
                     state_commit_marker.as_deref(),
@@ -3995,8 +4051,7 @@ impl Computer {
             }
             let mut published = lock(&self.state);
             *published = next;
-            self.authority_blocked
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.unblock_own_key_authority();
             #[cfg(feature = "test-knobs")]
             finish_state_commit_for_proof(
                 state_commit_marker.as_deref(),
@@ -4188,13 +4243,11 @@ impl Computer {
             let authorization_changed =
                 Self::revision_expired(&held) != Self::revision_expired(&next);
             if authorization_changed {
-                self.authority_blocked
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.block_own_key_authority();
             }
             if let Err(error) = self.save_before(&next, None) {
                 self.storage_failure();
-                self.authority_blocked
-                    .store(false, std::sync::atomic::Ordering::Release);
+                self.unblock_own_key_authority();
                 return Err(error);
             }
             if authorization_changed {
@@ -4202,8 +4255,7 @@ impl Computer {
             }
             let mut published = lock(&self.state);
             *published = next;
-            self.authority_blocked
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.unblock_own_key_authority();
             let _ = self.journal_changed.send(());
             if authorization_changed {
                 let now = std::time::Instant::now();

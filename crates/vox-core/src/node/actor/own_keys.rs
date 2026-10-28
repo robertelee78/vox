@@ -874,17 +874,28 @@ impl Node {
             });
             return;
         };
-        let mut pending = Some((send, recv, credit, output, frame));
+        let send = crate::node::channel::own_writer_gate::RevocableSend::new(send);
+        let mut pending = Some((recv, credit, output, frame));
+        let computer = self.computer.clone();
         let mut room_cancel = self.own_key_room_watch(context.channel_id);
         let response_room = Arc::clone(&room);
         let response_connection = Arc::clone(&connection);
         let response_context = context.clone();
         let tx = self.net_tx.clone();
         let admitted = self.with_current_computer_authority(|| {
-            let Some((mut send, recv, credit, output, frame)) = pending.take() else {
+            if computer
+                .as_ref()
+                .is_some_and(|computer| !computer.register_own_key_writer(&send))
+            {
+                return;
+            }
+            let Some((recv, credit, output, frame)) = pending.take() else {
                 return;
             };
             let mut epoch_changed = self.pairwise_epoch.subscribe();
+            let mut revoked = send.cancelled();
+            let mut settled = computer.as_ref().map(|computer| computer.own_key_settled());
+            let send = Arc::clone(&send);
             tokio::spawn(async move {
                 let (_recv, _credit, _output) = (recv, credit, output);
                 let mut writer = writer;
@@ -892,28 +903,52 @@ impl Node {
                 let written = tokio::select! {
                     biased;
                     _ = writer.cancel.changed() => { interrupted = true; false },
+                    _ = revoked.changed() => { interrupted = true; false },
                     _ = epoch_changed.changed() => false,
                     _ = room_cancel.changed() => false,
-                    written = crate::transport::framing::write_frame(&mut send, &frame) => written.is_ok(),
+                    written = send.write_frame(&frame) => written,
                 };
-                let acknowledged = if written && send.finish().is_ok() {
+                let acknowledged = if written {
                     tokio::select! {
                         biased;
                         _ = writer.cancel.changed() => { interrupted = true; false },
+                        _ = revoked.changed() => { interrupted = true; false },
                         _ = epoch_changed.changed() => false,
                         _ = room_cancel.changed() => false,
-                        stopped = send.stopped() => matches!(stopped, Ok(None)),
+                        stopped = send.finish_and_wait() => stopped,
                     }
-                } else { false };
+                } else {
+                    false
+                };
+                interrupted |= *revoked.borrow();
                 if !acknowledged {
-                    let _ = send.reset(crate::node::pairwise_stream::KeyRefusal::NotAccepted.code());
+                    send.revoke();
                 }
                 let interruption = interrupted.then(|| writer.interrupted()).flatten();
                 drop(writer);
                 drop((_recv, _credit, _output));
                 if let Some(interruption) = interruption {
-                    let ready = InterruptedReady { node, peer, connection: response_connection,
-                        room: response_room, context: response_context, interruption };
+                    if *revoked.borrow() {
+                        if let (Some(computer), Some(settled)) = (&computer, &mut settled) {
+                            while computer.own_key_authority_blocked() {
+                                tokio::select! {
+                                    biased;
+                                    _ = room_cancel.changed() => return,
+                                    _ = epoch_changed.changed() => return,
+                                    _ = response_connection.quinn().closed() => return,
+                                    changed = settled.changed() => if changed.is_err() { return; },
+                                }
+                            }
+                        }
+                    }
+                    let ready = InterruptedReady {
+                        node,
+                        peer,
+                        connection: response_connection,
+                        room: response_room,
+                        context: response_context,
+                        interruption,
+                    };
                     let connection = Arc::clone(&ready.connection);
                     tokio::select! {
                         biased;
@@ -925,9 +960,10 @@ impl Node {
                 }
             });
         });
-        if admitted.is_none() {
-            if let Some((send, recv, _, _, _)) = pending {
-                refuse(send, recv);
+        if admitted.is_none() || pending.is_some() {
+            send.revoke();
+            if let Some((mut recv, _, _, _)) = pending {
+                let _ = recv.stop(crate::node::pairwise_stream::KeyRefusal::NotAccepted.code());
             }
         }
     }

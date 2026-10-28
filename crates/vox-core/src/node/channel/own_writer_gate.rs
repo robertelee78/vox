@@ -168,3 +168,98 @@ impl Gate {
         }
     }
 }
+
+/// A physical response stream whose individual operations can be revoked synchronously.
+/// No lock is held while a socket operation waits for readiness.
+pub(crate) struct RevocableSend {
+    inner: StdMutex<SendState>,
+    revoked: watch::Sender<bool>,
+}
+
+struct SendState {
+    stream: quinn::SendStream,
+    revoked: bool,
+}
+
+impl RevocableSend {
+    pub(crate) fn new(stream: quinn::SendStream) -> Arc<Self> {
+        Arc::new(Self {
+            inner: StdMutex::new(SendState {
+                stream,
+                revoked: false,
+            }),
+            revoked: watch::channel(false).0,
+        })
+    }
+
+    pub(crate) fn revoke(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inner.revoked {
+            inner.revoked = true;
+            let _ = inner
+                .stream
+                .reset(crate::node::pairwise_stream::KeyRefusal::NotAccepted.code());
+            self.revoked.send_replace(true);
+        }
+    }
+
+    pub(crate) fn cancelled(&self) -> watch::Receiver<bool> {
+        self.revoked.subscribe()
+    }
+
+    pub(crate) async fn write_frame(&self, frame: &[u8]) -> bool {
+        let Ok(len) = u32::try_from(frame.len()) else {
+            return false;
+        };
+        for part in [&len.to_be_bytes()[..], frame] {
+            let mut offset = 0;
+            while offset < part.len() {
+                let result = std::future::poll_fn(|cx| {
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if inner.revoked {
+                        return std::task::Poll::Ready(None);
+                    }
+                    std::pin::Pin::new(&mut inner.stream)
+                        .poll_write(cx, &part[offset..])
+                        .map(Some)
+                })
+                .await;
+                match result {
+                    Some(Ok(n)) if n > 0 => offset += n,
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) async fn finish_and_wait(&self) -> bool {
+        let mut stopped = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.revoked || inner.stream.finish().is_err() {
+                return false;
+            }
+            Box::pin(inner.stream.stopped())
+        };
+        std::future::poll_fn(|cx| {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if inner.revoked {
+                return std::task::Poll::Ready(false);
+            }
+            std::future::Future::poll(stopped.as_mut(), cx).map(|r| matches!(r, Ok(None)))
+        })
+        .await
+    }
+}
