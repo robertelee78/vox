@@ -1418,7 +1418,7 @@ impl Receiver {
             record.entry.skeleton.v2.as_ref().is_some_and(|header| {
                 header.kind == crate::log::history::SignedEntryKind::Governance
             });
-        let needs_transition = if governance {
+        let (needs_transition, self_departure) = if governance {
             let classified = self
                 .read_precharged(
                     &job,
@@ -1431,22 +1431,25 @@ impl Receiver {
                             return Ok(None);
                         }
                         if input.history_effect_finished(&hash)? {
-                            return Ok(Some(false));
+                            return Ok(Some((false, false)));
                         }
                         let entry = input.history_entry(&hash)?.ok_or(Error::MalformedAtRest(
                             "pending history body record missing",
                         ))?;
                         // A join cannot narrow membership. If classification fails, gate
                         // conservatively until the effect verifies or rejects the body.
-                        Ok(Some(
+                        let needs_transition =
                             match crate::governance::entry::GovEntry::body_bound_to(&entry) {
                                 Ok(crate::governance::entry::GovBody::Presence(presence)) => {
                                     !presence.body.here
                                 }
                                 Ok(_) => false,
                                 Err(_) => true,
-                            },
-                        ))
+                            };
+                        Ok(Some((
+                            needs_transition,
+                            record.entry.skeleton.author_id == room.me(),
+                        )))
                     },
                 )
                 .await?;
@@ -1456,7 +1459,7 @@ impl Receiver {
                 Lookup::Missing => return Ok(Lookup::Missing),
             }
         } else {
-            false
+            (false, false)
         };
         let transition = if needs_transition {
             let gate = {
@@ -1467,10 +1470,12 @@ impl Receiver {
                 };
                 Arc::clone(&room.own_writer_gate)
             };
+            let targets =
+                (!self_departure).then(|| std::slice::from_ref(&record.entry.skeleton.author_id));
             Some(tokio::select! {
                 biased;
                 () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
-                transition = gate.transition(Some(std::slice::from_ref(&record.entry.skeleton.author_id))) => transition,
+                transition = gate.transition(targets) => transition,
             })
         } else {
             None
