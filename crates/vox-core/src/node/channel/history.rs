@@ -1826,6 +1826,21 @@ impl ChannelState {
                 self.effective_step_retention(),
                 self.legacy_sessions.display_revision(),
             ];
+            // An unchanged, fully built projection can answer from the committed
+            // snapshot. Do not acquire the single Store writer merely to discover
+            // that there is no projection work: a slow unrelated durable save would
+            // otherwise stall this read. A missing/unready render view retains the
+            // existing rebuild path below.
+            if self.projection_state.policy == Some(policy) && !self.projection_state.pending {
+                if let Ok(rendered) = self.entries.render_view(store, &self.sek, &self.channel_id) {
+                    if rendered
+                        .next_owed_expiry()?
+                        .is_none_or(|expires| expires > self.now_hint)
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
             if self.projection_state.policy != Some(policy) {
                 self.projection_state.policy = Some(policy);
                 self.projection_state.pending = true;
