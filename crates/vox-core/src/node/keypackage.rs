@@ -56,7 +56,7 @@ const KEY_PACKAGE_VERSION: u64 = 1;
 
 /// The largest key-package this node will parse: an SKDM and a PQXDH opening message, with
 /// room to spare. A bound, because the bytes come from another member's log entry.
-const MAX_KEY_PACKAGE: usize = 64 * 1024;
+pub(crate) const MAX_KEY_PACKAGE: usize = 64 * 1024;
 
 /// One sealed sender-key message for one member, as it sits in the log.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -19,16 +19,15 @@ struct Pending {
     role_signal: bool,
     role_connection: Option<u64>,
 }
+type RoleSeen = (crate::node::ports::SupportDiscovery, (u64, u64), HeadHint);
+
 #[derive(Default)]
 struct State {
     /// Retirement belongs to one room/peer lane. A stopped room or peer must not invalidate an
     /// unrelated worker that happened to read inventory concurrently.
     generations: BTreeMap<(Digest32, Digest32), u64>,
     pending: Vec<Pending>,
-    role_seen: BTreeMap<
-        (Digest32, Digest32),
-        (crate::node::ports::SupportDiscovery, (u64, u64), HeadHint),
-    >,
+    role_seen: BTreeMap<(Digest32, Digest32), RoleSeen>,
 }
 #[derive(Default)]
 pub(crate) struct HintInbox(Mutex<State>);

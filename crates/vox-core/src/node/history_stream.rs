@@ -36,7 +36,7 @@ pub const DONE_RESERVE: usize = 512;
 const MAX_HELLO_FRAME_BYTES: usize = 3;
 // Tag + outer pair + request ID + the largest canonical Query (Page). Query's bounded u64 and
 // digest fields make this an exact structural maximum, independent of peer input.
-const MAX_WANT_FRAME_BYTES: usize = 80;
+const MAX_WANT_FRAME_BYTES: usize = 160;
 // Tag and a conservatively maximal CBOR array header. Each locally materialized HAVE hint is an
 // array header, two 32-byte byte strings (each with a maximal CBOR length header), and one u64.
 // The decoder still reserves the full attacker-sized envelope before reading any variable frame;
@@ -317,6 +317,9 @@ impl ProofKind {
 pub enum Query {
     /// One bounded inventory of scalar authenticated-head hints; no content request.
     Inventory,
+    KeyAvailability {
+        after: Option<u64>,
+    },
     Head(Digest32),
     Context(Digest32),
     /// A proof dependency's signed header, without requesting its content body.
@@ -335,6 +338,14 @@ pub enum Query {
         seq: u64,
         offset: u64,
     },
+    /// Explicit sealed-package transfer for recipient delivery or opaque relay.
+    KeyBody {
+        head: Digest32,
+        author: Digest32,
+        hash: Digest32,
+        seq: u64,
+        offset: u64,
+    },
     Page {
         head: Digest32,
         lo: u64,
@@ -348,6 +359,11 @@ impl Query {
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::Inventory | Self::Head(_) | Self::Context(_) => {}
+            Self::KeyAvailability { after } => {
+                if *after == Some(0) {
+                    return Err(invalid("key availability cursor"));
+                }
+            }
             Self::Header { seq, .. } => position(*seq)?,
             Self::Proof { kind, from, to, .. } => {
                 if *from > *to
@@ -358,7 +374,7 @@ impl Query {
                     return Err(invalid("history proof interval"));
                 }
             }
-            Self::Entry { seq, offset, .. } => {
+            Self::Entry { seq, offset, .. } | Self::KeyBody { seq, offset, .. } => {
                 position(*seq)?;
                 if *offset > MAX_PAYLOAD_BYTES as u64 {
                     return Err(invalid("history body offset"));
@@ -390,6 +406,9 @@ impl Query {
             Self::Inventory => {
                 e.array(1).uint(6);
             }
+            Self::KeyAvailability { after } => {
+                e.array(2).uint(8).uint(after.unwrap_or(0));
+            }
             Self::Head(author) => {
                 e.array(2).uint(0).bytes(author);
             }
@@ -414,6 +433,21 @@ impl Query {
             }
             Self::Entry { head, seq, offset } => {
                 e.array(4).uint(3).bytes(head).uint(*seq).uint(*offset);
+            }
+            Self::KeyBody {
+                head,
+                author,
+                hash,
+                seq,
+                offset,
+            } => {
+                e.array(6)
+                    .uint(7)
+                    .bytes(head)
+                    .bytes(author)
+                    .bytes(hash)
+                    .uint(*seq)
+                    .uint(*offset);
             }
             Self::Page {
                 head,
@@ -450,8 +484,21 @@ impl Query {
                 from: d.uint()?,
                 to: d.uint()?,
             },
+            (8, 2) => {
+                let cursor = d.uint()?;
+                Self::KeyAvailability {
+                    after: (cursor != 0).then_some(cursor),
+                }
+            }
             (3, 4) => Self::Entry {
                 head: digest(d)?,
+                seq: d.uint()?,
+                offset: d.uint()?,
+            },
+            (7, 6) => Self::KeyBody {
+                head: digest(d)?,
+                author: digest(d)?,
+                hash: digest(d)?,
                 seq: d.uint()?,
                 offset: d.uint()?,
             },
@@ -579,12 +626,27 @@ pub struct HeadHint {
     pub head: Digest32,
 }
 
+/// A provider's durable acquisition of one opaque key-package body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyBodyAvailable {
+    pub(crate) cursor: u64,
+    pub(crate) author: Digest32,
+    pub(crate) head: Digest32,
+    pub(crate) seq: u64,
+    pub(crate) hash: Digest32,
+    pub(crate) recipient: Digest32,
+}
+
+pub(crate) type KeyAvailabilityPage = Option<(u64, Option<KeyBodyAvailable>)>;
+pub(crate) type KeyAvailabilityResult = Option<([u8; 16], KeyAvailabilityPage)>;
+
 /// Durable recipient body work, scoped to its authenticated source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyBodyNeed {
     pub(crate) head: Digest32,
     pub(crate) seq: u64,
     pub(crate) hash: Digest32,
+    pub(crate) recipient: Digest32,
     pub(crate) target: HeadHint,
     pub(crate) authorization: Digest32,
 }
@@ -612,6 +674,12 @@ pub enum Frame<'a> {
         /// An authenticated peer's progress hint for the recipient's own feed. This is
         /// a reason to query, never a receipt or an authorization decision.
         role: Option<HeadHint>,
+        key_catalog: Option<([u8; 16], u64)>,
+    },
+    KeyAvailability {
+        request: RequestId,
+        instance: [u8; 16],
+        page: Option<(u64, Option<KeyBodyAvailable>)>,
     },
     Want {
         request: RequestId,
@@ -675,8 +743,9 @@ impl<'a> Frame<'a> {
     fn encoding_envelope(&self) -> Result<(usize, usize)> {
         let maximum = match self {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
+            Self::KeyAvailability { .. } => 256,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
-            Self::Have { hints, .. } => (HAVE_FRAME_FIXED_BYTES + 18 + HAVE_HINT_MAX_BYTES)
+            Self::Have { hints, .. } => (HAVE_FRAME_FIXED_BYTES + 256 + HAVE_HINT_MAX_BYTES)
                 .checked_add(
                     hints
                         .len()
@@ -717,11 +786,15 @@ impl<'a> Frame<'a> {
                 e.uint(u64::from(*bitmap));
                 0x01
             }
-            Self::Have { hints, role } => {
+            Self::Have {
+                hints,
+                role,
+                key_catalog,
+            } => {
                 if hints.len() > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
                 }
-                e.array(2).array(hints.len());
+                e.array(3).array(hints.len());
                 let mut previous = None;
                 for hint in hints {
                     if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
@@ -742,6 +815,10 @@ impl<'a> Frame<'a> {
                         .bytes(&role.author)
                         .uint(role.size)
                         .bytes(&role.head);
+                }
+                e.array(usize::from(key_catalog.is_some()));
+                if let Some((instance, tip)) = key_catalog {
+                    e.array(2).bytes(instance).uint(*tip);
                 }
                 0x02
             }
@@ -827,6 +904,32 @@ impl<'a> Frame<'a> {
                 }
                 0x08
             }
+            Self::KeyAvailability {
+                request,
+                instance,
+                page,
+            } => {
+                e.array(3)
+                    .bytes(request)
+                    .bytes(instance)
+                    .array(usize::from(page.is_some()));
+                if let Some((cursor, body)) = page {
+                    if *cursor == 0 || body.is_some_and(|body| body.cursor != *cursor) {
+                        return Err(invalid("key availability page cursor"));
+                    }
+                    e.array(2).uint(*cursor).array(usize::from(body.is_some()));
+                    if let Some(body) = body {
+                        position(body.seq)?;
+                        e.array(5)
+                            .bytes(&body.author)
+                            .bytes(&body.head)
+                            .uint(body.seq)
+                            .bytes(&body.hash)
+                            .bytes(&body.recipient);
+                    }
+                }
+                0x0B
+            }
             Self::Cancel(request) => {
                 e.array(1).bytes(request);
                 0x09
@@ -869,7 +972,7 @@ impl<'a> Frame<'a> {
                 Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
             }
             0x02 => {
-                arity(&mut d, 2)?;
+                arity(&mut d, 3)?;
                 let count = d.array()?;
                 if count > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
@@ -907,7 +1010,19 @@ impl<'a> Frame<'a> {
                     }
                     _ => return Err(invalid("history role hint count")),
                 };
-                Self::Have { hints, role }
+                let key_catalog = match d.array()? {
+                    0 => None,
+                    1 => {
+                        arity(&mut d, 2)?;
+                        Some((request_id(&mut d)?, d.uint()?))
+                    }
+                    _ => return Err(invalid("key catalog hint count")),
+                };
+                Self::Have {
+                    hints,
+                    role,
+                    key_catalog,
+                }
             }
             0x03 => {
                 arity(&mut d, 2)?;
@@ -1010,6 +1125,49 @@ impl<'a> Frame<'a> {
                     request,
                     entry,
                     next_offset,
+                }
+            }
+            0x0B => {
+                arity(&mut d, 3)?;
+                let request = request_id(&mut d)?;
+                let instance = request_id(&mut d)?;
+                let page = match d.array()? {
+                    0 => None,
+                    1 => {
+                        arity(&mut d, 2)?;
+                        let cursor = d.uint()?;
+                        if cursor == 0 {
+                            return Err(invalid("key availability page cursor"));
+                        }
+                        let body = match d.array()? {
+                            0 => None,
+                            1 => {
+                                arity(&mut d, 5)?;
+                                let author = digest(&mut d)?;
+                                let head = digest(&mut d)?;
+                                let seq = d.uint()?;
+                                position(seq)?;
+                                let hash = digest(&mut d)?;
+                                let recipient = digest(&mut d)?;
+                                Some(KeyBodyAvailable {
+                                    cursor,
+                                    author,
+                                    head,
+                                    seq,
+                                    hash,
+                                    recipient,
+                                })
+                            }
+                            _ => return Err(invalid("key availability item count")),
+                        };
+                        Some((cursor, body))
+                    }
+                    _ => return Err(invalid("key availability page count")),
+                };
+                Self::KeyAvailability {
+                    request,
+                    instance,
+                    page,
                 }
             }
             _ => return Err(invalid("history frame kind")),

@@ -160,21 +160,15 @@ impl Drop for RouteLockWait {
     }
 }
 
+type AutoProbeResult =
+    Result<Option<([u8; 16], RequestId, demand::AdmittedEntry)>, (Option<[u8; 16]>, String)>;
+
 struct AutoProbe {
     room: Digest32,
     shared: Weak<Mutex<ChannelState>>,
     intent: u64,
     fence: Arc<Fence>,
-    result: Arc<
-        StdMutex<
-            Option<
-                Result<
-                    Option<([u8; 16], RequestId, demand::AdmittedEntry)>,
-                    (Option<[u8; 16]>, String),
-                >,
-            >,
-        >,
-    >,
+    result: Arc<StdMutex<Option<AutoProbeResult>>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 struct AutoWait {
@@ -861,11 +855,9 @@ impl Node {
             self.history_demand.auto_ticket =
                 Some(self.history_budget.enqueue(node, Lane::Control));
         }
-        let ticket = self
-            .history_demand
-            .auto_ticket
-            .as_mut()
-            .expect("ticket was installed");
+        let Some(ticket) = self.history_demand.auto_ticket.as_mut() else {
+            return;
+        };
         let wake = ticket.wake();
         let Some(job) = ticket.try_admit() else {
             self.wait_admitted_recovery(wake);
@@ -1406,8 +1398,10 @@ impl Node {
                         request,
                         resume_private,
                         local_admitted,
-                        Box::pin(async move { (*pressure).released().await }),
-                        "Waiting for local history preparation buffer capacity.",
+                        (
+                            Box::pin(async move { (*pressure).released().await }),
+                            "Waiting for local history preparation buffer capacity.",
+                        ),
                     ));
                 }
                 Err(error) => return Err(error.to_string()),
@@ -1459,10 +1453,12 @@ impl Node {
                         request,
                         resume_private,
                         Some(expected),
-                        Box::pin(async move {
-                            drop(secret.read_owned().await);
-                        }),
-                        "Waiting for the node's local history access.",
+                        (
+                            Box::pin(async move {
+                                drop(secret.read_owned().await);
+                            }),
+                            "Waiting for the node's local history access.",
+                        ),
                     ));
                 }
                 return Err("Node secret work is settling; history was not started.".into());
@@ -1653,9 +1649,12 @@ impl Node {
         request: RequestId,
         private: Option<bool>,
         local_admitted: Option<demand::AdmittedEntry>,
-        wait: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        detail: &str,
+        wait_and_detail: (
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+            &str,
+        ),
     ) -> Status {
+        let (wait, detail) = wait_and_detail;
         self.history_demand.clear_resume_owed();
         let mut pending = self
             .history_demand
@@ -2019,7 +2018,8 @@ impl Node {
                         && room.epoch() == prepared.epoch
                         && room.history_instance(profile.store()).ok()
                             == Some(prepared.status.instance);
-                    same_room && (committed_terminal
+                    same_room
+                        && (committed_terminal
                             || (room.is_member(&prepared.node)
                                 && !room.has_left(&prepared.node)
                                 && room.ended(self.now_ms().get()).is_none()
@@ -2039,9 +2039,8 @@ impl Node {
                 // A later authorization change must prevent dispatch, but it cannot undo a
                 // newer action already committed in this same room. Retire an older recovery
                 // probe before it can replace that action's status.
-                let committed_intent = user_intent
-                    && same_room
-                    && prepared.local_boundary == LocalBoundary::Durable;
+                let committed_intent =
+                    user_intent && same_room && prepared.local_boundary == LocalBoundary::Durable;
                 if let Some(Ok(prepared)) = result.take() {
                     if let Some(dispatch) = prepared.dispatch {
                         dispatch.fence.retire();

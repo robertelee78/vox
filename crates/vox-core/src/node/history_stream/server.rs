@@ -79,6 +79,9 @@ pub(super) async fn answer(
     if matches!(query, Query::Inventory) && preamble.purpose != Purpose::Control {
         return Err(Error::MalformedBundle("inventory requires control purpose"));
     }
+    if matches!(query, Query::KeyBody { .. }) && preamble.purpose != Purpose::Control {
+        return Err(Error::MalformedBundle("key body requires control purpose"));
+    }
     if preamble.purpose != Purpose::History && matches!(query, Query::Page { .. }) {
         return Err(Error::MalformedBundle(
             "archive page requires history reservation",
@@ -96,10 +99,18 @@ pub(super) async fn answer(
             Read::End => return Err(Error::MalformedBundle("inventory closed before HAVE")),
         };
         credit.charge_overhead(incoming.wire_len())?;
-        let Frame::Have { hints, role } = incoming.frame()? else {
+        let Frame::Have {
+            hints,
+            role,
+            key_catalog,
+        } = incoming.frame()?
+        else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
         };
         let work_job = incoming.job();
+        source
+            .offer_key_catalog(&work_job, key_catalog, connection_serial)
+            .await?;
         let offered = source
             .offer_role(
                 &work_job,
@@ -193,6 +204,7 @@ async fn respond(
 ) -> Result<(Status, Option<Continuation>)> {
     let job = io.job().clone();
     let request = preamble.request;
+    let explicit_key_body = matches!(query, Query::KeyBody { .. });
     match *query {
         Query::Inventory => {
             let Lookup::Found(inventory) = source.inventory(&job).await? else {
@@ -205,6 +217,41 @@ async fn respond(
                 Frame::Have {
                     hints: inventory.value.0,
                     role: inventory.value.1.as_ref().map(|notice| notice.head),
+                    key_catalog: inventory.value.2,
+                },
+                0,
+            )
+            .await?
+            {
+                Sent::Yes => Status::Complete,
+                Sent::Busy | Sent::Full => Status::Busy,
+            };
+            Ok((status, None))
+        }
+        Query::KeyAvailability { after } => {
+            if preamble.purpose != Purpose::Control {
+                return Err(Error::MalformedBundle("key availability requires control"));
+            }
+            let (instance, page) = match source
+                .read(&job, 512 * 1024, move |room, store| {
+                    Ok(Some((
+                        room.history_instance(store)?,
+                        room.history_key_available_page(store, after)?,
+                    )))
+                })
+                .await?
+            {
+                Lookup::Found(held) => held.value,
+                Lookup::Busy | Lookup::Missing => return Ok((Status::Busy, None)),
+            };
+            let status = match send(
+                source,
+                io,
+                credit,
+                Frame::KeyAvailability {
+                    request,
+                    instance,
+                    page,
                 },
                 0,
             )
@@ -384,7 +431,14 @@ async fn respond(
                 Sent::Busy | Sent::Full => Ok((Status::Busy, None)),
             }
         }
-        Query::Entry { head, seq, offset } => {
+        Query::Entry { head, seq, offset }
+        | Query::KeyBody {
+            head, seq, offset, ..
+        } => {
+            let key_identity = match query {
+                Query::KeyBody { author, hash, .. } => Some((*author, *hash)),
+                _ => None,
+            };
             let result = entry(
                 source,
                 io,
@@ -393,6 +447,8 @@ async fn respond(
                 head,
                 seq,
                 offset,
+                explicit_key_body,
+                key_identity,
                 served_object,
             )
             .await?;
@@ -417,8 +473,19 @@ async fn respond(
             // reader's next ask cut short left rendered rows below unrendered ones; nothing
             // refilled the hole, and the ask below the bottom row found nothing to fetch.
             for seq in (lo..=hi).rev() {
-                let result =
-                    entry(source, io, preamble, credit, head, seq, 0, served_object).await?;
+                let result = entry(
+                    source,
+                    io,
+                    preamble,
+                    credit,
+                    head,
+                    seq,
+                    0,
+                    false,
+                    None,
+                    served_object,
+                )
+                .await?;
                 if result.status != Status::Complete {
                     return Ok((
                         result.status,
@@ -475,6 +542,8 @@ async fn entry(
     head: Digest32,
     seq: u64,
     offset: u64,
+    explicit_key_body: bool,
+    key_identity: Option<(Digest32, Digest32)>,
     served_object: &mut bool,
 ) -> Result<EntryResult> {
     let job = io.job().clone();
@@ -486,9 +555,32 @@ async fn entry(
         offset,
         role_complete: false,
     };
+    // A relay may have validated this exact package under a different signed head.
+    // The receiver retains its own head for admission; the provider serves only an
+    // independently validated matching author, sequence, and signed entry hash.
+    let provider_head = if let Some((author, hash)) = key_identity {
+        match source
+            .read(&job, 128 * 1024, move |room, store| {
+                let read = room.history_read(store)?;
+                Ok(read
+                    .history_validated_header(&author, seq)?
+                    .and_then(|(head, entry)| (entry.entry_hash() == hash).then_some(head)))
+            })
+            .await?
+        {
+            Lookup::Found(held) => held.value,
+            Lookup::Busy => {
+                result.status = Status::Busy;
+                return Ok(result);
+            }
+            Lookup::Missing => return Ok(result),
+        }
+    } else {
+        head
+    };
     let head = match source
         .read(&job, 128 * 1024, move |room, store| {
-            room.history_head_by_id(store, &head)
+            room.history_head_by_id(store, &provider_head)
         })
         .await?
     {
@@ -521,6 +613,11 @@ async fn entry(
     };
     let parsed = Entry::from_wire(&header.value.wire)?;
     let hash = parsed.entry_hash();
+    if key_identity
+        .is_some_and(|(author, expected)| parsed.skeleton.author_id != author || hash != expected)
+    {
+        return Ok(result);
+    }
     let length = parsed.skeleton.payload_len;
     if length > MAX_PAYLOAD_BYTES as u64 || offset > length {
         return Err(Error::MalformedBundle("requested history offset/length"));
@@ -580,15 +677,25 @@ async fn entry(
     } else {
         None
     };
-    // Membership grants the public authenticated header, not another member's private key.
-    // Decide this from the verified signed header before even opening the retained body. Page
-    // and Entry share this path, so an archive request cannot override recipient privacy.
+    // The authenticated room member may carry this sealed package for its recipient.
+    // The sender and signed recipient are checked on admission; the ciphertext stays opaque.
     let private_for_another = parsed.skeleton.v2.as_ref().is_some_and(|v2| {
         v2.kind == crate::log::history::SignedEntryKind::KeyPackage
             && v2.recipient != Some(source.peer)
     });
+    if explicit_key_body
+        && !parsed
+            .skeleton
+            .v2
+            .as_ref()
+            .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
+    {
+        return Err(Error::MalformedBundle(
+            "key body request names a non-package",
+        ));
+    }
     let mut hostile_private_body = private_for_another.then(test_private_body_marker).flatten();
-    let withhold_private_body = private_for_another && hostile_private_body.is_none();
+    let withhold_private_body = private_for_another && !explicit_key_body;
     // Five worst-case record/sealing copies plus fixed work space, scaled to the signed length.
     // A small control uses the small pool; a large record must have the foreground/archive job.
     let envelope = 5 * (length as usize + MAX_HEADER_BYTES + 9) + 4 * MIB;
@@ -662,8 +769,8 @@ async fn entry(
     }
     result.hash = Some(hash);
     if withhold_private_body {
-        // This peer's role is fully satisfied by the authenticated header.  Complete the entry
-        // instead of advertising a missing body, so Page can continue past it without a retry.
+        // A nonrecipient's role receipt does not depend on its optional relay copy. An exact
+        // Control body request still receives BodyNotHeld so only this provider is declined.
         result.status = Status::Complete;
         result.role_complete = true;
         if let Some(bound) = live {

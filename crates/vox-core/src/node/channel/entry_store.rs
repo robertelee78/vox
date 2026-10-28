@@ -1180,7 +1180,7 @@ impl Source<'_> {
                     return Ok(rows
                         .binary_search_by_key(key, |r| r.0)
                         .ok()
-                        .map(|at| rows[at].1))
+                        .map(|at| rows[at].1));
                 }
                 Page::Branch(rows) => match rows.iter().find(|r| r.0 >= *key) {
                     Some((_, next)) => root = *next,
@@ -1608,7 +1608,7 @@ impl<'s> Write<'_, 's> {
                             Vec::new()
                         } else {
                             vec![(rows.last().ok_or(invalid("empty entry leaf"))?.0, root)]
-                        })
+                        });
                     }
                 }
                 if rows.len() > PAGE_ITEMS {
@@ -1710,10 +1710,46 @@ impl<'s> Write<'_, 's> {
         {
             return Err(invalid("entry rewrite location differs"));
         }
+        let acquiring_package = if entry
+            .payload
+            .as_deref()
+            .is_some_and(crate::node::keypackage::KeyPackage::is_key_package)
+        {
+            let previous = self
+                .batch
+                .get_segment_bounded(
+                    self.channel,
+                    SegmentKind::LogDb,
+                    log,
+                    crate::node::keypackage::MAX_KEY_PACKAGE
+                        + crate::log::history::MAX_HEADER_BYTES
+                        + 9,
+                )?
+                .ok_or(invalid("key-package previous entry missing"))?;
+            let wire = open_segment(self.sek, SegmentKind::LogDb, log, &previous)?;
+            let old = Entry::from_wire(&wire)?;
+            if old.entry_hash() != entry.entry_hash() {
+                return Err(invalid("key-package previous entry differs"));
+            }
+            old.payload.is_none()
+        } else {
+            false
+        };
         let sealed = seal_segment(self.sek, SegmentKind::LogDb, log, &entry.to_wire())?;
         self.batch
             .put_segment(self.channel, SegmentKind::LogDb, log, &sealed)?;
         self.directory.active = self.index(self.directory.active, entry, log)?;
+        // A retained package catalog entry must disappear in the same transaction as
+        // its body. Refill assigns a new monotonic cursor when the body is acquired again.
+        let pruning_package = entry.payload.is_none()
+            && entry
+                .skeleton
+                .v2
+                .as_ref()
+                .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage);
+        if acquiring_package || pruning_package {
+            self.directory.active = self.forget_package_index(self.directory.active, log)?;
+        }
         if entry.skeleton.v2.is_none()
             || Source::Batch(self.batch).sparse_effect_finished(
                 self.sek,
@@ -1844,7 +1880,6 @@ pub(crate) struct SparsePublication<'a> {
     pub first_log: u64,
     pub received_ms: u64,
     pub origin: u64,
-    pub local_id: Digest32,
 }
 
 const PROMOTION_ENTRIES: usize = 64;

@@ -266,6 +266,14 @@ impl Drop for KeyBodyWait {
     }
 }
 
+type KeyAvailabilityRequest = (Option<u64>, std::sync::Arc<()>, [u8; 16], u64);
+type KeyAvailabilityResponse = (
+    [u8; 16],
+    u64,
+    [u8; 16],
+    crate::node::history_stream::KeyAvailabilityPage,
+);
+
 /// One `(room, peer)`'s sync port (ADR-025 D1).
 pub struct Port {
     /// The room instance it belongs to.
@@ -317,6 +325,21 @@ pub struct Port {
     /// Exact dirty edge whose bounded scan owns the cursor.
     pub(crate) key_body_scan_token: Option<std::sync::Arc<()>>,
     pub(crate) key_body_wait: Option<KeyBodyWait>,
+    /// Exact local ordered-debt position held until the corresponding Flow settles.
+    /// Alternate completed local-debt and eligible remote-catalog turns.
+    pub(crate) key_provider_remote_turn: bool,
+    pub(crate) key_debt_selected: Option<u64>,
+    pub(crate) key_debt_advance: Option<u64>,
+    pub(crate) key_provider_cursor:
+        Option<crate::node::channel::entry_store::sparse::KeyProviderCursor>,
+    pub(crate) key_provider_expected:
+        Option<crate::node::channel::entry_store::sparse::KeyProviderCursor>,
+    pub(crate) key_catalog_seen: Option<([u8; 16], u64)>,
+    pub(crate) key_availability_request: Option<KeyAvailabilityRequest>,
+    pub(crate) key_availability_page: Option<KeyAvailabilityResponse>,
+    pub(crate) key_availability_exhausted: Option<([u8; 16], u64)>,
+    pub(crate) key_remote_selected: Option<([u8; 16], u64)>,
+    pub(crate) key_remote_advance: Option<([u8; 16], u64)>,
     /// The room generation credited to the peer: monotonic within the room instance.
     pub done_gen: u64,
     /// Scheduler-only watermark after one current-only exchange found a legacy gap.
@@ -338,6 +361,8 @@ pub struct Port {
     pub announced_seq: u64,
     /// A role-head announcement has not yet completed its exact inventory exchange.
     pub(crate) role_owed: bool,
+    pub(crate) key_catalog_owed: bool,
+    /// Durable body availability is advertised by one exact inventory notice at a time.
     /// `req_gen` as the periodic request (ADR-025 D7) last left it: while it is the newest
     /// request and unconsumed, a round the port runs for it is a `periodic` round in
     /// `vox status` (ADR-038 FX-15, #996).
@@ -376,6 +401,17 @@ impl Port {
             key_body_initialized: false,
             key_body_scan_token: None,
             key_body_wait: None,
+            key_provider_remote_turn: false,
+            key_debt_selected: None,
+            key_debt_advance: None,
+            key_provider_cursor: None,
+            key_provider_expected: None,
+            key_catalog_seen: None,
+            key_availability_request: None,
+            key_availability_page: None,
+            key_availability_exhausted: None,
+            key_remote_selected: None,
+            key_remote_advance: None,
             done_gen: 0,
             legacy_checked_gen: None,
             busy_attempt_gen: 0,
@@ -384,6 +420,7 @@ impl Port {
             own_seq: 0,
             announced_seq: 0,
             role_owed: false,
+            key_catalog_owed: false,
             periodic_req: 0,
             last_start: None,
         }
@@ -394,7 +431,7 @@ impl Port {
     /// peer; a hinted drain of the peer's backlog must not hold that announcement back.
     #[must_use]
     pub fn announce_owed(&self) -> bool {
-        self.own_seq > self.announced_seq || self.role_owed
+        self.own_seq > self.announced_seq || self.role_owed || self.key_catalog_owed
     }
 
     /// Whether the port needs a session (ADR-025 D1).
@@ -409,6 +446,7 @@ impl Port {
                 > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
                 || self.req_gen > self.req_done
                 || self.key_body.is_some()
+                || self.key_availability_request.is_some()
                 || self.announce_owed())
     }
 

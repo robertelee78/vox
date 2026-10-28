@@ -167,6 +167,29 @@ pub(super) fn stage(
         (Query::Entry { head, seq, .. } | Query::Header { head, seq }, Object::Header(bytes)) => {
             stage_header(room, store, committed, *head, *seq, *seq, bytes, &mut work)
         }
+        (
+            Query::KeyBody {
+                head,
+                author,
+                hash,
+                seq,
+                ..
+            },
+            Object::Header(bytes),
+        ) => {
+            let entry = Entry::from_wire(bytes)?;
+            if entry.skeleton.author_id != *author
+                || entry.entry_hash() != *hash
+                || !entry
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
+            {
+                return Err(invalid("requested key body header differs"));
+            }
+            stage_header(room, store, committed, *head, *seq, *seq, bytes, &mut work)
+        }
         (Query::Page { head, lo, hi, .. }, Object::Header(bytes)) => {
             stage_header(room, store, committed, *head, *lo, *hi, bytes, &mut work)
         }
@@ -286,8 +309,8 @@ fn stage_header(
         .history_pending_header(&head_id, entry.skeleton.seq)?
         .is_some_and(|pending| pending.entry_hash() == entry.entry_hash());
     drop(input);
-    // Header authentication is the authority for recipient privacy. A peer cannot make a
-    // private key package body admissible by merely sending it after its public header.
+    // Ordinary role queries need only another member's authenticated package header.
+    // An explicit KeyBody query separately admits the sealed bytes for opaque relay.
     let body_allowed = !entry.skeleton.v2.as_ref().is_some_and(|v2| {
         v2.kind == crate::log::history::SignedEntryKind::KeyPackage
             && v2.recipient != Some(room.me())
@@ -790,9 +813,7 @@ pub(super) fn start_entry(
     }
     // Public control admission can retain an authenticated key-package header while the
     // recipient's durable body obligation is serviced independently.
-    let private_for_another = v2.kind == crate::log::history::SignedEntryKind::KeyPackage
-        && v2.recipient != Some(room.me());
-    if require_body && !private_for_another && entry.payload.is_none() {
+    if require_body && entry.payload.is_none() {
         return Ok(EntryStart::BodyNeeded);
     }
     let body = match governance::TypedSparseBody::verify(entry, &key, &mut WorkBudget::default())? {

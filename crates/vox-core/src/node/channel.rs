@@ -70,6 +70,7 @@ pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
 pub(crate) use own_history::OwnRecoveryPage;
+pub(crate) use sparse_history::KeyDebtPage;
 pub(crate) use sparse_history::{
     HistoryDeclineResult, HistoryEffectCursor, HistoryEffectProgress, HistoryPayload,
     HistorySourceStart,
@@ -1215,6 +1216,12 @@ pub struct ChannelState {
     sparse_contiguous_pending: BTreeSet<Digest32>,
     role_cuts: BTreeMap<Digest32, u64>,
     sparse_contiguous_after: Option<Digest32>,
+    /// Bounded scan for durable key-body refusal cleanup; reset by a committed new owner.
+    key_provider_prune_after: Option<Digest32>,
+    key_provider_prune_pending: bool,
+    key_debt_retention_pending: bool,
+    key_debt_retention_wait: Option<sparse_history::KeyProviderPruneWait>,
+    key_provider_prune_wait: Option<sparse_history::KeyProviderPruneWait>,
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
     next_log_id: u64,
@@ -2156,6 +2163,11 @@ impl ChannelState {
             sparse_contiguous_pending: BTreeSet::new(),
             role_cuts: BTreeMap::new(),
             sparse_contiguous_after: None,
+            key_provider_prune_after: None,
+            key_provider_prune_pending: true,
+            key_debt_retention_pending: false,
+            key_debt_retention_wait: None,
+            key_provider_prune_wait: None,
             sender,
             next_log_id: 1,
             read_mark_scan: None,
@@ -2951,6 +2963,11 @@ impl ChannelState {
             sparse_contiguous_pending,
             role_cuts,
             sparse_contiguous_after: None,
+            key_provider_prune_after: None,
+            key_provider_prune_pending: true,
+            key_debt_retention_pending: false,
+            key_debt_retention_wait: None,
+            key_provider_prune_wait: None,
             sender,
             next_log_id,
             read_mark_scan: None,
@@ -3229,6 +3246,11 @@ impl ChannelState {
             sparse_contiguous_pending: BTreeSet::new(),
             role_cuts: BTreeMap::new(),
             sparse_contiguous_after: None,
+            key_provider_prune_after: None,
+            key_provider_prune_pending: true,
+            key_debt_retention_pending: false,
+            key_debt_retention_wait: None,
+            key_provider_prune_wait: None,
             sender,
             next_log_id: 1,
             read_mark_scan: None,
@@ -4154,10 +4176,17 @@ impl ChannelState {
     }
 
     fn finish_entry_publication(&mut self, store: &Store) -> Result<()> {
-        let local_applied = self.local_history.as_ref().map(|prepared| {
-            let entry = prepared.header.entry();
-            (entry.skeleton.author_id, entry.skeleton.seq)
-        });
+        let local_applied =
+            self.local_history.as_ref().map(|prepared| {
+                let entry = prepared.header.entry();
+                (
+                    entry.skeleton.author_id,
+                    entry.skeleton.seq,
+                    entry.skeleton.v2.as_ref().is_some_and(|v| {
+                        v.kind == crate::log::history::SignedEntryKind::KeyPackage
+                    }),
+                )
+            });
         self.local_history = None;
         self.local_pre_context = None;
         self.local_append_budget = None;
@@ -4166,7 +4195,10 @@ impl ChannelState {
         // The caller committed the local append and all of its effects before entering here.
         // Remote effects advance this cache in `advance_history_effect`; advance the authored
         // path from the exact verified header too, before optional cleanup can return early.
-        if let Some((author, seq)) = local_applied {
+        if let Some((author, seq, key_package)) = local_applied {
+            if key_package {
+                self.note_key_body_acquired();
+            }
             debug_assert_eq!(author, self.me());
             self.sparse_applied_tips
                 .entry(author)
@@ -6357,6 +6389,7 @@ impl ChannelState {
             return Ok(0);
         }
         self.forget_settled_owed(store)?;
+        self.prune_expired_key_body_debts(store, now)?;
         self.refresh_projection(store)?;
         self.drain_backfill(store, now.get())?;
         if self.poisoned {
@@ -6368,6 +6401,105 @@ impl ChannelState {
             self.last_pruned_at = now.get();
         }
         Ok(pruned)
+    }
+
+    /// Retire a bounded page of package-body recovery work only once this node's
+    /// current effective message retention has expired the exact signed package.
+    /// The index is ordered by signed time, so an idle sweep reads one next item
+    /// and performs no write. The existing retention turn supplies the wake.
+    pub(crate) fn key_debt_retention_pending(&self) -> bool {
+        self.key_debt_retention_pending || self.role_owed.key_retention_dirty()
+    }
+
+    pub(crate) fn prune_expired_key_body_debts(
+        &mut self,
+        store: &Store,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        if self.role_owed.take_key_retention_dirty() {
+            self.key_debt_retention_pending = true;
+        }
+        if !self.governance_display_current(now.get()) {
+            return Ok(());
+        }
+        let ttl = self.effective_retention();
+        if ttl == 0 {
+            self.key_debt_retention_pending = false;
+            return Ok(());
+        }
+        if let Some(wait) = self.key_debt_retention_wait.as_ref() {
+            if !wait.ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            self.key_debt_retention_wait = None;
+        }
+        let cutoff = now.get().saturating_sub(ttl.saturating_mul(1_000));
+        let wake = self.history_publication_wake();
+        let read = self.history_read(store)?;
+        let debts = read.expired_key_debts(cutoff, 16)?;
+        if debts.is_empty() {
+            drop(read);
+            self.key_debt_retention_pending = false;
+            return Ok(());
+        }
+        if read.publication_busy() {
+            drop(read);
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = Arc::clone(&ready);
+            let owner = Arc::clone(&self.role_owed);
+            let local = self.me();
+            let task = tokio::spawn(async move {
+                wake.await;
+                signal.store(true, std::sync::atomic::Ordering::Release);
+                owner.mark_key_retention_dirty(local);
+            });
+            self.key_debt_retention_wait =
+                Some(sparse_history::KeyProviderPruneWait { ready, task });
+            self.key_debt_retention_pending = false;
+            return Ok(());
+        }
+        let more = debts.len() == 16;
+        for debt in &debts {
+            let Some((head, entry)) = read.history_validated_header(&debt.author, debt.from)?
+            else {
+                return Err(Error::MalformedAtRest("expired key debt source missing"));
+            };
+            let log = read
+                .log_id(&debt.object)?
+                .ok_or(Error::MalformedAtRest("expired key debt log missing"))?;
+            let saved = store
+                .snapshot()?
+                .get_segment(&self.channel_id, SegmentKind::Index, log)?
+                .ok_or(Error::MalformedAtRest("expired key debt age missing"))?;
+            let (first_seen, _) =
+                parse_first_seen(&open_segment(&self.sek, SegmentKind::Index, log, &saved)?)?;
+            if debt.from != debt.through
+                || head != debt.head
+                || entry.entry_hash() != debt.object
+                || !entry
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
+                || !expired_at(entry.skeleton.claimed_ms.min(first_seen), now.get(), ttl)
+            {
+                return Err(Error::MalformedAtRest("expired key debt binding"));
+            }
+        }
+        drop(read);
+        self.key_debt_retention_pending = more;
+        let mut batch = store.batch()?;
+        batch.derived();
+        let mut index = self
+            .entries
+            .write(&mut batch, &self.sek, &self.channel_id)?;
+        for debt in &debts {
+            index.finish_history_obligation(debt)?;
+        }
+        index.seal()?;
+        batch.commit()?;
+        self.entries.committed();
+        Ok(())
     }
 
     fn retention_due(
@@ -10805,6 +10937,8 @@ impl ChannelState {
     /// App-lock this channel: wipe the SEK now. The state should be dropped
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {
+        self.key_provider_prune_wait = None;
+        self.key_debt_retention_wait = None;
         self.sek.lock_now();
         self.history_publication_changed.notify_waiters();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel

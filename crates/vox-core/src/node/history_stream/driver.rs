@@ -38,7 +38,15 @@ pub(crate) async fn exchange(
     let mut io = Transport::new(streams.0, streams.1, job, fence, deadline);
     let kind_bytes = StreamKind::Sync.frame().len() + 4;
     drop(opening);
-    let result = handshake_and_pull(receiver, &mut io, preamble, query, kind_bytes).await;
+    let result = handshake_and_pull(
+        receiver,
+        &mut io,
+        preamble,
+        query,
+        kind_bytes,
+        conn.serial(),
+    )
+    .await;
     if let Err(error) = &result {
         io.abort(match error {
             Error::HistoryCapacity(_) => WireError::SessionBusy,
@@ -55,6 +63,7 @@ async fn handshake_and_pull(
     preamble: Preamble,
     query: Query,
     kind_bytes: usize,
+    connection_serial: u64,
 ) -> Result<Received> {
     let mut overhead = kind_bytes + io.write_preamble(preamble).await?;
     let hello = Frame::Hello(crate::wire::SYNC_MODE_BOUNDED_HISTORY);
@@ -82,6 +91,7 @@ async fn handshake_and_pull(
     io.write_encoded(&encoded).await?;
     drop(encoded);
     let mut announcement = None;
+    let mut catalog_announcement = None;
     if matches!(query, Query::Inventory) {
         let super::source::Lookup::Found(mut held) = receiver.inventory(io.job()).await? else {
             return Err(Error::Unreachable("history inventory buffers busy"));
@@ -89,6 +99,7 @@ async fn handshake_and_pull(
         let frame = Frame::Have {
             hints: std::mem::take(&mut held.value.0),
             role: held.value.1.as_ref().map(|notice| notice.head),
+            key_catalog: held.value.2,
         };
         let encoded = frame.encode_required(io.job())?;
         overhead += encoded.as_slice().len() + 4;
@@ -97,6 +108,7 @@ async fn handshake_and_pull(
         }
         io.write_encoded(&encoded).await?;
         announcement = held.value.1.take();
+        catalog_announcement = held.value.3.take();
         drop(encoded);
         drop(frame);
         drop(held);
@@ -105,6 +117,11 @@ async fn handshake_and_pull(
     if result.status == super::Status::Complete {
         if let Some(announcement) = announcement {
             receiver.acknowledge_role(io.job(), announcement).await?;
+        }
+        if let Some(announcement) = catalog_announcement {
+            receiver
+                .acknowledge_key_catalog(io.job(), announcement, connection_serial)
+                .await?;
         }
     }
     Ok(result)

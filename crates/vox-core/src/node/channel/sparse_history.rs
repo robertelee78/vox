@@ -5,6 +5,16 @@ use super::*;
 use crate::log::history::{ControlContext, LogScope, SignedHead};
 use crate::node::store::Batch;
 
+pub(super) struct KeyProviderPruneWait {
+    pub(super) ready: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) task: tokio::task::JoinHandle<()>,
+}
+impl Drop for KeyProviderPruneWait {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Exact signed header and the length bound governing payload continuations.
 pub(crate) struct HistoryHeader {
     pub wire: Vec<u8>,
@@ -28,6 +38,20 @@ pub(crate) enum HistoryPayload {
     Held { payload_len: u64, bytes: Vec<u8> },
 }
 
+/// One authenticated local debt, or an explicit dependency that must wake before retry.
+// Keep the bounded record inline; boxing would add an uncharged allocation.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum KeyDebtPage {
+    End,
+    Frozen {
+        serial: u64,
+    },
+    Ready {
+        serial: u64,
+        need: crate::node::history_stream::KeyBodyNeed,
+    },
+}
+
 /// Atomic result of persisting one advertised-head refusal. Authorization mismatch is not a
 /// storage error: it carries the fresh generation read by the same batch that fenced the flow's
 /// captured generation.
@@ -37,6 +61,52 @@ pub(crate) enum HistoryDeclineResult {
 }
 
 impl ChannelState {
+    /// One cursor per turn; membership is checked under the same room guard that
+    /// owns the write, so a stale departure observation cannot erase a rejoin.
+    pub(crate) fn advance_key_provider_prune(&mut self, store: &Store) -> Result<bool> {
+        if self.role_owed.take_key_provider_prune() {
+            self.key_provider_prune_pending = true;
+            self.key_provider_prune_after = None;
+        }
+        if !self.key_provider_prune_pending {
+            return Ok(false);
+        }
+        if let Some(wait) = self.key_provider_prune_wait.as_ref() {
+            if !wait.ready.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(false);
+            }
+            self.key_provider_prune_wait = None;
+        }
+        let wake = self.history_publication_wake();
+        let read = self.history_read(store)?;
+        if read.publication_busy() {
+            drop(read);
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let signal = Arc::clone(&ready);
+            let owner = Arc::clone(&self.role_owed);
+            let local = self.me();
+            let task = tokio::spawn(async move {
+                wake.await;
+                signal.store(true, std::sync::atomic::Ordering::Release);
+                owner.mark_key_provider_prune(local);
+            });
+            self.key_provider_prune_wait = Some(KeyProviderPruneWait { ready, task });
+            return Ok(false);
+        }
+        let next = read.key_provider_cursor_after(self.key_provider_prune_after)?;
+        drop(read);
+        let Some(peer) = next else {
+            self.key_provider_prune_pending = false;
+            self.key_provider_prune_after = None;
+            return Ok(false);
+        };
+        if !self.is_member(&peer) {
+            self.history_write(store, |index| index.forget_key_provider_cursor(peer))?;
+        }
+        self.key_provider_prune_after = Some(peer);
+        Ok(true)
+    }
+
     /// The current membership incarnation whose inventory a refusal describes. A leave makes
     /// this absent; a readmission uses the leave position until the member's signed `back`
     /// statement supplies its newer position. Thus the same scalar head after a real scope
@@ -86,15 +156,10 @@ impl ChannelState {
         peer: Digest32,
         author: Digest32,
         head: Digest32,
-        authorization: (
-            Digest32,
-            Digest32,
-            bool,
-            Option<crate::node::history_stream::KeyBodyNeed>,
-        ),
+        authorization: (Digest32, Digest32, bool),
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<HistoryDeclineResult> {
-        let (node, expected_authorization, metadata, key_body) = authorization;
+        let (node, expected_authorization, metadata) = authorization;
         let peer_incarnation =
             self.history_inventory_incarnation(&peer)
                 .ok_or(Error::MalformedGovernance(
@@ -123,28 +188,10 @@ impl ChannelState {
             return Ok(HistoryDeclineResult::AuthorizationChanged { current });
         }
         let mut index = self.entries.write(&mut batch, &self.sek, &room)?;
-        let relationship = if let Some(need) = key_body {
-            if metadata
-                || need.target.author != author
-                || peer != author
-                || head != need.target.head
-            {
-                return Err(Error::Profile("key-body refusal scope differs"));
-            }
-            if !index.history_key_body_pending(need)? {
-                return Ok(HistoryDeclineResult::Stored {
-                    remembered: false,
-                    current,
-                });
-            }
-            entry_store::sparse::key_body_decline_key(&author, &need.hash)
-        } else {
-            author
-        };
         let prior = if metadata {
             index.history_declined_metadata(&peer, &author)?
         } else {
-            index.history_declined_head(&peer, &relationship)?
+            index.history_declined_head(&peer, &author)?
         };
         if prior
             == Some((
@@ -171,7 +218,7 @@ impl ChannelState {
         } else {
             index.keep_history_declined_head(
                 peer,
-                relationship,
+                author,
                 head,
                 expected_authorization,
                 peer_incarnation,
@@ -186,6 +233,70 @@ impl ChannelState {
             remembered: true,
             current,
         })
+    }
+
+    /// Read the receiver's one provider cursor. The caller owns a bounded worker and must
+    /// recheck the room/connection and peer trust before using the result.
+    pub(crate) fn key_provider_cursor(
+        &self,
+        store: &Store,
+        provider: Digest32,
+    ) -> Result<Option<entry_store::sparse::KeyProviderCursor>> {
+        self.history_read(store)?.key_provider_cursor(&provider)
+    }
+
+    /// Commit only the captured cursor owner under the same batch as authority revalidation.
+    /// A superseded Flow must never advance the current provider cursor.
+    pub(crate) fn advance_key_provider_cursor(
+        &self,
+        store: &Store,
+        provider: Digest32,
+        node: Digest32,
+        authorization: Digest32,
+        expected: Option<entry_store::sparse::KeyProviderCursor>,
+        next: entry_store::sparse::KeyProviderCursor,
+    ) -> Result<bool> {
+        if node != self.me()
+            || !self.is_member(&node)
+            || !self.is_member(&provider)
+            || self.history_inventory_incarnation(&provider) != Some(next.peer_incarnation)
+            || next.authorization != authorization
+        {
+            return Ok(false);
+        }
+        if let Some(old) = expected {
+            if old.authorization == next.authorization
+                && old.peer_incarnation == next.peer_incarnation
+                && old.connection == next.connection
+                && (next.local_after < old.local_after
+                    || (old.instance == next.instance && next.after < old.after))
+            {
+                return Err(Error::Profile("key provider cursor moved backwards"));
+            }
+        }
+        let instance = self.history_instance(store)?;
+        let mut batch = store.batch()?;
+        if crate::node::history_stream::authorization_generation_in(
+            &batch,
+            node,
+            self.channel_id,
+            instance,
+            self.epoch,
+        )? != authorization
+        {
+            return Ok(false);
+        }
+        let mut index = self
+            .entries
+            .write(&mut batch, &self.sek, &self.channel_id)?;
+        if index.key_provider_cursor(&provider)? != expected {
+            return Ok(false);
+        }
+        index.keep_key_provider_cursor(provider, next)?;
+        index.seal()?;
+        batch.commit()?;
+        self.entries.committed();
+        Ok(true)
     }
 
     /// A relevant advertised successor or changed membership incarnation removes the durable
@@ -705,79 +816,213 @@ impl ChannelState {
             .publication_busy())
     }
 
-    /// One bounded page of local key-delivery debt for the actual author's port. Public
-    /// metadata and role receipts remain independent of this recipient-only work.
-    pub(crate) fn history_key_body_page(
+    /// Enumerate one locally held sealed package using the durable acquisition cursor.
+    /// An ineligible catalog entry advances the cursor without advertising it.
+    pub(crate) fn history_key_available_page(
         &self,
         store: &Store,
-        author: Digest32,
+        after: Option<u64>,
+    ) -> Result<Option<(u64, Option<crate::node::history_stream::KeyBodyAvailable>)>> {
+        let read = self.history_read(store)?;
+        let Some((cursor, log)) = read.key_package_after(after)? else {
+            return Ok(None);
+        };
+        let sealed = store
+            .snapshot()?
+            .get_segment_bounded(
+                &self.channel_id,
+                SegmentKind::LogDb,
+                log,
+                crate::node::keypackage::MAX_KEY_PACKAGE
+                    + crate::log::history::MAX_HEADER_BYTES
+                    + 9,
+            )?
+            .ok_or(Error::MalformedAtRest("key-package catalog body missing"))?;
+        let wire = open_segment(&self.sek, SegmentKind::LogDb, log, &sealed)?;
+        let entry = Entry::from_wire(&wire)?;
+        entry.verify_payload_binding()?;
+        let Some(v2) = entry.skeleton.v2.as_ref() else {
+            return Ok(Some((cursor, None)));
+        };
+        if v2.kind != crate::log::history::SignedEntryKind::KeyPackage {
+            return Err(Error::MalformedAtRest("key-package catalog entry differs"));
+        }
+        if entry.payload.is_none() {
+            return Ok(Some((cursor, None)));
+        }
+        let recipient = v2
+            .recipient
+            .ok_or(Error::MalformedAtRest("key-package recipient missing"))?;
+        let Some((head, header)) =
+            read.history_validated_header(&entry.skeleton.author_id, entry.skeleton.seq)?
+        else {
+            return Ok(Some((cursor, None)));
+        };
+        if header.entry_hash() != entry.entry_hash() {
+            return Err(Error::MalformedAtRest("key-package source header differs"));
+        }
+        Ok(Some((
+            cursor,
+            Some(crate::node::history_stream::KeyBodyAvailable {
+                cursor,
+                author: entry.skeleton.author_id,
+                head,
+                seq: entry.skeleton.seq,
+                hash: entry.entry_hash(),
+                recipient,
+            }),
+        )))
+    }
+
+    /// A newly committed sealed-package debt may be filled by any eligible room peer.
+    pub(crate) fn note_key_body_debt(&self) {
+        for peer in self
+            .authors
+            .keys()
+            .copied()
+            .filter(|peer| *peer != self.me() && self.is_member(peer))
+        {
+            self.role_owed.mark_key_dirty(peer);
+        }
+    }
+
+    /// A newly durable indexed ciphertext may satisfy an exact peer's outstanding debt.
+    pub(crate) fn note_key_body_acquired(&self) {
+        for peer in self
+            .authors
+            .keys()
+            .copied()
+            .filter(|peer| *peer != self.me() && self.is_member(peer))
+        {
+            self.role_owed.mark_key_catalog_changed(peer);
+        }
+    }
+
+    /// Read one exact local debt in insertion order; this does not advance its owner.
+    /// An unavailable author head is a dependency, never evidence that the debt is gone.
+    pub(crate) fn key_debt_after(
+        &self,
+        store: &Store,
         authorization: Digest32,
-        after: Option<[u8; 64]>,
-    ) -> Result<
-        Option<(
-            Option<[u8; 64]>,
-            Option<crate::node::history_stream::KeyBodyNeed>,
-        )>,
-    > {
+        after: u64,
+    ) -> Result<Option<KeyDebtPage>> {
         let read = self.history_read(store)?;
         if read.publication_busy() {
-            // Cleanup completion produces another retained metadata wake.
             return Ok(None);
         }
-        let Some(state) = read.sparse_author(&author, crate::log::history::LogScope::Public)?
-        else {
-            return Ok(Some((None, None)));
+        let Some((serial, debt)) = read.history_key_debt_after(Some(after))? else {
+            return Ok(Some(KeyDebtPage::End));
         };
+        let author = debt.author;
+        let state = read
+            .sparse_author(&author, crate::log::history::LogScope::Public)?
+            .ok_or(Error::MalformedAtRest("key-body author missing"))?;
+        // A conflicting signed source is permanently frozen, so it cannot be a donor
+        // candidate. Advance past it without blocking unrelated authenticated authors.
         if state.observed_conflict.is_some() {
-            return Ok(Some((None, None)));
+            return Ok(Some(KeyDebtPage::Frozen { serial }));
         }
-        let Some(target_id) = state.committed else {
-            return Ok(Some((None, None)));
-        };
-        let Some(target) = read.history_head(&target_id)? else {
-            return Ok(Some((None, None)));
-        };
-        let (next, debt) = read.history_key_body_page(
-            author,
-            after,
-            target.id(),
-            authorization,
-            self.history_inventory_incarnation(&author)
-                .zip(self.history_author_inventory_incarnation(&author)),
-        )?;
-        let Some(debt) = debt else {
-            return Ok(Some((next, None)));
-        };
+        let target_id = state
+            .committed
+            .ok_or(Error::MalformedAtRest("key-body committed head missing"))?;
+        let target = read
+            .history_head(&target_id)?
+            .ok_or(Error::MalformedAtRest("key-body head object missing"))?;
         let (source_head, entry) = read
             .history_validated_header(&author, debt.from)?
             .ok_or(Error::MalformedAtRest("key-body source missing"))?;
+        let recipient = entry
+            .skeleton
+            .v2
+            .as_ref()
+            .filter(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
+            .and_then(|v| v.recipient)
+            .ok_or(Error::MalformedAtRest("key-body recipient missing"))?;
         if debt.from != debt.through
             || source_head != debt.head
             || entry.entry_hash() != debt.object
-            || !entry.skeleton.v2.as_ref().is_some_and(|v| {
-                v.kind == crate::log::history::SignedEntryKind::KeyPackage
-                    && v.recipient == Some(self.me())
-            })
             || !read.history_head_accepted(&source_head, target.binding)?
             || !read.history_head_accepted(&target.id(), target.binding)?
             || debt.from > target.root.leaves
         {
             return Err(Error::MalformedAtRest("key-body source binding"));
         }
-        Ok(Some((
-            next,
-            Some(crate::node::history_stream::KeyBodyNeed {
+        Ok(Some(KeyDebtPage::Ready {
+            serial,
+            need: crate::node::history_stream::KeyBodyNeed {
                 head: source_head,
                 seq: debt.from,
                 hash: debt.object,
+                recipient,
                 authorization,
                 target: crate::node::history_stream::HeadHint {
                     author,
                     head: target.id(),
                     size: target.root.leaves,
                 },
-            }),
-        )))
+            },
+        }))
+    }
+
+    /// Match an availability hint against an already authenticated, still-pending local debt.
+    /// The hint is neither evidence of a body nor a grant to admit it.
+    pub(crate) fn key_debt_for_notice(
+        &self,
+        store: &Store,
+        authorization: Digest32,
+        notice: crate::node::history_stream::KeyBodyAvailable,
+    ) -> Result<Option<Option<crate::node::history_stream::KeyBodyNeed>>> {
+        let read = self.history_read(store)?;
+        if read.publication_busy() {
+            return Ok(None);
+        }
+        let Some((source_head, entry)) =
+            read.history_validated_header(&notice.author, notice.seq)?
+        else {
+            return Ok(Some(None));
+        };
+        if entry.entry_hash() != notice.hash
+            || !entry.skeleton.v2.as_ref().is_some_and(|v| {
+                v.kind == crate::log::history::SignedEntryKind::KeyPackage
+                    && v.recipient == Some(notice.recipient)
+            })
+        {
+            return Ok(Some(None));
+        }
+        let Some(state) =
+            read.sparse_author(&notice.author, crate::log::history::LogScope::Public)?
+        else {
+            return Ok(Some(None));
+        };
+        if state.observed_conflict.is_some() {
+            return Ok(Some(None));
+        }
+        let Some(target_id) = state.committed else {
+            return Ok(Some(None));
+        };
+        let Some(target) = read.history_head(&target_id)? else {
+            return Ok(Some(None));
+        };
+        if !read.history_head_accepted(&source_head, target.binding)?
+            || !read.history_head_accepted(&target_id, target.binding)?
+        {
+            return Ok(Some(None));
+        }
+        let need = crate::node::history_stream::KeyBodyNeed {
+            head: source_head,
+            seq: notice.seq,
+            hash: notice.hash,
+            recipient: notice.recipient,
+            authorization,
+            target: crate::node::history_stream::HeadHint {
+                author: notice.author,
+                head: target.id(),
+                size: target.root.leaves,
+            },
+        };
+        Ok(Some(
+            read.history_key_body_owed(need, self.me())?.then_some(need),
+        ))
     }
 
     /// Source validation has already consumed the shared verifier envelope. This checks the
@@ -863,7 +1108,6 @@ impl ChannelState {
                 first_log: self.next_log_id,
                 received_ms: now.get(),
                 origin: self.genesis.body.created_ms,
-                local_id: self.me(),
             },
         )?;
         committed.store(true, std::sync::atomic::Ordering::Release);
@@ -916,6 +1160,7 @@ impl ChannelState {
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
         index.publish_promotion()?;
+        index.publish_key_body_debt(entry, now.get())?;
         index.seal()?;
         let first_seen = seal_segment(
             &self.sek,
@@ -957,12 +1202,13 @@ impl ChannelState {
         batch.commit()?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         if entry.payload.is_none()
-            && entry.skeleton.v2.as_ref().is_some_and(|v| {
-                v.kind == crate::log::history::SignedEntryKind::KeyPackage
-                    && v.recipient == Some(self.me())
-            })
+            && entry
+                .skeleton
+                .v2
+                .as_ref()
+                .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
         {
-            self.role_owed.mark_key_dirty(entry.skeleton.author_id);
+            self.note_key_body_debt();
         }
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
         // publication paths, a sparse history caller does not poison the room on commit failure.
@@ -1112,6 +1358,8 @@ pub(crate) enum HistoryEffectProgress {
         governance: bool,
     },
     BodyUnavailable,
+    /// The exact requested package expired or was otherwise already satisfied.
+    KeyBodyRetired,
     ControlPending {
         head: Digest32,
         through: u64,
@@ -1424,8 +1672,13 @@ impl ChannelState {
                 let mut index = self
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.finish_history_effect(&entry, &finished, self.me())?;
+                let catalog_advanced = index.finish_history_effect(&entry, &finished, self.me())?;
                 index.seal()?;
+                if catalog_advanced {
+                    // A peer can persist this catalog position after our notification. Its
+                    // allocation must survive a crash before that position is advertised.
+                    batch.ruled();
+                }
             }
             session_projection::private_index::observe_public(
                 &mut batch,
@@ -1485,6 +1738,9 @@ impl ChannelState {
             }
             let mut expired = Vec::new();
             let mut rows = Vec::new();
+            if kind == SignedEntryKind::KeyPackage && entry.payload.is_some() {
+                self.track_known_body_into(&mut batch, &entry, log)?;
+            }
             let refill_pending =
                 body_expected && kind == SignedEntryKind::Content && entry.payload.is_none();
             let mut projection_deferred = false;
@@ -1535,8 +1791,11 @@ impl ChannelState {
                     let mut index = self
                         .entries
                         .write(&mut batch, &self.sek, &self.channel_id)?;
-                    index.finish_history_effect(&entry, &finished, self.me())?;
+                    let catalog_advanced = index.finish_history_effect(&entry, &finished, self.me())?;
                     index.seal()?;
+                    if catalog_advanced {
+                        batch.ruled();
+                    }
                 }
                 on_admitted(&mut batch, *hash)?;
             }
@@ -1570,6 +1829,9 @@ impl ChannelState {
                 self.key_member_became_current(entry.skeleton.author_id);
             }
             self.key_packages.published(self.next_log_id);
+            if kind == SignedEntryKind::KeyPackage && entry.payload.is_some() {
+                self.note_key_body_acquired();
+            }
             if kind == SignedEntryKind::KeyPackage
                 && entry.payload.is_some()
                 && key_package_for(&entry, &self.me())
@@ -1750,6 +2012,7 @@ impl ChannelState {
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
         historical: bool,
+        key_body: Option<crate::node::history_stream::KeyBodyNeed>,
         received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
@@ -1790,7 +2053,7 @@ impl ChannelState {
             .ok_or(Error::MalformedAtRest("history refill locator missing"))?;
         let settled = input.history_effect_finished(&hash)?;
         drop(input);
-        if settled {
+        if settled || key_body.is_some() {
             match self.checked_governance(store, now.get()) {
                 Ok(view) => drop(view),
                 Err(error) if governance::refreshing(&error) => {
@@ -1806,12 +2069,43 @@ impl ChannelState {
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
+        if let Some(need) = key_body {
+            if kind != SignedEntryKind::KeyPackage
+                || need.head != head
+                || need.seq != entry.skeleton.seq
+                || need.target.author != entry.skeleton.author_id
+                || need.hash != hash
+            {
+                return Err(Error::MalformedBundle("key body refill owner differs"));
+            }
+            let index = self
+                .entries
+                .write(&mut batch, &self.sek, &self.channel_id)?;
+            if !index.history_key_body_pending(need)? {
+                return Ok(HistoryEffectProgress::KeyBodyRetired);
+            }
+        }
+        // Retention must follow the signed package age in the same transaction as its
+        // refill. A body already past its current lifetime cannot revive an expired debt.
+        if kind == SignedEntryKind::KeyPackage {
+            self.track_known_body_into(&mut batch, entry, log)?;
+            if key_body.is_some()
+                && self.already_expired_entry(
+                    Transaction::Batch(&batch),
+                    entry,
+                    entry.skeleton.claimed_ms,
+                    now.get(),
+                )?
+            {
+                return Ok(HistoryEffectProgress::KeyBodyRetired);
+            }
+        }
         // A received body (ADR-038 FX-30): flushed before this node acknowledges it, at once
         // when it is a key package or governance.
         if matches!(
             kind,
             SignedEntryKind::Governance | SignedEntryKind::StepPolicy
-        ) || (kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me()))
+        ) || kind == SignedEntryKind::KeyPackage
         {
             batch.ruled();
         }
@@ -1820,6 +2114,7 @@ impl ChannelState {
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
             index.put_committed(entry, log)?;
+
             if kind == SignedEntryKind::KeyPackage {
                 index.finish_history_obligation(&entry_store::sparse::Obligation {
                     head,
@@ -1829,10 +2124,6 @@ impl ChannelState {
                     from: entry.skeleton.seq,
                     through: entry.skeleton.seq,
                 })?;
-                index.forget_history_declined_head(
-                    entry.skeleton.author_id,
-                    entry_store::sparse::key_body_decline_key(&entry.skeleton.author_id, &hash),
-                )?;
             }
             index.seal()?;
             let mut expired = Vec::new();
@@ -1893,6 +2184,9 @@ impl ChannelState {
             committed.store(true, std::sync::atomic::Ordering::Release);
             self.entries.committed();
             self.note_role_progress(entry.skeleton.author_id, 0);
+            if settled && kind == SignedEntryKind::KeyPackage {
+                self.note_key_body_acquired();
+            }
             if settled && kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me())
             {
                 self.key_packages.published(self.next_log_id);

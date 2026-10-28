@@ -6952,6 +6952,9 @@ impl Node {
                         if !self.channels.contains_key(&room) || !role_wake.current(room, &owner) {
                             continue;
                         }
+                        if owner.key_provider_prune_pending() || owner.key_retention_dirty() {
+                            self.governance_work.wake_room(room);
+                        }
                         let Some(current) = self.current_room(&room) else { continue };
                         if let Some(port) = self.ports.get_mut(&(room, peer)) {
                             if !port.room.is(&current) {
@@ -6960,6 +6963,19 @@ impl Node {
                                 continue;
                             }
                             let owed = owner.pending(peer);
+                            let catalog_owed = owner.key_catalog_announcement(peer).is_some();
+                            let newly_catalog_owed = catalog_owed && !port.key_catalog_owed;
+                            port.key_catalog_owed = catalog_owed;
+                            if newly_catalog_owed {
+                                port.raise();
+                                self.sched_rooms.insert(room);
+                            }
+                            if let Some(catalog) = owner.key_catalog(peer) {
+                                if port.key_catalog_seen != Some(catalog) {
+                                    port.key_catalog_seen = Some(catalog);
+                                    owner.mark_key_dirty(peer);
+                                }
+                            }
                             if let Some(token) = owner.key_token(peer) {
                                 let changed = !port.key_body_scan_token.as_ref().is_some_and(|old| Arc::ptr_eq(old, &token));
                                 if changed {
@@ -6974,9 +6990,14 @@ impl Node {
                             port.role_owed = owed;
                             if newly_owed {
                                 port.raise();
+                            }
+                            // An exact notice ACK advances its cursor while the same port
+                            // remains owed. That causal edge must schedule the next page too.
+                            if newly_owed {
                                 self.sched_rooms.insert(room);
                             }
                         } else if owner.pending(peer)
+                            || owner.key_catalog_announcement(peer).is_some() || owner.key_catalog(peer).is_some()
                             || (self.trust.is_trusted(&peer) && owner.key_token(peer).is_some())
                         {
                             self.discover_rooms.insert(room);
@@ -10780,6 +10801,23 @@ impl Node {
                     for room in self.channels.keys().copied() {
                         if let Some(owner) = self.role_wake.owner(room) {
                             owner.on_connect(peer);
+                            if let Some(conn) = conn.as_ref() {
+                                if let Err(error) =
+                                    owner.key_catalog_on_connect(peer, conn.serial())
+                                {
+                                    eprintln!("vox: key catalog connection could not be initialized: {error}");
+                                }
+                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                    port.key_catalog_seen = None;
+                                    port.key_availability_exhausted = None;
+                                    port.key_availability_request = None;
+                                    port.key_availability_page = None;
+                                    port.key_remote_selected = None;
+                                    port.key_remote_advance = None;
+                                    port.raise();
+                                    self.sched_rooms.insert(room);
+                                }
+                            }
                             if self.trust.is_trusted(&peer)
                                 && self.ports.contains_key(&(room, peer))
                             {
@@ -16212,6 +16250,15 @@ impl Node {
             port.key_body_token = None;
             port.key_body_after = None;
             port.key_body_initialized = false;
+            port.key_debt_selected = None;
+            port.key_debt_advance = None;
+            port.key_provider_cursor = None;
+            port.key_provider_expected = None;
+            port.key_availability_request = None;
+            port.key_availability_page = None;
+            port.key_availability_exhausted = None;
+            port.key_remote_selected = None;
+            port.key_remote_advance = None;
             if let Some(owner) = self.role_wake.owner(room) {
                 owner.mark_key_dirty(peer);
             }
@@ -16244,11 +16291,21 @@ impl Node {
         );
         if let Some(owner) = self.role_wake.owner(*channel_id) {
             owner.on_connect(*peer);
+            if let Some(conn) = self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(peer))
+            {
+                if let Err(error) = owner.key_catalog_on_connect(*peer, conn.serial()) {
+                    eprintln!("vox: key catalog connection could not be initialized: {error}");
+                }
+            }
             if self.trust.is_trusted(peer) {
                 owner.mark_key_dirty(*peer);
             }
-            if owner.pending(*peer) {
+            if owner.pending(*peer) || owner.key_catalog_announcement(*peer).is_some() {
                 if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
+                    port.key_catalog_owed = owner.key_catalog_announcement(*peer).is_some();
                     port.role_owed = true;
                     port.raise();
                 }
@@ -22625,6 +22682,11 @@ impl Node {
             let members: Vec<Digest32> = ch.members().into_iter().filter(|m| *m != me).collect();
             let gen = ch.generation().load(std::sync::atomic::Ordering::Relaxed);
             drop(ch);
+            if let Some(owner) = self.role_wake.owner(cid) {
+                for d in &newly {
+                    owner.mark_key_provider_prune(*d);
+                }
+            }
             for d in &departed {
                 self.deliveries
                     .retain(|(room, peer, _), _| *room != cid || peer != d);
@@ -24020,6 +24082,9 @@ impl Node {
                 }
             };
             pruned += here;
+            if ch.key_debt_retention_pending() {
+                self.governance_work.wake_room(*cid);
+            }
             // Asked every tick, not only after a prune: a room opened with an expired backlog
             // (after a restart) or one idle with a backlog under the batch size is checkpointed
             // without waiting for another prune. The check stops at this identity's first entry

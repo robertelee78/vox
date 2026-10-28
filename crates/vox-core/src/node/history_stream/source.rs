@@ -63,6 +63,12 @@ pub(super) struct RoleAnnouncement {
     pub(super) head: super::HeadHint,
 }
 
+pub(super) struct CatalogAnnouncement {
+    pub(super) owner: Arc<crate::node::channel::role_owed::RoleOwed>,
+    pub(super) peer: Digest32,
+    pub(super) token: Arc<()>,
+}
+
 impl<T> Held<T> {
     pub(super) fn job(&self) -> Job {
         self._charge.job()
@@ -155,7 +161,6 @@ impl Source {
         head: Digest32,
         request: RequestId,
         metadata: bool,
-        key_body: Option<super::KeyBodyNeed>,
     ) -> Result<DeclineResult> {
         // The marker is apparatus only: it proves that a real shipped flow carrying its captured
         // authorization has reached the durability edge before a proof changes trust.
@@ -172,7 +177,7 @@ impl Source {
                     peer,
                     author,
                     head,
-                    (authorization.0, authorization.1, metadata, key_body),
+                    (authorization.0, authorization.1, metadata),
                     &committed,
                 )?))
             })
@@ -476,7 +481,7 @@ impl Source {
                     return Ok(Lookup::Found(Held {
                         value,
                         _charge: step._charge,
-                    }))
+                    }));
                 }
                 crate::node::channel::ProofRangeStep::Missing => return Ok(Lookup::Missing),
                 crate::node::channel::ProofRangeStep::Busy => return Ok(Lookup::Busy),
@@ -681,9 +686,16 @@ impl Source {
     pub(super) async fn inventory(
         &self,
         job: &Job,
-    ) -> Result<Lookup<(Vec<super::HeadHint>, Option<RoleAnnouncement>)>> {
+    ) -> Result<
+        Lookup<(
+            Vec<super::HeadHint>,
+            Option<RoleAnnouncement>,
+            Option<([u8; 16], u64)>,
+            Option<CatalogAnnouncement>,
+        )>,
+    > {
         let charge = job.reserve_or_pressure(
-            crate::log::history::MAX_CONTEXT_AUTHORS * std::mem::size_of::<super::HeadHint>(),
+            (crate::log::history::MAX_CONTEXT_AUTHORS + 2) * std::mem::size_of::<super::HeadHint>(),
         )?;
         let mut hints = Vec::with_capacity(crate::log::history::MAX_CONTEXT_AUTHORS);
         let mut after = None;
@@ -740,13 +752,28 @@ impl Source {
                         Lookup::Found(role) => role.value,
                         Lookup::Busy | Lookup::Missing => return Ok(Lookup::Busy),
                     };
+                    let (key_catalog, catalog_announcement) = match self
+                        .read(job, 128 * 1024, move |room, store| {
+                            let instance = room.history_instance(store)?;
+                            let tip = room.history_read(store)?.key_package_tip()?;
+                            let owner = room.role_owed();
+                            let notice = owner
+                                .key_catalog_announcement(peer)
+                                .map(|token| CatalogAnnouncement { owner, peer, token });
+                            Ok(Some(((instance, tip), notice)))
+                        })
+                        .await?
+                    {
+                        Lookup::Found(hint) => (Some(hint.value.0), hint.value.1),
+                        Lookup::Busy | Lookup::Missing => return Ok(Lookup::Busy),
+                    };
                     let mut authors: Vec<_> = hints.iter().map(|hint| hint.author).collect();
                     if role.is_some() && !authors.contains(&peer) {
                         authors.push(peer);
                     }
                     self.flush_authors_before_ack(room_id, authors).await?;
                     return Ok(Lookup::Found(Held {
-                        value: (hints, role),
+                        value: (hints, role, key_catalog, catalog_announcement),
                         _charge: charge,
                     }));
                 }
@@ -802,13 +829,42 @@ impl Source {
         let (needed, scope, incarnations) = match current {
             Lookup::Found(held) => held.value,
             Lookup::Busy | Lookup::Missing => {
-                return Err(Error::Unreachable("history role hint authority busy"))
+                return Err(Error::Unreachable("history role hint authority busy"));
             }
         };
         if !needed {
             return Ok(super::hints::Offer::default());
         }
         inbox.offer_role(generation, room_id, self.peer, scope, incarnations, role)
+    }
+
+    /// A catalog watermark is an unauthoritative scheduling hint for this exact peer.
+    pub(super) async fn offer_key_catalog(
+        &self,
+        job: &Job,
+        hint: Option<([u8; 16], u64)>,
+        connection_serial: u64,
+    ) -> Result<()> {
+        let Some((instance, tip)) = hint else {
+            return Ok(());
+        };
+        if instance == [0; 16] {
+            return Err(Error::MalformedBundle("key catalog instance is zero"));
+        }
+        let peer = self.peer;
+        match self
+            .read(job, 128, move |room, _store| {
+                room.role_owed()
+                    .observe_key_catalog(peer, instance, tip, connection_serial);
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            Lookup::Busy | Lookup::Missing => {
+                Err(Error::Unreachable("key catalog hint authority busy"))
+            }
+        }
     }
 
     /// Complete only the exact notice after the peer processed the inventory and while the
@@ -842,6 +898,48 @@ impl Source {
             Lookup::Found(_) => Ok(()),
             Lookup::Busy | Lookup::Missing => Err(Error::Unreachable(
                 "history role announcement confirmation busy",
+            )),
+        }
+    }
+
+    /// Retire only the catalog change whose matching inventory reached the peer.
+    pub(super) async fn acknowledge_key_catalog(
+        &self,
+        job: &Job,
+        notice: CatalogAnnouncement,
+        connection_serial: u64,
+    ) -> Result<()> {
+        let authorization = self.authorization;
+        let epoch = self.epoch;
+        match self
+            .read(job, 128, move |room, store| {
+                if !Arc::ptr_eq(&room.role_owed(), &notice.owner) {
+                    return Ok(Some(()));
+                }
+                if let Some((node, expected)) = authorization {
+                    let current = super::authorization_generation(
+                        store,
+                        node,
+                        room.channel_id(),
+                        room.history_instance(store)?,
+                        epoch,
+                    )?;
+                    if current != expected {
+                        return Ok(Some(()));
+                    }
+                }
+                notice.owner.ack_key_catalog_announcement(
+                    notice.peer,
+                    &notice.token,
+                    connection_serial,
+                );
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            Lookup::Busy | Lookup::Missing => Err(Error::Unreachable(
+                "key catalog announcement confirmation busy",
             )),
         }
     }

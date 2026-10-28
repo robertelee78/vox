@@ -2335,7 +2335,8 @@ impl Node {
                 if let Some(owner) = self.role_wake.owner(work.room) {
                     if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                         port.role_owed = owner.pending(work.peer);
-                        if port.role_owed {
+                        port.key_catalog_owed = owner.key_catalog_announcement(work.peer).is_some();
+                        if port.role_owed || port.key_catalog_owed {
                             self.sched_rooms.insert(work.room);
                         }
                     }
@@ -2984,6 +2985,25 @@ impl Node {
                 );
             }
             if flow.done() {
+                if let Some(token) = flow.key_availability_token.as_ref() {
+                    if let Some(port) = self.ports.get_mut(&(work.room, flow.hint_peer)) {
+                        if port
+                            .key_availability_request
+                            .as_ref()
+                            .is_some_and(|(_, owner, _, _)| Arc::ptr_eq(owner, token))
+                        {
+                            if let (Some((_, _, expected_instance, tip)), Some((instance, page))) = (
+                                port.key_availability_request.take(),
+                                flow.key_availability_result.take(),
+                            ) {
+                                port.key_availability_page =
+                                    Some((expected_instance, tip, instance, page));
+                                port.key_body_initialized = false;
+                                self.bounded_completion_wake.notify_one();
+                            }
+                        }
+                    }
+                }
                 if let Some(need) = flow.key_body_root {
                     if let Some(port) = self.ports.get_mut(&(work.room, flow.hint_peer)) {
                         if port.key_body == Some(need)
@@ -2996,11 +3016,16 @@ impl Node {
                         {
                             // The physical Flow and its staging cleanup have both completed.
                             // Continue the same bounded local scan; an older Flow cannot clear
-                            // a replacement port's different exact root.
+                            // a replacement port's different exact root. A missing body or
+                            // source remains an outstanding local debt; a later acquisition
+                            // announces its exact catalog entry without rewinding other work.
                             port.key_body = None;
                             port.key_body_instance = None;
                             port.key_body_token = None;
+                            port.key_debt_advance = port.key_debt_selected.take();
+                            port.key_remote_advance = port.key_remote_selected.take();
                             port.key_body_initialized = false;
+                            self.bounded_completion_wake.notify_one();
                             self.sched_rooms.insert(work.room);
                         }
                     }
@@ -3734,11 +3759,24 @@ impl Node {
                         } else {
                             None
                         };
+                        let availability_candidate = if !announce_first
+                            && required.is_none()
+                            && departure_hint.is_none()
+                            && own_verification.is_none()
+                            && own_discovery.is_none()
+                        {
+                            self.ports
+                                .get(&(room, peer))
+                                .and_then(|port| port.key_availability_request.clone())
+                        } else {
+                            None
+                        };
                         let prefer_key = self
                             .ports
                             .get(&(room, peer))
                             .is_some_and(|port| port.key_body_turn);
                         let mut selected_key_body = None;
+                        let mut selected_key_availability = None;
                         let mut chose_public_hint = false;
                         let hint = if announce_first || required.is_some() {
                             None
@@ -3746,8 +3784,13 @@ impl Node {
                             departure_hint.or(own_verification).or(own_discovery)
                         {
                             Some(priority)
-                        } else if prefer_key && key_candidate.is_some() {
+                        } else if prefer_key
+                            && (key_candidate.is_some() || availability_candidate.is_some())
+                        {
                             selected_key_body = key_candidate;
+                            if selected_key_body.is_none() {
+                                selected_key_availability = availability_candidate.clone();
+                            }
                             None
                         } else {
                             let hint = take_foreground_hint(
@@ -3765,10 +3808,14 @@ impl Node {
                                 chose_public_hint = true;
                             } else {
                                 selected_key_body = key_candidate;
+                                if selected_key_body.is_none() {
+                                    selected_key_availability = availability_candidate;
+                                }
                             }
                             hint
                         };
-                        let chose_key_body = selected_key_body.is_some();
+                        let chose_key_body =
+                            selected_key_body.is_some() || selected_key_availability.is_some();
                         if hint.is_none()
                             && required.is_none()
                             && selected_key_body.is_none()
@@ -3787,7 +3834,9 @@ impl Node {
                         let reason = foreground_reason(
                             node,
                             hint,
-                            required.is_some() || selected_key_body.is_some(),
+                            required.is_some()
+                                || selected_key_body.is_some()
+                                || selected_key_availability.is_some(),
                             announce_owed,
                             periodic_pending,
                         );
@@ -3817,6 +3866,9 @@ impl Node {
                             actor_incarnation,
                         ) {
                             Ok(mut flow) => {
+                                if let Some((after, token, _, _)) = selected_key_availability {
+                                    flow = flow.with_key_availability(after, token);
+                                }
                                 if let Some((need, instance, token)) = selected_key_body {
                                     let context = match crate::node::history_demand::Context::key_body_unlocked(profile, lease.clone()) {
                                         Ok(value) => Arc::new(value),
@@ -3828,7 +3880,8 @@ impl Node {
                                     if chose_key_body {
                                         port.key_body_turn = false;
                                     } else if chose_public_hint {
-                                        port.key_body_turn = port.key_body.is_some();
+                                        port.key_body_turn = port.key_body.is_some()
+                                            || port.key_availability_request.is_some();
                                     }
                                 }
                                 flow.reason = reason;
@@ -3895,11 +3948,24 @@ impl Node {
                     } else {
                         None
                     };
+                    let availability_candidate = if !announce_first
+                        && required.is_none()
+                        && departure_hint.is_none()
+                        && own_verification.is_none()
+                        && own_discovery.is_none()
+                    {
+                        self.ports
+                            .get(&(room, peer))
+                            .and_then(|port| port.key_availability_request.clone())
+                    } else {
+                        None
+                    };
                     let prefer_key = self
                         .ports
                         .get(&(room, peer))
                         .is_some_and(|port| port.key_body_turn);
                     let mut selected_key_body = None;
+                    let mut selected_key_availability = None;
                     let mut chose_public_hint = false;
                     let hint = if announce_first || required.is_some() {
                         None
@@ -3907,8 +3973,13 @@ impl Node {
                         departure_hint.or(own_verification).or(own_discovery)
                     {
                         Some(priority)
-                    } else if prefer_key && key_candidate.is_some() {
+                    } else if prefer_key
+                        && (key_candidate.is_some() || availability_candidate.is_some())
+                    {
                         selected_key_body = key_candidate;
+                        if selected_key_body.is_none() {
+                            selected_key_availability = availability_candidate.clone();
+                        }
                         None
                     } else {
                         let hint = take_foreground_hint(
@@ -3926,10 +3997,14 @@ impl Node {
                             chose_public_hint = true;
                         } else {
                             selected_key_body = key_candidate;
+                            if selected_key_body.is_none() {
+                                selected_key_availability = availability_candidate;
+                            }
                         }
                         hint
                     };
-                    let chose_key_body = selected_key_body.is_some();
+                    let chose_key_body =
+                        selected_key_body.is_some() || selected_key_availability.is_some();
                     if hint.is_none()
                         && required.is_none()
                         && selected_key_body.is_none()
@@ -3948,7 +4023,9 @@ impl Node {
                     let reason = foreground_reason(
                         node,
                         hint,
-                        required.is_some() || selected_key_body.is_some(),
+                        required.is_some()
+                            || selected_key_body.is_some()
+                            || selected_key_availability.is_some(),
                         announce_owed,
                         periodic_pending,
                     );
@@ -3978,6 +4055,9 @@ impl Node {
                         actor_incarnation,
                     ) {
                         Ok(mut flow) => {
+                            if let Some((after, token, _, _)) = selected_key_availability {
+                                flow = flow.with_key_availability(after, token);
+                            }
                             if let Some((need, instance, token)) = selected_key_body {
                                 let context =
                                     match crate::node::history_demand::Context::key_body_unlocked(
@@ -3993,7 +4073,8 @@ impl Node {
                                 if chose_key_body {
                                     port.key_body_turn = false;
                                 } else if chose_public_hint {
-                                    port.key_body_turn = port.key_body.is_some();
+                                    port.key_body_turn = port.key_body.is_some()
+                                        || port.key_availability_request.is_some();
                                 }
                             }
                             flow.reason = reason;
