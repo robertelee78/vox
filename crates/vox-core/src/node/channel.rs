@@ -3413,7 +3413,7 @@ impl ChannelState {
         self.board_kept
             .notices
             .insert(joiner, (at, notice.to_wire()));
-        self.save_board_kept(store)
+        self.save_board_kept(store, false)
     }
 
     /// Keep a member's own withdraw (#520), checked by the caller against the member's key: the
@@ -3446,7 +3446,7 @@ impl ChannelState {
         self.board_kept
             .withdraws
             .insert(member, (withdraw.timestamp_ms, withdraw.to_wire()));
-        self.save_board_kept(store)?;
+        self.save_board_kept(store, true)?;
         Ok(true)
     }
 
@@ -3534,19 +3534,29 @@ impl ChannelState {
         Ok(())
     }
 
-    fn save_board_kept(&mut self, store: &Store) -> Result<()> {
+    fn save_board_kept(&mut self, store: &Store, durable: bool) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_BOARD_KEPT,
             &board_kept_bytes(&self.board_kept),
         )?;
-        if let Err(e) = store.put_segment_derived(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_BOARD_KEPT,
-            &seg,
-        ) {
+        let save = if durable {
+            store.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_BOARD_KEPT,
+                &seg,
+            )
+        } else {
+            store.put_segment_derived(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_BOARD_KEPT,
+                &seg,
+            )
+        };
+        if let Err(e) = save {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
             return Err(e);
@@ -4488,7 +4498,7 @@ impl ChannelState {
             SEG_ORIGINS,
             &self.origins.to_state(),
         )?;
-        if let Err(e) = store.put_segment_derived(
+        if let Err(e) = store.put_segment(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_ORIGINS,

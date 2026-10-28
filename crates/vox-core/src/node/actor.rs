@@ -764,6 +764,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SeatAsk { .. } => "answering whether a member's newcomer may take a place",
         NetEvent::SeatAbort { .. } => "freeing a place promised to a member's newcomer",
         NetEvent::AgreeAsk { .. } => "answering whether this node holds a member's claim",
+        NetEvent::AgreeCurrent { .. } => "checking a room's agreement recipient",
         NetEvent::AgreeFetch { .. } => "pulling what members hold for a claim's agreement",
         NetEvent::HandshakesQueued { .. } => "saying how a burst of connection attempts went",
         NetEvent::Stopped { .. } => "shutting the network down",
@@ -1702,6 +1703,14 @@ enum NetEvent {
         ask: crate::node::agreestream::Ask,
         /// The stream's send half.
         send: quinn::SendStream,
+    },
+    /// Revalidate the exact room and member after agreement durability work.
+    AgreeCurrent {
+        channel_id: Digest32,
+        epoch: u64,
+        peer: Digest32,
+        room: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        reply: oneshot::Sender<bool>,
     },
     /// An agreement round needs posts these members hold and this node does not: sync the room
     /// with them now (V210-168).
@@ -9742,6 +9751,22 @@ impl Node {
                 }
             }
             NetEvent::AgreeAsk { peer, ask, send } => self.answer_agree(peer, ask, send).await,
+            NetEvent::AgreeCurrent {
+                channel_id,
+                epoch,
+                peer,
+                room,
+                reply,
+            } => {
+                let current = match (self.channels.get(&channel_id), room.upgrade()) {
+                    (Some(current), Some(original)) if Arc::ptr_eq(current, &original) => {
+                        let channel = current.lock().await;
+                        channel.epoch() == epoch && channel.members().contains(&peer)
+                    }
+                    _ => false,
+                };
+                let _ = reply.send(current);
+            }
             NetEvent::SeatReserve {
                 channel_id,
                 joiner,
@@ -11921,6 +11946,7 @@ impl Node {
                 query,
                 reply,
             } => {
+                let mut agreement_debts = None;
                 let result = match (self.channels.get(&channel_id), self.profile.as_ref()) {
                     (Some(shared), Some(profile)) => {
                         use crate::node::channel::history::Reply;
@@ -11961,12 +11987,42 @@ impl Node {
                                 }
                                 Ok(Reply::DisplayRevision(hash.finalize().into()))
                             }
+                            Ok(Reply::Agreement(Some(
+                                crate::node::agreestream::Answer::Holds(entries),
+                            ))) => {
+                                let (debts, replacement) =
+                                    profile.store().received_semantic_debts_for_room(channel_id);
+                                agreement_debts =
+                                    Some((profile.store_handle(), debts, replacement));
+                                Ok(Reply::Agreement(Some(
+                                    crate::node::agreestream::Answer::Holds(entries),
+                                )))
+                            }
                             other => other,
                         }
                     }
                     _ => Err("room not open".into()),
                 };
-                let _ = reply.send(result);
+                if let Some((store, debts, _)) = agreement_debts
+                    .filter(|(_, debts, replacement)| !debts.is_empty() || *replacement)
+                {
+                    // Never hold the actor or room across the disk durability boundary.
+                    tokio::spawn(async move {
+                        let flushed = tokio::task::spawn_blocking(move || {
+                            store.finish_received_replacement()?;
+                            for debt in debts {
+                                store.flush_received_through(debt)?;
+                            }
+                            Ok::<(), crate::error::Error>(())
+                        })
+                        .await
+                        .map_err(|error| format!("agreement durability worker stopped: {error}"))
+                        .and_then(|result| result.map_err(|error| error.to_string()));
+                        let _ = reply.send(flushed.and(result));
+                    });
+                } else {
+                    let _ = reply.send(result);
+                }
             }
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
@@ -17377,7 +17433,8 @@ impl Node {
         send: quinn::SendStream,
     ) {
         use crate::node::agreestream::{answer, Answer};
-        let member = match self.channels.get(&ask.channel_id).map(Arc::clone) {
+        let shared = self.channels.get(&ask.channel_id).map(Arc::clone);
+        let member = match shared.as_ref() {
             Some(shared) => {
                 let c = shared.lock().await;
                 c.epoch() == ask.epoch && c.members().contains(&peer)
@@ -17389,19 +17446,19 @@ impl Node {
             return;
         }
         let mut view = self.view_tx.subscribe();
+        let room = Arc::downgrade(shared.as_ref().expect("member requires an open room"));
         let clock = Arc::clone(&self.millis_clock);
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + crate::node::agreestream::HOLD_PATIENCE;
             let mut fetched = false;
             let a = loop {
-                match tokio::time::timeout_at(deadline, listed(&tx, &ask, clock())).await {
-                    Ok(Ok(Some(answer))) => break answer,
-                    Ok(Ok(None)) => {}
-                    Err(_) => break Answer::NotReceived,
+                match listed(&tx, &ask, clock()).await {
+                    Ok(Some(answer)) => break answer,
+                    Ok(None) => {}
                     // The room's query records/poisons local storage failure. Do not invent
                     // NotReceived or a held set from a failed local read.
-                    Ok(Err(_)) => return,
+                    Err(_) => return,
                 }
                 if !fetched {
                     let _ = tx
@@ -17417,6 +17474,23 @@ impl Node {
                     _ => break Answer::NotReceived,
                 }
             };
+            if matches!(a, Answer::Holds(_)) {
+                let (reply, current) = oneshot::channel();
+                if tx
+                    .send(NetEvent::AgreeCurrent {
+                        channel_id: ask.channel_id,
+                        epoch: ask.epoch,
+                        peer,
+                        room,
+                        reply,
+                    })
+                    .await
+                    .is_err()
+                    || !matches!(current.await, Ok(true))
+                {
+                    return;
+                }
+            }
             answer(send, &a).await;
         });
     }

@@ -1206,6 +1206,21 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Semantic receive owners in one room, for an agreement over its ordered set.
+    /// Source-only receive work is deliberately excluded.
+    pub(crate) fn received_semantic_debts_for_room(
+        &self,
+        room: Digest32,
+    ) -> (Vec<ReceivedDebt>, bool) {
+        let epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let debts = epochs
+            .received_authors
+            .range((room, [0; 32])..=(room, [u8::MAX; 32]))
+            .flat_map(|(_, debts)| debts.iter().cloned())
+            .collect();
+        (debts, epochs.replacement)
+    }
+
     /// Capture without attempting fallible replacement completion. The returned watch is
     /// subscribed under the same writer that publishes successful durability changes.
     pub(crate) fn received_settlement(&self, flow: &ReceivedFlow) -> ReceivedSettlement {
