@@ -9155,6 +9155,136 @@ fn cpu_time(pid: u32) -> Duration {
     Duration::from_secs_f64(hours * 3600.0 + mins * 60.0 + secs)
 }
 
+/// How long the harness hook waits for the daemon's control socket before it says "the vox daemon
+/// here did not answer promptly" (`attached_nodes`, `attached_node_infos` in the hook's client).
+const HOOK_WAIT: Duration = Duration::from_secs(2);
+
+/// **The daemon answers its control socket while it syncs** (ADR-038 FX-17; #981): alice and
+/// bob, each on a daemon of their own, have read each other; then alice posts a burst of 40
+/// messages while bob's daemon is asked `vox room list` and `vox status --json` ten times each,
+/// the way the harness hook asks before every turn. Every answer MUST come within [`HOOK_WAIT`].
+/// Measured before the lane fixes (#979): under a quiet room's own sync spin the hook printed
+/// "did not answer promptly" in two sessions.
+///
+/// Mutant: the actor holding its control socket past [`HOOK_WAIT`] per turn (a sleep in the
+/// tick) turns the latency assertion red on its own measurement.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "a timing bound a person feels; two real vox daemons; optional, run it in release"]
+fn a_daemon_answers_its_socket_within_the_hooks_wait_while_syncing() {
+    watchdog::arm_for_setup(1, 6);
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("APPARATUS: no temp dir: {e}"));
+    let root = tmp.path();
+    let alice = root.join("alice");
+    let bob = root.join("bob");
+    for d in [&alice, &bob] {
+        std::fs::create_dir_all(d.join("cfg"))
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", d.display()));
+    }
+    let mut fps = Vec::new();
+    for dir in [&alice, &bob] {
+        let (ok, out, err) = vox(dir, &["id"], None);
+        assert!(ok, "PRODUCT: `vox id` failed: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
+        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
+    }
+    let _alice_daemon = daemon(&alice, "alice");
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "busy"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: `vox room create` failed: {err}");
+    let listed = attached(&alice, "alice");
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room list` shows no room id: {listed}"))
+        .to_owned();
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
+    let link = link.trim().to_owned();
+    let _bob_daemon = daemon(&bob, "bob");
+    attached(&bob, "bob");
+    let (ok, _, err) = vox(
+        &bob,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");
+    let joined = Instant::now();
+    let (ok, out, err) = vox(&alice, &["room", "post", &room, "post 1"], None);
+    assert!(ok, "PRODUCT: alice's post was refused: {out}{err}");
+    let (ok, out, err) = vox(&bob, &["room", "post", &room, "bob is here"], None);
+    assert!(ok, "PRODUCT: bob's first post was refused: {out}{err}");
+    let (to_alice, to_bob) = arrivals(
+        joined,
+        (&alice, "bob is here"),
+        (&bob, "post 1"),
+        &room,
+        BOUND,
+    );
+    assert!(
+        to_alice.is_some() && to_bob.is_some(),
+        "PRODUCT: within {BOUND:?} of the join, alice read bob: {to_alice:?}; bob read alice: \
+         {to_bob:?} (None = never)\nbob's daemon said: {}\nalice's daemon said: {}",
+        said(&bob, "bob"),
+        said(&alice, "alice")
+    );
+
+    // ---- alice bursts while bob's daemon is asked what the hook asks -------------------------
+    let burst_room = room.clone();
+    let burst_dir = alice.clone();
+    let burst = std::thread::spawn(move || {
+        let mut refused = 0usize;
+        for i in 2..=41 {
+            let (ok, _, _) = vox(
+                &burst_dir,
+                &["room", "post", &burst_room, &format!("post {i}")],
+                None,
+            );
+            if !ok {
+                refused += 1;
+            }
+        }
+        refused
+    });
+    let mut slowest: Vec<(&str, Duration)> = Vec::new();
+    for _ in 0..10 {
+        for verb in [&["room", "list"][..], &["status", "--json"][..]] {
+            let asked = Instant::now();
+            let (ok, _, err) = vox(&bob, verb, None);
+            let took = asked.elapsed();
+            assert!(
+                ok,
+                "PRODUCT: bob's daemon refused `vox {}` while syncing: {err}",
+                verb.join(" ")
+            );
+            slowest.push((verb[0], took));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let refused = burst
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: the burst thread panicked"));
+    let max = slowest.iter().map(|(_, d)| *d).max().unwrap_or_default();
+    println!(
+        "[proof] while alice posted 40 ({refused} refused), bob's daemon answered 20 hook-style asks; \
+         slowest {max:?} (bound {HOOK_WAIT:?})"
+    );
+    assert!(
+        max <= HOOK_WAIT,
+        "PRODUCT: the daemon did not answer its control socket within the hook's wait while \
+         syncing (ADR-038 FX-17): slowest answer {max:?} over {HOOK_WAIT:?}; every ask: {slowest:?}\n\
+         bob's daemon said: {}",
+        said(&bob, "bob")
+    );
+}
+
 /// `vox status --json` of one profile: completed sync rounds summed over its ports, whether the
 /// room and every other member carry a last completed sync, and the raw status for a red.
 fn synced(dir: &Path) -> (u64, bool, String) {
