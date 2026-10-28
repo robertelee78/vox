@@ -223,8 +223,7 @@ pub(crate) struct Flow {
     pub(crate) key_body_token: Option<Arc<()>>,
     pub(crate) key_body_unavailable: Option<KeyBodyUnavailable>,
     pub(crate) key_availability_token: Option<Arc<()>>,
-    pub(crate) key_availability_result:
-        Option<([u8; 16], Option<(u64, Option<super::KeyBodyAvailable>)>)>,
+    pub(crate) key_availability_result: super::KeyAvailabilityResult,
     key_body_checked: bool,
     pub(crate) hint: Option<super::HeadHint>,
     /// Canonical local recovery proof root, not a consumed advisory inbox item.

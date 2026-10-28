@@ -266,6 +266,14 @@ impl Drop for KeyBodyWait {
     }
 }
 
+type KeyAvailabilityRequest = (Option<u64>, std::sync::Arc<()>, [u8; 16], u64);
+type KeyAvailabilityResponse = (
+    [u8; 16],
+    u64,
+    [u8; 16],
+    crate::node::history_stream::KeyAvailabilityPage,
+);
+
 /// One `(room, peer)`'s sync port (ADR-025 D1).
 pub struct Port {
     /// The room instance it belongs to.
@@ -328,13 +336,8 @@ pub struct Port {
     pub(crate) key_provider_expected:
         Option<crate::node::channel::entry_store::sparse::KeyProviderCursor>,
     pub(crate) key_catalog_seen: Option<([u8; 16], u64)>,
-    pub(crate) key_availability_request: Option<(Option<u64>, std::sync::Arc<()>, [u8; 16], u64)>,
-    pub(crate) key_availability_page: Option<(
-        [u8; 16],
-        u64,
-        [u8; 16],
-        Option<(u64, Option<crate::node::history_stream::KeyBodyAvailable>)>,
-    )>,
+    pub(crate) key_availability_request: Option<KeyAvailabilityRequest>,
+    pub(crate) key_availability_page: Option<KeyAvailabilityResponse>,
     pub(crate) key_availability_exhausted: Option<([u8; 16], u64)>,
     pub(crate) key_remote_selected: Option<([u8; 16], u64)>,
     pub(crate) key_remote_advance: Option<([u8; 16], u64)>,

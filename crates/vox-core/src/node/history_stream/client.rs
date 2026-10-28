@@ -88,7 +88,7 @@ pub(crate) struct Received {
     pub(crate) role_ready: Option<(Digest32, u64, Digest32)>,
     pub(crate) body_progress: bool,
     pub(crate) inventory: Option<Inventory>,
-    pub(crate) key_availability: Option<([u8; 16], Option<(u64, Option<super::KeyBodyAvailable>)>)>,
+    pub(crate) key_availability: super::KeyAvailabilityResult,
     pub(crate) heads: Vec<super::HeadHint>,
     pub(crate) own_head_incarnations: Option<(u64, u64)>,
     pub(crate) departure_receipt: Option<super::HeadHint>,

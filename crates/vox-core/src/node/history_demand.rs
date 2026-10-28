@@ -1316,14 +1316,14 @@ pub(crate) fn entry_admitted(
     let key = key(context)?;
     let scope = scope(context);
     let mut state = live(batch, key, &scope, context, active)?;
-    if !state
+    let Some(body) = state
         .body
         .as_ref()
-        .is_some_and(|b| b.entry == entry && b.offset == b.length)
-    {
+        .filter(|b| b.entry == entry && b.offset == b.length)
+    else {
         return Err(invalid("history entry is incomplete or changed"));
-    }
-    let admitted_seq = state.body.as_ref().expect("validated body").seq;
+    };
+    let admitted_seq = body.seq;
     schedule_cleanup(&mut state);
     if context.slot == Slot::Archive && state.private.is_none() && state.legacy.is_none() {
         state.admitted = Some(AdmittedEntry {

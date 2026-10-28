@@ -160,21 +160,15 @@ impl Drop for RouteLockWait {
     }
 }
 
+type AutoProbeResult =
+    Result<Option<([u8; 16], RequestId, demand::AdmittedEntry)>, (Option<[u8; 16]>, String)>;
+
 struct AutoProbe {
     room: Digest32,
     shared: Weak<Mutex<ChannelState>>,
     intent: u64,
     fence: Arc<Fence>,
-    result: Arc<
-        StdMutex<
-            Option<
-                Result<
-                    Option<([u8; 16], RequestId, demand::AdmittedEntry)>,
-                    (Option<[u8; 16]>, String),
-                >,
-            >,
-        >,
-    >,
+    result: Arc<StdMutex<Option<AutoProbeResult>>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 struct AutoWait {
@@ -861,11 +855,9 @@ impl Node {
             self.history_demand.auto_ticket =
                 Some(self.history_budget.enqueue(node, Lane::Control));
         }
-        let ticket = self
-            .history_demand
-            .auto_ticket
-            .as_mut()
-            .expect("ticket was installed");
+        let Some(ticket) = self.history_demand.auto_ticket.as_mut() else {
+            return;
+        };
         let wake = ticket.wake();
         let Some(job) = ticket.try_admit() else {
             self.wait_admitted_recovery(wake);
@@ -1406,8 +1398,10 @@ impl Node {
                         request,
                         resume_private,
                         local_admitted,
-                        Box::pin(async move { (*pressure).released().await }),
-                        "Waiting for local history preparation buffer capacity.",
+                        (
+                            Box::pin(async move { (*pressure).released().await }),
+                            "Waiting for local history preparation buffer capacity.",
+                        ),
                     ));
                 }
                 Err(error) => return Err(error.to_string()),
@@ -1459,10 +1453,12 @@ impl Node {
                         request,
                         resume_private,
                         Some(expected),
-                        Box::pin(async move {
-                            drop(secret.read_owned().await);
-                        }),
-                        "Waiting for the node's local history access.",
+                        (
+                            Box::pin(async move {
+                                drop(secret.read_owned().await);
+                            }),
+                            "Waiting for the node's local history access.",
+                        ),
                     ));
                 }
                 return Err("Node secret work is settling; history was not started.".into());
@@ -1653,9 +1649,12 @@ impl Node {
         request: RequestId,
         private: Option<bool>,
         local_admitted: Option<demand::AdmittedEntry>,
-        wait: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        detail: &str,
+        wait_and_detail: (
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+            &str,
+        ),
     ) -> Status {
+        let (wait, detail) = wait_and_detail;
         self.history_demand.clear_resume_owed();
         let mut pending = self
             .history_demand

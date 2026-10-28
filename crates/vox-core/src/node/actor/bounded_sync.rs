@@ -2992,11 +2992,10 @@ impl Node {
                             .as_ref()
                             .is_some_and(|(_, owner, _, _)| Arc::ptr_eq(owner, token))
                         {
-                            let (_, _, expected_instance, tip) = port
-                                .key_availability_request
-                                .take()
-                                .expect("matched availability owner");
-                            if let Some((instance, page)) = flow.key_availability_result.take() {
+                            if let (Some((_, _, expected_instance, tip)), Some((instance, page))) = (
+                                port.key_availability_request.take(),
+                                flow.key_availability_result.take(),
+                            ) {
                                 port.key_availability_page =
                                     Some((expected_instance, tip, instance, page));
                                 port.key_body_initialized = false;

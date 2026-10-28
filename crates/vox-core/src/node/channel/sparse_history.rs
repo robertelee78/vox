@@ -39,6 +39,8 @@ pub(crate) enum HistoryPayload {
 }
 
 /// One authenticated local debt, or an explicit dependency that must wake before retry.
+// Keep the bounded record inline; boxing would add an uncharged allocation.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum KeyDebtPage {
     End,
     Frozen {

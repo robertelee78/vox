@@ -124,7 +124,7 @@ impl Roots {
     }
     pub(super) fn read(d: &mut Decoder<'_>) -> Result<Self> {
         let arity = d.array()?;
-        if matches!(arity, 20 | 21 | 22 | 23) {
+        if matches!(arity, 20..=23) {
             return Err(Error::Profile(super::super::UNSUPPORTED_ROOM_FORMAT));
         }
         if arity != 25 {

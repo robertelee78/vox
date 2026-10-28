@@ -637,6 +637,9 @@ pub struct KeyBodyAvailable {
     pub(crate) recipient: Digest32,
 }
 
+pub(crate) type KeyAvailabilityPage = Option<(u64, Option<KeyBodyAvailable>)>;
+pub(crate) type KeyAvailabilityResult = Option<([u8; 16], KeyAvailabilityPage)>;
+
 /// Durable recipient body work, scoped to its authenticated source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyBodyNeed {

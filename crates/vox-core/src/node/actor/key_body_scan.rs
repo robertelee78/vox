@@ -64,7 +64,9 @@ impl Node {
                 .ok()
                 .and_then(|mut value| value.take());
             let Some(result) = result else { return };
-            let running = self.key_body_scan.running.take().expect("running scan");
+            let Some(running) = self.key_body_scan.running.take() else {
+                return;
+            };
             let current_room = self
                 .channels
                 .get(&running.room)
@@ -246,11 +248,11 @@ impl Node {
                     || port.key_body_initialized
                     || port.key_body_wait.is_some()
                     || !self.trust.is_trusted(&peer)
-                    || !self
+                    || self
                         .net
                         .as_ref()
                         .and_then(|net| net.manager().existing(&peer))
-                        .is_some_and(|conn| conn.quinn().close_reason().is_none())
+                        .is_none_or(|conn| conn.quinn().close_reason().is_some())
                 {
                     return None;
                 }
@@ -339,7 +341,9 @@ impl Node {
         if self.key_body_scan.ticket.is_none() {
             self.key_body_scan.ticket = Some(self.history_budget.enqueue(node, Lane::Control));
         }
-        let ticket = self.key_body_scan.ticket.as_mut().expect("scan ticket");
+        let Some(ticket) = self.key_body_scan.ticket.as_mut() else {
+            return;
+        };
         let wake = ticket.wake();
         let Some(job) = ticket.try_admit() else {
             drop(guard);

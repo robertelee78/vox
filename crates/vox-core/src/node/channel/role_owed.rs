@@ -15,11 +15,13 @@ struct Entry {
 }
 
 /// A room instance owns this map; a replacement room gets a different Arc.
+type CatalogState = (u64, [u8; 16], Option<([u8; 16], u64)>);
+
 #[derive(Default)]
 pub(crate) struct RoleOwed {
     entries: Mutex<BTreeMap<Digest32, Entry>>,
     key_dirty: Mutex<BTreeMap<Digest32, Arc<()>>>,
-    key_catalogs: Mutex<BTreeMap<Digest32, (u64, [u8; 16], Option<([u8; 16], u64)>)>>,
+    key_catalogs: Mutex<BTreeMap<Digest32, CatalogState>>,
     key_catalog_changed: Mutex<BTreeMap<Digest32, Arc<()>>>,
     provider_prune_dirty: std::sync::atomic::AtomicBool,
     key_retention_dirty: std::sync::atomic::AtomicBool,
@@ -156,9 +158,9 @@ impl RoleOwed {
         serial: u64,
     ) {
         let catalogs = self.key_catalogs.lock().unwrap_or_else(|e| e.into_inner());
-        if !catalogs
+        if catalogs
             .get(&peer)
-            .is_some_and(|(current, _, _)| *current == serial)
+            .is_none_or(|(current, _, _)| *current != serial)
         {
             return;
         }
