@@ -5195,7 +5195,12 @@ impl ChannelState {
             ));
         }
         match self.has_consented(profile.store(), &target) {
-            Ok(false) => return Ok(None),
+            Ok(false) => {
+                // A prior attempt may have committed the revocation before its entitlement
+                // cleanup. Replay that cleanup before the durable withdrawal debt can clear.
+                self.clear_withdrawn_ledgers(profile.store(), &target)?;
+                return Ok(None);
+            }
             Ok(true) => {}
             Err(error) if governance::refreshing(&error) => {}
             Err(error) => return Err(error),
@@ -5220,22 +5225,64 @@ impl ChannelState {
         let revocation =
             issue_consent_revocation(signer, &self.channel_id, self.epoch, target, new_chain_id)?;
         self.append_governance(profile, &revocation.to_wire(), now_ms)?;
-        // Nothing is owed to a revoked member; drop the row so a later re-consent
-        // starts from "holds nothing".
-        if self.delivered.remove(&target).is_some() {
-            self.persist_delivered(profile.store())?;
-        }
-        // Nor any history: and none is owed again, because `history_floor` refuses a
-        // member this identity has ever revoked here.
-        if self.history.remove(&target).is_some() {
-            self.persist_history(profile.store())?;
-        }
-        // And what the consent released is released no more: a later re-consent is
-        // entitled from its own position only.
-        if self.entitled.remove(&target).is_some() {
-            self.persist_entitled(profile.store())?;
-        }
+        self.clear_withdrawn_ledgers(profile.store(), &target)?;
         Ok(revocation)
+    }
+
+    /// Finish all ledgers as one transaction. If this follows an earlier durable revocation,
+    /// replay remains idempotent and preserves no entitlement from the excluded interval.
+    fn clear_withdrawn_ledgers(&mut self, store: &Store, target: &Digest32) -> Result<()> {
+        let mut next_delivered = self.delivered.clone();
+        let mut next_history = self.history.clone();
+        let mut next_entitled = self.entitled.clone();
+        let changed = next_delivered.remove(target).is_some()
+            | next_history.remove(target).is_some()
+            | next_entitled.remove(target).is_some();
+        if !changed {
+            return Ok(());
+        }
+        let delivered = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_DELIVERED,
+            &delivered_bytes(&next_delivered),
+        )?;
+        let history = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &delivered_bytes(&next_history),
+        )?;
+        let entitled = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_ENTITLED,
+            &positions_bytes(&next_entitled),
+        )?;
+        let mut batch = store.batch()?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_DELIVERED,
+            &delivered,
+        )?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_HISTORY,
+            &history,
+        )?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ENTITLED,
+            &entitled,
+        )?;
+        batch.commit()?;
+        self.delivered = next_delivered;
+        self.history = next_history;
+        self.entitled = next_entitled;
+        Ok(())
     }
 
     /// Forget that `target` holds this identity's current sender key, so the next
@@ -5686,21 +5733,6 @@ impl ChannelState {
     pub fn note_history_delivered(&mut self, store: &Store, target: &Digest32) -> Result<()> {
         if self.history.remove(target).is_some() {
             self.persist_history(store)?;
-        }
-        Ok(())
-    }
-
-    fn persist_entitled(&mut self, store: &Store) -> Result<()> {
-        let bytes = positions_bytes(&self.entitled);
-        self.persist_positions(store, SEG_ENTITLED, &bytes)
-    }
-
-    fn persist_positions(&mut self, store: &Store, id: u64, bytes: &[u8]) -> Result<()> {
-        let seg = seal_segment(&self.sek, SegmentKind::KeyMaterial, id, bytes)?;
-        if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, id, &seg) {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
         }
         Ok(())
     }
