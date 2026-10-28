@@ -450,74 +450,13 @@ impl ChannelState {
         read.history_head(&id)
     }
 
-    /// Durability debts for the exact live flows in this room. The Store also retains owners
-    /// whose ChannelState was erased by lock; their bytes must be settled before a reopened
-    /// room can acknowledge any of its received history.
+    /// Preserve exact author/transaction ownership even when this room is locked and reopened.
     pub(crate) fn received_debts_for_current(
         &mut self,
         store: &Store,
         author: &Digest32,
     ) -> Result<Vec<crate::node::store::ReceivedDebt>> {
-        let room_debts = store.received_debts_for_room(self.channel_id)?;
-        let Some(owners) = self.received_tip_owners.remove(author) else {
-            return Ok(room_debts);
-        };
-        let mut owners = owners.into_iter();
-        let mut pending = Vec::new();
-        let mut debts = Vec::new();
-        while let Some(owner) = owners.next() {
-            match owner.debt(store) {
-                Ok(Some(debt)) => {
-                    pending.push(owner);
-                    debts.push(debt);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    pending.push(owner);
-                    pending.extend(owners);
-                    self.received_tip_owners.insert(*author, pending);
-                    return Err(error);
-                }
-            }
-        }
-        if !pending.is_empty() {
-            self.received_tip_owners.insert(*author, pending);
-        }
-        debts.extend(room_debts);
-        Ok(debts)
-    }
-
-    /// Record one semantic receive under the exact flow which committed it. Repeated effects in
-    /// one bounded flow share one Store debt, so retain one Arc capability per author/flow.
-    pub(super) fn record_received_semantic_owner(
-        &mut self,
-        store: &Store,
-        author: Digest32,
-        owner: &crate::node::store::ReceivedFlow,
-    ) -> Result<()> {
-        // Terminal flow settlement often covers an earlier owner before this author is served.
-        // Prune those stale Arcs at the next semantic commit so a never-served author retains only
-        // concurrently live debts, not one handle per historical sync.
-        drop(self.received_debts_for_current(store, &author)?);
-        if owner.debt(store)?.is_none() {
-            return Ok(());
-        }
-        let owners = self.received_tip_owners.entry(author).or_default();
-        if !owners.iter().any(|known| known.same_owner(owner)) {
-            owners.push(owner.clone());
-        }
-        Ok(())
-    }
-
-    /// Record the exact receive owner for this author at the semantic boundary.
-    pub(super) fn record_sparse_received_semantic_owner(
-        &mut self,
-        _store: &Store,
-        author: Digest32,
-        _hash: Digest32,
-        owner: &crate::node::store::ReceivedFlow,
-    ) -> Result<()> {
-        self.record_received_semantic_owner(_store, author, owner)
+        store.received_debts_for_author(self.channel_id, *author)
     }
 
     pub(crate) fn history_context(
@@ -1309,6 +1248,7 @@ impl ChannelState {
         // This completion can belong to a different flow than the one that published the
         // source. Keep the completion's own received debt: flushing it before a receipt also
         // carries the earlier source transaction to disk.
+        batch.note_received_author(entry.skeleton.author_id)?;
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
@@ -1497,15 +1437,7 @@ impl ChannelState {
         })();
         let (rendered, refill_pending, projection_deferred, body_unavailable, contiguous) =
             match applied {
-                Ok(outcome) => {
-                    self.record_sparse_received_semantic_owner(
-                        store,
-                        entry.skeleton.author_id,
-                        *hash,
-                        received,
-                    )?;
-                    outcome
-                }
+                Ok(outcome) => outcome,
                 Err(error) => {
                     self.poison(&error);
                     #[cfg(feature = "test-knobs")]
@@ -1685,6 +1617,9 @@ impl ChannelState {
             }
         }
         let mut batch = store.received_batch(received)?;
+        if settled {
+            batch.note_received_author(entry.skeleton.author_id)?;
+        }
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
@@ -1799,17 +1734,7 @@ impl ChannelState {
             })
         })();
         match applied {
-            Ok(progress) => {
-                if settled {
-                    self.record_sparse_received_semantic_owner(
-                        store,
-                        entry.skeleton.author_id,
-                        hash,
-                        received,
-                    )?;
-                }
-                Ok(progress)
-            }
+            Ok(progress) => Ok(progress),
             Err(error) => {
                 self.poison(&error);
                 Err(error)

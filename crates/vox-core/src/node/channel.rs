@@ -1239,11 +1239,6 @@ pub struct ChannelState {
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
     held: BTreeMap<Digest32, u64>,
-    /// Every live receive flow which committed a semantic effect for an author. This is
-    /// memory-only: each Arc capability lets an acknowledgement capture that exact flow's
-    /// still-pending debt, never another lane selected merely by room id. A later durable
-    /// frontier removes covered owners when the acknowledgement next snapshots this set.
-    received_tip_owners: BTreeMap<Digest32, Vec<ReceivedFlow>>,
     /// Exact owners whose terminal settlement failed. This registry is separate from the room
     /// mutex so a session can retain its capability after releasing the room, even when another
     /// lane presently owns that mutex. The next room session retries them before doing work.
@@ -2167,7 +2162,6 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
-            received_tip_owners: BTreeMap::new(),
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
@@ -2943,7 +2937,6 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held,
-            received_tip_owners: BTreeMap::new(),
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
@@ -3217,7 +3210,6 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
-            received_tip_owners: BTreeMap::new(),
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
@@ -7412,6 +7404,11 @@ impl ChannelState {
             // quanta, so make its promoted witness durable in its own transaction.
             batch.ruled();
         }
+        if let Some(tips) = received_tips.as_ref() {
+            for author in tips.keys() {
+                batch.note_received_author(*author)?;
+            }
+        }
         if let Some(request) = authorization {
             request.check_in(self, &batch)?;
         }
@@ -7611,11 +7608,6 @@ impl ChannelState {
         self.place_committed(store, rendered_rows, &expired)?;
         // An entry that arrived may be a parent others named before it: rows move.
         self.settle_display_order(store)?;
-        if let Some(tips) = received_tips {
-            for (author, (_, owner)) in &tips {
-                self.record_received_semantic_owner(store, *author, owner)?;
-            }
-        }
         // Reconciliation done; only now surface a session failure, with its coded
         // reason preserved (ADR-008 never downgrades a failure silently).
         Ok(out)

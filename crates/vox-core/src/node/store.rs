@@ -26,6 +26,7 @@
 //! Deleting (TTL pruning) does not shrink the file; [`Store::compact`] does, and
 //! the node schedules it after pruning (ADR-016 §Consequences).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -267,6 +268,8 @@ struct Epochs {
     next_transaction: u64,
     durable_through: u64,
     pending: Vec<PendingReceived>,
+    /// Semantic receipts retain exact flow/transaction owners across room lock and reopen.
+    received_authors: BTreeMap<(Digest32, Digest32), Vec<ReceivedDebt>>,
     /// A database replacement whose directory entry has not
     /// yet been synced. This debt survives reopen or directory-sync failure and gates every
     /// later write and acknowledgement until the exact replacement becomes durable.
@@ -282,6 +285,7 @@ impl Default for Epochs {
             next_transaction: 0,
             durable_through: 0,
             pending: Vec::new(),
+            received_authors: BTreeMap::new(),
             replacement: false,
             replacement_generation: 0,
             replacement_completed: 0,
@@ -1119,6 +1123,7 @@ impl Store {
             store: self,
             class: Class::Unsaid,
             received_flow: None,
+            received_authors: BTreeSet::new(),
             epochs,
         })
     }
@@ -1142,6 +1147,7 @@ impl Store {
             store: self,
             class: Class::Received,
             received_flow: Some(flow.clone()),
+            received_authors: BTreeSet::new(),
             epochs,
         })
     }
@@ -1185,21 +1191,19 @@ impl Store {
         }))
     }
 
-    /// Capture every still-pending exact owner for a room, including flows whose former
-    /// ChannelState was erased by lock. A reopened room must not acknowledge bytes while
-    /// those owners remain unflushed.
-    pub(crate) fn received_debts_for_room(&self, room: Digest32) -> Result<Vec<ReceivedDebt>> {
+    /// Capture only the durable obligations for the exact room and author being advertised.
+    pub(crate) fn received_debts_for_author(
+        &self,
+        room: Digest32,
+        author: Digest32,
+    ) -> Result<Vec<ReceivedDebt>> {
         let mut epochs = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         self.finish_replacement(&mut epochs)?;
         Ok(epochs
-            .pending
-            .iter()
-            .filter(|pending| pending.owner.room == room)
-            .map(|pending| ReceivedDebt {
-                owner: Arc::clone(&pending.owner),
-                through: pending.through,
-            })
-            .collect())
+            .received_authors
+            .get(&(room, author))
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// Capture without attempting fallible replacement completion. The returned watch is
@@ -1270,6 +1274,10 @@ impl Store {
         epochs
             .pending
             .retain(|pending| pending.through > epochs.durable_through);
+        epochs.received_authors.retain(|_, owners| {
+            owners.retain(|owner| owner.through > epochs.durable_through);
+            !owners.is_empty()
+        });
     }
 
     /// Commit a raw transaction flushed to disk. Admission guarantees that no other receive
@@ -1447,11 +1455,21 @@ pub struct Batch<'a> {
     store: &'a Store,
     class: Class,
     received_flow: Option<ReceivedFlow>,
+    received_authors: BTreeSet<Digest32>,
     /// The store's writer, held from the batch's beginning to its commit's mark.
     epochs: MutexGuard<'a, Epochs>,
 }
 
 impl Batch<'_> {
+    /// Associate an author's visible semantic state with this exact received transaction.
+    /// The association is installed under the Store writer immediately after commit.
+    pub(crate) fn note_received_author(&mut self, author: Digest32) -> Result<()> {
+        if self.received_flow.is_none() {
+            return Err(Error::MalformedAtRest("received semantic owner is missing"));
+        }
+        self.received_authors.insert(author);
+        Ok(())
+    }
     /// This batch holds derived state only (ADR-038 FX-30): it commits without a flush and
     /// rides to disk with the next flushed commit. Said once, at the top of the batch; a later
     /// [`Self::ruled`] overrides it.
@@ -1726,8 +1744,14 @@ impl Batch<'_> {
             store: _store,
             class,
             received_flow,
+            received_authors,
             mut epochs,
         } = self;
+        let class = if !received_authors.is_empty() && matches!(class, Class::Derived) {
+            Class::Received
+        } else {
+            class
+        };
         let flushed = matches!(class, Class::Unsaid | Class::Ruled);
         if !flushed {
             txn.set_durability(redb::Durability::None)
@@ -1759,6 +1783,23 @@ impl Batch<'_> {
                         owner: Arc::clone(&flow.owner),
                         through: transaction,
                     });
+                }
+                for author in received_authors {
+                    let owners = epochs
+                        .received_authors
+                        .entry((flow.owner.room, author))
+                        .or_default();
+                    if let Some(previous) = owners
+                        .iter_mut()
+                        .find(|previous| Arc::ptr_eq(&previous.owner, &flow.owner))
+                    {
+                        previous.through = previous.through.max(transaction);
+                    } else {
+                        owners.push(ReceivedDebt {
+                            owner: Arc::clone(&flow.owner),
+                            through: transaction,
+                        });
+                    }
                 }
             }
         }
