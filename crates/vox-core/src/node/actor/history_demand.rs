@@ -193,9 +193,14 @@ impl Controller {
         if !self.owns_running_fence(request, generation, &dispatch.fence) {
             return None;
         }
-        self.failed_current(room, instance, request, generation,
-            "Authorization changed. Request this history page again under current access.")
-            .then_some((room, peer, instance, request, generation))
+        self.failed_current(
+            room,
+            instance,
+            request,
+            generation,
+            "Authorization changed. Request this history page again under current access.",
+        )
+        .then_some((room, peer, instance, request, generation))
     }
 
     fn clear_resume_owed(&mut self) {
