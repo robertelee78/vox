@@ -2358,6 +2358,22 @@ impl Flow {
                 )
                 .await?;
                 self.body_progress |= result.body_progress;
+                if let Some(inventory) = result.inventory.as_ref() {
+                    let offered = source
+                        .offer_role(
+                            job,
+                            inbox,
+                            inbox_generation,
+                            self.room,
+                            conn.serial(),
+                            inventory.role,
+                        )
+                        .await?;
+                    self.offered = self.offered.saturating_add(offered.added as u64);
+                    if offered.full {
+                        return Err(Error::Unreachable("history role hint capacity busy"));
+                    }
+                }
                 let brought_now = result.brought || result.body_progress;
                 self.brought |= brought_now;
                 if brought_now {

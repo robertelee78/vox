@@ -62,6 +62,7 @@ pub(super) async fn answer(
     handshake_bytes: usize,
     inbox: &super::HintInbox,
     inbox_generation: u64,
+    connection_serial: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,
 ) -> Result<Status> {
@@ -95,10 +96,24 @@ pub(super) async fn answer(
             Read::End => return Err(Error::MalformedBundle("inventory closed before HAVE")),
         };
         credit.charge_overhead(incoming.wire_len())?;
-        let Frame::Have(hints) = incoming.frame()? else {
+        let Frame::Have { hints, role } = incoming.frame()? else {
             return Err(Error::MalformedBundle("inventory expected one HAVE"));
         };
         let work_job = incoming.job();
+        let offered = source
+            .offer_role(
+                &work_job,
+                inbox,
+                inbox_generation,
+                preamble.room,
+                connection_serial,
+                role,
+            )
+            .await?;
+        *inventory_added |= offered.added != 0;
+        if offered.full {
+            return Err(Error::Unreachable("history role hint capacity busy"));
+        }
         for slice in hints.chunks(64) {
             let offered = source
                 .offer_inventory(&work_job, inbox, inbox_generation, preamble.room, slice)
@@ -183,7 +198,18 @@ async fn respond(
             let Lookup::Found(inventory) = source.inventory(&job).await? else {
                 return Ok((Status::Busy, None));
             };
-            let status = match send(source, io, credit, Frame::Have(inventory.value), 0).await? {
+            let status = match send(
+                source,
+                io,
+                credit,
+                Frame::Have {
+                    hints: inventory.value.0,
+                    role: inventory.value.1.as_ref().map(|notice| notice.head),
+                },
+                0,
+            )
+            .await?
+            {
                 Sent::Yes => Status::Complete,
                 Sent::Busy | Sent::Full => Status::Busy,
             };

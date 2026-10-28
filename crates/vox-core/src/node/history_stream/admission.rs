@@ -449,6 +449,7 @@ pub(super) fn advance(
                 index.keep_history_inclusion_receipt(&included)?;
                 index.finish_history_verifier_cursor(*binding)
             })?;
+            room.note_role_progress(binding.author, binding.from);
             combine_parent(
                 room,
                 store,
@@ -630,6 +631,7 @@ pub(super) fn promote_head(
     if conflict {
         return Err(invalid("conflicting authenticated heads retained"));
     }
+    room.note_role_progress(signed.binding.author, signed.root.leaves);
     // A newly accepted remote head changes what this room must advertise. The actor touches
     // the room on completion so every port observes this generation immediately and can echo
     // the exact head back to its author.

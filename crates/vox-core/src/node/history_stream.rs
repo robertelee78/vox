@@ -104,6 +104,7 @@ pub(crate) async fn serve(
     room: std::sync::Arc<tokio::sync::Mutex<super::channel::ChannelState>>,
     store: std::sync::Arc<super::store::Store>,
     peer: Digest32,
+    connection_serial: u64,
     preamble: Preamble,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -136,6 +137,7 @@ pub(crate) async fn serve(
         preamble,
         &inbox,
         generation,
+        connection_serial,
         &mut inventory_added,
         &mut served_object,
         &departure_receipt,
@@ -161,6 +163,7 @@ async fn serve_request(
     preamble: Preamble,
     inbox: &HintInbox,
     inbox_generation: u64,
+    connection_serial: u64,
     inventory_added: &mut bool,
     served_object: &mut bool,
     departure_receipt: &std::sync::atomic::AtomicBool,
@@ -226,6 +229,7 @@ async fn serve_request(
         overhead,
         inbox,
         inbox_generation,
+        connection_serial,
         inventory_added,
         served_object,
     )
@@ -593,7 +597,12 @@ pub enum Object<'a> {
 
 pub enum Frame<'a> {
     Hello(u8),
-    Have(Vec<HeadHint>),
+    Have {
+        hints: Vec<HeadHint>,
+        /// An authenticated peer's progress hint for the recipient's own feed. This is
+        /// a reason to query, never a receipt or an authorization decision.
+        role: Option<HeadHint>,
+    },
     Want {
         request: RequestId,
         query: Query,
@@ -657,7 +666,7 @@ impl<'a> Frame<'a> {
         let maximum = match self {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
-            Self::Have(hints) => HAVE_FRAME_FIXED_BYTES
+            Self::Have { hints, .. } => (HAVE_FRAME_FIXED_BYTES + 18 + HAVE_HINT_MAX_BYTES)
                 .checked_add(
                     hints
                         .len()
@@ -698,11 +707,11 @@ impl<'a> Frame<'a> {
                 e.uint(u64::from(*bitmap));
                 0x01
             }
-            Self::Have(hints) => {
+            Self::Have { hints, role } => {
                 if hints.len() > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
                 }
-                e.array(hints.len());
+                e.array(2).array(hints.len());
                 let mut previous = None;
                 for hint in hints {
                     if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
@@ -713,6 +722,16 @@ impl<'a> Frame<'a> {
                         .bytes(&hint.author)
                         .uint(hint.size)
                         .bytes(&hint.head);
+                }
+                e.array(usize::from(role.is_some()));
+                if let Some(role) = role {
+                    if role.size > MAX_SEQ {
+                        return Err(invalid("history role hint size"));
+                    }
+                    e.array(3)
+                        .bytes(&role.author)
+                        .uint(role.size)
+                        .bytes(&role.head);
                 }
                 0x02
             }
@@ -840,6 +859,7 @@ impl<'a> Frame<'a> {
                 Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
             }
             0x02 => {
+                arity(&mut d, 2)?;
                 let count = d.array()?;
                 if count > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
@@ -860,7 +880,24 @@ impl<'a> Frame<'a> {
                         head: digest(&mut d)?,
                     });
                 }
-                Self::Have(hints)
+                let role = match d.array()? {
+                    0 => None,
+                    1 => {
+                        arity(&mut d, 3)?;
+                        let author = digest(&mut d)?;
+                        let size = d.uint()?;
+                        if size > MAX_SEQ {
+                            return Err(invalid("history role hint size"));
+                        }
+                        Some(HeadHint {
+                            author,
+                            size,
+                            head: digest(&mut d)?,
+                        })
+                    }
+                    _ => return Err(invalid("history role hint count")),
+                };
+                Self::Have { hints, role }
             }
             0x03 => {
                 arity(&mut d, 2)?;
