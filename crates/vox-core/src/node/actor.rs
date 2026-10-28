@@ -16262,7 +16262,6 @@ impl Node {
     fn drop_departed_port(&mut self, channel_id: &Digest32, peer: &Digest32) {
         if let Some(owner) = self.role_wake.owner(*channel_id) {
             owner.clear(*peer);
-            owner.clear_key(*peer);
         }
         self.drop_port_inner(channel_id, peer, true);
         self.sched_rooms.insert(*channel_id);

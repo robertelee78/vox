@@ -101,12 +101,6 @@ impl RoleOwed {
             .insert(peer, Arc::new(()));
         self.signal(peer);
     }
-    pub(crate) fn clear_key(self: &Arc<Self>, peer: Digest32) {
-        self.key_dirty
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&peer);
-    }
     pub(crate) fn key_token(&self, peer: Digest32) -> Option<Arc<()>> {
         self.key_dirty
             .lock()
