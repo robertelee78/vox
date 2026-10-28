@@ -22610,6 +22610,8 @@ impl Node {
                 // poisoned receipt-only port belonged to its completed departure.
                 if self.ports.contains_key(&(cid, b)) {
                     self.drop_port(&cid, &b);
+                    self.discover_rooms.insert(cid);
+                    self.sched_rooms.insert(cid);
                 }
             }
             let over = ch.ended(now_ms).is_some();

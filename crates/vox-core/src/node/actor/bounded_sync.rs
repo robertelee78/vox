@@ -3718,7 +3718,7 @@ impl Node {
                         let required = required_at
                             .and_then(|at| self.bounded_sync.required.get(at))
                             .map(|required| (required.head, required.seq));
-                        let selected_key_body = if !announce_first
+                        let key_candidate = if !announce_first
                             && required.is_none()
                             && departure_hint.is_none()
                             && own_verification.is_none()
@@ -3734,29 +3734,41 @@ impl Node {
                         } else {
                             None
                         };
-                        let hint = if announce_first
-                            || required.is_some()
-                            || selected_key_body.is_some()
+                        let prefer_key = self
+                            .ports
+                            .get(&(room, peer))
+                            .is_some_and(|port| port.key_body_turn);
+                        let mut selected_key_body = None;
+                        let mut chose_public_hint = false;
+                        let hint = if announce_first || required.is_some() {
+                            None
+                        } else if let Some(priority) =
+                            departure_hint.or(own_verification).or(own_discovery)
                         {
+                            Some(priority)
+                        } else if prefer_key && key_candidate.is_some() {
+                            selected_key_body = key_candidate;
                             None
                         } else {
-                            departure_hint
-                                .or(own_verification)
-                                .or(own_discovery)
-                                .or_else(|| {
-                                    take_foreground_hint(
-                                        &self.history_hints,
-                                        room,
-                                        peer,
-                                        node,
-                                        parked_receipt,
-                                        self.net
-                                            .as_ref()
-                                            .and_then(|net| net.manager().existing(&peer))
-                                            .map(|conn| conn.serial()),
-                                    )
-                                })
+                            let hint = take_foreground_hint(
+                                &self.history_hints,
+                                room,
+                                peer,
+                                node,
+                                parked_receipt,
+                                self.net
+                                    .as_ref()
+                                    .and_then(|net| net.manager().existing(&peer))
+                                    .map(|conn| conn.serial()),
+                            );
+                            if hint.is_some() {
+                                chose_public_hint = true;
+                            } else {
+                                selected_key_body = key_candidate;
+                            }
+                            hint
                         };
+                        let chose_key_body = selected_key_body.is_some();
                         if hint.is_none()
                             && required.is_none()
                             && selected_key_body.is_none()
@@ -3812,6 +3824,13 @@ impl Node {
                                     };
                                     flow = flow.with_key_body(need, instance, context, token);
                                 }
+                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                    if chose_key_body {
+                                        port.key_body_turn = false;
+                                    } else if chose_public_hint {
+                                        port.key_body_turn = port.key_body.is_some();
+                                    }
+                                }
                                 flow.reason = reason;
                                 flow.discovery_incarnations = probe_incarnations;
                                 flow.local_own_after_inventory = flow.inventory
@@ -3860,7 +3879,7 @@ impl Node {
                     let required = required_at
                         .and_then(|at| self.bounded_sync.required.get(at))
                         .map(|required| (required.head, required.seq));
-                    let selected_key_body = if !announce_first
+                    let key_candidate = if !announce_first
                         && required.is_none()
                         && departure_hint.is_none()
                         && own_verification.is_none()
@@ -3876,27 +3895,41 @@ impl Node {
                     } else {
                         None
                     };
-                    let hint =
-                        if announce_first || required.is_some() || selected_key_body.is_some() {
-                            None
+                    let prefer_key = self
+                        .ports
+                        .get(&(room, peer))
+                        .is_some_and(|port| port.key_body_turn);
+                    let mut selected_key_body = None;
+                    let mut chose_public_hint = false;
+                    let hint = if announce_first || required.is_some() {
+                        None
+                    } else if let Some(priority) =
+                        departure_hint.or(own_verification).or(own_discovery)
+                    {
+                        Some(priority)
+                    } else if prefer_key && key_candidate.is_some() {
+                        selected_key_body = key_candidate;
+                        None
+                    } else {
+                        let hint = take_foreground_hint(
+                            &self.history_hints,
+                            room,
+                            peer,
+                            node,
+                            parked_receipt,
+                            self.net
+                                .as_ref()
+                                .and_then(|net| net.manager().existing(&peer))
+                                .map(|conn| conn.serial()),
+                        );
+                        if hint.is_some() {
+                            chose_public_hint = true;
                         } else {
-                            departure_hint
-                                .or(own_verification)
-                                .or(own_discovery)
-                                .or_else(|| {
-                                    take_foreground_hint(
-                                        &self.history_hints,
-                                        room,
-                                        peer,
-                                        node,
-                                        parked_receipt,
-                                        self.net
-                                            .as_ref()
-                                            .and_then(|net| net.manager().existing(&peer))
-                                            .map(|conn| conn.serial()),
-                                    )
-                                })
-                        };
+                            selected_key_body = key_candidate;
+                        }
+                        hint
+                    };
+                    let chose_key_body = selected_key_body.is_some();
                     if hint.is_none()
                         && required.is_none()
                         && selected_key_body.is_none()
@@ -3955,6 +3988,13 @@ impl Node {
                                         Err(_) => return false,
                                     };
                                 flow = flow.with_key_body(need, instance, context, token);
+                            }
+                            if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                if chose_key_body {
+                                    port.key_body_turn = false;
+                                } else if chose_public_hint {
+                                    port.key_body_turn = port.key_body.is_some();
+                                }
                             }
                             flow.reason = reason;
                             flow.discovery_incarnations = probe_incarnations;
@@ -4207,6 +4247,9 @@ impl Node {
             self.dispose_rearming_hint(flow);
             return false;
         };
+        if flow.key_body_root.is_some() {
+            port.key_body_turn = false;
+        }
         if flow.inventory {
             // This exchange carries every own append so far; one landing after this mark
             // makes the port owe the peer again, and the round after announces it.

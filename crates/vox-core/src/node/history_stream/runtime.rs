@@ -52,6 +52,12 @@ enum Operation {
     FinishArchive,
     Governance,
 }
+enum StageStart {
+    Ready,
+    Waiting,
+    Reclaimed,
+}
+
 /// How long one turn keeps running local slices before it yields to the actor.
 const LOCAL_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
 /// How many local slices one turn runs at most.
@@ -2430,13 +2436,22 @@ impl Flow {
                 }
                 if let Query::Entry { head, seq, .. } = query {
                     if task.purpose != Purpose::History {
-                        if !self
+                        match self
                             .ensure_stage(task.purpose, task.request, head, seq, job)
                             .await?
                         {
-                            self.push(task)?;
-                            self.waiting = true;
-                            return Ok(());
+                            StageStart::Ready => {}
+                            StageStart::Waiting => {
+                                self.push(task)?;
+                                self.waiting = true;
+                                return Ok(());
+                            }
+                            StageStart::Reclaimed => {
+                                // One bounded committed cleanup slice moved the retained
+                                // owner forward. Yield to the actor, then continue immediately.
+                                self.push(task)?;
+                                return Ok(());
+                            }
                         }
                         let staging = self
                             .stage(task.purpose)
@@ -3207,14 +3222,14 @@ impl Flow {
         head: Digest32,
         seq: u64,
         job: &Job,
-    ) -> Result<bool> {
+    ) -> Result<StageStart> {
         let is_key = self.key_body_root.is_some() && purpose == Purpose::Control;
         let wake = is_key.then(|| self.slots.key_released());
         if !self.slots.claim(purpose, request, is_key) {
             self.slot_wait = wake.map(|wake| {
                 wake as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>
             });
-            return Ok(false);
+            return Ok(StageStart::Waiting);
         }
         if let Some(index) = body_slot(purpose, self.key_body_root.is_some()) {
             self.owners[index] = Some(request);
@@ -3224,7 +3239,7 @@ impl Flow {
                 .await?
                 .ok_or(Error::Profile("current history state missing"))?;
             if snapshot.state().bounds.head == head && snapshot.state().bounds.lo == seq {
-                return Ok(true);
+                return Ok(StageStart::Ready);
             }
             return Err(Error::Profile("current body slot belongs to another entry"));
         }
@@ -3269,7 +3284,11 @@ impl Flow {
         .await
         .map_err(|_| Error::Profile("current history staging worker stopped"))??;
         let Some(active) = active else {
-            return Ok(false);
+            return Ok(if is_key {
+                StageStart::Reclaimed
+            } else {
+                StageStart::Waiting
+            });
         };
         let staging = Staging {
             context,
@@ -3280,7 +3299,7 @@ impl Flow {
             Purpose::Control => self.control = Some(staging),
             Purpose::History => unreachable!(),
         };
-        Ok(true)
+        Ok(StageStart::Ready)
     }
     async fn reclaim_stage(&mut self, purpose: Purpose, job: &Job, retiring: bool) -> Result<bool> {
         let Some(staging) = self.stage(purpose) else {
