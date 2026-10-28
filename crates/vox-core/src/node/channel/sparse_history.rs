@@ -346,10 +346,26 @@ impl ChannelState {
         store: &Store,
         operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
     ) -> Result<T> {
+        self.history_write_classified(store, false, operation)
+    }
+
+    fn history_write_classified<T>(
+        &self,
+        store: &Store,
+        durable: bool,
+        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
         if self.poisoned {
             return Err(self.save_failure());
         }
         let mut batch = store.batch()?;
+        // The lane's writes are derived: heads, headers, contexts, cursors, receipts, windows,
+        // rebuilt from the proofs and the peers after a crash (ADR-038 FX-30).
+        if durable {
+            batch.ruled();
+        } else {
+            batch.derived();
+        }
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -370,6 +386,19 @@ impl ChannelState {
         operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
     ) -> Result<T> {
         let result = self.history_write(store, operation)?;
+        committed.store(true, std::sync::atomic::Ordering::Release);
+        Ok(result)
+    }
+
+    /// Safety-narrowing evidence about this node's own signed feed must survive a crash
+    /// before later actor maintenance has written the recovery fence.
+    pub(crate) fn history_write_own_head_tracked<T>(
+        &self,
+        store: &Store,
+        committed: &std::sync::atomic::AtomicBool,
+        operation: impl FnOnce(&mut entry_store::Write<'_, '_>) -> Result<T>,
+    ) -> Result<T> {
+        let result = self.history_write_classified(store, true, operation)?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         Ok(result)
     }
@@ -763,6 +792,7 @@ impl ChannelState {
         committed: &std::sync::atomic::AtomicBool,
         entry: &Entry,
         now: crate::time::Ms,
+        received: &crate::node::store::ReceivedFlow,
         on_publish: impl FnOnce(&mut Batch<'_>) -> Result<()>,
     ) -> Result<()> {
         if self.poisoned {
@@ -781,7 +811,8 @@ impl ChannelState {
         }
         let late = read.child_after(&hash, None)?.is_some();
         drop(read);
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
+        // Other received source entries remain owned by this flow and flush before ACK.
         on_publish(&mut batch)?;
         let mut index = self
             .entries
@@ -810,6 +841,21 @@ impl ChannelState {
             entry,
             late,
         )?;
+        // Current consent/presence may become visible immediately at source publication, before
+        // the later effect turn. A newer current input can also change the causal sequence or
+        // historical revocation even when its displayed value stays the same. Keep those facts
+        // durable; duplicate, superseded and other-recipient key headers do not qualify.
+        // A consent target can be unknown at publication and become known through a later
+        // derived admission without an intervening flush. Its already-authenticated current
+        // input must therefore be durable before that admission can make it visible.
+        let durable_current = accepted.current_advanced
+            && matches!(
+                GovEntry::body_bound_to(entry),
+                Ok(GovBody::ConsentGrant(_) | GovBody::ConsentRevocation(_) | GovBody::Presence(_))
+            );
+        if durable_current {
+            batch.ruled();
+        }
         batch.commit()?;
         committed.store(true, std::sync::atomic::Ordering::Release);
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
@@ -891,6 +937,7 @@ impl ChannelState {
             return Ok((false, after));
         }
         let mut batch = store.batch()?;
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -1065,6 +1112,7 @@ impl ChannelState {
         now: crate::time::Ms,
         body_expected: bool,
         historical: bool,
+        received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -1213,7 +1261,11 @@ impl ChannelState {
             }
             Err(error) => return Err(error),
         }
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
+        // This completion can belong to a different flow than the one that published the
+        // source. Keep the completion's own received debt: flushing it before a receipt also
+        // carries the earlier source transaction to disk.
+        batch.note_received_author(entry.skeleton.author_id)?;
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
@@ -1253,6 +1305,16 @@ impl ChannelState {
                 kind,
                 SignedEntryKind::Governance | SignedEntryKind::StepPolicy
             ) {
+                // Current consent inputs were classified and, when they advanced, made durable
+                // in their source publication. Their later effect is derived bookkeeping; in
+                // particular a superseded older grant must not force a second full flush.
+                // Other governance can change authority in this turn and stays conservative.
+                if !matches!(
+                    GovEntry::body_bound_to(&entry),
+                    Ok(GovBody::ConsentGrant(_) | GovBody::ConsentRevocation(_))
+                ) {
+                    batch.ruled();
+                }
                 self.observe_governance_into(store, &mut batch, &entry, log)?;
             }
             // The source publication has already recorded the governance hash, so the
@@ -1285,6 +1347,9 @@ impl ChannelState {
             } else {
                 None
             };
+            if kind == SignedEntryKind::KeyPackage && key_package_for(&entry, &self.me()) {
+                batch.ruled();
+            }
             let mut expired = Vec::new();
             let mut rows = Vec::new();
             let refill_pending =
@@ -1448,6 +1513,7 @@ impl ChannelState {
             return Ok(self.sparse_contiguous_pending.contains(author));
         }
         let mut batch = store.batch()?;
+        batch.derived();
         let mut index = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -1518,6 +1584,7 @@ impl ChannelState {
         body: &governance::TypedSparseBody,
         now: crate::time::Ms,
         historical: bool,
+        received: &crate::node::store::ReceivedFlow,
         check_binding: impl FnOnce(&Batch<'_>) -> Result<()>,
         on_admitted: impl FnOnce(&mut Batch<'_>, Digest32) -> Result<()>,
     ) -> Result<HistoryEffectProgress> {
@@ -1566,10 +1633,22 @@ impl ChannelState {
                 Err(error) => return Err(error),
             }
         }
-        let mut batch = store.batch()?;
+        let mut batch = store.received_batch(received)?;
+        if settled {
+            batch.note_received_author(entry.skeleton.author_id)?;
+        }
         // A changed grant is an ordinary cancellation before projection/index mutation.
         // The held Batch serializes trust writes through the final publication.
         check_binding(&batch)?;
+        // A received body (ADR-038 FX-30): flushed before this node acknowledges it, at once
+        // when it is a key package or governance.
+        if matches!(
+            kind,
+            SignedEntryKind::Governance | SignedEntryKind::StepPolicy
+        ) || (kind == SignedEntryKind::KeyPackage && key_package_for(entry, &self.me()))
+        {
+            batch.ruled();
+        }
         let applied = (|| -> Result<HistoryEffectProgress> {
             let mut index = self
                 .entries

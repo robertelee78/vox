@@ -647,6 +647,26 @@ impl Source {
 }
 
 impl Source {
+    /// Settle the advertised authors after releasing the room lock. A newer
+    /// transaction can add a conservative debt; one already removed is durable.
+    pub(super) async fn flush_authors_before_ack(
+        &self,
+        room: Digest32,
+        authors: Vec<Digest32>,
+    ) -> Result<()> {
+        let store = Arc::clone(&self.store);
+        tokio::task::spawn_blocking(move || {
+            for author in authors {
+                for debt in store.received_debts_for_author(room, author)? {
+                    store.flush_received_through(debt)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Unreachable("history flush worker stopped"))?
+    }
+
     /// One bounded, charged scalar inventory. Every page rechecks current room access;
     /// the compact index is read without touching content bodies or walking the archive.
     pub(super) async fn inventory(&self, job: &Job) -> Result<Lookup<Vec<super::HeadHint>>> {
@@ -659,27 +679,34 @@ impl Source {
             self.current()?;
             let page = self
                 .read(job, 64 * 1024, move |room, store| {
-                    room.history_head_hints(store, after).map(Some)
+                    room.history_head_hints(store, after)
+                        .map(|page| Some((room.channel_id(), page)))
                 })
                 .await?;
             let Lookup::Found(page) = page else {
                 return Ok(Lookup::Busy);
             };
-            if hints.len() + page.value.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
+            let (room_id, page) = page.value;
+            if hints.len() + page.heads.len() > crate::log::history::MAX_CONTEXT_AUTHORS {
                 return Err(Error::SizeLimitExceeded("inventory author bound"));
             }
-            hints.extend(page.value.heads.iter().map(|hint| super::HeadHint {
+            hints.extend(page.heads.iter().map(|hint| super::HeadHint {
                 author: hint.author,
                 size: hint.leaves,
                 head: hint.head,
             }));
-            match page.value.next {
+            match page.next {
                 Some(next) if after.is_none_or(|previous| next > previous) => after = Some(next),
                 None => {
+                    self.flush_authors_before_ack(
+                        room_id,
+                        hints.iter().map(|hint| hint.author).collect(),
+                    )
+                    .await?;
                     return Ok(Lookup::Found(Held {
                         value: hints,
                         _charge: charge,
-                    }))
+                    }));
                 }
                 _ => return Err(Error::MalformedAtRest("inventory cursor did not advance")),
             }

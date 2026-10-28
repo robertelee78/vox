@@ -308,6 +308,7 @@ impl EntryIndex {
     ) -> Result<()> {
         loop {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut w = self.write(&mut batch, sek, room)?;
             if w.directory.retention_stage == 2 {
                 return Ok(());

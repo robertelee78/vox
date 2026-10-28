@@ -118,7 +118,7 @@ use crate::node::content::{Content, Decoded};
 use crate::node::drive::{drive_channel, DriveState, SessionRow};
 use crate::node::profile::Profile;
 use crate::node::retention::Tracked;
-use crate::node::store::Store;
+use crate::node::store::{ReceivedFlow, Store};
 use crate::suite::{algo, SuiteFloor};
 
 /// Segment id of the manifest in `KeyMaterial`.
@@ -1082,6 +1082,74 @@ struct ReadMarkScan {
     started: ReadMarkEligibility,
 }
 
+/// Memory-only exact capabilities for receive flows whose terminal durability settlement failed.
+/// The Store retains the corresponding pending owner, but deliberately offers no room-only way
+/// to recover it: this registry is what keeps the creating Arc available for a later exact retry.
+#[derive(Default)]
+struct ReceivedRetries(std::sync::Mutex<Vec<ReceivedFlow>>);
+
+impl ReceivedRetries {
+    fn retain(&self, owner: ReceivedFlow) {
+        let mut owners = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !owners.iter().any(|known| known.same_owner(&owner)) {
+            owners.push(owner);
+        }
+    }
+
+    fn remove(&self, owner: &ReceivedFlow) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|known| !known.same_owner(owner));
+    }
+
+    /// Settle this exact flow even if another retry is concurrently draining the registry.
+    fn retry_owner(&self, store: &Store, owner: &ReceivedFlow) -> Result<()> {
+        let result = owner.debt(store).and_then(|debt| {
+            debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
+        });
+        match result {
+            Ok(()) => {
+                self.remove(owner);
+                Ok(())
+            }
+            Err(error) => {
+                self.retain(owner.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn retry(&self, store: &Store) -> Result<()> {
+        let owners = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut owners = owners.into_iter();
+        while let Some(owner) = owners.next() {
+            let settled = owner.debt(store).and_then(|debt| {
+                debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
+            });
+            match settled {
+                Ok(()) => self.remove(&owner),
+                Err(error) => {
+                    self.retain(owner);
+                    for owner in owners {
+                        self.retain(owner);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Restart rebuild of the admitted-member consent projection. One maintenance turn examines at
 /// most [`governance::PAGE_ROWS`] author/target pairs; neither departed nor arbitrary
 /// off-roster targets occupy this state.
@@ -1175,6 +1243,10 @@ pub struct ChannelState {
     /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
     /// Persisted as [`SEG_HELD`].
     held: BTreeMap<Digest32, u64>,
+    /// Exact owners whose terminal settlement failed. This registry is separate from the room
+    /// mutex so a session can retain its capability after releasing the room, even when another
+    /// lane presently owns that mutex. The next room session retries them before doing work.
+    received_retries: Arc<ReceivedRetries>,
     /// Last missing-body position examined by `owed_wants`, including ineligible positions.
     /// The next session resumes after it and wraps, so unavailable bodies cannot starve others.
     owed_asked_to: Option<(Digest32, u64)>,
@@ -2094,6 +2166,7 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
+            received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
@@ -2816,6 +2889,9 @@ impl ChannelState {
                 sparse: false,
             };
             let mut batch = store.batch()?;
+            // Bootstrap reconstructs a restart index from authenticated room state. A later
+            // person-loss commit carries it; this derived-only rebuild does not force a flush.
+            batch.derived();
             let mut writer = entries.write(&mut batch, &sek, channel_id)?;
             writer.bootstrap_restart(state)?;
             writer.seal()?;
@@ -2868,6 +2944,7 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held,
+            received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: match restart
@@ -3143,6 +3220,7 @@ impl ChannelState {
             legacy_announced: None,
             private_sessions: private_session::PrivateSessions::default(),
             held: BTreeMap::new(),
+            received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
             projection_state: history::State::default(),
@@ -3345,7 +3423,7 @@ impl ChannelState {
         self.board_kept
             .notices
             .insert(joiner, (at, notice.to_wire()));
-        self.save_board_kept(store)
+        self.save_board_kept(store, false)
     }
 
     /// Keep a member's own withdraw (#520), checked by the caller against the member's key: the
@@ -3378,7 +3456,7 @@ impl ChannelState {
         self.board_kept
             .withdraws
             .insert(member, (withdraw.timestamp_ms, withdraw.to_wire()));
-        self.save_board_kept(store)?;
+        self.save_board_kept(store, true)?;
         Ok(true)
     }
 
@@ -3466,19 +3544,29 @@ impl ChannelState {
         Ok(())
     }
 
-    fn save_board_kept(&mut self, store: &Store) -> Result<()> {
+    fn save_board_kept(&mut self, store: &Store, durable: bool) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_BOARD_KEPT,
             &board_kept_bytes(&self.board_kept),
         )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_BOARD_KEPT,
-            &seg,
-        ) {
+        let save = if durable {
+            store.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_BOARD_KEPT,
+                &seg,
+            )
+        } else {
+            store.put_segment_derived(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_BOARD_KEPT,
+                &seg,
+            )
+        };
+        if let Err(e) = save {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
             return Err(e);
@@ -3666,7 +3754,7 @@ impl ChannelState {
             SEG_AUTHORS,
             &authors_bytes(&self.authors),
         )?;
-        if let Err(e) = store.put_segment(
+        if let Err(e) = store.put_segment_derived(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_AUTHORS,
@@ -4063,6 +4151,7 @@ impl ChannelState {
         let result = (|| -> Result<()> {
             loop {
                 let mut batch = store.batch()?;
+                batch.derived();
                 let mut index = self
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -4232,7 +4321,7 @@ impl ChannelState {
             SEG_KNOWN_MEMBERS,
             &known_members_bytes(&self.known_members),
         )?;
-        if let Err(e) = store.put_segment(
+        if let Err(e) = store.put_segment_derived(
             &self.channel_id,
             SegmentKind::KeyMaterial,
             SEG_KNOWN_MEMBERS,
@@ -5984,6 +6073,7 @@ impl ChannelState {
     fn forget_settled_owed(&mut self, store: &Store) -> Result<()> {
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut writer = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -6378,6 +6468,7 @@ impl ChannelState {
         }
         let result = (|| -> Result<usize> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -6538,6 +6629,7 @@ impl ChannelState {
         let mut display_changed = false;
         let persisted = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             for (hash, tracked) in &due {
                 let entry = self
                     .dag
@@ -6997,9 +7089,13 @@ impl ChannelState {
         now: crate::time::Ms,
     ) -> Result<SyncOutcome> {
         let now_ms = now.get();
+        let retry = self.received_retries.retry(store);
         if self.poisoned {
+            // The first persist/absorption failure remains the room's diagnosis. A later retry
+            // failure cannot relabel it, and the exact owner remains in `received_retries`.
             return Err(self.save_failure());
         }
+        retry?;
         // Per-author heads before the session, so the new entries can be found after.
         let before: BTreeMap<Digest32, u64> = self
             .authors
@@ -7024,7 +7120,31 @@ impl ChannelState {
 
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
-        let mut out = self.absorb_arrived(store, &before, now_ms)?;
+        let received = ReceivedFlow::new(self.channel_id);
+        let absorbed = received.scope(|| self.absorb_arrived(store, &before, now_ms, &received));
+        // `absorb_arrived` may commit one or more batches before a later batch fails. Settle that
+        // exact flow even on the partial-failure path; otherwise its committed Durability::None
+        // bytes have neither an acknowledgement owner nor a future retry capable of naming them.
+        let mut settled = received.debt(store).and_then(|debt| {
+            debt.map_or(Ok(()), |debt| store.flush_received_through(debt).map(drop))
+        });
+        if settled.is_err() {
+            self.received_retries.retain(received.clone());
+            // Retry this exact owner: another retry may be draining the shared registry.
+            settled = self.received_retries.retry_owner(store, &received);
+        } else {
+            self.received_retries.remove(&received);
+        }
+        let mut out = match absorbed {
+            Ok(out) => {
+                settled?;
+                out
+            }
+            // If both operations failed, return the original absorption error. The settlement
+            // error has retained its exact retry capability above and must not replace the cause
+            // which poisoned the room.
+            Err(error) => return Err(error),
+        };
         if let Ok(n) = session {
             out.applied = n;
         }
@@ -7055,6 +7175,7 @@ impl ChannelState {
         store: &Store,
         before: &BTreeMap<Digest32, u64>,
         now_ms: u64,
+        received: &ReceivedFlow,
     ) -> Result<SyncOutcome> {
         self.keep_forks(store)?;
         let result = (|| -> Result<SyncOutcome> {
@@ -7125,7 +7246,8 @@ impl ChannelState {
                             },
                         )?;
                         let count = arrived.len() as u64;
-                        let got = self.absorb_batch(store, arrived, now_ms, Some(count))?;
+                        let got =
+                            self.absorb_batch(store, arrived, now_ms, Some(count), received)?;
                         out.applied += got.applied;
                         out.rendered += got.rendered;
                         out.governance += got.governance;
@@ -7189,6 +7311,7 @@ impl ChannelState {
                         )],
                         now_ms,
                         Some(count),
+                        received,
                     )?;
                     out.applied += count as usize;
                     out.rendered += got.rendered;
@@ -7217,6 +7340,7 @@ impl ChannelState {
                     vec![(entry.skeleton.author_id, hash, entry.payload, Some(id))],
                     now_ms,
                     None,
+                    received,
                 )?;
                 out.applied += got.applied;
                 out.rendered += got.rendered;
@@ -7242,8 +7366,9 @@ impl ChannelState {
         arrived: Vec<Arrived>,
         now_ms: u64,
         promotion: Option<u64>,
+        received: &ReceivedFlow,
     ) -> Result<SyncOutcome> {
-        self.absorb_batch_authorized(store, arrived, now_ms, promotion, None)
+        self.absorb_batch_authorized(store, arrived, now_ms, promotion, Some(received), None)
     }
 
     fn absorb_batch_authorized(
@@ -7252,8 +7377,16 @@ impl ChannelState {
         arrived: Vec<Arrived>,
         now_ms: u64,
         promotion: Option<u64>,
+        received: Option<&ReceivedFlow>,
         authorization: Option<LegacySync>,
     ) -> Result<SyncOutcome> {
+        let received_tips = received.map(|flow| {
+            let mut tips = BTreeMap::new();
+            for (author, entry_hash, _, _) in &arrived {
+                tips.insert(*author, (*entry_hash, flow.clone()));
+            }
+            tips
+        });
         let mut out = SyncOutcome {
             applied: arrived.len(),
             ..SyncOutcome::default()
@@ -7274,14 +7407,28 @@ impl ChannelState {
         let mut packages = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let mut chains_advanced = false;
-        let mut batch = match store.batch() {
-            Ok(b) => b,
-            Err(e) => {
-                self.poisoned = true;
-                self.save_error = Some(e.to_string());
-                return Err(e);
+        let mut batch =
+            match received.map_or_else(|| store.batch(), |flow| store.received_batch(flow)) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.poisoned = true;
+                    self.save_error = Some(e.to_string());
+                    return Err(e);
+                }
+            };
+        // Received entries with the derived state that admits them (ADR-038 FX-30): committed
+        // without a flush, flushed before this node acknowledges holding them; a key package, a
+        // governance entry or a key written below says `ruled` and the batch is flushed.
+        if received.is_none() {
+            // Explicit legacy recovery does not retain a receive-flow capability across actor
+            // quanta, so make its promoted witness durable in its own transaction.
+            batch.ruled();
+        }
+        if let Some(tips) = received_tips.as_ref() {
+            for author in tips.keys() {
+                batch.note_received_author(*author)?;
             }
-        };
+        }
         if let Some(request) = authorization {
             request.check_in(self, &batch)?;
         }
@@ -7393,6 +7540,7 @@ impl ChannelState {
                         EntryKind::Content | EntryKind::Governance => None,
                     };
                     if gov.is_some() {
+                        batch.ruled();
                         // Every newly authenticated governance row is causal index work, even
                         // when its single-writer semantic effect is superseded. The projection
                         // observer separately declines to revise/invalidate/backfill for that
@@ -7404,6 +7552,7 @@ impl ChannelState {
                     // A key-package is queued for the actor to install, never rendered or aged as
                     // a message.
                     if crate::node::keypackage::KeyPackage::is_key_package(payload) {
+                        batch.ruled();
                         if key_package_for(&held, &self.me()) {
                             packages.push((author, id));
                         }
@@ -7516,29 +7665,35 @@ impl ChannelState {
     ) -> SessionReport {
         let now_ms = now.get();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let epoch = loop {
+        let (epoch, channel_id, received_retries, poisoned, keys_open) = loop {
             if fence.is_retired() || std::time::Instant::now() >= deadline {
                 return SessionReport::failed(SyncFailure::Session(
                     crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
                 ));
             }
             if let Ok(ch) = shared.try_lock() {
-                if ch.poisoned {
-                    return SessionReport::failed(SyncFailure::Poisoned(
-                        ch.save_failure().to_string(),
-                    ));
-                }
-                if ch.sek.key_bytes().is_err() {
-                    return SessionReport::failed(SyncFailure::Session(
-                        crate::log::sync::SessionError::Local(
-                            crate::wire::WireError::TransportFailed,
-                        ),
-                    ));
-                }
-                break ch.epoch;
+                break (
+                    ch.epoch,
+                    ch.channel_id,
+                    Arc::clone(&ch.received_retries),
+                    ch.poisoned.then(|| ch.save_failure().to_string()),
+                    ch.sek.key_bytes().is_ok(),
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
+        let retry = received_retries.retry(store);
+        if let Some(error) = poisoned {
+            return SessionReport::failed(SyncFailure::Poisoned(error));
+        }
+        if let Err(error) = retry {
+            return SessionReport::failed(SyncFailure::Poisoned(error.to_string()));
+        }
+        if !keys_open {
+            return SessionReport::failed(SyncFailure::Session(
+                crate::log::sync::SessionError::Local(crate::wire::WireError::TransportFailed),
+            ));
+        }
         let room = ChannelSessionRoom {
             shared,
             store,
@@ -7548,12 +7703,16 @@ impl ChannelState {
             fence,
             on_stored,
             legacy,
+            received: ReceivedFlow::new(channel_id),
+            received_retries,
             observe_tip: std::cell::Cell::new(None),
             deadline,
             out: std::cell::RefCell::new(SyncOutcome::default()),
             fatal: std::cell::RefCell::new(None),
         };
-        let session = crate::log::sync::frontier_session_room(transport, &room);
+        let session = room
+            .received
+            .scope(|| crate::log::sync::frontier_session_room(transport, &room));
         // Whatever arrived without a signature and was never chained to a signed entry is not
         // authentic; it was never persisted, and it is taken back here on every path out of the
         // session (ADR-023 decision 3).
@@ -7571,35 +7730,57 @@ impl ChannelState {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             };
             if let Some(mut ch) = guard.filter(|ch| ch.sek.key_bytes().is_ok()) {
-                let cleanup = if let Some(request) = legacy {
-                    if let Ok(Some(state)) = ch.legacy_provisional_state(store) {
-                        room.out.borrow_mut().legacy_next = Some(state.tail_seq.saturating_add(1));
-                        room.out.borrow_mut().legacy_pending = state.pending_witness != 0
-                            || ch
-                                .legacy_publication_progress(store, request.owner)
-                                .ok()
-                                .flatten()
-                                .is_some();
+                let cleanup = room.received.scope(|| {
+                    if let Some(request) = legacy {
+                        if let Ok(Some(state)) = ch.legacy_provisional_state(store) {
+                            room.out.borrow_mut().legacy_next =
+                                Some(state.tail_seq.saturating_add(1));
+                            room.out.borrow_mut().legacy_pending = state.pending_witness != 0
+                                || ch
+                                    .legacy_publication_progress(store, request.owner)
+                                    .ok()
+                                    .flatten()
+                                    .is_some();
+                        }
+                        ch.finish_legacy_sync(store, request).map(|()| 0)
+                    } else {
+                        match ch.legacy_provisional_state(store) {
+                            // A current session may finish between explicit recovery's lock
+                            // slices. It never owns that attached suffix or its durable spool.
+                            Ok(Some(_)) => Ok(0),
+                            Ok(None) => ch.discard_unverified(store),
+                            Err(error) => Err(error),
+                        }
                     }
-                    ch.finish_legacy_sync(store, request).map(|()| 0)
-                } else {
-                    match ch.legacy_provisional_state(store) {
-                        // A current session may finish between explicit recovery's lock
-                        // slices. It never owns that attached suffix or its durable spool.
-                        Ok(Some(_)) => Ok(0),
-                        Ok(None) => ch.discard_unverified(store),
-                        Err(error) => Err(error),
-                    }
-                };
+                });
                 match cleanup {
                     Ok(_) => {}
                     Err(error) => {
-                        ch.poisoned = true;
-                        ch.save_error = Some(error.to_string());
-                        *room.fatal.borrow_mut() = Some(error);
+                        ch.poison(&error);
+                        room.remember_fatal(error);
                     }
                 }
             }
+        }
+        let debt = match room.received.debt(store) {
+            Ok(debt) => debt,
+            Err(error) => {
+                room.received_retries.retain(room.received.clone());
+                room.remember_fatal(error);
+                None
+            }
+        };
+        if let Some(debt) = debt {
+            if store.flush_received_through(debt).is_err() {
+                room.received_retries.retain(room.received.clone());
+                if let Err(error) = room.received_retries.retry_owner(store, &room.received) {
+                    room.remember_fatal(error);
+                }
+            } else {
+                room.received_retries.remove(&room.received);
+            }
+        } else if room.fatal.borrow().is_none() {
+            room.received_retries.remove(&room.received);
         }
         let fatal = room.fatal.take();
         SessionReport::from_room(room.out.into_inner(), session, fatal)
@@ -7638,7 +7819,8 @@ impl ChannelState {
             return self.accept_drive_skdm(store, skdm, &key, now_ms);
         }
         let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
-        let slot = (author, chain.chain_id());
+        let chain_id = chain.chain_id();
+        let slot = (author, chain_id);
         // A second SKDM for a generation we already hold would rewind the chain
         // head and re-enable consumed iterations; keep the live one. An earlier authenticated
         // history release widens only the separate history floor. Persist that floor with the
@@ -7653,6 +7835,7 @@ impl ChannelState {
             }
             let saved = (|| -> Result<()> {
                 let mut batch = store.batch()?;
+                batch.ruled();
                 self.queue_receivers(&mut batch)?;
                 let mut writer = self
                     .entries
@@ -7682,6 +7865,7 @@ impl ChannelState {
         // retry ciphertext accepted before the key arrived.
         let queued = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.ruled();
             self.queue_receivers(&mut batch)?;
             {
                 let mut writer = self
@@ -8339,6 +8523,7 @@ impl ChannelState {
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             rows =
                 self.backfill_into(&mut batch, author, &BTreeSet::new(), now_ms, &mut expired)?;
             // Even an unrendered page advances the durable work cursor. Do not discard it
@@ -8550,6 +8735,7 @@ impl ChannelState {
         let mut expired = Vec::new();
         let result = (|| -> Result<Vec<Rendered>> {
             let mut batch = store.batch()?;
+            batch.derived();
             let rows =
                 self.drain_backfill_into(&mut batch, &BTreeSet::new(), now_ms, &mut expired)?;
             if self.chains_advanced {
@@ -8629,6 +8815,7 @@ impl ChannelState {
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let persisted = (|| -> Result<Option<Rendered>> {
             let mut batch = store.batch()?;
+            batch.derived();
             let projection = self.render_content_into(
                 &mut batch,
                 author,
@@ -8911,6 +9098,7 @@ impl ChannelState {
         let shown = shown_now();
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
+            batch.derived();
             let mut index = self
                 .entries
                 .write(&mut batch, &self.sek, &self.channel_id)?;
@@ -8965,6 +9153,9 @@ impl ChannelState {
 
     /// Queue the receiver chains, as they stand now, into `batch`.
     fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
+        // Persist the current receiver state in the caller's transaction. A newly accepted key
+        // marks that exact transaction ruled; ordinary chain/cursor
+        // advances remain part of their receive flow and are flushed once before its ACK.
         let receivers_seg = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
@@ -9159,6 +9350,17 @@ impl ChannelState {
         let persisted = (|| -> Result<()> {
             self.prepare_entry(store, &entry, kind, &key, now_ms)?;
             let mut batch = store.batch()?;
+            // This legacy direct API has no retained receive-flow owner, so its remote entry is
+            // durable in this transaction. Bounded/session receive paths use exact flow debt.
+            batch.ruled();
+            if gov.is_some()
+                || entry
+                    .payload
+                    .as_deref()
+                    .is_some_and(crate::node::keypackage::KeyPackage::is_key_package)
+            {
+                batch.ruled();
+            }
             if self.publish_entry_into(&mut batch, &entry)?.is_some() {
                 return Err(Error::Profile("remote entry produced local settlement"));
             }
@@ -9471,7 +9673,12 @@ impl ChannelState {
             SEG_HELD,
             &held_bytes(&self.held),
         ) {
-            let _ = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_HELD, &seg);
+            let _ = store.put_segment_derived(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_HELD,
+                &seg,
+            );
         }
     }
 
@@ -10639,6 +10846,8 @@ struct ChannelSessionRoom<'a> {
     /// Called after a batch persisted entries (ADR-025 D1a: stores report themselves).
     on_stored: &'a dyn Fn(),
     legacy: Option<LegacySync>,
+    received: ReceivedFlow,
+    received_retries: Arc<ReceivedRetries>,
     observe_tip: std::cell::Cell<Option<crate::log::sync::LegacyGap>>,
     deadline: std::time::Instant,
     out: std::cell::RefCell<SyncOutcome>,
@@ -10647,6 +10856,16 @@ struct ChannelSessionRoom<'a> {
 }
 
 impl ChannelSessionRoom<'_> {
+    /// Keep the first local error: it is the operation which stopped semantic absorption. A
+    /// later cleanup or durability-settlement failure retains its retry owner separately and
+    /// cannot overwrite that causal diagnosis.
+    fn remember_fatal(&self, error: Error) {
+        let mut fatal = self.fatal.borrow_mut();
+        if fatal.is_none() {
+            *fatal = Some(error);
+        }
+    }
+
     fn room(
         &self,
     ) -> std::result::Result<tokio::sync::MutexGuard<'_, ChannelState>, crate::wire::WireError>
@@ -10729,7 +10948,24 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 frontiers.sort_unstable_by_key(|head| head.author_id);
             }
         }
-        Ok((frontiers, ch.gen.load(std::sync::atomic::Ordering::Relaxed)))
+        drop(entries);
+        let generation = ch.gen.load(std::sync::atomic::Ordering::Relaxed);
+        let room_id = ch.channel_id();
+        // The captured frontiers name the authors to settle. Do not wait for the
+        // Store writer while holding the room; later debts only make this conservative.
+        drop(ch);
+        for frontier in &frontiers {
+            let debts = self
+                .store
+                .received_debts_for_author(room_id, frontier.author_id)
+                .map_err(|_| crate::wire::WireError::TransportFailed)?;
+            for debt in debts {
+                self.store
+                    .flush_received_through(debt)
+                    .map_err(|_| crate::wire::WireError::TransportFailed)?;
+            }
+        }
+        Ok((frontiers, generation))
     }
 
     fn wants(
@@ -10824,7 +11060,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             }
             Err(error) => {
                 room.poison(&error);
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 return Err(crate::wire::WireError::TransportFailed);
             }
         };
@@ -10850,13 +11086,12 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         ) {
             Ok(entries) => Ok(entries),
             Err(error) if session_projection::floor_index::refreshing(&error) => {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 Err(crate::wire::WireError::TransportFailed)
             }
             Err(error) => {
-                room.poisoned = true;
-                room.save_error = Some(error.to_string());
-                *self.fatal.borrow_mut() = Some(error);
+                room.poison(&error);
+                self.remember_fatal(error);
                 Err(crate::wire::WireError::TransportFailed)
             }
         }
@@ -10910,7 +11145,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                         }
                         Err(error) => {
                             ch.poison(&error);
-                            *self.fatal.borrow_mut() = Some(error);
+                            self.remember_fatal(error);
                             return crate::log::sync::ApplyReport {
                                 fail: Some(crate::wire::WireError::TransportFailed),
                                 ..crate::log::sync::ApplyReport::default()
@@ -10923,7 +11158,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         let legacy_state = match ch.legacy_provisional_state(self.store) {
             Ok(state) => state,
             Err(error) => {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 return crate::log::sync::ApplyReport {
                     fail: Some(crate::wire::WireError::TransportFailed),
                     ..crate::log::sync::ApplyReport::default()
@@ -10942,7 +11177,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             let accepted = match accepted {
                 Ok(accepted) => accepted,
                 Err(error) => {
-                    *self.fatal.borrow_mut() = Some(error);
+                    self.remember_fatal(error);
                     return crate::log::sync::ApplyReport {
                         fail: Some(crate::wire::WireError::TransportFailed),
                         ..Default::default()
@@ -11014,13 +11249,14 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             Ok(batch) => batch,
             Err(error) => {
                 ch.poison(&error);
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 return crate::log::sync::ApplyReport {
                     fail: Some(crate::wire::WireError::TransportFailed),
                     ..crate::log::sync::ApplyReport::default()
                 };
             }
         };
+        batch.derived();
         if let Some(request) = self.legacy {
             if request.check_in(ch, &batch).is_err() {
                 // Expected cancellation before any DAG/index mutation is not room corruption.
@@ -11088,20 +11324,19 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             Err(error) => (crate::log::sync::ApplyReport::default(), Some(error)),
         };
         if let Some(error) = local {
-            ch.poisoned = true;
-            ch.save_error = Some(error.to_string());
-            *self.fatal.borrow_mut() = Some(error);
+            ch.poison(&error);
+            self.remember_fatal(error);
             report.stored = 0;
             report.fail = Some(crate::wire::WireError::TransportFailed);
             // Fork evidence remains independently durable even when unpublished log work fails.
             if let Err(error) = ch.keep_forks(self.store) {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
             }
             return report;
         }
         if self.legacy.is_some() {
             if let Err(error) = ch.keep_forks(self.store) {
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 report.fail = Some(crate::wire::WireError::TransportFailed);
             }
             // Exact staging and any witness cursor are durable. Publication/effects are
@@ -11114,7 +11349,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 // Current overlap may discover a fork, but cannot refill or maintain the
                 // mutable roots owned by an explicit legacy publication.
                 if let Err(error) = ch.keep_forks(self.store) {
-                    *self.fatal.borrow_mut() = Some(error);
+                    self.remember_fatal(error);
                     report.fail = Some(crate::wire::WireError::TransportFailed);
                 }
                 report.stored = 0;
@@ -11123,7 +11358,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             Ok(false) => {}
             Err(error) => {
                 ch.poison(&error);
-                *self.fatal.borrow_mut() = Some(error);
+                self.remember_fatal(error);
                 report.fail = Some(crate::wire::WireError::TransportFailed);
                 return report;
             }
@@ -11147,14 +11382,13 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             }
         }
         if let Err(error) = ch.filter_received_session_bodies(self.store, &staged, self.now_ms) {
-            ch.poisoned = true;
-            ch.save_error = Some(error.to_string());
-            *self.fatal.borrow_mut() = Some(error);
+            ch.poison(&error);
+            self.remember_fatal(error);
             report.stored = 0;
             report.fail = Some(crate::wire::WireError::TransportFailed);
             return report;
         }
-        match ch.absorb_arrived(self.store, &before, self.now_ms) {
+        match ch.absorb_arrived(self.store, &before, self.now_ms, &self.received) {
             Ok(got) => {
                 let mut out = self.out.borrow_mut();
                 out.rendered += got.rendered;
@@ -11162,7 +11396,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
                 out.refused += got.refused;
             }
             Err(e) => {
-                *self.fatal.borrow_mut() = Some(e);
+                self.remember_fatal(e);
                 report.fail = Some(crate::wire::WireError::TransportFailed);
             }
         }

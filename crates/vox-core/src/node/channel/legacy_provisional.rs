@@ -98,6 +98,8 @@ impl ChannelState {
             hash: tip.entry_hash(),
         };
         let mut batch = store.batch()?;
+        // This authenticated requirement is a re-fetchable restart index, not a user fact.
+        batch.derived();
         let mut writer = self
             .entries
             .write(&mut batch, &self.sek, &self.channel_id)?;

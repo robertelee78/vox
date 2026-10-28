@@ -1439,6 +1439,14 @@ async fn footer_first(
     }
 }
 fn footer_fields(row: &mut serde_json::Value, page: &vox_core::node::api::MessageFooter) {
+    // On how many of the room's other members' nodes this own message is held, by their own
+    // word in a sync (ADR-028 R-6, "on N of M members' nodes"): what the TUI's footer shows, so
+    // an agent reading `--json` sees the same, and a proof can tell an acknowledged post from
+    // one only sent (ADR-038 FX-30).
+    if page.present {
+        row["held"] = page.held.into();
+        row["others"] = page.others.into();
+    }
     for (key, members) in [("read_by", &page.read_by), ("pulled_by", &page.pulled_by)] {
         if !members.is_empty() {
             let mut names: Vec<_> = members.iter().map(crate::ident::name_of).collect();
@@ -2412,8 +2420,8 @@ pub async fn read(
             let mut row = row_value(&room_key, r, &ops, None);
             let first = footers.remove(&r.entry_hash);
             if let Some(page) = first.filter(|page| page.present) {
+                footer_fields(&mut row, &page);
                 if page.read_after.is_none() && page.pulled_after.is_none() {
-                    footer_fields(&mut row, &page);
                     writeln!(out, "{row}")?;
                 } else {
                     let (mut readers, mut pullers) =

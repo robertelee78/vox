@@ -12,7 +12,7 @@ use crate::node::channel::entry_store::sparse::LiveWindow;
 use crate::node::channel::ChannelState;
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
-use crate::node::store::Store;
+use crate::node::store::{ReceivedFlow, Store};
 use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -257,6 +257,9 @@ pub(crate) struct Flow {
     /// A local trust edit invalidated this flow's grant. Retire it without blaming the peer;
     /// the controller re-arms its exact scalar hint under the new generation.
     pub(crate) authorization_changed: bool,
+    /// Durability debt created by this flow alone. It follows every receiver handoff and is
+    /// detached whenever the flow returns to the actor.
+    received: ReceivedFlow,
     /// A refusal reached the peer successfully but could not be recorded in the local store.
     /// The actor re-arms the exact owner without charging this failure to the peer.
     pub(crate) local_retry: Option<String>,
@@ -300,6 +303,7 @@ pub(crate) struct Flow {
     retirement_request: RequestId,
     request: RequestId,
     cleanup_store: Arc<Store>,
+    failed_settlement: Option<crate::node::store::ReceivedSettlement>,
     cleanup_budget: Arc<crate::node::history_budget::Budget>,
     actor_incarnation: Option<u64>,
     cleanup_after: Option<[u8; 64]>,
@@ -463,6 +467,7 @@ impl Flow {
             route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
+            received: ReceivedFlow::new(room),
             local_retry: None,
             tasks: Vec::with_capacity(MAX_TASKS),
             replay: None,
@@ -482,6 +487,7 @@ impl Flow {
             retirement_request: request,
             request,
             cleanup_store,
+            failed_settlement: None,
             cleanup_budget,
             actor_incarnation,
             cleanup_after: None,
@@ -632,6 +638,7 @@ impl Flow {
             route_origin_brought: false,
             route_complete: false,
             authorization_changed: false,
+            received: ReceivedFlow::new(room),
             local_retry: None,
             slots,
             owners: [None, None],
@@ -644,6 +651,7 @@ impl Flow {
             retirement_request: request,
             request,
             cleanup_store,
+            failed_settlement: None,
             cleanup_budget,
             actor_incarnation,
             cleanup_after: None,
@@ -1108,7 +1116,50 @@ impl Flow {
     /// Each transaction is bounded; no transport or authority effect runs during retirement.
     pub(crate) async fn retire_slice(&mut self) -> Result<RetirementStep> {
         self.publication_owner_wait = None;
-        if !self.initialized || self.shared.lock().await.history_retirement_locked() {
+        self.failed_settlement = None;
+        let room_unavailable =
+            !self.initialized || self.shared.lock().await.history_retirement_locked();
+        let store = Arc::clone(&self.cleanup_store);
+        let received = self.received.clone();
+        let target = tokio::task::spawn_blocking(move || store.received_settlement(&received))
+            .await
+            .map_err(|_| Error::Unreachable("history settlement snapshot worker stopped"))?;
+        let result = if let Some(debt) = target.debt.clone() {
+            self.settle_received_debt(Arc::clone(&self.cleanup_store), debt)
+                .await
+        } else if target.replacement_pending {
+            let store = Arc::clone(&self.cleanup_store);
+            tokio::task::spawn_blocking(move || store.finish_received_replacement())
+                .await
+                .map_err(|_| Error::Unreachable("history replacement worker stopped"))?
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            if room_unavailable {
+                // Store retains the exact debt after this flow drops. Reopened-room receipts
+                // collect that debt before acknowledging; key erasure must not wedge teardown.
+                eprintln!("vox: received history remains unflushed after room lock: {error}");
+                self.cancel();
+                return Ok(RetirementStep::Done);
+            }
+            let store = Arc::clone(&self.cleanup_store);
+            let received = self.received.clone();
+            match tokio::task::spawn_blocking(move || store.received_settlement(&received)).await {
+                Ok(mut failed) => {
+                    failed.debt = target.debt;
+                    self.failed_settlement = Some(failed);
+                }
+                Err(snapshot_error) => {
+                    // The attempted settlement error is the primary failure. Without a fresh
+                    // snapshot we cannot know which replacement must complete, so retain the
+                    // existing explicit recovery/erasure wait instead of claiming a wake.
+                    eprintln!("vox: history settlement recovery snapshot worker stopped: {snapshot_error}");
+                }
+            }
+            return Err(error);
+        }
+        if room_unavailable {
             self.cancel();
             return Ok(RetirementStep::Done);
         }
@@ -1314,7 +1365,24 @@ impl Flow {
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>> {
         let shared = Arc::clone(&self.shared);
+        let settlement = self.failed_settlement.clone();
         Box::pin(async move {
+            if let Some(settlement) = settlement {
+                tokio::select! {
+                    () = settlement.settled() => return,
+                    () = async {
+                        loop {
+                            let wake = {
+                                let room = shared.lock().await;
+                                let wake = room.history_publication_wake();
+                                if room.history_retirement_locked() { return; }
+                                wake
+                            };
+                            wake.await;
+                        }
+                    } => return,
+                }
+            }
             loop {
                 let wake = {
                     let room = shared.lock().await;
@@ -1350,6 +1418,7 @@ impl Flow {
             self.epoch,
             self.generation,
             self.node,
+            self.received.clone(),
             self.stage(purpose),
             purpose == Purpose::History,
             fence,
@@ -1357,6 +1426,23 @@ impl Flow {
             Arc::clone(&self.work_committed),
             Arc::clone(&self.own_head_observed),
         )
+    }
+
+    async fn settle_received(&self, store: Arc<Store>) -> Result<()> {
+        let Some(debt) = self.received.debt(&store)? else {
+            return Ok(());
+        };
+        self.settle_received_debt(store, debt).await
+    }
+
+    async fn settle_received_debt(
+        &self,
+        store: Arc<Store>,
+        debt: crate::node::store::ReceivedDebt,
+    ) -> Result<()> {
+        tokio::task::spawn_blocking(move || store.flush_received_through(debt).map(|_| ()))
+            .await
+            .map_err(|_| Error::Unreachable("history received flush worker stopped"))?
     }
     fn binding(&self) -> Binding {
         Binding {
@@ -1399,7 +1485,7 @@ impl Flow {
         // serving three joiners at once read their first posts after 30 s (#934).
         let mut quantum_started = tokio::time::Instant::now();
         let mut slices = 0u32;
-        let result = loop {
+        let mut result = loop {
             let result = self
                 .turn_inner(
                     store.clone(),
@@ -1467,11 +1553,26 @@ impl Flow {
             )
         }) {
             self.authorization_changed = true;
-            return Ok(());
+            result = Ok(());
         }
         // Busy is a retained exact need. A count of turns can neither revoke the body slot nor
         // dispose its root; the semantic response/progress edge is the only thing that advances
         // it, while the actor's named Busy backoff prevents spinning between those edges.
+        // A successful partial turn keeps this exact owner inside the returned Flow, allowing a
+        // sparse source and its later semantic effect to share one durability debt. Every path
+        // which stops carrying the flow forward settles first; a failure keeps the Flow owned by
+        // retirement, which retries this same debt instead of lending it to a later transaction.
+        if result.is_err() || self.authorization_changed || self.done() {
+            let settlement = self.settle_received(store).await;
+            if settlement.is_err() {
+                // A stale actor callback must not publish a saved archive completion whose
+                // received bytes did not cross their durable boundary.
+                self.archive_status = None;
+            }
+            if result.is_ok() {
+                settlement?;
+            }
+        }
         result
     }
 
