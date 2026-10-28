@@ -899,6 +899,8 @@ pub(crate) struct RetiredPublicToken {
     request: RequestId,
     serial: u64,
     binding: Binding,
+    pub(crate) wire_bytes: u64,
+    pub(crate) counted_body: Option<Digest32>,
 }
 impl RetiredPublicToken {
     pub(crate) fn matches_state(&self, context: &Context, state: &State, binding: Binding) -> bool {
@@ -921,6 +923,8 @@ impl Active {
             request: self.request,
             serial: self.serial,
             binding: self.binding,
+            wire_bytes: 0,
+            counted_body: None,
         }
     }
 }

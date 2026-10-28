@@ -313,6 +313,7 @@ pub(crate) struct Flow {
     history: Option<Staging>,
     /// Body bytes this explicit history quantum has fetched so far (ADR-036: one bounded ask).
     archive_wire_bytes: u64,
+    archive_counted_body: Option<Digest32>,
     archive_next: Option<u64>,
     pub(crate) request_fence: Option<Arc<Fence>>,
     initialized: bool,
@@ -360,7 +361,12 @@ impl Flow {
         }
         let staging = self.history.as_ref()?;
         let active = staging.active.try_lock().ok()?;
-        (Some(active.request()) == self.archive_request).then(|| active.retired_public_token())
+        (Some(active.request()) == self.archive_request).then(|| {
+            let mut token = active.retired_public_token();
+            token.wire_bytes = self.archive_wire_bytes;
+            token.counted_body = self.archive_counted_body;
+            token
+        })
     }
     pub(crate) fn local_own_root(&self) -> bool {
         self.local_own_verification || self.local_own_discovery
@@ -506,6 +512,7 @@ impl Flow {
             control: None,
             history: None,
             archive_wire_bytes: 0,
+            archive_counted_body: None,
             archive_next: None,
             request_fence: None,
             initialized: false,
@@ -685,12 +692,32 @@ impl Flow {
             control: None,
             history: Some(staging),
             archive_wire_bytes: 0,
+            archive_counted_body: None,
             archive_next: None,
             request_fence: Some(fence),
             initialized: true,
             live_unavailable: None,
             live_visited: false,
             control_head: None,
+        }
+    }
+    /// Restore only the interrupted quantum's already-consumed credit and exact cursor.
+    pub(crate) fn restore_interrupted_quantum(
+        &mut self,
+        bytes: u64,
+        counted: Option<Digest32>,
+        next: Option<u64>,
+        resume_body: bool,
+    ) {
+        self.archive_wire_bytes = bytes;
+        self.archive_counted_body = counted;
+        self.archive_next = next;
+        if resume_body {
+            if let Some(task) = self.tasks.last_mut() {
+                if let Operation::Wire(query) = &task.operation {
+                    task.operation = Operation::ResumeWire(query.clone());
+                }
+            }
         }
     }
     fn push(&mut self, task: Task) -> Result<()> {
@@ -2193,8 +2220,11 @@ impl Flow {
                                         .seq
                                         .checked_sub(1)
                                         .filter(|next| *next >= state.bounds.lo);
-                                    self.archive_wire_bytes =
-                                        self.archive_wire_bytes.saturating_add(saved.length);
+                                    if self.archive_counted_body != Some(saved.entry) {
+                                        self.archive_wire_bytes =
+                                            self.archive_wire_bytes.saturating_add(saved.length);
+                                        self.archive_counted_body = Some(saved.entry);
+                                    }
                                     self.push(Task {
                                         operation: Operation::Local(LocalStep::Entry {
                                             request: task.request,
@@ -2681,8 +2711,11 @@ impl Flow {
                             .ok_or(Error::Profile("archive state missing"))?;
                         if let Some(body) = &state.state().body {
                             self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
-                            self.archive_wire_bytes =
-                                self.archive_wire_bytes.saturating_add(body.length);
+                            if self.archive_counted_body != Some(body.entry) {
+                                self.archive_wire_bytes =
+                                    self.archive_wire_bytes.saturating_add(body.length);
+                                self.archive_counted_body = Some(body.entry);
+                            }
                             self.push(Task {
                                 request: wire_request,
                                 purpose: Purpose::History,

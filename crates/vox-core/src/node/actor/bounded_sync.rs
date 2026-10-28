@@ -3805,7 +3805,8 @@ impl Node {
                         .then(|| self.history_demand.take_ready(room, peer))
                         .flatten()
                     {
-                        Flow::archive(
+                        let interrupted_quantum = dispatch.interrupted_quantum;
+                        let mut flow = Flow::archive(
                             room,
                             peer,
                             node,
@@ -3822,7 +3823,11 @@ impl Node {
                             store.clone(),
                             Arc::clone(&self.history_budget),
                             actor_incarnation,
-                        )
+                        );
+                        if let Some((bytes, counted, next, resume_body)) = interrupted_quantum {
+                            flow.restore_interrupted_quantum(bytes, counted, next, resume_body);
+                        }
+                        flow
                     } else {
                         if page_only
                             || self.bounded_sync.ready[0].is_some()

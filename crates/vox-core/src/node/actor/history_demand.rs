@@ -28,6 +28,7 @@ pub(super) struct Dispatch {
     pub query: Query,
     pub staging: Staging,
     pub fence: Arc<Fence>,
+    pub interrupted_quantum: Option<(u64, Option<Digest32>, Option<u64>, bool)>,
     /// Set only after the actor checks the current connected donor's room membership.
     eligible: bool,
     /// A disconnected current member still owns a reconnect need.
@@ -2264,6 +2265,7 @@ fn prepare(
         audience: [0; 32],
         grant: generation,
     };
+    let mut interrupted_quantum = None;
     let mut answer = Prepared {
         node,
         room: weak,
@@ -2442,6 +2444,14 @@ fn prepare(
             && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq < state.bounds.lo))
         {
             return Err("This history interval has no remaining entries.".into());
+        }
+        if let Some(token) = interrupted {
+            interrupted_quantum = Some((
+                token.wire_bytes,
+                token.counted_body,
+                state.cursor.map(|cursor| cursor.next_seq),
+                state.body.is_some(),
+            ));
         }
         let head = room
             .history_head_by_id(store, &state.bounds.head)
@@ -2624,6 +2634,7 @@ fn prepare(
             active: Arc::new(StdMutex::new(active)),
         },
         fence,
+        interrupted_quantum,
         eligible: false,
         dial_eligible: false,
     });
