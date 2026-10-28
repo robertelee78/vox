@@ -260,6 +260,10 @@ pub enum Error {
     #[error("peer unreachable: {0}")]
     Unreachable(&'static str),
 
+    /// A history stream's physical QUIC connection closed while a frame was in flight.
+    #[error("history peer connection closed")]
+    HistoryConnectionClosed,
+
     /// Every rung of the ADR-012 ladder was tried and none landed, carrying **what each
     /// rung reported**.
     ///

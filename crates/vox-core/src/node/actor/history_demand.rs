@@ -28,6 +28,7 @@ pub(super) struct Dispatch {
     pub query: Query,
     pub staging: Staging,
     pub fence: Arc<Fence>,
+    pub interrupted_quantum: Option<(u64, Option<Digest32>, Option<u64>, bool)>,
     /// Set only after the actor checks the current connected donor's room membership.
     eligible: bool,
     /// A disconnected current member still owns a reconnect need.
@@ -67,6 +68,7 @@ struct Prepared {
     selection_after: Option<Option<Digest32>>,
     /// Sizing only. Classification owns no authority or durable mutation.
     resume_kind: Option<bool>,
+    interrupted_wait: Option<demand::RetiredPublicToken>,
 }
 
 /// A real follow-up failure cannot erase an activation which already committed. No driver is
@@ -126,6 +128,7 @@ struct ResumeOwed {
     wake_fence: Option<Arc<Fence>>,
     waiting_bytes: bool,
     private: Option<bool>,
+    interrupted: Option<demand::RetiredPublicToken>,
 }
 
 impl Drop for ResumeOwed {
@@ -203,6 +206,10 @@ impl Controller {
         .then_some((room, peer, instance, request, generation))
     }
 
+    pub(super) fn can_resume_interrupted(&self) -> bool {
+        self.preparing.is_none() && self.resume_owed.is_none() && self.private_work.is_none()
+    }
+
     fn clear_resume_owed(&mut self) {
         if let Some(mut owed) = self.resume_owed.take() {
             if let Some(task) = owed.wake_task.take() {
@@ -231,6 +238,35 @@ impl Controller {
             wake_fence: None,
             waiting_bytes: false,
             private: None,
+            interrupted: None,
+        });
+    }
+
+    pub(super) fn owe_interrupted_resume(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        token: demand::RetiredPublicToken,
+    ) {
+        self.clear_resume_owed();
+        if let Some(status) = self.owner_status.as_mut().filter(|status| {
+            status.room == room && status.instance == instance && status.request == Some(request)
+        }) {
+            status.phase = Phase::Pending;
+            status.detail =
+                "The interrupted history request is waiting for a connected member.".into();
+        }
+        self.resume_owed = Some(ResumeOwed {
+            room,
+            instance,
+            request,
+            ticket: None,
+            wake_task: None,
+            wake_fence: None,
+            waiting_bytes: false,
+            private: Some(false),
+            interrupted: Some(token),
         });
     }
 
@@ -393,6 +429,32 @@ impl Controller {
         }
         self.completed(request, generation, status);
         true
+    }
+    /// Publish the terminal checkpoint committed by this exact retired worker.
+    pub(super) fn complete_retired(
+        &mut self,
+        room: Digest32,
+        instance: [u8; 16],
+        request: RequestId,
+        generation: Digest32,
+    ) {
+        let Some(mut status) = self
+            .owner_status
+            .as_ref()
+            .filter(|status| {
+                status.room == room
+                    && status.instance == instance
+                    && status.request == Some(request)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        status.phase = Phase::Complete;
+        status.remaining = 0;
+        status.offset = 0;
+        status.detail = "This history interval is complete.".into();
+        self.completed_current(room, instance, request, generation, status);
     }
     /// A failed quantum leaves its durable request available for an explicit resume.
     pub(super) fn failed(&mut self, request: RequestId, generation: Digest32, detail: &str) {
@@ -862,7 +924,7 @@ impl Node {
             // A stale selector cannot cancel the exact accepted action already waiting here.
             return Err("The requested resume does not match the retained history request.".into());
         }
-        self.begin_history_demand_with_job(room, instance, action, None, None)
+        self.begin_history_demand_with_job(room, instance, action, None, None, None, None)
     }
 
     fn begin_history_demand_with_job(
@@ -872,6 +934,8 @@ impl Node {
         action: Action,
         admitted: Option<Job>,
         resume_private: Option<bool>,
+        interrupted: Option<demand::RetiredPublicToken>,
+        interrupted_room: Option<tokio::sync::OwnedMutexGuard<ChannelState>>,
     ) -> Result<Status, String> {
         self.accept_history_demand();
         if matches!(action, Action::Status) {
@@ -1052,6 +1116,7 @@ impl Node {
                         instance,
                         request,
                         resume_private,
+                        interrupted,
                         pressure,
                     ));
                 }
@@ -1111,7 +1176,17 @@ impl Node {
         let peers: Vec<_> = self
             .ports
             .keys()
-            .filter(|(r, p)| *r == room && *p != node && self.trust.is_trusted(p))
+            .filter(|(r, p)| {
+                *r == room
+                    && *p != node
+                    && self.trust.is_trusted(p)
+                    && (interrupted.is_none()
+                        || self
+                            .net
+                            .as_ref()
+                            .and_then(|net| net.manager().existing(p))
+                            .is_some_and(|conn| conn.quinn().close_reason().is_none()))
+            })
             .map(|(_, p)| *p)
             .collect();
         let connected_peers: std::collections::BTreeSet<_> = peers
@@ -1139,30 +1214,36 @@ impl Node {
         let weak = shared.as_ref().map(Arc::downgrade).unwrap_or_default();
         let now = self.now_ms().get();
         let local_cancel = matches!(action, Action::Cancel { .. });
+        let automatic_interrupted = interrupted.is_some();
         let task = tokio::spawn(async move {
             let work = async {
                 if let Some(prior) = prior_private { let _ = prior.task.await; }
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 let room_guard = if local_only || resume_inspect.is_some() { None } else {
                     let shared = shared.ok_or("room is not open")?;
-                    Some(tokio::select! {
-                        biased;
-                        () = worker_fence.retired() => return Err("history preparation cancelled".into()),
-                        guard = tokio::time::timeout_at(deadline, shared.lock_owned()) => guard.map_err(|_| "history room is busy".to_owned())?,
-                    })
+                    if automatic_interrupted {
+                        Some(interrupted_room.ok_or("interrupted history room ownership missing")?)
+                    } else {
+                        Some(tokio::select! {
+                            biased;
+                            () = worker_fence.retired() => return Err("history preparation cancelled".into()),
+                            guard = tokio::time::timeout_at(deadline, shared.lock_owned()) => guard.map_err(|_| "history room is busy".to_owned())?,
+                        })
+                    }
                 };
                 let read_fence = worker_fence.clone();
                 // Do not detach this read on cancellation: retire() awaits its bounded completion.
                 tokio::task::spawn_blocking(move || {
                     let _charge = preparation_scratch;
                     if read_fence.is_retired()
-                        || (!local_cancel && tokio::time::Instant::now() >= deadline)
+                        || (!automatic_interrupted && !local_cancel && tokio::time::Instant::now() >= deadline)
                     {
                         return Err("history preparation cancelled or expired".into());
                     }
                     let answer = match (room_guard, resume_inspect) {
                         (_, Some(credit)) => classify_resume(node, room, instance, action, context, credit),
-                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, connected_peers, weak, read_fence.clone(), now, deadline, selection_after, resume_admission),
+                        (Some(guard), None) => prepare(&guard, &store, node, instance, action, context, &job, peers, connected_peers, weak, read_fence.clone(), now, deadline, selection_after, resume_admission, interrupted),
+
                         (None, None) => prepare_local(
                             node,
                             room,
@@ -1178,7 +1259,7 @@ impl Node {
                     });
                     if !durable
                         && (read_fence.is_retired()
-                            || tokio::time::Instant::now() >= deadline)
+                            || (!automatic_interrupted && tokio::time::Instant::now() >= deadline))
                     {
                         return Err("history preparation cancelled or expired".into());
                     }
@@ -1239,6 +1320,7 @@ impl Node {
         instance: [u8; 16],
         request: RequestId,
         private: Option<bool>,
+        interrupted: Option<demand::RetiredPublicToken>,
         pressure: Box<BytePressure>,
     ) -> Status {
         self.history_demand.clear_resume_owed();
@@ -1286,6 +1368,7 @@ impl Node {
             wake_fence: Some(fence),
             waiting_bytes: true,
             private,
+            interrupted,
         });
         pending
     }
@@ -1308,9 +1391,83 @@ impl Node {
             return;
         }
         let Some(node) = self.profile.as_ref().map(|profile| profile.fingerprint()) else {
+            owed.ticket = None;
             self.history_demand.resume_owed = Some(owed);
             return;
         };
+        if owed.interrupted.is_some() {
+            let Some(shared) = self.channels.get(&owed.room).cloned() else {
+                owed.ticket = None;
+                self.history_demand.resume_owed = Some(owed);
+                return;
+            };
+            let room = match shared.try_lock() {
+                Ok(room) => room,
+                Err(_) => {
+                    // A room lock wait is not runnable Control work. Release its queued
+                    // ticket before waiting so it cannot pin other work at the FIFO head.
+                    owed.ticket = None;
+                    if let Some(task) = owed.wake_task.take() {
+                        task.abort();
+                    }
+                    if let Some(fence) = owed.wake_fence.take() {
+                        fence.retire();
+                    }
+                    if owed.wake_task.is_none() {
+                        let fence = Fence::new();
+                        let worker_fence = Arc::clone(&fence);
+                        let tx = self.net_tx.clone();
+                        let room_id = owed.room;
+                        let instance = owed.instance;
+                        let request = owed.request;
+                        let wait_room = Arc::clone(&shared);
+                        owed.wake_fence = Some(fence);
+                        owed.waiting_bytes = true;
+                        owed.wake_task = Some(tokio::spawn(async move {
+                            tokio::select! {
+                                biased;
+                                () = worker_fence.retired() => return,
+                                guard = wait_room.lock_owned() => drop(guard),
+                            }
+                            let _ = tx
+                                .send(NetEvent::HistoryResumeReady {
+                                    room: room_id,
+                                    instance,
+                                    request,
+                                    fence: worker_fence,
+                                })
+                                .await;
+                        }));
+                    }
+                    self.history_demand.resume_owed = Some(owed);
+                    return;
+                }
+            };
+            let connected = self.ports.keys().any(|(room_id, peer)| {
+                *room_id == owed.room
+                    && *peer != node
+                    && self.trust.is_trusted(peer)
+                    && room.history_inventory_incarnation(peer).is_some()
+                    && self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(peer))
+                        .is_some_and(|conn| conn.quinn().close_reason().is_none())
+            });
+            drop(room);
+            if !connected {
+                // A disconnected donor owns no runnable Control turn.
+                owed.ticket = None;
+                if let Some(task) = owed.wake_task.take() {
+                    task.abort();
+                }
+                if let Some(fence) = owed.wake_fence.take() {
+                    fence.retire();
+                }
+                self.history_demand.resume_owed = Some(owed);
+                return;
+            }
+        }
         if owed.ticket.is_none() {
             owed.ticket = Some(self.history_budget.enqueue(node, Lane::Control));
         }
@@ -1329,6 +1486,48 @@ impl Node {
             if let Some(fence) = owed.wake_fence.take() {
                 fence.retire();
             }
+            // Hold the exact room before creating a preparation owner; the earlier
+            // eligibility probe alone does not close the room-lock race.
+            let interrupted_room = if owed.interrupted.is_some() {
+                let Some(shared) = self.channels.get(&owed.room).cloned() else {
+                    drop(job);
+                    self.history_demand.resume_owed = Some(owed);
+                    return;
+                };
+                match shared.clone().try_lock_owned() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        drop(job);
+                        let fence = Fence::new();
+                        let worker_fence = Arc::clone(&fence);
+                        let tx = self.net_tx.clone();
+                        let room = owed.room;
+                        let instance = owed.instance;
+                        let request = owed.request;
+                        owed.wake_fence = Some(fence);
+                        owed.waiting_bytes = true;
+                        owed.wake_task = Some(tokio::spawn(async move {
+                            tokio::select! {
+                                biased;
+                                () = worker_fence.retired() => return,
+                                guard = shared.lock_owned() => drop(guard),
+                            }
+                            let _ = tx
+                                .send(NetEvent::HistoryResumeReady {
+                                    room,
+                                    instance,
+                                    request,
+                                    fence: worker_fence,
+                                })
+                                .await;
+                        }));
+                        self.history_demand.resume_owed = Some(owed);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let result = self.begin_history_demand_with_job(
                 owed.room,
                 owed.instance,
@@ -1337,6 +1536,8 @@ impl Node {
                 },
                 Some(job),
                 owed.private,
+                owed.interrupted,
+                interrupted_room,
             );
             if self.history_demand.preparing.is_none() && self.history_demand.resume_owed.is_none()
             {
@@ -1648,6 +1849,19 @@ impl Node {
                 }
             }
             Ok(prepared) => {
+                if let Some(token) = prepared.interrupted_wait {
+                    if self.history_demand.can_resume_interrupted() {
+                        if let Some(request) = prepared.status.request {
+                            self.history_demand.owe_interrupted_resume(
+                                target_room,
+                                target_instance,
+                                request,
+                                token,
+                            );
+                        }
+                    }
+                    return true;
+                }
                 if let Some(private) = prepared.resume_kind {
                     if let Some(request) = prepared.status.request {
                         self.history_demand.owner_status = Some(prepared.status);
@@ -1947,6 +2161,7 @@ fn prepare_local(
         local_boundary: LocalBoundary::Observed,
         selection_after: None,
         resume_kind: None,
+        interrupted_wait: None,
     };
     let (saved, mutation) = admission.inspect(&context).map_err(|e| e.to_string())?;
     let Some(saved) = saved else {
@@ -2052,6 +2267,7 @@ fn classify_resume(
         local_boundary: LocalBoundary::Observed,
         selection_after: None,
         resume_kind: Some(state.private.is_some()),
+        interrupted_wait: None,
     })
 }
 
@@ -2072,6 +2288,7 @@ fn prepare(
     deadline: tokio::time::Instant,
     selection_after: Option<Digest32>,
     mut resume_admission: Option<demand::ResumeAdmission>,
+    interrupted: Option<demand::RetiredPublicToken>,
 ) -> Result<Prepared, String> {
     let id = room.channel_id();
     if room.history_instance(store).map_err(|e| e.to_string())? != instance
@@ -2090,6 +2307,7 @@ fn prepare(
         audience: [0; 32],
         grant: generation,
     };
+    let mut interrupted_quantum = None;
     let mut answer = Prepared {
         node,
         room: weak,
@@ -2104,6 +2322,7 @@ fn prepare(
         local_boundary: LocalBoundary::Observed,
         selection_after: None,
         resume_kind: None,
+        interrupted_wait: None,
     };
     let mut saved = match resume_admission.as_mut() {
         Some(admission) => admission.inspect(&context),
@@ -2192,6 +2411,9 @@ fn prepare(
     // Public pages prefer an already connected peer; private and legacy selection above
     // keep their own donor contracts.
     peers.sort_by_key(|peer| !connected_peers.contains(peer));
+    if interrupted.is_some() {
+        peers.retain(|peer| connected_peers.contains(peer));
+    }
     // This immutable room snapshot determines whether activation must be followed by
     // a durable pause. Reserve that follow-up before start/resume can commit an Active;
     // cached/no-selection paths never acquire an unnecessary pause credit.
@@ -2231,10 +2453,47 @@ fn prepare(
                 "The requested resume does not match the saved history request.".into();
             return Ok(answer);
         }
+        if interrupted
+            .as_ref()
+            .is_some_and(|token| !token.matches_state(&context, state, binding))
+        {
+            return Err("The interrupted history owner changed before continuation.".into());
+        }
+        if interrupted.is_some()
+            && (state.stored_progress() != demand::Progress::Pending || state.reclaiming())
+        {
+            // A committed result or pending local cleanup wins over automatic continuation.
+            answer.status.phase = match state.stored_progress() {
+                demand::Progress::Pending | demand::Progress::Paused => Phase::Paused,
+                demand::Progress::More => Phase::More,
+                demand::Progress::Unavailable => Phase::Unavailable,
+                demand::Progress::Complete => Phase::Complete,
+                demand::Progress::Cancelled => Phase::Cancelled,
+            };
+            return Ok(answer);
+        }
+        if peer.is_none() {
+            if let Some(token) = interrupted {
+                answer.status.phase = Phase::Pending;
+                answer.status.request = Some(request);
+                answer.status.detail =
+                    "The interrupted history request is waiting for a connected member.".into();
+                answer.interrupted_wait = Some(token);
+                return Ok(answer);
+            }
+        }
         if state.body.is_none()
             && (state.remaining == 0 || state.cursor.is_some_and(|c| c.next_seq < state.bounds.lo))
         {
             return Err("This history interval has no remaining entries.".into());
+        }
+        if let Some(token) = interrupted {
+            interrupted_quantum = Some((
+                token.wire_bytes,
+                token.counted_body,
+                state.cursor.map(|cursor| cursor.next_seq),
+                state.body.is_some(),
+            ));
         }
         let head = room
             .history_head_by_id(store, &state.bounds.head)
@@ -2267,8 +2526,45 @@ fn prepare(
         let admission = resume_admission
             .as_ref()
             .ok_or("History Resume admission is missing.")?;
-        let active = demand::resume_precharged(&context, request, binding, admission.mutation())
-            .map_err(|error| error.to_string())?;
+        let active = if let Some(token) = interrupted.as_ref() {
+            match demand::resume_interrupted_pending_precharged(
+                &context,
+                request,
+                binding,
+                token,
+                admission.mutation(),
+            )
+            .map_err(|error| error.to_string())?
+            {
+                demand::InterruptedActivation::Resumed(active) => active,
+                demand::InterruptedActivation::Finished {
+                    progress,
+                    remaining,
+                    offset,
+                    reclaiming,
+                } => {
+                    answer.status.phase = match progress {
+                        demand::Progress::Pending | demand::Progress::Paused => Phase::Paused,
+                        demand::Progress::More => Phase::More,
+                        demand::Progress::Unavailable => Phase::Unavailable,
+                        demand::Progress::Complete => Phase::Complete,
+                        demand::Progress::Cancelled => Phase::Cancelled,
+                    };
+                    answer.status.remaining = remaining;
+                    answer.status.offset = offset;
+                    answer.status.detail = if reclaiming {
+                        "Provisional history cleanup is pending."
+                    } else {
+                        "The saved history result changed before automatic continuation."
+                    }
+                    .into();
+                    return Ok(answer);
+                }
+            }
+        } else {
+            demand::resume_precharged(&context, request, binding, admission.mutation())
+                .map_err(|error| error.to_string())?
+        };
         (
             state.bounds,
             head.binding.author,
@@ -2380,6 +2676,7 @@ fn prepare(
             active: Arc::new(StdMutex::new(active)),
         },
         fence,
+        interrupted_quantum,
         eligible: false,
         dial_eligible: false,
     });

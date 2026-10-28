@@ -1436,6 +1436,8 @@ pub enum Fault {
     PostSelectionChanged,
     /// A prior local room change/open still owes its checked publication; no new write began.
     RoomChangePending,
+    /// Trust was removed durably, but at least one room still needs its withdrawal completed.
+    TrustRemovalIncomplete,
     /// This node already has its bounded number of posts waiting to enter the actor.
     PostBusy,
     /// One admin removal is already being applied over bounded actor turns.
@@ -1696,6 +1698,9 @@ impl Fault {
             Fault::RoomChangePending => {
                 "a previous change to this room is still being applied; this request made no change\n       wait for its answer before changing the room again"
             }
+            Fault::TrustRemovalIncomplete => {
+                "trust was removed, but at least one room could not finish its withdrawal; its saved work remains pending\n       restart the node to finish narrowing before using that room"
+            }
             Fault::PostBusy => {
                 "this node already has too many posts waiting; this message was not posted\n       wait for those posts to finish, then try again"
             }
@@ -1933,6 +1938,7 @@ fault_names!(
     ReadSelectionChanged,
     PostSelectionChanged,
     RoomChangePending,
+    TrustRemovalIncomplete,
     PostBusy,
     AdminChangePending,
     SessionCleanupBusy,

@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::node::history_budget::Job;
 use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
-use crate::transport::streams::{open_typed, StreamKind};
+use crate::transport::streams::StreamKind;
 use crate::wire::WireError;
 
 use super::client::{Received, Receiver};
@@ -31,7 +31,11 @@ pub(crate) async fn exchange(
     let streams = tokio::select! {
         biased;
         () = fence.retired() => return Err(Error::Unreachable("history opening cancelled")),
-        result = tokio::time::timeout_at(deadline, open_typed(conn, StreamKind::Sync)) => {
+        result = tokio::time::timeout_at(deadline, async {
+            let (mut send, recv) = conn.open_history_stream().await?;
+            crate::transport::framing::write_history_frame(&mut send, &StreamKind::Sync.frame()).await?;
+            Ok::<_, Error>((send, recv))
+        }) => {
             result.map_err(|_| Error::Unreachable("history opening deadline elapsed"))??
         }
     };

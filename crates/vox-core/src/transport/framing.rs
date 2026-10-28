@@ -23,6 +23,25 @@ pub async fn write_frame(send: &mut SendStream, frame: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// History needs to distinguish an actual QUIC connection loss from a reset or short write.
+pub(crate) async fn write_history_frame(send: &mut SendStream, frame: &[u8]) -> Result<()> {
+    let len = u32::try_from(frame.len())
+        .map_err(|_| Error::SizeLimitExceeded("quic stream frame length"))?;
+    send.write_all(&len.to_be_bytes())
+        .await
+        .map_err(history_write_failure)?;
+    send.write_all(frame).await.map_err(history_write_failure)?;
+    Ok(())
+}
+
+fn history_write_failure(error: quinn::WriteError) -> Error {
+    if matches!(&error, quinn::WriteError::ConnectionLost(_)) {
+        Error::HistoryConnectionClosed
+    } else {
+        write_failure(error)
+    }
+}
+
 /// A stream the peer **reset or stopped with a coded reason** refused on purpose and said why;
 /// anything else went away with nothing said (#202). Reading the code is what lets the initiator
 /// of a sync tell a collision the peer refused from a path that died.

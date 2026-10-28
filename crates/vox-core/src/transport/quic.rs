@@ -2295,6 +2295,17 @@ impl VoxConnection {
         }
     }
 
+    /// Open a history stream while preserving the physical connection-loss cause.
+    pub(crate) async fn open_history_stream(&self) -> Result<(SendStream, RecvStream)> {
+        match tokio::time::timeout(OPEN_STREAM_PATIENCE, self.connection.open_bi()).await {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(_)) => Err(Error::HistoryConnectionClosed),
+            Err(_) => Err(Error::Unreachable(
+                "quic stream: the peer granted no stream in time",
+            )),
+        }
+    }
+
     /// Accept the next inbound bidirectional stream the peer opened.
     pub async fn accept_stream(&self) -> Result<(SendStream, RecvStream)> {
         self.connection

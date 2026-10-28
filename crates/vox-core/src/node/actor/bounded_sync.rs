@@ -459,9 +459,16 @@ pub(super) async fn erase_retired_node(ledger: &Arc<RetirementLedger>, node: Dig
 struct ReturnedFailure {
     text: String,
     classification: crate::node::channel::SyncFailure,
+    connection_closed: bool,
+    retired_by_fence: bool,
 }
 impl ReturnedFailure {
     fn from_error(error: Error) -> Self {
+        let connection_closed = matches!(&error, Error::HistoryConnectionClosed);
+        let retired_by_fence = matches!(
+            &error,
+            Error::Unreachable("history request cancelled" | "history opening cancelled")
+        );
         let text = error.to_string();
         let classification = match error {
             Error::PeerRefused(code) => crate::node::channel::SyncFailure::Session(
@@ -472,6 +479,8 @@ impl ReturnedFailure {
         Self {
             text,
             classification,
+            connection_closed,
+            retired_by_fence,
         }
     }
 
@@ -479,6 +488,8 @@ impl ReturnedFailure {
         Self {
             classification: crate::node::channel::SyncFailure::Unreachable(text.clone()),
             text,
+            connection_closed: false,
+            retired_by_fence: false,
         }
     }
 
@@ -486,6 +497,8 @@ impl ReturnedFailure {
         Self {
             text: format!("bounded history worker panicked: {panic}"),
             classification: crate::node::channel::SyncFailure::Panicked,
+            connection_closed: false,
+            retired_by_fence: false,
         }
     }
 
@@ -500,10 +513,25 @@ impl ReturnedFailure {
 }
 struct Returned {
     failure: Option<ReturnedFailure>,
+    /// A failed physical worker observed closure of the exact connection it used.
+    connection_closed: Option<u64>,
+}
+
+struct InterruptedArchive {
+    room: Digest32,
+    instance: [u8; 16],
+    request: stream::RequestId,
+    generation: Digest32,
+    fence: Arc<crate::transport::stream_transport::Fence>,
+    room_ref: std::sync::Weak<tokio::sync::Mutex<crate::node::channel::ChannelState>>,
+    token: crate::node::history_demand::RetiredPublicToken,
+    completed: bool,
 }
 struct Running {
     room: Digest32,
     peer: Digest32,
+    connection_serial: u64,
+    connection_closed: bool,
     token: u64,
     generation: u64,
     request: u64,
@@ -684,6 +712,8 @@ pub(super) struct Controller {
     body_slots: Arc<stream::runtime::BodySlots>,
     required: VecDeque<RequiredOwner>,
     retiring: VecDeque<Flow>,
+    interrupted_retiring: BTreeMap<RetirementKey, InterruptedArchive>,
+    interrupted_ready: VecDeque<InterruptedArchive>,
     cleanup: Option<Cleanup>,
     retirement_waiting: BTreeMap<RetirementKey, RetirementWaiting>,
     retirement_failed: std::collections::BTreeSet<RetirementKey>,
@@ -761,6 +791,13 @@ impl Drop for Controller {
 }
 
 impl Controller {
+    pub(super) fn note_archive_connection_closed(&mut self, peer: Digest32, serial: u64) {
+        for work in self.running.iter_mut().flatten() {
+            if work.peer == peer && work.connection_serial == serial && work.archive.is_some() {
+                work.connection_closed = true;
+            }
+        }
+    }
     pub(super) fn set_completion_wake(&mut self, wake: Arc<tokio::sync::Notify>) {
         self.completion_wake = wake;
     }
@@ -1294,6 +1331,10 @@ impl Controller {
                 self.retirement_waiting.remove(&key);
                 self.retirement_failed.remove(&key);
                 clear_retirement_error(&self.retirement_ledger, key);
+                if let Some(mut interrupted) = self.interrupted_retiring.remove(&key) {
+                    interrupted.completed = flow.retired_archive_complete;
+                    self.interrupted_ready.push_back(interrupted);
+                }
             }
             Ok(RetirementStep::Progress) => self.retiring.push_back(flow),
             Ok(RetirementStep::Wait(wait)) => {
@@ -1638,6 +1679,19 @@ impl Controller {
             .as_ref()
             .filter(|admission| admission.room == room && admission.peer == peer)
             .map(|admission| (admission.request, admission.generation, admission.instance))
+    }
+
+    pub(super) fn archive_is_running(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        request: stream::RequestId,
+    ) -> bool {
+        self.running.iter().flatten().any(|work| {
+            work.room == room
+                && work.peer == peer
+                && work.archive.is_some_and(|archive| archive.0 == request)
+        })
     }
 
     pub(super) fn retire_port(&mut self, room: Digest32, peer: Digest32) {
@@ -2241,8 +2295,114 @@ impl Node {
         self.bounded_sync.poll_cleanup();
     }
 
+    /// A close can arrive after a worker returned and before its next turn starts.
+    /// The parked flow still owns the exact request and must retire before it resumes.
+    pub(super) fn retire_parked_closed_archive(&mut self, peer: Digest32, serial: u64) {
+        let matches = self.bounded_sync.ready[1].as_ref().is_some_and(|flow| {
+            flow.started_connection == Some((peer, serial))
+                && flow.archive_status.is_none()
+                && self
+                    .channels
+                    .get(&flow.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+                && flow
+                    .archive_request
+                    .zip(flow.request_fence.as_ref())
+                    .is_some_and(|(request, fence)| {
+                        self.history_demand
+                            .owns_running_fence(request, flow.generation, fence)
+                    })
+                && flow.interrupted_public_token().is_some()
+        });
+        if !matches {
+            return;
+        }
+        let Some(flow) = self.bounded_sync.ready[1].take() else {
+            return;
+        };
+        let (Some(request), Some(token), Some(fence)) = (
+            flow.archive_request,
+            flow.interrupted_public_token(),
+            flow.request_fence.as_ref(),
+        ) else {
+            self.bounded_sync.ready[1] = Some(flow);
+            return;
+        };
+        let key = retirement_key(&flow);
+        self.bounded_sync.interrupted_retiring.insert(
+            key,
+            InterruptedArchive {
+                room: flow.room,
+                instance: flow.instance,
+                request,
+                generation: flow.generation,
+                fence: Arc::clone(fence),
+                room_ref: Arc::downgrade(&flow.shared),
+                token,
+                completed: false,
+            },
+        );
+        self.dispose_rearming_hint(flow);
+    }
+
     pub(super) fn accept_bounded_sync(&mut self) {
         self.bounded_sync.poll_cleanup();
+        while let Some(interrupted) = self.bounded_sync.interrupted_ready.pop_front() {
+            let same_room = interrupted.room_ref.upgrade().is_some_and(|old| {
+                self.channels
+                    .get(&interrupted.room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &old))
+            });
+            if !same_room {
+                if self.history_demand.owns_running_fence(
+                    interrupted.request,
+                    interrupted.generation,
+                    &interrupted.fence,
+                ) {
+                    self.history_demand.failed_current(interrupted.room, interrupted.instance, interrupted.request, interrupted.generation, "The room changed while history was retiring; resume the saved request in the current room.");
+                }
+                continue;
+            }
+            if same_room
+                && interrupted.completed
+                && self.history_demand.owns_running_fence(
+                    interrupted.request,
+                    interrupted.generation,
+                    &interrupted.fence,
+                )
+            {
+                self.history_demand.complete_retired(
+                    interrupted.room,
+                    interrupted.instance,
+                    interrupted.request,
+                    interrupted.generation,
+                );
+                continue;
+            }
+            if same_room
+                && self.history_demand.can_resume_interrupted()
+                && self.history_demand.owns_running_fence(
+                    interrupted.request,
+                    interrupted.generation,
+                    &interrupted.fence,
+                )
+                && self.history_demand.failed_current(
+                    interrupted.room,
+                    interrupted.instance,
+                    interrupted.request,
+                    interrupted.generation,
+                    "The history connection closed; retaining this request.",
+                )
+            {
+                self.history_demand.owe_interrupted_resume(
+                    interrupted.room,
+                    interrupted.instance,
+                    interrupted.request,
+                    interrupted.token,
+                );
+                self.retry_owed_history_resume();
+            }
+        }
         for index in 0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS {
             let Some(work) = self.bounded_sync.running[index].as_ref() else {
                 continue;
@@ -2502,6 +2662,102 @@ impl Node {
                 eprintln!("vox: {error}");
                 continue;
             }
+            if flow.published
+                && self
+                    .channels
+                    .get(&work.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            {
+                flow.published = false;
+                // Ordinary content publication has no governance work. The history worker's
+                // signed-kind result names the causal control publication that does.
+                if flow.governance {
+                    self.governance_work.wake_room(work.room);
+                }
+                self.sched_rooms.insert(work.room);
+                // A bounded publication may have made an addressed key-package durable. Its
+                // catalog is authoritative even when the best-effort presentation event below
+                // cannot fit in the actor queue, so make package installation runnable here.
+                // A turn that finds no package is bounded and clears the room again; a crash
+                // between publication and this mark is recovered by the room-open scan.
+                self.key_package_rooms.entry(work.room).or_insert(false);
+                let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
+                    channel_id: work.room,
+                    rendered: flow.rendered,
+                    governance: flow.governance,
+                });
+                flow.rendered = false;
+                flow.governance = false;
+                // A required control finished: the archive's next local slice can recheck its
+                // exact dependency. No archive wire request is created by this wake.
+                if let Some(flow) = self.bounded_sync.ready[1].as_mut() {
+                    flow.waiting = false;
+                    self.sched_rooms.insert(flow.room);
+                }
+            }
+            let closure_eligible = returned
+                .failure
+                .as_ref()
+                .is_none_or(|failure| failure.connection_closed || failure.retired_by_fence);
+            let closed_connection = closure_eligible
+                .then(|| {
+                    returned
+                        .connection_closed
+                        .or_else(|| work.connection_closed.then_some(work.connection_serial))
+                })
+                .flatten();
+            // A durable result from this exact worker wins even if its connection closed
+            // immediately afterwards. A newer request must never inherit this result.
+            if closed_connection.is_some() && flow.archive_status.is_some() {
+                if let Some(request) = flow.archive_request {
+                    if self
+                        .history_demand
+                        .owns_running_fence(request, flow.generation, &work.fence)
+                    {
+                        self.settle_archive_exit(
+                            &mut flow,
+                            "The history connection closed after a saved result.",
+                        );
+                    }
+                }
+                self.dispose_rearming_hint(flow);
+                continue;
+            }
+            // A physical connection loss may interrupt an accepted public quantum. Keep its
+            // original owner until the worker and its local retirement have both finished.
+            if closed_connection.is_some()
+                && flow.archive_status.is_none()
+                && self
+                    .channels
+                    .get(&work.room)
+                    .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            {
+                if let (Some(request), Some(token)) =
+                    (flow.archive_request, flow.interrupted_public_token())
+                {
+                    if self
+                        .history_demand
+                        .owns_running_fence(request, flow.generation, &work.fence)
+                    {
+                        let key = retirement_key(&flow);
+                        self.bounded_sync.interrupted_retiring.insert(
+                            key,
+                            InterruptedArchive {
+                                room: flow.room,
+                                instance: flow.instance,
+                                request,
+                                generation: flow.generation,
+                                fence: Arc::clone(&work.fence),
+                                room_ref: Arc::downgrade(&flow.shared),
+                                token,
+                                completed: false,
+                            },
+                        );
+                        self.dispose_rearming_hint(flow);
+                        continue;
+                    }
+                }
+            }
             if !valid {
                 let failure = returned.failure.as_ref().map_or(
                     "History round ended before completion; resume the saved request explicitly.",
@@ -2546,34 +2802,6 @@ impl Node {
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                     channel_id: work.room,
                 });
-            }
-            if flow.published {
-                flow.published = false;
-                // Ordinary content publication has no governance work. The history worker's
-                // signed-kind result names the causal control publication that does.
-                if flow.governance {
-                    self.governance_work.wake_room(work.room);
-                }
-                self.sched_rooms.insert(work.room);
-                // A bounded publication may have made an addressed key-package durable. Its
-                // catalog is authoritative even when the best-effort presentation event below
-                // cannot fit in the actor queue, so make package installation runnable here.
-                // A turn that finds no package is bounded and clears the room again; a crash
-                // between publication and this mark is recovered by the room-open scan.
-                self.key_package_rooms.entry(work.room).or_insert(false);
-                let _ = self.net_tx.try_send(NetEvent::BoundedRoomAdvanced {
-                    channel_id: work.room,
-                    rendered: flow.rendered,
-                    governance: flow.governance,
-                });
-                flow.rendered = false;
-                flow.governance = false;
-                // A required control finished: the archive's next local slice can recheck its
-                // exact dependency. No archive wire request is created by this wake.
-                if let Some(flow) = self.bounded_sync.ready[1].as_mut() {
-                    flow.waiting = false;
-                    self.sched_rooms.insert(flow.room);
-                }
             }
             if let Some((head, seq)) = flow.external.take() {
                 let need = RequiredOwner {
@@ -3587,7 +3815,8 @@ impl Node {
                         .then(|| self.history_demand.take_ready(room, peer))
                         .flatten()
                     {
-                        Flow::archive(
+                        let interrupted_quantum = dispatch.interrupted_quantum;
+                        let mut flow = Flow::archive(
                             room,
                             peer,
                             node,
@@ -3604,7 +3833,11 @@ impl Node {
                             store.clone(),
                             Arc::clone(&self.history_budget),
                             actor_incarnation,
-                        )
+                        );
+                        if let Some((bytes, counted, next, resume_body)) = interrupted_quantum {
+                            flow.restore_interrupted_quantum(bytes, counted, next, resume_body);
+                        }
+                        flow
                     } else {
                         if page_only
                             || self.bounded_sync.ready[0].is_some()
@@ -4105,6 +4338,7 @@ impl Node {
         // A key to this peer waiting on its bundle makes this round read the peer's board,
         // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.
         flow.wants_board = self.key_waiting.contains_key(&(room, peer));
+        flow.started_connection = Some((peer, conn.serial()));
         let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
         let worker_flow = Arc::clone(&flow);
@@ -4119,6 +4353,8 @@ impl Node {
         let pstore = profile.store_handle();
         let tx = self.net_tx.clone();
         let authority = self.computer_authority();
+        let result_connection = Arc::clone(&conn);
+        let connection_serial = conn.serial();
         let worker = tokio::spawn(async move {
             let _slot = slot;
             #[cfg(not(feature = "test-knobs"))]
@@ -4185,14 +4421,23 @@ impl Node {
             if let Some(flow) = settlement_flow.lock().await.as_mut() {
                 flow.park();
             }
+            let connection_closed = result_connection
+                .quinn()
+                .close_reason()
+                .map(|_| connection_serial);
             if let Ok(mut result) = output.lock() {
-                *result = Some(Returned { failure });
+                *result = Some(Returned {
+                    failure,
+                    connection_closed,
+                });
             }
             completion_wake.notify_one();
         });
         self.bounded_sync.running[index] = Some(Running {
             room,
             peer,
+            connection_serial,
+            connection_closed: false,
             token,
             generation,
             request,

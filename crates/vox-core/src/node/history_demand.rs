@@ -290,6 +290,9 @@ pub struct State {
 }
 
 impl State {
+    pub(crate) fn stored_progress(&self) -> Progress {
+        self.progress
+    }
     /// A retained operation is always paused without a live handle from explicit local demand.
     pub fn progress(&self, active: Option<&Active>) -> Progress {
         if self.progress.terminal() || active.is_some_and(|a| a.matches(self)) {
@@ -887,6 +890,113 @@ pub(crate) fn resume_precharged(
     })
 }
 
+/// Identity only: retaining this token does not retain the old Context, its key, or its
+/// secret-work lease. The caller may capture it only from the exact returned Flow it owns.
+#[derive(Clone, Copy)]
+pub(crate) struct RetiredPublicToken {
+    node: Digest32,
+    scope: Digest32,
+    request: RequestId,
+    serial: u64,
+    binding: Binding,
+    pub(crate) wire_bytes: u64,
+    pub(crate) counted_body: Option<Digest32>,
+}
+impl RetiredPublicToken {
+    pub(crate) fn matches_state(&self, context: &Context, state: &State, binding: Binding) -> bool {
+        self.node == context.fingerprint()
+            && self.scope == scope(context)
+            && self.request == state.request
+            && self.serial == state.serial
+            && self.binding == binding
+            && state.binding == binding
+            && state.private.is_none()
+            && state.legacy.is_none()
+            && binding.audience == [0; 32]
+    }
+}
+impl Active {
+    pub(crate) fn retired_public_token(&self) -> RetiredPublicToken {
+        RetiredPublicToken {
+            node: self.node,
+            scope: self.scope,
+            request: self.request,
+            serial: self.serial,
+            binding: self.binding,
+            wire_bytes: 0,
+            counted_body: None,
+        }
+    }
+}
+
+/// Result of observing a retired automatic quantum at the activation boundary.
+pub(crate) enum InterruptedActivation {
+    /// The exact interrupted Pending quantum has been reactivated.
+    Resumed(Active),
+    /// A different durable outcome won; it must be shown without starting another quantum.
+    Finished {
+        progress: Progress,
+        remaining: usize,
+        offset: u64,
+        reclaiming: bool,
+    },
+}
+
+/// Reacquire only the interrupted public Pending quantum. Unlike an explicit Resume, this
+/// cannot turn a committed More or Paused state into another user's unrequested quantum.
+/// Caller owns the exact retired Flow and must fence its room/request lifecycle separately.
+pub(crate) fn resume_interrupted_pending_precharged(
+    context: &Context,
+    request: RequestId,
+    binding: Binding,
+    retired: &RetiredPublicToken,
+    _admission: &AdmissionCharge,
+) -> Result<InterruptedActivation> {
+    let key = key(context)?;
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    authorize_in(&batch, context, binding)?;
+    let mut state = load(&batch, key, &scope)?.ok_or_else(|| invalid("no history demand"))?;
+    if state.request != request
+        || state.binding != binding
+        || retired.node != context.fingerprint()
+        || retired.scope != scope
+        || retired.request != request
+        || retired.binding != binding
+        || retired.serial != state.serial
+        || state.private.is_some()
+        || state.legacy.is_some()
+        || binding.audience != [0; 32]
+    {
+        return Err(invalid("interrupted history owner changed"));
+    }
+    context.check()?;
+    if state.progress != Progress::Pending || state.cleanup.is_some() {
+        return Ok(InterruptedActivation::Finished {
+            progress: state.progress,
+            remaining: state.remaining,
+            offset: state.body.as_ref().map_or_else(
+                || state.cursor.map_or(0, |cursor| cursor.offset),
+                |body| body.offset,
+            ),
+            reclaiming: state.reclaiming(),
+        });
+    }
+    state.serial = next_serial(state.serial)?;
+    put(&mut batch, key, &scope, &state)?;
+    context.check()?;
+    batch.commit()?;
+    Ok(InterruptedActivation::Resumed(Active {
+        node: context.fingerprint(),
+        scope,
+        request,
+        serial: state.serial,
+        valid: true,
+        binding,
+        cancellation: context.cancellation(),
+    }))
+}
+
 /// Reconstruct deletion ownership after a crash, never a live admission capability.
 pub(crate) fn own_recovery_cleanup(context: &Context, state: &State) -> Result<Active> {
     if context.slot != Slot::OwnRecovery || state.scope != context.scope {
@@ -1203,7 +1313,33 @@ pub(crate) fn entry_admitted(
     {
         return Err(invalid("history entry is incomplete or changed"));
     }
+    let admitted_seq = state.body.as_ref().ok_or_else(bad)?.seq;
     schedule_cleanup(&mut state);
+    // The admitted body and its cursor disappear together. Preserve the next exact
+    // position in the same transaction, so retirement or a restart cannot replay
+    // the original upper bound after publication.
+    if context.slot == Slot::Archive
+        && state.private.is_none()
+        && state.legacy.is_none()
+        && state.binding.audience == [0; 32]
+        && state.remaining > 0
+    {
+        if let Some(next_seq) = admitted_seq
+            .checked_sub(1)
+            .filter(|next| *next >= state.bounds.lo)
+        {
+            state.cursor = Some(Cursor {
+                query_kind: 4,
+                next_seq,
+                entry: None,
+                offset: 0,
+            });
+        } else {
+            // The authenticated lower bound was admitted; unused entry credit is
+            // not evidence that another entry exists outside this interval.
+            state.remaining = 0;
+        }
+    }
     put(batch, key, &scope, &state)
 }
 
@@ -1607,6 +1743,53 @@ pub(crate) fn reclaim_precharged(
     put(&mut batch, key, &scope, &state)?;
     commit_context(batch, context)?;
     Ok(state.cleanup.is_none())
+}
+
+/// Finish only already-admitted page reclamation for an interrupted public request.
+/// The exact activation identity prevents an old owner touching a replacement. This
+/// does not cancel the request or discard any unfinished body.
+pub(crate) fn retire_admitted_cleanup(
+    context: &Context,
+    active: &Active,
+    _admission: &AdmissionCharge,
+    committed: &std::sync::atomic::AtomicBool,
+) -> Result<(bool, bool)> {
+    let scope = scope(context);
+    let mut batch = context.store().batch()?;
+    let Some(mut state) = load(&batch, &context.key, &scope)? else {
+        return Ok((true, false));
+    };
+    if active.node != context.node
+        || active.scope != scope
+        || state.request != active.request
+        || state.binding != active.binding
+        || state.serial != active.serial
+    {
+        return Ok((true, false));
+    }
+    if let Some(mut cleanup) = state.cleanup {
+        let end = cleanup.last.min(cleanup.next + RECLAIM_ROWS - 1);
+        for page in cleanup.next..=end {
+            batch.delete_segment(&scope, KIND, page)?;
+        }
+        cleanup.next = end + 1;
+        state.cleanup = (cleanup.next <= cleanup.last).then_some(cleanup);
+    }
+    if state.cleanup.is_none()
+        && state.body.is_none()
+        && state.remaining == 0
+        && state.progress == Progress::Pending
+    {
+        state.cursor = None;
+        state.progress = Progress::Complete;
+    }
+    put(&mut batch, &context.key, &scope, &state)?;
+    batch.commit()?;
+    committed.store(true, std::sync::atomic::Ordering::Release);
+    Ok((
+        state.cleanup.is_none(),
+        state.progress == Progress::Complete,
+    ))
 }
 
 /// Retirement deletion only. The room owner first holds the room mutex and verifies its

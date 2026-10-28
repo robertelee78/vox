@@ -188,6 +188,9 @@ pub(crate) struct Flow {
     pub(crate) wants_board: bool,
     departure_probe: bool,
     pub(crate) archive_request: Option<RequestId>,
+    /// Physical connection used by the most recent worker turn.
+    pub(crate) started_connection: Option<(Digest32, u64)>,
+    pub(crate) retired_archive_complete: bool,
     /// Exact required control root removed from the actor queue when this foreground flow was
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
@@ -310,6 +313,7 @@ pub(crate) struct Flow {
     history: Option<Staging>,
     /// Body bytes this explicit history quantum has fetched so far (ADR-036: one bounded ask).
     archive_wire_bytes: u64,
+    archive_counted_body: Option<Digest32>,
     archive_next: Option<u64>,
     pub(crate) request_fence: Option<Arc<Fence>>,
     initialized: bool,
@@ -349,6 +353,21 @@ pub(crate) enum Resumed {
 }
 
 impl Flow {
+    /// Capture only scalar identity from the returned public archive owner. No context or key
+    /// survives this snapshot; physical retirement still owns all cleanup.
+    pub(crate) fn interrupted_public_token(&self) -> Option<demand::RetiredPublicToken> {
+        if !self.archive || self.automatic_own_recovery {
+            return None;
+        }
+        let staging = self.history.as_ref()?;
+        let active = staging.active.try_lock().ok()?;
+        (Some(active.request()) == self.archive_request).then(|| {
+            let mut token = active.retired_public_token();
+            token.wire_bytes = self.archive_wire_bytes;
+            token.counted_body = self.archive_counted_body;
+            token
+        })
+    }
     pub(crate) fn local_own_root(&self) -> bool {
         self.local_own_verification || self.local_own_discovery
     }
@@ -428,6 +447,8 @@ impl Flow {
             wants_board: false,
             departure_probe,
             archive_request: None,
+            started_connection: None,
+            retired_archive_complete: false,
             required_root: required,
             state_charge: None,
             hint,
@@ -491,6 +512,7 @@ impl Flow {
             control: None,
             history: None,
             archive_wire_bytes: 0,
+            archive_counted_body: None,
             archive_next: None,
             request_fence: None,
             initialized: false,
@@ -597,6 +619,8 @@ impl Flow {
             wants_board: false,
             departure_probe: false,
             archive_request: Some(request),
+            started_connection: None,
+            retired_archive_complete: false,
             required_root: None,
             state_charge: None,
             hint: None,
@@ -668,12 +692,32 @@ impl Flow {
             control: None,
             history: Some(staging),
             archive_wire_bytes: 0,
+            archive_counted_body: None,
             archive_next: None,
             request_fence: Some(fence),
             initialized: true,
             live_unavailable: None,
             live_visited: false,
             control_head: None,
+        }
+    }
+    /// Restore only the interrupted quantum's already-consumed credit and exact cursor.
+    pub(crate) fn restore_interrupted_quantum(
+        &mut self,
+        bytes: u64,
+        counted: Option<Digest32>,
+        next: Option<u64>,
+        resume_body: bool,
+    ) {
+        self.archive_wire_bytes = bytes;
+        self.archive_counted_body = counted;
+        self.archive_next = next;
+        if resume_body {
+            if let Some(task) = self.tasks.last_mut() {
+                if let Operation::Wire(query) = &task.operation {
+                    task.operation = Operation::ResumeWire(query.clone());
+                }
+            }
         }
     }
     fn push(&mut self, task: Task) -> Result<()> {
@@ -1125,11 +1169,17 @@ impl Flow {
             .tasks
             .iter()
             .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::Control)));
+        let preserve_public = self.archive && !self.automatic_own_recovery;
         let staging = if reclaim_live && self.live.is_some() {
             self.live.clone().map(|stage| (Purpose::Live, stage))
         } else if reclaim_control && self.control.is_some() {
             self.control.clone().map(|stage| (Purpose::Control, stage))
-        } else if self.automatic_own_recovery {
+        } else if self.automatic_own_recovery
+            || self
+                .tasks
+                .iter()
+                .any(|task| matches!(task.operation, Operation::Reclaim(Purpose::History)))
+        {
             self.history.clone().map(|stage| (Purpose::History, stage))
         } else {
             None
@@ -1175,7 +1225,7 @@ impl Flow {
         let committed = Arc::clone(&self.work_committed);
         enum Slice {
             Gone,
-            Staging(Purpose, bool),
+            Staging(Purpose, bool, bool),
             Source(bool, Option<[u8; 64]>),
             Publication(
                 Option<RequestId>,
@@ -1206,9 +1256,25 @@ impl Flow {
                 let admission = admission
                     .as_ref()
                     .ok_or(Error::Profile("history retirement admission missing"))?;
-                let done =
-                    demand::retire_staging(&staging.context, &mut active, admission, &committed)?;
-                return Ok(Slice::Staging(purpose, done));
+                let (done, completed) = if preserve_public && purpose == Purpose::History {
+                    demand::retire_admitted_cleanup(
+                        &staging.context,
+                        &active,
+                        admission,
+                        &committed,
+                    )?
+                } else {
+                    (
+                        demand::retire_staging(
+                            &staging.context,
+                            &mut active,
+                            admission,
+                            &committed,
+                        )?,
+                        false,
+                    )
+                };
+                return Ok(Slice::Staging(purpose, done, completed));
             }
             let wake = channel.history_publication_wake();
             let publication_owner = channel.history_publication_request(&store)?;
@@ -1229,7 +1295,8 @@ impl Flow {
                 self.cancel();
                 return Ok(RetirementStep::Done);
             }
-            Slice::Staging(purpose, done) => {
+            Slice::Staging(purpose, done, completed) => {
+                self.retired_archive_complete |= completed;
                 if done {
                     if let Some(index) = body_slot(purpose) {
                         if let Some(request) = self.owners[index].take() {
@@ -2153,8 +2220,11 @@ impl Flow {
                                         .seq
                                         .checked_sub(1)
                                         .filter(|next| *next >= state.bounds.lo);
-                                    self.archive_wire_bytes =
-                                        self.archive_wire_bytes.saturating_add(saved.length);
+                                    if self.archive_counted_body != Some(saved.entry) {
+                                        self.archive_wire_bytes =
+                                            self.archive_wire_bytes.saturating_add(saved.length);
+                                        self.archive_counted_body = Some(saved.entry);
+                                    }
                                     self.push(Task {
                                         operation: Operation::Local(LocalStep::Entry {
                                             request: task.request,
@@ -2641,8 +2711,11 @@ impl Flow {
                             .ok_or(Error::Profile("archive state missing"))?;
                         if let Some(body) = &state.state().body {
                             self.archive_next = body.seq.checked_sub(1).filter(|next| *next >= 1);
-                            self.archive_wire_bytes =
-                                self.archive_wire_bytes.saturating_add(body.length);
+                            if self.archive_counted_body != Some(body.entry) {
+                                self.archive_wire_bytes =
+                                    self.archive_wire_bytes.saturating_add(body.length);
+                                self.archive_counted_body = Some(body.entry);
+                            }
                             self.push(Task {
                                 request: wire_request,
                                 purpose: Purpose::History,
@@ -3146,14 +3219,15 @@ impl Flow {
                     && snapshot.state().body.is_none()
                     && !snapshot.state().reclaiming()
                 {
-                    if let Some(next) = next {
+                    if next.is_some() || snapshot.state().remaining == 0 {
                         // This branch ends More/Complete, so it never needs a subsequent
                         // pause. Prepay only its work and single reload before the commit.
                         let work = demand::AdmissionCharge::reserve(&job)?;
                         let reload = demand::AdmissionCharge::reserve(&job)?;
                         let state = snapshot.state();
-                        let cursor = (next >= state.bounds.lo && state.remaining > 0).then_some(
-                            super::Continuation {
+                        let cursor = next
+                            .filter(|next| *next >= state.bounds.lo && state.remaining > 0)
+                            .map(|next| super::Continuation {
                                 query_kind: 4,
                                 head: state.bounds.head,
                                 lo: state.bounds.lo,
@@ -3162,8 +3236,7 @@ impl Flow {
                                 entry: None,
                                 offset: 0,
                                 entries_remaining: state.remaining,
-                            },
-                        );
+                            });
                         demand::checkpoint_precharged(
                             &staging.context,
                             &mut active,

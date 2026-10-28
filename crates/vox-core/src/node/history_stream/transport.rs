@@ -11,7 +11,7 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::node::history_budget::{BufferCharge, Job};
-use crate::transport::framing::write_frame;
+use crate::transport::framing::write_history_frame as write_frame;
 use crate::transport::stream_transport::{Fence, SYNC_FRAME_TIMEOUT};
 use crate::wire::WireError;
 
@@ -274,6 +274,12 @@ async fn read_charged(
 }
 
 fn read_error(error: quinn::ReadExactError) -> Error {
+    if matches!(
+        &error,
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(_))
+    ) {
+        return Error::HistoryConnectionClosed;
+    }
     if let quinn::ReadExactError::ReadError(quinn::ReadError::Reset(code)) = error {
         if let Some(reason) = u8::try_from(code.into_inner())
             .ok()
