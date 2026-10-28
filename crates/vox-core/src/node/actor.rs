@@ -49,6 +49,7 @@ mod bounded_sync;
 mod computer;
 mod governance;
 mod history_demand;
+mod key_body_scan;
 mod local_trust;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
@@ -5381,6 +5382,7 @@ pub struct Node {
     /// the one actor select that audits its durable result slots.
     bounded_completion_wake: Arc<tokio::sync::Notify>,
     role_wake: Arc<crate::node::channel::role_owed::RoleWake>,
+    key_body_scan: key_body_scan::Controller,
     /// Exact retirement ownership and failures live on the daemon budget, so they survive both
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
@@ -6248,6 +6250,7 @@ impl Node {
             bounded_sync,
             bounded_completion_wake,
             role_wake: Arc::new(crate::node::channel::role_owed::RoleWake::default()),
+            key_body_scan: key_body_scan::Controller::default(),
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             own_recovery_rooms: BTreeMap::new(),
@@ -6957,13 +6960,25 @@ impl Node {
                                 continue;
                             }
                             let owed = owner.pending(peer);
+                            if let Some(token) = owner.key_token(peer) {
+                                let changed = !port.key_body_scan_token.as_ref().is_some_and(|old| Arc::ptr_eq(old, &token));
+                                if changed {
+                                    port.key_body_wait = None;
+                                    port.key_body_scan_token = Some(token);
+                                    port.key_body_after = None;
+                                    port.key_body_initialized = false;
+                                    self.sched_rooms.insert(room);
+                                }
+                            }
                             let newly_owed = owed && !port.role_owed;
                             port.role_owed = owed;
                             if newly_owed {
                                 port.raise();
                                 self.sched_rooms.insert(room);
                             }
-                        } else if owner.pending(peer) {
+                        } else if owner.pending(peer)
+                            || (self.trust.is_trusted(&peer) && owner.key_token(peer).is_some())
+                        {
                             self.discover_rooms.insert(room);
                             self.sched_rooms.insert(room);
                         }
@@ -10765,6 +10780,11 @@ impl Node {
                     for room in self.channels.keys().copied() {
                         if let Some(owner) = self.role_wake.owner(room) {
                             owner.on_connect(peer);
+                            if self.trust.is_trusted(&peer)
+                                && self.ports.contains_key(&(room, peer))
+                            {
+                                owner.mark_key_dirty(peer);
+                            }
                         }
                     }
                 }
@@ -14781,6 +14801,7 @@ impl Node {
             self.sched_rooms.insert(room);
         }
         self.trust = next;
+        self.note_key_body_trust_change();
         self.note_capability(fingerprint, had_drive);
         if let Some(decision) = decision {
             // Where each open room's sender key stands at the decision (V210-45). A rename is
@@ -15009,6 +15030,7 @@ impl Node {
             self.sched_rooms.insert(room);
         }
         self.trust = next;
+        self.note_key_body_trust_change();
         self.deliveries
             .retain(|(_, peer, _), _| peer != fingerprint);
         self.delivery_reserved
@@ -16173,6 +16195,29 @@ impl Node {
         false
     }
 
+    /// A successful keyring save changes the authorization incarnation used by key-body
+    /// refusals. Retire selected logical roots even for a newly untrusted peer; physical
+    /// workers retain their own staging until cleanup. Ordinary room traffic does not do this.
+    fn note_key_body_trust_change(&mut self) {
+        for (&(room, peer), port) in &mut self.ports {
+            let current = self
+                .channels
+                .get(&room)
+                .map(|channel| crate::node::ports::RoomRef::Channel(Arc::downgrade(channel)));
+            if !current.is_some_and(|current| port.room.is(&current)) {
+                continue;
+            }
+            port.key_body = None;
+            port.key_body_instance = None;
+            port.key_body_token = None;
+            port.key_body_after = None;
+            port.key_body_initialized = false;
+            if let Some(owner) = self.role_wake.owner(room) {
+                owner.mark_key_dirty(peer);
+            }
+        }
+    }
+
     /// Make sure `(channel_id, peer)` has a port for the room instance held now, creating it if
     /// it shares the room. A port for an older instance of the room (closed and held again: a
     /// reopen, an unlock, a new epoch) is retired and replaced. Returns whether a port exists.
@@ -16199,6 +16244,9 @@ impl Node {
         );
         if let Some(owner) = self.role_wake.owner(*channel_id) {
             owner.on_connect(*peer);
+            if self.trust.is_trusted(peer) {
+                owner.mark_key_dirty(*peer);
+            }
             if owner.pending(*peer) {
                 if let Some(port) = self.ports.get_mut(&(*channel_id, *peer)) {
                     port.role_owed = true;
@@ -16376,6 +16424,7 @@ impl Node {
             return false;
         }
         self.discover().await;
+        self.advance_key_body_scan();
         self.reroute_unstarted_history();
         let all = std::mem::take(&mut self.sched_all);
         let rooms = std::mem::take(&mut self.sched_rooms);
@@ -20024,6 +20073,9 @@ impl Node {
         self.publication_after = None;
         self.publication_pending = false;
         self.publication_again = false;
+        // Retire queued scanner admission and its wake before dropping room ownership. A
+        // physical blocking read retains its own secret guard until it actually exits.
+        self.key_body_scan = key_body_scan::Controller::default();
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
@@ -22558,6 +22610,8 @@ impl Node {
                 // poisoned receipt-only port belonged to its completed departure.
                 if self.ports.contains_key(&(cid, b)) {
                     self.drop_port(&cid, &b);
+                    self.discover_rooms.insert(cid);
+                    self.sched_rooms.insert(cid);
                 }
             }
             let over = ch.ended(now_ms).is_some();
@@ -26098,6 +26152,7 @@ impl Node {
             self.sched_rooms.insert(room);
         }
         self.trust = next;
+        self.note_key_body_trust_change();
         self.note_capability(fingerprint, had_drive);
         self.owe_private_support_in_open_rooms().await;
         self.publish().await;

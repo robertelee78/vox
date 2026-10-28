@@ -57,6 +57,7 @@ pub enum Slot {
     OwnRecovery,
     Live,
     Control,
+    KeyBody,
 }
 
 /// The actor retains this handle to fence a worker even when a blocking disk call cannot abort.
@@ -92,6 +93,13 @@ impl Context {
             Purpose::History => return Err(invalid("archive requires explicit local demand")),
         };
         Self::with_slot(profile, slot, secret_work)
+    }
+    /// Recipient key bodies own a separate staging boundary from public control work.
+    pub(crate) fn key_body_unlocked(
+        profile: &Profile,
+        secret_work: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
+    ) -> Result<Self> {
+        Self::with_slot(profile, Slot::KeyBody, secret_work)
     }
     /// Local durable own-feed recovery only; no public command or network request mints it.
     pub(crate) fn own_recovery_unlocked(
@@ -621,6 +629,7 @@ fn node_scope(node: Digest32, slot: Slot) -> Digest32 {
         Slot::Live => 1,
         Slot::Control => 2,
         Slot::OwnRecovery => 3,
+        Slot::KeyBody => 4,
     });
     sha256(&bytes)
 }

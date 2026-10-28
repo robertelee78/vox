@@ -632,6 +632,9 @@ pub(super) fn promote_head(
         return Err(invalid("conflicting authenticated heads retained"));
     }
     room.note_role_progress(signed.binding.author, signed.root.leaves);
+    if signed.binding.author != room.me() {
+        room.role_owed().mark_key_dirty(signed.binding.author);
+    }
     // A newly accepted remote head changes what this room must advertise. The actor touches
     // the room on completion so every port observes this generation immediately and can echo
     // the exact head back to its author.
@@ -785,15 +788,11 @@ pub(super) fn start_entry(
     if !context_ready {
         return Ok(EntryStart::Preflight);
     }
-    // A key-package body is private to its named recipient, but for that recipient it is the
-    // delivered key, not optional history. Upgrade every route that encounters this exact
-    // entry (live tail, parent or control dependency) before source/effect publication. Other
-    // members retain only its authenticated public header.
-    let addressed_key = v2.kind == crate::log::history::SignedEntryKind::KeyPackage
-        && v2.recipient == Some(room.me());
+    // Public control admission can retain an authenticated key-package header while the
+    // recipient's durable body obligation is serviced independently.
     let private_for_another = v2.kind == crate::log::history::SignedEntryKind::KeyPackage
         && v2.recipient != Some(room.me());
-    if (addressed_key || (require_body && !private_for_another)) && entry.payload.is_none() {
+    if require_body && !private_for_another && entry.payload.is_none() {
         return Ok(EntryStart::BodyNeeded);
     }
     let body = match governance::TypedSparseBody::verify(entry, &key, &mut WorkBudget::default())? {

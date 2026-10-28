@@ -467,6 +467,19 @@ impl ObligationKind {
         }
     }
 }
+/// Recipient-body refusals share the existing relationship tree but cannot suppress an
+/// author's public hint or a different owed package. Rows retire with the capped KeyBody.
+pub(crate) fn key_body_decline_key(author: &Digest32, hash: &Digest32) -> Digest32 {
+    let mut e = Encoder::new();
+    e.array(3)
+        .bytes(b"key-body-refusal")
+        .bytes(author)
+        .bytes(hash);
+    sha256(&e.finish())
+}
+
+pub(crate) type KeyBodyPage = (Option<[u8; 64]>, Option<Obligation>);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Obligation {
     pub head: Digest32,
@@ -835,6 +848,106 @@ impl Read<'_> {
             return Err(invalid("settled sparse tip binding"));
         }
         Ok(Some(header))
+    }
+    /// Recheck one captured local obligation before body staging or transport admission.
+    pub(crate) fn history_key_body_owed(
+        &self,
+        need: crate::node::history_stream::KeyBodyNeed,
+        local: Digest32,
+    ) -> Result<bool> {
+        let obligation = Obligation {
+            head: need.head,
+            kind: ObligationKind::KeyBody,
+            object: need.hash,
+            author: need.target.author,
+            from: need.seq,
+            through: need.seq,
+        };
+        if self
+            .source()
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.obligations,
+                &obligation.key()?,
+            )?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        let Some((head, header)) = self.history_validated_header(&need.target.author, need.seq)?
+        else {
+            return Err(invalid("key-body captured source missing"));
+        };
+        if head != need.head
+            || header.entry_hash() != need.hash
+            || !header.skeleton.v2.as_ref().is_some_and(|v| {
+                v.kind == crate::log::history::SignedEntryKind::KeyPackage
+                    && v.recipient == Some(local)
+            })
+        {
+            return Err(invalid("key-body captured source changed"));
+        }
+        self.missing_contains(&need.target.author, need.seq)
+    }
+    /// Sixteen fixed pending-work records per read. The key is source-Head scoped, not
+    /// author scoped, so callers retain the scalar continuation across released read guards.
+    pub(crate) fn history_key_body_page(
+        &self,
+        author: Digest32,
+        mut after: Option<[u8; 64]>,
+        target: Digest32,
+        authorization: Digest32,
+        incarnations: Option<(u64, u64)>,
+    ) -> Result<KeyBodyPage> {
+        for _ in 0..16 {
+            let seek = match after {
+                Some(key) => match dag_facts::successor(key) {
+                    Some(next) => next,
+                    None => return Ok((None, None)),
+                },
+                None => [0; 64],
+            };
+            let source = self.source();
+            let Some((key, value)) = source.first(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.obligations,
+                &seek,
+                0,
+            )?
+            else {
+                return Ok((None, None));
+            };
+            let Value::Number(id) = value else {
+                return Err(invalid("key-body obligation locator"));
+            };
+            let obligation = Obligation::parse(&source.sparse_record(
+                self.sek,
+                self.channel,
+                id,
+                STATE_BYTES,
+            )?)?;
+            if obligation.key()? != key {
+                return Err(invalid("key-body obligation binding"));
+            }
+            after = Some(key);
+            if obligation.kind == ObligationKind::KeyBody && obligation.author == author {
+                if let Some((head, scope, peer_i, author_i)) = self.history_declined_head(
+                    &author,
+                    &key_body_decline_key(&author, &obligation.object),
+                )? {
+                    if head == target
+                        && scope == authorization
+                        && incarnations == Some((peer_i, author_i))
+                    {
+                        continue;
+                    }
+                }
+                return Ok((after, Some(obligation)));
+            }
+        }
+        Ok((after, None))
     }
     pub(crate) fn history_effect_finished(&self, hash: &Digest32) -> Result<bool> {
         Ok(self.source().find_value(
@@ -2744,6 +2857,27 @@ impl Write<'_, '_> {
             self.save_sparse_author(head.binding, state)?;
         }
         Ok(())
+    }
+    pub(crate) fn history_key_body_pending(
+        &self,
+        need: crate::node::history_stream::KeyBodyNeed,
+    ) -> Result<bool> {
+        let obligation = Obligation {
+            head: need.head,
+            kind: ObligationKind::KeyBody,
+            object: need.hash,
+            author: need.target.author,
+            from: need.seq,
+            through: need.seq,
+        };
+        Ok(Source::Batch(self.batch)
+            .number(
+                self.sek,
+                self.channel,
+                self.directory.active.sparse.obligations,
+                &obligation.key()?,
+            )?
+            .is_some())
     }
     /// Bounded durable pending work. At the cap the caller yields before staging more objects.
     pub(crate) fn keep_history_obligation(&mut self, obligation: &Obligation) -> Result<bool> {

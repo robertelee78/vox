@@ -257,6 +257,15 @@ impl OwnProbe {
     }
 }
 
+/// A causal scanner wake belongs to the port and is retired with it.
+pub(crate) struct KeyBodyWait(pub(crate) tokio::task::JoinHandle<()>);
+
+impl Drop for KeyBodyWait {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// One `(room, peer)`'s sync port (ADR-025 D1).
 pub struct Port {
     /// The room instance it belongs to.
@@ -294,6 +303,20 @@ pub struct Port {
     /// One unavailable startup metadata probe, retired by connection/authority/local-head change.
     pub(crate) support_discovery_unavailable: Option<OwnProbe>,
     pub(crate) own_receipt_lower: Option<OwnProbe>,
+    /// Exact recipient-key body discovered by the bounded local scanner.
+    pub(crate) key_body: Option<crate::node::history_stream::KeyBodyNeed>,
+    pub(crate) key_body_instance: Option<[u8; 16]>,
+    /// The exact scan that selected this body, distinct from a later dirty edge.
+    pub(crate) key_body_token: Option<std::sync::Arc<()>>,
+    /// Alternate an available recipient body with public head work on this port.
+    pub(crate) key_body_turn: bool,
+    /// Scanner continuation in the room's sealed obligations index.
+    pub(crate) key_body_after: Option<[u8; 64]>,
+    /// False until a causal room/connection edge requests a scan.
+    pub(crate) key_body_initialized: bool,
+    /// Exact dirty edge whose bounded scan owns the cursor.
+    pub(crate) key_body_scan_token: Option<std::sync::Arc<()>>,
+    pub(crate) key_body_wait: Option<KeyBodyWait>,
     /// The room generation credited to the peer: monotonic within the room instance.
     pub done_gen: u64,
     /// Scheduler-only watermark after one current-only exchange found a legacy gap.
@@ -345,6 +368,14 @@ impl Port {
             support_discovery: None,
             support_discovery_unavailable: None,
             own_receipt_lower: None,
+            key_body: None,
+            key_body_instance: None,
+            key_body_token: None,
+            key_body_turn: false,
+            key_body_after: None,
+            key_body_initialized: false,
+            key_body_scan_token: None,
+            key_body_wait: None,
             done_gen: 0,
             legacy_checked_gen: None,
             busy_attempt_gen: 0,
@@ -377,6 +408,7 @@ impl Port {
             && (self.gen.load(Ordering::Relaxed)
                 > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
                 || self.req_gen > self.req_done
+                || self.key_body.is_some()
                 || self.announce_owed())
     }
 

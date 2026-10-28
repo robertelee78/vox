@@ -18,6 +18,7 @@ struct Entry {
 #[derive(Default)]
 pub(crate) struct RoleOwed {
     entries: Mutex<BTreeMap<Digest32, Entry>>,
+    key_dirty: Mutex<BTreeMap<Digest32, Arc<()>>>,
     wake: Mutex<Option<Weak<RoleWake>>>,
     room: Mutex<Option<Digest32>>,
 }
@@ -92,6 +93,30 @@ impl RoleOwed {
             wake.signal(room, peer, self);
         }
     }
+    /// Retain an exact per-author discovery edge until its bounded scan finishes.
+    pub(crate) fn mark_key_dirty(self: &Arc<Self>, peer: Digest32) {
+        self.key_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer, Arc::new(()));
+        self.signal(peer);
+    }
+    pub(crate) fn key_token(&self, peer: Digest32) -> Option<Arc<()>> {
+        self.key_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .cloned()
+    }
+    pub(crate) fn ack_key(self: &Arc<Self>, peer: Digest32, token: &Arc<()>) {
+        let mut dirty = self.key_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if dirty
+            .get(&peer)
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            dirty.remove(&peer);
+        }
+    }
     pub(crate) fn observe(self: &Arc<Self>, peer: Digest32, head: HeadHint) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = entries.entry(peer).or_default();
@@ -145,6 +170,9 @@ impl RoleOwed {
         let removed: Vec<_> = entries.keys().filter(|peer| !keep(peer)).copied().collect();
         entries.retain(|peer, _| keep(peer));
         drop(entries);
+        let mut key_dirty = self.key_dirty.lock().unwrap_or_else(|e| e.into_inner());
+        key_dirty.retain(|peer, _| keep(peer));
+        drop(key_dirty);
         for peer in removed {
             self.signal(peer);
         }

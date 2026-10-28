@@ -155,6 +155,7 @@ impl Source {
         head: Digest32,
         request: RequestId,
         metadata: bool,
+        key_body: Option<super::KeyBodyNeed>,
     ) -> Result<DeclineResult> {
         // The marker is apparatus only: it proves that a real shipped flow carrying its captured
         // authorization has reached the durability edge before a proof changes trust.
@@ -171,7 +172,7 @@ impl Source {
                     peer,
                     author,
                     head,
-                    (authorization.0, authorization.1, metadata),
+                    (authorization.0, authorization.1, metadata, key_body),
                     &committed,
                 )?))
             })
