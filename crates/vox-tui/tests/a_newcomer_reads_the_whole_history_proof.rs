@@ -6655,6 +6655,8 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     let bob_fold = root.join("bob-fold");
     let consent_hold = root.join("incoming-consent-hold");
     let consent_entered = root.join("incoming-consent-hold.entered");
+    let consent_backfill = root.join("consent-backfill");
+    let consent_backfill_entered = root.join("consent-backfill.entered");
     let render_hold = root.join("render-hold");
     let alice_fold_path = alice_fold
         .to_str()
@@ -6686,6 +6688,12 @@ fn key_before_consent_survives_a_restart(root: &Path) {
             (
                 "VOX_TEST_HOLD_RENDER_FILE",
                 render_hold.to_str().expect("APPARATUS: render hold path"),
+            ),
+            (
+                "VOX_TEST_CONSENT_BACKFILL_FILE",
+                consent_backfill
+                    .to_str()
+                    .expect("APPARATUS: consent backfill path"),
             ),
         ],
     );
@@ -6759,11 +6767,16 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage Bob's fold: {error}"));
     let full_room = vox_core::node::link::b32_encode(&room_id(&alice, "alice", &room));
     let consent_scope = format!("{} {} {}", full_room, alice_fp.trim(), bob_fp.trim());
+    let mut backfill_scope = room_id(&alice, "alice", &room).to_vec();
+    backfill_scope.extend_from_slice(
+        &vox_core::node::link::b32_decode(alice_fp.trim(), "Alice fingerprint")
+            .unwrap_or_else(|error| panic!("APPARATUS: malformed Alice fingerprint: {error}")),
+    );
+    std::fs::write(&consent_backfill, &backfill_scope)
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot arm consent backfill evidence: {error}"));
     std::fs::write(&consent_hold, &consent_scope)
         .unwrap_or_else(|error| panic!("APPARATUS: cannot arm incoming consent hold: {error}"));
     let before_consent = room_hashes(&alice, "alice", &room);
-    std::fs::write(&render_hold, b"")
-        .unwrap_or_else(|error| panic!("APPARATUS: cannot arm render hold: {error}"));
     std::fs::remove_file(&alice_fold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Alice's fold: {error}"));
     let (ok, out, err) = vox(
@@ -6801,6 +6814,24 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         with_key.received_key_generations >= 1,
         "APPARATUS: key-before-consent was not staged: {with_key:?}"
     );
+    while !consent_backfill_entered.exists() {
+        assert_eq!(
+            trust_detail(&bob, "bob", &room, "alice"),
+            "you trust it, but it has not trusted you: it cannot read you",
+            "APPARATUS: consent arrived before the keyed backfill attempt"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        std::fs::read(&consent_backfill_entered)
+            .unwrap_or_else(|error| panic!("APPARATUS: cannot read backfill evidence: {error}")),
+        backfill_scope,
+        "APPARATUS: keyed backfill evidence names another room or author"
+    );
+    // The actual product read, not the marker, determines whether consent prevented disclosure.
+    wait_for_held_rows(&bob, &room, &hashes, "keyed-backfill-before-consent");
+    std::fs::write(&render_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot arm render hold: {error}"));
 
     // The real signed consent must reach the held publication, then be durably accepted
     // while rendering remains held. Stop Alice before Bob renders or restarts.
@@ -6885,6 +6916,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     test_knobs::require(&[
         "VOX_TEST_FOLD_HOLD_FILE",
         "VOX_TEST_HOLD_INCOMING_CONSENT_FILE",
+        "VOX_TEST_CONSENT_BACKFILL_FILE",
         "VOX_TEST_HOLD_PACKAGES_FILE",
         "VOX_TEST_HOLD_RENDER_FILE",
         TEST_EXPIRING_ADMIN_ENV,

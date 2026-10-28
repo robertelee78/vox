@@ -1227,11 +1227,23 @@ impl Receiver {
                         let mut named = path.as_os_str().to_os_string();
                         named.push(".entered");
                         let entered = std::path::PathBuf::from(named);
+                        static NEXT_MARKER: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let mut temporary = path.as_os_str().to_os_string();
+                        temporary.push(format!(
+                            ".entered.{}.{}.tmp",
+                            std::process::id(),
+                            NEXT_MARKER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        ));
+                        let temporary = std::path::PathBuf::from(temporary);
                         std::fs::write(
-                            &entered,
+                            &temporary,
                             format!("{} {}", scope, encode(&record.entry.entry_hash())),
                         )
                         .map_err(|_| Error::Profile("consent hold could not record engagement"))?;
+                        std::fs::rename(&temporary, &entered).map_err(|_| {
+                            Error::Profile("consent hold could not publish engagement")
+                        })?;
                         while path.is_file() {
                             tokio::select! {
                                 biased;

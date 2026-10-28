@@ -8292,6 +8292,8 @@ impl ChannelState {
     }
 
     fn backfill(&mut self, store: &Store, author: &Digest32, now_ms: u64) -> Result<usize> {
+        #[cfg(feature = "test-knobs")]
+        self.discard_test_consent_backfill()?;
         // Commit one bounded backfill chunk and its continuation together.
         let mut rows: Vec<Rendered> = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
@@ -8319,6 +8321,8 @@ impl ChannelState {
         self.chains_advanced = false;
         let rendered = rows.len();
         self.place_committed(store, rows, &expired)?;
+        #[cfg(feature = "test-knobs")]
+        self.publish_test_consent_backfill()?;
         Ok(rendered)
     }
 
@@ -8387,6 +8391,44 @@ impl ChannelState {
             } else {
                 consent.can_read(&self.me(), &author) && self.has_sender_key(&author)
             };
+            // Apparatus evidence only: this exact author reached the real backfill decision
+            // with a key and without consent. The user-visible read supplies the verdict.
+            #[cfg(feature = "test-knobs")]
+            if author != self.me()
+                && self.has_sender_key(&author)
+                && !consent.can_read(&self.me(), &author)
+            {
+                if let Some(path) = std::env::var_os("VOX_TEST_CONSENT_BACKFILL_FILE")
+                    .filter(|path| !path.is_empty())
+                    .map(std::path::PathBuf::from)
+                {
+                    let mut scope = Vec::with_capacity(64);
+                    scope.extend_from_slice(&self.channel_id);
+                    scope.extend_from_slice(&author);
+                    if std::fs::read(&path).ok().as_deref() == Some(scope.as_slice()) {
+                        let mut target = path.as_os_str().to_os_string();
+                        target.push(".entered");
+                        let target = std::path::PathBuf::from(target);
+                        if !target.exists() {
+                            let mut tmp = path.as_os_str().to_os_string();
+                            tmp.push(format!(".{}.tmp", std::process::id()));
+                            let tmp = std::path::PathBuf::from(tmp);
+                            std::fs::write(&tmp, &scope).map_err(|_| {
+                                Error::Profile("consent backfill evidence could not be written")
+                            })?;
+                            let mut pending = path.as_os_str().to_os_string();
+                            pending.push(".pending");
+                            std::fs::rename(&tmp, std::path::PathBuf::from(pending)).map_err(
+                                |_| {
+                                    Error::Profile(
+                                        "consent backfill evidence could not be published",
+                                    )
+                                },
+                            )?;
+                        }
+                    }
+                }
+            }
             if !author_ready {
                 writer.queue_backfill(author, None)?;
                 writer.seal()?;
@@ -8491,6 +8533,8 @@ impl ChannelState {
     }
 
     fn drain_backfill(&mut self, store: &Store, now_ms: u64) -> Result<usize> {
+        #[cfg(feature = "test-knobs")]
+        self.discard_test_consent_backfill()?;
         // No durable cursor means no render work. Return before `place_committed`: that follow-up
         // also advances legacy/private-session migration and is not a harmless empty read. A
         // maintenance sweep with no backfill used to run it for every room on every unrelated
@@ -8533,7 +8577,62 @@ impl ChannelState {
         #[cfg(feature = "test-knobs")]
         engage_render_hold(&self.channel_id, &rows);
         self.place_committed(store, rows, &expired)?;
+        #[cfg(feature = "test-knobs")]
+        self.publish_test_consent_backfill()?;
         Ok(rendered)
+    }
+
+    /// Publish the scoped evidence only after the backfill transaction and its rows committed.
+    #[cfg(feature = "test-knobs")]
+    fn publish_test_consent_backfill(&self) -> Result<()> {
+        let Some(path) = std::env::var_os("VOX_TEST_CONSENT_BACKFILL_FILE")
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            return Ok(());
+        };
+        let mut pending = path.as_os_str().to_os_string();
+        pending.push(".pending");
+        let pending = std::path::PathBuf::from(pending);
+        let Ok(scope) = std::fs::read(&pending) else {
+            return Ok(());
+        };
+        if scope.len() != 64 || scope[..32] != self.channel_id {
+            return Ok(());
+        }
+        let mut entered = path.as_os_str().to_os_string();
+        entered.push(".entered");
+        std::fs::rename(&pending, std::path::PathBuf::from(entered))
+            .map_err(|_| Error::Profile("consent backfill evidence could not be published"))?;
+        Ok(())
+    }
+
+    /// A failed or interrupted prior turn is not evidence for this one.
+    #[cfg(feature = "test-knobs")]
+    fn discard_test_consent_backfill(&self) -> Result<()> {
+        let Some(path) =
+            std::env::var_os("VOX_TEST_CONSENT_BACKFILL_FILE").filter(|path| !path.is_empty())
+        else {
+            return Ok(());
+        };
+        let mut pending = path;
+        pending.push(".pending");
+        let pending = std::path::PathBuf::from(pending);
+        let scope = match std::fs::read(&pending) {
+            Ok(scope) => scope,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => {
+                return Err(Error::Profile(
+                    "stale consent backfill evidence could not be read",
+                ))
+            }
+        };
+        if scope.len() == 64 && scope[..32] == self.channel_id {
+            std::fs::remove_file(pending).map_err(|_| {
+                Error::Profile("stale consent backfill evidence could not be removed")
+            })?;
+        }
+        Ok(())
     }
 
     /// Whether test apparatus has parked this room after a causally named render turn. The
