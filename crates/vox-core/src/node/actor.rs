@@ -701,6 +701,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
         NetEvent::OwnKeyWriterInterrupted(..) => "resuming an interrupted own-key response",
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
+        NetEvent::OwnKeyCloseReady { .. } => "resuming a room close",
         NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
         NetEvent::OwnKeyRecoveryReady { .. } => "resuming room recovery",
         NetEvent::OwnKeyComputerReady { .. } => "resuming Computer policy",
@@ -1417,6 +1418,13 @@ enum NetEvent {
         reply: oneshot::Sender<Outcome>,
     },
     OwnKeyLeaveReady {
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        reply: oneshot::Sender<Outcome>,
+    },
+    OwnKeyCloseReady {
         room: Digest32,
         instance: SharedChannel,
         owner: Arc<()>,
@@ -6982,6 +6990,11 @@ impl Node {
                     }
                     // **A leave is answered once another member has the departure** (V210-164):
                     // see `begin_leave`.
+                    if let NodeCommand::CloseChannel { channel_id } = command {
+                        self.begin_own_key_close(channel_id, reply).await;
+                        self.note_if_stalled(name, started);
+                        continue;
+                    }
                     if let NodeCommand::LeaveRoom { channel_id } = command {
                         self.begin_own_key_leave(channel_id, reply).await;
                         self.note_if_stalled(name, started);
@@ -7421,7 +7434,7 @@ impl Node {
             } => self.append_session(&channel_id, &session_id, &body).await,
             // Answered through `begin_open_channel`, which the run loop calls instead of this.
             NodeCommand::OpenChannel { .. } => Outcome::Failed(Fault::Internal),
-            NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
+            NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id, None).await,
             NodeCommand::EndRoom { channel_id } => self.end_room(&channel_id).await,
             NodeCommand::SetAdmin {
                 channel_id,
@@ -10799,6 +10812,36 @@ impl Node {
                         } else {
                             let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                         }
+                    } else {
+                        let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    }
+                }
+            }
+            NetEvent::OwnKeyCloseReady {
+                room,
+                instance,
+                owner,
+                transition,
+                reply,
+            } => {
+                if !self
+                    .own_key_leave_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                } else {
+                    self.own_key_leave_pending.remove(&room);
+                    if reply.is_closed() {
+                        drop(transition);
+                    } else if self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                        && transition.is_some()
+                    {
+                        let outcome = self.close_channel(&room, transition).await;
+                        let _ = reply.send(outcome);
                     } else {
                         let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
                     }
@@ -22547,7 +22590,11 @@ impl Node {
         Outcome::Done
     }
 
-    async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
+    async fn close_channel(
+        &mut self,
+        channel_id: &Digest32,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    ) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
         if let Err(error) = self.retire_bounded_room(*channel_id).await {
@@ -22581,7 +22628,9 @@ impl Node {
         if self.channels.contains_key(channel_id) {
             self.own_key_room_set_changed.send_replace(());
         }
-        let outcome = match self.channels.remove(channel_id) {
+        let removed = self.channels.remove(channel_id);
+        drop(transition);
+        let outcome = match removed {
             Some(shared) => {
                 shared.lock().await.lock_now();
                 // The channel is gone from the view the board reads, so its members
@@ -22890,6 +22939,53 @@ impl Node {
                     rooms,
                     transitions,
                     command,
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    /// Retire physical own-key sends off actor before the close can take effect.
+    async fn begin_own_key_close(&mut self, room: Digest32, mut reply: oneshot::Sender<Outcome>) {
+        let Some(instance) = self.channels.get(&room).cloned() else {
+            let outcome = self.close_channel(&room, None).await;
+            let _ = reply.send(outcome);
+            return;
+        };
+        if self.own_key_leave_pending.contains_key(&room) {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = reply.closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyCloseReady {
+                    room,
+                    instance,
+                    owner,
+                    transition,
                     reply,
                 })
                 .await;
