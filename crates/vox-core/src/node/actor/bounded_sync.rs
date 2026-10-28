@@ -833,6 +833,24 @@ impl Controller {
             admission.task.abort();
         }
     }
+    pub(super) fn cancel_unstarted_archive_admission(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        instance: [u8; 16],
+        request: stream::RequestId,
+        generation: Digest32,
+    ) {
+        if self.archive_admission.as_ref().is_some_and(|admission| {
+            admission.room == room
+                && admission.peer == peer
+                && admission.instance == instance
+                && admission.request == request
+                && admission.generation == generation
+        }) {
+            self.cancel_archive_admission();
+        }
+    }
     pub(super) fn release_archive_admission(&mut self, token: u64, room: Digest32, peer: Digest32) {
         if self.archive_admission.as_ref().is_some_and(|admission| {
             admission.token == token && admission.room == room && admission.peer == peer
@@ -1576,32 +1594,50 @@ impl Controller {
         Ok(())
     }
 
-    pub(super) fn archive_for_port(
+    /// A physical archive Flow carries its own fence; its scalar request may have been reused.
+    pub(super) fn physical_archive_for_port(
         &self,
         room: Digest32,
         peer: Digest32,
-    ) -> Option<(stream::RequestId, Digest32)> {
+    ) -> Option<(
+        stream::RequestId,
+        Digest32,
+        Arc<crate::transport::stream_transport::Fence>,
+    )> {
         self.ready
             .iter()
             .flatten()
             .find(|flow| flow.room == room && flow.peer == peer && flow.archive)
             .and_then(|flow| {
-                flow.archive_request
-                    .map(|request| (request, flow.generation))
-            })
-            .or_else(|| {
-                self.archive_admission.as_ref().and_then(|admission| {
-                    (admission.room == room && admission.peer == peer)
-                        .then_some((admission.request, admission.generation))
-                })
+                Some((
+                    flow.archive_request?,
+                    flow.generation,
+                    Arc::clone(flow.request_fence.as_ref()?),
+                ))
             })
             .or_else(|| {
                 self.running
                     .iter()
                     .flatten()
                     .find(|work| work.room == room && work.peer == peer && work.archive.is_some())
-                    .and_then(|work| work.archive)
+                    .and_then(|work| {
+                        work.archive.map(|(request, generation)| {
+                            (request, generation, Arc::clone(&work.fence))
+                        })
+                    })
             })
+    }
+
+    /// Admission is separate from a physical Flow; its owner includes the room incarnation.
+    pub(super) fn archive_admission_for_port(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+    ) -> Option<(stream::RequestId, Digest32, [u8; 16])> {
+        self.archive_admission
+            .as_ref()
+            .filter(|admission| admission.room == room && admission.peer == peer)
+            .map(|admission| (admission.request, admission.generation, admission.instance))
     }
 
     pub(super) fn retire_port(&mut self, room: Digest32, peer: Digest32) {
@@ -2045,7 +2081,7 @@ impl Node {
         });
         if !keep_receipt {
             if self.ports.contains_key(&(room, peer)) {
-                self.drop_port(&room, &peer);
+                self.drop_departed_port(&room, &peer);
             }
             return;
         }
@@ -2132,6 +2168,15 @@ impl Node {
         let Some(request) = flow.archive_request else {
             return false;
         };
+        let Some(fence) = flow.request_fence.as_ref() else {
+            return false;
+        };
+        if !self
+            .history_demand
+            .owns_running_fence(request, flow.generation, fence)
+        {
+            return false;
+        }
         if let Some(status) = flow.archive_status.take() {
             if self.history_demand.completed_current(
                 flow.room,
@@ -2359,13 +2404,24 @@ impl Node {
             }
             if flow.authorization_changed {
                 let retry_peer = flow.route_origin.unwrap_or(flow.hint_peer);
-                let archive = flow.archive_request.map(|request| {
-                    self.history_demand.failed(
+                let archive = flow.archive_request.and_then(|request| {
+                    let fence = flow.request_fence.as_ref()?;
+                    if !self.history_demand.owns_running_fence(request, flow.generation, fence) {
+                        return None;
+                    }
+                    let other_resume = self.history_demand.has_other_resume(work.room, flow.instance, request);
+                    let detail = if other_resume {
+                        "Authorization changed; the saved history request can be resumed."
+                    } else {
+                        "Authorization changed while this history page was running; the exact request is being resumed."
+                    };
+                    self.history_demand.failed_current(
+                        work.room,
+                        flow.instance,
                         request,
                         flow.generation,
-                        "Authorization changed while this history page was running; the exact request is being resumed.",
-                    );
-                    (request, flow.instance)
+                        detail,
+                    ).then_some((request, flow.instance)).filter(|_| !other_resume)
                 });
                 if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
@@ -2399,7 +2455,7 @@ impl Node {
                     port.clear_backoff();
                 }
                 if let Some((request, instance)) = archive {
-                    // `failed` retired the stale running generation. Retain the exact Resume as
+                    // `failed_current` retired the still-owned running generation. Retain the exact Resume as
                     // its replacement owner before any fallible profile/room/admission preflight;
                     // `schedule` either installs preparation or keeps its fair Control ticket.
                     self.history_demand.owe_resume(work.room, instance, request);
@@ -2660,9 +2716,7 @@ impl Node {
                 let cancelled = error
                     == crate::error::Error::Profile(crate::node::history_demand::CANCELLED)
                         .to_string();
-                if let Some(request) = flow.archive_request {
-                    self.history_demand.failed(request, flow.generation, &error);
-                }
+                self.settle_archive_exit(&mut flow, &error);
 
                 if let Some(hint) = flow.hint.filter(|_| !flow.local_own_root()) {
                     self.history_hints
@@ -2901,10 +2955,22 @@ impl Node {
                     }
                 }
                 if !flow.automatic_own_recovery {
-                    if let Some(status) = flow.archive_status.take() {
-                        if let Some(request) = status.request {
-                            self.history_demand
-                                .completed(request, flow.generation, status);
+                    if let (Some(request), Some(fence)) =
+                        (flow.archive_request, flow.request_fence.as_ref())
+                    {
+                        if self
+                            .history_demand
+                            .owns_running_fence(request, flow.generation, fence)
+                        {
+                            if let Some(status) = flow.archive_status.take() {
+                                self.history_demand.completed_current(
+                                    flow.room,
+                                    flow.instance,
+                                    request,
+                                    flow.generation,
+                                    status,
+                                );
+                            }
                         }
                     }
                 }
@@ -3515,7 +3581,12 @@ impl Node {
                 } else if self.bounded_sync.ready[1].is_none()
                     && self.bounded_sync.running[1].is_none()
                 {
-                    if let Some(dispatch) = self.history_demand.take_ready(room, peer) {
+                    if let Some(dispatch) = self
+                        .trust
+                        .is_trusted(&peer)
+                        .then(|| self.history_demand.take_ready(room, peer))
+                        .flatten()
+                    {
                         Flow::archive(
                             room,
                             peer,

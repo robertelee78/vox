@@ -56,6 +56,13 @@ impl Node {
         let mut next = self.trust.clone();
         next.import_local_removals(removed);
         next.save(profile.store(), signer)?;
+        if let Some((room, peer, instance, request, generation)) =
+            self.history_demand.note_route_trust_change()
+        {
+            self.bounded_sync
+                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
+            self.sched_rooms.insert(room);
+        }
         self.trust = next;
         self.decisions.hold_for_local_trust_import(false);
         Ok(())
