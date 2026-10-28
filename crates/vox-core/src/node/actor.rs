@@ -14771,6 +14771,7 @@ impl Node {
         // under its reservation; preserve the exact generation for post-lock notifications.
         let mut completed = Vec::new();
         let mut incomplete = false;
+        let trusted = next.trusted();
         for (room, channel) in &mut reserved {
             if incomplete {
                 channel.poison(&Error::Profile(
@@ -14781,12 +14782,32 @@ impl Node {
             match authority
                 .publish(|| channel.withdraw_consent(profile, *fingerprint, self.now_ms()))
             {
-                Some(Ok(Some(revocation))) => {
-                    completed.push((*room, revocation.body.new_chain_id));
-                    locks.clear(room, fingerprint);
-                }
-                Some(Ok(None)) => {
-                    locks.clear(room, fingerprint);
+                Some(Ok(revocation)) => {
+                    if let Some(revocation) = revocation {
+                        completed.push((*room, revocation.body.new_chain_id));
+                    }
+                    // Key deletion is part of this room's durable withdrawal, not a
+                    // best-effort step after its debt was cleared.
+                    match authority
+                        .publish(|| channel.forget_keys_except(profile.store(), &trusted))
+                    {
+                        Some(Ok(_)) => {
+                            locks.clear(room, fingerprint);
+                        }
+                        Some(Err(error)) => {
+                            channel.poison(&error);
+                            channel.poison(&Error::Profile(
+                                "trust withdrawal is incomplete; reopen this room",
+                            ));
+                            incomplete = true;
+                        }
+                        None => {
+                            channel.poison(&Error::Profile(
+                                "trust withdrawal is incomplete; reopen this room",
+                            ));
+                            incomplete = true;
+                        }
+                    }
                 }
                 Some(Err(error)) => {
                     channel.poison(&error);
@@ -14829,18 +14850,8 @@ impl Node {
         self.key_delivery_settling
             .retain(|(_, peer)| peer != fingerprint);
         self.note_capability(*fingerprint, had_drive);
-        // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
-        // nothing it posts from now opens on this node. A closed room drops them, and changes its
-        // lock, when it opens (recorded above). What was already read stays read. A re-trust is
-        // offered its key again, as any member whose key this node does not hold.
-        let trusted = self.trust.trusted();
-        let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
-        for ch in shared {
-            let _ = ch
-                .lock()
-                .await
-                .forget_keys_except(profile.store(), &trusted);
-        }
+        // Receiver and Drive key deletion completed under each room's reservation before its
+        // debt was cleared; incomplete rooms remain fail-closed and replay on preparation.
         for (room, generation) in completed {
             self.note_completed_untrust(room, *fingerprint, generation);
         }
