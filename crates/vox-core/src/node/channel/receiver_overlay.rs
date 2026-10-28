@@ -313,22 +313,6 @@ pub(super) fn rewrite(
     batch.put_segment(room, SegmentKind::KeyMaterial, SEG_RECEIVERS, segment)?;
     h.seal(batch, sek, room)
 }
-pub(super) fn normal_dirty(
-    batch: &crate::node::store::Batch<'_>,
-    sek: &Sek,
-    room: &Digest32,
-    stamp: Stamp,
-) -> Result<bool> {
-    Ok(stamp.1 != 0 && Header::load(batch, sek, room)?.normal != stamp)
-}
-pub(super) fn drive_dirty(
-    batch: &crate::node::store::Batch<'_>,
-    sek: &Sek,
-    room: &Digest32,
-    stamp: Stamp,
-) -> Result<bool> {
-    Ok(stamp.1 != 0 && Header::load(batch, sek, room)?.drive != stamp)
-}
 pub(super) fn wrote_drive(
     batch: &mut crate::node::store::Batch<'_>,
     sek: &Sek,
