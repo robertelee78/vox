@@ -41,6 +41,15 @@ use crate::app::AppError;
 
 #[cfg(target_os = "macos")]
 mod bundle;
+#[cfg(target_os = "macos")]
+pub(crate) fn install_app(
+    apps: &Path,
+    source: &Path,
+    version: &str,
+    channel: &str,
+) -> Result<(), AppError> {
+    bundle::install_app(apps, source, version, channel)
+}
 pub(crate) mod restart;
 
 /// The repository releases are published from.
@@ -313,6 +322,16 @@ pub fn detect_channel(exe: &Path) -> Result<Channel, AppError> {
 fn bundle_apps_dir(exe: &Path) -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
+    }
+    // Proof-only: let the built `vox` drive an exact signed/notarized scratch Vox.app without
+    // replacing that artifact's helper (which would invalidate its code signature). Packaged
+    // binaries do not contain this branch or read this variable (V210-105).
+    #[cfg(feature = "test-knobs")]
+    if let Some(apps) = std::env::var_os("VOX_TEST_BUNDLE_APPS_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(apps);
     }
     let helpers = exe.parent()?;
     let contents = helpers.parent()?;
