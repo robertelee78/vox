@@ -43,14 +43,39 @@ pub(super) struct Parked {
 
 type SecretLease = Arc<tokio::sync::OwnedRwLockReadGuard<()>>;
 
+pub(super) struct ActiveAttempt {
+    pub(super) request: Request,
+    pub(super) cancel: tokio::sync::watch::Sender<bool>,
+}
+
+pub(super) struct OpenReady {
+    request: Request,
+    lease: Arc<super::own_attempts::Lease>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    node: Digest32,
+    peer: Digest32,
+    connection: Arc<VoxConnection>,
+    room: SharedChannel,
+    context: crate::join::session::JoinContext,
+    bundle: crate::identity::keyagreement::PrekeyBundlePublic,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    peer_credit: OwnedSemaphorePermit,
+    queue: tokio::sync::mpsc::OwnedPermit<PairwiseJob>,
+}
+
 pub(super) struct RequestReady {
     request: Request,
+    lease: Arc<super::own_attempts::Lease>,
+    cancel: tokio::sync::watch::Receiver<bool>,
     node: Digest32,
     peer: Digest32,
     connection: Arc<VoxConnection>,
     room: SharedChannel,
     context: crate::join::session::JoinContext,
     prepared: crate::error::Result<(crate::pairwise::session::Session, Vec<u8>)>,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
     queue: tokio::sync::mpsc::OwnedPermit<PairwiseJob>,
     credit: PairwiseCredit,
     output: crate::node::history_budget::OutputCharge,
@@ -65,6 +90,8 @@ pub(super) enum OwnKeyReply {
 
 pub(super) struct ResponseReady {
     request: Request,
+    _lease: Arc<super::own_attempts::Lease>,
+    cancel: tokio::sync::watch::Receiver<bool>,
     node: Digest32,
     peer: Digest32,
     connection: Arc<VoxConnection>,
@@ -101,8 +128,15 @@ impl Node {
         if let Some(cancel) = self.own_key_room_cancel.remove(&room) {
             cancel.send_replace(true);
         }
-        self.own_key_active.remove(&room);
-        self.own_key_pending.remove(&room);
+        for ((id, _), attempt) in &self.own_key_active {
+            if *id == room {
+                attempt.cancel.send_replace(true);
+            }
+        }
+        self.own_key_credit_trust.remove(&room);
+        self.own_key_credit_missing.remove(&room);
+        self.own_key_policy_waiting.remove(&room);
+        self.own_key_pending.retain(|(id, _), _| *id != room);
         self.own_key_interrupted_pending
             .retain(|(id, _), _| *id != room);
         self.own_key_parked.retain(|(id, _), _| *id != room);
@@ -119,7 +153,7 @@ impl Node {
     ) -> bool {
         let (node, peer) = identities;
         self.locking == 0
-            && self.own_key_active.get(&request.room) == Some(&request.id)
+            && self.own_key_active.get(&(request.room, peer)).is_some_and(|attempt| attempt.request.id == request.id && !*attempt.cancel.borrow())
             && self.profile.as_ref().is_some_and(|p| p.is_unlocked() && p.fingerprint() == node
                 && matches!(channel.own_recovery_key(p.store()), Ok(Some((id, _, true))) if id == request.target))
             && self.trust.is_trusted(&peer)
@@ -130,27 +164,20 @@ impl Node {
                 .is_some_and(|current| Arc::ptr_eq(&current, connection))
     }
 
-    fn own_key_wait_for_room(&mut self, request: Request, node: Digest32, room: SharedChannel) {
-        self.own_key_active.remove(&request.room);
-        self.bounded_sync.wait_for_own_recovery_room(
-            &self.net_tx,
-            &mut self.next_token,
-            node,
-            request.room,
-            room,
-        );
-    }
-
     pub(super) fn fail_own_key_request(
         &mut self,
         request: Request,
         peer: Digest32,
         connection: u64,
     ) {
-        if self.own_key_active.get(&request.room) != Some(&request.id) {
+        let Some(attempt) = self
+            .own_key_active
+            .get(&(request.room, peer))
+            .filter(|attempt| attempt.request.id == request.id && !*attempt.cancel.borrow())
+        else {
             return;
-        }
-        self.own_key_active.remove(&request.room);
+        };
+        attempt.cancel.send_replace(true);
         self.own_key_parked.insert(
             (request.room, peer),
             Parked {
@@ -168,24 +195,147 @@ impl Node {
         self.governance_work.wake_room(request.room);
     }
 
+    pub(super) fn defer_own_key_policy(&mut self, room: Digest32) {
+        if self.own_key_policy_waiting.contains_key(&room) {
+            return;
+        }
+        let owner = Arc::new(());
+        self.own_key_policy_waiting.insert(room, Arc::clone(&owner));
+        let Some(authority) = self.computer_authority() else {
+            return;
+        };
+        let computer = match &authority {
+            computer::ComputerAuthority::Managed { computer, .. } => Arc::clone(computer),
+            computer::ComputerAuthority::Unmanaged => return,
+        };
+        let mut settled = computer.own_key_settled();
+        if !computer.own_key_authority_blocked() {
+            return;
+        }
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            while computer.own_key_authority_blocked() {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => return,
+                    _ = epoch_changed.changed() => return,
+                    changed = settled.changed() => if changed.is_err() { return; },
+                }
+            }
+            if authority.current() {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => {},
+                    _ = epoch_changed.changed() => {},
+                    _ = tx.send(NetEvent::OwnKeyPolicyReady { room, owner }) => {},
+                }
+            }
+        });
+    }
+
+    pub(super) fn resume_own_key_policy_waiting(&mut self) {
+        for room in std::mem::take(&mut self.own_key_policy_waiting).into_keys() {
+            if self.channels.contains_key(&room) {
+                self.governance_work.wake_room(room);
+            }
+        }
+    }
+
+    pub(super) fn own_key_board_growth(&mut self, room: Digest32) {
+        let Some((epoch, peers)) = self.own_key_credit_missing.get(&room) else {
+            return;
+        };
+        let Some(net) = self.net.as_ref() else {
+            return;
+        };
+        let available = peers.iter().any(|peer| {
+            self.trust.is_trusted(peer)
+                && net.manager().existing(peer).is_some()
+                && net
+                    .board_bundle(&room, *epoch, peer)
+                    .map(|record| record.prekey_bundle)
+                    .or_else(|| net.board_prejoin_bundle(&room, peer))
+                    .is_some_and(|bundle| {
+                        prekeys::delivery_bundle(
+                            &bundle,
+                            self.now_ms().get(),
+                            &self.refused_otps.of(peer),
+                            prekeys::SpentOneTime::SignedPrekey,
+                        )
+                        .is_ok()
+                    })
+        });
+        if available {
+            self.own_key_credit_missing.remove(&room);
+            self.governance_work.wake_room(room);
+        }
+    }
+
     pub(super) fn finish_own_key_request(&mut self, ready: RequestReady) {
+        let room_lock = Arc::clone(&ready.room);
+        let Ok(channel) = room_lock.try_lock() else {
+            let request = ready.request;
+            let failure_lease = Arc::clone(&ready.lease);
+            let mut cancel = ready.cancel.clone();
+            let connection = Arc::clone(&ready.connection);
+            let room = Arc::clone(&ready.room);
+            let peer = ready.peer;
+            let tx = self.net_tx.clone();
+            let mut room_cancel = self.own_key_room_watch(request.room);
+            let mut epoch_changed = self.pairwise_epoch.subscribe();
+            tokio::spawn(async move {
+                let mut ready = Some(ready);
+                let available = tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => false,
+                    _ = cancel.changed() => false,
+                    _ = epoch_changed.changed() => false,
+                    _ = connection.quinn().closed() => {
+                        drop(ready.take());
+                        let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection.serial() }).await;
+                        false
+                    },
+                    channel = room.lock() => { drop(channel); true },
+                };
+                if available {
+                    let permit = tokio::select! {
+                        biased;
+                        _ = room_cancel.changed() => None,
+                        _ = cancel.changed() => None,
+                        _ = epoch_changed.changed() => None,
+                        _ = connection.quinn().closed() => {
+                            drop(ready.take());
+                            let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection.serial() }).await;
+                            None
+                        },
+                        permit = tx.clone().reserve_owned() => permit.ok(),
+                    };
+                    if let (Some(permit), Some(ready)) = (permit, ready.take()) {
+                        permit.send(NetEvent::OwnKeyRequestReady(Box::new(ready)));
+                    }
+                }
+            });
+            return;
+        };
         let RequestReady {
             request,
+            lease,
+            mut cancel,
             node,
             peer,
             connection,
             room,
             context,
             prepared,
+            send,
+            recv,
             queue,
             credit,
             output,
             secret,
         } = ready;
-        let Ok(channel) = room.try_lock() else {
-            self.own_key_wait_for_room(request, node, Arc::clone(&room));
-            return;
-        };
         let current = self.own_key_current(
             request,
             (node, peer),
@@ -195,8 +345,12 @@ impl Node {
             &channel,
         );
         if !current {
-            if self.own_key_active.get(&request.room) == Some(&request.id) {
-                self.own_key_active.remove(&request.room);
+            if let Some(attempt) = self
+                .own_key_active
+                .get(&(request.room, peer))
+                .filter(|attempt| attempt.request.id == request.id)
+            {
+                attempt.cancel.send_replace(true);
             }
             return;
         }
@@ -210,9 +364,11 @@ impl Node {
         let mut room_cancel = self.own_key_room_watch(request.room);
         let clock = Arc::clone(&self.clock);
         let room_for_network = Arc::clone(&room);
-        let mut launch = Some((session, frame, queue, credit, output, secret));
+        let mut launch = Some((
+            session, frame, send, recv, queue, credit, output, secret, lease,
+        ));
         let authorized = self.with_current_computer_authority(|| {
-            let Some((mut session, frame, queue, credit, output, secret)) = launch.take() else { return; };
+            let Some((mut session, frame, mut send, mut recv, queue, credit, output, secret, lease)) = launch.take() else { return; };
             // This one-shot session has no shared ratchet ordering with ordinary key delivery.
             drop(queue);
             tokio::spawn(async move {
@@ -220,26 +376,43 @@ impl Node {
                     biased;
                     _ = epoch_changed.changed() => return,
                     _ = room_cancel.changed() => return,
+                    _ = cancel.changed() => return,
                     result = async {
-                        let mut recv = crate::node::pairwise_stream::write_pairwise(&connection, &[frame]).await?;
+                        crate::transport::framing::write_frame(&mut send, &crate::transport::streams::StreamKind::Pairwise.frame()).await?;
+                        crate::transport::framing::write_frame(&mut send, &frame).await?;
+                        send.finish().map_err(|_| Error::Unreachable("own-key request stream closed"))?;
                         let frame = crate::node::pairwise_stream::recv_pairwise(&mut recv).await?
                             .ok_or(Error::Unreachable("own-key response ended without a reply"))?;
                         open_response(&mut session, frame, request, node, clock())
                     } => result,
                 };
-                let ready = ResponseReady { request, node, peer, connection, room: room_for_network, context,
+                let ready = ResponseReady { request, _lease: lease, cancel, node, peer, connection, room: room_for_network, context,
                     release: result, _credit: credit, _output: output, _secret: secret };
                 let _ = tx.send(NetEvent::OwnKeyResponseReady(Box::new(ready))).await;
             });
         });
         if authorized.is_none() {
-            self.own_key_active.remove(&request.room);
+            if let Some(attempt) = self
+                .own_key_active
+                .get(&(request.room, peer))
+                .filter(|attempt| attempt.request.id == request.id)
+            {
+                attempt.cancel.send_replace(true);
+            }
+            self.defer_own_key_policy(request.room);
         }
     }
 
     pub(super) fn receive_own_key_response(&mut self, ready: ResponseReady) {
         let request = ready.request;
-        if self.own_key_active.get(&request.room) != Some(&request.id) {
+        if *ready.cancel.borrow() {
+            return;
+        }
+        if !self
+            .own_key_active
+            .get(&(request.room, ready.peer))
+            .is_some_and(|attempt| attempt.request.id == request.id && !*attempt.cancel.borrow())
+        {
             return;
         }
         match &ready.release {
@@ -266,21 +439,30 @@ impl Node {
                 return;
             }
         }
-        self.own_key_pending.insert(request.room, ready);
+        self.own_key_pending
+            .insert((request.room, ready.peer), ready);
         self.try_install_own_key(request.room);
     }
 
     /// A ready response stays owned and charged while a different operation holds the room.
     /// The existing room-release continuation retries this exact response, not a network poll.
     pub(super) fn try_install_own_key(&mut self, room_id: Digest32) {
-        let Some(ready) = self.own_key_pending.remove(&room_id) else {
+        let Some(key) = self
+            .own_key_pending
+            .keys()
+            .find(|(room, _)| *room == room_id)
+            .copied()
+        else {
+            return;
+        };
+        let Some(ready) = self.own_key_pending.remove(&key) else {
             return;
         };
         let request = ready.request;
         let Ok(mut channel) = ready.room.try_lock() else {
             let node = ready.node;
             let room = Arc::clone(&ready.room);
-            self.own_key_pending.insert(room_id, ready);
+            self.own_key_pending.insert(key, ready);
             self.bounded_sync.wait_for_own_recovery_room(
                 &self.net_tx,
                 &mut self.next_token,
@@ -298,8 +480,12 @@ impl Node {
             &ready.context,
             &channel,
         ) {
-            if self.own_key_active.get(&room_id) == Some(&request.id) {
-                self.own_key_active.remove(&room_id);
+            if let Some(attempt) = self
+                .own_key_active
+                .get(&(room_id, ready.peer))
+                .filter(|attempt| attempt.request.id == request.id)
+            {
+                attempt.cancel.send_replace(true);
             }
             return;
         }
@@ -319,19 +505,28 @@ impl Node {
         });
         match result {
             Some(Ok(_)) => {
-                self.own_key_active.remove(&room_id);
+                for ((room, _), attempt) in &self.own_key_active {
+                    if *room == room_id {
+                        attempt.cancel.send_replace(true);
+                    }
+                }
+                self.own_key_pending.retain(|(room, _), _| *room != room_id);
                 self.own_key_parked.remove(&(room_id, ready.peer));
                 self.governance_work.wake_room(room_id);
             }
             Some(Err(error)) if ChannelState::receiver_release_cleanup_waiting(&error) => {
                 drop(channel);
-                self.own_key_pending.insert(room_id, ready);
+                self.own_key_pending.insert(key, ready);
                 self.governance_work.wake_room(room_id);
             }
             Some(Err(error)) if channel.is_poisoned() => {
                 // Local storage failure is room health, not evidence that this donor lacks a key.
                 // Keep the recovery obligation and stop selecting other donors for this failure.
-                self.own_key_active.remove(&room_id);
+                for ((room, _), attempt) in &self.own_key_active {
+                    if *room == room_id {
+                        attempt.cancel.send_replace(true);
+                    }
+                }
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {}: own history key could not be saved: {error}",
@@ -346,7 +541,14 @@ impl Node {
                 self.fail_own_key_request(request, ready.peer, ready.connection.serial());
             }
             None => {
-                self.own_key_active.remove(&room_id);
+                if let Some(attempt) = self
+                    .own_key_active
+                    .get(&(room_id, ready.peer))
+                    .filter(|attempt| attempt.request.id == request.id)
+                {
+                    attempt.cancel.send_replace(true);
+                }
+                self.defer_own_key_policy(room_id);
             }
         }
         // `ready` owns the secret lease, output bytes and peer credit until this point.
@@ -362,10 +564,7 @@ impl Node {
         chain: u64,
         iteration: u64,
     ) {
-        use crate::node::history_budget::Lane;
-        use crate::node::pairwise_stream::MAX_PAIRWISE_FRAME;
-
-        if self.locking != 0 || self.own_key_active.contains_key(&room_id) {
+        if self.locking != 0 {
             return;
         }
         let Some(profile) = self.profile.as_ref().filter(|p| p.is_unlocked()) else {
@@ -400,9 +599,21 @@ impl Node {
         }
         self.own_key_parked
             .retain(|(room, peer), _| self.ports.contains_key(&(*room, *peer)));
-        let mut selected = None;
+        for ((room, _), attempt) in &self.own_key_active {
+            if *room == room_id
+                && (attempt.request.target != target
+                    || attempt.request.key_epoch != epoch
+                    || attempt.request.chain != chain
+                    || attempt.request.floor != iteration)
+            {
+                attempt.cancel.send_replace(true);
+            }
+        }
+        let mut selected = Vec::new();
+        let mut missing_prekeys = BTreeSet::new();
         for ((r, peer), port) in &self.ports {
             if *r != room_id
+                || self.own_key_active.contains_key(&(room_id, *peer))
                 || !channel.is_member(peer)
                 || channel.has_left(peer)
                 || !self.trust.is_trusted(peer)
@@ -433,6 +644,7 @@ impl Node {
                 .map(|record| record.prekey_bundle)
                 .or_else(|| net.board_prejoin_bundle(&room_id, peer))
             else {
+                missing_prekeys.insert(*peer);
                 continue;
             };
             let Ok(bundle) = prekeys::delivery_bundle(
@@ -441,86 +653,289 @@ impl Node {
                 &self.refused_otps.of(peer),
                 prekeys::SpentOneTime::SignedPrekey,
             ) else {
+                missing_prekeys.insert(*peer);
                 continue;
             };
-            selected = Some((*peer, connection, bundle));
-            break;
+            let availability = port.availability.remote(connection.serial());
+            selected.push((*peer, connection, bundle, availability));
         }
         drop(channel);
-        let Some((peer, connection, bundle)) = selected else {
+        let mut candidates = Vec::new();
+        for (peer, connection, bundle, availability) in selected {
+            if self.reserve_pairwise(peer, &[]).is_none() {
+                continue;
+            }
+            if let Some(out) = self.pairwise_out.get(&peer) {
+                candidates.push((
+                    peer,
+                    connection,
+                    bundle,
+                    availability,
+                    Arc::clone(&out.jobs),
+                    out.queue.clone(),
+                ));
+            }
+        }
+        self.own_key_credit_trust.insert(
+            room_id,
+            self.ports
+                .keys()
+                .filter_map(|(room, peer)| {
+                    (*room == room_id && self.trust.is_trusted(peer)).then_some(*peer)
+                })
+                .collect(),
+        );
+        if candidates.is_empty() {
+            if !missing_prekeys.is_empty() {
+                self.own_key_credit_missing
+                    .insert(room_id, (context.epoch, missing_prekeys));
+            } else {
+                self.own_key_credit_missing.remove(&room_id);
+            }
             return;
-        };
-        let Ok(id) = crate::identity::rng::random_array::<16>() else {
-            return;
-        };
-        let request = Request {
-            id,
-            room: room_id,
-            session_epoch: context.epoch,
-            key_epoch: epoch,
-            target,
-            chain,
-            floor: iteration,
-            availability: self
-                .ports
-                .get(&(room_id, peer))
-                .and_then(|p| p.availability.remote(connection.serial())),
-        };
-        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
-            return;
-        };
-        let secret = Arc::new(secret);
-        let Some(admission) = self
-            .reserve_pairwise(peer, &[false])
-            .and_then(|mut a| a.pop())
-        else {
-            drop(secret);
-            let Some(out) = self.pairwise_out.get(&peer) else {
-                return;
+        }
+        drop(ring);
+        self.own_key_credit_missing
+            .insert(room_id, (context.epoch, missing_prekeys));
+
+        for (peer, connection, bundle, availability, peer_jobs, queue) in candidates {
+            let Ok(id) = crate::identity::rng::random_array::<16>() else {
+                continue;
             };
-            let node_jobs = Arc::clone(&self.pairwise_jobs);
-            let peer_jobs = Arc::clone(&out.jobs);
-            let queue = out.queue.clone();
+            let request = Request {
+                id,
+                room: room_id,
+                session_epoch: context.epoch,
+                key_epoch: epoch,
+                target,
+                chain,
+                floor: iteration,
+                availability,
+            };
+            let (cancel_tx, mut cancel) = tokio::sync::watch::channel(false);
+            self.own_key_active.insert(
+                (room_id, peer),
+                ActiveAttempt {
+                    request,
+                    cancel: cancel_tx,
+                },
+            );
+            let lease = self
+                .own_key_completions
+                .lease(super::own_attempts::Identity {
+                    room: room_id,
+                    peer,
+                    request: id,
+                });
+            let failure_lease = Arc::clone(&lease);
+            let room = Arc::clone(&room);
+            let context = context.clone();
             let tx = self.net_tx.clone();
             let mut epoch_changed = self.pairwise_epoch.subscribe();
             let mut room_cancel = self.own_key_room_watch(room_id);
-            self.own_key_active.insert(room_id, id);
             tokio::spawn(async move {
+                let opened = tokio::select! {
+                    biased;
+                    _ = epoch_changed.changed() => return,
+                    _ = room_cancel.changed() => return,
+                    _ = cancel.changed() => return,
+                    result = connection.quinn().open_bi() => result,
+                };
+                let Ok((send, recv)) = opened else {
+                    drop(lease);
+                    let _ = tx
+                        .send(NetEvent::OwnKeyRequestFailed {
+                            _lease: Arc::clone(&failure_lease),
+                            request,
+                            peer,
+                            connection: connection.serial(),
+                        })
+                        .await;
+                    return;
+                };
+                let peer_credit = tokio::select! {
+                    biased;
+                    _ = epoch_changed.changed() => return,
+                    _ = room_cancel.changed() => return,
+                    _ = cancel.changed() => return,
+                    _ = connection.quinn().closed() => { drop(lease); let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection.serial() }).await; return; },
+                    permit = peer_jobs.acquire_owned() => permit,
+                };
+                let Ok(peer_credit) = peer_credit else {
+                    return;
+                };
+                let queue = tokio::select! {
+                    biased;
+                    _ = epoch_changed.changed() => return,
+                    _ = room_cancel.changed() => return,
+                    _ = cancel.changed() => return,
+                    _ = connection.quinn().closed() => { drop((lease, peer_credit)); let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection.serial() }).await; return; },
+                    permit = queue.reserve_owned() => permit,
+                };
+                let Ok(queue) = queue else {
+                    return;
+                };
+                let connection_watch = Arc::clone(&connection);
+                let ready = OpenReady {
+                    request,
+                    lease,
+                    cancel: cancel.clone(),
+                    node,
+                    peer,
+                    connection,
+                    room,
+                    context,
+                    bundle,
+                    send,
+                    recv,
+                    peer_credit,
+                    queue,
+                };
                 tokio::select! {
                     biased;
-                    _ = epoch_changed.changed() => (),
-                    _ = room_cancel.changed() => (),
-                    result = async {
-                        let node = node_jobs.acquire_owned().await.ok()?;
-                        let peer = peer_jobs.acquire_owned().await.ok()?;
-                        let slot = queue.reserve_owned().await.ok()?;
-                        drop((node, peer, slot));
-                        Some(())
-                    } => {
-                        if result.is_some() {
-                            let _ = tx.send(NetEvent::OwnKeyCapacityReady { request }).await;
-                        }
+                    _ = epoch_changed.changed() => {},
+                    _ = room_cancel.changed() => {},
+                    _ = cancel.changed() => {},
+                    _ = connection_watch.quinn().closed() => {},
+                    _ = tx.send(NetEvent::OwnKeyOpenReady(Box::new(ready))) => {},
+                }
+            });
+        }
+    }
+
+    pub(super) fn finish_own_key_open(&mut self, ready: OpenReady) {
+        use crate::node::history_budget::Lane;
+        use crate::node::pairwise_stream::MAX_PAIRWISE_FRAME;
+        let room_lock = Arc::clone(&ready.room);
+        let Ok(channel) = room_lock.try_lock() else {
+            let request = ready.request;
+            let failure_lease = Arc::clone(&ready.lease);
+            let mut cancel = ready.cancel.clone();
+            let room = Arc::clone(&ready.room);
+            let connection = Arc::clone(&ready.connection);
+            let peer = ready.peer;
+            let tx = self.net_tx.clone();
+            let mut epoch_changed = self.pairwise_epoch.subscribe();
+            let mut room_cancel = self.own_key_room_watch(request.room);
+            tokio::spawn(async move {
+                let available = tokio::select! {
+                    biased;
+                    _ = epoch_changed.changed() => false,
+                    _ = room_cancel.changed() => false,
+                    _ = cancel.changed() => false,
+                    _ = connection.quinn().closed() => { let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection.serial() }).await; false },
+                    channel = room.lock() => { drop(channel); true },
+                };
+                if available {
+                    tokio::select! {
+                        biased;
+                        _ = epoch_changed.changed() => {},
+                        _ = room_cancel.changed() => {},
+                        _ = cancel.changed() => {},
+                        _ = connection.quinn().closed() => { let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection.serial() }).await; },
+                        _ = tx.send(NetEvent::OwnKeyOpenReady(Box::new(ready))) => {},
                     }
                 }
             });
             return;
         };
-        let PairwiseAdmission {
-            queue, job: credit, ..
-        } = admission;
-        self.own_key_active.insert(room_id, id);
+        if !self.own_key_current(
+            ready.request,
+            (ready.node, ready.peer),
+            &ready.connection,
+            &ready.room,
+            &ready.context,
+            &channel,
+        ) {
+            if let Some(attempt) = self
+                .own_key_active
+                .get(&(ready.request.room, ready.peer))
+                .filter(|attempt| attempt.request.id == ready.request.id)
+            {
+                attempt.cancel.send_replace(true);
+            }
+            return;
+        }
+        drop(channel);
+        let OpenReady {
+            request,
+            lease,
+            mut cancel,
+            node,
+            peer,
+            connection,
+            room,
+            context,
+            bundle,
+            send,
+            recv,
+            peer_credit,
+            queue,
+        } = ready;
+        let Some(ring) = self.prekeys.as_ref().map(Arc::downgrade) else {
+            self.fail_own_key_request(request, peer, connection.serial());
+            return;
+        };
+        let node_jobs = Arc::clone(&self.pairwise_jobs);
+        let secret_work = Arc::clone(&self.secret_work);
         let budget = Arc::clone(&self.history_budget);
         let tx = self.net_tx.clone();
         let mut epoch_changed = self.pairwise_epoch.subscribe();
-        let mut room_cancel = self.own_key_room_watch(room_id);
-        let worker_secret = Arc::clone(&secret);
+        let mut room_cancel = self.own_key_room_watch(request.room);
         let connection_serial = connection.serial();
+        let failure_lease = Arc::clone(&lease);
         tokio::spawn(async move {
+            let node_credit = tokio::select! {
+                biased;
+                _ = epoch_changed.changed() => return,
+                _ = room_cancel.changed() => return,
+                    _ = cancel.changed() => return,
+                _ = connection.quinn().closed() => { drop((peer_credit, queue)); let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection_serial }).await; return; },
+                permit = node_jobs.acquire_owned() => permit,
+            };
+            let Ok(node_credit) = node_credit else {
+                drop((peer_credit, queue));
+                let _ = tx
+                    .send(NetEvent::OwnKeyRequestFailed {
+                        _lease: Arc::clone(&failure_lease),
+                        request,
+                        peer,
+                        connection: connection_serial,
+                    })
+                    .await;
+                return;
+            };
+            let credit = PairwiseCredit {
+                _node: node_credit,
+                _peer: peer_credit,
+            };
+            let secret = tokio::select! {
+                biased;
+                _ = epoch_changed.changed() => return,
+                _ = room_cancel.changed() => return,
+                    _ = cancel.changed() => return,
+                _ = connection.quinn().closed() => { drop((credit, queue)); let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection_serial }).await; return; },
+                secret = secret_work.read_owned() => Arc::new(secret),
+            };
+            let Some(ring) = ring.upgrade() else {
+                drop((secret, credit, queue));
+                let _ = tx
+                    .send(NetEvent::OwnKeyRequestFailed {
+                        _lease: Arc::clone(&failure_lease),
+                        request,
+                        peer,
+                        connection: connection_serial,
+                    })
+                    .await;
+                return;
+            };
             let (job, mut work) = loop {
                 let job = tokio::select! {
                     biased;
                     _ = epoch_changed.changed() => return,
                     _ = room_cancel.changed() => return,
+                    _ = cancel.changed() => return,
+                    _ = connection.quinn().closed() => { drop((secret, credit, queue)); let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection_serial }).await; return; },
                     job = budget.admit_job(node, Lane::LargeControl) => job,
                 };
                 let envelope = Lane::LargeControl.buffer_limit() / 4;
@@ -528,11 +943,20 @@ impl Node {
                     Ok(work) => break (job, work),
                     Err(Error::HistoryCapacity(pressure)) => {
                         drop(job);
-                        tokio::select! { biased; _ = epoch_changed.changed() => return, _ = room_cancel.changed() => return, _ = pressure.released() => {} }
+                        tokio::select! {
+                                biased;
+                                _ = epoch_changed.changed() => return,
+                                _ = room_cancel.changed() => return,
+                        _ = cancel.changed() => return,
+                                _ = connection.quinn().closed() => { drop((secret, credit, queue)); let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection_serial }).await; return; },
+                                _ = pressure.released() => {},
+                            }
                     }
                     Err(_) => {
+                        drop((secret, credit, queue));
                         let _ = tx
                             .send(NetEvent::OwnKeyRequestFailed {
+                                _lease: Arc::clone(&failure_lease),
                                 request,
                                 peer,
                                 connection: connection_serial,
@@ -543,8 +967,10 @@ impl Node {
                 }
             };
             let Some(output) = work.split_off(2 * MAX_PAIRWISE_FRAME) else {
+                drop((secret, credit, queue));
                 let _ = tx
                     .send(NetEvent::OwnKeyRequestFailed {
+                        _lease: Arc::clone(&failure_lease),
                         request,
                         peer,
                         connection: connection_serial,
@@ -552,8 +978,11 @@ impl Node {
                     .await;
                 return;
             };
+            let worker_secret = Arc::clone(&secret);
+            let worker_lease = Arc::clone(&lease);
             let worker = tokio::task::spawn_blocking(move || {
                 let _secret = worker_secret;
+                let _lease = worker_lease;
                 let prepared = (|| {
                     let ring = ring.blocking_lock();
                     let (initial, mut session) = crate::pairwise::session::Session::initiate(
@@ -576,8 +1005,10 @@ impl Node {
                 (prepared, output)
             });
             let Ok((prepared, output)) = worker.await else {
+                drop((secret, credit, queue));
                 let _ = tx
                     .send(NetEvent::OwnKeyRequestFailed {
+                        _lease: Arc::clone(&failure_lease),
                         request,
                         peer,
                         connection: connection_serial,
@@ -586,8 +1017,10 @@ impl Node {
                 return;
             };
             let Ok(output) = output.into_output() else {
+                drop((secret, credit, queue));
                 let _ = tx
                     .send(NetEvent::OwnKeyRequestFailed {
+                        _lease: Arc::clone(&failure_lease),
                         request,
                         peer,
                         connection: connection_serial,
@@ -598,20 +1031,32 @@ impl Node {
             if epoch_changed.has_changed().unwrap_or(true) || *room_cancel.borrow() {
                 return;
             }
+            let connection_watch = Arc::clone(&connection);
             let ready = RequestReady {
                 request,
+                lease,
+                cancel: cancel.clone(),
                 node,
                 peer,
                 connection,
                 room,
                 context,
                 prepared,
+                send,
+                recv,
                 queue,
                 credit,
                 output,
                 secret,
             };
-            let _ = tx.send(NetEvent::OwnKeyRequestReady(Box::new(ready))).await;
+            tokio::select! {
+                biased;
+                _ = epoch_changed.changed() => {},
+                _ = room_cancel.changed() => {},
+                _ = cancel.changed() => {},
+                _ = connection_watch.quinn().closed() => { let _ = tx.send(NetEvent::OwnKeyRequestFailed { _lease: Arc::clone(&failure_lease), request, peer, connection: connection_serial }).await; },
+                _ = tx.send(NetEvent::OwnKeyRequestReady(Box::new(ready))) => {},
+            }
         });
     }
 

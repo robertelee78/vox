@@ -52,6 +52,7 @@ mod governance;
 mod history_demand;
 mod key_body_scan;
 mod local_trust;
+mod own_attempts;
 mod own_keys;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
@@ -709,10 +710,11 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::OwnKeyComputerReady { .. } => "resuming Computer policy",
         NetEvent::OwnKeyComputerCancelled { .. } => "retiring Computer policy",
         NetEvent::OwnKeyUnlockReady { .. } => "resuming identity unlock",
+        NetEvent::OwnKeyOpenReady(..) => "starting an own-key recovery stream",
+        NetEvent::OwnKeyPolicyReady { .. } => "resuming own-key recovery after Computer policy",
         NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
         NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
         NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
-        NetEvent::OwnKeyCapacityReady { .. } => "resuming own-key recovery after capacity release",
         NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
         NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
         NetEvent::Stream { .. } => "serving a stream",
@@ -1446,15 +1448,18 @@ enum NetEvent {
         owner: Arc<()>,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
     },
+    OwnKeyPolicyReady {
+        room: Digest32,
+        owner: Arc<()>,
+    },
+    OwnKeyOpenReady(Box<own_keys::OpenReady>),
     OwnKeyRequestReady(Box<own_keys::RequestReady>),
     OwnKeyResponseReady(Box<own_keys::ResponseReady>),
     OwnKeyRequestFailed {
+        _lease: Arc<own_attempts::Lease>,
         request: own_keys::Request,
         peer: Digest32,
         connection: u64,
-    },
-    OwnKeyCapacityReady {
-        request: own_keys::Request,
     },
     /// A stream that carried this node's hello to `peer` could not be written: the peer does not
     /// hold the session, so the next delivery must carry the hello again.
@@ -5531,9 +5536,13 @@ pub struct Node {
     /// The exact authenticated own message whose body the readability audit still needs.
     own_recovery_body_debts: BTreeMap<Digest32, (Digest32, u64, Digest32)>,
     /// At most one exact self-author key request is physically in flight per room.
-    own_key_active: BTreeMap<Digest32, [u8; 16]>,
+    own_key_active: BTreeMap<(Digest32, Digest32), own_keys::ActiveAttempt>,
+    own_key_completions: Arc<own_attempts::Completions>,
+    own_key_credit_trust: BTreeMap<Digest32, BTreeSet<Digest32>>,
+    own_key_credit_missing: BTreeMap<Digest32, (u64, BTreeSet<Digest32>)>,
+    own_key_policy_waiting: BTreeMap<Digest32, Arc<()>>,
     own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
-    own_key_pending: BTreeMap<Digest32, own_keys::ResponseReady>,
+    own_key_pending: BTreeMap<(Digest32, Digest32), own_keys::ResponseReady>,
     own_key_interrupted_pending: BTreeMap<(Digest32, Digest32), own_keys::InterruptedReady>,
     own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
     own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
@@ -6418,6 +6427,10 @@ impl Node {
             own_recovery_rooms: BTreeMap::new(),
             own_recovery_body_debts: BTreeMap::new(),
             own_key_active: BTreeMap::new(),
+            own_key_completions: Arc::new(own_attempts::Completions::default()),
+            own_key_credit_trust: BTreeMap::new(),
+            own_key_credit_missing: BTreeMap::new(),
+            own_key_policy_waiting: BTreeMap::new(),
             own_key_parked: BTreeMap::new(),
             own_key_pending: BTreeMap::new(),
             own_key_interrupted_pending: BTreeMap::new(),
@@ -6821,6 +6834,7 @@ impl Node {
         let ingress_wake = Arc::clone(&self.session_ingress_wake);
         let bounded_completion_wake = Arc::clone(&self.bounded_completion_wake);
         let role_wake = Arc::clone(&self.role_wake);
+        let own_key_completions = Arc::clone(&self.own_key_completions);
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Preparation, cleanup, governance and package scans share one select slot. Rotate between
@@ -6839,6 +6853,15 @@ impl Node {
             tokio::pin!(governance_deadline);
             tokio::select! {
                 () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
+                () = own_key_completions.notify.notified() => {
+                    for completed in own_key_completions.take() {
+                        let key = (completed.room, completed.peer);
+                        if self.own_key_active.get(&key).is_some_and(|active| active.request.id == completed.request) {
+                            self.own_key_active.remove(&key);
+                            if self.channels.contains_key(&completed.room) { self.governance_work.wake_room(completed.room); }
+                        }
+                    }
+                }
                 () = &mut governance_deadline => {
                     // Certificate expiry is its own causal wake. A quiet room does not wait for
                     // the one-second actor tick, a command, or network traffic to invalidate it.
@@ -7140,6 +7163,9 @@ impl Node {
                     }
                 }
                 _ = role_wake.notify.notified() => {
+                    for (room, owner) in role_wake.take_board() {
+                        if role_wake.current(room, &owner) { self.own_key_board_growth(room); }
+                    }
                     for ((room, peer), owner) in role_wake.take() {
                         if !self.channels.contains_key(&room) || !role_wake.current(room, &owner) {
                             continue;
@@ -7972,7 +7998,9 @@ impl Node {
         // all belong to other channels. The drop is acceptable, not harmless.
         {
             let tx = self.net_tx.clone();
+            let role_wake = Arc::clone(&self.role_wake);
             net.on_board_growth(Arc::new(move |channel_id: Digest32| {
+                role_wake.board_growth(channel_id);
                 let _ = tx.try_send(NetEvent::BoardGrew { channel_id });
             }));
             // A withdraw changes what the board shows (V030-14): an event, so the view is
@@ -10671,6 +10699,7 @@ impl Node {
                         Ok(()) => {
                             self.reopen_remembered().await;
                             self.resume_own_key_interruptions();
+                            self.resume_own_key_policy_waiting();
                             self.publish().await;
                             let _ = reply.send(Outcome::Done);
                         }
@@ -11024,20 +11053,28 @@ impl Node {
                     }
                 }
             }
+            NetEvent::OwnKeyPolicyReady { room, owner } => {
+                if self
+                    .own_key_policy_waiting
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    self.own_key_policy_waiting.remove(&room);
+                    if self.channels.contains_key(&room) {
+                        self.governance_work.wake_room(room);
+                    }
+                }
+            }
+            NetEvent::OwnKeyOpenReady(ready) => self.finish_own_key_open(*ready),
             NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
             NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
             NetEvent::OwnKeyRequestFailed {
+                _lease,
                 request,
                 peer,
                 connection,
             } => {
                 self.fail_own_key_request(request, peer, connection);
-            }
-            NetEvent::OwnKeyCapacityReady { request } => {
-                if self.own_key_active.get(&request.room) == Some(&request.id) {
-                    self.own_key_active.remove(&request.room);
-                    self.governance_work.wake_room(request.room);
-                }
             }
             NetEvent::HelloUndelivered {
                 channel_id,
@@ -11425,6 +11462,13 @@ impl Node {
                 });
                 if changed_connection {
                     for room in self.channels.keys().copied() {
+                        if self.ports.contains_key(&(room, peer))
+                            && (self.own_key_active.keys().any(|(r, _)| *r == room)
+                                || self.own_key_credit_missing.contains_key(&room)
+                                || self.own_recovery_rooms.contains_key(&room))
+                        {
+                            self.governance_work.wake_room(room);
+                        }
                         if let Some(owner) = self.role_wake.owner(room) {
                             owner.on_connect(peer);
                             if let Some(conn) = conn.as_ref() {
@@ -16913,6 +16957,29 @@ impl Node {
     /// refusals. Retire selected logical roots even for a newly untrusted peer; physical
     /// workers retain their own staging until cleanup. Ordinary room traffic does not do this.
     fn note_key_body_trust_change(&mut self) {
+        for ((_, peer), attempt) in &self.own_key_active {
+            if !self.trust.is_trusted(peer) {
+                attempt.cancel.send_replace(true);
+            }
+        }
+        let changed: Vec<_> = self
+            .own_key_credit_trust
+            .iter()
+            .filter_map(|(room, previous)| {
+                let current: BTreeSet<_> = self
+                    .ports
+                    .keys()
+                    .filter_map(|(r, peer)| {
+                        (*r == *room && self.trust.is_trusted(peer)).then_some(*peer)
+                    })
+                    .collect();
+                (current != *previous).then_some((*room, current))
+            })
+            .collect();
+        for (room, current) in changed {
+            self.own_key_credit_trust.insert(room, current);
+            self.governance_work.wake_room(room);
+        }
         for (&(room, peer), port) in &mut self.ports {
             let current = self
                 .channels
@@ -16962,6 +17029,15 @@ impl Node {
         else {
             return false;
         };
+        if self
+            .own_key_active
+            .keys()
+            .any(|(room, _)| room == channel_id)
+            || self.own_key_credit_missing.contains_key(channel_id)
+            || self.own_recovery_rooms.contains_key(channel_id)
+        {
+            self.governance_work.wake_room(*channel_id);
+        }
         self.ports.insert(
             (*channel_id, *peer),
             crate::node::ports::Port::new(room, gen, epoch, sparse, availability),
@@ -17013,6 +17089,9 @@ impl Node {
         peer: &Digest32,
         preserve_unstarted: bool,
     ) {
+        if let Some(attempt) = self.own_key_active.get(&(*channel_id, *peer)) {
+            attempt.cancel.send_replace(true);
+        }
         if let Some((request, generation, fence)) = self
             .bounded_sync
             .physical_archive_for_port(*channel_id, *peer)
@@ -19780,7 +19859,8 @@ impl Node {
     ) -> Option<Vec<PairwiseAdmission>> {
         // An idle peer must not leave a writer/credit registry entry behind forever.
         self.pairwise_out.retain(|_, out| {
-            out.jobs.available_permits() != PAIRWISE_PEER_LIMIT
+            Arc::strong_count(&out.jobs) > 1
+                || out.jobs.available_permits() != PAIRWISE_PEER_LIMIT
                 || out.deliveries.available_permits() != PAIRWISE_PEER_LIMIT
         });
         let out = self.pairwise_out.entry(peer).or_insert_with(|| {
@@ -21103,6 +21183,7 @@ impl Node {
         }
         if outcome.is_done() {
             self.resume_own_key_interruptions();
+            self.resume_own_key_policy_waiting();
         }
         // Publish identity, trust and room preparation before acknowledging Ready.
         self.publish().await;
@@ -22957,6 +23038,7 @@ impl Node {
                 if result.is_ok() {
                     self.governance_work.resume_after_computer_policy();
                     self.resume_own_key_interruptions();
+                    self.resume_own_key_policy_waiting();
                 }
                 let _ = work.reply.send(result);
             }

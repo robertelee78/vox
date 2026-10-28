@@ -565,6 +565,7 @@ impl Node {
         };
         let store = profile.store_handle();
         let now = self.now_ms();
+        let mut authority_wait = false;
         let (changed, completed, receiver_changed, audit, key) = {
             let Ok(mut channel) = shared.try_lock() else {
                 // A read-only holder need not publish another event. Retain this exact room's
@@ -625,7 +626,10 @@ impl Node {
                         channel.poison(&error);
                         (false, false, crate::node::channel::OwnReadability::Waiting)
                     }
-                    None => (false, false, crate::node::channel::OwnReadability::Waiting),
+                    None => {
+                        authority_wait = true;
+                        (false, false, crate::node::channel::OwnReadability::Waiting)
+                    }
                 };
             let key = match channel.own_recovery_key(&store) {
                 Ok(key) => key,
@@ -636,6 +640,9 @@ impl Node {
             };
             (changed, completed, receiver_changed, audit, key)
         };
+        if authority_wait {
+            self.defer_own_key_policy(room);
+        }
         if matches!(audit, crate::node::channel::OwnReadability::Runnable) {
             self.governance_work.wake_room(room);
         }

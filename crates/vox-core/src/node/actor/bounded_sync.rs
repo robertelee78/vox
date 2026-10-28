@@ -2415,6 +2415,7 @@ impl Node {
                 }
                 if flow.admitted_authors > 0 {
                     flow.admitted_authors = 0;
+                    self.role_wake.board_growth(work.room);
                     let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                         channel_id: work.room,
                     });
@@ -2607,6 +2608,7 @@ impl Node {
             }
             if flow.admitted_authors > 0 {
                 flow.admitted_authors = 0;
+                self.role_wake.board_growth(work.room);
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                     channel_id: work.room,
                 });
