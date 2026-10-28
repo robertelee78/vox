@@ -882,6 +882,7 @@ impl Node {
         let response_connection = Arc::clone(&connection);
         let response_context = context.clone();
         let tx = self.net_tx.clone();
+        let event_tx = self.event_tx.clone();
         let admitted = self.with_current_computer_authority(|| {
             if computer
                 .as_ref()
@@ -930,7 +931,16 @@ impl Node {
                 if let Some(interruption) = interruption {
                     if *revoked.borrow() {
                         if let (Some(computer), Some(settled)) = (&computer, &mut settled) {
-                            while computer.own_key_authority_blocked() {
+                            loop {
+                                if let Err(error) = computer.storage_ready() {
+                                    let _ = event_tx.send(NodeEvent::NodeNote {
+                                        note: format!("own-key recovery response stopped: {error}"),
+                                    });
+                                    return;
+                                }
+                                if !computer.own_key_authority_blocked() {
+                                    break;
+                                }
                                 tokio::select! {
                                     biased;
                                     _ = room_cancel.changed() => return,
