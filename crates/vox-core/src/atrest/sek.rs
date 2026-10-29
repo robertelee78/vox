@@ -239,10 +239,45 @@ fn derive_kek(
 /// never handed out by value and never escapes except inside tightly-scoped
 /// [`Zeroizing`] temporaries within this module.
 pub struct Sek {
-    /// The key bytes in locked/zeroizing memory; emptied when `locked`.
+    owner: std::sync::Arc<std::sync::RwLock<KeyState>>,
+    primary: bool,
+}
+
+struct KeyState {
     key: SecretBuf,
-    /// Whether the SEK has been invalidated by an app-lock.
     locked: bool,
+}
+
+/// A bounded borrow of the sole key buffer. App-lock drains these borrows before wiping.
+pub struct KeyBytes<'a>(std::sync::RwLockReadGuard<'a, KeyState>);
+impl std::ops::Deref for KeyBytes<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.0.key.as_slice()
+    }
+}
+
+/// Read resources cannot keep an unlocked room's key owner alive.
+#[derive(Clone)]
+pub(crate) struct WeakSek(std::sync::Weak<std::sync::RwLock<KeyState>>);
+impl WeakSek {
+    pub(crate) fn with<T>(&self, read: impl FnOnce(&Sek) -> Result<T>) -> Result<T> {
+        let owner = self.0.upgrade().ok_or(Error::AtRestLocked)?;
+        let sek = Sek {
+            owner,
+            primary: false,
+        };
+        sek.key_bytes()?;
+        read(&sek)
+    }
+}
+
+impl Drop for Sek {
+    fn drop(&mut self) {
+        if self.primary {
+            self.lock_now();
+        }
+    }
 }
 
 impl Sek {
@@ -265,25 +300,36 @@ impl Sek {
     #[must_use]
     pub fn from_bytes(key: Zeroizing<[u8; SEK_LEN]>) -> Self {
         Self {
-            key: SecretBuf::from_array(key),
-            locked: false,
+            owner: std::sync::Arc::new(std::sync::RwLock::new(KeyState {
+                key: SecretBuf::from_array(key),
+                locked: false,
+            })),
+            primary: true,
         }
     }
 
     /// Borrow the key bytes for AEAD keying, **iff** the SEK is still unlocked.
     /// Returns [`Error::AtRestLocked`] after [`Sek::lock_now`] — the enforcement
     /// point for ADR-010's "post-lock unseal fails until re-auth".
-    pub fn key_bytes(&self) -> Result<&[u8]> {
-        if self.locked {
+    pub fn key_bytes(&self) -> Result<KeyBytes<'_>> {
+        let state = self.owner.read().unwrap_or_else(|error| error.into_inner());
+        if state.locked {
             return Err(Error::AtRestLocked);
         }
-        Ok(self.key.as_slice())
+        Ok(KeyBytes(state))
+    }
+
+    pub(crate) fn reader(&self) -> WeakSek {
+        WeakSek(std::sync::Arc::downgrade(&self.owner))
     }
 
     /// Whether this SEK has been invalidated by an app-lock.
     #[must_use]
     pub fn is_locked(&self) -> bool {
-        self.locked
+        self.owner
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .locked
     }
 
     /// Whether the key buffer is `mlock`ed (best-effort, ADR-010): `false` means
@@ -291,7 +337,11 @@ impl Sek {
     /// so (ADR-015 memory-protection honesty).
     #[must_use]
     pub fn is_mlocked(&self) -> bool {
-        self.key.is_mlocked()
+        self.owner
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .key
+            .is_mlocked()
     }
 
     /// **App-lock**: zeroize the key and invalidate this SEK (manual lock / idle /
@@ -299,8 +349,12 @@ impl Sek {
     /// SEK-backed operation fail with [`Error::AtRestLocked`] until a fresh SEK is
     /// re-derived from both factors.
     pub fn lock_now(&mut self) {
-        self.key.lock_now();
-        self.locked = true;
+        let mut state = self
+            .owner
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        state.key.lock_now();
+        state.locked = true;
     }
 
     /// Double-lock **seal**: wrap this SEK under `(identity factor, passphrase)`
@@ -359,7 +413,7 @@ impl Sek {
             .encrypt(
                 &nonce.into(),
                 Payload {
-                    msg: key,
+                    msg: &key,
                     aad: WRAP_AAD,
                 },
             )
@@ -376,7 +430,7 @@ impl Sek {
 impl core::fmt::Debug for Sek {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Sek")
-            .field("locked", &self.locked)
+            .field("locked", &self.is_locked())
             .finish_non_exhaustive()
     }
 }

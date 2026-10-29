@@ -1,6 +1,6 @@
 //! Daemon-only local trust (ADR-031 LT-1–6). No IPC request exposes these operations.
 use super::*;
-use crate::node::trust::{Capability, HistoryGrant};
+use crate::node::trust::Capability;
 
 impl NodeHandle {
     /// The daemon reads manual-removal exclusions from an unlocked node it already owns.
@@ -41,96 +41,5 @@ impl NodeHandle {
             return Outcome::Failed(Fault::Internal);
         }
         rx.await.unwrap_or(Outcome::Failed(Fault::Internal))
-    }
-}
-
-impl Node {
-    pub(super) fn import_local_trust_history(&mut self) -> crate::error::Result<()> {
-        if self.trust.local_history_imported() {
-            self.decisions.hold_for_local_trust_import(false);
-            return Ok(());
-        }
-        let profile = self.profile.as_ref().ok_or(Error::Profile("no identity"))?;
-        let signer = profile.signer()?;
-        let removed = self.decisions.local_trust_removals()?;
-        let mut next = self.trust.clone();
-        next.import_local_removals(removed);
-        next.save(profile.store(), signer)?;
-        if let Some((room, peer, instance, request, generation)) =
-            self.history_demand.note_route_trust_change()
-        {
-            self.bounded_sync
-                .cancel_unstarted_archive_admission(room, peer, instance, request, generation);
-            self.sched_rooms.insert(room);
-        }
-        self.trust = next;
-        self.note_key_body_trust_change();
-        self.decisions.hold_for_local_trust_import(false);
-        Ok(())
-    }
-
-    pub(super) fn local_trust_blacklist(
-        &mut self,
-    ) -> crate::error::Result<Option<BTreeSet<Digest32>>> {
-        if self.profile.as_ref().is_none_or(|p| !p.is_unlocked()) {
-            return Ok(None);
-        }
-        self.import_local_trust_history()?;
-        Ok(Some(self.trust.local_removals().clone()))
-    }
-
-    pub(super) async fn trust_local_node(
-        &mut self,
-        fingerprint: Digest32,
-        name: &str,
-        capability: Capability,
-    ) -> Outcome {
-        // A local grant queued before pairing cannot widen the fixed computer policy.
-        if self.computer.as_ref().is_some_and(|c| c.grouped()) {
-            return Outcome::Done;
-        }
-        let Some(profile) = self.profile.as_ref() else {
-            return Outcome::Failed(Fault::NoIdentity);
-        };
-        if !profile.is_unlocked() {
-            return Outcome::Failed(Fault::Locked);
-        }
-        if fingerprint == profile.fingerprint() {
-            return Outcome::Done;
-        }
-        if let Err(e) = self.import_local_trust_history() {
-            return Outcome::Failed(fault_of(&e));
-        }
-        // Recheck inside the actor: a queued grant must not undo a removal processed since
-        // the daemon read its snapshot.
-        if self.trust.local_removals().contains(&fingerprint) {
-            return Outcome::Done;
-        }
-        let held = self.trust.capability(&fingerprint);
-        if held.is_some_and(|held| held >= capability) {
-            return Outcome::Done;
-        }
-        let name = self.trust.petname(&fingerprint).unwrap_or(name).to_owned();
-        let history = if held.is_some() {
-            self.trust.history(&fingerprint)
-        } else {
-            HistoryGrant::Now
-        };
-        let outcome = self
-            .trust_identity(fingerprint, &name, history, Some(capability))
-            .await;
-        if matches!(outcome, Outcome::Done) {
-            self.decided(
-                "to trust a node of this computer",
-                fingerprint,
-                None,
-                crate::node::decisions::Decided::Trusted,
-                format!(
-                    "the daemon applied this computer's local trust rule: {}",
-                    capability.words()
-                ),
-            );
-        }
-        outcome
     }
 }

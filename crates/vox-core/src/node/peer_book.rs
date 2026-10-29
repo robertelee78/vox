@@ -41,7 +41,7 @@ use crate::error::{Error, Result};
 use crate::hash::{sha256, Digest32};
 use crate::identity::composite::RootSigner;
 use crate::nat::multiaddr::{EndpointList, Multiaddr};
-use crate::node::store::Store;
+use crate::node::store::{Batch, Store};
 
 /// HKDF label for the book's sealing key.
 pub const PEER_BOOK_SEK_INFO: &[u8] = b"vox/peer-book-sek/v1";
@@ -83,11 +83,11 @@ fn peer_book_sek(signer: &dyn RootSigner) -> Result<Sek> {
     Ok(Sek::from_bytes(key))
 }
 
-/// Save bounded self-reported anchor hints in the node's existing sealed metadata store.
+/// Queue bounded self-reported anchor hints in the node's existing sealed metadata store.
 /// A different metadata key and segment id keep them separate from addresses actually reached.
 /// This cache supplies no authorization; callers must intersect with current anchor sources.
-pub fn save_anchor_hints(
-    store: &Store,
+pub fn queue_anchor_hints(
+    batch: &mut crate::node::store::Batch<'_>,
     signer: &dyn RootSigner,
     hints: &crate::nat::bootstrap::BootstrapSet,
 ) -> Result<()> {
@@ -100,7 +100,7 @@ pub fn save_anchor_hints(
     let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
     blob.extend_from_slice(&sealed.nonce);
     blob.extend_from_slice(&sealed.ciphertext);
-    store.put_meta("anchor-endpoint-hints", &blob)
+    batch.put_meta("anchor-endpoint-hints", &blob)
 }
 
 /// Read the self-reported hint cache. Malformed/unsupported bytes are an error, never a reset.
@@ -258,8 +258,9 @@ impl PeerBook {
         Ok(Self { peers })
     }
 
-    /// Seal and write the book. Requires an unlocked identity.
-    pub fn save(&self, store: &Store, signer: &dyn RootSigner) -> Result<()> {
+    /// Seal and queue the book in an already admitted native writer transaction.
+    /// Requires an unlocked identity; the caller commits the batch.
+    pub fn queue_save(&self, batch: &mut Batch<'_>, signer: &dyn RootSigner) -> Result<()> {
         let sek = peer_book_sek(signer)?;
         let sealed = seal_segment(
             &sek,
@@ -270,7 +271,7 @@ impl PeerBook {
         let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
         blob.extend_from_slice(&sealed.nonce);
         blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(PEER_BOOK_META_KEY, &blob)
+        batch.put_meta(PEER_BOOK_META_KEY, &blob)
     }
 
     /// Read and open the book, or an empty one if this node has never reached anybody.

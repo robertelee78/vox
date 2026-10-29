@@ -873,36 +873,169 @@ pub fn delivery_bundle(
     Ok(out)
 }
 
-/// One-time prekey ids of a peer never targeted again (ADR-030 P-3): each one a key delivery named,
-/// which the peer consumes on receipt, and each one the peer answered it does not hold. At most
-/// [`ONE_TIME_PREKEY_TARGET`] per peer, oldest dropped first. A ring issues ids in increasing order
-/// and never reissues one, so a dropped id is targeted again only if its owner still offers it: the
-/// delivery naming it never arrived, and the prekey is still unused.
+/// One-time prekeys already named/refused or owned by an unfinished outbound delivery.
+/// Unpinned named history keeps at most [`ONE_TIME_PREKEY_TARGET`] ids per peer. A live reservation
+/// is never evicted to make that history fit: its owning native admission bounds its lifetime.
 #[derive(Debug, Default)]
 pub struct RefusedOneTime {
-    by_peer: std::collections::BTreeMap<Digest32, std::collections::VecDeque<u64>>,
+    by_peer: std::collections::BTreeMap<Digest32, std::collections::VecDeque<OneTimeSelection>>,
 }
 
-impl RefusedOneTime {
-    /// Record that a delivery named `peer`'s `prekey_id`, or that `peer` refused it.
-    pub fn note(&mut self, peer: Digest32, prekey_id: u64) {
-        let ids = self.by_peer.entry(peer).or_default();
-        if ids.contains(&prekey_id) {
-            return;
+#[derive(Debug)]
+struct OneTimeSelection {
+    id: u64,
+    reservation: Option<std::sync::Arc<OneTimeOwner>>,
+}
+
+enum OneTimeDisposition {
+    Inactive,
+    Protected,
+    Named,
+}
+
+impl OneTimeSelection {
+    fn disposition(&self) -> OneTimeDisposition {
+        let Some(owner) = &self.reservation else {
+            return OneTimeDisposition::Named;
+        };
+        if std::sync::Arc::strong_count(owner) > 1 {
+            return OneTimeDisposition::Protected;
         }
-        ids.push_back(prekey_id);
-        while ids.len() > ONE_TIME_PREKEY_TARGET {
-            ids.pop_front();
+        // An owner marks its receipt before releasing its Arc. Synchronize with that
+        // last release before deciding that the table's sole Arc is inactive/evictable.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        if owner.uncertain.load(std::sync::atomic::Ordering::Acquire) {
+            OneTimeDisposition::Protected
+        } else if owner.named.load(std::sync::atomic::Ordering::Acquire) {
+            OneTimeDisposition::Named
+        } else {
+            OneTimeDisposition::Inactive
         }
     }
 
-    /// The ids `peer` refused.
+    fn active(&self) -> bool {
+        !matches!(self.disposition(), OneTimeDisposition::Inactive)
+    }
+
+    fn evictable(&self) -> bool {
+        matches!(self.disposition(), OneTimeDisposition::Named)
+    }
+}
+
+#[derive(Debug)]
+struct OneTimeOwner {
+    uncertain: std::sync::atomic::AtomicBool,
+    named: std::sync::atomic::AtomicBool,
+}
+
+impl OneTimeOwner {
+    fn mark_named(&self) {
+        self.named.store(true, std::sync::atomic::Ordering::Release);
+        self.uncertain
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The exact selected OTP remains unavailable to other outbound jobs through native crypto
+/// and its original actor receipt. Dropping an unused selection is not a fabricated spend.
+#[derive(Debug)]
+pub(crate) struct OneTimeReservation {
+    owner: std::sync::Arc<OneTimeOwner>,
+}
+
+impl OneTimeReservation {
+    /// Mark only an actual unconfirmed native publication attempt. Ownership identity makes
+    /// retirement safe: this cannot insert an id into another profile's/current room's table.
+    pub(crate) fn mark_uncertain(&self) {
+        self.owner
+            .uncertain
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Mark only a confirmed actual package/frame naming receipt, including detached native
+    /// success. The original table retains that fact without touching another profile.
+    pub(crate) fn mark_named(&self) {
+        self.owner.mark_named();
+    }
+}
+
+impl RefusedOneTime {
+    fn trim(ids: &mut std::collections::VecDeque<OneTimeSelection>) {
+        ids.retain(OneTimeSelection::active);
+        let mut excess = ids
+            .iter()
+            .filter(|used| used.evictable())
+            .count()
+            .saturating_sub(ONE_TIME_PREKEY_TARGET);
+        while excess != 0 {
+            let Some(oldest) = ids.iter().position(OneTimeSelection::evictable) else {
+                break;
+            };
+            ids.remove(oldest);
+            excess -= 1;
+        }
+    }
+
+    /// Reserve after the original bundle eligibility check, before handing work to a native
+    /// worker. The same table serves selection, temporary ownership and actual named receipts.
+    pub(crate) fn reserve(&mut self, peer: Digest32, prekey_id: u64) -> Option<OneTimeReservation> {
+        let ids = self.by_peer.entry(peer).or_default();
+        Self::trim(ids);
+        if ids.iter().any(|used| used.id == prekey_id) {
+            return None;
+        }
+        let owner = std::sync::Arc::new(OneTimeOwner {
+            uncertain: std::sync::atomic::AtomicBool::new(false),
+            named: std::sync::atomic::AtomicBool::new(false),
+        });
+        ids.push_back(OneTimeSelection {
+            id: prekey_id,
+            reservation: Some(std::sync::Arc::clone(&owner)),
+        });
+        Some(OneTimeReservation { owner })
+    }
+
+    /// Record only the original real delivery/refusal receipt; a reservation is not a receipt.
+    pub fn note(&mut self, peer: Digest32, prekey_id: u64) {
+        let ids = self.by_peer.entry(peer).or_default();
+        Self::trim(ids);
+        if let Some(used) = ids.iter_mut().find(|used| used.id == prekey_id) {
+            if let Some(owner) = &used.reservation {
+                // Preserve the same Arc until every unfinished token is gone. Naming is
+                // not permission to evict a still-owned or uncertain selection.
+                owner.mark_named();
+            }
+        } else {
+            ids.push_back(OneTimeSelection {
+                id: prekey_id,
+                reservation: None,
+            });
+        }
+        Self::trim(ids);
+    }
+
+    /// Named/refused ids and exact selections still held by unfinished outbound work.
     #[must_use]
     pub fn of(&self, peer: &Digest32) -> Vec<u64> {
-        self.by_peer
-            .get(peer)
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
+        let Some(ids) = self.by_peer.get(peer) else {
+            return Vec::new();
+        };
+        let mut result = Vec::with_capacity(ids.len());
+        let mut named = 0usize;
+        for used in ids.iter().rev() {
+            match used.disposition() {
+                OneTimeDisposition::Inactive => {}
+                OneTimeDisposition::Protected => result.push(used.id),
+                OneTimeDisposition::Named => {
+                    named += 1;
+                    if named <= ONE_TIME_PREKEY_TARGET {
+                        result.push(used.id);
+                    }
+                }
+            }
+        }
+        result.reverse();
+        result
     }
 }
 

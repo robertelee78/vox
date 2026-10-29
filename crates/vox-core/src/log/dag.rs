@@ -87,6 +87,8 @@ use crate::log::entry::{Entry, EntryKind, EntryRead, EntryWrite, MAX_SEEN};
 pub const MAX_LEAD_MS: u64 = 10 * 60 * 1_000;
 use crate::log::feed::{Feed, FeedError};
 
+type SignatureSweepPage = (Vec<Entry>, Vec<(Digest32, u64)>);
+
 /// The set of identities admitted to a `(channelID, epoch)` — the membership
 /// input to the acceptance predicate (ADR-008 §"Abuse resistance"). M5 models
 /// this as an explicit input; the *population* of the set from authenticated join
@@ -136,6 +138,42 @@ pub struct ForkProof {
     pub existing: Entry,
     /// The conflicting entry presented for the same `(author_id, seq)`.
     pub conflicting: Entry,
+}
+
+/// An authenticated fork carried across durable storage before its live freeze is published.
+pub(crate) struct VerifiedFork(ForkProof);
+
+impl VerifiedFork {
+    pub(crate) fn verify(
+        proof: ForkProof,
+        author_root: &CompositePublicKey,
+    ) -> std::result::Result<Self, Rejected> {
+        let same_place =
+            |e: &Entry| e.skeleton.author_id == proof.author_id && e.skeleton.seq == proof.seq;
+        if !same_place(&proof.existing)
+            || !same_place(&proof.conflicting)
+            || proof.existing.entry_hash() == proof.conflicting.entry_hash()
+            || !proof.existing.is_signed()
+            || !proof.conflicting.is_signed()
+        {
+            return Err(Rejected::Verification(Error::MalformedBundle(
+                "kept fork proof is not two different signed entries at one place",
+            )));
+        }
+        proof
+            .existing
+            .verify(author_root)
+            .map_err(Rejected::Verification)?;
+        proof
+            .conflicting
+            .verify(author_root)
+            .map_err(Rejected::Verification)?;
+        Ok(Self(proof))
+    }
+
+    pub(crate) fn proof(&self) -> &ForkProof {
+        &self.0
+    }
 }
 
 /// The result of attempting to accept an entry that conflicts with a stored one.
@@ -246,6 +284,47 @@ impl Dag {
     #[must_use]
     pub fn for_room(_origin_ms: u64) -> Self {
         Self::default()
+    }
+
+    /// Unpublished authored work needs only per-author feed scalars, never retained entries or
+    /// fork-proof bodies. The caller rejects a frozen local author before taking this candidate.
+    pub(crate) fn authored_candidate(&self) -> Self {
+        Self {
+            feeds: self.feeds.clone(),
+            frozen: HashMap::new(),
+            checkpoints: self.checkpoints.clone(),
+            unverified_from: self.unverified_from.clone(),
+            swept_to: self.swept_to.clone(),
+            reorder_generation: self.reorder_generation,
+            newest_clock: self.newest_clock,
+            body_generation: self.body_generation,
+            refused_below_checkpoint: self.refused_below_checkpoint,
+            filled: Vec::new(),
+            refused: self.refused.clone(),
+        }
+    }
+
+    pub(crate) fn authored_feed(&self, author: &Digest32) -> Option<PublishedFeed> {
+        self.feeds.get(author).map(|feed| PublishedFeed {
+            seq: feed.max_seq(),
+            hash: feed.head_hash(),
+            first_claimed_ms: feed.first_claimed_ms().unwrap_or(0),
+            ended: feed.ended(),
+            checkpoint: self.checkpoints.get(author).copied(),
+            swept_to: self.swept_to.get(author).copied().unwrap_or(0),
+        })
+    }
+
+    pub(crate) fn commit_authored_feed(
+        &mut self,
+        author: Digest32,
+        state: &PublishedFeed,
+    ) -> Result<()> {
+        self.restore_contiguous_author(author, state)?;
+        // Every authored candidate is signed, including its context-control. Its committed
+        // successor authenticates the same unsigned prefix as ordinary Dag::accept.
+        self.unverified_from.remove(&author);
+        Ok(())
     }
 
     /// Bootstrap only after the complete historical acceptance pass has discarded all
@@ -424,28 +503,12 @@ impl Dag {
         proof: ForkProof,
         author_root: &CompositePublicKey,
     ) -> std::result::Result<(), Rejected> {
-        let same_place =
-            |e: &Entry| e.skeleton.author_id == proof.author_id && e.skeleton.seq == proof.seq;
-        if !same_place(&proof.existing)
-            || !same_place(&proof.conflicting)
-            || proof.existing.entry_hash() == proof.conflicting.entry_hash()
-            || !proof.existing.is_signed()
-            || !proof.conflicting.is_signed()
-        {
-            return Err(Rejected::Verification(Error::MalformedBundle(
-                "kept fork proof is not two different signed entries at one place",
-            )));
-        }
-        proof
-            .existing
-            .verify(author_root)
-            .map_err(Rejected::Verification)?;
-        proof
-            .conflicting
-            .verify(author_root)
-            .map_err(Rejected::Verification)?;
-        self.frozen.insert(proof.author_id, proof);
+        self.install_verified_fork(VerifiedFork::verify(proof, author_root)?);
         Ok(())
+    }
+
+    pub(crate) fn install_verified_fork(&mut self, proof: VerifiedFork) {
+        self.frozen.insert(proof.0.author_id, proof.0);
     }
 
     /// Look up a stored entry by its 32-byte hash (the Negentropy key).
@@ -782,6 +845,52 @@ impl Dag {
             self.feeds.contains_key(author)
                 && self.swept_to.get(author).copied().unwrap_or(0) < *below
         })
+    }
+
+    /// Select the next bounded checkpoint-proof page without copying retained feeds.
+    pub(crate) fn retention_signature_page(
+        &self,
+        entries: &impl EntryRead,
+        limit: usize,
+    ) -> Result<SignatureSweepPage> {
+        let mut selected = Vec::new();
+        let mut swept = Vec::new();
+        let mut remaining = limit;
+        for (author, (below, _)) in &self.checkpoints {
+            if remaining == 0 {
+                break;
+            }
+            let Some(feed) = self.feeds.get(author) else {
+                continue;
+            };
+            let from = self
+                .swept_to
+                .get(author)
+                .map_or(1, |seq| seq.saturating_add(1));
+            let mut through = None;
+            for seq in (from..=*below).take(remaining) {
+                if let Some(entry) = feed.get(entries, seq)? {
+                    if entry.is_signed() && entry.payload.is_none() {
+                        selected.push(entry);
+                    }
+                }
+                through = Some(seq);
+            }
+            if let Some(through) = through {
+                remaining -= usize::try_from(through - from + 1)
+                    .map_err(|_| Error::MalformedAtRest("retention proof page width"))?;
+                swept.push((*author, through));
+            }
+        }
+        Ok((selected, swept))
+    }
+
+    /// Install only the facts whose native transaction committed.
+    pub(crate) fn install_retention_delta(&mut self, bodies: u64, swept: &[(Digest32, u64)]) {
+        self.body_generation = self.body_generation.wrapping_add(bodies);
+        for (author, through) in swept {
+            self.swept_to.insert(*author, *through);
+        }
     }
 
     /// Drop the signatures of every entry at or below its author's checkpoint whose body is

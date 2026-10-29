@@ -6,7 +6,9 @@ use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::channel::{entry_store::sparse::CursorBinding, ChannelState};
+use crate::node::channel::{
+    entry_store::sparse::CursorBinding, ChannelState, HistoryAdmissionRoom,
+};
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Active, Context};
 use crate::node::store::{ReceivedFlow, Store};
@@ -14,7 +16,7 @@ use crate::wire::WireError;
 
 use super::admission::{self, Advanced, Staged};
 use super::credit::Response;
-use super::source::{Lookup, PreparedRead, Source};
+use super::source::{Held, Lookup, PreparedRead, Source};
 use super::transport::{Read, Transport};
 use super::{Continuation, Frame, ProofKind, Query, RequestId, Status};
 
@@ -297,18 +299,22 @@ impl Receiver {
         let committed = self.source.commit_ledger();
         let own_observed = Arc::clone(&self.own_head_observed);
         let staged = self
-            .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
-                admission::stage(
-                    room,
-                    store,
-                    (&committed, &own_observed),
-                    request,
-                    generation,
-                    &query,
-                    super::Object::Proof(proof.value),
-                )
-                .map(Some)
-            })
+            .source
+            .write_admission(
+                &work_job,
+                (VERIFY_ENVELOPE, 4 * 1024 * 1024),
+                move |room, store| {
+                    admission::stage(
+                        room,
+                        store,
+                        (&committed, &own_observed),
+                        request,
+                        generation,
+                        &query,
+                        super::Object::Proof(proof.value),
+                    )
+                },
+            )
             .await?;
         Ok(match staged {
             Lookup::Found(staged) => match staged.value {
@@ -474,25 +480,42 @@ impl Receiver {
                     // bounded worker pool. Its charges still account the complete overlapping
                     // frame, directory and verifier peak on one owner.
                     let work_job = incoming.job();
+                    let grant = self.grant();
                     let staged = self
-                        .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
-                            let Frame::Meta { object, .. } = incoming.frame()? else {
-                                return Err(Error::MalformedBundle("metadata frame changed"));
-                            };
-                            let staged = admission::stage(
-                                room,
-                                store,
-                                (&committed, &own_observed),
-                                request,
-                                generation,
-                                &selected,
-                                object,
-                            )?;
-                            let incarnations = room
-                                .history_inventory_incarnation(&peer)
-                                .zip(room.history_author_inventory_incarnation(&room.me()));
-                            Ok(Some((staged, incarnations)))
-                        })
+                        .source
+                        .write_owned(
+                            &work_job,
+                            (VERIFY_ENVELOPE, 4 * 1024 * 1024, false),
+                            move |room, store| {
+                                grant.check(room, store)?;
+                                let incarnations = room
+                                    .history_inventory_incarnation(&peer)
+                                    .zip(room.history_author_inventory_incarnation(&room.me()));
+                                let pending = room.prepare_history_admission(
+                                    store,
+                                    Some((grant.node, grant.generation)),
+                                )?;
+                                Ok((pending, incarnations))
+                            },
+                            move |(pending, incarnations), store| {
+                                let Frame::Meta { object, .. } = incoming.frame()? else {
+                                    return Err(Error::MalformedBundle("metadata frame changed"));
+                                };
+                                let staged = pending.with(|room| {
+                                    admission::stage(
+                                        room,
+                                        store,
+                                        (&committed, &own_observed),
+                                        request,
+                                        generation,
+                                        &selected,
+                                        object,
+                                    )
+                                })?;
+                                Ok((staged, incarnations))
+                            },
+                            |_, _, value| Ok(value),
+                        )
                         .await?;
                     let Lookup::Found(staged) = staged else {
                         io.abort(WireError::SessionBusy);
@@ -857,12 +880,17 @@ impl Receiver {
         };
         let commit_ledger = self.source.commit_ledger();
         let advanced = self
-            .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
-                if room.channel_id() != binding.room {
-                    return Err(Error::Profile("history verifier room changed"));
-                }
-                admission::advance(room, store, &commit_ledger, &binding).map(Some)
-            })
+            .source
+            .write_admission(
+                &work_job,
+                (VERIFY_ENVELOPE, 4 * 1024 * 1024),
+                move |room, store| {
+                    if room.channel_id() != binding.room {
+                        return Err(Error::Profile("history verifier room changed"));
+                    }
+                    admission::advance(room, store, &commit_ledger, &binding)
+                },
+            )
             .await?;
         Ok(advanced)
     }
@@ -1007,21 +1035,22 @@ impl Receiver {
         let job = record.job.clone();
         let committed = self.source.commit_ledger();
         // The record already owns the complete verification/parse envelope.
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-            admission::start_entry(
-                room,
-                store,
-                &committed,
-                request,
-                generation,
-                head,
-                &record.entry,
-                require_body,
-                context_ready,
-            )
-            .map(Some)
-        })
-        .await
+        self.source
+            .write_admission(&job, (64 * 1024, 0), move |room, store| {
+                let outcome = admission::start_entry(
+                    room,
+                    store,
+                    &committed,
+                    request,
+                    generation,
+                    head,
+                    &record.entry,
+                    require_body,
+                    context_ready,
+                )?;
+                Ok((record, outcome))
+            })
+            .await
     }
 
     pub(super) async fn advance_entry(
@@ -1034,11 +1063,8 @@ impl Receiver {
         }
         let job = record.job.clone();
         let committed = self.source.commit_ledger();
-        self.read_precharged(
-            &job,
-            ENTRY_VALIDATION_WORK,
-            record,
-            move |room, store, record| {
+        self.source
+            .write_admission(&job, (ENTRY_VALIDATION_WORK, 0), move |room, store| {
                 if record.entry.skeleton.author_id != binding.author
                     || record.entry.skeleton.seq != binding.from
                 {
@@ -1047,10 +1073,10 @@ impl Receiver {
                 if room.channel_id() != binding.room {
                     return Err(Error::Profile("history entry room changed"));
                 }
-                admission::advance_entry(room, store, &committed, binding).map(Some)
-            },
-        )
-        .await
+                let outcome = admission::advance_entry(room, store, &committed, binding)?;
+                Ok((record, outcome))
+            })
+            .await
     }
 }
 
@@ -1301,14 +1327,35 @@ impl Receiver {
     pub(super) async fn advance_source(
         &self,
         record: Arc<Record>,
+        binding: CursorBinding,
     ) -> Result<Lookup<(Arc<Record>, bool)>> {
+        if binding.generation != self.generation {
+            return Err(Error::Profile("history publication activation changed"));
+        }
         let job = record.job.clone();
         let committed = self.source.commit_ledger();
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, _| {
-            let advanced = room.advance_history_source(store, &committed)?;
-            Ok(Some(advanced))
-        })
-        .await
+        let grant = self.grant();
+        self.source
+            .write_owned(
+                &job,
+                (64 * 1024, 0, true),
+                move |room, store| {
+                    grant.check(room, store)?;
+                    let pending = room.prepare_history_publication(
+                        store,
+                        Some(record.entry.entry_hash()),
+                        Some(binding.request),
+                    )?;
+                    Ok((record, pending))
+                },
+                move |(record, pending), store| {
+                    pending
+                        .advance(store, &committed)
+                        .map(|advanced| (record, advanced))
+                },
+                |_, _, value| Ok(value),
+            )
+            .await
     }
 
     pub(super) async fn commit_source(
@@ -1324,29 +1371,42 @@ impl Receiver {
         let grant = self.grant();
         let received = self.received.clone();
         let committed = self.source.commit_ledger();
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-            if binding.room != room.channel_id()
-                || binding.author != record.entry.skeleton.author_id
-                || binding.from != record.entry.skeleton.seq
-            {
-                return Err(Error::Profile("history publication record changed"));
-            }
-            let room_id = room.channel_id();
-            let instance = room.history_instance(store)?;
-            let epoch = room.epoch();
-            room.commit_history_source(
-                store,
-                &committed,
-                &record.entry,
-                now,
-                &received,
-                |batch| grant.check_batch(batch, room_id, instance, epoch),
-            )?;
-            // Publication is now Switched, not Idle. Keep the exact verifier until the
-            // bounded cleanup phase finishes; sparse metadata cannot mutate these roots yet.
-            Ok(Some(()))
-        })
-        .await
+        self.source
+            .write_owned(
+                &job,
+                (64 * 1024, 0, true),
+                move |room, store| {
+                    grant.check(room, store)?;
+                    if binding.room != room.channel_id()
+                        || binding.author != record.entry.skeleton.author_id
+                        || binding.from != record.entry.skeleton.seq
+                    {
+                        return Err(Error::Profile("history publication record changed"));
+                    }
+                    let instance = room.history_instance(store)?;
+                    let epoch = room.epoch();
+                    let pending =
+                        room.prepare_history_source(store, &record.entry, binding.request)?;
+                    Ok((record, pending, instance, epoch))
+                },
+                move |(record, pending, instance, epoch), store| {
+                    let saved = pending.commit(
+                        store,
+                        &committed,
+                        &record.entry,
+                        now,
+                        &received,
+                        |batch| grant.check_batch(batch, binding.room, instance, epoch),
+                    )?;
+                    Ok((record, saved))
+                },
+                |room, _, (record, saved)| {
+                    room.install_history_source(&record.entry, &saved)?;
+                    // Keep the verifier until the separately bounded Switched cleanup finishes.
+                    Ok((record, ()))
+                },
+            )
+            .await
     }
 
     pub(super) async fn cleanup_source(
@@ -1359,35 +1419,48 @@ impl Receiver {
         }
         let job = record.job.clone();
         let committed = self.source.commit_ledger();
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-            if binding.room != room.channel_id()
-                || binding.author != record.entry.skeleton.author_id
-                || binding.from != record.entry.skeleton.seq
-                || binding.through != record.entry.skeleton.seq
-                || binding.proof_kind != 3
-            {
-                return Err(Error::Profile("history cleanup record changed"));
-            }
-            let input = room.history_read(store)?;
-            let included = input
-                .history_inclusion_receipt(&binding.head, &binding.author, binding.from)?
-                .ok_or(Error::Profile("history cleanup inclusion missing"))?;
-            if included.header().entry().header_wire() != record.entry.header_wire() {
-                return Err(Error::Profile("history cleanup head/entry changed"));
-            }
-            drop(input);
-            let done = room.cleanup_history_source(store, &committed)?;
-            if done {
-                // The same room lock spans cleanup's transition to Idle and this exact
-                // cursor retirement. A crash between them leaves only a resumable cursor;
-                // the accepted source is already durable and is never rolled back here.
-                room.history_write_tracked(store, &committed, |index| {
-                    index.finish_history_verifier_cursor(binding)
-                })?;
-            }
-            Ok(Some(done))
-        })
-        .await
+        let grant = self.grant();
+        self.source
+            .write_owned(
+                &job,
+                (64 * 1024, 0, true),
+                move |room, store| {
+                    grant.check(room, store)?;
+                    if binding.room != room.channel_id()
+                        || binding.author != record.entry.skeleton.author_id
+                        || binding.from != record.entry.skeleton.seq
+                        || binding.through != record.entry.skeleton.seq
+                        || binding.proof_kind != 3
+                    {
+                        return Err(Error::Profile("history cleanup record changed"));
+                    }
+                    let input = room.history_read(store)?;
+                    let included = input
+                        .history_inclusion_receipt(&binding.head, &binding.author, binding.from)?
+                        .ok_or(Error::Profile("history cleanup inclusion missing"))?;
+                    if included.header().entry().header_wire() != record.entry.header_wire() {
+                        return Err(Error::Profile("history cleanup head/entry changed"));
+                    }
+                    let source = input
+                        .publication_busy()
+                        .then_some(record.entry.entry_hash());
+                    drop(input);
+                    let pending =
+                        room.prepare_history_publication(store, source, Some(binding.request))?;
+                    Ok((record, pending))
+                },
+                move |(record, pending), store| {
+                    Ok((
+                        record,
+                        pending.cleanup(store, &committed, Some(binding), None),
+                    ))
+                },
+                |room, _, (record, completed)| {
+                    let (done, _) = room.finish_history_publication(completed)?;
+                    Ok((record, done))
+                },
+            )
+            .await
     }
 
     /// One existing authority/effect slice, with the full signed-length record reservation.
@@ -1395,7 +1468,7 @@ impl Receiver {
     pub(super) async fn advance_effect(
         &self,
         record: Arc<Record>,
-        mut cursor: crate::node::channel::HistoryEffectCursor,
+        cursor: crate::node::channel::HistoryEffectCursor,
         now: crate::time::Ms,
     ) -> Result<
         Lookup<(
@@ -1480,26 +1553,73 @@ impl Receiver {
         } else {
             None
         };
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
+        let source = self.source.clone();
+        // Own both native quanta as one continuation. Cancelling the protocol waiter cannot
+        // drop the original post-render migration cadence between matching installations.
+        tokio::spawn(async move {
             let _transition = transition;
-            let room_id = room.channel_id();
-            let instance = room.history_instance(store)?;
-            let epoch = room.epoch();
-            let body_expected = record.staged.is_some();
-            let outcome = room.advance_history_effect(
-                store,
-                &committed,
-                &mut cursor,
-                now,
-                body_expected,
-                historical,
-                &received,
-                |batch| grant.check_batch(batch, room_id, instance, epoch),
-                |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
-            )?;
-            Ok(Some((cursor, outcome)))
+            let migration_received = received.clone();
+            let saved = source
+                .write_owned(
+                    &job,
+                    (64 * 1024, 0, false),
+                    move |room, store| {
+                        grant.check(room, store)?;
+                        let binding = (
+                            room.channel_id(),
+                            room.history_instance(store)?,
+                            room.epoch(),
+                        );
+                        let pending = room.prepare_received_effect(
+                            store,
+                            cursor,
+                            now,
+                            record.staged.is_some(),
+                            historical,
+                        )?;
+                        Ok((record, pending, binding))
+                    },
+                    move |(record, pending, (room, instance, epoch)), store| {
+                        let completed = pending.save(
+                            store,
+                            &committed,
+                            &received,
+                            None,
+                            |batch| grant.check_batch(batch, room, instance, epoch),
+                            |batch, hash| complete_staged(batch, staging.as_ref(), &record, hash),
+                        );
+                        Ok((record, completed, instance))
+                    },
+                    |room, store, (record, completed, instance)| {
+                        let migrate = completed.legacy_migration();
+                        let progress = room.finish_received(store, completed)?;
+                        Ok(((record, progress), migrate.map(|now| (instance, now))))
+                    },
+                )
+                .await?;
+            match saved {
+                Lookup::Found(saved) => {
+                    let saved = if let Some((instance, maintenance_now)) = saved.value.1 {
+                        migrate_received_legacy(
+                            &source,
+                            saved,
+                            grant,
+                            migration_received,
+                            maintenance_now,
+                            instance,
+                        )
+                        .await?
+                    } else {
+                        saved
+                    };
+                    Ok(Lookup::Found(saved.map(|(value, _)| value)))
+                }
+                Lookup::Busy => Ok(Lookup::Busy),
+                Lookup::Missing => Ok(Lookup::Missing),
+            }
         })
         .await
+        .map_err(|_| Error::Profile("history semantic continuation stopped"))?
     }
 
     /// A body for a previously source-complete header is validated before replacing storage.
@@ -1520,38 +1640,128 @@ impl Receiver {
         });
         let received = self.received.clone();
         let committed = self.source.commit_ledger();
-        self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-            use crate::node::channel::governance::{PayloadValidation, TypedSparseBody};
-            let key = room
-                .history_author_key(&record.entry.skeleton.author_id)
-                .ok_or(Error::MalformedBundle("history refill author vanished"))?;
-            let body = match TypedSparseBody::verify(
-                &record.entry,
-                &key,
-                &mut crate::log::history::WorkBudget::default(),
-            )? {
-                PayloadValidation::Complete(body) => body,
-                _ => return Err(Error::MalformedBundle("history refill body is incomplete")),
-            };
-            let room_id = room.channel_id();
-            let instance = room.history_instance(store)?;
-            let epoch = room.epoch();
-            let progress = room.refill_history_body(
-                store,
-                &committed,
-                &record.entry,
-                &body,
-                now,
-                historical,
-                key_body,
-                &received,
-                |batch| grant.check_batch(batch, room_id, instance, epoch),
-                |batch, hash| complete_staged(batch, staging.as_ref(), record, hash),
-            )?;
-            Ok(Some(progress))
+        let source = self.source.clone();
+        tokio::spawn(async move {
+            let migration_received = received.clone();
+            let saved = source
+                .write_owned(
+                    &job,
+                    (64 * 1024, 0, false),
+                    move |room, store| {
+                        use crate::node::channel::governance::{
+                            PayloadValidation, TypedSparseBody,
+                        };
+                        grant.check(room, store)?;
+                        let key = room
+                            .history_author_key(&record.entry.skeleton.author_id)
+                            .ok_or(Error::MalformedBundle("history refill author vanished"))?;
+                        let body = match TypedSparseBody::verify(
+                            &record.entry,
+                            &key,
+                            &mut crate::log::history::WorkBudget::default(),
+                        )? {
+                            PayloadValidation::Complete(body) => body,
+                            _ => {
+                                return Err(Error::MalformedBundle(
+                                    "history refill body is incomplete",
+                                ))
+                            }
+                        };
+                        let binding = (
+                            room.channel_id(),
+                            room.history_instance(store)?,
+                            room.epoch(),
+                        );
+                        let pending = room.prepare_received_refill(
+                            store,
+                            &record.entry,
+                            &body,
+                            now,
+                            historical,
+                            key_body,
+                        )?;
+                        Ok((record, pending, binding))
+                    },
+                    move |(record, pending, (room, instance, epoch)), store| {
+                        let completed = pending.save(
+                            store,
+                            &committed,
+                            &received,
+                            Some(&record.entry),
+                            |batch| grant.check_batch(batch, room, instance, epoch),
+                            |batch, hash| complete_staged(batch, staging.as_ref(), &record, hash),
+                        );
+                        Ok((record, completed, instance))
+                    },
+                    |room, store, (record, completed, instance)| {
+                        let migrate = completed.legacy_migration();
+                        let (_, progress) = room.finish_received(store, completed)?;
+                        Ok(((record, progress), migrate.map(|now| (instance, now))))
+                    },
+                )
+                .await?;
+            match saved {
+                Lookup::Found(saved) => {
+                    let saved = if let Some((instance, maintenance_now)) = saved.value.1 {
+                        migrate_received_legacy(
+                            &source,
+                            saved,
+                            grant,
+                            migration_received,
+                            maintenance_now,
+                            instance,
+                        )
+                        .await?
+                    } else {
+                        saved
+                    };
+                    Ok(Lookup::Found(saved.map(|(value, _)| value)))
+                }
+                Lookup::Busy => Ok(Lookup::Busy),
+                Lookup::Missing => Ok(Lookup::Missing),
+            }
         })
         .await
+        .map_err(|_| Error::Profile("history refill continuation stopped"))?
     }
+}
+
+/// Preserve exactly one original legacy migration quantum after a committed semantic turn.
+/// Every native migration transaction rechecks the same flow grant, not a freshly acquired one.
+async fn migrate_received_legacy<V: Send + 'static>(
+    source: &Source,
+    held: Held<V>,
+    grant: Grant,
+    received: ReceivedFlow,
+    now: crate::time::Ms,
+    expected_instance: [u8; 16],
+) -> Result<Held<V>> {
+    source
+        .continue_owned(
+            held,
+            expected_instance,
+            move |room, store| {
+                grant.check(room, store)?;
+                let binding = (room.channel_id(), expected_instance, room.epoch());
+                Ok((room.prepare_legacy_migration(store, now)?, binding))
+            },
+            move |(pending, (room, instance, epoch)), store| {
+                received.scope(|| {
+                    Ok(pending.map(|pending| {
+                        pending.run_guarded(store, |batch| {
+                            grant.check_batch(batch, room, instance, epoch)
+                        })
+                    }))
+                })
+            },
+            |room, _, completed| {
+                if let Some(completed) = completed {
+                    room.finish_legacy_migration(completed)?;
+                }
+                Ok(())
+            },
+        )
+        .await
 }
 
 fn complete_staged(
@@ -1862,7 +2072,6 @@ impl Receiver {
                     }
                     LocalResult::wait(step, LocalNeed::Entry { head, seq })
                 }
-                Effect::Busy => LocalResult::busy(step),
                 Effect::Complete { rendered } => LocalResult {
                     next: None,
                     need: None,
@@ -1993,30 +2202,50 @@ impl Receiver {
             EntryPhase::Begin(binding) => {
                 let job = record.job.clone();
                 let committed = self.source.commit_ledger();
+                let verified = self.advance_entry(Arc::clone(&record), binding).await?;
+                let Lookup::Found(verified) = verified else {
+                    return Ok(LocalResult::busy(step));
+                };
+                let admission::EntryAdvanced::Validated(validated) = verified.value.1 else {
+                    return Err(Error::Profile(
+                        "completed history validation requires renewed evidence",
+                    ));
+                };
+                let grant = self.grant();
+                let received = self.received.clone();
                 let value = self
-                    .read_precharged(&job, 64 * 1024, record, move |room, store, record| {
-                        let admission::EntryAdvanced::Validated(validated) =
-                            admission::advance_entry(room, store, &committed, binding)?
-                        else {
-                            return Err(Error::Profile(
-                                "completed history validation requires renewed evidence",
-                            ));
-                        };
-                        let started = room.begin_history_source(
-                            store,
-                            &committed,
-                            request,
-                            &record.entry,
-                            &validated,
-                            now,
-                        )?;
-                        if matches!(started, Start::Duplicate) {
-                            room.history_write_tracked(store, &committed, |index| {
-                                index.finish_history_verifier_cursor(binding)
-                            })?;
-                        }
-                        Ok(Some(started))
-                    })
+                    .source
+                    .write_owned(
+                        &job,
+                        (64 * 1024, 0, false),
+                        move |room, store| {
+                            grant.check(room, store)?;
+                            let instance = room.history_instance(store)?;
+                            let epoch = room.epoch();
+                            let pending =
+                                room.prepare_history_begin(store, &record.entry, &validated)?;
+                            Ok((record, validated, pending, instance, epoch))
+                        },
+                        move |(record, validated, pending, instance, epoch), store| {
+                            let saved = received.scope(|| {
+                                pending.commit(
+                                    store,
+                                    &committed,
+                                    request,
+                                    &record.entry,
+                                    &validated,
+                                    binding,
+                                    now,
+                                    |batch| grant.check_batch(batch, binding.room, instance, epoch),
+                                )
+                            });
+                            Ok((record, saved))
+                        },
+                        |room, _, (record, saved)| {
+                            room.finish_history_begin(saved)
+                                .map(|started| (record, started))
+                        },
+                    )
                     .await?;
                 let Lookup::Found(value) = value else {
                     return Ok(LocalResult::busy(step));
@@ -2032,7 +2261,7 @@ impl Receiver {
                 }
             }
             EntryPhase::Prepare(binding) => {
-                let Lookup::Found(value) = self.advance_source(record).await? else {
+                let Lookup::Found(value) = self.advance_source(record, binding).await? else {
                     return Ok(LocalResult::busy(step));
                 };
                 LocalResult::next(next(if value.value.1 {
@@ -2132,62 +2361,64 @@ impl Receiver {
         };
         let committed = self.source.commit_ledger();
         let value = self
-            .read(&work_job, VERIFY_ENVELOPE, move |room, store| {
-                let input = room.history_read(store)?;
-                if room.history_publication_busy(store)? {
-                    return Ok(None);
-                }
-                let target = input
-                    .history_head(&head)?
-                    .ok_or(Error::MalformedAtRest("control target head missing"))?;
-                if through == 0 || through > target.root.leaves {
-                    return Err(Error::Profile("control receipt bound exceeds target"));
-                }
-                let complete = if effects {
-                    input.control_effects_complete(&head, through)?
-                } else {
-                    input.control_sources_complete(&head, through)?
-                };
-                if complete {
-                    // Effects may finish while this signed head is still only observed. The
-                    // effect walker then cannot publish its exact-head receipt yet. Once the
-                    // same head commits, do one writer turn even though its prefix is already
-                    // complete so `advance_control_effects` can atomically promote it to
-                    // `control_ready`; otherwise every later inventory re-offers it forever.
-                    let state =
-                        input.sparse_author(&target.binding.author, target.binding.scope)?;
-                    let receipt_ready = !effects
-                        || through < target.root.leaves
-                        || state.is_some_and(|state| state.control_ready == Some(head));
-                    if receipt_ready {
-                        return Ok(Some((SourceProgress::Complete { through }, None)));
-                    }
-                }
-                drop(input);
-                let progress = room.history_write_tracked(store, &committed, |index| {
-                    if effects {
-                        index.advance_control_effects(&head, through)
-                    } else {
-                        index.advance_control_sources(&head, through)
-                    }
-                })?;
-                let needed = if let SourceProgress::PendingEffect { hash } = &progress {
+            .source
+            .write_admission(
+                &work_job,
+                (VERIFY_ENVELOPE, 4 * 1024 * 1024),
+                move |room, store| {
                     let input = room.history_read(store)?;
-                    input
-                        .history_object(
-                            crate::node::channel::entry_store::sparse::ObjectKind::Header,
-                            hash,
-                        )?
-                        .map(|wire| {
-                            crate::log::entry::Entry::from_wire(&wire)
-                                .map(|entry| entry.skeleton.seq)
-                        })
-                        .transpose()?
-                } else {
-                    None
-                };
-                Ok(Some((progress, needed)))
-            })
+                    let target = input
+                        .history_head(&head)?
+                        .ok_or(Error::MalformedAtRest("control target head missing"))?;
+                    if through == 0 || through > target.root.leaves {
+                        return Err(Error::Profile("control receipt bound exceeds target"));
+                    }
+                    let complete = if effects {
+                        input.control_effects_complete(&head, through)?
+                    } else {
+                        input.control_sources_complete(&head, through)?
+                    };
+                    if complete {
+                        // Effects may finish while this signed head is still only observed. The
+                        // effect walker then cannot publish its exact-head receipt yet. Once the
+                        // same head commits, do one writer turn even though its prefix is already
+                        // complete so `advance_control_effects` can atomically promote it to
+                        // `control_ready`; otherwise every later inventory re-offers it forever.
+                        let state =
+                            input.sparse_author(&target.binding.author, target.binding.scope)?;
+                        let receipt_ready = !effects
+                            || through < target.root.leaves
+                            || state.is_some_and(|state| state.control_ready == Some(head));
+                        if receipt_ready {
+                            return Ok((SourceProgress::Complete { through }, None));
+                        }
+                    }
+                    drop(input);
+                    let progress = room.history_write_tracked(store, &committed, |index| {
+                        if effects {
+                            index.advance_control_effects(&head, through)
+                        } else {
+                            index.advance_control_sources(&head, through)
+                        }
+                    })?;
+                    let needed = if let SourceProgress::PendingEffect { hash } = &progress {
+                        let input = room.history_read(store)?;
+                        input
+                            .history_object(
+                                crate::node::channel::entry_store::sparse::ObjectKind::Header,
+                                hash,
+                            )?
+                            .map(|wire| {
+                                crate::log::entry::Entry::from_wire(&wire)
+                                    .map(|entry| entry.skeleton.seq)
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    Ok((progress, needed))
+                },
+            )
             .await?;
         let Lookup::Found(value) = value else {
             return Ok(LocalResult::busy(step));
@@ -2260,7 +2491,7 @@ impl Grant {
             room.epoch(),
         )?;
         if actual != self.generation {
-            return Err(Error::Profile("history authorization changed"));
+            return Err(Error::StreamRefused(super::AUTHORIZATION_CHANGED));
         }
         Ok(())
     }
@@ -2274,9 +2505,7 @@ impl Grant {
         if super::authorization_generation_in(batch, self.node, room, instance, epoch)?
             != self.generation
         {
-            return Err(Error::Profile(
-                "history authorization changed before publication",
-            ));
+            return Err(Error::StreamRefused(super::AUTHORIZATION_CHANGED));
         }
         Ok(())
     }

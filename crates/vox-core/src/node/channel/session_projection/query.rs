@@ -317,41 +317,78 @@ fn next(
 }
 
 impl ChannelState {
-    /// One bounded maintenance step; incomplete work stays unpublished. A local
-    /// storage failure follows the room's existing poison/refusal boundary.
-    pub(crate) fn advance_sessions(&mut self, store: &Store, now: u64) -> Result<bool> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        let result = (|| {
-            if !self.advance_private_sessions(store, now)? {
-                return Ok(false);
+    /// Resolve current Drive authority against the same committed roots as the answer.
+    /// Current in-memory revocations remain authoritative; storage never escapes the pin.
+    pub(in crate::node::channel) fn drive_from_known_view(
+        &self,
+        view: &super::super::entry_store::RenderView<'_>,
+    ) -> Result<(Vec<Digest32>, Vec<Digest32>)> {
+        let me = self.me();
+        let held: std::collections::BTreeSet<Digest32> = self
+            .drive
+            .receivers
+            .keys()
+            .map(|(author, _)| *author)
+            .collect();
+        let mut known = std::collections::BTreeSet::new();
+        let mut refreshing = std::collections::BTreeSet::new();
+        for author in held {
+            if author == me {
+                continue;
             }
-            let metadata = super::build::advance(self, store, now)?;
-            let activity = super::activity_fold::advance(self, store)?;
-            let waiting = super::waiting::advance(self, store)?;
-            Ok(metadata || activity || waiting)
-        })();
-        if let Err(ref error) = result {
-            self.poison(error);
+            if !self.current_session_control_ready_in(view.read_index(), &author)? {
+                refreshing.insert(author);
+                continue;
+            }
+            let announced = self.floor_author(view.transaction(), &author)?.announced;
+            let newest = match announced {
+                Some(generation) => Some(generation),
+                None => match self.legacy_drive_generation_in(view.snapshot(), &author) {
+                    Ok(generation) => generation,
+                    Err(Error::StreamRefused("Session control facts are refreshing")) => {
+                        refreshing.insert(author);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            if newest
+                .is_none_or(|generation| self.drive.receivers.contains_key(&(author, generation)))
+                || self.key_packages.pending_from(&author)
+            {
+                known.insert(author);
+            }
         }
-        result
+        known.insert(me);
+        Ok((
+            known.into_iter().collect(),
+            refreshing.into_iter().collect(),
+        ))
     }
 
     /// An opaque change token, including private-only inputs and room reincarnation.
     /// It carries no Session body, metadata string, or all-Session array.
     pub(crate) fn sessions_revision(&self, store: &Store) -> Result<Digest32> {
-        let snapshot = store.snapshot()?;
-        let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
+        if let Some(resource) = self.history_read_resource() {
+            return resource.with_snapshot(|_, view, _| self.sessions_revision_view(view));
+        }
+        let view = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        self.sessions_revision_view(&view)
+    }
+
+    fn sessions_revision_view(
+        &self,
+        view: &super::super::entry_store::RenderView<'_>,
+    ) -> Result<Digest32> {
+        let read = Read::existing(view.snapshot(), &self.sek, &self.channel_id)?;
         let private = read.as_ref().map_or(0, |r| r.header.private_generation);
         let activity = read.as_ref().map_or(0, |r| r.header.activity_generation);
         let published = read
             .as_ref()
             .and_then(|r| r.header.published)
             .unwrap_or_default();
-        let view = self
-            .entries
-            .render_view(store, &self.sek, &self.channel_id)?;
         let mut h = Sha256::new();
         h.update(b"vox/session-display/v1");
         h.update(view.history_instance());
@@ -382,7 +419,7 @@ impl ChannelState {
         h.update(published.1.to_be_bytes());
         // An author becoming current, a fold publishing for the first time and a saved-Session
         // upgrade ending each change what a listing can show (ADR-037 R4): wake every client.
-        let (known, refreshing) = self.drive_from_known(store)?;
+        let (known, refreshing) = self.drive_from_known_view(view)?;
         h.update(drive_basis(&known, &refreshing));
         h.update([u8::from(read.as_ref().is_some_and(|r| r.header.ready))]);
         h.update([u8::from(self.needs_session_upgrade())]);
@@ -396,468 +433,118 @@ impl ChannelState {
         max_bytes: usize,
         now: u64,
     ) -> std::result::Result<Reply, String> {
-        if self.poisoned {
+        let resource = self.history_read_resource();
+        if self.poisoned
+            && !resource
+                .as_ref()
+                .is_some_and(|read| read.has_pending_snapshot())
+        {
             return Err(self.save_failure().to_string());
         }
-        let result = (|| -> Answer<Reply> {
-            let (authors, refreshing) = self.drive_from_known(store)?;
-            let me = self.me();
-            let view = self
+        let result = match resource {
+            Some(resource) => resource
+                .with_snapshot(
+                    |_, view, _| Ok(self.session_query_view(view, query, max_bytes, now)),
+                )
+                .map_err(Failure::Storage)
+                .and_then(|answer| answer),
+            None => self
                 .entries
-                .render_view(store, &self.sek, &self.channel_id)?;
-            let read = Read::existing(view.snapshot(), &self.sek, &self.channel_id)?
-                .map(|read| read.with_sources(self, &view, now));
-            let public = view.session_revision();
-            let published = read.as_ref().and_then(|read| read.header.published);
-            // The published fold is the answer. It is provisional while the fold is behind
-            // the room's inputs or has never published, and while a saved-Session upgrade,
-            // restore, import or pending render runs: rows may still be added. What was
-            // last published is shown and said to be provisional, and the next publication
-            // changes the basis so every page re-reads. Expiry only ever removes rows and
-            // applies per row where bodies are read; it makes no absence unproven.
-            let provisional = read.as_ref().is_none_or(|read| {
-                !read.header.ready
-                    || read.header.published != Some((public, read.header.private_generation))
-            }) || self.needs_session_upgrade();
-            let revision = Revision {
-                incarnation: self.gen.clone(),
-                published,
-                drive: drive_basis(&authors, &refreshing),
-                member: None,
-                refreshing: refreshing.clone(),
-                provisional,
-            };
-            let check = |previous: &Revision| -> Answer<()> {
-                if !Arc::ptr_eq(&previous.incarnation, &revision.incarnation)
-                    || previous.published != revision.published
-                    || previous.drive != revision.drive
-                    || previous.member.is_some_and(|node| !self.is_member(&node))
-                {
-                    return Err(Failure::Request(CHANGED));
-                }
+                .render_view(store, &self.sek, &self.channel_id)
+                .map_err(Failure::Storage)
+                .and_then(|view| self.session_query_view(&view, query, max_bytes, now)),
+        };
+        match result {
+            Ok(reply) => Ok(reply),
+            Err(Failure::Request(why)) => Err(why.into()),
+            Err(Failure::Storage(error)) => {
+                self.poison(&error);
+                Err(error.to_string())
+            }
+        }
+    }
+
+    fn session_query_view<'a>(
+        &'a self,
+        view: &'a super::super::entry_store::RenderView<'a>,
+        query: Query,
+        max_bytes: usize,
+        now: u64,
+    ) -> Answer<Reply> {
+        let (authors, refreshing) = self.drive_from_known_view(view)?;
+        let me = self.me();
+        let read = Read::existing(view.snapshot(), &self.sek, &self.channel_id)?
+            .map(|read| read.with_sources(self, view, now));
+        let public = view.session_revision();
+        let published = read.as_ref().and_then(|read| read.header.published);
+        // The published fold is the answer. It is provisional while the fold is behind
+        // the room's inputs or has never published, and while a saved-Session upgrade,
+        // restore, import or pending render runs: rows may still be added. What was
+        // last published is shown and said to be provisional, and the next publication
+        // changes the basis so every page re-reads. Expiry only ever removes rows and
+        // applies per row where bodies are read; it makes no absence unproven.
+        let provisional = read.as_ref().is_none_or(|read| {
+            !read.header.ready
+                || read.header.published != Some((public, read.header.private_generation))
+        }) || self.needs_session_upgrade();
+        let revision = Revision {
+            incarnation: self.gen.clone(),
+            published,
+            drive: drive_basis(&authors, &refreshing),
+            member: None,
+            refreshing: refreshing.clone(),
+            provisional,
+        };
+        let check = |previous: &Revision| -> Answer<()> {
+            if !Arc::ptr_eq(&previous.incarnation, &revision.incarnation)
+                || previous.published != revision.published
+                || previous.drive != revision.drive
+                || previous.member.is_some_and(|node| !self.is_member(&node))
+            {
+                return Err(Failure::Request(CHANGED));
+            }
+            Ok(())
+        };
+        // Whether this node may read `node`'s Sessions. An author whose control effects
+        // are refreshing is neither readable nor unreadable yet: that is said as such.
+        let readable = |node: &Digest32| -> Answer<()> {
+            if authors.contains(node) {
                 Ok(())
-            };
-            // Whether this node may read `node`'s Sessions. An author whose control effects
-            // are refreshing is neither readable nor unreadable yet: that is said as such.
-            let readable = |node: &Digest32| -> Answer<()> {
-                if authors.contains(node) {
-                    Ok(())
-                } else if refreshing.contains(node) {
-                    Err(Failure::Request(REFRESHING))
-                } else {
-                    Err(Failure::Request(CANNOT_READ))
-                }
-            };
-            // A provisional fold proves no absence: a Session it does not hold may be among
-            // the unfolded inputs, and "none" would let an idempotent opening post twice.
-            let proven = |found: bool| -> Answer<()> {
-                if !found && provisional {
-                    return Err(Failure::Request(REFRESHING));
-                }
-                Ok(())
-            };
-            let Some(read) = read else {
-                // No fold has run here yet: nothing is known, and every answer says so.
-                return match query {
-                    Query::Waiting => Ok(Reply::Waiting(0)),
-                    Query::Pending { .. } => Ok(Reply::Pending {
-                        targets: Vec::new(),
-                        next: None,
-                    }),
-                    Query::Lifecycle { .. } => Ok(Reply::Lifecycle {
-                        rows: Vec::new(),
-                        older: false,
-                        revision,
-                    }),
-                    Query::Page {
-                        revision: previous, ..
-                    } => {
-                        if let Some(previous) = &previous {
-                            check(previous)?;
-                        }
-                        Ok(Reply::Page {
-                            rows: Vec::new(),
-                            more: false,
-                            revision,
-                        })
-                    }
-                    Query::Validate { revision: previous } => {
-                        check(&previous)?;
-                        Ok(Reply::Valid)
-                    }
-                    Query::Join { node } => {
-                        if node != me
-                            && self.is_member(&node)
-                            && (authors.contains(&node) || refreshing.contains(&node))
-                        {
-                            return Err(Failure::Request(REFRESHING));
-                        }
-                        Ok(Reply::Page {
-                            rows: Vec::new(),
-                            more: false,
-                            revision: Revision {
-                                member: Some(node),
-                                ..revision
-                            },
-                        })
-                    }
-                    Query::HasOpen { node } if node == me => Ok(Reply::HasOpen(false)),
-                    Query::HasOpen { node }
-                    | Query::Exact { node, .. }
-                    | Query::Lookup { node, .. } => {
-                        readable(&node)?;
-                        Err(Failure::Request(REFRESHING))
-                    }
-                    Query::Summary { .. } | Query::Text { .. } => Err(Failure::Request(CHANGED)),
-                };
-            };
-            let mut retired_remaining = PAGE_ROWS;
-            match query {
-                Query::Summary {
-                    opening,
-                    revision: previous,
-                } => {
-                    check(&previous)?;
-                    let descriptor_id = read
-                        .find(Tree::OpeningHash, &hash_key(&opening))?
-                        .ok_or(Failure::Request(CHANGED))?;
-                    let row =
-                        live_descriptor(&read, descriptor_id)?.ok_or(Failure::Request(CHANGED))?;
-                    if !authors.contains(&row.node) {
-                        return Err(Failure::Request(CHANGED));
-                    }
-                    let mut entries = 0u64;
-                    let mut newest: Option<(u64, Digest32)> = None;
-                    for author in &authors {
-                        let group = super::activity_index::group(&row.id, author);
-                        entries = entries
-                            .checked_add(
-                                read.find(Tree::ActivityCounts, &hash_key(&group))?
-                                    .unwrap_or(0),
-                            )
-                            .ok_or(Error::MalformedAtRest("Session entry count exhausted"))?;
-                        let mut bound = [255; 64];
-                        bound[..32].copy_from_slice(&group);
-                        if let Some((key, id)) = read.previous(Tree::ActivityRaw, Some(bound))? {
-                            if key[..32] == group && newest.is_none_or(|(old, _)| id > old) {
-                                let fact = super::activity_index::fact(&read, id)?;
-                                if fact.author != *author || fact.session != row.id {
-                                    return Err(
-                                        Error::MalformedAtRest("Session newest binding").into()
-                                    );
-                                }
-                                newest = Some((id, fact.hash));
-                            }
-                        }
-                    }
-                    let waiting = if row.ended.is_none() {
-                        read.activity_find(
-                            super::activity_state::ActivityTree::PendingCount,
-                            &hash_key(&super::activity_index::group(&row.id, &row.node)),
-                        )?
-                        .unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    Ok(Reply::Summary(crate::node::ipc::SessionSummary {
-                        entries,
-                        newest: newest.map(|(_, hash)| hash),
-                        waiting: u32::try_from(waiting).unwrap_or(u32::MAX),
-                    }))
-                }
-                Query::Pending { after } => {
-                    use super::activity_index::{arrival_key, fact};
-                    use super::activity_state::ActivityTree;
-                    let stamp = self.sessions_revision(store)?;
-                    if after.is_some_and(|c| c.revision != stamp) {
-                        return Err(Failure::Request(CHANGED));
-                    }
-                    let mut cursor = after.map(|c| c.after);
-                    let mut targets = Vec::new();
-                    let mut complete = false;
-                    for _ in 0..256 {
-                        if targets.len() == 64 {
-                            break;
-                        }
-                        let Some((key, id)) =
-                            read.activity_next(ActivityTree::RoomPending, cursor.map(arrival_key))?
-                        else {
-                            complete = true;
-                            break;
-                        };
-                        if key != arrival_key(id) {
-                            return Err(
-                                Error::MalformedAtRest("Session pending cursor binding").into()
-                            );
-                        }
-                        cursor = Some(id);
-                        let f = fact(&read, id)?;
-                        if !authors.contains(&f.author) {
-                            continue;
-                        }
-                        let reference = f
-                            .outcome_reference()
-                            .ok_or(Error::MalformedAtRest("Session pending request reference"))?;
-                        if read
-                            .activity_find(
-                                ActivityTree::Resolved,
-                                &hash_key(&super::activity_fold::authored_reference(
-                                    &f, &reference,
-                                )),
-                            )?
-                            .is_some()
-                        {
-                            continue;
-                        }
-                        let group = sha256_concat(&[
-                            b"vox/session-projection/id/v1",
-                            &f.author,
-                            f.session.as_bytes(),
-                        ]);
-                        let Some(row_id) = read.find(Tree::Groups, &hash_key(&group))? else {
-                            continue;
-                        };
-                        let Some(row) = live_descriptor(&read, row_id)? else {
-                            continue;
-                        };
-                        if row.node != f.author || row.id != f.session {
-                            return Err(
-                                Error::MalformedAtRest("Session pending opening binding").into()
-                            );
-                        }
-                        if row.ended.is_some() {
-                            continue;
-                        }
-                        targets.push(crate::node::sessions::PendingTarget {
-                            node: f.author,
-                            id: f.session,
-                            opening: row.opening.position.hash,
-                            entry: f.hash,
-                        });
-                    }
-                    Ok(Reply::Pending {
-                        targets,
-                        next: if complete {
-                            None
-                        } else {
-                            cursor.map(|after| crate::node::sessions::PendingCursor {
-                                revision: stamp,
-                                after,
-                            })
-                        },
-                    })
-                }
-                Query::Waiting => {
-                    // The published waiting root answers; a rebuild in flight publishes its
-                    // own root later and changes the room's Session revision, so the count
-                    // is read again then.
-                    let waiting = &read.header.activity.waiting;
-                    let mut total = 0u64;
-                    for author in &authors {
-                        total = total
-                            .checked_add(
-                                read.waiting_find(waiting.root, &hash_key(author))?
-                                    .unwrap_or(0),
-                            )
-                            .ok_or(Error::MalformedAtRest("Session waiting total exhausted"))?;
-                    }
-                    Ok(Reply::Waiting(total))
-                }
-                Query::Lifecycle {
-                    before,
-                    not_before,
-                    limit,
-                } => {
-                    let mut cursor = match before {
-                        None => None,
-                        Some(cursor) => {
-                            let id = read
-                                .find(Tree::OpeningHash, &hash_key(&cursor.opening))?
-                                .ok_or(Failure::Request(CHANGED))?;
-                            let row =
-                                live_descriptor(&read, id)?.ok_or(Failure::Request(CHANGED))?;
-                            let time = if cursor.ended {
-                                row.ended.map(|e| e.position.created)
-                            } else {
-                                Some(row.position.created)
-                            };
-                            if !authors.contains(&row.node) || time != Some(cursor.at_millis) {
-                                return Err(Failure::Request(CHANGED));
-                            }
-                            Some((cursor.at_millis, id, cursor.ended))
-                        }
-                    };
-                    let mut rows = Vec::new();
-                    let mut bytes = 0u64;
-                    let mut older = false;
-                    while let Some((key, id)) = previous_lifecycle(&read, &authors, cursor)? {
-                        let time = u64::from_be_bytes(
-                            key[32..40]
-                                .try_into()
-                                .map_err(|_| Error::MalformedAtRest("Session lifecycle time"))?,
-                        );
-                        if not_before.is_some_and(|lower| time < lower) {
-                            break;
-                        }
-                        let row = descriptor(&read, id)?;
-                        let ended = key[48] == 1;
-                        if key[48] > 1 || key != lifecycle_key(&row.node, time, id, ended) {
-                            return Err(
-                                Error::MalformedAtRest("Session lifecycle index binding").into()
-                            );
-                        }
-                        let cost = 256u64
-                            .saturating_add(row.name.map_or(0, |f| f.bytes))
-                            .saturating_add(row.harness.map_or(0, |f| f.bytes))
-                            .saturating_add(row.cwd.map_or(0, |f| f.bytes));
-                        if !rows.is_empty()
-                            && (rows.len() >= limit.clamp(1, PAGE_ROWS)
-                                || bytes.saturating_add(cost) > max_bytes as u64)
-                        {
-                            older = true;
-                            break;
-                        }
-                        cursor = Some((time, id, ended));
-                        let Some(row) = live_descriptor(&read, id)? else {
-                            retired_remaining = retired_remaining.saturating_sub(1);
-                            if retired_remaining == 0 {
-                                return Err(Failure::Request(REFRESHING));
-                            }
-                            continue;
-                        };
-                        bytes = bytes.saturating_add(cost);
-                        cursor = Some((time, id, ended));
-                        let cursor = crate::node::sessions::LifecycleCursor {
-                            at_millis: time,
-                            opening: row.opening.position.hash,
-                            ended,
-                        };
-                        rows.push((Row::from(row), cursor));
-                    }
-                    rows.reverse();
-                    Ok(Reply::Lifecycle {
-                        rows,
-                        older,
-                        revision,
-                    })
-                }
-                Query::HasOpen { node } => {
-                    // This node's own Sessions are its own durable facts (ADR-037 R5): they
-                    // are answered while other authors' controls refresh, and a provisional
-                    // fold does not turn its own "none" into a retry.
-                    if node != me {
-                        readable(&node)?;
-                    }
-                    let open = next(&read, &[node], 0, true, &mut retired_remaining)?.is_some();
-                    if node != me {
-                        proven(open)?;
-                    }
-                    Ok(Reply::HasOpen(open))
-                }
-                Query::Join { node } => {
-                    // One deterministic current opening, directly from the existing author
-                    // index. Read-only members get the same empty answer as no opening; a
-                    // member whose controls are refreshing, or whose opening a provisional
-                    // fold does not hold yet, is told to retry rather than "none".
-                    let row = if (authors.contains(&node) || node == me) && self.is_member(&node) {
-                        next(&read, &[node], 0, true, &mut retired_remaining)?.map(|(_, row)| row)
-                    } else {
-                        None
-                    };
-                    // The node's own opening is its own durable fact (ADR-037 R5): its harness
-                    // hook, a one-shot command, was turned away with "refreshing saved
-                    // Sessions" while another member's join folded, and no Session ever
-                    // opened; a member with drive then never read it.
-                    if self.is_member(&node) && node != me {
-                        if refreshing.contains(&node) {
-                            return Err(Failure::Request(REFRESHING));
-                        }
-                        if authors.contains(&node) {
-                            proven(row.is_some())?;
-                        }
-                    }
-                    if row.as_ref().is_some_and(|row| {
-                        256u64
-                            .saturating_add(row.name.map_or(0, |f| f.bytes))
-                            .saturating_add(row.harness.map_or(0, |f| f.bytes))
-                            .saturating_add(row.cwd.map_or(0, |f| f.bytes))
-                            > max_bytes as u64
-                    }) {
-                        return Err(Failure::Request("Session join metadata exceeds one page"));
-                    }
-                    Ok(Reply::Page {
-                        rows: row.map(Row::from).into_iter().collect(),
-                        more: false,
-                        revision: Revision {
-                            member: Some(node),
-                            ..revision
-                        },
-                    })
-                }
+            } else if refreshing.contains(node) {
+                Err(Failure::Request(REFRESHING))
+            } else {
+                Err(Failure::Request(CANNOT_READ))
+            }
+        };
+        // A provisional fold proves no absence: a Session it does not hold may be among
+        // the unfolded inputs, and "none" would let an idempotent opening post twice.
+        let proven = |found: bool| -> Answer<()> {
+            if !found && provisional {
+                return Err(Failure::Request(REFRESHING));
+            }
+            Ok(())
+        };
+        let Some(read) = read else {
+            // No fold has run here yet: nothing is known, and every answer says so.
+            return match query {
+                Query::Waiting => Ok(Reply::Waiting(0)),
+                Query::Pending { .. } => Ok(Reply::Pending {
+                    targets: Vec::new(),
+                    next: None,
+                }),
+                Query::Lifecycle { .. } => Ok(Reply::Lifecycle {
+                    rows: Vec::new(),
+                    older: false,
+                    revision,
+                }),
                 Query::Page {
-                    open_only,
-                    after,
-                    revision: previous,
-                    limit,
+                    revision: previous, ..
                 } => {
                     if let Some(previous) = &previous {
                         check(previous)?;
                     }
-                    // Every member's Sessions are listed, those this node cannot open among
-                    // them: a member without drive sees a Session's entry and is offered no
-                    // driving action on it (ADR-029 CL-3), and `can_drive` says which. Listing
-                    // only the authors whose drive key this node holds made a Session vanish
-                    // from the list the moment its node took drive back, instead of saying
-                    // `can_drive: false`; the walk stays one sealed path per member per row.
-                    let listed: Vec<Digest32> = self
-                        .authors
-                        .keys()
-                        .copied()
-                        .filter(|member| !self.has_left(member))
-                        .collect();
-                    let mut cursor = match after {
-                        None => 0,
-                        Some(hash) => {
-                            let id = read
-                                .find(Tree::OpeningHash, &hash_key(&hash))?
-                                .ok_or(Failure::Request("cursor not among this room's Sessions"))?;
-                            if !listed.contains(
-                                &live_descriptor(&read, id)?
-                                    .ok_or(Failure::Request(CHANGED))?
-                                    .node,
-                            ) {
-                                return Err(Failure::Request(CHANGED));
-                            }
-                            id
-                        }
-                    };
-                    let mut rows = Vec::new();
-                    let mut bytes = 0u64;
-                    let mut candidate =
-                        next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
-                    while let Some((id, row)) = candidate {
-                        let cost = 256u64
-                            .saturating_add(row.name.map_or(0, |f| f.bytes))
-                            .saturating_add(row.harness.map_or(0, |f| f.bytes))
-                            .saturating_add(row.cwd.map_or(0, |f| f.bytes));
-                        if !rows.is_empty()
-                            && (rows.len() >= limit.clamp(1, PAGE_ROWS)
-                                || bytes.saturating_add(cost) > max_bytes as u64)
-                        {
-                            return Ok(Reply::Page {
-                                rows,
-                                more: true,
-                                revision,
-                            });
-                        }
-                        bytes = bytes.saturating_add(cost);
-                        cursor = id;
-                        rows.push(Row::from(row));
-                        candidate =
-                            next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
-                    }
                     Ok(Reply::Page {
-                        rows,
+                        rows: Vec::new(),
                         more: false,
                         revision,
                     })
@@ -866,87 +553,449 @@ impl ChannelState {
                     check(&previous)?;
                     Ok(Reply::Valid)
                 }
-                Query::Exact { node, id } => {
-                    readable(&node)?;
-                    let group =
-                        sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
-                    let row = read
-                        .find(Tree::Groups, &hash_key(&group))?
-                        .map(|id| live_descriptor(&read, id))
-                        .transpose()?
-                        .flatten()
-                        .map(Row::from);
-                    proven(row.is_some())?;
+                Query::Join { node } => {
+                    if node != me
+                        && self.is_member(&node)
+                        && (authors.contains(&node) || refreshing.contains(&node))
+                    {
+                        return Err(Failure::Request(REFRESHING));
+                    }
                     Ok(Reply::Page {
-                        rows: row.into_iter().collect(),
+                        rows: Vec::new(),
                         more: false,
-                        revision,
+                        revision: Revision {
+                            member: Some(node),
+                            ..revision
+                        },
                     })
                 }
-                Query::Lookup { node, id } => {
+                Query::HasOpen { node } if node == me => Ok(Reply::HasOpen(false)),
+                Query::HasOpen { node }
+                | Query::Exact { node, .. }
+                | Query::Lookup { node, .. } => {
                     readable(&node)?;
-                    let group =
-                        sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
-                    let row = read
-                        .find(Tree::Groups, &hash_key(&group))?
-                        .map(|id| live_descriptor(&read, id))
-                        .transpose()?
-                        .flatten()
-                        .map(Row::from);
-                    proven(row.is_some())?;
-                    Ok(Reply::Lookup(row))
+                    Err(Failure::Request(REFRESHING))
                 }
-                Query::Text {
-                    opening,
-                    field,
-                    after,
-                    revision: previous,
-                } => {
-                    check(&previous)?;
-                    let id = read
-                        .find(Tree::OpeningHash, &hash_key(&opening))?
-                        .ok_or(Failure::Request(CHANGED))?;
-                    let row = descriptor(&read, id)?;
-                    if !read.retained(row.opening)? {
-                        return Err(Failure::Request(CHANGED));
-                    }
-                    if !authors.contains(&row.node) {
-                        return Err(Failure::Request(CHANGED));
-                    }
-                    let field = match field {
-                        FieldKind::Name => row.name,
-                        FieldKind::Harness => row.harness,
-                        FieldKind::Cwd => row.cwd,
-                    };
-                    let Some(field) = field else {
-                        return Ok(Reply::Text(TextPage {
-                            bytes: Vec::new(),
-                            next: None,
-                        }));
-                    };
-                    if !read.retained(field.envelope.first)? {
-                        return Err(Failure::Request(CHANGED));
-                    }
-                    let mut input = EnvelopeInput::new(&read, field.envelope);
-                    let page =
-                        super::text::page(&mut input, field, after, max_bytes.clamp(4, TEXT_BYTES));
-                    if input.retired() {
-                        return Err(Failure::Request(CHANGED));
-                    }
-                    let page = page?;
-                    Ok(Reply::Text(TextPage {
-                        bytes: page.bytes,
-                        next: page.next,
-                    }))
+                Query::Summary { .. } | Query::Text { .. } => Err(Failure::Request(CHANGED)),
+            };
+        };
+        let mut retired_remaining = PAGE_ROWS;
+        match query {
+            Query::Summary {
+                opening,
+                revision: previous,
+            } => {
+                check(&previous)?;
+                let descriptor_id = read
+                    .find(Tree::OpeningHash, &hash_key(&opening))?
+                    .ok_or(Failure::Request(CHANGED))?;
+                let row =
+                    live_descriptor(&read, descriptor_id)?.ok_or(Failure::Request(CHANGED))?;
+                if !authors.contains(&row.node) {
+                    return Err(Failure::Request(CHANGED));
                 }
+                let mut entries = 0u64;
+                let mut newest: Option<(u64, Digest32)> = None;
+                for author in &authors {
+                    let group = super::activity_index::group(&row.id, author);
+                    entries = entries
+                        .checked_add(
+                            read.find(Tree::ActivityCounts, &hash_key(&group))?
+                                .unwrap_or(0),
+                        )
+                        .ok_or(Error::MalformedAtRest("Session entry count exhausted"))?;
+                    let mut bound = [255; 64];
+                    bound[..32].copy_from_slice(&group);
+                    if let Some((key, id)) = read.previous(Tree::ActivityRaw, Some(bound))? {
+                        if key[..32] == group && newest.is_none_or(|(old, _)| id > old) {
+                            let fact = super::activity_index::fact(&read, id)?;
+                            if fact.author != *author || fact.session != row.id {
+                                return Err(Error::MalformedAtRest("Session newest binding").into());
+                            }
+                            newest = Some((id, fact.hash));
+                        }
+                    }
+                }
+                let waiting = if row.ended.is_none() {
+                    read.activity_find(
+                        super::activity_state::ActivityTree::PendingCount,
+                        &hash_key(&super::activity_index::group(&row.id, &row.node)),
+                    )?
+                    .unwrap_or(0)
+                } else {
+                    0
+                };
+                Ok(Reply::Summary(crate::node::ipc::SessionSummary {
+                    entries,
+                    newest: newest.map(|(_, hash)| hash),
+                    waiting: u32::try_from(waiting).unwrap_or(u32::MAX),
+                }))
             }
-        })();
-        match result {
-            Ok(reply) => Ok(reply),
-            Err(Failure::Request(why)) => Err(why.into()),
-            Err(Failure::Storage(error)) => {
-                self.poison(&error);
-                Err(error.to_string())
+            Query::Pending { after } => {
+                use super::activity_index::{arrival_key, fact};
+                use super::activity_state::ActivityTree;
+                let stamp = self.sessions_revision_view(view)?;
+                if after.is_some_and(|c| c.revision != stamp) {
+                    return Err(Failure::Request(CHANGED));
+                }
+                let mut cursor = after.map(|c| c.after);
+                let mut targets = Vec::new();
+                let mut complete = false;
+                for _ in 0..256 {
+                    if targets.len() == 64 {
+                        break;
+                    }
+                    let Some((key, id)) =
+                        read.activity_next(ActivityTree::RoomPending, cursor.map(arrival_key))?
+                    else {
+                        complete = true;
+                        break;
+                    };
+                    if key != arrival_key(id) {
+                        return Err(Error::MalformedAtRest("Session pending cursor binding").into());
+                    }
+                    cursor = Some(id);
+                    let f = fact(&read, id)?;
+                    if !authors.contains(&f.author) {
+                        continue;
+                    }
+                    let reference = f
+                        .outcome_reference()
+                        .ok_or(Error::MalformedAtRest("Session pending request reference"))?;
+                    if read
+                        .activity_find(
+                            ActivityTree::Resolved,
+                            &hash_key(&super::activity_fold::authored_reference(&f, &reference)),
+                        )?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let group = sha256_concat(&[
+                        b"vox/session-projection/id/v1",
+                        &f.author,
+                        f.session.as_bytes(),
+                    ]);
+                    let Some(row_id) = read.find(Tree::Groups, &hash_key(&group))? else {
+                        continue;
+                    };
+                    let Some(row) = live_descriptor(&read, row_id)? else {
+                        continue;
+                    };
+                    if row.node != f.author || row.id != f.session {
+                        return Err(
+                            Error::MalformedAtRest("Session pending opening binding").into()
+                        );
+                    }
+                    if row.ended.is_some() {
+                        continue;
+                    }
+                    targets.push(crate::node::sessions::PendingTarget {
+                        node: f.author,
+                        id: f.session,
+                        opening: row.opening.position.hash,
+                        entry: f.hash,
+                    });
+                }
+                Ok(Reply::Pending {
+                    targets,
+                    next: if complete {
+                        None
+                    } else {
+                        cursor.map(|after| crate::node::sessions::PendingCursor {
+                            revision: stamp,
+                            after,
+                        })
+                    },
+                })
+            }
+            Query::Waiting => {
+                // The published waiting root answers; a rebuild in flight publishes its
+                // own root later and changes the room's Session revision, so the count
+                // is read again then.
+                let waiting = &read.header.activity.waiting;
+                let mut total = 0u64;
+                for author in &authors {
+                    total = total
+                        .checked_add(
+                            read.waiting_find(waiting.root, &hash_key(author))?
+                                .unwrap_or(0),
+                        )
+                        .ok_or(Error::MalformedAtRest("Session waiting total exhausted"))?;
+                }
+                Ok(Reply::Waiting(total))
+            }
+            Query::Lifecycle {
+                before,
+                not_before,
+                limit,
+            } => {
+                let mut cursor = match before {
+                    None => None,
+                    Some(cursor) => {
+                        let id = read
+                            .find(Tree::OpeningHash, &hash_key(&cursor.opening))?
+                            .ok_or(Failure::Request(CHANGED))?;
+                        let row = live_descriptor(&read, id)?.ok_or(Failure::Request(CHANGED))?;
+                        let time = if cursor.ended {
+                            row.ended.map(|e| e.position.created)
+                        } else {
+                            Some(row.position.created)
+                        };
+                        if !authors.contains(&row.node) || time != Some(cursor.at_millis) {
+                            return Err(Failure::Request(CHANGED));
+                        }
+                        Some((cursor.at_millis, id, cursor.ended))
+                    }
+                };
+                let mut rows = Vec::new();
+                let mut bytes = 0u64;
+                let mut older = false;
+                while let Some((key, id)) = previous_lifecycle(&read, &authors, cursor)? {
+                    let time = u64::from_be_bytes(
+                        key[32..40]
+                            .try_into()
+                            .map_err(|_| Error::MalformedAtRest("Session lifecycle time"))?,
+                    );
+                    if not_before.is_some_and(|lower| time < lower) {
+                        break;
+                    }
+                    let row = descriptor(&read, id)?;
+                    let ended = key[48] == 1;
+                    if key[48] > 1 || key != lifecycle_key(&row.node, time, id, ended) {
+                        return Err(
+                            Error::MalformedAtRest("Session lifecycle index binding").into()
+                        );
+                    }
+                    let cost = 256u64
+                        .saturating_add(row.name.map_or(0, |f| f.bytes))
+                        .saturating_add(row.harness.map_or(0, |f| f.bytes))
+                        .saturating_add(row.cwd.map_or(0, |f| f.bytes));
+                    if !rows.is_empty()
+                        && (rows.len() >= limit.clamp(1, PAGE_ROWS)
+                            || bytes.saturating_add(cost) > max_bytes as u64)
+                    {
+                        older = true;
+                        break;
+                    }
+                    cursor = Some((time, id, ended));
+                    let Some(row) = live_descriptor(&read, id)? else {
+                        retired_remaining = retired_remaining.saturating_sub(1);
+                        if retired_remaining == 0 {
+                            return Err(Failure::Request(REFRESHING));
+                        }
+                        continue;
+                    };
+                    bytes = bytes.saturating_add(cost);
+                    cursor = Some((time, id, ended));
+                    let cursor = crate::node::sessions::LifecycleCursor {
+                        at_millis: time,
+                        opening: row.opening.position.hash,
+                        ended,
+                    };
+                    rows.push((Row::from(row), cursor));
+                }
+                rows.reverse();
+                Ok(Reply::Lifecycle {
+                    rows,
+                    older,
+                    revision,
+                })
+            }
+            Query::HasOpen { node } => {
+                // This node's own Sessions are its own durable facts (ADR-037 R5): they
+                // are answered while other authors' controls refresh, and a provisional
+                // fold does not turn its own "none" into a retry.
+                if node != me {
+                    readable(&node)?;
+                }
+                let open = next(&read, &[node], 0, true, &mut retired_remaining)?.is_some();
+                if node != me {
+                    proven(open)?;
+                }
+                Ok(Reply::HasOpen(open))
+            }
+            Query::Join { node } => {
+                // One deterministic current opening, directly from the existing author
+                // index. Read-only members get the same empty answer as no opening; a
+                // member whose controls are refreshing, or whose opening a provisional
+                // fold does not hold yet, is told to retry rather than "none".
+                let row = if (authors.contains(&node) || node == me) && self.is_member(&node) {
+                    next(&read, &[node], 0, true, &mut retired_remaining)?.map(|(_, row)| row)
+                } else {
+                    None
+                };
+                // The node's own opening is its own durable fact (ADR-037 R5): its harness
+                // hook, a one-shot command, was turned away with "refreshing saved
+                // Sessions" while another member's join folded, and no Session ever
+                // opened; a member with drive then never read it.
+                if self.is_member(&node) && node != me {
+                    if refreshing.contains(&node) {
+                        return Err(Failure::Request(REFRESHING));
+                    }
+                    if authors.contains(&node) {
+                        proven(row.is_some())?;
+                    }
+                }
+                if row.as_ref().is_some_and(|row| {
+                    256u64
+                        .saturating_add(row.name.map_or(0, |f| f.bytes))
+                        .saturating_add(row.harness.map_or(0, |f| f.bytes))
+                        .saturating_add(row.cwd.map_or(0, |f| f.bytes))
+                        > max_bytes as u64
+                }) {
+                    return Err(Failure::Request("Session join metadata exceeds one page"));
+                }
+                Ok(Reply::Page {
+                    rows: row.map(Row::from).into_iter().collect(),
+                    more: false,
+                    revision: Revision {
+                        member: Some(node),
+                        ..revision
+                    },
+                })
+            }
+            Query::Page {
+                open_only,
+                after,
+                revision: previous,
+                limit,
+            } => {
+                if let Some(previous) = &previous {
+                    check(previous)?;
+                }
+                // Every member's Sessions are listed, those this node cannot open among
+                // them: a member without drive sees a Session's entry and is offered no
+                // driving action on it (ADR-029 CL-3), and `can_drive` says which. Listing
+                // only the authors whose drive key this node holds made a Session vanish
+                // from the list the moment its node took drive back, instead of saying
+                // `can_drive: false`; the walk stays one sealed path per member per row.
+                let listed: Vec<Digest32> = self
+                    .authors
+                    .keys()
+                    .copied()
+                    .filter(|member| !self.has_left(member))
+                    .collect();
+                let mut cursor = match after {
+                    None => 0,
+                    Some(hash) => {
+                        let id = read
+                            .find(Tree::OpeningHash, &hash_key(&hash))?
+                            .ok_or(Failure::Request("cursor not among this room's Sessions"))?;
+                        if !listed.contains(
+                            &live_descriptor(&read, id)?
+                                .ok_or(Failure::Request(CHANGED))?
+                                .node,
+                        ) {
+                            return Err(Failure::Request(CHANGED));
+                        }
+                        id
+                    }
+                };
+                let mut rows = Vec::new();
+                let mut bytes = 0u64;
+                let mut candidate =
+                    next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
+                while let Some((id, row)) = candidate {
+                    let cost = 256u64
+                        .saturating_add(row.name.map_or(0, |f| f.bytes))
+                        .saturating_add(row.harness.map_or(0, |f| f.bytes))
+                        .saturating_add(row.cwd.map_or(0, |f| f.bytes));
+                    if !rows.is_empty()
+                        && (rows.len() >= limit.clamp(1, PAGE_ROWS)
+                            || bytes.saturating_add(cost) > max_bytes as u64)
+                    {
+                        return Ok(Reply::Page {
+                            rows,
+                            more: true,
+                            revision,
+                        });
+                    }
+                    bytes = bytes.saturating_add(cost);
+                    cursor = id;
+                    rows.push(Row::from(row));
+                    candidate = next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
+                }
+                Ok(Reply::Page {
+                    rows,
+                    more: false,
+                    revision,
+                })
+            }
+            Query::Validate { revision: previous } => {
+                check(&previous)?;
+                Ok(Reply::Valid)
+            }
+            Query::Exact { node, id } => {
+                readable(&node)?;
+                let group = sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
+                let row = read
+                    .find(Tree::Groups, &hash_key(&group))?
+                    .map(|id| live_descriptor(&read, id))
+                    .transpose()?
+                    .flatten()
+                    .map(Row::from);
+                proven(row.is_some())?;
+                Ok(Reply::Page {
+                    rows: row.into_iter().collect(),
+                    more: false,
+                    revision,
+                })
+            }
+            Query::Lookup { node, id } => {
+                readable(&node)?;
+                let group = sha256_concat(&[b"vox/session-projection/id/v1", &node, id.as_bytes()]);
+                let row = read
+                    .find(Tree::Groups, &hash_key(&group))?
+                    .map(|id| live_descriptor(&read, id))
+                    .transpose()?
+                    .flatten()
+                    .map(Row::from);
+                proven(row.is_some())?;
+                Ok(Reply::Lookup(row))
+            }
+            Query::Text {
+                opening,
+                field,
+                after,
+                revision: previous,
+            } => {
+                check(&previous)?;
+                let id = read
+                    .find(Tree::OpeningHash, &hash_key(&opening))?
+                    .ok_or(Failure::Request(CHANGED))?;
+                let row = descriptor(&read, id)?;
+                if !read.retained(row.opening)? {
+                    return Err(Failure::Request(CHANGED));
+                }
+                if !authors.contains(&row.node) {
+                    return Err(Failure::Request(CHANGED));
+                }
+                let field = match field {
+                    FieldKind::Name => row.name,
+                    FieldKind::Harness => row.harness,
+                    FieldKind::Cwd => row.cwd,
+                };
+                let Some(field) = field else {
+                    return Ok(Reply::Text(TextPage {
+                        bytes: Vec::new(),
+                        next: None,
+                    }));
+                };
+                if !read.retained(field.envelope.first)? {
+                    return Err(Failure::Request(CHANGED));
+                }
+                let mut input = EnvelopeInput::new(&read, field.envelope);
+                let page =
+                    super::text::page(&mut input, field, after, max_bytes.clamp(4, TEXT_BYTES));
+                if input.retired() {
+                    return Err(Failure::Request(CHANGED));
+                }
+                let page = page?;
+                Ok(Reply::Text(TextPage {
+                    bytes: page.bytes,
+                    next: page.next,
+                }))
             }
         }
     }

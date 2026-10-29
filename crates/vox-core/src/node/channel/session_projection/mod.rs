@@ -27,6 +27,7 @@ mod activity_state;
 mod build;
 mod files;
 mod metadata;
+mod pending;
 mod query;
 mod record;
 mod source;
@@ -41,4 +42,7 @@ pub(crate) use activity_query::{
     Cursor as ActivityCursor, Query as ActivityQuery, Reply as ActivityReply,
 };
 pub(crate) use files::{FileQuery, FileReply};
+pub(crate) use pending::{
+    CompletedProjection, PendingProjection, ProjectionProgress, ProjectionWork,
+};
 pub(crate) use query::{FieldKind, Query, Reply, Row};

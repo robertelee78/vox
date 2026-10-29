@@ -22,6 +22,7 @@ use crate::node::paths::{
 use zeroize::Zeroizing;
 
 mod pairing;
+mod publication_gate;
 pub use pairing::{
     ComputerApplication, ComputerBindingAction, ComputerIdentity, ComputerNode, ComputerStatus,
     ExchangeRecord, Management, PairingPreview, COMPUTER_PAIR_WITHIN,
@@ -1068,7 +1069,7 @@ impl Invitation {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct AppliedPolicy {
     pub revision: u64,
     pub interval: Digest32,
@@ -2540,7 +2541,10 @@ pub struct Computer {
     /// Serialize replacement-state transactions without making readers wait for their disk I/O.
     /// `state` is held only to take and publish a snapshot; `changes` keeps two writers from
     /// staging from the same snapshot while either one has released `state` to save it.
-    changes: Mutex<()>,
+    changes: Arc<publication_gate::Gate>,
+    /// Irreversible publications are concurrent readers; authority replacement is an exclusive
+    /// writer. Neither side retains `state` during physical I/O.
+    publications: Arc<publication_gate::Gate>,
     pub(crate) state: Mutex<State>,
     // Existing live room gates, weakly held: a durable policy change invalidates them before
     // exposing the new revision. Actors republish only after their keyring is reconciled.
@@ -2559,6 +2563,27 @@ pub struct Computer {
     plans: Mutex<BTreeMap<Digest32, (u64, PolicyPlan)>>,
 }
 
+/// Owns physical publication through its actual durable outcome, not through task cancellation.
+/// This is deliberately separate from revocable network sends: a database commit cannot reset.
+pub(crate) struct ComputerPublication {
+    _lease: publication_gate::Reader,
+}
+
+/// One authority transition, acquired off actor (or without waiting on actor). Lock order is
+/// `changes` -> exclusive `publications` -> short `state`; node-store writers are acquired last.
+/// Keeping the writer-order guard here lets binding, preparation, keyring and receipt commits
+/// borrow the same transition without recursively acquiring either physical fence.
+pub(crate) struct ComputerPublicationTransition {
+    changes: publication_gate::Writer,
+    _lease: publication_gate::Writer,
+}
+
+/// Ordinary trust-command journal ownership. It serializes Computer snapshots without closing
+/// physical publication admission; the actor retains it from command admission to completion.
+pub(crate) struct ComputerJournalWriter {
+    lease: publication_gate::Writer,
+}
+
 /// When a node's management binding was last derived, and at which policy revision (ADR-038
 /// FX-28): what `vox computer status` shows, so a person can tell a stale binding from a
 /// current one. Part of the signed state, so a restart derives nothing again at the same
@@ -2571,6 +2596,65 @@ pub struct DerivedBinding {
     pub at_ms: u64,
 }
 impl Computer {
+    pub(crate) fn writer_pending(&self) -> bool {
+        self.changes.writer_pending()
+    }
+
+    /// Observe writer completion without reserving another writer or blocking the actor.
+    pub(crate) async fn wait_writer(&self) {
+        drop(self.changes.read().await);
+    }
+
+    pub(crate) fn try_journal_writer(&self) -> Option<ComputerJournalWriter> {
+        Some(ComputerJournalWriter {
+            lease: self.changes.try_write()?,
+        })
+    }
+
+    /// Deferred trust work acquires this before taking room authority transitions.
+    pub(crate) async fn journal_writer(&self) -> ComputerJournalWriter {
+        ComputerJournalWriter {
+            lease: self.changes.write().await,
+        }
+    }
+
+    /// Actor admission never waits on a physical publication or another Computer writer.
+    pub(crate) fn try_publication_transition(&self) -> Option<ComputerPublicationTransition> {
+        let changes = self.changes.try_write()?;
+        let lease = self.publications.try_write()?;
+        Some(ComputerPublicationTransition {
+            changes,
+            _lease: lease,
+        })
+    }
+
+    /// Only deferred workers wait here; hold no actor, room, state or node-store writer.
+    pub(crate) async fn publication_transition(&self) -> ComputerPublicationTransition {
+        let changes = self.changes.write().await;
+        let lease = self.publications.write().await;
+        ComputerPublicationTransition {
+            changes,
+            _lease: lease,
+        }
+    }
+
+    fn require_transition(&self, transition: &ComputerPublicationTransition) {
+        assert!(transition.changes.belongs_to(&self.changes));
+    }
+
+    /// A retained post waits off actor, before taking any room or node-store writer. Revalidation
+    /// follows lease acquisition: a queued revocation always wins over newly admitted old work.
+    pub(crate) async fn acquire_publication(
+        &self,
+        applied: u64,
+        expired: bool,
+        node: Digest32,
+    ) -> Option<ComputerPublication> {
+        let lease = self.publications.read().await;
+        self.policy_current(applied, expired, node)
+            .then_some(ComputerPublication { _lease: lease })
+    }
+
     /// Exact durable policy projection current at this instant. Callers carry both fields through
     /// delayed work; expiry can move without a new operator-policy revision.
     pub fn policy_target(&self) -> ComputerPolicyTarget {
@@ -2586,7 +2670,7 @@ impl Computer {
     /// publication (or failure); take no view, slot or state lock while waiting for it.
     pub(crate) fn policy_target_after_writer(&self) -> Result<ComputerPolicyTarget> {
         blocking_transaction(|| {
-            let _change = lock(&self.changes);
+            let _change = self.changes.blocking_write();
             if self
                 .authority_blocked
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -2663,10 +2747,10 @@ impl Computer {
                     })
     }
 
-    /// Execute one synchronous irreversible publication only while `node`'s actor projection is
-    /// current. The policy-state lock stays held through `publish`, so a durable revocation cannot
-    /// land between the final revision/binding check and the room-log or delivery-queue write.
-    /// Callers must complete every await (connection, prekey, channel lock) before entering.
+    /// Try one synchronous irreversible publication without waiting for an authority transition.
+    /// The read lease prevents revocation through `publish`; `state` is only sampled by the
+    /// freshness check and is never retained through room-log, delivery-queue or filesystem I/O.
+    /// Closures may read Computer state, but must not start a Computer authority transaction.
     pub(crate) fn publish_with_current_authority<T>(
         &self,
         applied: u64,
@@ -2674,30 +2758,8 @@ impl Computer {
         node: Digest32,
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
-        let state = lock(&self.state);
-        let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
-        let current = !self
-            .authority_blocked
-            .load(std::sync::atomic::Ordering::Acquire)
-            && (unmanaged
-                || (self.storage_ready().is_ok()
-                    && state.policy_revision == applied
-                    && Self::revision_expired(&state) == expired
-                    && if Self::revision_expired(&state)
-                        || state.grant(&self.signer.fingerprint()).is_none()
-                    {
-                        // The expired policy itself is not authority.  The safe, durably-revoked
-                        // projection is: it lets manual/unmanaged work continue without allowing a
-                        // grant from the missed revision to survive or reappear.
-                        Self::application_settled_in(&state, &node, applied)
-                    } else {
-                        Self::application_settled_in(&state, &node, applied)
-                            && state
-                                .derived
-                                .get(&node)
-                                .is_some_and(|derived| derived.revision == state.policy_revision)
-                    }));
-        current.then(publish)
+        let _lease = self.publications.try_read()?;
+        self.policy_current(applied, expired, node).then(publish)
     }
 
     pub(crate) fn storage_ready(&self) -> Result<()> {
@@ -2711,7 +2773,7 @@ impl Computer {
         }
     }
 
-    /// Register while `publish_with_current_authority` holds the state lock.
+    /// Register while `publish_with_current_authority` retains its physical publication lease.
     pub(crate) fn register_own_key_writer(
         &self,
         writer: &Arc<crate::node::channel::own_writer_gate::RevocableSend>,
@@ -2772,6 +2834,8 @@ impl Computer {
         });
     }
 
+    /// A storage fault closes new authorization immediately. Already-admitted physical commits
+    /// keep their actual outcomes: unlike a network stream, they cannot be reset or made unsent.
     fn storage_failure(&self) {
         self.storage_failed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2824,22 +2888,32 @@ impl Computer {
     /// Bind an already unlocked local node. The signer never crosses the daemon's actor boundary.
     /// This does not unlock or create a node, enroll a computer, or authorize an unapproved group.
     pub fn bind_node(&self, signer: &dyn RootSigner, name: &str) -> Result<()> {
-        self.bind_node_until(
+        self.bind_node_guarded(
             signer,
             name,
-            std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+            ComputerChangeBoundary::Deadline(
+                std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+            ),
+            None,
         )
+        .map(|_| ())
     }
     pub(crate) fn bind_node_until(
         &self,
         signer: &dyn RootSigner,
         name: &str,
         deadline: std::time::Instant,
+        transition: &ComputerPublicationTransition,
     ) -> Result<()> {
-        self.bind_node_guarded(signer, name, ComputerChangeBoundary::Deadline(deadline))
-            .map(|current| {
-                debug_assert!(current, "a deadline boundary cannot be superseded");
-            })
+        self.bind_node_guarded(
+            signer,
+            name,
+            ComputerChangeBoundary::Deadline(deadline),
+            Some(transition),
+        )
+        .map(|current| {
+            debug_assert!(current, "a deadline boundary cannot be superseded");
+        })
     }
 
     /// Bind only while the accepted follower event still owns the exact policy projection.
@@ -2849,8 +2923,14 @@ impl Computer {
         signer: &dyn RootSigner,
         name: &str,
         change: ComputerChange,
+        transition: &ComputerPublicationTransition,
     ) -> Result<bool> {
-        self.bind_node_guarded(signer, name, ComputerChangeBoundary::Current(change))
+        self.bind_node_guarded(
+            signer,
+            name,
+            ComputerChangeBoundary::Current(change),
+            Some(transition),
+        )
     }
 
     fn bind_node_guarded(
@@ -2858,6 +2938,7 @@ impl Computer {
         signer: &dyn RootSigner,
         name: &str,
         boundary: ComputerChangeBoundary,
+        transition: Option<&ComputerPublicationTransition>,
     ) -> Result<bool> {
         let local = self.signer.fingerprint();
         let key = signer.fingerprint();
@@ -3004,12 +3085,8 @@ impl Computer {
                 );
                 Ok(true)
             };
-            let current = match boundary {
-                ComputerChangeBoundary::Deadline(deadline) => {
-                    Some(self.change_until(deadline, bind)?)
-                }
-                ComputerChangeBoundary::Current(change) => self.change_for_target(change, bind)?,
-            };
+            let current =
+                blocking_transaction(|| self.change_guarded_blocking(boundary, bind, transition))?;
             let Some(current) = current else {
                 return Ok(false);
             };
@@ -3190,8 +3267,22 @@ impl Computer {
     /// still-current policy. A later completion repairs current state but cannot rewrite history.
     /// `false` means policy movement superseded the observed flight before the miss was recorded.
     pub fn record_application_miss(&self, node: Digest32, change: ComputerChange) -> Result<bool> {
+        self.record_application_miss_with_transition(node, change, None)
+    }
+
+    pub(crate) fn record_application_miss_with_transition(
+        &self,
+        node: Digest32,
+        change: ComputerChange,
+        transition: Option<&ComputerPublicationTransition>,
+    ) -> Result<bool> {
         blocking_transaction(|| {
-            let _change = lock(&self.changes);
+            let _change = if let Some(transition) = transition {
+                self.require_transition(transition);
+                None
+            } else {
+                Some(self.changes.blocking_write())
+            };
             self.storage_ready()?;
             let held = lock(&self.state).clone();
             if held.policy_revision != change.target.revision
@@ -3225,6 +3316,7 @@ impl Computer {
             revision,
             covered,
             std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+            None,
         )
         .map(|_| ())
     }
@@ -3240,6 +3332,7 @@ impl Computer {
         expected_expired: bool,
         covered: &[Digest32],
         deadline: std::time::Instant,
+        transition: &ComputerPublicationTransition,
     ) -> Result<bool> {
         self.prepare_application_guarded(
             node,
@@ -3247,6 +3340,7 @@ impl Computer {
             expected_expired,
             covered,
             ComputerChangeBoundary::Deadline(deadline),
+            transition,
         )
     }
 
@@ -3257,6 +3351,7 @@ impl Computer {
         expected_expired: bool,
         covered: &[Digest32],
         change: ComputerChange,
+        transition: &ComputerPublicationTransition,
     ) -> Result<bool> {
         self.prepare_application_guarded(
             node,
@@ -3264,6 +3359,7 @@ impl Computer {
             expected_expired,
             covered,
             ComputerChangeBoundary::Current(change),
+            transition,
         )
     }
 
@@ -3274,6 +3370,7 @@ impl Computer {
         expected_expired: bool,
         covered: &[Digest32],
         boundary: ComputerChangeBoundary,
+        transition: &ComputerPublicationTransition,
     ) -> Result<bool> {
         blocking_transaction(|| self.change_guarded_blocking(boundary, |state| {
             let current = state.policy_revision;
@@ -3316,7 +3413,7 @@ impl Computer {
                 }
             }
             Ok(true)
-        }))
+        }, Some(transition)))
         .map(|prepared| prepared.unwrap_or(false))
     }
 
@@ -3330,9 +3427,10 @@ impl Computer {
         revision: u64,
         expired: bool,
         commit: impl FnOnce() -> Result<T>,
+        transition: &ComputerPublicationTransition,
     ) -> Result<Option<T>> {
         blocking_transaction(|| {
-            let _change = lock(&self.changes);
+            self.require_transition(transition);
             self.storage_ready()?;
             {
                 let state = lock(&self.state);
@@ -3350,52 +3448,58 @@ impl Computer {
         revision: u64,
         covered: &[Digest32],
         _deadline: std::time::Instant,
+        transition: Option<&ComputerPublicationTransition>,
     ) -> Result<ApplicationReceipt> {
         let mut receipt = ApplicationReceipt::Current;
         // The node-keyring commit is already irreversible. Its receipt or rollback decision is
         // safety recovery, not fresh authorization, and must not be abandoned merely because the
         // initiating convergence deadline ended between the two durable stores.
-        self.change_durable(|s| {
-            if revision > s.policy_revision {
-                return Err(bad());
-            }
-            // The node keyring was prepared while this revision was live, but an authenticated
-            // missed-exchange marker may have expired it during the node-store rename. Preserve
-            // the durable prepared rollback set and make the actor revoke the just-written grant
-            // before it publishes the projection or starts networking. This check deliberately
-            // shares the policy-state transaction with the receipt below.
-            if revision == s.policy_revision && Self::revision_expired(s) {
-                receipt = ApplicationReceipt::Reconcile;
-                return Ok(());
-            }
-            // Another authenticated roster may have arrived during the node store write.
-            // Record the exact revision actually applied; the actor retries before authorizing.
-            if revision != s.policy_revision {
-                receipt = ApplicationReceipt::Reconcile;
-            }
+        blocking_transaction(|| {
+            self.change_durable_blocking(
+                |s| {
+                    if revision > s.policy_revision {
+                        return Err(bad());
+                    }
+                    // The node keyring was prepared while this revision was live, but an authenticated
+                    // missed-exchange marker may have expired it during the node-store rename. Preserve
+                    // the durable prepared rollback set and make the actor revoke the just-written grant
+                    // before it publishes the projection or starts networking. This check deliberately
+                    // shares the policy-state transaction with the receipt below.
+                    if revision == s.policy_revision && Self::revision_expired(s) {
+                        receipt = ApplicationReceipt::Reconcile;
+                        return Ok(());
+                    }
+                    // Another authenticated roster may have arrived during the node store write.
+                    // Record the exact revision actually applied; the actor retries before authorizing.
+                    if revision != s.policy_revision {
+                        receipt = ApplicationReceipt::Reconcile;
+                    }
 
-            let interval = s
-                .genesis
-                .as_ref()
-                .map(Enrollment::incarnation)
-                .unwrap_or([0; 32]);
-            let applied = s.applied.entry(node).or_insert_with(|| AppliedPolicy {
-                revision,
-                interval,
-                grants: BTreeMap::new(),
-            });
-            applied.interval = interval;
-            for peer in covered {
-                applied.grants.entry(*peer).or_insert(revision);
-            }
-            applied.revision = revision;
-            if s.prepared
-                .get(&node)
-                .is_some_and(|prepared| prepared.revision == revision)
-            {
-                s.prepared.remove(&node);
-            }
-            Ok(())
+                    let interval = s
+                        .genesis
+                        .as_ref()
+                        .map(Enrollment::incarnation)
+                        .unwrap_or([0; 32]);
+                    let applied = s.applied.entry(node).or_insert_with(|| AppliedPolicy {
+                        revision,
+                        interval,
+                        grants: BTreeMap::new(),
+                    });
+                    applied.interval = interval;
+                    for peer in covered {
+                        applied.grants.entry(*peer).or_insert(revision);
+                    }
+                    applied.revision = revision;
+                    if s.prepared
+                        .get(&node)
+                        .is_some_and(|prepared| prepared.revision == revision)
+                    {
+                        s.prepared.remove(&node);
+                    }
+                    Ok(())
+                },
+                transition,
+            )
         })?;
         Ok(receipt)
     }
@@ -3407,36 +3511,42 @@ impl Computer {
         node: Digest32,
         revision: u64,
         _deadline: std::time::Instant,
+        transition: &ComputerPublicationTransition,
     ) -> Result<ApplicationReceipt> {
         let mut receipt = ApplicationReceipt::Current;
         // As with the applied receipt, the keyring write already happened. Completing or
         // superseding its recovery journal cannot be cut off by the earlier apply deadline.
-        self.change_durable(|state| {
-            if revision > state.policy_revision {
-                return Err(bad());
-            }
-            // The revoked node keyring already committed. Its old live receipt is obsolete
-            // even if the expiry was repaired before this journal write; keeping it would
-            // certify the revoked keyring as live at the same revision, including on restart.
-            // A strictly newer application belongs to another completed projection and stands.
-            if state
-                .applied
-                .get(&node)
-                .is_none_or(|applied| applied.revision <= revision)
-            {
-                state.applied.remove(&node);
-                state.receipts.remove(&self.signer.fingerprint());
-            }
-            // A newer authenticated policy can arrive during the revocation keyring rename.
-            // The stale revocation is safe but is not current: retain its recovery records and
-            // immediately derive the newer policy instead of failing or claiming convergence.
-            if state.policy_revision != revision || !Self::revision_expired(state) {
-                receipt = ApplicationReceipt::Reconcile;
-                return Ok(());
-            }
-            // Only the exact current expiry can discharge its prepared rollback obligation.
-            state.prepared.remove(&node);
-            Ok(())
+        blocking_transaction(|| {
+            self.change_durable_blocking(
+                |state| {
+                    if revision > state.policy_revision {
+                        return Err(bad());
+                    }
+                    // The revoked node keyring already committed. Its old live receipt is obsolete
+                    // even if the expiry was repaired before this journal write; keeping it would
+                    // certify the revoked keyring as live at the same revision, including on restart.
+                    // A strictly newer application belongs to another completed projection and stands.
+                    if state
+                        .applied
+                        .get(&node)
+                        .is_none_or(|applied| applied.revision <= revision)
+                    {
+                        state.applied.remove(&node);
+                        state.receipts.remove(&self.signer.fingerprint());
+                    }
+                    // A newer authenticated policy can arrive during the revocation keyring rename.
+                    // The stale revocation is safe but is not current: retain its recovery records and
+                    // immediately derive the newer policy instead of failing or claiming convergence.
+                    if state.policy_revision != revision || !Self::revision_expired(state) {
+                        receipt = ApplicationReceipt::Reconcile;
+                        return Ok(());
+                    }
+                    // Only the exact current expiry can discharge its prepared rollback obligation.
+                    state.prepared.remove(&node);
+                    Ok(())
+                },
+                Some(transition),
+            )
         })?;
         Ok(receipt)
     }
@@ -3444,17 +3554,6 @@ impl Computer {
     /// Whether the durable Computer journal proves this exact node projection is complete.
     /// Expiry is complete only after its prepared rollback set is gone and its recorded
     /// computer-managed grants are empty; observing the expiry marker alone is not settlement.
-    pub(crate) fn application_settled(
-        &self,
-        node: &Digest32,
-        revision: u64,
-        expired: bool,
-    ) -> bool {
-        let state = lock(&self.state);
-        Self::revision_expired(&state) == expired
-            && Self::application_settled_in(&state, node, revision)
-    }
-
     fn application_settled_in(state: &State, node: &Digest32, revision: u64) -> bool {
         // No computer group has policy to apply. Keep this decision under the same state lock as
         // the grouped checks below, so establishing a group cannot race Ready publication.
@@ -3514,10 +3613,9 @@ impl Computer {
         Ok(())
     }
 
-    /// Publish Ready only while this exact application and its live binding are current. The
-    /// state lock stays held through `publish`, so policy movement after the actor's receipt
-    /// cannot land between this check and Ready. Revoked/unmanaged projections need no live
-    /// binding; they still must have completed their durable application.
+    /// Publish Ready under a concurrent physical lease after a short exact-state check. A
+    /// transition cannot land between this check and Ready; no Computer state guard survives
+    /// into the callback. Revoked/unmanaged projections still require completed application.
     pub(crate) fn with_application_settled<T>(
         &self,
         node: &Digest32,
@@ -3525,6 +3623,7 @@ impl Computer {
         expired: bool,
         publish: impl FnOnce() -> T,
     ) -> Option<T> {
+        let _lease = self.publications.try_read()?;
         let state = lock(&self.state);
         let unmanaged = state.genesis.is_none() && state.intervals.is_empty();
         let settled = !self
@@ -3534,6 +3633,7 @@ impl Computer {
             && Self::revision_expired(&state) == expired
             && Self::application_settled_in(&state, node, revision)
             && self.startup_binding_current_in(&state, node, revision, expired);
+        drop(state);
         #[cfg(feature = "test-knobs")]
         let settled = settled || fx28_mutant("ready-fence-accepts-unsettled");
         settled.then(publish)
@@ -3638,6 +3738,7 @@ impl Computer {
             node,
             aliases,
             std::time::Instant::now() + COMPUTER_CHANGE_SHOWN_WITHIN,
+            None,
         )
     }
     pub(crate) fn retain_aliases_until(
@@ -3645,11 +3746,17 @@ impl Computer {
         node: Digest32,
         aliases: &[(Digest32, String)],
         deadline: std::time::Instant,
+        transition: Option<&ComputerPublicationTransition>,
     ) -> Result<()> {
-        self.retain_aliases_guarded(node, aliases, ComputerChangeBoundary::Deadline(deadline))
-            .map(|retained| {
-                debug_assert!(retained, "a deadline boundary cannot be superseded");
-            })
+        self.retain_aliases_guarded(
+            node,
+            aliases,
+            ComputerChangeBoundary::Deadline(deadline),
+            transition,
+        )
+        .map(|retained| {
+            debug_assert!(retained, "a deadline boundary cannot be superseded");
+        })
     }
 
     pub(crate) fn retain_aliases_for_change(
@@ -3657,8 +3764,14 @@ impl Computer {
         node: Digest32,
         aliases: &[(Digest32, String)],
         change: ComputerChange,
+        transition: &ComputerPublicationTransition,
     ) -> Result<bool> {
-        self.retain_aliases_guarded(node, aliases, ComputerChangeBoundary::Current(change))
+        self.retain_aliases_guarded(
+            node,
+            aliases,
+            ComputerChangeBoundary::Current(change),
+            Some(transition),
+        )
     }
 
     fn retain_aliases_guarded(
@@ -3666,15 +3779,20 @@ impl Computer {
         node: Digest32,
         aliases: &[(Digest32, String)],
         boundary: ComputerChangeBoundary,
+        transition: Option<&ComputerPublicationTransition>,
     ) -> Result<bool> {
         blocking_transaction(|| {
-            self.change_guarded_blocking(boundary, |s| {
-                s.aliases
-                    .entry(node)
-                    .or_default()
-                    .extend(aliases.iter().cloned());
-                Ok(())
-            })
+            self.change_guarded_blocking(
+                boundary,
+                |s| {
+                    s.aliases
+                        .entry(node)
+                        .or_default()
+                        .extend(aliases.iter().cloned());
+                    Ok(())
+                },
+                transition,
+            )
         })
         .map(|retained| retained.is_some())
     }
@@ -3710,7 +3828,13 @@ impl Computer {
     /// The ordinary explicit Trust command after retirement chooses individual mode. Journal
     /// that local choice before its keyring write; a failed write grants nothing and can be
     /// retried. A peer that Computer policy never covered needs no Computer journal entry.
-    pub(crate) fn individual_choice(&self, node: Digest32, peer: Digest32) -> Result<()> {
+    pub(crate) fn individual_choice(
+        &self,
+        node: Digest32,
+        peer: Digest32,
+        writer: &ComputerJournalWriter,
+    ) -> Result<()> {
+        assert!(writer.lease.belongs_to(&self.changes));
         let Some(plan) = self.plan(node)? else {
             return Ok(());
         };
@@ -3720,11 +3844,16 @@ impl Computer {
         if !self.individual_permitted(node, &peer)? {
             return Err(Error::SignatureInvalid);
         }
-        self.change_durable(|s| {
-            s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
-            let revision = s.revision;
-            s.individual.entry(node).or_default().insert(peer, revision);
-            Ok(())
+        blocking_transaction(|| {
+            self.change_durable_under_writer(
+                |s| {
+                    s.revision = s.revision.checked_add(1).ok_or_else(bad)?;
+                    let revision = s.revision;
+                    s.individual.entry(node).or_default().insert(peer, revision);
+                    Ok(())
+                },
+                false,
+            )
         })?;
         lock(&self.plans).remove(&node);
         Ok(())
@@ -3769,7 +3898,8 @@ impl Computer {
                 own_key_writers: Mutex::new(Vec::new()),
                 own_key_settled: tokio::sync::watch::channel(()).0,
                 signer,
-                changes: Mutex::new(()),
+                changes: Arc::new(publication_gate::Gate::default()),
+                publications: Arc::new(publication_gate::Gate::default()),
                 state: Mutex::new(state),
                 reachers: Mutex::new(Vec::new()),
                 changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
@@ -3842,7 +3972,8 @@ impl Computer {
             own_key_writers: Mutex::new(Vec::new()),
             own_key_settled: tokio::sync::watch::channel(()).0,
             signer: Arc::new(root),
-            changes: Mutex::new(()),
+            changes: Arc::new(publication_gate::Gate::default()),
+            publications: Arc::new(publication_gate::Gate::default()),
             state: Mutex::new(state),
             reachers: Mutex::new(Vec::new()),
             changed: tokio::sync::broadcast::channel(MAX_RECORDS).0,
@@ -3912,7 +4043,7 @@ impl Computer {
         f: impl FnOnce(&mut State) -> Result<T>,
     ) -> Result<T> {
         blocking_transaction(|| {
-            self.change_guarded_blocking(ComputerChangeBoundary::Deadline(deadline), f)
+            self.change_guarded_blocking(ComputerChangeBoundary::Deadline(deadline), f, None)
                 .and_then(|value| {
                     value.ok_or(Error::Profile(
                         "the deadline-bound computer transaction ended without a committed result",
@@ -3921,27 +4052,20 @@ impl Computer {
         })
     }
 
-    /// Commit work only while `target` is still the exact durable policy projection. Unlike an
-    /// observation deadline, target movement is real supersession and therefore discards the
-    /// uncommitted closure. The caller receives `None` and yields to the event for the new target.
-    fn change_for_target<T>(
-        &self,
-        change: ComputerChange,
-        f: impl FnOnce(&mut State) -> Result<T>,
-    ) -> Result<Option<T>> {
-        blocking_transaction(|| {
-            self.change_guarded_blocking(ComputerChangeBoundary::Current(change), f)
-        })
-    }
-
     fn change_guarded_blocking<T>(
         &self,
         boundary: ComputerChangeBoundary,
         f: impl FnOnce(&mut State) -> Result<T>,
+        transition: Option<&ComputerPublicationTransition>,
     ) -> Result<Option<T>> {
         // A writer owns the transaction order, but readers own no part of its filesystem work:
         // status and authorization observations remain live while staging or flush is slow.
-        let _change = lock(&self.changes);
+        let _change = if let Some(transition) = transition {
+            self.require_transition(transition);
+            None
+        } else {
+            Some(self.changes.blocking_write())
+        };
         self.storage_ready()?;
         let held = lock(&self.state).clone();
         match boundary {
@@ -4008,7 +4132,10 @@ impl Computer {
             }
             let authorization_changed = held.policy_revision != next.policy_revision
                 || Self::revision_expired(&held) != Self::revision_expired(&next);
-            if authorization_changed {
+            let publication_changed = self.publication_authority_changed(&held, &next);
+            let _publication = (publication_changed && transition.is_none())
+                .then(|| self.publications.blocking_write());
+            if publication_changed {
                 self.block_own_key_authority();
             }
             #[cfg(feature = "test-knobs")]
@@ -4047,7 +4174,7 @@ impl Computer {
                 return Err(error);
             }
             let committed_late = deadline.filter(|deadline| std::time::Instant::now() >= *deadline);
-            if authorization_changed {
+            if publication_changed {
                 self.invalidate_reachers();
             }
             let mut published = lock(&self.state);
@@ -4231,19 +4358,40 @@ impl Computer {
     /// Persistence used by convergence bookkeeping whose truth must survive a crash and which
     /// has no wall-clock success criterion of its own.
     fn change_durable<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        blocking_transaction(|| self.change_durable_blocking(f))
+        blocking_transaction(|| self.change_durable_blocking(f, None))
     }
 
-    fn change_durable_blocking<T>(&self, f: impl FnOnce(&mut State) -> Result<T>) -> Result<T> {
-        let _change = lock(&self.changes);
+    fn change_durable_blocking<T>(
+        &self,
+        f: impl FnOnce(&mut State) -> Result<T>,
+        transition: Option<&ComputerPublicationTransition>,
+    ) -> Result<T> {
+        let _change = if let Some(transition) = transition {
+            self.require_transition(transition);
+            None
+        } else {
+            Some(self.changes.blocking_write())
+        };
+        self.change_durable_under_writer(f, transition.is_some())
+    }
+
+    /// The caller owns `changes`; `publication_owned` also proves exclusive physical ownership.
+    fn change_durable_under_writer<T>(
+        &self,
+        f: impl FnOnce(&mut State) -> Result<T>,
+        publication_owned: bool,
+    ) -> Result<T> {
         self.storage_ready()?;
         let held = lock(&self.state).clone();
         let mut next = held.clone();
         let value = f(&mut next)?;
         if held.body() != next.body() {
-            let authorization_changed =
-                Self::revision_expired(&held) != Self::revision_expired(&next);
-            if authorization_changed {
+            let authorization_changed = held.policy_revision != next.policy_revision
+                || Self::revision_expired(&held) != Self::revision_expired(&next);
+            let publication_changed = self.publication_authority_changed(&held, &next);
+            let _publication = (publication_changed && !publication_owned)
+                .then(|| self.publications.blocking_write());
+            if publication_changed {
                 self.block_own_key_authority();
             }
             if let Err(error) = self.save_before(&next, None) {
@@ -4251,7 +4399,7 @@ impl Computer {
                 self.unblock_own_key_authority();
                 return Err(error);
             }
-            if authorization_changed {
+            if publication_changed {
                 self.invalidate_reachers();
             }
             let mut published = lock(&self.state);
@@ -4271,6 +4419,20 @@ impl Computer {
             }
         }
         Ok(value)
+    }
+
+    /// Only changes to physical publication eligibility drain current publications. Pairing
+    /// preview, aliases, reach, delivery watermarks and observation history stay independent.
+    /// Application preparation/receipts and binding derivation matter even at one policy revision.
+    fn publication_authority_changed(&self, held: &State, next: &State) -> bool {
+        held.policy_revision != next.policy_revision
+            || Self::revision_expired(held) != Self::revision_expired(next)
+            || held.genesis.is_some() != next.genesis.is_some()
+            || held.intervals.is_empty() != next.intervals.is_empty()
+            || held.grant(&self.signer.fingerprint()) != next.grant(&self.signer.fingerprint())
+            || held.applied != next.applied
+            || held.prepared != next.prepared
+            || held.derived != next.derived
     }
 
     /// Publish into an existing room gate only while its node's durable keyring matches

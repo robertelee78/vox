@@ -8,8 +8,53 @@ use crate::node::history_stream::{
 };
 use crate::node::store::Store;
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex as StdMutex;
+
+/// The native recovery-fence write belongs to a retained physical worker, not the actor's
+/// BoundedHeadCompleted callback. Only its matching reservation may install the durable fence.
+pub(super) async fn refresh_own_recovery_owned(
+    shared: Arc<tokio::sync::Mutex<ChannelState>>,
+    store: Arc<Store>,
+) -> crate::error::Result<bool> {
+    let mut room = shared.lock().await;
+    let Some(pending) = room.prepare_own_recovery(&store)? else {
+        return Ok(false);
+    };
+    let instance = room.history_instance(&store)?;
+    let owner = Arc::new(());
+    let pin = room.reserve_pending_write(&store, Arc::clone(&owner))?;
+    drop(room);
+    tokio::task::spawn_blocking(move || {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.commit(&store)));
+        let mut room = shared.blocking_lock();
+        let owns = room.owns_pending_history_write(&owner);
+        let result = match result {
+            Ok(Ok(())) => {
+                if owns {
+                    (|| {
+                        if room.history_instance(&store)? != instance {
+                            return Err(Error::Unreachable("own recovery room changed"));
+                        }
+                        room.install_own_recovery(pending).map(|()| true)
+                    })()
+                } else {
+                    Err(Error::Unreachable("own recovery publication owner changed"))
+                }
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(Error::Profile("own recovery save worker stopped")),
+        };
+        room.release_pending_text(&owner, false);
+        drop(room);
+        drop(pin);
+        result
+    })
+    .await
+    .map_err(|_| Error::Profile("own recovery completion worker stopped"))?
+}
 
 /// Prepare one immutable automatic page using the same durable admission and body machinery as
 /// a user Archive. The namespace is private to this node/room; it never replaces a user's page.
@@ -668,6 +713,130 @@ const fn lane_name(lane: crate::node::history_budget::Lane) -> &'static str {
     }
 }
 
+struct DetachedFlowCharge {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    held: usize,
+}
+impl Drop for DetachedFlowCharge {
+    fn drop(&mut self) {
+        self.count.fetch_sub(self.held, Ordering::AcqRel);
+    }
+}
+
+/// Only one room's physical owners move here; the live node controller remains on actor.
+pub(super) struct RoomRetirement {
+    driver: Controller,
+    room: Digest32,
+    epoch: u64,
+    instance: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+    attempts: Vec<(Digest32, u64)>,
+    inbound: Vec<(
+        Digest32,
+        u64,
+        Arc<crate::transport::stream_transport::Fence>,
+        Option<tokio::task::AbortHandle>,
+    )>,
+    _charge: Option<DetachedFlowCharge>,
+}
+pub(super) struct RetiredRoom {
+    owned: RoomRetirement,
+    result: crate::error::Result<()>,
+}
+impl RetiredRoom {
+    pub(super) fn succeeded(&self) -> bool {
+        self.result.is_ok()
+    }
+    pub(super) fn failure(&self) -> Option<&Error> {
+        self.result.as_ref().err()
+    }
+}
+impl RoomRetirement {
+    /// Run on the existing lifecycle gate worker, never the actor or a cancellable select arm.
+    pub(super) async fn run(mut self) -> RetiredRoom {
+        for slot in &mut self.driver.running {
+            if let Some(work) = slot.take() {
+                let _ = work.task.await;
+                if let Some(flow) = work.flow.lock().await.take() {
+                    self.driver.retiring.push_back(flow);
+                }
+            }
+        }
+        let mut result = self.drain().await;
+        // A failed slice must not leave a second physical cleanup in an occupied actor slot.
+        if let Err(error) = self.driver.join_cleanup().await {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
+        if result.is_ok() {
+            for (_, _, fence, abort) in &self.inbound {
+                fence.retire();
+                if let Some(abort) = abort {
+                    abort.abort();
+                }
+            }
+        }
+        RetiredRoom {
+            owned: self,
+            result,
+        }
+    }
+
+    async fn drain(&mut self) -> crate::error::Result<()> {
+        loop {
+            self.driver.join_cleanup().await?;
+            self.driver.poll_cleanup();
+            if self.driver.retiring.iter().any(|flow| {
+                self.driver
+                    .retirement_failed
+                    .contains(&retirement_key(flow))
+            }) {
+                return Err(Error::Profile(
+                    "history retirement requires recovery; see status",
+                ));
+            }
+            if self.driver.cleanup.is_some() {
+                continue;
+            }
+            if self.driver.retiring.is_empty() {
+                return Ok(());
+            }
+            // Transferred waiters retain their original notification tasks. Poll those exact
+            // handles directly, so no second controller competes for a Notify's single permit.
+            let waited = std::future::poll_fn(|cx| {
+                for (key, waiting) in &mut self.driver.retirement_waiting {
+                    if waiting.ready.load(Ordering::Acquire) {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                    if let std::task::Poll::Ready(joined) =
+                        std::pin::Pin::new(&mut waiting.task).poll(cx)
+                    {
+                        return std::task::Poll::Ready(joined.map_err(|_| *key));
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            if let Err(key) = waited {
+                let error = Error::Profile("history retirement waiter stopped");
+                note_retirement_error(&self.driver.retirement_ledger, key, &error.to_string());
+                self.driver.retirement_failed.insert(key);
+                self.driver.retirement_waiting.remove(&key);
+                let erased = self
+                    .driver
+                    .retiring
+                    .iter()
+                    .find(|flow| retirement_key(flow) == key)
+                    .map(Flow::retirement_erasure);
+                if let Some(erased) = erased {
+                    self.driver.wait_for_retirement(key, erased, true);
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Controller {
     running: [Option<Running>; crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS],
@@ -698,6 +867,7 @@ pub(super) struct Controller {
     /// retains a permit while the actor is elsewhere; one wake audits every result slot, so no
     /// completion can be stranded behind the actor's bounded event queue.
     completion_wake: Arc<tokio::sync::Notify>,
+    detached_flows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for Controller {
@@ -1010,6 +1180,63 @@ impl Controller {
         room: Digest32,
         shared: Arc<tokio::sync::Mutex<ChannelState>>,
     ) {
+        let waiting = Arc::clone(&shared);
+        self.wait_for_own_recovery_release(
+            net_tx,
+            next_token,
+            (room, node),
+            shared,
+            "own_recovery",
+            async move {
+                drop(waiting.lock_owned().await);
+            },
+        );
+    }
+
+    pub(super) fn wait_for_support_discovery_publication(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        node: Digest32,
+        room: Digest32,
+        shared: Arc<tokio::sync::Mutex<ChannelState>>,
+        released: std::pin::Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
+    ) {
+        self.wait_for_own_recovery_release(
+            net_tx,
+            next_token,
+            (room, node),
+            shared,
+            "private_support",
+            released,
+        );
+    }
+
+    pub(super) fn is_support_discovery_waiter(
+        &self,
+        token: u64,
+        room: Digest32,
+        node: Digest32,
+    ) -> bool {
+        self.local_admission
+            .get(&(room, node))
+            .is_some_and(|entry| {
+                entry.token == token
+                    && entry.kind == LocalAdmissionKind::Room
+                    && entry.root == "private_support"
+            })
+    }
+
+    fn wait_for_own_recovery_release(
+        &mut self,
+        net_tx: &mpsc::Sender<NetEvent>,
+        next_token: &mut u64,
+        key: (Digest32, Digest32),
+        shared: Arc<tokio::sync::Mutex<ChannelState>>,
+        root: &'static str,
+        released: impl Future<Output = ()> + Send + 'static,
+    ) {
+        let (room, node) = key;
         if self.local_admission.contains_key(&(room, node)) {
             return;
         }
@@ -1018,7 +1245,7 @@ impl Controller {
         let tx = net_tx.clone();
         let instance = Arc::downgrade(&shared);
         let task = tokio::spawn(async move {
-            drop(shared.lock_owned().await);
+            released.await;
             let _ = tx
                 .send(NetEvent::OwnRecoveryRoomReady {
                     token,
@@ -1033,7 +1260,7 @@ impl Controller {
             LocalAdmission {
                 kind: LocalAdmissionKind::Room,
                 token,
-                root: "own_recovery",
+                root,
                 lane: crate::node::history_budget::Lane::Control,
                 task,
             },
@@ -1280,12 +1507,15 @@ impl Controller {
     }
     /// Retiring work stays inside the same twelve-flow limit and retains its charge/lease.
     /// Other rooms may progress while one room waits for its next bounded cleanup slice.
-    fn flow_count(&self) -> usize {
+    fn local_flow_count(&self) -> usize {
         self.ready.iter().flatten().count()
             + self.running.iter().flatten().count()
             + self.deferred.len()
             + self.retiring.len()
             + usize::from(self.cleanup.is_some())
+    }
+    fn flow_count(&self) -> usize {
+        self.local_flow_count() + self.detached_flows.load(Ordering::Acquire)
     }
     fn dispose(&mut self, flow: Flow) {
         // Exclusive ownership moves to the retirement queue. Its only permitted next work is
@@ -1532,7 +1762,7 @@ impl Controller {
             tokio::task::yield_now().await;
         }
     }
-    pub(super) async fn retire_room(&mut self, room: Digest32) -> crate::error::Result<()> {
+    fn take_room(&mut self, room: Digest32) -> Self {
         if self
             .archive_admission
             .as_ref()
@@ -1575,34 +1805,93 @@ impl Controller {
         for (room, peer) in waiting {
             self.cancel_pool_admission(room, peer);
         }
+        let mut retired = Self {
+            running: std::array::from_fn(|_| None),
+            ready: std::array::from_fn(|_| None),
+            archive_admission: None,
+            foreground_admission: std::array::from_fn(|_| None),
+            local_admission: BTreeMap::new(),
+            byte_admission: BTreeMap::new(),
+            pool_admission: BTreeMap::new(),
+            deferred: VecDeque::new(),
+            body_slots: Arc::clone(&self.body_slots),
+            required: VecDeque::new(),
+            retiring: VecDeque::new(),
+            cleanup: None,
+            retirement_waiting: BTreeMap::new(),
+            retirement_failed: BTreeSet::new(),
+            retirement_changed: Arc::clone(&self.retirement_changed),
+            retirement_ledger: Arc::clone(&self.retirement_ledger),
+            completion_wake: Arc::clone(&self.completion_wake),
+            detached_flows: Arc::clone(&self.detached_flows),
+        };
         for slot in &mut self.ready {
             if let Some(flow) = slot.take_if(|flow| flow.room == room) {
-                self.retiring.push_back(flow);
+                retired.retiring.push_back(flow);
             }
         }
         let mut keep = VecDeque::new();
         while let Some(flow) = self.deferred.pop_front() {
             if flow.room == room {
-                self.retiring.push_back(flow);
+                retired.retiring.push_back(flow);
             } else {
                 keep.push_back(flow);
             }
         }
         self.deferred = keep;
-        for slot in &mut self.running {
+        for (index, slot) in self.running.iter_mut().enumerate() {
             if let Some(work) = slot.take_if(|work| work.room == room) {
                 work.fence.retire();
-                let _ = work.task.await;
-                if let Some(flow) = work.flow.lock().await.take() {
-                    self.retiring.push_back(flow);
-                }
+                retired.running[index] = Some(work);
             }
         }
+        let mut keep = VecDeque::new();
+        while let Some(flow) = self.retiring.pop_front() {
+            if flow.room == room {
+                retired.retiring.push_back(flow);
+            } else {
+                keep.push_back(flow);
+            }
+        }
+        self.retiring = keep;
+        if self
+            .cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.key.room == room)
+        {
+            retired.cleanup = self.cleanup.take();
+        }
+        let waiting: Vec<_> = self
+            .retirement_waiting
+            .keys()
+            .filter(|key| key.room == room)
+            .copied()
+            .collect();
+        for key in waiting {
+            if let Some(waiting) = self.retirement_waiting.remove(&key) {
+                retired.retirement_waiting.insert(key, waiting);
+            }
+        }
+        let failed: Vec<_> = self
+            .retirement_failed
+            .iter()
+            .filter(|key| key.room == room)
+            .copied()
+            .collect();
+        for key in failed {
+            self.retirement_failed.remove(&key);
+            retired.retirement_failed.insert(key);
+        }
         self.required.retain(|required| required.room != room);
-        self.join_cleanup().await?;
-        self.drain_retiring(Some(room)).await?;
-        self.poll_cleanup();
-        Ok(())
+        retired
+    }
+
+    fn restore_room_retirement(&mut self, retired: &mut Self) {
+        self.retiring.append(&mut retired.retiring);
+        self.retirement_waiting
+            .append(&mut retired.retirement_waiting);
+        self.retirement_failed
+            .append(&mut retired.retirement_failed);
     }
 
     /// A physical archive Flow carries its own fence; its scalar request may have been reused.
@@ -2096,7 +2385,7 @@ impl Node {
         if self
             .leave_waiters
             .iter()
-            .any(|(left_room, generation, _, _)| {
+            .any(|(left_room, generation, _, _, _)| {
                 *left_room == room
                     && self
                         .ports
@@ -2163,13 +2452,13 @@ impl Node {
         self.port_queue.remove(&room, &peer);
     }
 
-    /// Retire bounded workers for `room` and release the exact actor attempts they owned.
-    /// The controller removes a running work item before awaiting it, so its ordinary
-    /// completion can no longer reach `accept_bounded_sync` to take the matching port token.
-    /// Capture those tokens first and clear them after the worker lifetime ends, including
-    /// the cleanup-error path; unrelated inbound and later attempts keep their own tokens.
-    pub(super) async fn retire_bounded_room(&mut self, room: Digest32) -> crate::error::Result<()> {
-        let attempts: Vec<_> = self
+    /// Detach exact physical owners before the existing lifecycle gate task waits for them.
+    pub(super) fn take_bounded_room(
+        &mut self,
+        room: Digest32,
+        retire_inbound: bool,
+    ) -> RoomRetirement {
+        let attempts = self
             .bounded_sync
             .running
             .iter()
@@ -2177,16 +2466,88 @@ impl Node {
             .filter(|work| work.room == room)
             .map(|work| (work.peer, work.token))
             .collect();
-        let result = self.bounded_sync.retire_room(room).await;
-        for (peer, token) in attempts {
-            if let Some(attempt) = self
-                .ports
-                .get_mut(&(room, peer))
-                .and_then(|port| port.take(token))
-            {
-                attempt.retire();
+        let driver = self.bounded_sync.take_room(room);
+        let held = driver.local_flow_count();
+        let charge = if held == 0 {
+            None
+        } else {
+            self.bounded_sync
+                .detached_flows
+                .fetch_add(held, Ordering::AcqRel);
+            Some(DetachedFlowCharge {
+                count: Arc::clone(&self.bounded_sync.detached_flows),
+                held,
+            })
+        };
+        let inbound = if retire_inbound {
+            self.ports
+                .iter()
+                .filter(|((id, _), _)| *id == room)
+                .flat_map(|((_, peer), port)| {
+                    port.inbound.iter().map(move |(token, attempt)| {
+                        (
+                            *peer,
+                            *token,
+                            Arc::clone(&attempt.fence),
+                            attempt.abort.clone(),
+                        )
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        RoomRetirement {
+            driver,
+            room,
+            epoch: self.delivery_epoch,
+            instance: self.channels.get(&room).map(Arc::downgrade),
+            attempts,
+            inbound,
+            _charge: charge,
+        }
+    }
+
+    /// Only a matching physical terminal can retire its captured actor attempt token.
+    pub(super) fn finish_bounded_room_retirement(
+        &mut self,
+        retired: RetiredRoom,
+        gate_retired: bool,
+    ) -> crate::error::Result<()> {
+        let RetiredRoom { mut owned, result } = retired;
+        let current = owned.epoch == self.delivery_epoch
+            && match owned.instance.as_ref() {
+                Some(instance) => instance.upgrade().is_some_and(|instance| {
+                    self.channels
+                        .get(&owned.room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                }),
+                None => !self.channels.contains_key(&owned.room),
+            };
+        if current {
+            self.bounded_sync.restore_room_retirement(&mut owned.driver);
+            for (peer, token) in &owned.attempts {
+                if let Some(attempt) = self
+                    .ports
+                    .get_mut(&(owned.room, *peer))
+                    .and_then(|port| port.take(*token))
+                {
+                    attempt.retire();
+                }
+            }
+            if result.is_ok() && gate_retired {
+                for (peer, token, _, _) in &owned.inbound {
+                    if let Some(attempt) = self
+                        .ports
+                        .get_mut(&(owned.room, *peer))
+                        .and_then(|port| port.take(*token))
+                    {
+                        attempt.retire();
+                    }
+                }
             }
         }
+        // A stale driver's Drop retains its remaining exact debt in the existing daemon ledger.
         result
     }
 
@@ -2715,7 +3076,7 @@ impl Node {
                         || self
                             .leave_waiters
                             .iter()
-                            .any(|(room, _, _, _)| *room == work.room)
+                            .any(|(room, _, _, _, _)| *room == work.room)
                         || self.bounded_sync.required.iter().any(|required| {
                             required.room == work.room && required.peer == work.peer
                         });
@@ -3214,7 +3575,7 @@ impl Node {
                         || self
                             .leave_waiters
                             .iter()
-                            .any(|(r, _, _, _)| *r == work.room)
+                            .any(|(r, _, _, _, _)| *r == work.room)
                         || self.bounded_sync.required.iter().any(|required| {
                             required.room == work.room && required.peer == work.peer
                         })
@@ -3320,6 +3681,11 @@ impl Node {
         store: Arc<Store>,
         conn: Arc<VoxConnection>,
     ) -> bool {
+        if self.own_key_leave_pending.contains_key(&room)
+            || self.own_key_ended_pending.contains_key(&room)
+        {
+            return false;
+        }
         self.accept_bounded_sync();
         if let Some((flow, ended_request)) =
             self.bounded_sync
@@ -3550,7 +3916,7 @@ impl Node {
 
                 // Inventory must first advertise the new local departure. Once that fixed
                 // exchange completes, probe only our own exact head; no archive is followed.
-                let departure_hint = if self.leave_waiters.iter().any(|(r, generation, _, _)| {
+                let departure_hint = if self.leave_waiters.iter().any(|(r, generation, _, _, _)| {
                     *r == room
                         && self
                             .ports
@@ -4516,7 +4882,7 @@ impl Node {
         };
         let board_observations = Arc::clone(&self.sync_book);
         let pstore = profile.store_handle();
-        let tx = self.net_tx.clone();
+        let board_signer = board_scope.as_ref().and_then(|_| profile.signer_arc().ok());
         let authority = self.computer_authority();
         let worker = tokio::spawn(async move {
             let _slot = slot;
@@ -4547,17 +4913,35 @@ impl Node {
             let deadline =
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
             if flow.needs_board() && !worker_fence.is_retired() {
-                if let (Some(net), Some(authority), Some(scope)) =
-                    (net, authority.as_ref(), board_scope)
+                if let (Some(net), Some(authority), Some(scope), Some(signer)) =
+                    (net, authority, board_scope, board_signer)
                 {
-                    flow.admitted_authors = tokio::select! {
+                    let publication = tokio::select! {
                         biased;
-                        ()=worker_fence.retired()=>0,
-                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,authority,&tx,scope,crate::time::Ms(now),(&board_observations,false)))=>result.unwrap_or(0),
+                        () = worker_fence.retired() => None,
+                        publication = authority.acquire_publication() => publication,
                     };
+                    if let Some(publication) = publication {
+                        let lifetime = Arc::new(maintenance_save::Lifetime {
+                            authority,
+                            publication: Some(publication),
+                            exclusive: None,
+                            secret: flow.secret_work(),
+                            store: Arc::clone(&pstore),
+                            signer,
+                        });
+                        flow.admitted_authors = tokio::select! {
+                            biased;
+                            () = worker_fence.retired() => 0,
+                            result = tokio::time::timeout(SETUP_PATIENCE,
+                                exchange_boards(&net, &conn, &flow.shared, &lifetime, scope,
+                                    crate::time::Ms(now), (&board_observations, false))) =>
+                                result.unwrap_or(0),
+                        };
+                    }
                 }
             }
-            let failure = flow
+            let mut failure = flow
                 .turn(
                     store,
                     &conn,
@@ -4571,6 +4955,19 @@ impl Node {
                 .await
                 .err()
                 .map(ReturnedFailure::from_error);
+            if failure.is_none()
+                && flow.done()
+                && !flow.archive
+                && !flow.inventory
+                && flow.authenticated_head.is_some()
+                && flow.completed_support_discovery().is_some()
+            {
+                if let Err(error) =
+                    refresh_own_recovery_owned(Arc::clone(&flow.shared), pstore).await
+                {
+                    failure = Some(ReturnedFailure::from_error(error));
+                }
+            }
             // The round is over: its flow state goes back here, in the step that ends it
             // (ADR-038 FX-35), not when the actor next looks; a finished task holds no charge.
             flow.park();

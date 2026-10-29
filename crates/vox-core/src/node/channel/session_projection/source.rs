@@ -12,8 +12,16 @@ use super::record::{EnvelopeRef, Part, Source};
 use super::storage::{Read, Tree};
 use super::text::Input;
 
+#[derive(Clone, Copy)]
+pub(super) struct SourcePolicy {
+    pub retention: u64,
+    pub step_retention: u64,
+}
+
 pub(super) struct Eligibility<'a> {
-    pub channel: &'a super::super::ChannelState,
+    pub policy: SourcePolicy,
+    pub room: &'a Digest32,
+    pub dag: &'a crate::log::dag::Dag,
     pub view: &'a super::super::entry_store::RenderView<'a>,
     pub now: u64,
 }
@@ -23,7 +31,8 @@ pub(super) struct Eligibility<'a> {
 /// from an unrelated revision change or from a missing body alone.
 pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source) -> Result<bool> {
     let snapshot = scope.view.snapshot();
-    let channel = scope.channel;
+    let room = scope.room;
+    let sek = scope.view.key();
     if source.position.private {
         let mut key = [0; 64];
         key[..32].copy_from_slice(&source.position.hash);
@@ -43,19 +52,14 @@ pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source)
             return Err(invalid("Session metadata candidate binding"));
         }
         let sealed = snapshot
-            .get_segment(&channel.channel_id, SegmentKind::PrivateSession, source.id)?
+            .get_segment(room, SegmentKind::PrivateSession, source.id)?
             .ok_or_else(|| invalid("Session metadata source missing"))?;
         if sealed.ciphertext.len()
             > (2 * crate::node::sessionstream::MAX_RECORD).saturating_add(TAG_LEN)
         {
             return Err(invalid("Session metadata source exceeds record format"));
         }
-        let bytes = open_segment(
-            &channel.sek,
-            SegmentKind::PrivateSession,
-            source.id,
-            &sealed,
-        )?;
+        let bytes = open_segment(sek, SegmentKind::PrivateSession, source.id, &sealed)?;
         let saved = super::super::private_session::Stored::read(&bytes)?;
         let row = saved
             .row
@@ -67,7 +71,14 @@ pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source)
         {
             return Err(invalid("Session metadata source binding"));
         }
-        return Ok(!channel.private_expired(&saved, scope.now));
+        let ttl = if crate::node::sessions::is_record(&row.body) {
+            scope.policy.retention
+        } else {
+            scope.policy.step_retention
+        };
+        let claimed = row.created_millis;
+        return Ok(ttl == 0
+            || saved.first_seen.min(claimed) > scope.now.saturating_sub(ttl.saturating_mul(1000)));
     }
     let Some(fact) = scope.view.fact(&source.position.hash)? else {
         return Ok(false);
@@ -82,25 +93,35 @@ pub(super) fn retained(read: &Read<'_>, scope: &Eligibility<'_>, source: Source)
     if row.author != source.author || row.created_millis != source.position.created {
         return Err(invalid("Session metadata source binding"));
     }
-    let transaction = scope.view.transaction();
-    let tracked = channel
-        .retention_get_in(transaction, &source.position.hash)?
+    let tracked = scope
+        .view
+        .retention(&source.position.hash)?
         .ok_or_else(|| invalid("Session metadata retention missing"))?;
     if tracked.cache_id != Some(fact.cache) {
         return Err(invalid("Session metadata retention binding"));
     }
-    let entry = channel
-        .entry_at(transaction, &source.position.hash)?
+    let entry = scope
+        .dag
+        .get_by_hash(scope.view.read_index(), &source.position.hash)?
         .ok_or_else(|| invalid("Session metadata entry missing"))?;
-    if entry.skeleton.channel_id != channel.channel_id || entry.skeleton.author_id != source.author
-    {
+    if entry.skeleton.channel_id != *room || entry.skeleton.author_id != source.author {
         return Err(invalid("Session metadata source binding"));
     }
     if fact.cache != source.id {
         // All replacement body, age and author bindings above remain mandatory.
         return Ok(false);
     }
-    let ttl = channel.entry_retention(transaction, &entry)?;
+    let ttl = if entry
+        .payload
+        .as_deref()
+        .is_some_and(super::super::retained_control)
+    {
+        0
+    } else if tracked.steps {
+        scope.policy.step_retention
+    } else {
+        scope.policy.retention
+    };
     Ok(ttl == 0 || scope.now < tracked.base().saturating_add(ttl.saturating_mul(1000)))
 }
 

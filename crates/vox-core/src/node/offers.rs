@@ -19,6 +19,8 @@ use crate::identity::composite::RootSigner;
 use crate::node::api::{ChannelDetail, Offer, OfferBasis, OfferRoom, OfferWhy};
 use crate::node::store::Store;
 
+pub(crate) mod native;
+
 /// HKDF label for the dismissals' sealing key, taken over `self_seed` ([`crate::atrest::seal`]).
 pub const DISMISSED_OFFERS_SEK_INFO: &[u8] = b"vox/dismissed-offers-sek/v1";
 
@@ -51,19 +53,12 @@ impl DismissedOffers {
     /// Dismiss what `member` is offered on now, in every room of `rooms`. Returns whether anything
     /// was added.
     pub fn dismiss(&mut self, member: &Digest32, rooms: &[ChannelDetail]) -> bool {
-        let before = self.entries.len();
-        for room in rooms {
-            for b in room.offer_bases.iter().filter(|b| b.member == *member) {
-                self.entries.insert((room.channel_id, *b));
-            }
-        }
-        while self.entries.len() > MAX_DISMISSED {
-            let first = self.entries.iter().next().copied();
-            if let Some(first) = first {
-                self.entries.remove(&first);
-            }
-        }
-        self.entries.len() != before
+        self.dismiss_bases(rooms.iter().flat_map(|room| {
+            room.offer_bases
+                .iter()
+                .filter(|basis| basis.member == *member)
+                .map(|basis| (room.channel_id, *basis))
+        }))
     }
 
     /// Canonical CBOR body: `[version, [[room, member, why, seq], ..]]`.
@@ -128,12 +123,9 @@ impl DismissedOffers {
     /// # Errors
     /// The identity is locked, or the store cannot be written.
     pub fn save(&self, store: &Store, signer: &dyn RootSigner) -> Result<()> {
-        let sek = sek(signer)?;
-        let sealed = seal_segment(&sek, SegmentKind::Trust, SEGMENT_ID, &self.to_bytes())?;
-        let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
-        blob.extend_from_slice(&sealed.nonce);
-        blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(META_KEY, &blob)
+        let mut batch = store.batch()?;
+        self.queue_save(&mut batch, signer)?;
+        batch.commit()
     }
 
     /// Read and open, or an empty set if nothing was ever dismissed. Requires an unlocked identity.

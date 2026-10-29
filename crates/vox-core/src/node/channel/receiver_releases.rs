@@ -331,13 +331,33 @@ pub(super) fn retire(
     header.seal(batch, sek, room)
 }
 
-/// At most one existing bounded tree lookup and one COW deletion per room maintenance turn.
-/// No release body/key is opened to discard a slot; each committed cursor is restartable.
-pub(super) fn advance(
+/// Select only the next cleanup receiver. Its binding, never a receiver map or key, crosses
+/// publication ownership; the native transaction still validates the exact descriptor.
+pub(super) fn cleanup_receiver(
+    store: &Store,
+    sek: &Sek,
+    room: &Digest32,
+) -> Result<Option<(Digest32, u64)>> {
+    let snapshot = store.snapshot()?;
+    let Some(sealed) = snapshot.get_segment_bounded(room, KIND, HEADER, HEADER_BYTES)? else {
+        return Ok(None);
+    };
+    let header = Header::decode(&open_segment(sek, KIND, HEADER, &sealed)?)?;
+    if !header.cleanup {
+        return Ok(None);
+    }
+    session_tree::Read::snapshot(&snapshot, sek, room, KIND)
+        .first_after(header.root, header.after)?
+        .map(|(key, _)| slot(&key).map(|(author, _, chain)| (author, chain)))
+        .transpose()
+}
+
+/// Same bounded cleanup, with only committed receiver metadata crossing a worker boundary.
+pub(super) fn advance_current(
     batch: &mut crate::node::store::Batch<'_>,
     sek: &Sek,
     room: &Digest32,
-    receivers: &BTreeMap<(Digest32, u64), ReceiverChain>,
+    current: impl Fn(&Digest32, u64, u64, (u64, Digest32)) -> Result<bool>,
 ) -> Result<Option<(bool, bool)>> {
     let mut header = Header::load(batch, sek, room)?;
     if !header.cleanup {
@@ -355,9 +375,13 @@ pub(super) fn advance(
             header.after = None;
         }
         Some((key, id)) => {
-            let (author, _epoch, chain) = slot(&key)?;
             let descriptor = Descriptor::load(batch, sek, room, &header, &key, id)?;
-            if !descriptor.current(receivers.get(&(author, chain))) {
+            if !current(
+                &descriptor.author,
+                descriptor.chain,
+                descriptor.epoch,
+                (descriptor.floor, descriptor.digest),
+            )? {
                 {
                     let mut tree = session_tree::Write::new(batch, sek, room, KIND, header.next)?;
                     header.root = tree.set(header.root, key, None)?;

@@ -3,7 +3,6 @@
 //! already scanned groups in the same transaction, so a busy transcript cannot
 //! starve publication and no client needs to collect all Sessions to count them.
 
-use super::super::ChannelState;
 use super::activity_index::{hash_key, Fact};
 use super::activity_state::ActivityTree;
 use super::record::{Descriptor, Key};
@@ -164,9 +163,13 @@ pub(super) fn changed(index: &mut Write<'_, '_>, f: &Fact, old: u64, new: u64) -
     }
     Ok(())
 }
-pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
+pub(super) fn advance_owned(
+    store: &Store,
+    sek: &crate::atrest::sek::Sek,
+    room: &Digest32,
+) -> Result<bool> {
     let snapshot = store.snapshot()?;
-    let Some(read) = Read::existing(&snapshot, &ch.sek, &ch.channel_id)? else {
+    let Some(read) = Read::existing(&snapshot, sek, room)? else {
         return Ok(false);
     };
     if !read.header.activity.ready || !read.header.ready {
@@ -179,7 +182,7 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
     }
     let mut batch = store.batch()?;
     batch.derived();
-    let mut index = Write::open(&mut batch, &ch.sek, &ch.channel_id)?;
+    let mut index = Write::open(&mut batch, sek, room)?;
     if index.header.activity.waiting.metadata != metadata {
         index.header.activity.waiting.ready = false;
     }

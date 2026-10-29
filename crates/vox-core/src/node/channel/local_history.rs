@@ -109,6 +109,14 @@ impl ChannelState {
         after_departure: bool,
         recover_own: bool,
     ) -> Result<()> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        if self.post_pending() {
+            return Err(Error::Profile(
+                "room publication is busy; retry this operation",
+            ));
+        }
         let read = self.local_append_eligible_mode(store, after_departure, recover_own)?;
         if read.publication_busy()
             || (read.sparse_enabled() && read.history_obligation_capacity() < 2)
@@ -161,75 +169,13 @@ impl ChannelState {
         store: &Store,
         author: &Digest32,
     ) -> Result<(ControlContext, Vec<EntryReference>, bool)> {
-        if self.authors.len() > MAX_CONTEXT_AUTHORS {
-            return Err(Error::SizeLimitExceeded("local context authors"));
-        }
-        let read = self.entries.read(store, &self.sek, &self.channel_id)?;
-        let binding = TreeBinding {
-            room: self.channel_id,
-            scope: LogScope::Public,
-            author: *author,
-        };
-        let own_seq = self.dag.feed(author).map_or(0, |feed| feed.max_seq());
-        let mut context = if own_seq == 0 {
-            ControlContext::empty(self.channel_id, LogScope::Public)
-        } else {
-            let head_id = read
-                .sparse_author(author, LogScope::Public)?
-                .and_then(|state| state.committed)
-                .ok_or_else(|| authored_missing("authored history own committed head missing"))?;
-            let head = read
-                .history_head(&head_id)?
-                .ok_or_else(|| authored_missing("authored history own head record missing"))?;
-            if head.binding != binding || head.root.leaves != own_seq {
-                return Err(authored_missing(
-                    "authored history own head binding differs",
-                ));
-            }
-            read.history_context(&head.root.frontier)?
-                .ok_or_else(|| authored_missing("authored history own frontier context missing"))?
-        };
-        let original = context.hash();
-        let mut tips = BTreeMap::new();
-        for other in self.authors.keys().filter(|other| *other != author) {
-            let Some(tip) = read.history_settled_tip(other)? else {
-                continue;
-            };
-            let hash = tip.entry_hash();
-            let Some(clock) = read.clock(&hash)? else {
-                return Err(authored_missing(
-                    "authored history settled peer clock missing",
-                ));
-            };
-            tips.insert(
-                (clock, hash),
-                EntryReference {
-                    author: *other,
-                    seq: tip.skeleton.seq,
-                    hash,
-                },
-            );
-            if tips.len() > crate::log::entry::MAX_SEEN {
-                tips.pop_first();
-            }
-        }
-        let mut seen: Vec<_> = tips.into_values().collect();
-        seen.sort_unstable_by_key(|reference| reference.author);
-        for reference in &seen {
-            let b = TreeBinding {
-                author: reference.author,
-                ..binding
-            };
-            let prefix = read
-                .history_range(b, 1, reference.seq)?
-                .ok_or_else(|| authored_missing("authored history settled peer prefix missing"))?;
-            let frontier = read.history_context(&prefix.frontier)?.ok_or_else(|| {
-                authored_missing("authored history settled peer frontier context missing")
-            })?;
-            context = context.join(&frontier)?;
-        }
-        let changed = context.hash() != original;
-        Ok((context, seen, changed))
+        authored_context(
+            &self.entries.read(store, &self.sek, &self.channel_id)?,
+            self.channel_id,
+            &self.authors,
+            self.dag.feed(author).map_or(0, |feed| feed.max_seq()),
+            author,
+        )
     }
 
     /// Fill the real EntrySkeleton's v2 fields. Changed context is explicitly carried by a
@@ -249,44 +195,8 @@ impl ChannelState {
             return Ok(None);
         }
         let (kind, recipient) = classify(payload)?;
-        if kind == SignedEntryKind::Content {
-            if let Some(prepared) = self.local_content_header.take() {
-                return Ok(Some(prepared));
-            }
-        }
         self.authored_kind(profile, author, kind, recipient, claimed_ms, false)
             .map(Some)
-    }
-
-    /// Resolve local proof dependencies and append any context control before the sender
-    /// ratchet is advanced. A retryable dependency failure cannot consume a message key.
-    pub(super) fn prepare_content_context(
-        &mut self,
-        profile: &Profile,
-        author: &Digest32,
-        claimed_ms: u64,
-        after_departure: bool,
-    ) -> Result<()> {
-        if !self
-            .entries
-            .read(profile.store(), &self.sek, &self.channel_id)?
-            .sparse_enabled()
-        {
-            return Ok(());
-        }
-        self.local_content_header = None;
-        // An intentional post's context control, when required, is part of that same operation
-        // and shares its departure exception. Automatic read records pass false.
-        let prepared = self.authored_kind(
-            profile,
-            author,
-            SignedEntryKind::Content,
-            None,
-            claimed_ms,
-            after_departure,
-        )?;
-        self.local_content_header = Some(prepared);
-        Ok(())
     }
 
     fn authored_kind(
@@ -358,7 +268,83 @@ impl ChannelState {
     }
 }
 
-fn prepare(
+pub(super) fn authored_context(
+    read: &entry_store::Read<'_>,
+    channel_id: Digest32,
+    authors: &BTreeMap<Digest32, CompositePublicKey>,
+    own_seq: u64,
+    author: &Digest32,
+) -> Result<(ControlContext, Vec<EntryReference>, bool)> {
+    if authors.len() > MAX_CONTEXT_AUTHORS {
+        return Err(Error::SizeLimitExceeded("local context authors"));
+    }
+    let binding = TreeBinding {
+        room: channel_id,
+        scope: LogScope::Public,
+        author: *author,
+    };
+    let mut context = if own_seq == 0 {
+        ControlContext::empty(channel_id, LogScope::Public)
+    } else {
+        let head_id = read
+            .sparse_author(author, LogScope::Public)?
+            .and_then(|state| state.committed)
+            .ok_or_else(|| authored_missing("authored history own committed head missing"))?;
+        let head = read
+            .history_head(&head_id)?
+            .ok_or_else(|| authored_missing("authored history own head record missing"))?;
+        if head.binding != binding || head.root.leaves != own_seq {
+            return Err(authored_missing(
+                "authored history own head binding differs",
+            ));
+        }
+        read.history_context(&head.root.frontier)?
+            .ok_or_else(|| authored_missing("authored history own frontier context missing"))?
+    };
+    let original = context.hash();
+    let mut tips = BTreeMap::new();
+    for other in authors.keys().filter(|other| *other != author) {
+        let Some(tip) = read.history_settled_tip(other)? else {
+            continue;
+        };
+        let hash = tip.entry_hash();
+        let Some(clock) = read.clock(&hash)? else {
+            return Err(authored_missing(
+                "authored history settled peer clock missing",
+            ));
+        };
+        tips.insert(
+            (clock, hash),
+            EntryReference {
+                author: *other,
+                seq: tip.skeleton.seq,
+                hash,
+            },
+        );
+        if tips.len() > crate::log::entry::MAX_SEEN {
+            tips.pop_first();
+        }
+    }
+    let mut seen: Vec<_> = tips.into_values().collect();
+    seen.sort_unstable_by_key(|reference| reference.author);
+    for reference in &seen {
+        let binding = TreeBinding {
+            author: reference.author,
+            ..binding
+        };
+        let prefix = read
+            .history_range(binding, 1, reference.seq)?
+            .ok_or_else(|| authored_missing("authored history settled peer prefix missing"))?;
+        let frontier = read.history_context(&prefix.frontier)?.ok_or_else(|| {
+            authored_missing("authored history settled peer frontier context missing")
+        })?;
+        context = context.join(&frontier)?;
+    }
+    let changed = context.hash() != original;
+    Ok((context, seen, changed))
+}
+
+pub(super) fn prepare(
     read: &entry_store::Read<'_>,
     signer: &dyn crate::identity::composite::RootSigner,
     entry: &Entry,

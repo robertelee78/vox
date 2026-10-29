@@ -302,6 +302,16 @@ impl Write<'_, '_> {
 }
 
 impl Read<'_> {
+    pub(crate) fn read_receipt_cache(&self, receipt: &Digest32) -> Result<Option<u64>> {
+        receipt_cache(
+            &self.source(),
+            self.sek,
+            self.channel,
+            readable_roots(&self.directory)?,
+            receipt,
+        )
+    }
+
     pub(crate) fn was_read(&self, message: &Digest32, reader: &Digest32) -> Result<bool> {
         was_read(
             &self.source(),

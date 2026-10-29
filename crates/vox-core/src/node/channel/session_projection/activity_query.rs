@@ -353,13 +353,49 @@ impl ChannelState {
         query: Query,
         now: u64,
     ) -> std::result::Result<Reply, String> {
-        if self.poisoned {
+        let resource = self.history_read_resource();
+        if self.poisoned
+            && !resource
+                .as_ref()
+                .is_some_and(|read| read.has_pending_snapshot())
+        {
             return Err(self.save_failure().to_string());
         }
-        let result = (|| -> Result<Reply> {
-            let (authors, refreshing) = self.drive_from_known(store)?;
-            let snapshot = store.snapshot()?;
-            let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
+        let result = match resource {
+            Some(resource) => resource.with_snapshot(|_, view, retention| {
+                self.session_activity_query_view(view, query, now, retention)
+            }),
+            None => self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)
+                .and_then(|view| {
+                    self.session_activity_query_view(
+                        &view,
+                        query,
+                        now,
+                        (self.effective_retention(), self.effective_step_retention()),
+                    )
+                }),
+        };
+        if let Err(error) = &result {
+            if !matches!(error, Error::StreamRefused(_)) {
+                self.poison(error);
+            }
+        }
+        result.map_err(|error| error.to_string())
+    }
+
+    fn session_activity_query_view(
+        &self,
+        view: &super::super::entry_store::RenderView<'_>,
+        query: Query,
+        now: u64,
+        retention: (u64, u64),
+    ) -> Result<Reply> {
+        (|| -> Result<Reply> {
+            let (authors, refreshing) = self.drive_from_known_view(view)?;
+            let snapshot = view.snapshot();
+            let read = Read::existing(snapshot, &self.sek, &self.channel_id)?;
             // The published activity roots answer (ADR-037 R4). A rebuild in flight keeps the
             // old generation published and is said to be provisional; publication moves the
             // boundary, so a page under way re-reads.
@@ -367,7 +403,7 @@ impl ChannelState {
                 || self.needs_session_upgrade();
             let current = Revision {
                 incarnation: self.gen.clone(),
-                instance: self.history_instance(store)?,
+                instance: view.history_instance(),
                 invalidated: read.as_ref().map_or(0, |r| r.header.activity.invalidated),
                 drive: super::query::drive_basis(&authors, &refreshing),
                 boundary: read.as_ref().map_or(0, |r| r.header.activity.applied),
@@ -488,7 +524,7 @@ impl ChannelState {
                         )?
                         .ok_or_else(bad)?;
                     let saved = self.read_private(arrival, &sealed)?;
-                    if self.private_expired(&saved, now) {
+                    if super::super::private_session::expired(&saved, now, retention) {
                         return Err(Error::StreamRefused(REFRESHING));
                     }
                     let row = saved.row.ok_or_else(bad)?;
@@ -636,7 +672,7 @@ impl ChannelState {
                         let mut rows = 0u64;
                         for hash in entries {
                             let Some(arrival) = super::private_index::find(
-                                &snapshot,
+                                snapshot,
                                 &self.sek,
                                 &self.channel_id,
                                 hash,
@@ -714,7 +750,7 @@ impl ChannelState {
                     }
                     let bound = match before {
                         Some(hash) => super::private_index::find(
-                            &snapshot,
+                            snapshot,
                             &self.sek,
                             &self.channel_id,
                             &hash,
@@ -776,13 +812,7 @@ impl ChannelState {
                     }))
                 }
             }
-        })();
-        if let Err(ref error) = result {
-            if !matches!(error, Error::StreamRefused(_)) {
-                self.poison(error);
-            }
-        }
-        result.map_err(|e| e.to_string())
+        })()
     }
 }
 

@@ -26,11 +26,17 @@ impl Persistence {
         })
     }
     pub(super) fn advance_normal(&mut self) -> Result<()> {
-        self.normal = self.normal.checked_add(1).ok_or(invalid())?;
-        Ok(())
+        self.advance_normal_by(1)
     }
     pub(super) fn advance_drive(&mut self) -> Result<()> {
-        self.drive = self.drive.checked_add(1).ok_or(invalid())?;
+        self.advance_drive_by(1)
+    }
+    pub(super) fn advance_normal_by(&mut self, advances: u64) -> Result<()> {
+        self.normal = self.normal.checked_add(advances).ok_or(invalid())?;
+        Ok(())
+    }
+    pub(super) fn advance_drive_by(&mut self, advances: u64) -> Result<()> {
+        self.drive = self.drive.checked_add(advances).ok_or(invalid())?;
         Ok(())
     }
     pub(super) fn next_normal(&self) -> Result<Stamp> {
@@ -44,6 +50,18 @@ impl Persistence {
     }
     pub(super) fn drive(&self) -> Stamp {
         Stamp(self.nonce, self.drive)
+    }
+    pub(super) fn normal_after(&self, advances: u64) -> Result<Stamp> {
+        Ok(Stamp(
+            self.nonce,
+            self.normal.checked_add(advances).ok_or(invalid())?,
+        ))
+    }
+    pub(super) fn drive_after(&self, advances: u64) -> Result<Stamp> {
+        Ok(Stamp(
+            self.nonce,
+            self.drive.checked_add(advances).ok_or(invalid())?,
+        ))
     }
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -167,6 +185,33 @@ impl Header {
         self.drive.encode(&mut e);
         batch.put_segment(room, KIND, 0, &seal_segment(sek, KIND, 0, &e.finish())?)
     }
+}
+
+/// Compact durable basis for a native whole-map rewrite. In-memory persistence nonces
+/// restart on open, so the exact written stamps, not fresh process stamps, bind the read.
+pub(super) fn written_stamps(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+) -> Result<(Stamp, Stamp)> {
+    let Some(sealed) = snapshot.get_segment_bounded(room, KIND, 0, HEADER_BYTES)? else {
+        return Ok((Stamp::default(), Stamp::default()));
+    };
+    let header = Header::decode(&open_segment(sek, KIND, 0, &sealed)?)?;
+    Ok((header.normal, header.drive))
+}
+
+pub(super) fn require_written_stamps(
+    batch: &crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    expected: (Stamp, Stamp),
+) -> Result<()> {
+    let header = Header::load(batch, sek, room)?;
+    if (header.normal, header.drive) != expected {
+        return Err(invalid());
+    }
+    Ok(())
 }
 fn key(chain: u64) -> Key {
     let mut key = [0; 64];

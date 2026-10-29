@@ -1,7 +1,6 @@
 //! Activity-specific derived indexes: raw ranks, multipart origins/companions and
 //! pending approvals. Repair never publishes a partial count or a partial grouping.
 
-use super::super::ChannelState;
 use super::activity_index::{arrival_key, hash_key, member_key, Fact, Kind};
 use super::activity_state::{ActivityTree as T, ActivityWork, ACTIVITY_TREES};
 use super::storage::{Read, Tree, Write};
@@ -224,9 +223,13 @@ pub(super) fn appended(index: &mut Write<'_, '_>, f: &Fact) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
+pub(super) fn advance_owned(
+    store: &Store,
+    sek: &crate::atrest::sek::Sek,
+    room: &Digest32,
+) -> Result<bool> {
     let snapshot = store.snapshot()?;
-    let Some(read) = Read::existing(&snapshot, &ch.sek, &ch.channel_id)? else {
+    let Some(read) = Read::existing(&snapshot, sek, room)? else {
         return Ok(false);
     };
     let retire = read.header.activity.ready && read.activity_next(T::RawRetire, None)?.is_some();
@@ -235,7 +238,7 @@ pub(super) fn advance(ch: &ChannelState, store: &Store) -> Result<bool> {
     }
     let mut batch = store.batch()?;
     batch.derived();
-    let mut index = Write::open(&mut batch, &ch.sek, &ch.channel_id)?;
+    let mut index = Write::open(&mut batch, sek, room)?;
     if retire {
         super::activity_pending::advance(&mut index, 32)?;
     }

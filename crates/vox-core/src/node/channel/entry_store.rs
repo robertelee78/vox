@@ -1258,8 +1258,22 @@ impl std::fmt::Debug for EntryIndex {
     }
 }
 
+enum ReadSnapshot {
+    Query(Snapshot),
+    Pending(std::sync::Arc<Snapshot>),
+}
+impl std::ops::Deref for ReadSnapshot {
+    type Target = Snapshot;
+    fn deref(&self) -> &Snapshot {
+        match self {
+            Self::Query(snapshot) => snapshot,
+            Self::Pending(snapshot) => snapshot,
+        }
+    }
+}
+
 pub(crate) struct Read<'a> {
-    snapshot: Snapshot,
+    snapshot: ReadSnapshot,
     cache: &'a RefCell<PageCache>,
     sek: &'a Sek,
     channel: &'a Digest32,
@@ -1267,13 +1281,40 @@ pub(crate) struct Read<'a> {
 }
 
 impl EntryIndex {
+    /// Independent bounded read cache with the same accepted/provisional visibility policy.
+    pub(crate) fn fork_reader(&self) -> Self {
+        Self {
+            legacy_attached: Cell::new(self.legacy_attached.get()),
+            provisional_hidden: Cell::new(self.provisional_hidden.get()),
+            ..Self::default()
+        }
+    }
+    pub(crate) fn copy_reader_visibility(&self, from: &Self) {
+        self.legacy_attached.set(from.legacy_attached.get());
+        self.provisional_hidden.set(from.provisional_hidden.get());
+    }
     pub(crate) fn read<'a>(
         &'a self,
         store: &Store,
         sek: &'a Sek,
         channel: &'a Digest32,
     ) -> Result<Read<'a>> {
-        let snapshot = store.snapshot()?;
+        self.read_from(ReadSnapshot::Query(store.snapshot()?), sek, channel)
+    }
+    pub(crate) fn read_snapshot<'a>(
+        &'a self,
+        snapshot: std::sync::Arc<Snapshot>,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<Read<'a>> {
+        self.read_from(ReadSnapshot::Pending(snapshot), sek, channel)
+    }
+    fn read_from<'a>(
+        &'a self,
+        snapshot: ReadSnapshot,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<Read<'a>> {
         let source = Source::Snapshot(&snapshot);
         let bytes = source
             .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
@@ -2001,6 +2042,23 @@ impl Write<'_, '_> {
             if let Some(feed) = restart.feeds.get_mut(author) {
                 if *seq > feed.checkpoint.map_or(0, |cp| cp.0) {
                     return Err(invalid("sweep beyond published checkpoint"));
+                }
+                feed.swept_to = *seq;
+            }
+        }
+        Ok(())
+    }
+    /// Persist only cursor facts examined by one owned checkpoint-proof page.
+    pub(crate) fn note_swept_delta(&mut self, swept: &[(Digest32, u64)]) -> Result<()> {
+        let restart = self
+            .directory
+            .restart
+            .as_mut()
+            .ok_or(invalid("sweep without restart state"))?;
+        for (author, seq) in swept {
+            if let Some(feed) = restart.feeds.get_mut(author) {
+                if *seq > feed.checkpoint.map_or(0, |cp| cp.0) || *seq < feed.swept_to {
+                    return Err(invalid("sweep outside published checkpoint range"));
                 }
                 feed.swept_to = *seq;
             }

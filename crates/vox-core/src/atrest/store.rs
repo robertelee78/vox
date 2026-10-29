@@ -165,8 +165,8 @@ pub fn seal_segment(
 ) -> Result<SealedSegment> {
     // `key_bytes()` returns `Err(AtRestLocked)` if the app has been locked, so a
     // seal cannot proceed under an invalidated SEK (ADR-010 app-lock enforcement).
-    let cipher =
-        Aes256Gcm::new_from_slice(sek.key_bytes()?).map_err(|_| Error::AtRestUnlockFailed)?;
+    let key = sek.key_bytes()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| Error::AtRestUnlockFailed)?;
     let nonce = random_array::<NONCE_LEN>()?;
     let aad = segment_aad(kind, segment_id);
     let ct = cipher
@@ -201,8 +201,8 @@ pub fn open_segment(
         return Err(Error::MalformedAtRest("segment ciphertext too short"));
     }
     // Post-lock open fails with `AtRestLocked` until re-auth (ADR-010).
-    let cipher =
-        Aes256Gcm::new_from_slice(sek.key_bytes()?).map_err(|_| Error::AtRestUnlockFailed)?;
+    let key = sek.key_bytes()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| Error::AtRestUnlockFailed)?;
     let aad = segment_aad(kind, segment_id);
     cipher
         .decrypt(

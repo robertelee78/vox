@@ -144,6 +144,9 @@ impl Context {
             _secret_work: secret_work,
         })
     }
+    pub(crate) fn secret_work(&self) -> Arc<tokio::sync::OwnedRwLockReadGuard<()>> {
+        Arc::clone(&self._secret_work)
+    }
     pub fn cancellation(&self) -> Cancellation {
         self.cancellation.clone()
     }
@@ -1704,10 +1707,11 @@ pub(crate) fn reclaim_precharged(
     Ok(state.cleanup.is_none())
 }
 
-/// Retirement deletion only. The room owner first holds the room mutex and verifies its
-/// unlocked incarnation. Observer cancellation cannot revoke permission to delete this exact
-/// abandoned staging, but a replacement request/binding is always left untouched. This route
-/// cannot start/resume demand, admit entries, append bodies, acknowledge bytes or grant access.
+/// Retirement deletion only. The room owner first verifies its unlocked incarnation and
+/// acquires Active in room->Active order, then releases the room before acquiring the writer.
+/// Observer cancellation cannot revoke permission to delete this exact abandoned staging;
+/// replacement request/binding/serial checks remain in the same transaction. This route cannot
+/// start/resume demand, admit entries, append bodies, acknowledge bytes or grant access.
 pub(crate) fn retire_staging(
     context: &Context,
     active: &mut Active,

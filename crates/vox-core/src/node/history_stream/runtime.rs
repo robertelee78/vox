@@ -9,7 +9,7 @@ use super::{
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::entry_store::sparse::LiveWindow;
-use crate::node::channel::ChannelState;
+use crate::node::channel::{ChannelState, HistoryAdmissionRoom};
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
 use crate::node::store::{ReceivedFlow, Store};
@@ -962,6 +962,10 @@ impl Flow {
     pub(crate) fn needs_board(&self) -> bool {
         (self.inventory && !self.initialized) || self.wants_board
     }
+
+    pub(crate) fn secret_work(&self) -> Arc<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.control_context.secret_work()
+    }
     /// The author of a retained signed head, for the record of a peer that could not fill a
     /// body under it; `None` when the head is not retained or the room is busy, and then no
     /// record is made (the next period asks once more).
@@ -1421,21 +1425,57 @@ impl Flow {
                 let admission = admission
                     .as_ref()
                     .ok_or(Error::Profile("history retirement admission missing"))?;
+                // This deletion touches only the exact request's staging namespace and Active
+                // serial, never the room projection. Context retains its existing secret lease.
+                // Preserve room->Active acquisition order, then release the room before writer
+                // acquisition; no room reacquisition occurs while Active is held.
+                drop(channel);
                 let done =
                     demand::retire_staging(&staging.context, &mut active, admission, &committed)?;
                 return Ok(Slice::Staging(purpose, done));
             }
             let wake = channel.history_publication_wake();
             let publication_owner = channel.history_publication_request(&store)?;
-            if channel.history_publication_busy(&store)? && publication_owner != Some(request) {
+            if channel.post_pending()
+                || (channel.history_publication_busy(&store)? && publication_owner != Some(request))
+            {
                 return Ok(Slice::Publication(publication_owner, wake));
             }
-            if !channel.cleanup_history_source_owned(&store, &committed, request)? {
-                return Ok(Slice::Source(false, after));
+            let pending = channel.prepare_history_publication(&store, None, Some(request))?;
+            let owner = Arc::new(());
+            let pin = channel.reserve_pending_history_write(&store, Arc::clone(&owner), true)?;
+            drop(channel);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pending.cleanup(&store, &committed, None, Some((request, after)))
+            }));
+            let mut channel = room.blocking_lock();
+            let owns = channel.owns_pending_history_write(&owner);
+            if owns {
+                channel.history_index_committed();
             }
-            channel
-                .cleanup_history_verifiers(&store, &committed, request, after)
-                .map(|(done, next)| Slice::Source(done, next))
+            let result = match result {
+                Ok(completed) => (|| {
+                    if !owns {
+                        return Err(Error::Unreachable("history retirement owner changed"));
+                    }
+                    if channel.history_instance(&store)? != instance {
+                        return Err(Error::Unreachable("history retirement room changed"));
+                    }
+                    let (done, next) = channel.finish_history_publication(completed)?;
+                    Ok(Slice::Source(done, next))
+                })(),
+                Err(_) => Err(Error::Profile("history retirement save worker stopped")),
+            };
+            channel.release_pending_text(&owner, false);
+            let publication = if owns {
+                channel.history_write_released(&store)
+            } else {
+                Ok(())
+            };
+            let result = result.and_then(|slice| publication.map(|()| slice));
+            drop(channel);
+            drop(pin);
+            result
         })
         .await
         .map_err(|_| Error::Profile("history retirement worker stopped"))??;
@@ -1715,7 +1755,7 @@ impl Flow {
                         | "history authorization changed before refusal"
                         | "live window authorization changed"
                         | "live retry authorization changed"
-                )
+                ) | Error::StreamRefused(super::AUTHORIZATION_CHANGED)
             )
         }) {
             self.authorization_changed = true;
@@ -2042,54 +2082,71 @@ impl Flow {
                 let room = self.room;
                 let epoch = self.epoch;
                 let committed = Arc::clone(&self.work_committed);
+                enum Selection<P> {
+                    Held(LiveWindow, u64),
+                    Write(P, u64),
+                }
                 let found = source
-                    .read(job, 256, move |channel, store| {
-                        if channel.history_instance(store)? != instance
-                            || super::authorization_generation(store, node, room, instance, epoch)?
-                                != generation
-                        {
-                            return Err(Error::Profile("live window authorization changed"));
-                        }
-                        if channel.history_publication_busy(store)? {
-                            return Ok(None);
-                        }
-                        let input = channel.history_read(store)?;
-                        let target = input
-                            .history_head(&head)?
-                            .ok_or(Error::MalformedAtRest("live window head missing"))?;
-                        if target.binding.author != author
-                            || target.binding.scope != crate::log::history::LogScope::Public
-                        {
-                            return Err(Error::MalformedAtRest("live window head binding differs"));
-                        }
-                        let state = input
-                            .sparse_author(&author, crate::log::history::LogScope::Public)?
-                            .ok_or(Error::MalformedAtRest("live window author missing"))?;
-                        if state.observed_conflict.is_some() {
-                            return Err(Error::MalformedBundle(
-                                "live window author has conflicting heads",
-                            ));
-                        }
-                        // A head no newer than the window's top resumes it. A newer head
-                        // selects a new window at once, even over an unfinished one: fresh
-                        // messages never wait for old bodies (ADR-036; the decider, #934), and
-                        // the selector keeps the unfinished positions inside the new window,
-                        // walked newest first after the fresh ones, held positions passing
-                        // locally. Measured before this: a joiner read the creator's next post
-                        // only when his drain of her 150-post window ended, 51–59 s on.
-                        if let Some(window) = state.live {
-                            if window.through >= target.root.leaves {
-                                return Ok(Some((window, target.root.leaves)));
+                    .write_owned(
+                        job,
+                        (256, 4 * 1024 * 1024, false),
+                        move |channel, store| {
+                            if channel.history_instance(store)? != instance
+                                || super::authorization_generation(
+                                    store, node, room, instance, epoch,
+                                )? != generation
+                            {
+                                return Err(Error::Profile("live window authorization changed"));
                             }
-                        }
-                        let through = target.root.leaves;
-                        drop(input);
-                        channel
-                            .history_write_tracked(store, &committed, |index| {
-                                index.select_history_live_window(&author, head)
-                            })
-                            .map(|window| Some((window, through)))
-                    })
+                            let input = channel.history_read(store)?;
+                            let target = input
+                                .history_head(&head)?
+                                .ok_or(Error::MalformedAtRest("live window head missing"))?;
+                            if target.binding.author != author
+                                || target.binding.scope != crate::log::history::LogScope::Public
+                            {
+                                return Err(Error::MalformedAtRest(
+                                    "live window head binding differs",
+                                ));
+                            }
+                            let state = input
+                                .sparse_author(&author, crate::log::history::LogScope::Public)?
+                                .ok_or(Error::MalformedAtRest("live window author missing"))?;
+                            if state.observed_conflict.is_some() {
+                                return Err(Error::MalformedBundle(
+                                    "live window author has conflicting heads",
+                                ));
+                            }
+                            // A head no newer than the window's top resumes it. A newer head
+                            // selects a new window at once, even over an unfinished one: fresh
+                            // messages never wait for old bodies (ADR-036; the decider, #934), and
+                            // the selector keeps the unfinished positions inside the new window,
+                            // walked newest first after the fresh ones, held positions passing
+                            // locally. Measured before this: a joiner read the creator's next post
+                            // only when his drain of her 150-post window ended, 51–59 s on.
+                            if let Some(window) = state.live {
+                                if window.through >= target.root.leaves {
+                                    return Ok(Selection::Held(window, target.root.leaves));
+                                }
+                            }
+                            let through = target.root.leaves;
+                            drop(input);
+                            let pending = channel
+                                .prepare_history_admission(store, Some((node, generation)))?;
+                            Ok(Selection::Write(pending, through))
+                        },
+                        move |selection, store| match selection {
+                            Selection::Held(window, through) => Ok((window, through)),
+                            Selection::Write(pending, through) => pending.with(|channel| {
+                                channel
+                                    .history_write_tracked(store, &committed, |index| {
+                                        index.select_history_live_window(&author, head)
+                                    })
+                                    .map(|window| (window, through))
+                            }),
+                        },
+                        |_, _, value| Ok(value),
+                    )
                     .await?;
                 let found = match found {
                     Lookup::Found(found) => found,
@@ -2269,50 +2326,60 @@ impl Flow {
                 let unavailable = self.live_unavailable == Some((window.head, window.next));
                 let committed = Arc::clone(&self.work_committed);
                 let advanced = source
-                    .read(job, 128, move |channel, store| {
-                        if channel.history_instance(store)? != instance
-                            || super::authorization_generation(store, node, room, instance, epoch)?
-                                != generation
-                        {
-                            return Err(Error::Profile("live window authorization changed"));
-                        }
-                        let input = channel.history_read(store)?;
-                        if input.publication_busy() {
-                            return Ok(None);
-                        }
-                        let Some(header) = input.history_position_header(&author, window.next)?
-                        else {
-                            return Err(Error::MalformedAtRest(
-                                "live window position was not published",
-                            ));
-                        };
-                        let hash = header.entry_hash();
-                        let content = header.skeleton.v2.as_ref().is_some_and(|v| {
-                            v.kind == crate::log::history::SignedEntryKind::Content
-                        });
-                        let missing = unavailable
-                            && content
-                            && input.missing_contains(&author, window.next)?;
-                        let finished = input.history_effect_finished(&hash)?;
-                        let body = !content
-                            || input.retention(&hash)?.is_some()
-                            || channel
-                                .body_expired(header.skeleton.claimed_ms, crate::time::Ms(now));
-                        if !(missing || finished && body) {
-                            return Err(Error::MalformedAtRest(
-                                "live window position is not complete or explicitly missing",
-                            ));
-                        }
-                        if retry {
-                            return Ok(Some(true));
-                        }
-                        drop(input);
-                        channel
-                            .history_write_tracked(store, &committed, |index| {
-                                index.advance_history_live_window(&author, window)
-                            })
-                            .map(Some)
-                    })
+                    .write_owned(
+                        job,
+                        (128, 4 * 1024 * 1024, false),
+                        move |channel, store| {
+                            if channel.history_instance(store)? != instance
+                                || super::authorization_generation(
+                                    store, node, room, instance, epoch,
+                                )? != generation
+                            {
+                                return Err(Error::Profile("live window authorization changed"));
+                            }
+                            let input = channel.history_read(store)?;
+                            let Some(header) =
+                                input.history_position_header(&author, window.next)?
+                            else {
+                                return Err(Error::MalformedAtRest(
+                                    "live window position was not published",
+                                ));
+                            };
+                            let hash = header.entry_hash();
+                            let content = header.skeleton.v2.as_ref().is_some_and(|v| {
+                                v.kind == crate::log::history::SignedEntryKind::Content
+                            });
+                            let missing = unavailable
+                                && content
+                                && input.missing_contains(&author, window.next)?;
+                            let finished = input.history_effect_finished(&hash)?;
+                            let body = !content
+                                || input.retention(&hash)?.is_some()
+                                || channel
+                                    .body_expired(header.skeleton.claimed_ms, crate::time::Ms(now));
+                            if !(missing || finished && body) {
+                                return Err(Error::MalformedAtRest(
+                                    "live window position is not complete or explicitly missing",
+                                ));
+                            }
+                            if retry {
+                                return Ok(None);
+                            }
+                            drop(input);
+                            channel
+                                .prepare_history_admission(store, Some((node, generation)))
+                                .map(Some)
+                        },
+                        move |pending, store| match pending {
+                            None => Ok(true),
+                            Some(pending) => pending.with(|channel| {
+                                channel.history_write_tracked(store, &committed, |index| {
+                                    index.advance_history_live_window(&author, window)
+                                })
+                            }),
+                        },
+                        |_, _, value| Ok(value),
+                    )
                     .await?;
                 match advanced {
                     Lookup::Found(_) => {}
@@ -3352,16 +3419,22 @@ impl Flow {
                 let room = self.room;
                 let epoch = self.epoch;
                 let advanced = source
-                    .read(job, 128, move |channel, store| {
-                        if super::authorization_generation(store, node, room, instance, epoch)?
-                            != generation
-                        {
-                            return Err(Error::Profile("history authorization changed"));
-                        }
-                        channel
-                            .advance_governance(store, crate::time::Ms(now))
-                            .map(|_| Some(()))
-                    })
+                    .write_owned(
+                        job,
+                        (128, 4 * 1024 * 1024, false),
+                        move |channel, store| {
+                            if super::authorization_generation(store, node, room, instance, epoch)?
+                                != generation
+                            {
+                                return Err(Error::Profile("history authorization changed"));
+                            }
+                            channel.prepare_history_governance_projection(crate::time::Ms(now))
+                        },
+                        |pending, store| Ok(pending.run(store)),
+                        |channel, store, completed| {
+                            channel.finish_history_governance_projection(store, completed)
+                        },
+                    )
                     .await?;
                 // A bounded fold step, then the entry slice is re-derived and decides for itself
                 // whether the fold now serves it. A fold that is held or slow left that cycle

@@ -4,11 +4,11 @@ use crate::identity::composite::RootSigner;
 use std::time::Instant;
 
 pub(super) struct Retry {
-    cause: String,
-    name: String,
-    attempts: u32,
-    due: Instant,
-    busy: bool,
+    pub(super) cause: String,
+    pub(super) name: String,
+    pub(super) attempts: u32,
+    pub(super) due: Instant,
+    pub(super) busy: bool,
 }
 
 impl Node {
@@ -68,6 +68,9 @@ impl Node {
             }
             tokio::spawn(async move {
                 let opened = secret_blocking(&secret_work, move || {
+                    // Establish a real durable writer before opening a replacement room.
+                    // A latched native backend requires fresh-inode reconstruction; failure
+                    // leaves the original poisoned room and its committed read pin authoritative.
                     store.resave_room_after_write_failure(&id)?;
                     ChannelState::open_with_sek_owned(
                         &store,
@@ -127,90 +130,30 @@ impl Node {
                         waiting: None,
                         waiting_noted: false,
                         progressed: false,
-                        channel: tokio::sync::Mutex::new(channel),
+                        channel: Arc::new(tokio::sync::Mutex::new(channel)),
                         reply: None,
                         reopening: false,
                         recovery: Some(original),
                         recovery_writer_gate: None,
-                        trusted: None,
-                        removal_after: None,
-                        consent_after: None,
+                        save: preparation_save::State::default(),
+                        retry_packages: false,
                     },
                 );
             }
             Err(error) => {
-                self.complete_store_recovery(id, Err(error), None).await;
+                self.fail_store_recovery(id, error);
             }
         }
     }
 
-    pub(super) async fn complete_store_recovery(
-        &mut self,
-        id: Digest32,
-        opened: crate::error::Result<ChannelState>,
-        transition: Option<crate::node::channel::own_writer_gate::Transition>,
-    ) -> Outcome {
-        match opened {
-            Ok(channel) => {
-                let name = self
-                    .store_recovery
-                    .get(&id)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_else(|| crate::node::link::b32_encode(&id));
-                let peers = self
-                    .ports
-                    .keys()
-                    .filter(|(room, _)| *room == id)
-                    .map(|(_, peer)| *peer)
-                    .collect::<Vec<_>>();
-                for peer in peers {
-                    self.drop_port(&id, &peer);
-                }
-                let outcome = self.publish_open_channel(channel, transition).await;
-                if !outcome.is_done() {
-                    let cause = match outcome {
-                        Outcome::Failed(fault) => fault.to_string(),
-                        other => format!("room publication returned {other:?}"),
-                    };
-                    if self.channels.contains_key(&id) {
-                        if let Some(retry) = self.store_recovery.get_mut(&id) {
-                            retry.cause = cause;
-                            retry.busy = false;
-                            retry.due =
-                                Instant::now() + Duration::from_secs(1u64 << retry.attempts.min(6));
-                        }
-                    } else {
-                        self.store_recovery.remove(&id);
-                        let _ = self.event_tx.send(NodeEvent::NodeNote {
-                            note: format!("room {} could not finish recovery: {cause}; it remains closed. Reopen it to try again.", crate::node::link::b32_encode(&id)),
-                        });
-                    }
-                    return outcome;
-                }
-                self.store_recovery.remove(&id);
-                self.store_recovered
-                    .insert(id, format!("{name} recovered; it can save again"));
-                eprintln!(
-                    "vox: node {} room {}: {name} recovered; it can save again",
-                    self.paths
-                        .profile_dir
-                        .file_name()
-                        .and_then(|v| v.to_str())
-                        .unwrap_or("unknown"),
-                    crate::node::link::b32_encode(&id)
-                );
-                outcome
-            }
-            Err(e) => {
-                let fault = fault_of(&e);
-                if let Some(retry) = self.store_recovery.get_mut(&id) {
-                    retry.cause = e.to_string();
-                    retry.busy = false;
-                    retry.due = Instant::now() + Duration::from_secs(1u64 << retry.attempts.min(6));
-                }
-                Outcome::Failed(fault)
-            }
+    pub(super) fn fail_store_recovery(&mut self, id: Digest32, error: Error) -> Outcome {
+        let fault = fault_of(&error);
+        if let Some(retry) = self.store_recovery.get_mut(&id) {
+            retry.cause = error.to_string();
+            retry.busy = false;
+            retry.due = Instant::now() + Duration::from_secs(1u64 << retry.attempts.min(6));
         }
+        Outcome::Failed(fault)
     }
 
     pub(super) fn storage_health(&self, report: &mut crate::node::status::StatusReport) {

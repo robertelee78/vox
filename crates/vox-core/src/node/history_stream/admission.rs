@@ -8,7 +8,7 @@ use crate::log::history::{
     ConsistencyVerifier, ControlContext, ControlRangeVerifier, Descriptor, HistoryStep,
     InclusionVerifier, LogScope, SignedHead, VerifiedHeader, WorkBudget,
 };
-use crate::node::channel::{entry_store, governance, ChannelState};
+use crate::node::channel::{entry_store, governance, HistoryAdmissionRoom};
 use crate::node::store::Store;
 
 use super::{Object, Proof, ProofKind, Query, RequestId};
@@ -47,10 +47,10 @@ fn invalid(message: &'static str) -> Error {
     Error::MalformedBundle(message)
 }
 
-/// Caller owns the 4-MiB verifier envelope and current room lock. Peer proof bytes only
-/// construct ordinary verifiers; they can never enter an authenticated-local restore API.
+/// Caller owns the 4-MiB verifier envelope and reserved room publication, not its mutex.
+/// Peer proof bytes only construct verifiers; they never enter authenticated-local restore APIs.
 pub(super) fn stage(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     ledgers: (
         &std::sync::atomic::AtomicBool,
@@ -275,7 +275,7 @@ pub(super) fn stage(
 
 #[allow(clippy::too_many_arguments)]
 fn stage_header(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
     head_id: Digest32,
@@ -370,7 +370,7 @@ pub(super) enum Advanced {
 /// receipt/final cursor. A crash or missing-context retry starts from the retained original proof
 /// bytes. A missing proof is never fork evidence.
 pub(super) fn advance(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
     binding: &CursorBinding,
@@ -542,7 +542,7 @@ pub(super) fn advance(
 }
 
 fn combine_parent(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
     head: Digest32,
@@ -563,7 +563,7 @@ fn combine_parent(
 }
 
 pub(super) fn promote_head(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
     id: Digest32,
@@ -679,7 +679,7 @@ pub(super) enum EntryStart {
 // All scalar bindings belong to this exact entry and current validation phase.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_entry(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
     request: RequestId,
@@ -859,7 +859,7 @@ pub(super) enum EntryAdvanced {
 }
 
 pub(super) fn advance_entry(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     committed: &std::sync::atomic::AtomicBool,
     binding: CursorBinding,
@@ -938,7 +938,7 @@ pub(super) enum Preflight {
     Busy,
 }
 pub(super) fn preflight(
-    room: &ChannelState,
+    room: &impl HistoryAdmissionRoom,
     store: &Store,
     head: Digest32,
     entry: &Entry,

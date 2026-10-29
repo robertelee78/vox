@@ -360,7 +360,33 @@ impl<'a> Read<'a> {
         view: &'a super::super::entry_store::RenderView<'a>,
         now: u64,
     ) -> Self {
-        self.sources = Some(super::source::Eligibility { channel, view, now });
+        self.sources = Some(super::source::Eligibility {
+            policy: super::source::SourcePolicy {
+                retention: channel.effective_retention(),
+                step_retention: channel.effective_step_retention(),
+            },
+            room: self.room,
+            dag: &channel.dag,
+            view,
+            now,
+        });
+        self
+    }
+
+    pub fn with_source_policy(
+        mut self,
+        policy: super::source::SourcePolicy,
+        dag: &'a crate::log::dag::Dag,
+        view: &'a super::super::entry_store::RenderView<'a>,
+        now: u64,
+    ) -> Self {
+        self.sources = Some(super::source::Eligibility {
+            policy,
+            room: self.room,
+            dag,
+            view,
+            now,
+        });
         self
     }
 

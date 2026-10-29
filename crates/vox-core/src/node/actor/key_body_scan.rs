@@ -55,6 +55,51 @@ impl Drop for Controller {
     }
 }
 
+/// Consume the inspection guard before acquiring the Store writer. The exact cursor CAS and
+/// captured grant still share one native transaction, and its pin lives through mirror install.
+fn commit_provider_cursor(
+    mut guard: tokio::sync::OwnedMutexGuard<ChannelState>,
+    store: &Arc<crate::node::store::Store>,
+    provider: Digest32,
+    node: Digest32,
+    authorization: Digest32,
+    expected: Option<KeyProviderCursor>,
+    next: KeyProviderCursor,
+) -> crate::error::Result<bool> {
+    let Some(pending) =
+        guard.prepare_key_provider_cursor(store, provider, node, authorization, expected, next)?
+    else {
+        return Ok(false);
+    };
+    let epoch = guard.epoch();
+    let instance = guard.history_instance(store)?;
+    let shared = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&guard));
+    let owner = Arc::new(());
+    let pin = guard.reserve_pending_write(store, Arc::clone(&owner))?;
+    drop(guard);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.commit(store)));
+    let mut guard = shared.blocking_lock();
+    let owns = guard.owns_pending_history_write(&owner);
+    if owns {
+        guard.history_index_committed();
+    }
+    let result = match result {
+        Ok(Ok(committed)) if owns => (|| {
+            if guard.epoch() != epoch || guard.history_instance(store)? != instance {
+                return Err(Error::Unreachable("key cursor room changed"));
+            }
+            Ok(committed)
+        })(),
+        Ok(Ok(_)) => Err(Error::Unreachable("key cursor publication owner changed")),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(Error::Profile("key cursor save worker stopped")),
+    };
+    guard.release_pending_text(&owner, false);
+    drop(guard);
+    drop(pin);
+    result
+}
+
 impl Node {
     pub(super) fn advance_key_body_scan(&mut self) {
         if let Some(running) = self.key_body_scan.running.as_ref() {
@@ -402,7 +447,7 @@ impl Node {
         tokio::spawn(async move {
             let inspected = tokio::task::spawn_blocking(move || {
                 let _held = (secret, job, charge);
-                let inspected = (|| -> crate::error::Result<ScanResult> {
+                (|| -> crate::error::Result<ScanResult> {
                     if !guard.is_member(&peer) || !guard.is_member(&node) {
                         return Ok(ScanResult::Ineligible);
                     }
@@ -430,7 +475,8 @@ impl Node {
                             cursor.instance = remote_instance;
                             cursor.after = serial;
                         }
-                        return if guard.advance_key_provider_cursor(
+                        return if commit_provider_cursor(
+                            guard,
                             &store,
                             peer,
                             node,
@@ -482,7 +528,8 @@ impl Node {
                         }
                         cursor.instance = remote_instance;
                         cursor.after = serial;
-                        return if guard.advance_key_provider_cursor(
+                        return if commit_provider_cursor(
+                            guard,
                             &store,
                             peer,
                             node,
@@ -531,8 +578,8 @@ impl Node {
                         if guard.history_publication_busy(&store)? {
                             return Ok(ScanResult::Busy(wake));
                         }
-                        return if guard.advance_key_provider_cursor(
-                            &store, peer, node, generation, expected, cursor,
+                        return if commit_provider_cursor(
+                            guard, &store, peer, node, generation, expected, cursor,
                         )? {
                             Ok(ScanResult::Installed(cursor))
                         } else {
@@ -549,8 +596,8 @@ impl Node {
                         if guard.history_publication_busy(&store)? {
                             return Ok(ScanResult::Busy(wake));
                         }
-                        return if guard.advance_key_provider_cursor(
-                            &store, peer, node, generation, expected, cursor,
+                        return if commit_provider_cursor(
+                            guard, &store, peer, node, generation, expected, cursor,
                         )? {
                             Ok(ScanResult::Installed(cursor))
                         } else {
@@ -580,9 +627,7 @@ impl Node {
                         None => Ok(ScanResult::Busy(wake)),
                     }
                 })()
-                .unwrap_or_else(|error| ScanResult::Failed(error.to_string()));
-                drop(guard);
-                inspected
+                .unwrap_or_else(|error| ScanResult::Failed(error.to_string()))
             })
             .await
             .unwrap_or_else(|_| ScanResult::Failed("inspection worker stopped".to_owned()));

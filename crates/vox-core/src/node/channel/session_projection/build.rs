@@ -10,7 +10,6 @@ use crate::error::{Error, Result};
 use crate::hash::{sha256_concat, Digest32};
 use crate::node::store::Store;
 
-use super::super::ChannelState;
 use super::metadata;
 use super::record::{Descriptor, EnvelopeRef, Field, Key, Part, Position, Source};
 use super::source::EnvelopeInput;
@@ -491,19 +490,27 @@ fn advance_phase(index: &mut Write<'_, '_>, phase: u8) -> Result<()> {
 
 /// One ordinary page of work. The caller drives this from actor maintenance, not a client
 /// wait loop. A reader sees the old valid generation or an explicit refreshing refusal.
-pub(super) fn advance(ch: &ChannelState, store: &Store, now: u64) -> Result<bool> {
-    let view = ch.entries.render_view(store, &ch.sek, &ch.channel_id)?;
+pub(super) fn advance_owned(
+    entries: &super::super::entry_store::EntryIndex,
+    dag: &crate::log::dag::Dag,
+    store: &Store,
+    sek: &crate::atrest::sek::Sek,
+    room: &crate::hash::Digest32,
+    policy: super::source::SourcePolicy,
+    now: u64,
+) -> Result<bool> {
+    let view = entries.render_view(store, sek, room)?;
     let public = view.session_revision();
     let snapshot = view.snapshot();
-    let captured = Read::existing(snapshot, &ch.sek, &ch.channel_id)?
-        .map(|read| read.with_sources(ch, &view, now));
+    let captured = Read::existing(snapshot, sek, room)?
+        .map(|read| read.with_source_policy(policy, dag, &view, now));
     let header = captured
         .as_ref()
         .map(|read| read.header.clone())
         .unwrap_or_default();
     let mut batch = store.batch()?;
     batch.derived();
-    let mut index = Write::open(&mut batch, &ch.sek, &ch.channel_id)?;
+    let mut index = Write::open(&mut batch, sek, room)?;
     let current = (public, header.private_generation);
     if let Some(work) = &mut index.header.building {
         if work.phase != 7 && (work.public, work.private) != current {
@@ -575,8 +582,8 @@ pub(super) fn advance(ch: &ChannelState, store: &Store, now: u64) -> Result<bool
             }
         }
         3 => {
-            let read = Read::open(snapshot, &ch.sek, &ch.channel_id)?
-                .with_sources(ch, &view, now)
+            let read = Read::open(snapshot, sek, room)?
+                .with_source_policy(policy, dag, &view, now)
                 .work()?;
             for _ in 0..WORK_ROWS {
                 let Some((key, id)) = read.next(Tree::Gathered, cursor)? else {
@@ -591,8 +598,8 @@ pub(super) fn advance(ch: &ChannelState, store: &Store, now: u64) -> Result<bool
             }
         }
         4 => {
-            let read = Read::open(snapshot, &ch.sek, &ch.channel_id)?
-                .with_sources(ch, &view, now)
+            let read = Read::open(snapshot, sek, room)?
+                .with_source_policy(policy, dag, &view, now)
                 .work()?;
             // At most one metadata envelope is interpreted per turn. Its fields stream from
             // individual records; no declared part count controls a resident allocation.

@@ -283,6 +283,32 @@ impl OriginKeyStore {
         self.records.contains_key(&(*channel_id, epoch, chain_id))
     }
 
+    /// Retain only the selected generation for an operation-owned recovery release.
+    pub(crate) fn generation_candidate(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+        chain_id: u64,
+    ) -> Self {
+        let key = (*channel_id, epoch, chain_id);
+        let mut records = HashMap::new();
+        if let Some(record) = self.records.get(&key) {
+            records.insert(
+                key,
+                OriginRecord {
+                    channel_id: record.channel_id,
+                    epoch: record.epoch,
+                    author_id: record.author_id,
+                    origin_key: record.origin_key.clone(),
+                    signing_pubkey: record.signing_pubkey,
+                    created_at: record.created_at,
+                    mint_seq: record.mint_seq,
+                },
+            );
+        }
+        Self { records }
+    }
+
     /// The retained generations `author` minted for `(channel_id, epoch)`, as
     /// `(chain_id, mint_seq)` in ascending `chain_id` order — what a history release
     /// can cover, and all it can (V210-45). At most [`MAX_RETAINED_ORIGINS`].

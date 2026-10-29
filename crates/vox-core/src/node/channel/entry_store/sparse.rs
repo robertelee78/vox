@@ -859,6 +859,34 @@ fn key_debt_claim(serial: u64) -> Key {
     key
 }
 
+impl Directory {
+    fn sparse_publication_source(&self) -> Result<Option<(Digest32, u64)>> {
+        let Some(promotion) = &self.promotion else {
+            return Ok(None);
+        };
+        if promotion.sparse_head.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((promotion.witness_hash, promotion.first_log)))
+    }
+
+    fn sparse_publication_request(&self) -> Option<[u8; 16]> {
+        self.promotion
+            .as_ref()
+            .and_then(|promotion| promotion.sparse_request)
+    }
+}
+
+impl View<'_, '_> {
+    pub(crate) fn sparse_publication_source(&self) -> Result<Option<(Digest32, u64)>> {
+        self.directory.sparse_publication_source()
+    }
+
+    pub(crate) fn sparse_publication_request(&self) -> Option<[u8; 16]> {
+        self.directory.sparse_publication_request()
+    }
+}
+
 impl Read<'_> {
     pub(crate) fn expired_key_debts(&self, cutoff: u64, limit: usize) -> Result<Vec<Obligation>> {
         if limit > 16 {
@@ -1222,19 +1250,10 @@ impl Read<'_> {
     }
 
     pub(crate) fn sparse_publication_source(&self) -> Result<Option<(Digest32, u64)>> {
-        let Some(promotion) = &self.directory.promotion else {
-            return Ok(None);
-        };
-        if promotion.sparse_head.is_none() {
-            return Ok(None);
-        }
-        Ok(Some((promotion.witness_hash, promotion.first_log)))
+        self.directory.sparse_publication_source()
     }
     pub(crate) fn sparse_publication_request(&self) -> Option<[u8; 16]> {
-        self.directory
-            .promotion
-            .as_ref()
-            .and_then(|promotion| promotion.sparse_request)
+        self.directory.sparse_publication_request()
     }
     /// A consistency-accepted exact head, including an older accepted head for which a
     /// verification cursor is still finishing. Observed hints do not satisfy this lookup.
@@ -3605,28 +3624,34 @@ impl Read<'_> {
         }
         Ok(Some(result))
     }
-}
-impl Write<'_, '_> {
-    /// The first sparse position at or after `from` that this node has accepted for `author`.
-    ///
-    /// The outer option distinguishes the end of this author's accepted positions. The inner
-    /// option is present only once that exact entry's semantic effect is settled. A key-arrival
-    /// backfill advances past an unsettled position because its effect path will render it with
-    /// the now-current key; it must not mistake a hole in the sparse feed for the end of the
-    /// accepted positions that follow it.
+
+    /// Snapshot discovery uses the same settled-position kernel as the native writer.
     pub(crate) fn next_sparse_backfill(
         &self,
         author: &Digest32,
         from: u64,
     ) -> Result<Option<(u64, Option<Entry>)>> {
-        if !self.directory.active.sparse.enabled {
+        self.source()
+            .sparse_backfill(self.sek, self.channel, self.directory.active, author, from)
+    }
+}
+
+impl Source<'_> {
+    fn sparse_backfill(
+        &self,
+        sek: &Sek,
+        channel: &Digest32,
+        roots: super::Roots,
+        author: &Digest32,
+        from: u64,
+    ) -> Result<Option<(u64, Option<Entry>)>> {
+        if !roots.sparse.enabled {
             return Ok(None);
         }
-        let source = Source::Batch(self.batch);
-        let Some((key, value)) = source.first(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.validated_positions,
+        let Some((key, value)) = self.first(
+            sek,
+            channel,
+            roots.sparse.validated_positions,
             &position(author, from),
             0,
         )?
@@ -3644,29 +3669,41 @@ impl Write<'_, '_> {
                 .try_into()
                 .map_err(|_| invalid("sparse validated position sequence"))?,
         );
-        let header = source
-            .sparse_position_header(
-                self.sek,
-                self.channel,
-                self.directory.active.sparse,
-                author,
-                seq,
-            )?
+        let header = self
+            .sparse_position_header(sek, channel, roots.sparse, author, seq)?
             .ok_or(invalid("sparse validated position vanished"))?;
         let hash = header.entry_hash();
-        if source.find_value(
-            self.sek,
-            self.channel,
-            self.directory.active.sparse.settled_entries,
-            &hashed(&hash),
-        )? != Some(Value::Present)
+        if self.find_value(sek, channel, roots.sparse.settled_entries, &hashed(&hash))?
+            != Some(Value::Present)
         {
             return Ok(Some((seq, None)));
         }
-        let entry = source
-            .published_sparse_entry(self.sek, self.channel, self.directory.active, &hash)?
+        let entry = self
+            .published_sparse_entry(sek, channel, roots, &hash)?
             .ok_or(invalid("settled sparse backfill entry missing"))?;
         Ok(Some((seq, Some(entry))))
+    }
+}
+impl Write<'_, '_> {
+    /// The first sparse position at or after `from` that this node has accepted for `author`.
+    ///
+    /// The outer option distinguishes the end of this author's accepted positions. The inner
+    /// option is present only once that exact entry's semantic effect is settled. A key-arrival
+    /// backfill advances past an unsettled position because its effect path will render it with
+    /// the now-current key; it must not mistake a hole in the sparse feed for the end of the
+    /// accepted positions that follow it.
+    pub(crate) fn next_sparse_backfill(
+        &self,
+        author: &Digest32,
+        from: u64,
+    ) -> Result<Option<(u64, Option<Entry>)>> {
+        Source::Batch(self.batch).sparse_backfill(
+            self.sek,
+            self.channel,
+            self.directory.active,
+            author,
+            from,
+        )
     }
 
     pub(crate) fn sparse_enabled(&self) -> bool {

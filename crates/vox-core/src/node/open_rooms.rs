@@ -191,6 +191,17 @@ impl OpenRooms {
         store.put_meta(OPEN_ROOMS_META_KEY, &self.sealed(signer)?)
     }
 
+    /// Queue this set in an already-admitted transaction. Read-modify-write callers must begin
+    /// the batch before loading the set, so another room's update cannot be replaced by a stale
+    /// snapshot while this caller waits for the native writer.
+    pub(crate) fn queue_save(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        signer: &VaultRootSigner,
+    ) -> Result<()> {
+        batch.put_meta(OPEN_ROOMS_META_KEY, &self.sealed(signer)?)
+    }
+
     /// The set sealed as [`Self::save`] writes it under [`OPEN_ROOMS_META_KEY`], for a caller that
     /// writes it in a batch of its own (a join, with the room it remembers: #412).
     pub fn sealed(&self, signer: &VaultRootSigner) -> Result<Vec<u8>> {
