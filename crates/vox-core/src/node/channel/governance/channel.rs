@@ -3,34 +3,14 @@
 use super::super::{ChannelState, RoomNotice, Share};
 use super::View;
 use crate::error::Result;
-use crate::governance::capability::Capability;
 use crate::governance::entry::{GovBody, GovEntry};
 use crate::hash::Digest32;
 use crate::node::store::Store;
-use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Presence {
     pub last: (u64, bool),
     pub back: Option<(u64, u64)>,
-}
-
-pub(in crate::node::channel) fn remember_presence(
-    state: &mut BTreeMap<Digest32, Presence>,
-    entry: &GovEntry,
-) {
-    if let GovBody::Presence(presence) = &entry.body {
-        let held = state.entry(entry.author_id).or_insert(Presence {
-            last: (entry.seq, presence.body.here),
-            back: None,
-        });
-        if entry.seq >= held.last.0 {
-            held.last = (entry.seq, presence.body.here);
-        }
-        if presence.body.here && held.back.is_none_or(|(seq, _)| seq < entry.seq) {
-            held.back = Some((entry.seq, entry.claimed_ms));
-        }
-    }
 }
 
 /// A turn may publish current authority while later ordinary causal work remains.
@@ -90,8 +70,15 @@ impl ChannelState {
 
     /// Check one target against current authority at `now`, including the genesis creator.
     /// Pending replay or authority expiry returns refreshing rather than an absence claim.
-    pub fn is_admin(&self, store: &Store, target: &Digest32, now: crate::time::Ms) -> Result<bool> {
-        self.checked_governance(store, now.get())?.is_admin(target)
+    pub fn is_admin(
+        &self,
+        _store: &Store,
+        target: &Digest32,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        self.with_semantic_facts(now.get(), |facts| {
+            facts.is_admin(target, &self.genesis.creator_pubkey().fingerprint())
+        })
     }
 
     /// Current governance revision, requiring authority to be ready at the room's latest time.
@@ -109,15 +96,17 @@ impl ChannelState {
     /// A departed host or a withdrawn share returns none; incomplete source replay is an error.
     pub fn shared_service(
         &self,
-        store: &Store,
+        _store: &Store,
         host: &Digest32,
         name: &str,
     ) -> Result<Option<Share>> {
-        let view = self.current_governance(store)?;
-        if self.has_left(host) {
-            return Ok(None);
-        }
-        view.share_selector(host, name)
+        self.with_semantic_facts(self.now_hint, |facts| {
+            if self.has_left(host) {
+                Ok(None)
+            } else {
+                facts.share_selector(host, name)
+            }
+        })?
     }
 
     /// Answer one exact lookup or page inspecting at most 64 slots.
@@ -128,21 +117,15 @@ impl ChannelState {
         query: crate::node::api::GovernanceQuery,
     ) -> Result<crate::node::api::GovernancePage> {
         use crate::node::api::{GovernancePage as Page, GovernanceQuery as Query};
-        let (expected, authority) = match &query {
+        let expected = match &query {
             Query::Notices { revision, .. }
             | Query::NoticesAfter { revision, .. }
-            | Query::Admins { revision, .. } => (*revision, true),
-            Query::Shares { revision, .. } | Query::Consent { revision, .. } => (*revision, false),
-            Query::Service { .. } => (None, false),
-            Query::Admin { .. } => (None, true),
+            | Query::Admins { revision, .. }
+            | Query::Shares { revision, .. }
+            | Query::Consent { revision, .. } => *revision,
+            Query::Service { .. } | Query::Admin { .. } => None,
         };
-        let revision = if matches!(&query, Query::Consent { .. }) {
-            self.current_governance(store)?.revision()
-        } else if authority {
-            self.checked_governance(store, self.now_hint)?.revision()
-        } else {
-            self.current_governance(store)?.revision()
-        };
+        let revision = self.governance_revision(crate::time::Ms(self.now_hint))?;
         if expected.is_some_and(|expected| expected != revision) {
             return Err(crate::error::Error::Profile(
                 "room governance changed; reload the page",
@@ -254,6 +237,42 @@ impl ChannelState {
         )
     }
 
+    /// The ordinary semantic query boundary. Neither readiness nor the answer opens storage.
+    fn with_semantic_facts<T>(
+        &self,
+        now: u64,
+        answer: impl FnOnce(&super::view::SemanticFacts) -> T,
+    ) -> Result<T> {
+        self.governance_revision(crate::time::Ms(now))?;
+        let state = self
+            .governance_semantic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(answer(state.current(
+            self.governance_display.revision,
+            self.governance_display.valid_until,
+        )?))
+    }
+
+    pub(in crate::node::channel) fn semantic_admin_clock(&self) -> Result<Option<u64>> {
+        self.with_semantic_facts(self.now_hint, super::view::SemanticFacts::admin_clock)
+    }
+
+    pub(in crate::node::channel) fn semantic_share_exact(
+        &self,
+        host: &Digest32,
+        name: &str,
+    ) -> Result<Option<Share>> {
+        self.with_semantic_facts(self.now_hint, |facts| facts.share_exact(host, name))?
+    }
+
+    pub(in crate::node::channel) fn advance_semantic_facts(&self, view: &View<'_>) -> Result<bool> {
+        self.governance_semantic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .advance(view)
+    }
+
     pub(in crate::node::channel) fn checked_governance(
         &self,
         store: &Store,
@@ -299,7 +318,7 @@ impl ChannelState {
             if state.ready {
                 let view = self.checked_governance(store, now.get())?;
                 let display = view.display(&self.genesis)?;
-                consent_ready = self.advance_consent_facts(&view)?;
+                consent_ready = self.advance_semantic_facts(&view)?;
                 changed = self.governance_display.revision != display.revision
                     || (!was_ready && consent_ready);
                 self.governance_display = display;
@@ -381,7 +400,7 @@ impl ChannelState {
 
     pub(in crate::node::channel) fn grants_policy(
         &self,
-        store: &Store,
+        _store: &Store,
         who: &Digest32,
         now: u64,
     ) -> Result<bool> {
@@ -393,24 +412,23 @@ impl ChannelState {
         if *who == self.genesis.creator_pubkey().fingerprint() {
             return Ok(true);
         }
-        Ok(self
-            .checked_governance(store, now)?
-            .grants(who, &Capability::Policy)?
-            .is_granted())
+        self.with_semantic_facts(now, |facts| {
+            facts.grants_policy(who, &self.genesis.creator_pubkey().fingerprint())
+        })
     }
 
     /// Select current consent targets, including identities outside the admitted roster.
     /// Inspect at most `limit` clamped to 1..=64 slots strictly after `after`.
     pub fn consent_page(
         &self,
-        store: &Store,
+        _store: &Store,
         author: &Digest32,
         after: Option<Digest32>,
         limit: usize,
     ) -> Result<GovernanceTargets> {
-        let page = self
-            .current_governance(store)?
-            .consenters(author, after, limit)?;
+        let page = self.with_semantic_facts(self.now_hint, |facts| {
+            facts.consenters(author, after, limit)
+        })?;
         Ok(GovernanceTargets {
             targets: page.rows,
             next: page.next,
@@ -421,14 +439,12 @@ impl ChannelState {
     /// Inspect at most `limit` clamped to 1..=64 slots strictly after `after`.
     pub fn admin_page(
         &self,
-        store: &Store,
+        _store: &Store,
         after: Option<Digest32>,
         limit: usize,
         now: crate::time::Ms,
     ) -> Result<GovernanceTargets> {
-        let page = self
-            .checked_governance(store, now.get())?
-            .admins(after, limit)?;
+        let page = self.with_semantic_facts(now.get(), |facts| facts.admins(after, limit))?;
         // The genesis creator is a separate scalar and is not repeated in this page.
         Ok(GovernanceTargets {
             targets: page.rows,
@@ -440,11 +456,11 @@ impl ChannelState {
     /// Inspect at most `limit` clamped to 1..=64 slots; an empty page may still continue.
     pub fn share_page(
         &self,
-        store: &Store,
+        _store: &Store,
         after: Option<(Digest32, Digest32)>,
         limit: usize,
     ) -> Result<GovernanceShares> {
-        let page = self.current_governance(store)?.shares(after, limit)?;
+        let page = self.with_semantic_facts(self.now_hint, |facts| facts.shares(after, limit))?;
         Ok(GovernanceShares {
             shares: page
                 .rows
@@ -482,6 +498,16 @@ impl ChannelState {
         })
     }
 
+    /// A semantic-changing durable receipt retires publication before its current-input
+    /// mirror or presence can become visible. Last-good saved reads retain their own facts.
+    pub(in crate::node::channel) fn retire_governance(&mut self) -> Result<()> {
+        self.governance_ready = false;
+        self.governance_semantic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retire()
+    }
+
     pub(in crate::node::channel) fn observe_governance_into(
         &mut self,
         store: &Store,
@@ -512,6 +538,9 @@ impl ChannelState {
         // The Batch failure path poisons this ChannelState, so it is safe to advance the
         // in-memory mirror here with the same accepted input: no usable state can outlive a
         // failed commit. This covers every publication path without polling a sealed header.
+        if accepted.work_changed {
+            self.retire_governance()?;
+        }
         if accepted.current_advanced {
             self.note_committed_consent(entry)?;
         }

@@ -40,7 +40,7 @@ mod render_facts;
 mod restart;
 mod retention_facts;
 pub(crate) mod sparse;
-pub(crate) use restart::RestartState;
+use restart::RestartState;
 pub(crate) mod session_tree;
 pub use dag_facts::OrderView;
 pub(crate) use render_facts::{Filter, RenderFact, RenderView};
@@ -1742,16 +1742,6 @@ impl<'s> Write<'_, 's> {
         roots.hash = self.change(roots.hash, hashed(&entry.entry_hash()), Some(at))?;
         Ok(roots)
     }
-    pub(crate) fn index_existing(&mut self, entry: &Entry, log: u64) -> Result<()> {
-        if self.directory.phase != Phase::Rebuilding {
-            return Err(invalid("not rebuilding entry index"));
-        }
-        self.directory.active = self.index(self.directory.active, entry, log)?;
-        if entry.payload.is_none() {
-            self.directory.active = self.missing_in_roots(self.directory.active, entry, true)?;
-        }
-        Ok(())
-    }
     pub(crate) fn finish_rebuild(&mut self) -> Result<()> {
         if self.directory.phase != Phase::Rebuilding {
             return Err(invalid("not rebuilding entry index"));
@@ -1970,21 +1960,14 @@ const PROMOTION_BYTES: usize = 1024 * 1024;
 
 impl Write<'_, '_> {
     pub(crate) fn initialize_restart(&mut self, epoch: u64) -> Result<()> {
-        if self.directory.active.sequence != 0 {
-            return Err(invalid("nonempty restart initialization"));
-        }
-        self.bootstrap_restart(RestartState::empty(*self.channel, epoch))?;
-        self.directory.packages_ready = true;
-        Ok(())
-    }
-    pub(crate) fn bootstrap_restart(&mut self, state: RestartState) -> Result<()> {
-        if self.directory.phase != Phase::Idle
-            || state.room != *self.channel
+        if self.directory.active.sequence != 0
+            || self.directory.phase != Phase::Idle
             || self.directory.restart.is_some()
         {
-            return Err(invalid("restart bootstrap binding"));
+            return Err(invalid("nonempty restart initialization"));
         }
-        self.directory.restart = Some(state);
+        self.directory.restart = Some(RestartState::empty(*self.channel, epoch));
+        self.directory.packages_ready = true;
         Ok(())
     }
     pub(crate) fn note_presence(
@@ -2147,11 +2130,6 @@ impl Write<'_, '_> {
         first_log
             .checked_add(count)
             .ok_or(invalid("promotion log allocator exhausted"))?;
-        if self.directory.restart.is_none() && self.directory.active.sequence == 0 && from == 1 {
-            self.directory.packages_ready = true;
-            self.directory.restart =
-                Some(RestartState::empty(*self.channel, witness.skeleton.epoch));
-        }
         let restart = self
             .directory
             .restart
@@ -2598,20 +2576,45 @@ impl EntryIndex {
         store: &Store,
         sek: &Sek,
         channel: &Digest32,
-        origin: u64,
+        epoch: u64,
         mut paused_owner: impl FnMut(LegacyProvisionalOwner) -> Result<bool>,
     ) -> Result<Preparation> {
-        self.legacy_attached.set(None);
-        self.provisional_hidden.set(true);
-        // Never hold a read or write transaction while the verifier opens node-owned demand.
+        // Current create/join seal these roots and the empty restart state in the same
+        // transaction as the manifest and sender. Publication only switches sealed roots;
+        // it cannot leave a supported room needing archive replay. Refuse an old/missing
+        // bootstrap before any orphan cleanup, preserving all its durable data.
+        // Never hold a transaction while the verifier opens node-owned demand.
         let candidate = {
             let snapshot = store.snapshot()?;
-            Source::Snapshot(&snapshot)
+            let directory = Source::Snapshot(&snapshot)
                 .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
                 .map(|bytes| Directory::parse(&bytes))
                 .transpose()?
-                .and_then(|d| d.legacy_provisional.map(|s| s.owner))
+                .ok_or(Error::Profile(super::UNSUPPORTED_ROOM_FORMAT))?;
+            let restart = directory
+                .restart
+                .as_ref()
+                .filter(|_| directory.phase != Phase::Rebuilding)
+                .ok_or(Error::Profile(super::UNSUPPORTED_ROOM_FORMAT))?;
+            if restart.room != *channel || restart.epoch != epoch {
+                return Err(invalid("restart room or epoch differs"));
+            }
+            if restart.sparse != directory.active.sparse.enabled {
+                return Err(invalid(
+                    "restart history format differs from published roots",
+                ));
+            }
+            if !directory.graph_ready
+                || !directory.render_ready
+                || directory.retention_stage != 2
+                || !directory.packages_ready
+            {
+                return Err(invalid("published restart indexes incomplete"));
+            }
+            directory.legacy_provisional.map(|state| state.owner)
         };
+        self.legacy_attached.set(None);
+        self.provisional_hidden.set(true);
         let verified_owner = match candidate {
             Some(owner) => match paused_owner(owner) {
                 Ok(true) => Some(owner),
@@ -2625,43 +2628,23 @@ impl EntryIndex {
             },
             None => None,
         };
-        let mut preserved = false;
-        {
-            let read = self.read(store, sek, channel);
-            if let Ok(read) = &read {
-                if let Some(state) = read.directory.legacy_provisional {
-                    let owned_phase = read.directory.phase == Phase::Idle
-                        || (matches!(read.directory.phase, Phase::Building | Phase::Switched)
-                            && read.directory.promotion.as_ref().is_some_and(|p| {
-                                p.sparse_head.is_none() && p.author == state.owner.author
-                            }));
-                    preserved = Some(state.owner) == verified_owner && owned_phase;
-                }
-            }
-            // An absent/Rebuilding directory follows the existing bounded-index initialization
-            // below; malformed present directories are not silently treated as empty.
-            if let Err(error) = read {
-                if candidate.is_some() {
-                    return Err(error);
-                }
-            }
-        }
+        let preserved = {
+            let read = self.read(store, sek, channel)?;
+            read.directory.legacy_provisional.is_some_and(|state| {
+                let owned_phase = read.directory.phase == Phase::Idle
+                    || (matches!(read.directory.phase, Phase::Building | Phase::Switched)
+                        && read.directory.promotion.as_ref().is_some_and(|p| {
+                            p.sparse_head.is_none() && p.author == state.owner.author
+                        }));
+                Some(state.owner) == verified_owner && owned_phase
+            })
+        };
         if preserved {
             self.provisional_hidden.set(false); // owned roots remain detached by owner check
         } else {
             // This is the only orphan cleanup quantum performed by open, including when a
             // publication needs many later rollback/retirement transactions.
-            let snapshot = store.snapshot()?;
-            let existing = Source::Snapshot(&snapshot)
-                .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
-                .map(|v| Directory::parse(&v))
-                .transpose()?;
-            drop(snapshot);
-            if existing
-                .as_ref()
-                .is_some_and(|d| d.phase != Phase::Rebuilding)
-                && self.cleanup_orphan_provisional(store, sek, channel)?
-                    == Preparation::CleanupPending
+            if self.cleanup_orphan_provisional(store, sek, channel)? == Preparation::CleanupPending
             {
                 return Ok(Preparation::CleanupPending);
             }
@@ -2688,101 +2671,6 @@ impl EntryIndex {
                 break;
             }
             after = next;
-        }
-        let snapshot = store.snapshot()?;
-        let directory = Source::Snapshot(&snapshot)
-            .open(sek, channel, SegmentKind::EntryIndex, DIRECTORY)?
-            .map(|v| Directory::parse(&v))
-            .transpose()?;
-        let rebuilding = directory
-            .as_ref()
-            .is_none_or(|d| d.phase == Phase::Rebuilding);
-        if rebuilding && directory.as_ref().is_some_and(|d| d.active.sparse.enabled) {
-            return Err(invalid(
-                "authenticated history cannot use the legacy archive rebuild",
-            ));
-        }
-        drop(snapshot);
-        if rebuilding {
-            let mut fresh = Directory {
-                origin: Some(origin),
-                history_instance: directory.as_ref().map_or([0; 16], |d| d.history_instance),
-                legacy_required: directory
-                    .as_ref()
-                    .map(|d| d.legacy_required.clone())
-                    .unwrap_or_default(),
-                ..Directory::default()
-            };
-            fresh.ensure_instance()?;
-            // A crashed rebuild is restarted after discarding only its derived pages. Keep a
-            // durable Rebuilding directory throughout, never an apparently complete empty index.
-            loop {
-                let mut batch = store.batch()?;
-                batch.derived();
-                let mut removed = 0;
-                for _ in 0..PROMOTION_ENTRIES {
-                    let Some((id, _)) =
-                        batch.segment_after(channel, SegmentKind::EntryIndex, Some(0))?
-                    else {
-                        break;
-                    };
-                    batch.delete_segment(channel, SegmentKind::EntryIndex, id)?;
-                    removed += 1;
-                }
-                let sealed = seal_segment(sek, SegmentKind::EntryIndex, DIRECTORY, &fresh.bytes())?;
-                batch.put_segment(channel, SegmentKind::EntryIndex, DIRECTORY, &sealed)?;
-                batch.commit()?;
-                if removed < PROMOTION_ENTRIES {
-                    break;
-                }
-            }
-            // Read the immutable log through each write transaction. A read snapshot spanning
-            // the whole rebuild pins every retired redb page until the last entry, preventing
-            // reuse across these commits. Only the stable LogDb id crosses a batch boundary;
-            // index writes cannot move or replace any of the log rows being visited.
-            let mut after = None;
-            loop {
-                let mut batch = store.batch()?;
-                batch.derived();
-                let mut writer = self.write(&mut batch, sek, channel)?;
-                let mut bytes = 0usize;
-                let mut complete = false;
-                for _ in 0..PROMOTION_ENTRIES {
-                    let Some((id, sealed)) =
-                        writer
-                            .batch
-                            .segment_after(channel, SegmentKind::LogDb, after)?
-                    else {
-                        complete = true;
-                        break;
-                    };
-                    let wire = open_segment(sek, SegmentKind::LogDb, id, &sealed)?;
-                    if bytes != 0 && bytes.saturating_add(wire.len()) > PROMOTION_BYTES {
-                        break;
-                    }
-                    let entry = Entry::from_wire(&wire)?;
-                    if entry.skeleton.channel_id != *channel {
-                        return Err(invalid("saved entry belongs to another room"));
-                    }
-                    writer.index_existing(&entry, id)?;
-                    bytes = bytes.saturating_add(wire.len());
-                    after = Some(id);
-                }
-                // All changed roots and their directory become durable together. Keep one
-                // writer for the batch instead of decrypting and resealing it for every row.
-                writer.seal()?;
-                batch.commit()?;
-                if complete {
-                    break;
-                }
-            }
-            let mut batch = store.batch()?;
-            batch.derived();
-            let mut writer = self.write(&mut batch, sek, channel)?;
-            writer.finish_rebuild()?;
-            writer.seal()?;
-            batch.commit()?;
-            self.committed();
         }
         self.provisional_hidden.set(false);
         let read = self.read(store, sek, channel)?;

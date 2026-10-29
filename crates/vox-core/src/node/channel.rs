@@ -1184,32 +1184,6 @@ impl ReceivedRetries {
     }
 }
 
-/// Restart rebuild of the admitted-member consent projection. One maintenance turn examines at
-/// most [`governance::PAGE_ROWS`] author/target pairs; neither departed nor arbitrary
-/// off-roster targets occupy this state.
-struct ConsentFactsBuild {
-    members: Vec<Digest32>,
-    author: usize,
-    target: usize,
-    facts: governance::ConsentFacts,
-}
-
-impl ConsentFactsBuild {
-    fn new(authors: &BTreeMap<Digest32, CompositePublicKey>) -> Self {
-        Self {
-            members: authors.keys().copied().collect(),
-            author: 0,
-            target: 0,
-            facts: governance::ConsentFacts::empty(),
-        }
-    }
-}
-
-enum ConsentFactsState {
-    Building(ConsentFactsBuild),
-    Ready(std::sync::Arc<governance::ConsentFacts>),
-}
-
 /// An open (SEK-unlocked) channel on this device.
 pub struct ChannelState {
     channel_id: Digest32,
@@ -1232,9 +1206,9 @@ pub struct ChannelState {
     /// irreversible authority decisions still require the sealed checked view.
     governance_display: governance::Display,
     governance_ready: bool,
-    /// This room's admitted-member consent facts in memory (ADR-038 FX-22). Unchanged questions
-    /// never open storage; restart reconstruction advances in bounded governance turns.
-    consent_facts: std::sync::Mutex<ConsentFactsState>,
+    /// Completed semantic governance facts in memory (ADR-038 FX-22). Native bounded index
+    /// turns rebuild this projection without retaining store snapshots or source rows.
+    governance_semantic: std::sync::Mutex<governance::SemanticState>,
     /// A member holds entries of this node's own feed here that this node does not (ADR-037
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
@@ -2226,9 +2200,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            consent_facts: std::sync::Mutex::new(ConsentFactsState::Ready(std::sync::Arc::new(
-                governance::ConsentFacts::empty(),
-            ))),
+            governance_semantic: std::sync::Mutex::new(governance::SemanticState::default()),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
             historical_retirement: own_historical_keys::Retirement::default(),
@@ -2355,9 +2327,9 @@ impl ChannelState {
         self.append_unpublished_control(store, signer, statement.to_wire(), now)
     }
 
-    /// Open a channel from its sealed accepted-prefix state and on-disk indexes. A store
-    /// without that state performs one verified bootstrap; normal restarts do not replay
-    /// message bodies or rewrite history. Restore the sender chain before any append.
+    /// Open a channel from its sealed accepted-prefix state and on-disk indexes, never by
+    /// replaying stored history. Creation and join publish even an empty restart state
+    /// atomically with the manifest. Restore the sender chain before any append.
     pub fn open(
         profile: &Profile,
         channel_id: &Digest32,
@@ -2430,297 +2402,83 @@ impl ChannelState {
             admission.admit(*channel_id, epoch, *author);
         }
 
-        // Rebuild the DAG: every stored entry re-passes the acceptance predicate,
-        // classified by its payload so governance entries are not re-admitted as
-        // content.
-        //
-        // **What a hostile peer got onto disk before V210-74 does not keep the room shut.** An entry
-        // its author signed that cannot be classified, or whose governance body does not bind to
-        // it, is set aside and reported, and still taken as a link in its author's feed so the
-        // author's later entries link. An entry held without its predecessor is retried once the
-        // rest is in, and set aside only if it still does not link: sync then fetches the missing
-        // ones again. Anything else that fails acceptance is a tampered store, and the room does
-        // not open. (A body-less entry is not set aside here, as it is in v0.2.10: in v0.3.0 it is
-        // a pruned skeleton, kept on purpose — ADR-023 decision 2.)
-        let mut dag = Dag::for_room(genesis.body.created_ms);
+        // Accepted heads come only from the sealed publication state, not from the largest
+        // stored locator or from replaying entries that may still be unpublished.
         let entries = entry_store::EntryIndex::default();
         // A retained v1 recovery cannot be converted into an authenticated sparse history.
         // Refuse before cleanup so its saved witness and the accepted room remain untouched.
         if entries.legacy_history_present(store, &sek, channel_id)? {
             return Err(Error::Profile(UNSUPPORTED_ROOM_FORMAT));
         }
-        // Recover unpublished work before reading authoritative LogDb; rebuild only derived
-        // locators when absent. No unsigned suffix is replayed after a crash.
+        // Recover unpublished work against the existing sealed roots. Unsupported stores
+        // without a compact restart state are refused before cleanup, without rewriting data.
         let legacy_preparation =
-            entries.prepare_owned(store, &sek, channel_id, genesis.body.created_ms, |owner| {
+            entries.prepare_owned(store, &sek, channel_id, epoch, |owner| {
                 Ok(Some(owner) == paused_legacy_owner)
             })?;
-        let mut entry_read = entries.read(store, &sek, channel_id)?;
-
-        let mut next_log_id = 1u64;
-        let mut presence = BTreeMap::new();
-        let mut retained_step_body = None;
-        // Key-packages for this identity found on reload are offered again: installing one
-        // twice is harmless (`accept_skdm` keeps the live chain), and one that arrived just
-        // before a crash would otherwise never be installed.
-        let mut key_packages = key_package_queue::Queue::new(1);
-        let mut set_aside = SetAside::default();
-        let restart = entry_read.restart_state().cloned();
-        if let Some(state) = &restart {
-            if state.room != *channel_id || state.epoch != epoch {
-                return Err(Error::MalformedAtRest("restart room or epoch differs"));
-            }
-            if state.sparse != entry_read.sparse_enabled() {
-                return Err(Error::MalformedAtRest(
-                    "restart history format differs from published roots",
-                ));
-            }
-            // Each compact head was sealed atomically with its accepted prefix. Verify its
-            // bounded source binding, never infer acceptance from an arbitrary locator maximum.
-            for (author, head) in &state.feeds {
-                let key = authors
-                    .get(author)
-                    .ok_or(Error::MalformedAtRest("restart author missing"))?;
-                let entry = entry_read
-                    .get(author, head.seq)?
-                    .ok_or(Error::MalformedAtRest("restart head missing"))?;
-                if entry.skeleton.channel_id != *channel_id
-                    || entry.skeleton.epoch != epoch
-                    || entry.entry_hash() != head.hash
-                    || entry.skeleton.end_of_feed != head.ended
-                {
-                    return Err(Error::MalformedAtRest("restart head source differs"));
-                }
-                entry.verify(key)?;
-                let first = entry_read
-                    .get(author, 1)?
-                    .ok_or(Error::MalformedAtRest("restart first entry missing"))?;
-                if first.skeleton.claimed_ms != head.first_claimed_ms {
-                    return Err(Error::MalformedAtRest("restart first clock differs"));
-                }
-                if let Some((seq, hash)) = head.checkpoint {
-                    if entry_read.get(author, seq)?.map(|entry| entry.entry_hash()) != Some(hash) {
-                        return Err(Error::MalformedAtRest("restart checkpoint source differs"));
-                    }
-                }
-            }
-            dag = Dag::restore_published(&state.feeds)?;
-            presence = state.presence.clone();
-            retained_step_body = state.retained_step_body;
-            set_aside = state.set_aside.clone();
-            let snapshot = store.snapshot()?;
-            next_log_id = snapshot
-                .last_segment_id(channel_id, SegmentKind::LogDb)?
-                .unwrap_or(0)
-                .max(
-                    snapshot
-                        .last_segment_id(channel_id, SegmentKind::PlaintextCache)?
-                        .unwrap_or(0),
-                )
-                .checked_add(1)
-                .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
-        } else {
-            let mut unlinked = 0usize;
-            store.visit_segments(channel_id, SegmentKind::LogDb, |id, seg| {
-                next_log_id = id.saturating_add(1);
-                let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
-                let entry = Entry::from_wire(&wire)?;
-                let key = authors
-                    .get(&entry.skeleton.author_id)
-                    .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?
-                    .clone();
-                let at = format!(
-                    "{}#{}",
-                    crate::node::link::b32_encode(&entry.skeleton.author_id)
-                        .chars()
-                        .take(12)
-                        .collect::<String>(),
-                    entry.skeleton.seq
-                );
-                // **A pruned entry is a kept entry** (ADR-023 decision 2). Retention drops a content
-                // body and keeps the signed skeleton, which still verifies and still links the feed —
-                // refusing it here made a room with one expired message impossible to open.
-                // Governance is never pruned, so a body-less entry is content.
-                let kind = match entry.payload.as_deref() {
-                    None => EntryKind::Content,
-                    Some(payload) => match classify_payload(payload) {
-                        Ok(EntryKind::Governance) => {
-                            match GovEntry::from_verified_log_entry(
-                                &entry,
-                                &key,
-                                channel_id,
-                                Default::default(),
-                            ) {
-                                Ok(gov) => {
-                                    if gov.body.verify(&key).is_ok() {
-                                        governance::remember_presence(&mut presence, &gov);
-                                    }
-                                    EntryKind::Governance
-                                }
-                                Err(e) => {
-                                    set_aside.push(format!("{at}: {e}"));
-                                    EntryKind::Content
-                                }
-                            }
-                        }
-                        Ok(kind) => kind,
-                        Err(e) => {
-                            set_aside.push(format!("{at}: {e}"));
-                            EntryKind::Content
-                        }
-                    },
-                };
-                if entry
-                    .payload
-                    .as_deref()
-                    .is_some_and(crate::governance::step_policy::is_step_policy)
-                {
-                    match GovEntry::from_verified_log_entry(
-                        &entry,
-                        &key,
-                        channel_id,
-                        Default::default(),
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => set_aside.push(format!("{at}: {e}")),
-                    }
-                }
-                let saved_age = match store.get_segment(channel_id, SegmentKind::Index, id)? {
-                    Some(seg) => {
-                        parse_first_seen(&open_segment(&sek, SegmentKind::Index, id, &seg)?)?
-                    }
-                    None => (now_ms, false),
-                };
-                let steps = saved_age.1
-                    || entry
-                        .payload
-                        .as_deref()
-                        .is_some_and(|p| is_step_body(channel_id, p));
-                if steps && entry.payload.is_some() {
-                    retained_step_body.get_or_insert_with(|| entry.entry_hash());
-                }
-                let package = key_package_for(&entry, &me);
-                let package_author = entry.skeleton.author_id;
-                let package_seq = entry.skeleton.seq;
-                match dag.accept(&mut entry_read, entry, kind, &key, &admission) {
-                    Ok(_) => {
-                        if package && package_seq <= dag.verified_head(&package_author) {
-                            key_packages.note(package_author, id)?;
-                        }
-                    }
-                    Err(crate::log::dag::Rejected::Feed(_)) => unlinked += 1,
-                    Err(crate::log::dag::Rejected::Local(error)) => return Err(error),
-                    Err(_) => return Err(Error::MalformedAtRest("stored entry failed acceptance")),
-                }
-                Ok(())
-            })?;
-            // Retry using the encrypted rows themselves, not a history-sized Vec<Entry>.
-            // A pass that links nothing more leaves the same truthful set-aside diagnostics.
-            while unlinked != 0 {
-                let before = unlinked;
-                unlinked = 0;
-                store.visit_segments(channel_id, SegmentKind::LogDb, |id, seg| {
-                    let wire = open_segment(&sek, SegmentKind::LogDb, id, &seg)?;
-                    let entry = Entry::from_wire(&wire)?;
-                    if dag
-                        .feed(&entry.skeleton.author_id)
-                        .is_some_and(|f| entry.skeleton.seq <= f.max_seq())
-                    {
-                        return Ok(());
-                    }
-                    let key = authors
-                        .get(&entry.skeleton.author_id)
-                        .ok_or(Error::MalformedAtRest("stored entry from unknown author"))?;
-                    let kind = match entry
-                        .payload
-                        .as_deref()
-                        .and_then(|p| classify_payload(p).ok())
-                    {
-                        Some(EntryKind::Governance)
-                            if GovEntry::from_verified_log_entry(
-                                &entry,
-                                key,
-                                channel_id,
-                                Default::default(),
-                            )
-                            .is_err() =>
-                        {
-                            EntryKind::Content
-                        }
-                        Some(kind) => kind,
-                        None => EntryKind::Content,
-                    };
-                    let package = key_package_for(&entry, &me);
-                    let package_author = entry.skeleton.author_id;
-                    let package_seq = entry.skeleton.seq;
-                    match dag.accept(&mut entry_read, entry, kind, key, &admission) {
-                        Ok(_) => {
-                            if package && package_seq <= dag.verified_head(&package_author) {
-                                key_packages.note(package_author, id)?;
-                            }
-                        }
-                        Err(crate::log::dag::Rejected::Feed(_)) => unlinked += 1,
-                        Err(crate::log::dag::Rejected::Local(error)) => return Err(error),
-                        Err(_) => {
-                            return Err(Error::MalformedAtRest("stored entry failed acceptance"))
-                        }
-                    }
-                    Ok(())
-                })?;
-                if unlinked == before {
-                    break;
-                }
-            }
-            if unlinked != 0 {
-                store.visit_segments(channel_id, SegmentKind::LogDb, |id, seg| {
-                    let entry =
-                        Entry::from_wire(&open_segment(&sek, SegmentKind::LogDb, id, &seg)?)?;
-                    if dag
-                        .feed(&entry.skeleton.author_id)
-                        .is_none_or(|f| entry.skeleton.seq > f.max_seq())
-                    {
-                        let at = crate::node::link::b32_encode(&entry.skeleton.author_id)
-                            .chars()
-                            .take(12)
-                            .collect::<String>();
-                        set_aside.push(format!(
-                            "{at}#{}: an earlier entry of its author is missing",
-                            entry.skeleton.seq
-                        ));
-                    }
-                    Ok(())
-                })?;
-            }
-            // Replay's EntryWrite never deletes disk rows. Any unsigned tail is corrupt durable
-            // history and returns the same refusal, rather than making it an authentic prefix.
-            dag.discard_unverified(&mut entry_read)?;
-        }
-        drop(entry_read);
-        entries.prepare_facts(store, &sek, channel_id, &dag, genesis.body.created_ms)?;
-        entries.prepare_retention(store, &sek, channel_id, now_ms, |entry| {
-            let Some(payload) = entry.payload.as_deref() else {
-                return Ok(false);
-            };
-            if retained_control(payload) {
-                return Ok(false);
-            }
-            let kind = classify_payload(payload).unwrap_or(EntryKind::Content);
-            if kind == EntryKind::Checkpoint {
-                return Ok(false);
-            }
-            if kind == EntryKind::Governance {
-                let key = authors
-                    .get(&entry.skeleton.author_id)
-                    .ok_or(Error::MalformedAtRest("retention author missing"))?;
-                if GovEntry::from_verified_log_entry(entry, key, channel_id, Default::default())
-                    .is_ok()
-                {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        })?;
         let entry_read = entries.read(store, &sek, channel_id)?;
+        let restart = entry_read
+            .restart_state()
+            .ok_or(Error::MalformedAtRest("published restart state missing"))?
+            .clone();
+        if restart.room != *channel_id || restart.epoch != epoch {
+            return Err(Error::MalformedAtRest("restart room or epoch differs"));
+        }
+        if restart.sparse != entry_read.sparse_enabled() {
+            return Err(Error::MalformedAtRest(
+                "restart history format differs from published roots",
+            ));
+        }
+        // Each compact head was sealed atomically with its accepted prefix. Verify its
+        // bounded source binding, never infer acceptance from an arbitrary locator maximum.
+        for (author, head) in &restart.feeds {
+            let key = authors
+                .get(author)
+                .ok_or(Error::MalformedAtRest("restart author missing"))?;
+            let entry = entry_read
+                .get(author, head.seq)?
+                .ok_or(Error::MalformedAtRest("restart head missing"))?;
+            if entry.skeleton.channel_id != *channel_id
+                || entry.skeleton.epoch != epoch
+                || entry.entry_hash() != head.hash
+                || entry.skeleton.end_of_feed != head.ended
+            {
+                return Err(Error::MalformedAtRest("restart head source differs"));
+            }
+            entry.verify(key)?;
+            let first = entry_read
+                .get(author, 1)?
+                .ok_or(Error::MalformedAtRest("restart first entry missing"))?;
+            if first.skeleton.claimed_ms != head.first_claimed_ms {
+                return Err(Error::MalformedAtRest("restart first clock differs"));
+            }
+            if let Some((seq, hash)) = head.checkpoint {
+                if entry_read.get(author, seq)?.map(|entry| entry.entry_hash()) != Some(hash) {
+                    return Err(Error::MalformedAtRest("restart checkpoint source differs"));
+                }
+            }
+        }
+        let mut dag = Dag::restore_published(&restart.feeds)?;
+        let presence = restart.presence.clone();
+        let retained_step_body = restart.retained_step_body;
+        let set_aside = restart.set_aside.clone();
+        // Cache and log ids share one allocator. Resume past both through metadata, without
+        // decrypting unrelated rows or inferring accepted feed positions from their IDs.
+        let snapshot = store.snapshot()?;
+        let next_log_id = snapshot
+            .last_segment_id(channel_id, SegmentKind::LogDb)?
+            .unwrap_or(0)
+            .max(
+                snapshot
+                    .last_segment_id(channel_id, SegmentKind::PlaintextCache)?
+                    .unwrap_or(0),
+            )
+            .checked_add(1)
+            .ok_or(Error::MalformedAtRest("log allocator exhausted"))?;
+        drop(snapshot);
+        // Key-packages found on reload are offered again: installing one twice is harmless,
+        // and one that arrived just before a crash would otherwise never be installed.
+        let mut key_packages = key_package_queue::Queue::new(1);
         dag.set_order_revision(
             entry_read.order_revision(),
             entry_read.order_previous(None)?.map(|(clock, _)| clock),
@@ -2878,16 +2636,7 @@ impl ChannelState {
             }
         }
 
-        // Cache and log ids share one allocator. Resume past both without retaining rows;
-        // prepare_rendered validates and indexes the sealed cache one row at a time below.
-        if restart.is_none() {
-            store.visit_segments(channel_id, SegmentKind::PlaintextCache, |id, segment| {
-                next_log_id = next_log_id.max(id.saturating_add(1));
-                let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &segment)?;
-                let _ = parse_cache(&row)?;
-                Ok(())
-            })?;
-        }
+        // The package-only catalog resumes retries without reading unrelated log bodies.
         key_packages.published(next_log_id);
         let display_order_revision = dag.reorder_generation();
 
@@ -3041,28 +2790,6 @@ impl ChannelState {
             };
 
         drop(entry_read);
-        if restart.is_none() {
-            let state = entry_store::RestartState {
-                room: *channel_id,
-                epoch,
-                feeds: dag.published_feeds()?,
-                presence: presence.clone(),
-                projection: None,
-                retained_step_body,
-                set_aside: set_aside.clone(),
-                sparse: false,
-            };
-            let mut batch = store.batch()?;
-            // Bootstrap reconstructs a restart index from authenticated room state. A later
-            // person-loss commit carries it; this derived-only rebuild does not force a flush.
-            batch.derived();
-            let mut writer = entries.write(&mut batch, &sek, channel_id)?;
-            writer.bootstrap_restart(state)?;
-            writer.seal()?;
-            batch.commit()?;
-            entries.committed();
-        }
-        entries.prepare_packages(store, &sek, channel_id, &dag)?;
         key_packages.restore(
             store,
             &sek,
@@ -3072,9 +2799,6 @@ impl ChannelState {
         governance::prepare(store, &sek, channel_id)?;
         // No destructive retention uses a partially rebuilt authority projection.
         let governance_display = governance::Display::genesis(&genesis);
-        let consent_facts = std::sync::Mutex::new(ConsentFactsState::Building(
-            ConsentFactsBuild::new(&authors),
-        ));
         let mut room = Self {
             channel_id: *channel_id,
             genesis,
@@ -3089,7 +2813,7 @@ impl ChannelState {
             forks_kept,
             governance_display,
             governance_ready: false,
-            consent_facts,
+            governance_semantic: std::sync::Mutex::new(governance::SemanticState::default()),
             own_behind,
             own_recovery,
             historical_retirement: own_historical_keys::Retirement::default(),
@@ -3119,10 +2843,7 @@ impl ChannelState {
             received_retries: Arc::new(ReceivedRetries::default()),
             owed_asked_to: None,
             now_hint: now_ms,
-            projection_state: match restart
-                .as_ref()
-                .and_then(|state| state.projection.as_deref())
-            {
+            projection_state: match restart.projection.as_deref() {
                 Some(bytes) => history::State::from_bytes(bytes)?,
                 None => history::State::default(),
             },
@@ -3169,12 +2890,7 @@ impl ChannelState {
             readmitted: BTreeMap::new(),
         };
         room.entries
-            .prepare_rendered(store, &room.sek, &room.channel_id, |batch, hash, id| {
-                Ok(room
-                    .retention_get_in(Transaction::Batch(batch), hash)?
-                    .and_then(|r| r.cache_id)
-                    == Some(id))
-            })?;
+            .reopen_rendered(store, &room.sek, &room.channel_id)?;
         room.display_tail = room
             .entries
             .render_view(store, &room.sek, &room.channel_id)?
@@ -3378,9 +3094,7 @@ impl ChannelState {
             forks_kept: 0,
             governance_display,
             governance_ready: false,
-            consent_facts: std::sync::Mutex::new(ConsentFactsState::Ready(std::sync::Arc::new(
-                governance::ConsentFacts::empty(),
-            ))),
+            governance_semantic: std::sync::Mutex::new(governance::SemanticState::default()),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
             historical_retirement: own_historical_keys::Retirement::default(),
@@ -3779,11 +3493,6 @@ impl ChannelState {
             self.save_error = Some(e.to_string());
             return Err(e);
         }
-        *self
-            .consent_facts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            ConsentFactsState::Building(ConsentFactsBuild::new(&self.authors));
         if self.is_member(&fingerprint) {
             self.key_member_became_current(fingerprint);
         }
@@ -3916,18 +3625,16 @@ impl ChannelState {
     /// offered at once but can be said only once the room settles (V210-164); this says it then.
     pub fn say_unsaid_shares(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
         let me = profile.signer()?.fingerprint();
-        let view = self.current_governance(profile.store())?;
         let mut unsaid = Vec::new();
         for tag in self
             .services
             .keys()
             .filter(|tag| !self.transient.contains(*tag))
         {
-            if view.share(&me, service_name(tag))?.is_none() {
+            if self.semantic_share_exact(&me, service_name(tag))?.is_none() {
                 unsaid.push(tag.clone());
             }
         }
-        drop(view);
         for tag in &unsaid {
             self.say_share(profile, tag, true, now)?;
         }
@@ -4858,9 +4565,8 @@ impl ChannelState {
         })
     }
 
-    /// The admitted-member consent projection. The common path is only this mutex and an Arc
-    /// clone: it opens and decrypts no segment, including the governance header. A restart or a
-    /// newly admitted member returns refreshing until bounded governance turns reconstruct it.
+    /// The consent facts shared with the completed semantic governance projection. Ordinary
+    /// questions clone only its Arc; native index turns reconstruct it after restart.
     fn consent_facts(&self) -> Result<std::sync::Arc<governance::ConsentFacts>> {
         if self.poisoned {
             return Err(self.save_failure());
@@ -4869,19 +4575,15 @@ impl ChannelState {
             return Err(Error::Profile(governance::REFRESHING));
         }
         let held = self
-            .consent_facts
+            .governance_semantic
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &*held {
-            ConsentFactsState::Ready(facts) => Ok(std::sync::Arc::clone(facts)),
-            ConsentFactsState::Building(_) => Err(Error::Profile(governance::REFRESHING)),
-        }
+        held.consent_facts()
+            .ok_or(Error::Profile(governance::REFRESHING))
     }
 
-    /// Apply one newly indexed current-input fact to the in-memory projection. During a restart
-    /// build, fold it into the partial result instead of resetting the cursor: pairs not yet
-    /// inspected will read the committed slot later, while already-inspected pairs retain the
-    /// newer authenticated sequence observed here.
+    /// Mirror a newly committed current-input fact, including causal sequence metadata on a
+    /// same-value grant. Unvisited index slots are reconstructed by the native semantic turn.
     fn note_committed_consent(&self, entry: &Entry) -> Result<()> {
         let Ok(fact) = GovEntry::body_bound_to(entry) else {
             return Ok(());
@@ -4895,82 +4597,12 @@ impl ChannelState {
         if fact.verify(author_key).is_err() {
             return Ok(());
         }
-        let relevant = match &fact {
-            GovBody::ConsentGrant(grant) => {
-                self.authors.contains_key(&entry.skeleton.author_id)
-                    && self.authors.contains_key(&grant.body.target_id)
-            }
-            GovBody::ConsentRevocation(revoke) => {
-                self.authors.contains_key(&entry.skeleton.author_id)
-                    && self.authors.contains_key(&revoke.body.target_id)
-            }
-            GovBody::Presence(_) => self.authors.contains_key(&entry.skeleton.author_id),
-            _ => false,
-        };
-        if !relevant {
-            return Ok(());
-        }
         let mut held = self
-            .consent_facts
+            .governance_semantic
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match &mut *held {
-            ConsentFactsState::Ready(facts) => {
-                std::sync::Arc::make_mut(facts).observe(
-                    entry.skeleton.author_id,
-                    entry.skeleton.seq,
-                    &fact,
-                );
-            }
-            ConsentFactsState::Building(build) => {
-                build
-                    .facts
-                    .observe(entry.skeleton.author_id, entry.skeleton.seq, &fact);
-            }
-        }
+        held.observe_consent(entry.skeleton.author_id, entry.skeleton.seq, &fact)?;
         Ok(())
-    }
-
-    /// Examine at most one production governance page of admitted author/target pairs. Returns
-    /// true only when the restart/admission rebuild is complete.
-    fn advance_consent_facts(&self, view: &governance::View<'_>) -> Result<bool> {
-        let mut held = self
-            .consent_facts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ConsentFactsState::Building(build) = &mut *held else {
-            return Ok(true);
-        };
-        let current_members: Vec<Digest32> = self.authors.keys().copied().collect();
-        if build.members != current_members {
-            *build = ConsentFactsBuild::new(&self.authors);
-        }
-        let mut examined = 0usize;
-        while build.author < build.members.len() && examined < governance::PAGE_ROWS {
-            let author = build.members[build.author];
-            if build.target == 0 {
-                build.facts.set_reset(author, view.consent_reset(&author)?);
-            }
-            let target = build.members[build.target];
-            build
-                .facts
-                .set_consent(author, target, view.consent_state(&author, &target)?);
-            build
-                .facts
-                .set_ever_revoked(author, target, view.ever_revoked(&author, &target)?);
-            examined += 1;
-            build.target += 1;
-            if build.target == build.members.len() {
-                build.author += 1;
-                build.target = 0;
-            }
-        }
-        if build.author != build.members.len() {
-            return Ok(false);
-        }
-        let facts = std::mem::take(&mut build.facts);
-        *held = ConsentFactsState::Ready(std::sync::Arc::new(facts));
-        Ok(true)
     }
 
     /// One consent question answered from [`Self::consent_facts`].
@@ -9270,8 +8902,8 @@ impl ChannelState {
 
     /// When the room's admins last changed, on the room's own clock (V030-14): the newest admin
     /// certificate or revocation on the log. `None` when the room never had one.
-    pub fn admin_change_clock(&self, store: &Store) -> Result<Option<u64>> {
-        Ok(self.checked_governance(store, self.now_hint)?.admin_clock())
+    pub fn admin_change_clock(&self, _store: &Store) -> Result<Option<u64>> {
+        self.semantic_admin_clock()
     }
 
     /// Number of accepted log entries.

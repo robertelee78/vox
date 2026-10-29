@@ -428,8 +428,8 @@ fn held(dir: &Path, room: &str, page: usize) -> Held {
     }
 }
 
-/// Every row a person reads, oldest first, in one exact paged JSON observation. A malformed row
-/// or a refused read is a product red because both are what the shipped command returned.
+/// Every row a person reads, oldest first, in one exact paged JSON observation. Follow the
+/// product's explicit refresh instruction by discarding the partial observation, not its rows.
 fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
     let limit = PAGE.to_string();
     let mut before: Option<String> = None;
@@ -440,6 +440,17 @@ fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
             args.extend(["--before", cursor]);
         }
         let (ok, out, err) = vox(dir, &args, None);
+        if !ok
+            && matches!(
+                err.trim(),
+                "vox: the room changed while reading; refresh and retry"
+                    | "vox: node: the room changed while reading; refresh and retry"
+            )
+        {
+            before = None;
+            pages_newest_first.clear();
+            continue;
+        }
         assert!(
             ok,
             "PRODUCT: paged `vox room read --json` refused before {before:?}: {out}{err}"
@@ -483,11 +494,15 @@ fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
     pages_newest_first.into_iter().rev().flatten().collect()
 }
 
-/// Wait until the exact rows Alice posted are visibly present in Bob's paged log, while none has
-/// text he can read. That is the user-visible evidence that those rows were accepted before their
-/// missing prerequisite; counts alone could be satisfied by Bob's own join records.
+/// The hash view exposes retained ciphertext; the timeline must not expose its SAY body while
+/// a required key or consent fact is absent. Stage exact source hashes, not a row-count proxy.
 fn wait_for_held_rows(dir: &Path, room: &str, expected_hashes: &[String], hold: &str) {
     loop {
+        let hashes = room_hashes(dir, "reader", room);
+        let held: Vec<&String> = hashes
+            .iter()
+            .filter(|hash| expected_hashes.contains(hash))
+            .collect();
         let rows = room_rows(dir, room);
         let staged: Vec<&serde_json::Value> = rows
             .iter()
@@ -497,24 +512,22 @@ fn wait_for_held_rows(dir: &Path, room: &str, expected_hashes: &[String], hold: 
                     .is_some_and(|hash| expected_hashes.iter().any(|expected| expected == hash))
             })
             .collect();
-        if staged.len() < expected_hashes.len() {
-            std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            staged
+                .iter()
+                .all(|row| row["envelope"]["body"].as_str().is_none()),
+            "PRODUCT: an exact retained row was readable while its required {hold} fact was \
+             absent in room {room}; staged rows: {staged:?}"
+        );
+        if held.len() < expected_hashes.len() {
+            std::thread::yield_now();
             continue;
         }
-        let actual_hashes: Vec<&str> = staged
-            .iter()
-            .filter_map(|row| row["entry_hash"].as_str())
-            .collect();
         assert_eq!(
-            actual_hashes, expected_hashes,
-            "APPARATUS: the exact late rows were not staged once each in source order while the \
-             {hold} hold was engaged in room {room}; all rows: {rows:?}"
-        );
-        assert!(
-            staged.iter().all(|row| row["text"].as_str().is_none()),
-            "PRODUCT: an exact late row was readable while the {hold} hold proved its required \
-             consent/key fact absent \
-             in room {room}; staged rows: {staged:?}"
+            held,
+            expected_hashes.iter().collect::<Vec<_>>(),
+            "APPARATUS: the exact late rows were not retained once each in source order while \
+             the {hold} hold was engaged in room {room}; hashes: {hashes:?}"
         );
         return;
     }
@@ -546,7 +559,12 @@ fn assert_exact_read_rows(
                 expected_hashes
                     .iter()
                     .any(|expected| expected == hash)
-                    .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
+                    .then(|| {
+                        (
+                            hash.to_owned(),
+                            row["envelope"]["body"].as_str().map(str::to_owned),
+                        )
+                    })
             })
             .collect();
         if actual == expected {
@@ -567,7 +585,12 @@ fn assert_exact_read_rows(
                     expected_hashes
                         .iter()
                         .any(|expected| expected == hash)
-                        .then(|| (hash.to_owned(), row["text"].as_str().map(str::to_owned)))
+                        .then(|| {
+                            (
+                                hash.to_owned(),
+                                row["envelope"]["body"].as_str().map(str::to_owned),
+                            )
+                        })
                 })
                 .collect();
             if final_actual == expected {
@@ -593,6 +616,7 @@ fn assert_exact_read_rows(
 #[derive(Clone, Debug)]
 struct RoomStatus {
     log_entries: u64,
+    members: Vec<String>,
     received_key_generations: u64,
     governance_revision: u64,
     governance_pending: bool,
@@ -633,6 +657,17 @@ fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
         log_entries: row["log_entries"].as_u64().unwrap_or_else(|| {
             panic!("PRODUCT: {reader}'s room status has no numeric `log_entries`: {row}")
         }),
+        members: row["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("PRODUCT: {reader}'s room status has no members: {row}"))
+            .iter()
+            .map(|member| {
+                member["id"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("PRODUCT: room member has no id: {member}"))
+                    .to_owned()
+            })
+            .collect(),
         received_key_generations: row["received_key_generations"].as_u64().unwrap_or_else(|| {
             panic!(
                 "PRODUCT: {reader}'s room status has no numeric `received_key_generations`: {row}"
@@ -719,7 +754,19 @@ fn room_id_as(
 
 /// Exact authenticated room-order hashes exposed by the shipped diagnostic command.
 fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
-    let (ok, out, err) = vox(dir, &["room", "read", room, "--hashes"], None);
+    let (ok, out, err) = loop {
+        let result = vox(dir, &["room", "read", room, "--hashes"], None);
+        if !result.0
+            && matches!(
+                result.2.trim(),
+                "vox: the room changed while reading; refresh and retry"
+                    | "vox: node: the room changed while reading; refresh and retry"
+            )
+        {
+            continue;
+        }
+        break result;
+    };
     assert!(
         ok,
         "PRODUCT: {reader}'s `vox room read --hashes` failed for {room}: {out}{err}"
@@ -844,6 +891,19 @@ fn trust_detail(dir: &Path, reader: &str, room: &str, member: &str) -> String {
              {room} ({error}): {out}{err}"
         )
     });
+    // A join can return before its room is published. Doctor explicitly reports that state
+    // instead of inventing a trust answer; waiters must observe it until preparation completes.
+    if report["room"].is_null() {
+        if let Some(detail) = report["checks"].as_array().and_then(|checks| {
+            checks
+                .iter()
+                .find(|check| check["check"] == "room")
+                .and_then(|check| check["detail"].as_str())
+                .filter(|detail| detail.starts_with("that room is preparing its saved history;"))
+        }) {
+            return detail.to_owned();
+        }
+    }
     let trust_check = format!("trust {member}");
     report["checks"]
         .as_array()
@@ -6455,13 +6515,12 @@ fn await_lane_claim(
 
 /// Rooms staged together so the bounded backfill has both a long author and independent work.
 const WORK_ROOMS: usize = 3;
-/// Rows Alice seals in each work room before Bob joins it. The fold and package marker holds below
-/// make Bob accept these rows before their author's consent and sender key, respectively.
-const BEFORE_KEY: usize = 4 * vox_core::node::channel::RENDER_BACKFILL_ROWS_PER_TURN + 1;
-/// **Rows parked on missing consent/key cost no busy loop and wake from retained facts**
-/// (ADR-038 FX-22, #1007): Bob visibly retains Alice's exact rows while both facts are absent.
-/// Alice then becomes unavailable before Bob opens the retained logged key package; Bob MUST
-/// render every retained row once and in order.
+/// Cross a production render turn without requesting an archive outside the 128-position live
+/// suffix. The missing-key/consent journey must not wait for unrequested older history.
+const BEFORE_KEY: usize = vox_core::node::channel::RENDER_BACKFILL_ROWS_PER_TURN + 1;
+/// **Retained rows wake when their key and consent arrive** (ADR-038 FX-22, #1007).
+/// Bob receives the key before Alice's consent, then restarts with both facts retained and Alice
+/// unavailable; every exact row must become readable once and in order.
 ///
 /// Mutant: after rendering the first retained row, clearing that author's next sparse backfill
 /// cursor makes shipped status say the continuation is finished while exact retained hashes/text
@@ -6475,6 +6534,9 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     }
     let alice_fold = root.join("alice-fold");
     let bob_fold = root.join("bob-fold");
+    let consent_hold = root.join("incoming-consent-hold");
+    let consent_entered = consent_hold.with_extension("entered");
+    let render_hold = root.join("render-hold");
     let alice_fold_path = alice_fold
         .to_str()
         .expect("APPARATUS: a UTF-8 Alice fold path");
@@ -6484,13 +6546,15 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     assert!(ok, "PRODUCT: Alice's `vox id` failed: {err}");
     let (ok, bob_fp, err) = vox(&bob, &["id"], None);
     assert!(ok, "PRODUCT: Bob's `vox id` failed: {err}");
-    for (dir, fp, name) in [
-        (&alice, bob_fp.trim(), "bob"),
-        (&bob, alice_fp.trim(), "alice"),
-    ] {
-        let (ok, out, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "PRODUCT: `vox trust add {name}` failed: {out}{err}");
-    }
+    let (ok, out, err) = vox(
+        &bob,
+        &["trust", "add", alice_fp.trim(), "--name", "alice"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Bob's `vox trust add alice` failed: {out}{err}"
+    );
     let alice_daemon = daemon_env(
         &alice,
         "alice-consent-last",
@@ -6499,7 +6563,17 @@ fn key_before_consent_survives_a_restart(root: &Path) {
     let bob_daemon = daemon_env(
         &bob,
         "bob-consent-last",
-        &[("VOX_TEST_FOLD_HOLD_FILE", bob_fold_path)],
+        &[
+            ("VOX_TEST_FOLD_HOLD_FILE", bob_fold_path),
+            (
+                "VOX_TEST_HOLD_INCOMING_CONSENT_FILE",
+                consent_hold.to_str().expect("APPARATUS: consent hold path"),
+            ),
+            (
+                "VOX_TEST_HOLD_RENDER_FILE",
+                render_hold.to_str().expect("APPARATUS: render hold path"),
+            ),
+        ],
     );
     attached(&alice, "alice-consent-last");
     attached(&bob, "bob-consent-last");
@@ -6554,28 +6628,48 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: Bob could not join consent-last: {out}{err}");
-    assert_eq!(
-        trust_detail(&bob, "bob", &room, "alice"),
+    wait_trust_detail(
+        &bob,
+        "bob",
+        &room,
+        "alice",
         "you trust it, but it has not trusted you: it cannot read you",
-        "APPARATUS: consent was not held before the key-before-consent ordering"
     );
     wait_for_held_rows(&bob, &room, &hashes, "author-governance");
-    // Take Bob's count after the paged observation, so its read record is also inside the causal
-    // boundary Alice must accept before her fold is released.
-    let bob_log = room_status(&bob, "bob", &room).log_entries;
     wait_room_status(
         &alice,
         "alice",
         &room,
         false,
-        "Alice never retained Bob's causal join/read boundary",
-        |status| status.log_entries >= bob_log,
+        "Alice never listed Bob as a room member",
+        |status| status.members.iter().any(|member| member == bob_fp.trim()),
     );
 
     std::fs::write(&bob_fold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage Bob's fold: {error}"));
+    let full_room = vox_core::node::link::b32_encode(&room_id(&alice, "alice", &room));
+    let consent_scope = format!("{} {} {}", full_room, alice_fp.trim(), bob_fp.trim());
+    std::fs::write(&consent_hold, &consent_scope)
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot hold incoming consent: {error}"));
     std::fs::remove_file(&alice_fold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Alice's fold: {error}"));
+    let (ok, out, err) = vox(
+        &alice,
+        &[
+            "trust",
+            "add",
+            bob_fp.trim(),
+            "--name",
+            "bob",
+            "--history",
+            "full",
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Alice could not grant Bob full history: {out}{err}"
+    );
     let with_key = wait_room_status(
         &bob,
         "bob",
@@ -6595,12 +6689,50 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         "APPARATUS: key-before-consent was not staged: {with_key:?}"
     );
 
-    // Both source and reader stop while the exact rows, key and as-yet-unfolded consent are
-    // retained. Only Bob returns; successful reprojection therefore cannot be a refetch.
+    while !consent_entered.exists() {
+        std::thread::yield_now();
+    }
+    let entered = std::fs::read_to_string(&consent_entered)
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot read held consent: {error}"));
+    let (scope, hash) = entered
+        .rsplit_once(' ')
+        .unwrap_or_else(|| panic!("APPARATUS: malformed held consent: {entered}"));
+    assert_eq!(
+        scope, consent_scope,
+        "APPARATUS: held consent belongs to another room or peer"
+    );
+    assert!(
+        room_hashes(&alice, "alice", &room)
+            .iter()
+            .any(|held| held == hash),
+        "APPARATUS: held consent is not an actual Alice publication: {entered}"
+    );
+    wait_for_held_rows(&bob, &room, &hashes, "key-before-consent");
+    std::fs::write(&render_hold, b"")
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot hold rendering: {error}"));
+    std::fs::remove_file(&consent_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot release consent: {error}"));
+    std::fs::remove_file(&bob_fold)
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot release Bob's fold: {error}"));
+    wait_trust_detail(&bob, "bob", &room, "alice", "you trust each other");
+    wait_for_held_rows(&bob, &room, &hashes, "post-consent restart boundary");
+    // Both facts are durable, but the retained rows have not rendered. Only Bob returns.
     alice_daemon.stop();
     bob_daemon.stop();
-    std::fs::remove_file(&bob_fold)
-        .unwrap_or_else(|error| panic!("APPARATUS: could not release Bob's fold: {error}"));
+    let bob_held = daemon_env(
+        &bob,
+        "bob-consent-last-held-restart",
+        &[(
+            "VOX_TEST_HOLD_RENDER_FILE",
+            render_hold.to_str().expect("APPARATUS: render hold path"),
+        )],
+    );
+    attached(&bob, "bob-consent-last-held-restart");
+    wait_trust_detail(&bob, "bob", &room, "alice", "you trust each other");
+    wait_for_held_rows(&bob, &room, &hashes, "held Bob-only restart");
+    bob_held.stop();
+    std::fs::remove_file(&render_hold)
+        .unwrap_or_else(|error| panic!("APPARATUS: cannot release rendering: {error}"));
     let _bob_restarted = daemon(&bob, "bob-consent-last-restarted");
     attached(&bob, "bob-consent-last-restarted");
     wait_trust_detail(&bob, "bob", &room, "alice", "you trust each other");
@@ -6620,6 +6752,7 @@ fn key_before_consent_survives_a_restart(root: &Path) {
 fn retained_rows_render_once_their_key_and_consent_arrive() {
     test_knobs::require(&[
         "VOX_TEST_FOLD_HOLD_FILE",
+        "VOX_TEST_HOLD_INCOMING_CONSENT_FILE",
         "VOX_TEST_HOLD_PACKAGES_FILE",
         "VOX_TEST_HOLD_RENDER_FILE",
         TEST_EXPIRING_ADMIN_ENV,
@@ -6842,17 +6975,15 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
             "APPARATUS: Carol's governance fold was not visibly held in room {room}"
         );
         wait_for_held_rows(&bob, room, &competing_hashes[i], "Carol-governance-fold");
-        // Alice has durably accepted Bob's join-side rows before he goes offline; only her held
-        // governance fold keeps the release from being issued. Take Bob's count after the paged
-        // observation above, so any read record it made is before this causal sync boundary too.
-        let bob_log = room_status(&bob, "bob", room).log_entries;
+        // Membership, not counts over two different retained collections, is the precondition
+        // for Alice to issue Bob's consent after the fold is released.
         wait_room_status(
             &alice,
             "alice",
             room,
             false,
-            "Alice never retained Bob's causal join/read boundary",
-            |status| status.log_entries >= bob_log,
+            "Alice never listed Bob as a room member",
+            |status| status.members.iter().any(|member| member == &fps[1]),
         );
     }
 

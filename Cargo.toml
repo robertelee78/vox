@@ -178,6 +178,9 @@ sha1 = { version = "0.11", default-features = false }
 # design (ADR-008 quotas), every stored value is an already-sealed blob (ADR-010),
 # and the single-writer transaction matches the Node actor's single-writer rule.
 redb = "4.3"
+# Saved governance readers share immutable tree nodes; each new consent fact copies only
+# its changed search paths, not the room's growing consent/reset/revocation projection.
+imbl = { version = "7.0.2", default-features = false }
 # Temp directories for store/vault tests only (pure Rust).
 tempfile = "3.27"
 # --- Terminal proofs (test-only) -----------------------------------------------

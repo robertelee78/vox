@@ -262,7 +262,7 @@ impl ChannelState {
             return Ok(true);
         }
         if sparse && self.settled {
-            return self.visit_unsaid_recovery_shares(store, |_| {});
+            return self.visit_unsaid_recovery_shares(|_| {});
         }
         Ok(false)
     }
@@ -304,11 +304,7 @@ impl ChannelState {
             })
     }
 
-    fn visit_unsaid_recovery_shares(
-        &self,
-        store: &Store,
-        mut visit: impl FnMut(&str),
-    ) -> Result<bool> {
+    fn visit_unsaid_recovery_shares(&self, mut visit: impl FnMut(&str)) -> Result<bool> {
         let mut tags = self
             .services
             .keys()
@@ -316,11 +312,10 @@ impl ChannelState {
         let Some(first) = tags.next() else {
             return Ok(false);
         };
-        let view = self.current_governance(store)?;
         let me = self.me();
         let mut unsaid = false;
         for tag in std::iter::once(first).chain(tags) {
-            if view.share(&me, service_name(tag))?.is_none() {
+            if self.semantic_share_exact(&me, service_name(tag))?.is_none() {
                 unsaid = true;
                 visit(tag);
             }
@@ -526,7 +521,7 @@ impl ChannelState {
             }
             Work::Shares => {
                 let mut unsaid = Vec::new();
-                self.visit_unsaid_recovery_shares(store, |tag| {
+                self.visit_unsaid_recovery_shares(|tag| {
                     unsaid.push((tag.to_owned(), self.kind_of(tag)));
                 })?;
                 if unsaid.is_empty() {
