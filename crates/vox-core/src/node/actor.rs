@@ -41,7 +41,7 @@ use crate::node::api::{
 };
 use crate::node::channel::{ChannelState, Rendered, SessionAdvance, SessionRefresh};
 use crate::node::net::PeerPolicy;
-use crate::node::network::{Inbound, NodeNet};
+use crate::node::network::{BoardExchangeScope, Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
 
@@ -1598,6 +1598,12 @@ enum NetEvent {
     BoardRecordsOwed {
         conn: Arc<crate::transport::quic::VoxConnection>,
         records: Vec<Vec<u8>>,
+        scope: BoardExchangeScope,
+        revision: Digest32,
+        observations: crate::node::status::SharedSyncBook,
+        anchor_path: bool,
+        owner: tokio::sync::OwnedMutexGuard<()>,
+        reply: oneshot::Sender<(Option<Digest32>, tokio::sync::OwnedMutexGuard<()>)>,
     },
     BoundedSyncDone {
         channel_id: Digest32,
@@ -5732,6 +5738,7 @@ pub struct Node {
     /// endpoint needs the identity's signer, so a locked node has no network
     /// identity to present and serves nothing (M14.7d).
     net: Option<Arc<NodeNet>>,
+    board_exchange_retirement: Option<crate::node::network::BoardExchangeRetirement>,
     /// The presence the network runs on, and whether this node made it for itself (a solo
     /// presence, closed with the node) rather than attached to the daemon's.
     presence: Option<(Arc<crate::node::presence::NetPresence>, bool)>,
@@ -6620,6 +6627,7 @@ impl Node {
             checkpoint_idle_secs,
             stuck_after,
             net: None,
+            board_exchange_retirement: None,
             presence: None,
             net_tx,
             bind,
@@ -8135,7 +8143,7 @@ impl Node {
         endpoint.serve_anchor_lookup(self.anchor_boards);
         // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
         endpoint.local().set_stuck_after(self.stuck_after);
-        let mut net = NodeNet::new(endpoint, Arc::clone(&presence), Arc::clone(&self.clock));
+        let mut net = NodeNet::new(endpoint, Arc::clone(&presence), Arc::clone(&self.clock))?;
         self.sync_anchor_scopes(&net);
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
@@ -8177,6 +8185,8 @@ impl Node {
         }
         let net = Arc::new(net);
         self.net = Some(Arc::clone(&net));
+        self.board_exchange_retirement =
+            Some(crate::node::network::BoardExchangeRetirement::new(&net));
         // **Liveness is tended off the actor.** A connection silent past `SILENCE_IS_DEATH` gives
         // way to a live one to the same peer, or is closed — how a restarted peer's connection
         // takes over from the dead one. That cannot ride the actor's tick, because the actor is
@@ -8358,6 +8368,7 @@ impl Node {
     /// Tear the network down: close every connection and the endpoint, so a locked
     /// node presents no network identity at all.
     async fn stop_network(&mut self) {
+        drop(self.board_exchange_retirement.take());
         self.cancel_private_pulls(None);
         if let Some(task) = self.nearby_task.take() {
             task.abort();
@@ -10089,6 +10100,9 @@ impl Node {
             {
                 policy.expect_joiner(left);
                 departed.insert(left);
+            }
+            if self.board_exchange_allowed(cid) {
+                net.activate_board_exchange_room(*cid, ch.epoch());
             }
             net.membership().set_channel(*cid, ch.epoch(), members);
         }
@@ -12748,21 +12762,39 @@ impl Node {
                     }
                 }
             }
-            NetEvent::BoardRecordsOwed { conn, records } => {
-                tokio::spawn(async move {
-                    let Ok(mut client) = crate::nat::service::RendezvousClient::open(&conn).await
-                    else {
-                        return;
-                    };
-                    for wire in records {
-                        if let Err(error) = client.put(&wire).await {
-                            if !matches!(error, Error::RendezvousRejected(_)) {
-                                break;
+            NetEvent::BoardRecordsOwed {
+                conn,
+                records,
+                scope,
+                revision,
+                observations,
+                anchor_path,
+                owner,
+                mut reply,
+            } => {
+                if let Some(net) = self.net.as_ref().map(Arc::clone) {
+                    // Queue admission stays actor-owned; the waiting exchange owns cancellation
+                    // of actual transport, not merely cancellation of its eventual cache result.
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            () = scope.retired() => {}
+                            () = reply.closed() => {
+                                net.note_board_exchange(
+                                    &scope, &observations, conn.peer_id(), (0, 0, true), anchor_path,
+                                );
+                            }
+                            result = offer_board_records(
+                                &net, &conn, &scope, &records, revision,
+                                &observations, anchor_path,
+                            ) => {
+                                if let Ok(revision) = result {
+                                    let _ = reply.send((revision, owner));
+                                }
                             }
                         }
-                    }
-                    client.finish();
-                });
+                    });
+                }
             }
             NetEvent::BoundedSyncDone {
                 channel_id,
@@ -12799,6 +12831,10 @@ impl Node {
                         |counts| match result {
                             Ok(crate::node::history_stream::Status::Complete) => {
                                 counts.completed += 1;
+                                // A current authenticated bounded completion settles the same
+                                // failure streak as a successful legacy session.
+                                counts.consecutive_failures = 0;
+                                counts.failing_since = None;
                                 counts
                                     .reasons
                                     .count(crate::node::status::RoundReason::Served);
@@ -15201,6 +15237,9 @@ impl Node {
         self.role_wake
             .install(parsed.channel_id, &channel.role_owed());
         self.own_key_room_set_changed.send_replace(());
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(&parsed.channel_id);
+        }
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -15227,7 +15266,7 @@ impl Node {
             let _ = admit_board_records(
                 &shared,
                 profile.store(),
-                &authority,
+                (&authority, None),
                 &set.bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now_ms,
@@ -16024,6 +16063,9 @@ impl Node {
             Some(Ok(())) => {}
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
+        }
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchanges();
         }
         // No old own-key response can remain active after the keyring narrowing commits.
         // Later withdrawals and board publication do not need to hold writer admission closed.
@@ -17062,7 +17104,7 @@ impl Node {
             let _ = admit_board_records(
                 &shared,
                 &store,
-                &authority,
+                (&authority, None),
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now_ms,
@@ -17074,7 +17116,7 @@ impl Node {
         let from_notices = admit_board_notices(
             &shared,
             &store,
-            &authority,
+            (&authority, None),
             &net,
             channel_id,
             ChannelState::MAX_ADMISSIONS_PER_SWEEP,
@@ -17840,6 +17882,12 @@ impl Node {
         }
     }
 
+    fn board_exchange_allowed(&self, room: &Digest32) -> bool {
+        !self.own_key_leave_pending.contains_key(room)
+            && !self.own_key_ended_pending.contains_key(room)
+            && self.own_key_untrust_pending.is_none()
+    }
+
     /// **Read the boards of the anchors this node is connected to**, for every room naming them
     /// ([`exchange_boards`]), each on a task of its own: `only` for one anchor that just
     /// connected, or every connected one on the tick. A member of the room is not read here: its
@@ -17853,8 +17901,13 @@ impl Node {
         };
         let now_ms = self.now_ms();
         for (cid, shared) in &self.channels {
+            if !self.board_exchange_allowed(cid) {
+                continue;
+            }
             let (anchors, known) = {
-                let ch = shared.lock().await;
+                let Ok(ch) = shared.try_lock() else {
+                    continue;
+                };
                 if ch.require_governance_ready(&store, now_ms).is_err() {
                     continue;
                 }
@@ -17870,6 +17923,7 @@ impl Node {
                     .collect();
                 (anchors, ch.epoch())
             };
+            let scope = net.activate_board_exchange_room(*cid, known);
             for anchor in anchors {
                 let Some(authority) = self.computer_authority() else {
                     continue;
@@ -17882,18 +17936,24 @@ impl Node {
                 else {
                     continue;
                 };
-                let (net, store, shared, cid) = (
-                    Arc::clone(&net),
-                    Arc::clone(&store),
-                    Arc::clone(shared),
-                    *cid,
-                );
+                let (net, store, shared) =
+                    (Arc::clone(&net), Arc::clone(&store), Arc::clone(shared));
+                let scope = scope.clone();
+                let observations = Arc::clone(&self.sync_book);
                 let tx = self.net_tx.clone();
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(
                         SETUP_PATIENCE,
                         exchange_boards(
-                            &net, &conn, &shared, &store, &authority, &tx, cid, known, now_ms,
+                            &net,
+                            &conn,
+                            &shared,
+                            &store,
+                            &authority,
+                            &tx,
+                            scope,
+                            now_ms,
+                            (&observations, true),
                         ),
                     )
                     .await;
@@ -18173,7 +18233,7 @@ impl Node {
     }
 
     async fn start_outbound(&mut self, channel_id: Digest32, peer: Digest32) -> bool {
-        if self.own_key_ended_pending.contains_key(&channel_id) {
+        if !self.board_exchange_allowed(&channel_id) {
             return false;
         }
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
@@ -18217,6 +18277,14 @@ impl Node {
             self.note_start(channel_id, peer, "archive_budget_busy");
             return false;
         };
+        if !shared
+            .try_lock()
+            .is_ok_and(|channel| channel.epoch() == epoch)
+        {
+            return false;
+        }
+        let board_scope = net.activate_board_exchange_room(channel_id, epoch);
+        let board_observations = Arc::clone(&self.sync_book);
         let target = SessionTarget::Channel(shared);
         let wake = self.net_tx.clone();
         let Some(slot) = crate::node::ports::Slots::take(
@@ -18280,7 +18348,6 @@ impl Node {
             let mut admitted_authors = 0usize;
             let epoch = match &target {
                 SessionTarget::Channel(shared) => {
-                    let known = shared.lock().await.epoch();
                     // **Bounded** (ADR-025 D6): the board read and the offer are best-effort, and a
                     // live peer answers them in milliseconds. Unbounded, a peer that stopped
                     // answering held this slot and the port's one outbound attempt until the
@@ -18289,7 +18356,15 @@ impl Node {
                     let setup = async {
                         if let (Some(pstore), Some(authority)) = (admit_store, authority.as_ref()) {
                             admitted_authors = exchange_boards(
-                                &net, &conn, shared, &pstore, authority, &tx, cid, known, now_ms,
+                                &net,
+                                &conn,
+                                shared,
+                                &pstore,
+                                authority,
+                                &tx,
+                                board_scope,
+                                now_ms,
+                                (&board_observations, false),
                             )
                             .await;
                         }
@@ -19297,7 +19372,7 @@ impl Node {
             let _ = admit_board_records(
                 &shared,
                 &store,
-                &authority,
+                (&authority, None),
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
                 now_ms,
@@ -21301,6 +21376,9 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchanges();
+        }
         let retirement_node = self.profile.as_ref().map(Profile::fingerprint);
         let mut bounded_sync = std::mem::take(&mut self.bounded_sync);
         self.bounded_sync
@@ -21608,6 +21686,9 @@ impl Node {
         let inserted = authority.publish_room_creation(|| {
             self.role_wake.install(id, &ch.role_owed());
             self.own_key_room_set_changed.send_replace(());
+            if let Some(net) = self.net.as_ref() {
+                net.forget_board_exchange_room(&id);
+            }
             self.channels
                 .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
@@ -22201,6 +22282,9 @@ impl Node {
     }
 
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(channel_id);
+        }
         self.cancel_private_pulls(Some(*channel_id));
         self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
@@ -23175,6 +23259,9 @@ impl Node {
             self.remember_or_say(&ch);
             self.role_wake.install(channel_id, &ch.role_owed());
             self.own_key_room_set_changed.send_replace(());
+            if let Some(net) = self.net.as_ref() {
+                net.forget_board_exchange_room(&channel_id);
+            }
             self.channels
                 .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
@@ -23249,6 +23336,9 @@ impl Node {
             if let Err(e) = self.forget_open(channel_id) {
                 return Outcome::Failed(fault_of(&e));
             }
+        }
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(channel_id);
         }
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
@@ -23534,6 +23624,9 @@ impl Node {
         let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_untrust_pending = Some(Arc::clone(&owner));
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchanges();
+        }
         let rooms: Vec<_> = self
             .channels
             .iter()
@@ -23652,6 +23745,9 @@ impl Node {
         let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_ended_pending.insert(room, Arc::clone(&owner));
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(&room);
+        }
         if let Err(error) = self.retire_bounded_room(room).await {
             self.own_key_ended_pending.remove(&room);
             if self
@@ -23749,6 +23845,9 @@ impl Node {
         let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_ended_pending.insert(room, Arc::clone(&owner));
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(&room);
+        }
         if let Err(error) = self.retire_bounded_room(room).await {
             self.own_key_ended_pending.remove(&room);
             let _ = self.event_tx.send(NodeEvent::NodeNote {
@@ -23816,6 +23915,9 @@ impl Node {
         let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(&room);
+        }
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
         let tx = self.net_tx.clone();
@@ -23867,6 +23969,9 @@ impl Node {
         let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(&room);
+        }
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
         let tx = self.net_tx.clone();
@@ -23919,6 +24024,9 @@ impl Node {
         let secret = Arc::new(secret);
         let owner = Arc::new(());
         self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(&room);
+        }
         let mut room_cancel = self.own_key_room_watch(room);
         let mut epoch_changed = self.pairwise_epoch.subscribe();
         let tx = self.net_tx.clone();
@@ -24557,6 +24665,9 @@ impl Node {
                 }
             },
         };
+        if let Some(net) = self.net.as_ref() {
+            net.forget_board_exchange_room(channel_id);
+        }
         self.cancel_room_preparation(channel_id, Fault::UnknownChannel);
         // A leave still waiting for this room is overtaken: the room is joined again from scratch.
         let (overtaken, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leave_waiters)
@@ -28429,82 +28540,347 @@ async fn exchange_boards(
     conn: &Arc<crate::transport::quic::VoxConnection>,
     shared: &tokio::sync::Mutex<ChannelState>,
     pstore: &crate::node::store::Store,
-    authority: &crate::node::actor::computer::ComputerAuthority,
+    authority: &computer::ComputerAuthority,
     tx: &mpsc::Sender<NetEvent>,
-    cid: Digest32,
-    known: u64,
+    scope: BoardExchangeScope,
     now: crate::time::Ms,
+    observations: (&crate::node::status::SharedSyncBook, bool),
 ) -> usize {
-    let Ok(set) = net.fetch_channel(conn, &cid, known).await else {
+    tokio::select! {
+        biased;
+        () = scope.retired() => 0,
+        admitted = exchange_boards_live(
+            net, conn, shared, pstore, authority, tx, &scope, now, observations,
+        ) => admitted,
+    }
+}
+
+fn board_record_superseded(error: &Error) -> bool {
+    matches!(error, Error::RendezvousRejected(reason)
+        if *reason == crate::nat::service::RejectReason::Stale.as_str()
+            || *reason == crate::nat::service::RejectReason::Withdrawn.as_str())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exchange_boards_live(
+    net: &NodeNet,
+    conn: &Arc<crate::transport::quic::VoxConnection>,
+    shared: &tokio::sync::Mutex<ChannelState>,
+    pstore: &crate::node::store::Store,
+    authority: &computer::ComputerAuthority,
+    tx: &mpsc::Sender<NetEvent>,
+    scope: &BoardExchangeScope,
+    now: crate::time::Ms,
+    observations: (&crate::node::status::SharedSyncBook, bool),
+) -> usize {
+    let (book, anchor_path) = observations;
+    let (cid, epoch) = (scope.channel_id, scope.epoch);
+    let board = conn.peer_id();
+    let Some(owner) = net
+        .board_exchange_owner(scope, board, book, !anchor_path)
+        .await
+    else {
         return 0;
     };
-    let admitted_authors = admit_board_records(
+    let cached = net.board_exchange_revision(board, scope);
+    let expected = cached.as_ref().map(|(remote, local, _)| (*remote, *local));
+    let Ok(read) = net
+        .fetch_channel_if_changed(conn, &cid, epoch, expected.map(|(remote, _)| remote))
+        .await
+    else {
+        return 0;
+    };
+    net.note_board_exchange(
+        scope,
+        book,
+        board,
+        (
+            read.records
+                .as_ref()
+                .map_or(0, crate::nat::service::RecordSet::record_count),
+            0,
+            false,
+        ),
+        anchor_path,
+    );
+    let fetched = read.records.map(Arc::new);
+    let Some(records) = fetched
+        .as_ref()
+        .cloned()
+        .or_else(|| cached.as_ref().map(|(_, _, records)| Arc::clone(records)))
+    else {
+        return 0;
+    };
+    // Unchanged inventory is not completed admission work. Both retained remote evidence and
+    // local mirror get a bounded turn, even when either contains permanently unresolved rows.
+    let local_bundles = net.board_bundles(&cid, epoch);
+    let cap = ChannelState::MAX_ADMISSIONS_PER_SWEEP;
+    let remote_cap = if records.bundles.is_empty() || local_bundles.is_empty() {
+        cap
+    } else {
+        cap.div_ceil(2)
+    };
+    let remote_admitted = admit_board_records(
         shared,
         pstore,
-        authority,
-        &set.bundles,
-        ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+        (authority, Some(scope)),
+        &records.bundles,
+        remote_cap,
         now,
         Some(net),
     )
     .await;
-    // What the peer's board holds is filed on this node's own, so its board carries the whole
-    // membership it knows. Bundles go first: they carry the key an address record is verified
-    // with (M15.2a). Mirroring to the anchors follows on the actor when `SyncDone` lands, because
-    // that needs channel state.
-    let _ = authority.publish(|| {
-        for wire in set
-            .bundles
-            .iter()
-            .map(MemberBundleRecord::to_wire)
-            .chain(set.members.iter().map(RendezvousRecord::to_wire))
-            // The members' withdraws, then the admission notices (#520): a withdraw first, so
-            // this node's board refuses a notice of a member that left.
-            .chain(
-                set.withdraws
-                    .iter()
-                    .map(crate::nat::withdraw::BoardWithdraw::to_wire),
-            )
-            .chain(
-                set.notices
-                    .iter()
-                    .map(crate::nat::notice::AdmissionNotice::to_wire),
-            )
-        {
-            let _ = net.publish_local(&wire);
+    let local_admitted = admit_board_records(
+        shared,
+        pstore,
+        (authority, Some(scope)),
+        &local_bundles,
+        cap.saturating_sub(remote_admitted),
+        now,
+        Some(net),
+    )
+    .await;
+    let admitted = remote_admitted + local_admitted;
+    // A failed mirror must not ACK the response's revision. Prejoins verify their own author,
+    // not the relaying node. All frames still traverse the full local service policy.
+    // Share the existing room-state fence with lifecycle preparation. A close/untrust first
+    // cancels this scope, then its existing off-actor room lock waits out an operation already
+    // entered here. No crypto, disk or authority wait holds the cache's bookkeeping mutex.
+    let mirror_channel = shared.lock().await;
+    if mirror_channel.epoch() != epoch || !scope.is_live() {
+        return admitted;
+    }
+    let mut mirror_complete = true;
+    for (wire, anonymous) in records
+        .bundles
+        .iter()
+        .map(MemberBundleRecord::to_wire)
+        .map(|wire| (wire, false))
+        .chain(
+            records
+                .prejoins
+                .iter()
+                .map(crate::nat::record::PreJoinRecord::to_wire)
+                .map(|wire| (wire, true)),
+        )
+        .chain(
+            records
+                .members
+                .iter()
+                .map(RendezvousRecord::to_wire)
+                .map(|wire| (wire, false)),
+        )
+        .chain(
+            records
+                .withdraws
+                .iter()
+                .map(crate::nat::withdraw::BoardWithdraw::to_wire)
+                .map(|wire| (wire, false)),
+        )
+        .chain(
+            records
+                .notices
+                .iter()
+                .map(crate::nat::notice::AdmissionNotice::to_wire)
+                .map(|wire| (wire, false)),
+        )
+        .chain(
+            records
+                .room_withdraws
+                .iter()
+                .map(crate::nat::withdraw::BoardWithdraw::to_wire)
+                .map(|wire| (wire, false)),
+        )
+    {
+        let mirrored = authority.publish(|| {
+            scope.is_live().then(|| {
+                if anonymous {
+                    net.mirror_board_record(&wire)
+                } else {
+                    net.publish_local(&wire)
+                }
+            })
+        });
+        match mirrored {
+            Some(Some(Ok(()))) => {}
+            Some(Some(Err(error))) if board_record_superseded(&error) => {}
+            // A notice can precede the notice that introduces its witness. Keep processing
+            // independent records, but do not acknowledge this snapshot until all are mirrored.
+            Some(Some(Err(_))) => mirror_complete = false,
+            _ => return admitted,
         }
-    });
-    let admitted_authors = admitted_authors
+    }
+    drop(mirror_channel);
+    let admitted = admitted
         + admit_board_notices(
             shared,
             pstore,
-            authority,
+            (authority, Some(scope)),
             net,
             &cid,
-            ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+            cap,
             now,
         )
         .await;
-    // **And the other way: what this node's board holds that the peer's lacks.** A member who
-    // joined through this node is on this node's board and no other, and the peer learned of it
-    // only when *it* next read this board, on its own periodic sync: 24–28 s for a third member to
-    // see a new one, measured. Offered here, a push that follows a join carries the newcomer to
-    // every connected member at once. Best-effort: a refusal (a record the peer's board already
-    // holds newer) costs nothing, and the peer's own sync still reads this board.
-    let missing = net.board_records_missing_from(&cid, known, &set);
-    if !missing.is_empty() {
-        // The off-actor worker does not retain authority past this synchronous queue admission.
-        // A replaced Computer projection therefore cannot enqueue any transport publication;
-        // once admitted, the actor event owns completing that already-authorized operation.
-        let _ = authority.publish(|| {
+    if !mirror_complete {
+        return admitted;
+    }
+    // Completed inventory lives once in the shared local board, not once per peer. Only
+    // unresolved handoffs remain peer-specific, so later admission need not refetch frames.
+    let mirrored: BTreeSet<Digest32> = net
+        .board_bundles(&cid, epoch)
+        .into_iter()
+        .map(|bundle| bundle.author_id)
+        .collect();
+    let pending: BTreeSet<Digest32> = records
+        .bundles
+        .iter()
+        .filter(|bundle| !mirrored.contains(&bundle.author_id))
+        .map(|bundle| bundle.author_id)
+        .collect();
+    let notices: BTreeSet<(Digest32, u64)> = net
+        .board_notices(&cid)
+        .into_iter()
+        .map(|notice| (notice.joiner(), notice.witness.timestamp_ms))
+        .collect();
+    let retained = Arc::new(crate::nat::service::RecordSet {
+        bundles: records
+            .bundles
+            .iter()
+            .filter(|bundle| pending.contains(&bundle.author_id))
+            .cloned()
+            .collect(),
+        members: records
+            .members
+            .iter()
+            .filter(|member| pending.contains(&member.author_id))
+            .cloned()
+            .collect(),
+        notices: records
+            .notices
+            .iter()
+            .filter(|notice| !notices.contains(&(notice.joiner(), notice.witness.timestamp_ms)))
+            .cloned()
+            .collect(),
+        ..crate::nat::service::RecordSet::default()
+    });
+    let local_revision = net.local_board_revision(&cid);
+    let missing = match &fetched {
+        Some(_) => net.board_records_missing_from(&cid, epoch, &records),
+        None if expected.is_some_and(|(_, local)| local != local_revision) => {
+            net.board_records_for_offer(&cid, epoch)
+        }
+        None => Vec::new(),
+    };
+    let mut revision = read.revision;
+    let _owner = if missing.is_empty() {
+        owner
+    } else {
+        let (reply, response) = oneshot::channel();
+        let queued = authority.publish(|| {
+            if !scope.is_live() {
+                return false;
+            }
             tx.try_send(NetEvent::BoardRecordsOwed {
                 conn: Arc::clone(conn),
                 records: missing,
+                scope: scope.clone(),
+                revision,
+                observations: Arc::clone(book),
+                anchor_path,
+                owner,
+                reply,
             })
             .is_ok()
         });
+        if queued != Some(true) {
+            net.note_board_exchange(scope, book, board, (0, 0, true), anchor_path);
+            return admitted;
+        }
+        match response.await {
+            Ok((chained, owner)) => {
+                if let Some(chained) = chained {
+                    revision = chained;
+                }
+                owner
+            }
+            Err(_) => return admitted,
+        }
+    };
+    let channel = shared.lock().await;
+    if channel.epoch() != epoch || !scope.is_live() {
+        return admitted;
     }
-    admitted_authors
+    net.commit_board_exchange_revision(
+        board,
+        scope,
+        expected,
+        (revision, local_revision),
+        retained,
+    );
+    admitted
+}
+
+/// Runs after actor queue admission. Its caller owns cancellation of the actual I/O.
+#[allow(clippy::too_many_arguments)]
+async fn offer_board_records(
+    net: &NodeNet,
+    conn: &crate::transport::quic::VoxConnection,
+    scope: &BoardExchangeScope,
+    records: &[Vec<u8>],
+    mut revision: Digest32,
+    book: &crate::node::status::SharedSyncBook,
+    anchor_path: bool,
+) -> std::result::Result<Option<Digest32>, ()> {
+    if !scope.is_live() {
+        return Err(());
+    }
+    let board = conn.peer_id();
+    let mut client = match crate::nat::service::RendezvousClient::open(conn).await {
+        Ok(client) => client,
+        Err(_) => {
+            net.note_board_exchange(scope, book, board, (0, 0, true), anchor_path);
+            return Err(());
+        }
+    };
+    let mut complete = true;
+    for wire in records {
+        if !scope.is_live() {
+            client.finish();
+            return Err(());
+        }
+        match client.put_with_revision(wire).await {
+            Ok(Some(edge)) => {
+                if complete && edge.previous_revision == revision {
+                    revision = edge.revision;
+                } else {
+                    complete = false;
+                }
+                net.note_board_exchange(scope, book, board, (0, 1, false), anchor_path);
+            }
+            Ok(None) => {
+                complete = false;
+                net.note_board_exchange(scope, book, board, (0, 1, false), anchor_path);
+            }
+            Err(error @ Error::RendezvousRejected(_)) => {
+                net.note_board_exchange(scope, book, board, (0, 1, false), anchor_path);
+                if board_record_superseded(&error) {
+                    complete = false;
+                } else {
+                    client.finish();
+                    net.note_board_exchange(scope, book, board, (0, 0, true), anchor_path);
+                    return Err(());
+                }
+            }
+            Err(_) => {
+                client.finish();
+                net.note_board_exchange(scope, book, board, (0, 0, true), anchor_path);
+                return Err(());
+            }
+        }
+    }
+    client.finish();
+    Ok(complete.then_some(revision))
 }
 
 /// **Admit the newcomers this node's board holds notices of** (#520), to a fixpoint, as
@@ -28516,7 +28892,10 @@ async fn exchange_boards(
 async fn admit_board_notices(
     shared: &tokio::sync::Mutex<ChannelState>,
     store: &crate::node::store::Store,
-    authority: &crate::node::actor::computer::ComputerAuthority,
+    (authority, scope): (
+        &crate::node::actor::computer::ComputerAuthority,
+        Option<&BoardExchangeScope>,
+    ),
     net: &NodeNet,
     channel_id: &Digest32,
     quota: usize,
@@ -28528,8 +28907,14 @@ async fn admit_board_notices(
         return 0;
     }
     let mut channel = shared.lock().await;
+    if scope.is_some_and(|scope| channel.epoch() != scope.epoch) {
+        return 0;
+    }
     authority
         .publish(|| {
+            if scope.is_some_and(|scope| !scope.is_live()) {
+                return 0;
+            }
             for w in &withdraws {
                 let _ = channel.keep_withdraw(store, w);
             }
@@ -28596,7 +28981,10 @@ async fn admit_board_notices(
 async fn admit_board_records(
     shared: &tokio::sync::Mutex<ChannelState>,
     store: &crate::node::store::Store,
-    authority: &crate::node::actor::computer::ComputerAuthority,
+    (authority, scope): (
+        &crate::node::actor::computer::ComputerAuthority,
+        Option<&BoardExchangeScope>,
+    ),
     records: &[crate::nat::record::MemberBundleRecord],
     quota: usize,
     now_ms: crate::time::Ms,
@@ -28638,8 +29026,14 @@ async fn admit_board_records(
         return 0;
     }
     let mut channel = shared.lock().await;
+    if scope.is_some_and(|scope| channel.epoch() != scope.epoch) {
+        return 0;
+    }
     authority
         .publish(|| {
+            if scope.is_some_and(|scope| !scope.is_live()) {
+                return 0;
+            }
             let mut admitted = 0usize;
             while admitted < quota {
                 let before = admitted;

@@ -2626,6 +2626,8 @@ impl Node {
                     work.peer,
                     |counts| {
                         counts.completed += 1;
+                        counts.consecutive_failures = 0;
+                        counts.failing_since = None;
                         counts
                             .reasons
                             .count(crate::node::status::RoundReason::Announce);
@@ -2889,6 +2891,8 @@ impl Node {
                     work.peer,
                     |counts| {
                         counts.completed += 1;
+                        counts.consecutive_failures = 0;
+                        counts.failing_since = None;
                         counts.reasons.count(reason);
                         counts.fetched_completed += 1;
                         // Returning one dependency turn to its advertising source is a lane
@@ -3237,6 +3241,8 @@ impl Node {
                     work.peer,
                     |counts| {
                         counts.completed += 1;
+                        counts.consecutive_failures = 0;
+                        counts.failing_since = None;
                         counts.reasons.count(reason);
                         counts.fetched_completed += 1;
                         if !brought {
@@ -4502,6 +4508,13 @@ impl Node {
         let inbox_generation = inbox.generation(room, peer);
         let now = self.now_ms().get();
         let net = self.net.as_ref().cloned();
+        let board_scope = if self.board_exchange_allowed(&room) {
+            net.as_ref()
+                .map(|net| net.activate_board_exchange_room(room, epoch))
+        } else {
+            None
+        };
+        let board_observations = Arc::clone(&self.sync_book);
         let pstore = profile.store_handle();
         let tx = self.net_tx.clone();
         let authority = self.computer_authority();
@@ -4534,11 +4547,13 @@ impl Node {
             let deadline =
                 tokio::time::Instant::now() + crate::node::history_budget::BOUNDED_ROUND_PATIENCE;
             if flow.needs_board() && !worker_fence.is_retired() {
-                if let (Some(net), Some(authority)) = (net, authority.as_ref()) {
+                if let (Some(net), Some(authority), Some(scope)) =
+                    (net, authority.as_ref(), board_scope)
+                {
                     flow.admitted_authors = tokio::select! {
                         biased;
                         ()=worker_fence.retired()=>0,
-                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,authority,&tx,room,epoch,crate::time::Ms(now)))=>result.unwrap_or(0),
+                        result=tokio::time::timeout(SETUP_PATIENCE,exchange_boards(&net,&conn,&flow.shared,&pstore,authority,&tx,scope,crate::time::Ms(now),(&board_observations,false)))=>result.unwrap_or(0),
                     };
                 }
             }
