@@ -692,6 +692,7 @@ impl Source {
             Option<RoleAnnouncement>,
             Option<([u8; 16], u64)>,
             Option<CatalogAnnouncement>,
+            super::super::channel::availability::Token,
         )>,
     > {
         let charge = job.reserve_or_pressure(
@@ -772,8 +773,22 @@ impl Source {
                         authors.push(peer);
                     }
                     self.flush_authors_before_ack(room_id, authors).await?;
+                    let Lookup::Found(availability) = self
+                        .read(job, 0, move |room, _| {
+                            Ok(Some(room.availability_peer(peer, None)?.local()))
+                        })
+                        .await?
+                    else {
+                        return Ok(Lookup::Busy);
+                    };
                     return Ok(Lookup::Found(Held {
-                        value: (hints, role, key_catalog, catalog_announcement),
+                        value: (
+                            hints,
+                            role,
+                            key_catalog,
+                            catalog_announcement,
+                            availability.value,
+                        ),
                         _charge: charge,
                     }));
                 }
@@ -781,6 +796,26 @@ impl Source {
             }
         }
         Err(Error::SizeLimitExceeded("inventory index slice bound"))
+    }
+
+    pub(super) async fn observe_availability(
+        &self,
+        job: &Job,
+        connection: u64,
+        token: super::super::channel::availability::Token,
+    ) -> Result<()> {
+        let peer = self.peer;
+        match self
+            .read(job, 0, move |room, _| {
+                room.availability_peer(peer, None)?
+                    .observe(connection, token);
+                Ok(Some(()))
+            })
+            .await?
+        {
+            Lookup::Found(_) => Ok(()),
+            _ => Err(Error::Unreachable("availability room read busy")),
+        }
     }
 
     /// A peer's role advertisement wakes an authenticated query; it is not a receipt.

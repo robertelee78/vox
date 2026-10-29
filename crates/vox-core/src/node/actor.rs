@@ -47,10 +47,13 @@ use crate::node::paths::Paths;
 
 mod bounded_sync;
 mod computer;
+pub use computer::PolicySupersession;
 mod governance;
 mod history_demand;
 mod key_body_scan;
 mod local_trust;
+mod own_attempts;
+mod own_keys;
 mod recovery;
 use crate::node::prekeys::{self, PrekeyRing};
 use crate::node::profile::Profile;
@@ -142,6 +145,16 @@ const EVENT_QUEUE: usize = 256;
 /// channel and failed — three symptoms of one cause. A guard makes them wait the few
 /// milliseconds instead, which is the behaviour a client expects.
 type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
+
+/// One authenticated own body whose effect can now finish from its staged Page. A donor
+/// receives at most one retry for this exact readability edge, not one per governance turn.
+struct ReadableOwnEffect {
+    instance: std::sync::Weak<Mutex<ChannelState>>,
+    target: Digest32,
+    seq: u64,
+    entry_hash: Digest32,
+    woken: BTreeSet<Digest32>,
+}
 
 /// How often the actor's timers run. Sync is not paced by it: a port is evaluated at the end of
 /// every event that can change what it needs (ADR-025 D6a); the tick retires attempts whose
@@ -683,7 +696,7 @@ fn command_name(c: &NodeCommand) -> &'static str {
         NodeCommand::Serve { .. } => "publishing a service",
         NodeCommand::Up { .. } => "bringing the proxy up",
         NodeCommand::Forward { .. } => "opening a forward",
-        NodeCommand::Unlock { .. } => "unlocking the identity",
+        NodeCommand::Unlock { .. } | NodeCommand::UnlockAdmitted { .. } => "unlocking the identity",
         NodeCommand::LeaveRoom { .. } => "leaving a room",
         NodeCommand::EndRoom { .. } => "ending a room",
         _ => "a client command",
@@ -696,6 +709,28 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::JoinRequest { .. } => "answering somebody's join",
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
+        NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
+        NetEvent::OwnKeyDonorBusy { .. }
+        | NetEvent::OwnKeyDonorSlot { .. }
+        | NetEvent::OwnKeyDonorAvailable { .. } => "resuming own-key donor capacity",
+        NetEvent::OwnKeyWriterInterrupted(..) => "resuming an interrupted own-key response",
+        NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
+        NetEvent::OwnKeyCloseReady { .. } => "resuming a room close",
+        NetEvent::OwnKeyPublicationRejectReady { .. } => "retiring an unpublished room",
+        NetEvent::OwnKeyEndedPurgeReady { .. } => "retiring an ended room",
+        NetEvent::OwnKeyLeftPurgeReady { .. } => "retiring a departed room",
+        NetEvent::OwnKeyUntrustReady { .. } => "resuming a trust removal",
+        NetEvent::OwnKeyRecoveryReady { .. } => "resuming room recovery",
+        NetEvent::OwnKeyComputerReady { .. } => "resuming Computer policy",
+        NetEvent::OwnKeyComputerCancelled { .. } => "retiring Computer policy",
+        NetEvent::OwnKeyUnlockReady { .. } => "resuming identity unlock",
+        NetEvent::OwnKeyOpenReady(..) => "starting an own-key recovery stream",
+        NetEvent::OwnKeyPolicyReady { .. } | NetEvent::OwnKeyPolicyFailed { .. } => {
+            "resuming own-key recovery after Computer policy"
+        }
+        NetEvent::OwnKeyRequestReady(..) => "starting an own-key recovery request",
+        NetEvent::OwnKeyResponseReady(..) => "installing an own-key recovery response",
+        NetEvent::OwnKeyRequestFailed { .. } => "retiring an own-key recovery request",
         NetEvent::HelloUndelivered { .. } => "owing a hello that could not be written",
         NetEvent::ReopenUndelivered { .. } => "owing a reopen that could not be written",
         NetEvent::Stream { .. } => "serving a stream",
@@ -1240,6 +1275,7 @@ enum NetEvent {
     ComputerPolicy {
         guard: computer::ComputerPolicyGuard,
         reply: oneshot::Sender<crate::error::Result<()>>,
+        permit: tokio::sync::OwnedSemaphorePermit,
     },
     TrustLocalNode {
         fingerprint: Digest32,
@@ -1366,6 +1402,122 @@ enum NetEvent {
     },
     /// A peer's pairwise stream, its frames **already read** off the actor (V210-71).
     Pairwise(PairwiseIn),
+    /// A bounded worker has prepared an encrypted own-key response; current authority and
+    /// the exact connection are checked again before it is sent.
+    OwnKeyDonorBusy {
+        room: Digest32,
+        peer: Digest32,
+        connection: Arc<VoxConnection>,
+        overflow: Arc<own_keys::DonorOverflow>,
+    },
+    OwnKeyDonorSlot {
+        room: Digest32,
+        peer: Digest32,
+        connection: Arc<VoxConnection>,
+        instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        capacity: OwnedSemaphorePermit,
+    },
+    OwnKeyDonorAvailable {
+        room: Digest32,
+        peer: Digest32,
+        connection: Arc<VoxConnection>,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        from_wait: bool,
+    },
+    OwnKeyDonorReady(own_keys::DonorReady),
+    OwnKeyWriterInterrupted(own_keys::InterruptedReady),
+    OwnKeyUnlockReady {
+        _secret: own_keys::SecretLease,
+        owner: Arc<()>,
+        rooms: Vec<(Digest32, SharedChannel)>,
+        transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+        targets: Vec<Digest32>,
+        boundary: (std::time::Instant, Digest32),
+        generation: u64,
+        reply: oneshot::Sender<Outcome>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    OwnKeyComputerCancelled {
+        owner: Arc<()>,
+    },
+    OwnKeyComputerReady {
+        _secret: own_keys::SecretLease,
+        owner: Arc<()>,
+        rooms: Vec<(Digest32, SharedChannel)>,
+        transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+        work: computer::OwnKeyPolicyWork,
+    },
+    OwnKeyRecoveryReady {
+        room: Digest32,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    },
+    OwnKeyUntrustReady {
+        _secret: own_keys::SecretLease,
+        owner: Arc<()>,
+        rooms: Vec<(Digest32, SharedChannel)>,
+        transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+        command: NodeCommand,
+        reply: oneshot::Sender<Outcome>,
+    },
+    OwnKeyLeaveReady {
+        _secret: own_keys::SecretLease,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        reply: oneshot::Sender<Outcome>,
+    },
+    OwnKeyCloseReady {
+        _secret: own_keys::SecretLease,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        reply: oneshot::Sender<Outcome>,
+    },
+    OwnKeyPublicationRejectReady {
+        _secret: own_keys::SecretLease,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        waiting: RoomPublication,
+    },
+    OwnKeyLeftPurgeReady {
+        _secret: own_keys::SecretLease,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+        purpose: LeftPurgePurpose,
+    },
+    OwnKeyEndedPurgeReady {
+        _secret: own_keys::SecretLease,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    },
+    OwnKeyPolicyReady {
+        room: Digest32,
+        owner: Arc<()>,
+    },
+    OwnKeyPolicyFailed {
+        room: Digest32,
+        owner: Arc<()>,
+        error: String,
+    },
+    OwnKeyOpenReady(Box<own_keys::OpenReady>),
+    OwnKeyRequestReady(Box<own_keys::RequestReady>),
+    OwnKeyResponseReady(Box<own_keys::ResponseReady>),
+    OwnKeyRequestFailed {
+        _lease: Arc<own_attempts::Lease>,
+        request: own_keys::Request,
+        peer: Digest32,
+        connection: u64,
+    },
     /// A stream that carried this node's hello to `peer` could not be written: the peer does not
     /// hold the session, so the next delivery must carry the hello again.
     HelloUndelivered {
@@ -1433,6 +1585,7 @@ enum NetEvent {
         channel_id: Digest32,
         peer: Digest32,
         discovery_connection: Option<u64>,
+        availability: Option<crate::node::channel::availability::Token>,
         instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
         head: crate::node::history_stream::HeadHint,
         epoch: u64,
@@ -2296,11 +2449,15 @@ async fn serve_typed(
         // pairwise streams is load-bearing: a hello and the key that follows it can be separate
         // streams, and reordering them is the race F12 was. So a silent stream holds back only
         // the pairwise streams its own peer opened after it.
-        Ok(Inbound::Pairwise { peer, send, recv }) => {
+        Ok(Inbound::Pairwise {
+            peer: _,
+            send,
+            recv,
+        }) => {
             state.failures = 0;
             let queue = state.pairwise.get_or_insert_with(|| {
                 let (q, rx) = mpsc::channel(PAIRWISE_QUEUE);
-                tokio::spawn(read_pairwise_streams(peer, rx, tx.clone()));
+                tokio::spawn(read_pairwise_streams(Arc::clone(&conn), rx, tx.clone()));
                 q
             });
             // Back-pressure on this peer's own connection only: a full queue means this peer has
@@ -2604,11 +2761,50 @@ const PAIRWISE_QUEUE: usize = 32;
 /// `framing::FRAME_PATIENCE`; a stream that sends nothing usable is dropped here, as the actor
 /// dropped it before.
 async fn read_pairwise_streams(
-    peer: Digest32,
+    conn: Arc<VoxConnection>,
     mut streams: mpsc::Receiver<(quinn::SendStream, quinn::RecvStream)>,
     tx: mpsc::Sender<NetEvent>,
 ) {
     use crate::node::pairwise_stream::{recv_pairwise, PairwiseFrame};
+    let peer = conn.peer_id();
+    // The existing per-connection queue allowance also bounds recovery requests retained
+    // beyond actor dequeue while they wait on a real local admission edge.
+    let recovery_slots = Arc::new(Semaphore::new(PAIRWISE_QUEUE));
+    let overflow = Arc::new(own_keys::DonorOverflow::default());
+    let overflow_worker = {
+        let overflow = Arc::clone(&overflow);
+        let slots = Arc::clone(&recovery_slots);
+        let connection = Arc::clone(&conn);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut after = None;
+            loop {
+                let changed = overflow.changed.notified();
+                let Some((room, instance)) = overflow.take(after) else {
+                    tokio::select! {
+                        _ = connection.quinn().closed() => return,
+                        _ = changed => continue,
+                    }
+                };
+                after = Some(room);
+                let capacity = tokio::select! {
+                    _ = connection.quinn().closed() => return,
+                    permit = Arc::clone(&slots).acquire_owned() => match permit { Ok(permit) => permit, Err(_) => return },
+                };
+                tokio::select! {
+                    _ = connection.quinn().closed() => return,
+                    result = tx.send(NetEvent::OwnKeyDonorSlot { room, peer, connection: Arc::clone(&connection), instance, capacity }) => if result.is_err() { return; },
+                }
+            }
+        })
+    };
+    struct AbortOverflow(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOverflow {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _overflow_worker = AbortOverflow(overflow_worker);
     while let Some((mut send, mut recv)) = streams.recv().await {
         let first = match recv_pairwise(&mut recv).await {
             Ok(Some(first)) => first,
@@ -2624,6 +2820,15 @@ async fn read_pairwise_streams(
                 continue;
             }
         };
+        if matches!(first, PairwiseFrame::RecoveryReply { .. })
+            || (matches!(first, PairwiseFrame::RecoveryOpen { .. })
+                && !conn.supports_own_recovery())
+        {
+            let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
+            let _ = send.reset(why);
+            let _ = recv.stop(why);
+            continue;
+        }
         // A hello is followed on the same stream by the frame it opens the session for, written
         // without waiting for anything, so it is read now too.
         let second = if matches!(first, PairwiseFrame::Hello { .. }) {
@@ -2631,7 +2836,36 @@ async fn read_pairwise_streams(
         } else {
             None
         };
+        let recovery_credit = if let PairwiseFrame::RecoveryOpen { channel_id, .. } = &first {
+            match Arc::clone(&recovery_slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    let room = *channel_id;
+                    let why = crate::node::pairwise_stream::KeyRefusal::NotAccepted.code();
+                    let _ = send.reset(why);
+                    let _ = recv.stop(why);
+                    if tx
+                        .send(NetEvent::OwnKeyDonorBusy {
+                            room,
+                            peer,
+                            connection: Arc::clone(&conn),
+                            overflow: Arc::clone(&overflow),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let stream = PairwiseIn {
+            recovery_credit,
+            donor_admission: None,
+            conn: Arc::clone(&conn),
             peer,
             first,
             second,
@@ -2646,6 +2880,9 @@ async fn read_pairwise_streams(
 
 /// A pairwise stream whose frames have been read off the actor.
 struct PairwiseIn {
+    recovery_credit: Option<OwnedSemaphorePermit>,
+    donor_admission: Option<PairwiseAdmission>,
+    conn: Arc<VoxConnection>,
     /// The authenticated peer.
     peer: Digest32,
     /// The stream's first frame.
@@ -4415,6 +4652,7 @@ pub struct NodeHandle {
     /// Posts waiting for one room's bounded publication owner to yield. The command queue does
     /// not bound sleeping client futures, so their retained text has its own fixed node budget.
     post_slots: Arc<Semaphore>,
+    computer_policy_slots: Arc<Semaphore>,
     view_rx: watch::Receiver<NodeView>,
     /// Kept so a client may subscribe at any time after the node started.
     event_tx: broadcast::Sender<NodeEvent>,
@@ -5008,6 +5246,21 @@ impl NodeHandle {
     /// actor has stopped.
     pub async fn apply(&self, command: NodeCommand) -> Outcome {
         match command {
+            NodeCommand::Unlock { passphrase } => {
+                let permit = match Arc::clone(&self.computer_policy_slots)
+                    .acquire_owned()
+                    .await
+                {
+                    Ok(permit) => permit,
+                    Err(_) => return Outcome::Failed(Fault::ShuttingDown),
+                };
+                apply_command(
+                    &self.cmd_tx,
+                    NodeCommand::UnlockAdmitted { passphrase, permit },
+                )
+                .await
+            }
+            NodeCommand::UnlockAdmitted { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::SendText { channel_id, text } => {
                 apply_post_command(&self.cmd_tx, &self.post_slots, channel_id, text, None).await
             }
@@ -5235,11 +5488,26 @@ fn read_pending_withdrawals(
 
 /// An opened room stays private until one bounded recovery/retention turn completes.
 /// Only its original caller is held; no transcript-sized task or waiter list is retained.
+enum RecoveryWriterGate {
+    Waiting {
+        owner: Arc<()>,
+        fence: Arc<crate::transport::stream_transport::Fence>,
+    },
+    Ready(crate::node::channel::own_writer_gate::Transition),
+}
+
+struct OwnKeyPolicyFlight {
+    owner: Arc<()>,
+    guard: computer::ComputerPolicyGuard,
+    fence: Arc<crate::transport::stream_transport::Fence>,
+}
+
 struct RoomPreparation {
     channel: tokio::sync::Mutex<ChannelState>,
     reply: Option<oneshot::Sender<Outcome>>,
     reopening: bool,
     recovery: Option<std::sync::Weak<tokio::sync::Mutex<ChannelState>>>,
+    recovery_writer_gate: Option<RecoveryWriterGate>,
     // Current trust is checked again between bounded preparation turns. A later decision
     // restarts both cursors before this room can become visible or serve a peer.
     trusted: Option<BTreeSet<Digest32>>,
@@ -5342,6 +5610,38 @@ struct RoomPublication {
     authority: Option<(computer::ComputerAuthority, RoomPublicationOwnership)>,
 }
 
+enum LeftPurgePurpose {
+    Join {
+        link: String,
+        passphrase: Secret,
+        reply: oneshot::Sender<Outcome>,
+    },
+    Leave {
+        replies: Vec<oneshot::Sender<Outcome>>,
+    },
+}
+
+impl LeftPurgePurpose {
+    async fn caller_closed(&mut self) {
+        match self {
+            Self::Join { reply, .. } => reply.closed().await,
+            Self::Leave { .. } => std::future::pending::<()>().await,
+        }
+    }
+    fn fail(self, fault: Fault) {
+        match self {
+            Self::Join { reply, .. } => {
+                let _ = reply.send(Outcome::Failed(fault));
+            }
+            Self::Leave { replies } => {
+                for reply in replies {
+                    let _ = reply.send(Outcome::Failed(fault));
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct MemberReachOwner {
     room: Digest32,
@@ -5383,12 +5683,38 @@ pub struct Node {
     bounded_completion_wake: Arc<tokio::sync::Notify>,
     role_wake: Arc<crate::node::channel::role_owed::RoleWake>,
     key_body_scan: key_body_scan::Controller,
+    availability_wake: Arc<tokio::sync::Notify>,
     /// Exact retirement ownership and failures live on the daemon budget, so they survive both
     /// lock/unlock controller replacement and this actor unwinding until cleanup completes.
     bounded_retirement_ledger: Arc<crate::node::history_budget::RetirementLedger>,
     history_hints: Arc<crate::node::history_stream::HintInbox>,
     /// Scalar scheduling identities only. Durable targets and pages remain in the room/store.
     own_recovery_rooms: BTreeMap<Digest32, (Digest32, u64, bool)>,
+    /// The exact authenticated own message whose body the readability audit still needs.
+    own_recovery_body_debts: BTreeMap<Digest32, (Digest32, u64, Digest32)>,
+    own_readable_effects: BTreeMap<Digest32, ReadableOwnEffect>,
+    /// One exact request per room/donor, including requests waiting for an opening turn.
+    own_key_active: BTreeMap<(Digest32, Digest32), own_keys::ActiveAttempt>,
+    own_key_open: own_keys::OpenScheduler,
+    own_key_completions: Arc<own_attempts::Completions>,
+    own_key_credit_trust: BTreeMap<Digest32, BTreeSet<Digest32>>,
+    own_key_credit_missing: BTreeMap<Digest32, (u64, BTreeSet<Digest32>)>,
+    own_key_policy_waiting: BTreeMap<Digest32, Arc<()>>,
+    own_key_parked: BTreeMap<(Digest32, Digest32), own_keys::Parked>,
+    own_key_pending: BTreeMap<(Digest32, Digest32), own_keys::ResponseReady>,
+    own_key_interrupted_pending: BTreeMap<(Digest32, Digest32), own_keys::InterruptedReady>,
+    own_key_donor_busy: BTreeMap<(Digest32, Digest32), own_keys::DonorBusy>,
+    own_key_room_cancel: BTreeMap<Digest32, tokio::sync::watch::Sender<bool>>,
+    own_key_leave_pending: BTreeMap<Digest32, Arc<()>>,
+    own_key_ended_pending: BTreeMap<Digest32, Arc<()>>,
+    own_key_untrust_pending: Option<Arc<()>>,
+    own_key_room_set_changed: watch::Sender<()>,
+    own_key_untrust_transitions: Option<Vec<crate::node::channel::own_writer_gate::Transition>>,
+    own_key_computer_transitions: Option<computer::OwnKeyComputerTransitions>,
+    own_key_computer_pending: std::collections::VecDeque<computer::OwnKeyPolicyWork>,
+    own_key_computer_flight: Option<OwnKeyPolicyFlight>,
+    own_key_unlock_drain: Option<Vec<Digest32>>,
+    own_key_unlock_pending: Vec<Arc<()>>,
     /// Peers' acknowledgements of this node's own feed reported by lane rounds, applied on
     /// the next schedule (`note_held`).
     held_notes: Vec<(Digest32, Digest32, u64)>,
@@ -5640,7 +5966,11 @@ pub struct Node {
     locking: usize,
     /// Unlocks asked for while locking, run once it has settled: an unlock in between would
     /// start new work beside threads still holding the old secrets.
-    unlock_after_lock: Vec<(Secret, oneshot::Sender<Outcome>)>,
+    unlock_after_lock: Vec<(
+        Secret,
+        oneshot::Sender<Outcome>,
+        tokio::sync::OwnedSemaphorePermit,
+    )>,
     /// The last `refresh_network_view` gave up on a busy room, so the view is behind and the tick
     /// rebuilds it. Atomic only because the refresh takes `&self`.
     view_stale: std::sync::atomic::AtomicBool,
@@ -6251,9 +6581,33 @@ impl Node {
             bounded_completion_wake,
             role_wake: Arc::new(crate::node::channel::role_owed::RoleWake::default()),
             key_body_scan: key_body_scan::Controller::default(),
+            availability_wake: Arc::new(tokio::sync::Notify::new()),
             bounded_retirement_ledger,
             history_hints: crate::node::history_stream::HintInbox::new(),
             own_recovery_rooms: BTreeMap::new(),
+            own_recovery_body_debts: BTreeMap::new(),
+            own_readable_effects: BTreeMap::new(),
+            own_key_active: BTreeMap::new(),
+            own_key_open: own_keys::OpenScheduler::default(),
+            own_key_completions: Arc::new(own_attempts::Completions::default()),
+            own_key_credit_trust: BTreeMap::new(),
+            own_key_credit_missing: BTreeMap::new(),
+            own_key_policy_waiting: BTreeMap::new(),
+            own_key_parked: BTreeMap::new(),
+            own_key_pending: BTreeMap::new(),
+            own_key_interrupted_pending: BTreeMap::new(),
+            own_key_donor_busy: BTreeMap::new(),
+            own_key_room_cancel: BTreeMap::new(),
+            own_key_leave_pending: BTreeMap::new(),
+            own_key_ended_pending: BTreeMap::new(),
+            own_key_untrust_pending: None,
+            own_key_room_set_changed: watch::channel(()).0,
+            own_key_untrust_transitions: None,
+            own_key_computer_transitions: None,
+            own_key_computer_pending: std::collections::VecDeque::new(),
+            own_key_computer_flight: None,
+            own_key_unlock_drain: None,
+            own_key_unlock_pending: Vec::new(),
             held_notes: Vec::new(),
             history_budget,
             private_pulls: BTreeMap::new(),
@@ -6540,6 +6894,7 @@ impl Node {
             startup_computer_boundary,
             cmd_tx,
             post_slots,
+            computer_policy_slots: Arc::new(Semaphore::new(NET_QUEUE)),
             view_rx,
             event_tx: handle_event_tx,
             events: Arc::new(Mutex::new(event_rx)),
@@ -6604,7 +6959,7 @@ impl Node {
             }
             return;
         }
-        for (_, reply) in std::mem::take(&mut self.unlock_after_lock) {
+        for (_, reply, _permit) in std::mem::take(&mut self.unlock_after_lock) {
             let _ = reply.send(Outcome::Failed(Fault::ShuttingDown));
         }
         self.settle_lock().await;
@@ -6642,6 +6997,7 @@ impl Node {
         let ingress_wake = Arc::clone(&self.session_ingress_wake);
         let bounded_completion_wake = Arc::clone(&self.bounded_completion_wake);
         let role_wake = Arc::clone(&self.role_wake);
+        let own_key_completions = Arc::clone(&self.own_key_completions);
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Preparation, cleanup, governance and package scans share one select slot. Rotate between
@@ -6659,6 +7015,18 @@ impl Node {
             };
             tokio::pin!(governance_deadline);
             tokio::select! {
+                () = self.availability_wake.notified() => { self.accept_availability(); self.schedule().await; }
+                () = own_key_completions.notify.notified() => {
+                    for completed in own_key_completions.take() {
+                        let key = (completed.room, completed.peer);
+                        self.own_key_open.finished(completed.room, completed.peer, completed.request);
+                        if self.own_key_active.get(&key).is_some_and(|active| active.request.id == completed.request) {
+                            self.own_key_active.remove(&key);
+                            if self.channels.contains_key(&completed.room) { self.governance_work.wake_room(completed.room); }
+                        }
+                    }
+                    self.schedule_own_key_open();
+                }
                 () = &mut governance_deadline => {
                     // Certificate expiry is its own causal wake. A quiet room does not wait for
                     // the one-second actor tick, a command, or network traffic to invalidate it.
@@ -6827,8 +7195,13 @@ impl Node {
                     }
                     // **A leave is answered once another member has the departure** (V210-164):
                     // see `begin_leave`.
+                    if let NodeCommand::CloseChannel { channel_id } = command {
+                        self.begin_own_key_close(channel_id, reply).await;
+                        self.note_if_stalled(name, started);
+                        continue;
+                    }
                     if let NodeCommand::LeaveRoom { channel_id } = command {
-                        self.begin_leave(channel_id, reply).await;
+                        self.begin_own_key_leave(channel_id, reply).await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
                         self.schedule().await;
@@ -6846,14 +7219,21 @@ impl Node {
                     // reopen off the actor so the node answers everyone meanwhile, but a caller
                     // told `Done` — `vox daemon`, which then opens its control socket — must not
                     // find a room it held still closed.
-                    if let NodeCommand::Unlock { passphrase } = command {
+                    if let NodeCommand::UnlockAdmitted { passphrase, permit } = command {
                         if self.locking > 0 {
-                            self.unlock_after_lock.push((passphrase, reply));
+                            self.unlock_after_lock.push((passphrase, reply, permit));
                         } else {
-                            self.unlock_and_answer(&passphrase, reply).await;
+                            self.unlock_and_answer(&passphrase, reply, permit).await;
                         }
                         self.note_if_stalled(name, started);
                         self.publish().await;
+                        continue;
+                    }
+                    if matches!(&command, NodeCommand::Untrust { .. })
+                        || matches!(&command, NodeCommand::Proved { change } if matches!(**change, NodeCommand::Untrust { .. }))
+                    {
+                        self.begin_own_key_untrust(command, reply);
+                        self.note_if_stalled(name, started);
                         continue;
                     }
                     // Reserve the room's sole completion before any signed/config write.
@@ -6948,6 +7328,9 @@ impl Node {
                     }
                 }
                 _ = role_wake.notify.notified() => {
+                    for (room, owner) in role_wake.take_board() {
+                        if role_wake.current(room, &owner) { self.own_key_board_growth(room); }
+                    }
                     for ((room, peer), owner) in role_wake.take() {
                         if !self.channels.contains_key(&room) || !role_wake.current(room, &owner) {
                             continue;
@@ -7162,6 +7545,7 @@ impl Node {
             }
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
+            NodeCommand::UnlockAdmitted { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::SetAnchors { anchors } => {
                 if self.anchors == anchors {
                     return Outcome::Done;
@@ -7258,7 +7642,7 @@ impl Node {
             } => self.append_session(&channel_id, &session_id, &body).await,
             // Answered through `begin_open_channel`, which the run loop calls instead of this.
             NodeCommand::OpenChannel { .. } => Outcome::Failed(Fault::Internal),
-            NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
+            NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id, None).await,
             NodeCommand::EndRoom { channel_id } => self.end_room(&channel_id).await,
             NodeCommand::SetAdmin {
                 channel_id,
@@ -7657,6 +8041,10 @@ impl Node {
                     return Outcome::Failed(fault_of(&e));
                 }
                 if let Err(e) = self.start_network() {
+                    if let Error::OwnKeyWriterDrainRequired(targets) = e {
+                        self.own_key_unlock_drain = Some(targets);
+                        return Outcome::Failed(Fault::RoomChangePending);
+                    }
                     drop(self.lock_all().await);
                     eprintln!("vox node: identity unlock could not start networking: {e}");
                     return Outcome::Failed(fault_of(&e));
@@ -7674,6 +8062,13 @@ impl Node {
     /// identity and spawn the accept loop. A no-op when this node does not network,
     /// or when it is already up.
     fn start_network(&mut self) -> crate::error::Result<()> {
+        self.start_network_with_boundary(None)
+    }
+
+    fn start_network_with_boundary(
+        &mut self,
+        boundary: Option<(std::time::Instant, Digest32)>,
+    ) -> crate::error::Result<()> {
         let identity = self.profile.as_ref().map(Profile::fingerprint).or_else(|| {
             self.headless
                 .as_ref()
@@ -7687,8 +8082,15 @@ impl Node {
         // and every daemon Ready reconciliation. A miss does not cancel accepted valid work;
         // actual policy movement retries under this same original observation end. The identity
         // travels with it so headless actors do not depend on a vault projection in `NodeView`.
-        let deadline =
-            std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN;
+        let deadline = match boundary {
+            Some((deadline, owner)) if owner == identity => deadline,
+            Some(_) => {
+                return Err(Error::Profile(
+                    "startup identity changed during policy settlement",
+                ))
+            }
+            None => std::time::Instant::now() + crate::node::computer::COMPUTER_RETURN_SHOWN_WITHIN,
+        };
         *self
             .startup_computer_boundary
             .lock()
@@ -7761,7 +8163,9 @@ impl Node {
         // all belong to other channels. The drop is acceptable, not harmless.
         {
             let tx = self.net_tx.clone();
+            let role_wake = Arc::clone(&self.role_wake);
             net.on_board_growth(Arc::new(move |channel_id: Digest32| {
+                role_wake.board_growth(channel_id);
                 let _ = tx.try_send(NetEvent::BoardGrew { channel_id });
             }));
             // A withdraw changes what the board shows (V030-14): an event, so the view is
@@ -8597,25 +9001,7 @@ impl Node {
                     self.publish_waiters.insert(room, waiting);
                     return;
                 }
-                // Create/join may already have put this room or member on a board before the
-                // final authority fence discovered the concurrent Computer change. Publish the
-                // narrowing withdrawal first and retain it for later anchors; only then may the
-                // local unpublished room be purged.
-                let scope = if *ownership == RoomPublicationOwnership::Created {
-                    crate::nat::withdraw::WithdrawScope::Room
-                } else {
-                    crate::nat::withdraw::WithdrawScope::Member
-                };
-                if let Err(fault) = self.withdraw_from_boards(&room, scope, authority).await {
-                    self.fail_room_publication(room, waiting, fault);
-                    return;
-                }
-                let outcome =
-                    self.reject_room_publication(&room, *ownership, Fault::ComputerPolicy);
-                self.publish().await;
-                if let Some(reply) = waiting.reply {
-                    let _ = reply.send(outcome);
-                }
+                self.begin_own_key_publication_reject(room, waiting);
                 return;
             }
         }
@@ -10413,6 +10799,613 @@ impl Node {
             NetEvent::Pairwise(stream) => {
                 self.take_inbound_skdm(stream).await;
             }
+            NetEvent::OwnKeyDonorBusy {
+                room,
+                peer,
+                connection,
+                overflow,
+            } => {
+                if self.trust.is_trusted(&peer)
+                    && self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&peer))
+                        .is_some_and(|current| Arc::ptr_eq(&current, &connection))
+                {
+                    if let Some(instance) = self.channels.get(&room) {
+                        // A contended room may be retained as identity only. When readable,
+                        // reject a nonmember before it can occupy an overflow slot.
+                        let eligible = instance.try_lock().map_or(true, |channel| {
+                            !channel.has_left(&channel.me())
+                                && channel.is_member(&peer)
+                                && !channel.has_left(&peer)
+                        });
+                        if eligible {
+                            overflow.add(room, Arc::downgrade(instance));
+                        }
+                    }
+                }
+            }
+            NetEvent::OwnKeyDonorSlot {
+                room,
+                peer,
+                connection,
+                instance,
+                capacity,
+            } => {
+                if self.channels.get(&room).is_some_and(|current| {
+                    instance
+                        .upgrade()
+                        .is_some_and(|old| Arc::ptr_eq(current, &old))
+                }) {
+                    self.begin_own_key_donor_busy(room, peer, connection, capacity);
+                }
+            }
+            NetEvent::OwnKeyDonorAvailable {
+                room,
+                peer,
+                connection,
+                instance,
+                owner,
+                from_wait,
+            } => self.finish_own_key_donor_busy(room, peer, connection, instance, owner, from_wait),
+            NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
+            NetEvent::OwnKeyWriterInterrupted(ready) => self.finish_own_key_interruption(ready),
+            NetEvent::OwnKeyUnlockReady {
+                _secret,
+                owner,
+                rooms,
+                transitions,
+                mut targets,
+                boundary,
+                generation,
+                reply,
+                permit,
+            } => {
+                let Some(position) = self
+                    .own_key_unlock_pending
+                    .iter()
+                    .position(|current| Arc::ptr_eq(current, &owner))
+                else {
+                    let _ = reply.send(Outcome::Failed(Fault::Locked));
+                    return;
+                };
+                self.own_key_unlock_pending.remove(position);
+                let same_identity = self.locking == 0
+                    && *self.pairwise_epoch.borrow() == generation
+                    && self.profile.as_ref().is_some_and(|profile| {
+                        profile.is_unlocked() && profile.fingerprint() == boundary.1
+                    });
+                let current = rooms.len() == self.channels.len()
+                    && rooms.iter().all(|(id, old)| {
+                        self.channels
+                            .get(id)
+                            .is_some_and(|current| Arc::ptr_eq(current, old))
+                    });
+                if reply.is_closed() {
+                    drop(transitions);
+                } else if !same_identity {
+                    let _ = reply.send(Outcome::Failed(Fault::Locked));
+                } else if !current || transitions.is_none() {
+                    drop(transitions);
+                    self.begin_own_key_unlock(targets, boundary, generation, reply, permit);
+                } else if let Some(transitions) = transitions {
+                    targets.sort_unstable();
+                    self.own_key_computer_transitions = Some(computer::OwnKeyComputerTransitions {
+                        rooms: rooms
+                            .iter()
+                            .map(|(id, room)| (*id, Arc::downgrade(room)))
+                            .collect(),
+                        removed: targets,
+                        transitions,
+                    });
+                    let result = self.start_network_with_boundary(Some(boundary));
+                    self.own_key_computer_transitions = None;
+                    match result {
+                        Err(Error::OwnKeyWriterDrainRequired(targets)) => {
+                            self.begin_own_key_unlock(targets, boundary, generation, reply, permit)
+                        }
+                        Err(error) => {
+                            drop(self.lock_all().await);
+                            eprintln!(
+                                "vox node: identity unlock could not start networking: {error}"
+                            );
+                            let _ = reply.send(Outcome::Failed(fault_of(&error)));
+                        }
+                        Ok(()) => {
+                            self.reopen_remembered().await;
+                            self.resume_own_key_interruptions();
+                            self.resume_own_key_donor_busy();
+                            self.resume_own_key_policy_waiting();
+                            self.publish().await;
+                            let _ = reply.send(Outcome::Done);
+                        }
+                    }
+                }
+            }
+            NetEvent::OwnKeyComputerCancelled { owner } => {
+                self.own_key_computer_pending
+                    .retain(|work| !Arc::ptr_eq(&work.owner, &owner));
+                if let Some(flight) = &self.own_key_computer_flight {
+                    if Arc::ptr_eq(&flight.owner, &owner) {
+                        flight.fence.retire();
+                    }
+                }
+                self.start_own_key_computer_drain();
+            }
+            NetEvent::OwnKeyComputerReady {
+                _secret,
+                owner,
+                rooms,
+                transitions,
+                mut work,
+            } => {
+                if self
+                    .own_key_computer_flight
+                    .as_ref()
+                    .is_some_and(|flight| Arc::ptr_eq(&flight.owner, &owner))
+                {
+                    self.own_key_computer_flight = None;
+                    let current = rooms.len() == self.channels.len()
+                        && rooms.iter().all(|(id, old)| {
+                            self.channels
+                                .get(id)
+                                .is_some_and(|current| Arc::ptr_eq(current, old))
+                        });
+                    if work.reply.is_closed() {
+                        drop(transitions);
+                    } else if let Err(error) = work.guard.active(self.computer.as_ref()) {
+                        let _ = work.reply.send(Err(error));
+                    } else if current {
+                        if let Some(transitions) = transitions {
+                            work.targets.sort_unstable();
+                            self.own_key_computer_transitions =
+                                Some(computer::OwnKeyComputerTransitions {
+                                    rooms: rooms
+                                        .iter()
+                                        .map(|(id, room)| (*id, Arc::downgrade(room)))
+                                        .collect(),
+                                    removed: work.targets.clone(),
+                                    transitions,
+                                });
+                            self.apply_owned_computer_policy(work).await;
+                        } else {
+                            self.own_key_computer_pending.push_front(work);
+                        }
+                    } else {
+                        drop(transitions);
+                        self.own_key_computer_pending.push_front(work);
+                    }
+                    self.start_own_key_computer_drain();
+                }
+            }
+            NetEvent::OwnKeyRecoveryReady {
+                room,
+                owner,
+                transition,
+            } => {
+                if let Some(prepared) = self.preparing_rooms.get_mut(&room) {
+                    if matches!(&prepared.recovery_writer_gate, Some(RecoveryWriterGate::Waiting { owner: current, .. }) if Arc::ptr_eq(current, &owner))
+                    {
+                        prepared.recovery_writer_gate = transition.map(RecoveryWriterGate::Ready);
+                        prepared.legacy_cleanup_due = None;
+                        self.preparation_after = None;
+                    }
+                }
+            }
+            NetEvent::OwnKeyUntrustReady {
+                _secret,
+                owner,
+                rooms,
+                transitions,
+                command,
+                reply,
+            } => {
+                if !self
+                    .own_key_untrust_pending
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                } else {
+                    self.own_key_untrust_pending = None;
+                    let current = rooms.len() == self.channels.len()
+                        && rooms.iter().all(|(room, instance)| {
+                            self.channels
+                                .get(room)
+                                .is_some_and(|current| Arc::ptr_eq(current, instance))
+                        });
+                    if reply.is_closed() {
+                        drop(transitions);
+                    } else if current {
+                        if let Some(transitions) = transitions {
+                            self.own_key_untrust_transitions = Some(transitions);
+                            let outcome = self.handle(command).await;
+                            self.own_key_untrust_transitions = None;
+                            let _ = reply.send(outcome);
+                        } else {
+                            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+                        }
+                    } else {
+                        drop(transitions);
+                        self.begin_own_key_untrust(command, reply);
+                    }
+                }
+            }
+            NetEvent::OwnKeyLeaveReady {
+                _secret,
+                room,
+                instance,
+                owner,
+                transition,
+                reply,
+            } => {
+                if !self
+                    .own_key_leave_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                } else {
+                    self.own_key_leave_pending.remove(&room);
+                    if self.publish_waiters.contains_key(&room) {
+                        self.publication_pending = true;
+                        self.publication_again = true;
+                    }
+                    if reply.is_closed() {
+                        drop(transition);
+                    } else if self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        if let Some(transition) = transition {
+                            self.begin_leave(room, reply, Some(transition)).await;
+                        } else {
+                            let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                        }
+                    } else {
+                        let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    }
+                }
+            }
+            NetEvent::OwnKeyCloseReady {
+                _secret,
+                room,
+                instance,
+                owner,
+                transition,
+                reply,
+            } => {
+                if !self
+                    .own_key_leave_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                } else {
+                    self.own_key_leave_pending.remove(&room);
+                    if self.publish_waiters.contains_key(&room) {
+                        self.publication_pending = true;
+                        self.publication_again = true;
+                    }
+                    if reply.is_closed() {
+                        drop(transition);
+                    } else if self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                        && transition.is_some()
+                    {
+                        let outcome = self.close_channel(&room, transition).await;
+                        let _ = reply.send(outcome);
+                    } else {
+                        let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+                    }
+                }
+            }
+            NetEvent::OwnKeyPublicationRejectReady {
+                _secret,
+                room,
+                instance,
+                owner,
+                transition,
+                waiting,
+            } => {
+                if !self
+                    .own_key_leave_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    self.fail_room_publication(room, waiting, Fault::ChannelNotOpen);
+                } else {
+                    self.own_key_leave_pending.remove(&room);
+                    if transition.is_none()
+                        || !self
+                            .channels
+                            .get(&room)
+                            .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        self.fail_room_publication(room, waiting, Fault::ChannelNotOpen);
+                    } else if let Some((authority, ownership)) = waiting.authority.as_ref() {
+                        let current = if *ownership == RoomPublicationOwnership::Created {
+                            authority.publish_room_creation(|| ()).is_some()
+                        } else {
+                            authority.current()
+                        };
+                        if current {
+                            drop(transition);
+                            self.publish_waiters.insert(room, waiting);
+                            self.publication_pending = true;
+                            self.publication_again = true;
+                            return;
+                        }
+                        // An unavailable authority may merely be blocked during a save or
+                        // waiting for application at the same revision. Preserve the room
+                        // in that case; only a newer committed revision proves supersession.
+                        let superseded = match authority {
+                            computer::ComputerAuthority::Managed {
+                                computer, applied, ..
+                            } => {
+                                computer.storage_ready().is_ok()
+                                    && computer.policy_revision() > *applied
+                            }
+                            computer::ComputerAuthority::Unmanaged => false,
+                        };
+                        if !superseded {
+                            drop(transition);
+                            self.fail_room_publication(room, waiting, Fault::ComputerPolicy);
+                            return;
+                        }
+                        let scope = if *ownership == RoomPublicationOwnership::Created {
+                            crate::nat::withdraw::WithdrawScope::Room
+                        } else {
+                            crate::nat::withdraw::WithdrawScope::Member
+                        };
+                        if let Err(fault) = self.withdraw_from_boards(&room, scope, authority).await
+                        {
+                            self.fail_room_publication(room, waiting, fault);
+                        } else {
+                            let still_superseded = match authority {
+                                computer::ComputerAuthority::Managed {
+                                    computer, applied, ..
+                                } => {
+                                    computer.storage_ready().is_ok()
+                                        && computer.policy_revision() > *applied
+                                }
+                                computer::ComputerAuthority::Unmanaged => false,
+                            };
+                            if !still_superseded
+                                || !self
+                                    .channels
+                                    .get(&room)
+                                    .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                            {
+                                drop(transition);
+                                self.fail_room_publication(room, waiting, Fault::ComputerPolicy);
+                                return;
+                            }
+                            let outcome = self.reject_room_publication(
+                                &room,
+                                *ownership,
+                                Fault::ComputerPolicy,
+                            );
+                            drop(transition);
+                            self.publish().await;
+                            if let Some(reply) = waiting.reply {
+                                let _ = reply.send(outcome);
+                            }
+                        }
+                    } else {
+                        self.fail_room_publication(room, waiting, Fault::ComputerPolicy);
+                    }
+                }
+            }
+            NetEvent::OwnKeyLeftPurgeReady {
+                _secret,
+                room,
+                instance,
+                owner,
+                transition,
+                purpose,
+            } => {
+                if !self
+                    .own_key_ended_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    purpose.fail(Fault::ChannelNotOpen);
+                } else if let Some(transition) = transition {
+                    if !self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        self.own_key_ended_pending.remove(&room);
+                        purpose.fail(Fault::ChannelNotOpen);
+                    } else {
+                        match Arc::clone(&instance).try_lock_owned() {
+                            Err(_) => self.wait_own_key_left_room(
+                                room, instance, owner, transition, purpose, _secret,
+                            ),
+                            Ok(channel) if !channel.has_left(&channel.me()) => {
+                                drop(channel);
+                                drop(transition);
+                                self.own_key_ended_pending.remove(&room);
+                                self.sched_rooms.insert(room);
+                                self.discover_rooms.insert(room);
+                                let fault = match self.forget_pending_withdrawal(&room) {
+                                    Ok(()) => Fault::LeaveUndone,
+                                    Err(error) => fault_of(&error),
+                                };
+                                purpose.fail(fault);
+                            }
+                            Ok(channel) => {
+                                self.own_key_ended_pending.remove(&room);
+                                let outcome =
+                                    self.purge_room(&room, Some((transition, channel))).await;
+                                if !outcome.is_done() && self.channels.contains_key(&room) {
+                                    self.sched_rooms.insert(room);
+                                    self.discover_rooms.insert(room);
+                                }
+                                match purpose {
+                                    LeftPurgePurpose::Join {
+                                        link,
+                                        passphrase,
+                                        reply,
+                                    } => {
+                                        if outcome.is_done() {
+                                            self.begin_join_channel(link, passphrase, reply).await;
+                                        } else {
+                                            let _ = reply.send(outcome);
+                                        }
+                                    }
+                                    LeftPurgePurpose::Leave { replies } => {
+                                        for reply in replies {
+                                            let _ = reply.send(outcome);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    self.own_key_ended_pending.remove(&room);
+                    if self
+                        .channels
+                        .get(&room)
+                        .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                    {
+                        self.sched_rooms.insert(room);
+                        self.discover_rooms.insert(room);
+                    }
+                    purpose.fail(Fault::ChannelNotOpen);
+                }
+            }
+            NetEvent::OwnKeyEndedPurgeReady {
+                _secret,
+                room,
+                instance,
+                owner,
+                transition,
+            } => {
+                if self
+                    .own_key_ended_pending
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    if let Some(transition) = transition {
+                        if self
+                            .channels
+                            .get(&room)
+                            .is_some_and(|current| Arc::ptr_eq(current, &instance))
+                        {
+                            match Arc::clone(&instance).try_lock_owned() {
+                                Ok(channel) => {
+                                    let ended = channel.ended(self.now_ms().get()).is_some();
+                                    let pending =
+                                        self.publish_waiters.get(&room).is_some_and(|waiting| {
+                                            waiting.kind != RoomPublicationKind::Open
+                                        });
+                                    if ended && !pending && self.winding.contains_key(&room) {
+                                        let members: Vec<_> = channel
+                                            .members()
+                                            .into_iter()
+                                            .filter(|peer| *peer != channel.me())
+                                            .collect();
+                                        let winding = &self.winding[&room];
+                                        let handed = members
+                                            .iter()
+                                            .filter(|peer| {
+                                                self.ports.get(&(room, **peer)).is_some_and(
+                                                    |port| port.done_gen >= winding.gen,
+                                                )
+                                            })
+                                            .count();
+                                        if handed >= members.len()
+                                            || winding.since.elapsed() >= WIND_DOWN
+                                        {
+                                            self.own_key_ended_pending.remove(&room);
+                                            self.winding.remove(&room);
+                                            let _ = self.event_tx.send(NodeEvent::RoomEnded {
+                                                channel_id: room,
+                                                handed,
+                                                members: members.len(),
+                                            });
+                                            let _ = self
+                                                .purge_room(&room, Some((transition, channel)))
+                                                .await;
+                                            return;
+                                        }
+                                    }
+                                    drop(channel);
+                                    drop(transition);
+                                    self.own_key_ended_pending.remove(&room);
+                                    self.sched_rooms.insert(room);
+                                    self.discover_rooms.insert(room);
+                                }
+                                Err(_) => {
+                                    self.wait_own_key_ended_room(
+                                        room, instance, owner, transition, _secret,
+                                    );
+                                }
+                            }
+                        } else {
+                            self.own_key_ended_pending.remove(&room);
+                        }
+                    } else {
+                        self.own_key_ended_pending.remove(&room);
+                        self.sched_rooms.insert(room);
+                    }
+                }
+            }
+            NetEvent::OwnKeyPolicyReady { room, owner } => {
+                if self
+                    .own_key_policy_waiting
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    self.own_key_policy_waiting.remove(&room);
+                    if self.channels.contains_key(&room) {
+                        self.governance_work.wake_room(room);
+                        self.resume_own_key_donor_busy();
+                    }
+                }
+            }
+            NetEvent::OwnKeyPolicyFailed { room, owner, error } => {
+                if self
+                    .own_key_policy_waiting
+                    .get(&room)
+                    .is_some_and(|current| Arc::ptr_eq(current, &owner))
+                {
+                    self.own_key_policy_waiting.remove(&room);
+                    let keys: Vec<_> = self
+                        .own_key_donor_busy
+                        .keys()
+                        .filter(|(id, _)| *id == room)
+                        .copied()
+                        .collect();
+                    for key in keys {
+                        self.retire_own_key_donor_busy(key);
+                    }
+                    let _ = self.event_tx.send(NodeEvent::NodeNote {
+                        note: format!("own-key recovery stopped: {error}"),
+                    });
+                }
+            }
+            NetEvent::OwnKeyOpenReady(ready) => self.handle_own_key_open(*ready),
+            NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
+            NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
+            NetEvent::OwnKeyRequestFailed {
+                _lease,
+                request,
+                peer,
+                connection,
+            } => {
+                self.own_key_open.finished(request.room, peer, request.id);
+                self.fail_own_key_request(request, peer, connection);
+                self.schedule_own_key_open();
+            }
             NetEvent::HelloUndelivered {
                 channel_id,
                 peer,
@@ -10799,6 +11792,13 @@ impl Node {
                 });
                 if changed_connection {
                     for room in self.channels.keys().copied() {
+                        if self.ports.contains_key(&(room, peer))
+                            && (self.own_key_active.keys().any(|(r, _)| *r == room)
+                                || self.own_key_credit_missing.contains_key(&room)
+                                || self.own_recovery_rooms.contains_key(&room))
+                        {
+                            self.governance_work.wake_room(room);
+                        }
                         if let Some(owner) = self.role_wake.owner(room) {
                             owner.on_connect(peer);
                             if let Some(conn) = conn.as_ref() {
@@ -11657,6 +12657,7 @@ impl Node {
                 channel_id,
                 peer,
                 discovery_connection,
+                availability,
                 instance,
                 head,
                 epoch,
@@ -11684,7 +12685,10 @@ impl Node {
                                     == Some(generation);
                             let discovered = current
                                 && discovery_connection.is_some_and(|serial| {
-                                    self.net
+                                    self.ports.get(&(channel_id, peer)).is_some_and(|p| {
+                                        p.availability.remote(serial) == availability
+                                    }) && self
+                                        .net
                                         .as_ref()
                                         .and_then(|net| net.manager().existing(&peer))
                                         .is_some_and(|connection| {
@@ -12095,17 +13099,18 @@ impl Node {
                         use crate::node::channel::history::Reply;
                         let mut room = shared.lock().await;
                         let trusted = self.trust.trusted();
-                        let result = room
-                            .forget_keys_except(profile.store(), &trusted)
-                            .map_err(|error| error.to_string())
-                            .and_then(|_| {
-                                room.history_query(
-                                    profile.store(),
-                                    query,
-                                    crate::node::ipc::rows_budget(),
-                                    (self.clock)(),
-                                )
-                            });
+                        let removed = room.forget_keys_except(profile.store(), &trusted);
+                        if removed.as_ref().is_ok_and(|count| *count > 0) {
+                            self.governance_work.wake_room(channel_id);
+                        }
+                        let result = removed.map_err(|error| error.to_string()).and_then(|_| {
+                            room.history_query(
+                                profile.store(),
+                                query,
+                                crate::node::ipc::rows_budget(),
+                                (self.clock)(),
+                            )
+                        });
                         match result {
                             Ok(Reply::DisplayRevision(revision)) => {
                                 use sha2::{Digest, Sha256};
@@ -12201,29 +13206,51 @@ impl Node {
                 .await;
                 let _ = reply.send(result);
             }
-            NetEvent::ComputerPolicy { guard, reply } => {
+            NetEvent::ComputerPolicy {
+                guard,
+                mut reply,
+                permit,
+            } => {
                 #[cfg(feature = "test-knobs")]
                 self.hold_computer_policy_for_proof(&guard).await;
                 #[cfg(feature = "test-knobs")]
                 let reply_delay = self.hold_computer_policy_reply_for_proof();
-                let result = match self.prepare_computer_binding_guarded(&guard) {
-                    Ok(()) => self.apply_computer_keyring_guarded(&guard).await,
-                    Err(e) => Err(e),
-                };
-                if result.is_ok() {
-                    self.governance_work.resume_after_computer_policy();
+                if reply.is_closed() {
+                    return;
                 }
-                #[cfg(feature = "test-knobs")]
-                if let Some(delay) = reply_delay {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = reply.send(result);
-                    });
-                } else {
-                    let _ = reply.send(result);
+                if let Some(flight) = &self.own_key_computer_flight {
+                    if flight.guard.active(self.computer.as_ref()).is_err() {
+                        flight.fence.retire();
+                    }
                 }
-                #[cfg(not(feature = "test-knobs"))]
-                let _ = reply.send(result);
+                let owner = Arc::new(());
+                let cancel_owner = Arc::clone(&owner);
+                let tx = self.net_tx.clone();
+                let (completion, finished) = oneshot::channel();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        biased;
+                        _ = reply.closed() => {
+                            let _ = tx.send(NetEvent::OwnKeyComputerCancelled { owner: cancel_owner }).await;
+                        }
+                        result = finished => {
+                            if let Ok(result) = result {
+                                #[cfg(feature = "test-knobs")]
+                                if let Some(delay) = reply_delay { tokio::time::sleep(delay).await; }
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
+                    drop(permit);
+                });
+                self.apply_owned_computer_policy(computer::OwnKeyPolicyWork {
+                    owner,
+                    guard,
+                    reply: completion,
+                    targets: Vec::new(),
+                })
+                .await;
+                self.start_own_key_computer_drain();
             }
             NetEvent::LocalTrustBlacklist(reply) => {
                 let _ = reply.send(self.local_trust_blacklist());
@@ -13813,10 +14840,17 @@ impl Node {
                 ch.has_left(&ch.me())
             };
             if left {
-                if let Outcome::Failed(f) = self.purge_room(&parsed.channel_id).await {
-                    let _ = reply.send(Outcome::Failed(f));
-                    return;
-                }
+                self.begin_own_key_left_purge(
+                    parsed.channel_id,
+                    shared,
+                    LeftPurgePurpose::Join {
+                        link,
+                        passphrase,
+                        reply,
+                    },
+                )
+                .await;
+                return;
             }
         }
         // A prior deletion's owner must finish clearing its saved bindings before the same
@@ -14166,6 +15200,7 @@ impl Node {
         }
         self.role_wake
             .install(parsed.channel_id, &channel.role_owed());
+        self.own_key_room_set_changed.send_replace(());
         self.channels.insert(
             parsed.channel_id,
             Arc::new(tokio::sync::Mutex::new(channel)),
@@ -14700,9 +15735,13 @@ impl Node {
             let trusted = self.trust.trusted();
             {
                 let mut channel = shared.lock().await;
-                if let Err(error) = channel.forget_keys_except(profile.store(), &trusted) {
-                    channel.poison(&error);
-                    return Err(error);
+                match channel.forget_keys_except(profile.store(), &trusted) {
+                    Ok(count) if count > 0 => self.governance_work.wake_room(*channel_id),
+                    Ok(_) => {}
+                    Err(error) => {
+                        channel.poison(&error);
+                        return Err(error);
+                    }
                 }
             }
             let signer = profile.signer()?;
@@ -14986,6 +16025,9 @@ impl Node {
             Some(Err(error)) => return Outcome::Failed(fault_of(&error)),
             None => return Outcome::Failed(Fault::ComputerPolicy),
         }
+        // No old own-key response can remain active after the keyring narrowing commits.
+        // Later withdrawals and board publication do not need to hold writer admission closed.
+        self.own_key_untrust_transitions = None;
         // The keyring decision is durable. Finish each open-room withdrawal synchronously
         // under its reservation; preserve the exact generation for post-lock notifications.
         let mut completed = Vec::new();
@@ -15173,16 +16215,20 @@ impl Node {
             .collect();
         let trusted: BTreeSet<Digest32> = self.trust.trusted().into_iter().collect();
         let now_ms = self.now_ms();
-        for shared in self.channels.values() {
+        for (room, shared) in &self.channels {
             // A room mid-session is skipped, not waited for; the next tick comes round.
             let Ok(mut channel) = shared.try_lock() else {
                 continue;
             };
             // Other members' generations this node has read to the end go too (R14 on the
             // receiving side), whatever this node still owes with its own.
-            pruned |= channel
+            let receiver_pruned = channel
                 .prune_superseded_receivers(&store)
                 .is_ok_and(|n| n > 0);
+            pruned |= receiver_pruned;
+            if receiver_pruned {
+                self.governance_work.wake_room(*room);
+            }
             // A refreshing or unreadable consent projection cannot prove that old keys are
             // no longer owed. Preserve them until a later bounded governance turn settles it.
             if channel.key_generations() <= 1
@@ -16194,20 +17240,31 @@ impl Node {
     async fn room_ref(
         &self,
         channel_id: &Digest32,
+        peer: &Digest32,
     ) -> Option<(
         crate::node::ports::RoomRef,
         Arc<std::sync::atomic::AtomicU64>,
         u64,
         bool,
+        Arc<crate::node::channel::availability::Peer>,
     )> {
         use crate::node::ports::RoomRef;
         let store = self.log_store()?;
         if let Some(shared) = self.channels.get(channel_id) {
-            let channel = shared.lock().await;
+            let mut channel = shared.lock().await;
+            let availability = channel
+                .availability_peer(*peer, Some(&self.availability_wake))
+                .ok()?;
             let gen = channel.generation();
             let epoch = channel.epoch();
             let sparse = channel.uses_sparse_history(&store).ok()?;
-            return Some((RoomRef::Channel(Arc::downgrade(shared)), gen, epoch, sparse));
+            return Some((
+                RoomRef::Channel(Arc::downgrade(shared)),
+                gen,
+                epoch,
+                sparse,
+                availability,
+            ));
         }
         None
     }
@@ -16237,6 +17294,41 @@ impl Node {
     /// refusals. Retire selected logical roots even for a newly untrusted peer; physical
     /// workers retain their own staging until cleanup. Ordinary room traffic does not do this.
     fn note_key_body_trust_change(&mut self) {
+        for ((_, peer), attempt) in &self.own_key_active {
+            if !self.trust.is_trusted(peer) {
+                attempt.cancel.send_replace(true);
+            }
+        }
+        self.own_key_open.drop_cancelled();
+        self.own_key_pending
+            .retain(|(_, peer), _| self.trust.is_trusted(peer));
+        let revoked: Vec<_> = self
+            .own_key_donor_busy
+            .keys()
+            .filter(|(_, peer)| !self.trust.is_trusted(peer))
+            .copied()
+            .collect();
+        for key in revoked {
+            self.retire_own_key_donor_busy(key);
+        }
+        let changed: Vec<_> = self
+            .own_key_credit_trust
+            .iter()
+            .filter_map(|(room, previous)| {
+                let current: BTreeSet<_> = self
+                    .ports
+                    .keys()
+                    .filter_map(|(r, peer)| {
+                        (*r == *room && self.trust.is_trusted(peer)).then_some(*peer)
+                    })
+                    .collect();
+                (current != *previous).then_some((*room, current))
+            })
+            .collect();
+        for (room, current) in changed {
+            self.own_key_credit_trust.insert(room, current);
+            self.governance_work.wake_room(room);
+        }
         for (&(room, peer), port) in &mut self.ports {
             let current = self
                 .channels
@@ -16282,12 +17374,22 @@ impl Node {
         if !self.shares_room(channel_id, peer).await {
             return false;
         }
-        let Some((room, gen, epoch, sparse)) = self.room_ref(channel_id).await else {
+        let Some((room, gen, epoch, sparse, availability)) = self.room_ref(channel_id, peer).await
+        else {
             return false;
         };
+        if self
+            .own_key_active
+            .keys()
+            .any(|(room, _)| room == channel_id)
+            || self.own_key_credit_missing.contains_key(channel_id)
+            || self.own_recovery_rooms.contains_key(channel_id)
+        {
+            self.governance_work.wake_room(*channel_id);
+        }
         self.ports.insert(
             (*channel_id, *peer),
-            crate::node::ports::Port::new(room, gen, epoch, sparse),
+            crate::node::ports::Port::new(room, gen, epoch, sparse, availability),
         );
         if let Some(owner) = self.role_wake.owner(*channel_id) {
             owner.on_connect(*peer);
@@ -16311,6 +17413,7 @@ impl Node {
                 }
             }
         }
+        self.availability_wake.notify_one();
         self.sched_rooms.insert(*channel_id);
         true
     }
@@ -16335,6 +17438,12 @@ impl Node {
         peer: &Digest32,
         preserve_unstarted: bool,
     ) {
+        if let Some(attempt) = self.own_key_active.get(&(*channel_id, *peer)) {
+            attempt.cancel.send_replace(true);
+        }
+        self.own_key_open.drop_peer(*channel_id, *peer);
+        self.own_key_pending.remove(&(*channel_id, *peer));
+        self.retire_own_key_donor_busy((*channel_id, *peer));
         if let Some((request, generation, fence)) = self
             .bounded_sync
             .physical_archive_for_port(*channel_id, *peer)
@@ -16450,6 +17559,7 @@ impl Node {
             }
             // **A new connection** raises a request and clears the backoff (ADR-025 D2, D5).
             if fresh_peers.contains(&peer) && existed {
+                self.availability_wake.notify_one();
                 if let Some(port) = self.ports.get_mut(&(room, peer)) {
                     port.raise();
                     port.clear_backoff();
@@ -16458,6 +17568,46 @@ impl Node {
                     c.backoff = None;
                 });
                 self.sched_rooms.insert(room);
+            }
+        }
+    }
+
+    // Only a real postcommit edge or authenticated HAVE wakes this branch. The shared
+    // handles contain scalars; retired rooms cannot mutate replacement ports.
+    fn accept_availability(&mut self) {
+        for ((room, peer), port) in &mut self.ports {
+            let connection = self
+                .net
+                .as_ref()
+                .and_then(|net| net.manager().existing(peer));
+            // This capability extends bounded HAVE, never the legacy room protocol.
+            port.availability_enabled = port.sparse
+                && connection
+                    .as_ref()
+                    .is_some_and(|c| c.supports_availability());
+            let Some(connection) = connection.filter(|c| port.sparse && c.supports_availability())
+            else {
+                continue;
+            };
+            if port.availability_connection != Some(connection.serial()) {
+                port.availability_connection = Some(connection.serial());
+                port.availability_acked = None;
+            }
+            if port.availability_acked != Some(port.availability.local()) {
+                self.sched_rooms.insert(*room);
+            }
+            if let Some(token) = port.availability.remote(connection.serial()) {
+                let observed = (connection.serial(), token);
+                if port.availability_seen != Some(observed) {
+                    port.availability_seen = Some(observed);
+                    port.support_discovery_check = true;
+                    port.support_discovery = None;
+                    port.support_discovery_unavailable = None;
+                    port.raise();
+                    port.clear_backoff();
+                    self.governance_work.wake_room(*room);
+                    self.sched_rooms.insert(*room);
+                }
             }
         }
     }
@@ -17023,6 +18173,9 @@ impl Node {
     }
 
     async fn start_outbound(&mut self, channel_id: Digest32, peer: Digest32) -> bool {
+        if self.own_key_ended_pending.contains_key(&channel_id) {
+            return false;
+        }
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return false;
         };
@@ -17832,6 +18985,19 @@ impl Node {
         recv: quinn::RecvStream,
     ) {
         use crate::node::syncstream::accept_sync;
+        if self.own_key_ended_pending.contains_key(&channel_id) {
+            let (mut send, mut recv) = (send, recv);
+            if self.owed_a_reason(&channel_id, &peer, epoch) {
+                crate::node::net::refuse_stream_because(
+                    &mut send,
+                    &mut recv,
+                    crate::wire::WireError::SessionBusy,
+                );
+            } else {
+                crate::node::net::refuse_stream(&mut send, &mut recv);
+            }
+            return;
+        }
         // The mutant build's `refuse-sessions` (#85): every inbound session refused, with a reason.
         #[cfg(feature = "mutant-sender")]
         if let Some(code) = crate::log::sync::mutant::refuses() {
@@ -17936,10 +19102,12 @@ impl Node {
         // Admitted: the port exists for the room instance held now (it may not have been
         // discovered yet, since the peer spoke first).
         if departure_receipt {
-            if let Some((room, gen, epoch, sparse)) = self.room_ref(&channel_id).await {
-                self.ports
-                    .entry((channel_id, peer))
-                    .or_insert_with(|| crate::node::ports::Port::new(room, gen, epoch, sparse));
+            if let Some((room, gen, epoch, sparse, availability)) =
+                self.room_ref(&channel_id, &peer).await
+            {
+                self.ports.entry((channel_id, peer)).or_insert_with(|| {
+                    crate::node::ports::Port::new(room, gen, epoch, sparse, availability)
+                });
             }
         }
         if !self.ensure_port(&channel_id, &peer).await {
@@ -18002,6 +19170,7 @@ impl Node {
             false,
             crate::node::status::SyncStep::Exchanging,
         );
+        let availability_connection = conn.supports_availability().then_some(conn.serial());
         port.inbound.insert(
             token,
             crate::node::ports::Attempt {
@@ -18032,6 +19201,7 @@ impl Node {
                 fence,
                 inbox,
                 departure_receipt,
+                availability_connection,
             )
             .await;
             let _ = tx
@@ -18631,6 +19801,12 @@ impl Node {
                 if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
                 }
+                if installed
+                    .as_ref()
+                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                {
+                    self.governance_work.wake_room(*channel_id);
+                }
                 installed
             };
             if let Ok(accepted) = installed {
@@ -19035,7 +20211,8 @@ impl Node {
     ) -> Option<Vec<PairwiseAdmission>> {
         // An idle peer must not leave a writer/credit registry entry behind forever.
         self.pairwise_out.retain(|_, out| {
-            out.jobs.available_permits() != PAIRWISE_PEER_LIMIT
+            Arc::strong_count(&out.jobs) > 1
+                || out.jobs.available_permits() != PAIRWISE_PEER_LIMIT
                 || out.deliveries.available_permits() != PAIRWISE_PEER_LIMIT
         });
         let out = self.pairwise_out.entry(peer).or_insert_with(|| {
@@ -19626,7 +20803,9 @@ impl Node {
             PairwiseFrame::Skdm { channel_id, .. }
             | PairwiseFrame::Open { channel_id, .. }
             | PairwiseFrame::Hello { channel_id, .. }
-            | PairwiseFrame::RotationHello { channel_id, .. } => *channel_id,
+            | PairwiseFrame::RotationHello { channel_id, .. }
+            | PairwiseFrame::RecoveryOpen { channel_id, .. }
+            | PairwiseFrame::RecoveryReply { channel_id, .. } => *channel_id,
         };
         // **Held, not dropped, while this node is still joining that room.** The join runs off the
         // actor now, so the responder's key — sent the moment it admits us — can arrive before the
@@ -19668,12 +20847,20 @@ impl Node {
 
     /// [`Self::handle_pairwise`], unboxed: see [`Boxed`].
     async fn handle_pairwise_unboxed(&mut self, stream: PairwiseIn) {
+        if matches!(
+            stream.first,
+            crate::node::pairwise_stream::PairwiseFrame::RecoveryOpen { .. }
+        ) {
+            self.start_own_key_donor(stream);
+            return;
+        }
         let PairwiseIn {
             peer,
             first,
             second,
             mut send,
             recv,
+            ..
         } = stream;
         #[cfg(feature = "test-knobs")]
         if self.end_key_unanswered_for_proof(
@@ -19763,6 +20950,9 @@ impl Node {
         // against our own prekey ring, exactly as the join responder does, then read
         // the SKDM it precedes.
         let (channel_id, sealed) = match first {
+            PairwiseFrame::RecoveryOpen { .. } | PairwiseFrame::RecoveryReply { .. } => {
+                return Some(Err(KeyRefusal::NotAccepted));
+            }
             PairwiseFrame::Skdm { channel_id, sealed } => (channel_id, sealed),
             // A key delivery in a session of its own (ADR-030 W-1), opened under that session alone
             // and never filed (W-2).
@@ -19927,11 +21117,17 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                let installed = channel.accept_skdm(profile.store(), skdm, now_ms).ok();
-                if installed.as_ref().is_some_and(|accepted| accepted.changed) {
+                let installed = channel.accept_skdm(profile.store(), skdm, now_ms);
+                if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                     self.governance_work.pending = true;
                 }
-                installed
+                if installed
+                    .as_ref()
+                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                {
+                    self.governance_work.wake_room(channel_id);
+                }
+                installed.ok()
             }
             _ => None,
         };
@@ -20124,6 +21320,10 @@ impl Node {
         }
         self.opening_rooms.clear();
         for (_, mut prepared) in std::mem::take(&mut self.preparing_rooms) {
+            if let Some(RecoveryWriterGate::Waiting { fence, .. }) = &prepared.recovery_writer_gate
+            {
+                fence.retire();
+            }
             prepared.channel.get_mut().lock_now();
             if let Some(reply) = prepared.reply {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
@@ -20147,6 +21347,14 @@ impl Node {
         // Retire queued scanner admission and its wake before dropping room ownership. A
         // physical blocking read retains its own secret guard until it actually exits.
         self.key_body_scan = key_body_scan::Controller::default();
+        self.own_key_room_set_changed.send_replace(());
+        let busy: Vec<_> = self.own_key_donor_busy.keys().copied().collect();
+        for key in busy {
+            self.retire_own_key_donor_busy(key);
+        }
+        for (_, cancel) in std::mem::take(&mut self.own_key_room_cancel) {
+            cancel.send_replace(true);
+        }
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
@@ -20190,6 +21398,14 @@ impl Node {
         // And the watchers still running answer for what is no longer in flight.
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.pairwise_epoch.send_replace(self.delivery_epoch);
+        self.own_key_active.clear();
+        self.own_key_open.clear();
+        self.own_key_parked.clear();
+        self.own_key_pending.clear();
+        self.own_key_interrupted_pending.clear();
+        self.own_recovery_rooms.clear();
+        self.own_recovery_body_debts.clear();
+        self.own_readable_effects.clear();
         self.history_in_flight.clear();
         // What the boards held was learnt over the network that goes down with the lock; an address
         // asked for meanwhile is not handed out by a locked node (V210-96).
@@ -20295,16 +21511,39 @@ impl Node {
         }
         // The view first: whoever is told the lock is done reads a locked view.
         self.publish().await;
-        for (passphrase, reply) in std::mem::take(&mut self.unlock_after_lock) {
-            self.unlock_and_answer(&passphrase, reply).await;
+        for (passphrase, reply, permit) in std::mem::take(&mut self.unlock_after_lock) {
+            self.unlock_and_answer(&passphrase, reply, permit).await;
         }
     }
 
     /// Ready authenticates the identity and starts its network, independently of saved history.
     /// Each remembered room stays unavailable until its own verification, governance and
     /// retention preparation finishes; the view reports that work explicitly.
-    async fn unlock_and_answer(&mut self, passphrase: &Secret, reply: oneshot::Sender<Outcome>) {
+    async fn unlock_and_answer(
+        &mut self,
+        passphrase: &Secret,
+        reply: oneshot::Sender<Outcome>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let outcome = self.unlock(passphrase).await;
+        if let Some(targets) = self.own_key_unlock_drain.take() {
+            let boundary = *self
+                .startup_computer_boundary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(boundary) = boundary {
+                let generation = *self.pairwise_epoch.borrow();
+                self.begin_own_key_unlock(targets, boundary, generation, reply, _permit);
+            } else {
+                let _ = reply.send(Outcome::Failed(Fault::Internal));
+            }
+            return;
+        }
+        if outcome.is_done() {
+            self.resume_own_key_interruptions();
+            self.resume_own_key_donor_busy();
+            self.resume_own_key_policy_waiting();
+        }
         // Publish identity, trust and room preparation before acknowledging Ready.
         self.publish().await;
         let _ = reply.send(outcome);
@@ -20368,6 +21607,7 @@ impl Node {
         }
         let inserted = authority.publish_room_creation(|| {
             self.role_wake.install(id, &ch.role_owed());
+            self.own_key_room_set_changed.send_replace(());
             self.channels
                 .insert(id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
@@ -20962,6 +22202,13 @@ impl Node {
 
     fn retract_live_channel(&mut self, channel_id: &Digest32) {
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
+        self.own_readable_effects.remove(channel_id);
+        if self.channels.contains_key(channel_id) {
+            self.own_key_room_set_changed.send_replace(());
+        }
         self.channels.remove(channel_id);
         self.room_publication_authority.remove(channel_id);
         self.fresh_details.remove(channel_id);
@@ -21204,6 +22451,7 @@ impl Node {
                 reply,
                 reopening,
                 recovery: None,
+                recovery_writer_gate: None,
                 trusted: None,
                 removal_after: None,
                 consent_after: None,
@@ -21214,7 +22462,10 @@ impl Node {
     fn room_preparation_work_ready(&self) -> bool {
         self.publication_pending
             || self.preparing_rooms.values().any(|prepared| {
-                prepared
+                !matches!(
+                    prepared.recovery_writer_gate,
+                    Some(RecoveryWriterGate::Waiting { .. })
+                ) && prepared
                     .legacy_cleanup_due
                     .is_none_or(|due| std::time::Instant::now() >= due)
             })
@@ -21332,6 +22583,9 @@ impl Node {
         let Some(mut prepared) = self.preparing_rooms.remove(id) else {
             return opening || publishing;
         };
+        if let Some(RecoveryWriterGate::Waiting { fence, .. }) = &prepared.recovery_writer_gate {
+            fence.retire();
+        }
         prepared.channel.get_mut().lock_now();
         if let Some(reply) = prepared.reply {
             let _ = reply.send(Outcome::Failed(fault));
@@ -21351,13 +22605,23 @@ impl Node {
             .and_then(|after| {
                 self.preparing_rooms
                     .range((Excluded(after), Unbounded))
-                    .find(|(_, prepared)| prepared.legacy_cleanup_due.is_none_or(|due| now >= due))
+                    .find(|(_, prepared)| {
+                        !matches!(
+                            prepared.recovery_writer_gate,
+                            Some(RecoveryWriterGate::Waiting { .. })
+                        ) && prepared.legacy_cleanup_due.is_none_or(|due| now >= due)
+                    })
                     .map(|(id, _)| *id)
             })
             .or_else(|| {
                 self.preparing_rooms
                     .iter()
-                    .find(|(_, prepared)| prepared.legacy_cleanup_due.is_none_or(|due| now >= due))
+                    .find(|(_, prepared)| {
+                        !matches!(
+                            prepared.recovery_writer_gate,
+                            Some(RecoveryWriterGate::Waiting { .. })
+                        ) && prepared.legacy_cleanup_due.is_none_or(|due| now >= due)
+                    })
                     .map(|(id, _)| *id)
             });
         let Some(id) = id else { return };
@@ -21365,107 +22629,177 @@ impl Node {
         let Some(mut prepared) = self.preparing_rooms.remove(&id) else {
             return;
         };
-        let outcome =
-            if !self.profile.as_ref().is_some_and(Profile::is_unlocked) || self.locking != 0 {
-                Outcome::Failed(Fault::Locked)
-            } else if prepared.recovery.as_ref().is_some_and(|original| {
-                !self
-                    .channels
-                    .get(&id)
-                    .zip(original.upgrade())
-                    .is_some_and(|(a, b)| Arc::ptr_eq(a, &b))
-            }) {
-                Outcome::Failed(Fault::ChannelNotOpen)
-            } else if prepared.recovery.is_none() && self.channels.contains_key(&id) {
-                Outcome::Done
-            } else if prepared.reopening && !self.reopening.contains(&id) {
-                Outcome::Failed(Fault::ChannelNotOpen)
-            } else {
-                let waited_before = prepared.waiting.clone();
-                match self.retention_before_publication(&mut prepared).await {
-                    Ok(false) => {
-                        if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due = Some(
-                                std::time::Instant::now()
-                                    + prepared.retry_after(waited_before.as_ref()),
-                            );
-                        }
-                        if let Some((what, since)) = &prepared.waiting {
-                            let now = self.now_ms().get();
-                            if !prepared.waiting_noted
-                                && now.saturating_sub(*since) >= PREPARE_WAIT_NOTED_AFTER_MS
-                            {
-                                prepared.waiting_noted = true;
-                                let _ = self.event_tx.send(NodeEvent::NodeNote {
-                                    note: format!(
-                                        "room {} is still preparing: it waits for {what}, {}",
-                                        crate::node::link::b32_encode(&id),
-                                        crate::node::status::since_text(*since)
-                                    ),
-                                });
-                            }
-                        }
-                        // A wait that changed is published at once: the room list, the status
-                        // and the app say it without waiting for another event (#991).
-                        let changed = prepared.waiting != waited_before;
-                        self.preparing_rooms.insert(id, prepared);
-                        if changed {
-                            self.publish().await;
-                        }
-                        return;
+        let outcome = if !self.profile.as_ref().is_some_and(Profile::is_unlocked)
+            || self.locking != 0
+        {
+            Outcome::Failed(Fault::Locked)
+        } else if prepared.recovery.as_ref().is_some_and(|original| {
+            !self
+                .channels
+                .get(&id)
+                .zip(original.upgrade())
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, &b))
+        }) {
+            Outcome::Failed(Fault::ChannelNotOpen)
+        } else if prepared.recovery.is_none() && self.channels.contains_key(&id) {
+            Outcome::Done
+        } else if prepared.reopening && !self.reopening.contains(&id) {
+            Outcome::Failed(Fault::ChannelNotOpen)
+        } else {
+            let waited_before = prepared.waiting.clone();
+            match self.retention_before_publication(&mut prepared).await {
+                Ok(false) => {
+                    if matches!(
+                        prepared.recovery_writer_gate,
+                        Some(RecoveryWriterGate::Ready(_))
+                    ) {
+                        prepared.recovery_writer_gate = None;
                     }
-                    Err(error)
-                        if ChannelState::governance_refreshing(&error)
-                            || ChannelState::legacy_classification_refreshing(&error) =>
-                    {
-                        // Current policy and classification are prerequisites for private
-                        // retention/publication. Pending replay keeps this room unpublished.
-                        prepared.wait_on(
-                            "its governance records being refreshed",
-                            self.now_ms().get(),
+                    if prepared.legacy_cleanup_due.is_none() {
+                        prepared.legacy_cleanup_due = Some(
+                            std::time::Instant::now()
+                                + prepared.retry_after(waited_before.as_ref()),
                         );
-                        if prepared.legacy_cleanup_due.is_none() {
-                            prepared.legacy_cleanup_due = Some(
-                                std::time::Instant::now()
-                                    + prepared.retry_after(waited_before.as_ref()),
-                            );
-                        }
-                        // A wait that changed is published at once: the room list, the status
-                        // and the app say it without waiting for another event (#991).
-                        let changed = prepared.waiting != waited_before;
-                        self.preparing_rooms.insert(id, prepared);
-                        if changed {
-                            self.publish().await;
-                        }
-                        return;
                     }
-                    Ok(true) => {
-                        if prepared.recovery.is_some() {
-                            self.complete_store_recovery(id, Ok(prepared.channel.into_inner()))
-                                .await;
-                            Outcome::Done
-                        } else {
-                            self.publish_open_channel(prepared.channel.into_inner())
-                                .await
+                    if let Some((what, since)) = &prepared.waiting {
+                        let now = self.now_ms().get();
+                        if !prepared.waiting_noted
+                            && now.saturating_sub(*since) >= PREPARE_WAIT_NOTED_AFTER_MS
+                        {
+                            prepared.waiting_noted = true;
+                            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                                note: format!(
+                                    "room {} is still preparing: it waits for {what}, {}",
+                                    crate::node::link::b32_encode(&id),
+                                    crate::node::status::since_text(*since)
+                                ),
+                            });
                         }
                     }
-                    Err(error) => {
-                        let fault = fault_of(&error);
-                        if prepared.recovery.is_some() {
-                            self.complete_store_recovery(id, Err(error)).await;
-                            self.publish().await;
-                            return;
-                        }
-                        let _ = self.event_tx.send(NodeEvent::NodeNote {
-                            note: format!(
-                                "room {} could not finish opening: {error}; it stays closed",
-                                crate::node::link::b32_encode(&id)
-                            ),
-                        });
-                        Outcome::Failed(fault)
+                    // A wait that changed is published at once: the room list, the status
+                    // and the app say it without waiting for another event (#991).
+                    let changed = prepared.waiting != waited_before;
+                    self.preparing_rooms.insert(id, prepared);
+                    if changed {
+                        self.publish().await;
+                    }
+                    return;
+                }
+                Err(error)
+                    if ChannelState::governance_refreshing(&error)
+                        || ChannelState::legacy_classification_refreshing(&error) =>
+                {
+                    if matches!(
+                        prepared.recovery_writer_gate,
+                        Some(RecoveryWriterGate::Ready(_))
+                    ) {
+                        prepared.recovery_writer_gate = None;
+                    }
+                    // Current policy and classification are prerequisites for private
+                    // retention/publication. Pending replay keeps this room unpublished.
+                    prepared.wait_on(
+                        "its governance records being refreshed",
+                        self.now_ms().get(),
+                    );
+                    if prepared.legacy_cleanup_due.is_none() {
+                        prepared.legacy_cleanup_due = Some(
+                            std::time::Instant::now()
+                                + prepared.retry_after(waited_before.as_ref()),
+                        );
+                    }
+                    // A wait that changed is published at once: the room list, the status
+                    // and the app say it without waiting for another event (#991).
+                    let changed = prepared.waiting != waited_before;
+                    self.preparing_rooms.insert(id, prepared);
+                    if changed {
+                        self.publish().await;
+                    }
+                    return;
+                }
+                Ok(true) => {
+                    if prepared.recovery.is_some() {
+                        let transition = match prepared.recovery_writer_gate.take() {
+                            Some(RecoveryWriterGate::Ready(transition)) => transition,
+                            Some(waiting @ RecoveryWriterGate::Waiting { .. }) => {
+                                prepared.recovery_writer_gate = Some(waiting);
+                                self.preparing_rooms.insert(id, prepared);
+                                return;
+                            }
+                            None => {
+                                let Some(old) =
+                                    prepared.recovery.as_ref().and_then(|old| old.upgrade())
+                                else {
+                                    self.preparing_rooms.insert(id, prepared);
+                                    return;
+                                };
+                                let owner = Arc::new(());
+                                let fence = crate::transport::stream_transport::Fence::new();
+                                prepared.recovery_writer_gate = Some(RecoveryWriterGate::Waiting {
+                                    owner: Arc::clone(&owner),
+                                    fence: Arc::clone(&fence),
+                                });
+                                self.preparing_rooms.insert(id, prepared);
+                                let tx = self.net_tx.clone();
+                                let mut room_cancel = self.own_key_room_watch(id);
+                                let mut epoch_changed = self.pairwise_epoch.subscribe();
+                                tokio::spawn(async move {
+                                    let gate = tokio::select! {
+                                        biased;
+                                        () = fence.retired() => None,
+                                        _ = room_cancel.changed() => None,
+                                        _ = epoch_changed.changed() => None,
+                                        channel = old.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                                    };
+                                    let transition = if let Some(gate) = gate {
+                                        tokio::select! {
+                                            biased;
+                                            () = fence.retired() => None,
+                                            _ = room_cancel.changed() => None,
+                                            _ = epoch_changed.changed() => None,
+                                            transition = gate.transition(None) => Some(transition),
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let _ = tx
+                                        .send(NetEvent::OwnKeyRecoveryReady {
+                                            room: id,
+                                            owner,
+                                            transition,
+                                        })
+                                        .await;
+                                });
+                                return;
+                            }
+                        };
+                        self.complete_store_recovery(
+                            id,
+                            Ok(prepared.channel.into_inner()),
+                            Some(transition),
+                        )
+                        .await
+                    } else {
+                        self.publish_open_channel(prepared.channel.into_inner(), None)
+                            .await
                     }
                 }
-            };
+                Err(error) => {
+                    let fault = fault_of(&error);
+                    if prepared.recovery.is_some() {
+                        self.complete_store_recovery(id, Err(error), None).await;
+                        self.publish().await;
+                        return;
+                    }
+                    let _ = self.event_tx.send(NodeEvent::NodeNote {
+                        note: format!(
+                            "room {} could not finish opening: {error}; it stays closed",
+                            crate::node::link::b32_encode(&id)
+                        ),
+                    });
+                    Outcome::Failed(fault)
+                }
+            }
+        };
         if outcome.is_done() {
             self.queue_room_publication(
                 id,
@@ -21492,6 +22826,12 @@ impl Node {
         prepared: &mut RoomPreparation,
     ) -> crate::error::Result<bool> {
         let ch = prepared.channel.get_mut();
+        if let Some(profile) = self.profile.as_ref() {
+            let (more, _, _) = ch.advance_receiver_release_cleanup(profile.store())?;
+            // Existing preparation remains runnable after actual bounded progress. A ready
+            // room still publishes now; its ordinary maintenance inherits the durable debt.
+            prepared.progressed |= more;
+        }
         if ch.legacy_startup_cleanup_blocks_current() {
             let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
             let Some(cleaned) = self.with_current_computer_authority(|| {
@@ -21585,6 +22925,12 @@ impl Node {
                                 let installed = ch.accept_skdm(profile.store(), &skdm, now);
                                 if installed.as_ref().is_ok_and(|accepted| accepted.changed) {
                                     self.governance_work.pending = true;
+                                }
+                                if installed
+                                    .as_ref()
+                                    .is_err_and(ChannelState::receiver_release_cleanup_waiting)
+                                {
+                                    self.governance_work.wake_room(ch.channel_id());
                                 }
                                 installed.map(|_| ())
                             }
@@ -21809,7 +23155,11 @@ impl Node {
     }
 
     /// Publish a room only after both shared and local retention have been applied durably.
-    async fn publish_open_channel(&mut self, ch: ChannelState) -> Outcome {
+    async fn publish_open_channel(
+        &mut self,
+        ch: ChannelState,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    ) -> Outcome {
         let channel_id = ch.channel_id();
         let governance_deadline = ch.governance_deadline();
         let Some(authority) = self.computer_authority() else {
@@ -21824,12 +23174,17 @@ impl Node {
         let published = authority.publish(|| {
             self.remember_or_say(&ch);
             self.role_wake.install(channel_id, &ch.role_owed());
+            self.own_key_room_set_changed.send_replace(());
             self.channels
                 .insert(channel_id, Arc::new(tokio::sync::Mutex::new(ch)));
         });
         if published.is_none() {
             return Outcome::Failed(Fault::ComputerPolicy);
         }
+        drop(transition);
+        // Retire request/response owners from any replaced room instance before processing
+        // further actor events. Existing physical blocking workers still join on their own task.
+        self.cancel_own_key_room(channel_id);
         // Reopening replaces the room instance. Never inherit a settled marker retained for the
         // prior instance while it was absent from the open-room map.
         self.governance_work.wake_room(channel_id);
@@ -21869,7 +23224,11 @@ impl Node {
         Outcome::Done
     }
 
-    async fn close_channel(&mut self, channel_id: &Digest32) -> Outcome {
+    async fn close_channel(
+        &mut self,
+        channel_id: &Digest32,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    ) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
         if let Err(error) = self.retire_bounded_room(*channel_id).await {
@@ -21893,11 +23252,20 @@ impl Node {
         }
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
+        self.own_readable_effects.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
         let reopening = self.reopening.remove(channel_id);
-        let outcome = match self.channels.remove(channel_id) {
+        if self.channels.contains_key(channel_id) {
+            self.own_key_room_set_changed.send_replace(());
+        }
+        let removed = self.channels.remove(channel_id);
+        drop(transition);
+        let outcome = match removed {
             Some(shared) => {
                 shared.lock().await.lock_now();
                 // The channel is gone from the view the board reads, so its members
@@ -21934,12 +23302,669 @@ impl Node {
         outcome
     }
 
+    fn begin_own_key_unlock(
+        &mut self,
+        targets: Vec<Digest32>,
+        boundary: (std::time::Instant, Digest32),
+        generation: u64,
+        mut reply: oneshot::Sender<Outcome>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
+        let owner = Arc::new(());
+        self.own_key_unlock_pending.push(Arc::clone(&owner));
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(id, room)| (*id, Arc::clone(room)))
+            .collect();
+        let watches: Vec<_> = rooms
+            .iter()
+            .map(|(id, _)| self.own_key_room_watch(*id))
+            .collect();
+        let mut room_set_changed = self.own_key_room_set_changed.subscribe();
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mut changes: Vec<_> = watches
+                .into_iter()
+                .map(|mut watch| {
+                    Box::pin(async move {
+                        let _ = watch.changed().await;
+                    })
+                })
+                .collect();
+            let retired = std::future::poll_fn(move |cx| {
+                for change in &mut changes {
+                    if std::future::Future::poll(change.as_mut(), cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                std::task::Poll::Pending
+            });
+            tokio::pin!(retired);
+            let mut transitions = Vec::with_capacity(rooms.len());
+            for (_, room) in &rooms {
+                let gate = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = &mut retired => None,
+                    channel = room.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                };
+                let Some(gate) = gate else { break };
+                let transition = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = &mut retired => None,
+                    transition = gate.transition(Some(&targets)) => Some(transition),
+                };
+                let Some(transition) = transition else { break };
+                transitions.push(transition);
+            }
+            let transitions = (transitions.len() == rooms.len()).then_some(transitions);
+            let _ = tx
+                .send(NetEvent::OwnKeyUnlockReady {
+                    _secret: secret,
+                    owner,
+                    rooms,
+                    transitions,
+                    targets,
+                    boundary,
+                    generation,
+                    reply,
+                    permit,
+                })
+                .await;
+        });
+    }
+
+    async fn apply_owned_computer_policy(&mut self, mut work: computer::OwnKeyPolicyWork) {
+        if work.reply.is_closed() {
+            self.own_key_computer_transitions = None;
+            return;
+        }
+        let result = match self.prepare_computer_binding_guarded(&work.guard) {
+            Ok(()) => self.apply_computer_keyring_guarded(&work.guard).await,
+            Err(error) => Err(error),
+        };
+        self.own_key_computer_transitions = None;
+        match result {
+            Err(Error::OwnKeyWriterDrainRequired(targets)) => {
+                work.targets = targets;
+                self.own_key_computer_pending.push_back(work);
+            }
+            result => {
+                if result.is_ok() {
+                    self.governance_work.resume_after_computer_policy();
+                    self.resume_own_key_interruptions();
+                    self.resume_own_key_donor_busy();
+                    self.resume_own_key_policy_waiting();
+                }
+                let _ = work.reply.send(result);
+            }
+        }
+    }
+
+    fn start_own_key_computer_drain(&mut self) {
+        if self.own_key_computer_flight.is_some() {
+            return;
+        }
+        while let Some(mut work) = self.own_key_computer_pending.pop_front() {
+            if work.reply.is_closed() {
+                continue;
+            }
+            if let Err(error) = work.guard.active(self.computer.as_ref()) {
+                let _ = work.reply.send(Err(error));
+                continue;
+            }
+            work.targets.sort_unstable();
+            let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+                let _ = work.reply.send(Err(Error::AtRestLocked));
+                continue;
+            };
+            let secret = Arc::new(secret);
+            let owner = Arc::clone(&work.owner);
+            let fence = crate::transport::stream_transport::Fence::new();
+            self.own_key_computer_flight = Some(OwnKeyPolicyFlight {
+                owner: Arc::clone(&owner),
+                guard: work.guard.clone(),
+                fence: Arc::clone(&fence),
+            });
+            let rooms: Vec<_> = self
+                .channels
+                .iter()
+                .map(|(id, room)| (*id, Arc::clone(room)))
+                .collect();
+            let watches: Vec<_> = rooms
+                .iter()
+                .map(|(id, _)| self.own_key_room_watch(*id))
+                .collect();
+            let mut room_set_changed = self.own_key_room_set_changed.subscribe();
+            let mut epoch_changed = self.pairwise_epoch.subscribe();
+            let tx = self.net_tx.clone();
+            tokio::spawn(async move {
+                let mut changes: Vec<_> = watches
+                    .into_iter()
+                    .map(|mut watch| {
+                        Box::pin(async move {
+                            let _ = watch.changed().await;
+                        })
+                    })
+                    .collect();
+                let retired = std::future::poll_fn(move |cx| {
+                    for change in &mut changes {
+                        if std::future::Future::poll(change.as_mut(), cx).is_ready() {
+                            return std::task::Poll::Ready(());
+                        }
+                    }
+                    std::task::Poll::Pending
+                });
+                tokio::pin!(retired);
+                let mut transitions = Vec::with_capacity(rooms.len());
+                for (_, room) in &rooms {
+                    let gate = tokio::select! {
+                        biased;
+                        () = fence.retired() => None,
+                        _ = work.reply.closed() => None,
+                        _ = room_set_changed.changed() => None,
+                        _ = epoch_changed.changed() => None,
+                        _ = &mut retired => None,
+                        channel = room.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                    };
+                    let Some(gate) = gate else { break };
+                    let transition = tokio::select! {
+                        biased;
+                        () = fence.retired() => None,
+                        _ = work.reply.closed() => None,
+                        _ = room_set_changed.changed() => None,
+                        _ = epoch_changed.changed() => None,
+                        _ = &mut retired => None,
+                        transition = gate.transition(Some(&work.targets)) => Some(transition),
+                    };
+                    let Some(transition) = transition else { break };
+                    transitions.push(transition);
+                }
+                let transitions = (transitions.len() == rooms.len()).then_some(transitions);
+                let _ = tx
+                    .send(NetEvent::OwnKeyComputerReady {
+                        _secret: secret,
+                        owner,
+                        rooms,
+                        transitions,
+                        work,
+                    })
+                    .await;
+            });
+            break;
+        }
+    }
+
+    /// Retire sends from all current rooms off actor before committing a keyring removal.
+    fn begin_own_key_untrust(&mut self, command: NodeCommand, mut reply: oneshot::Sender<Outcome>) {
+        if self.own_key_untrust_pending.is_some() {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
+        let target = match &command {
+            NodeCommand::Untrust { fingerprint } => *fingerprint,
+            NodeCommand::Proved { change } => match change.as_ref() {
+                NodeCommand::Untrust { fingerprint } => *fingerprint,
+                _ => {
+                    let _ = reply.send(Outcome::Failed(Fault::Internal));
+                    return;
+                }
+            },
+            _ => {
+                let _ = reply.send(Outcome::Failed(Fault::Internal));
+                return;
+            }
+        };
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
+        let owner = Arc::new(());
+        self.own_key_untrust_pending = Some(Arc::clone(&owner));
+        let rooms: Vec<_> = self
+            .channels
+            .iter()
+            .map(|(room, instance)| (*room, Arc::clone(instance)))
+            .collect();
+        let watches: Vec<_> = rooms
+            .iter()
+            .map(|(room, _)| self.own_key_room_watch(*room))
+            .collect();
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let mut room_set_changed = self.own_key_room_set_changed.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let mut transitions = Vec::with_capacity(rooms.len());
+            let mut changes: Vec<_> = watches
+                .into_iter()
+                .map(|mut watch| {
+                    Box::pin(async move {
+                        let _ = watch.changed().await;
+                    })
+                })
+                .collect();
+            let retired = std::future::poll_fn(move |cx| {
+                for change in &mut changes {
+                    if std::future::Future::poll(change.as_mut(), cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                std::task::Poll::Pending
+            });
+            tokio::pin!(retired);
+            for (_, instance) in &rooms {
+                let gate: Option<Arc<crate::node::channel::own_writer_gate::Gate>> = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = &mut retired => None,
+                    channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+                };
+                let Some(gate) = gate else { break };
+                let transition = tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = epoch_changed.changed() => None,
+                    _ = room_set_changed.changed() => None,
+                    _ = &mut retired => None,
+                    transition = gate.transition(Some(std::slice::from_ref(&target))) => Some(transition),
+                };
+                let Some(transition) = transition else { break };
+                transitions.push(transition);
+            }
+            let transitions = (transitions.len() == rooms.len()).then_some(transitions);
+            let _ = tx
+                .send(NetEvent::OwnKeyUntrustReady {
+                    _secret: secret,
+                    owner,
+                    rooms,
+                    transitions,
+                    command,
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    fn wait_own_key_left_room(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: crate::node::channel::own_writer_gate::Transition,
+        mut purpose: LeftPurgePurpose,
+        secret: own_keys::SecretLease,
+    ) {
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let transition = tokio::select! {
+                biased;
+                _ = purpose.caller_closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => { drop(channel); Some(transition) },
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyLeftPurgeReady {
+                    _secret: secret,
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    purpose,
+                })
+                .await;
+        });
+    }
+
+    async fn begin_own_key_left_purge(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        mut purpose: LeftPurgePurpose,
+    ) {
+        if self.own_key_ended_pending.contains_key(&room)
+            || self.own_key_leave_pending.contains_key(&room)
+        {
+            purpose.fail(Fault::RoomChangePending);
+            return;
+        }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            purpose.fail(Fault::Locked);
+            return;
+        };
+        let secret = Arc::new(secret);
+        let owner = Arc::new(());
+        self.own_key_ended_pending.insert(room, Arc::clone(&owner));
+        if let Err(error) = self.retire_bounded_room(room).await {
+            self.own_key_ended_pending.remove(&room);
+            if self
+                .channels
+                .get(&room)
+                .is_some_and(|current| Arc::ptr_eq(current, &instance))
+            {
+                self.sched_rooms.insert(room);
+                self.discover_rooms.insert(room);
+            }
+            purpose.fail(fault_of(&error));
+            return;
+        }
+        for ((id, _), port) in &mut self.ports {
+            if *id == room {
+                for (_, attempt) in std::mem::take(&mut port.inbound) {
+                    attempt.retire();
+                }
+            }
+        }
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = purpose.caller_closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = purpose.caller_closed() => None,
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyLeftPurgeReady {
+                    _secret: secret,
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    purpose,
+                })
+                .await;
+        });
+    }
+
+    fn wait_own_key_ended_room(
+        &mut self,
+        room: Digest32,
+        instance: SharedChannel,
+        owner: Arc<()>,
+        transition: crate::node::channel::own_writer_gate::Transition,
+        secret: own_keys::SecretLease,
+    ) {
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let transition = tokio::select! {
+                biased;
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => { drop(channel); Some(transition) },
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyEndedPurgeReady {
+                    _secret: secret,
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                })
+                .await;
+        });
+    }
+
+    async fn begin_own_key_ended_purge(&mut self, room: Digest32, instance: SharedChannel) {
+        if self.own_key_ended_pending.contains_key(&room)
+            || self.own_key_leave_pending.contains_key(&room)
+        {
+            return;
+        }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            return;
+        };
+        let secret = Arc::new(secret);
+        let owner = Arc::new(());
+        self.own_key_ended_pending.insert(room, Arc::clone(&owner));
+        if let Err(error) = self.retire_bounded_room(room).await {
+            self.own_key_ended_pending.remove(&room);
+            let _ = self.event_tx.send(NodeEvent::NodeNote {
+                note: format!("ended room cleanup stopped: {error}"),
+            });
+            return;
+        }
+        for ((id, _), port) in &mut self.ports {
+            if *id == room {
+                for (_, attempt) in std::mem::take(&mut port.inbound) {
+                    attempt.retire();
+                }
+            }
+        }
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyEndedPurgeReady {
+                    _secret: secret,
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                })
+                .await;
+        });
+    }
+
+    fn begin_own_key_publication_reject(&mut self, room: Digest32, waiting: RoomPublication) {
+        let Some(instance) = self.channels.get(&room).cloned().filter(|instance| {
+            waiting
+                .instance
+                .upgrade()
+                .is_some_and(|old| Arc::ptr_eq(instance, &old))
+        }) else {
+            self.fail_room_publication(room, waiting, Fault::ChannelNotOpen);
+            return;
+        };
+        if self.own_key_leave_pending.contains_key(&room) {
+            self.publish_waiters.insert(room, waiting);
+            return;
+        }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            self.fail_room_publication(room, waiting, Fault::Locked);
+            return;
+        };
+        let secret = Arc::new(secret);
+        let owner = Arc::new(());
+        self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyPublicationRejectReady {
+                    _secret: secret,
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    waiting,
+                })
+                .await;
+        });
+    }
+
+    /// Retire physical own-key sends off actor before the close can take effect.
+    async fn begin_own_key_close(&mut self, room: Digest32, mut reply: oneshot::Sender<Outcome>) {
+        let Some(instance) = self.channels.get(&room).cloned() else {
+            let outcome = self.close_channel(&room, None).await;
+            let _ = reply.send(outcome);
+            return;
+        };
+        if self.own_key_leave_pending.contains_key(&room) {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
+        let owner = Arc::new(());
+        self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate = tokio::select! {
+                biased;
+                _ = reply.closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyCloseReady {
+                    _secret: secret,
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    /// Retire physical own-key sends off actor before the leave can commit.
+    async fn begin_own_key_leave(&mut self, room: Digest32, mut reply: oneshot::Sender<Outcome>) {
+        let Some(instance) = self.channels.get(&room).cloned() else {
+            self.begin_leave(room, reply, None).await;
+            return;
+        };
+        if self.own_key_leave_pending.contains_key(&room) {
+            let _ = reply.send(Outcome::Failed(Fault::RoomChangePending));
+            return;
+        }
+        let Ok(secret) = self.secret_work.clone().try_read_owned() else {
+            let _ = reply.send(Outcome::Failed(Fault::Locked));
+            return;
+        };
+        let secret = Arc::new(secret);
+        let owner = Arc::new(());
+        self.own_key_leave_pending.insert(room, Arc::clone(&owner));
+        let mut room_cancel = self.own_key_room_watch(room);
+        let mut epoch_changed = self.pairwise_epoch.subscribe();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let gate: Option<Arc<crate::node::channel::own_writer_gate::Gate>> = tokio::select! {
+                biased;
+                _ = reply.closed() => None,
+                _ = room_cancel.changed() => None,
+                _ = epoch_changed.changed() => None,
+                channel = instance.lock() => Some(Arc::clone(&channel.own_writer_gate)),
+            };
+            let transition = if let Some(gate) = gate {
+                tokio::select! {
+                    biased;
+                    _ = reply.closed() => None,
+                    _ = room_cancel.changed() => None,
+                    _ = epoch_changed.changed() => None,
+                    transition = gate.transition(None) => Some(transition),
+                }
+            } else {
+                None
+            };
+            let _ = tx
+                .send(NetEvent::OwnKeyLeaveReady {
+                    _secret: secret,
+                    room,
+                    instance,
+                    owner,
+                    transition,
+                    reply,
+                })
+                .await;
+        });
+    }
+
     /// Leave a room (V210-164): write this identity's departure into it, take this identity's
     /// records off boards (V030-14), push the departure to the room's other members, and answer
     /// once one of them has it — then the room is deleted from this node
     /// ([`Self::finish_leave_if_heard`]). Waiting is what makes the leave seen: a room deleted
     /// first would take the only copy of the departure with it.
-    async fn begin_leave(&mut self, channel_id: Digest32, reply: oneshot::Sender<Outcome>) {
+    async fn begin_leave(
+        &mut self,
+        channel_id: Digest32,
+        reply: oneshot::Sender<Outcome>,
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    ) {
         self.history_demand.retire_room(channel_id);
         self.history_hints.retire_room(channel_id);
         if let Err(error) = self.retire_bounded_room(channel_id).await {
@@ -22012,6 +24037,9 @@ impl Node {
                 return;
             }
         };
+        // The departure is durable. Release the gate before network/board work.
+        drop(transition);
+        self.cancel_own_key_room(channel_id);
         if let Err(fault) = self
             .withdraw_from_boards(
                 &channel_id,
@@ -22025,7 +24053,18 @@ impl Node {
         }
         // Nobody else is in the room: there is nobody to tell.
         if alone {
-            let _ = reply.send(self.purge_room(&channel_id).await);
+            if let Some(instance) = self.channels.get(&channel_id).cloned() {
+                self.begin_own_key_left_purge(
+                    channel_id,
+                    instance,
+                    LeftPurgePurpose::Leave {
+                        replies: vec![reply],
+                    },
+                )
+                .await;
+            } else {
+                let _ = reply.send(Outcome::Failed(Fault::ChannelNotOpen));
+            }
             return;
         }
         self.wait_for_leave(channel_id, gen, Some(reply)).await;
@@ -22088,25 +24127,19 @@ impl Node {
         if heard.is_empty() {
             return;
         }
-        // Written in the room since — it posted, or said it is back — and so not leaving.
-        let still_left = match self.channels.get(&channel_id) {
-            Some(shared) => {
-                let ch = shared.lock().await;
-                ch.has_left(&ch.me())
-            }
-            None => false,
-        };
-        let outcome = if still_left {
-            self.purge_room(&channel_id).await
+        let replies = heard
+            .into_iter()
+            .filter_map(|(_, _, reply, _)| reply)
+            .collect();
+        if let Some(instance) = self.channels.get(&channel_id).cloned() {
+            self.begin_own_key_left_purge(
+                channel_id,
+                instance,
+                LeftPurgePurpose::Leave { replies },
+            )
+            .await;
         } else {
-            // In the room again: its records go on boards again.
-            match self.forget_pending_withdrawal(&channel_id) {
-                Ok(()) => Outcome::Failed(Fault::LeaveUndone),
-                Err(error) => Outcome::Failed(fault_of(&error)),
-            }
-        };
-        for reply in heard.into_iter().filter_map(|(_, _, reply, _)| reply) {
-            let _ = reply.send(outcome);
+            LeftPurgePurpose::Leave { replies }.fail(Fault::ChannelNotOpen);
         }
     }
 
@@ -22473,11 +24506,20 @@ impl Node {
     /// and its key, its place among the rooms reopened at unlock, the consents pending in it,
     /// and then the store is rewritten so none of the deleted bytes stay in the file. A room left
     /// (V210-164) or ended (the decider, 2026-10-03) goes this way.
-    async fn purge_room(&mut self, channel_id: &Digest32) -> Outcome {
+    async fn purge_room(
+        &mut self,
+        channel_id: &Digest32,
+        ready: Option<(
+            crate::node::channel::own_writer_gate::Transition,
+            tokio::sync::OwnedMutexGuard<ChannelState>,
+        )>,
+    ) -> Outcome {
         self.history_demand.retire_room(*channel_id);
         self.history_hints.retire_room(*channel_id);
-        if let Err(error) = self.retire_bounded_room(*channel_id).await {
-            return Outcome::Failed(fault_of(&error));
+        if ready.is_none() {
+            if let Err(error) = self.retire_bounded_room(*channel_id).await {
+                return Outcome::Failed(fault_of(&error));
+            }
         }
         if self
             .session_rooms_retiring
@@ -22527,11 +24569,25 @@ impl Node {
         let mut name = String::new();
         self.key_package_rooms.remove(channel_id);
         self.cancel_private_pulls(Some(*channel_id));
+        self.cancel_own_key_room(*channel_id);
+        self.own_recovery_rooms.remove(channel_id);
+        self.own_recovery_body_debts.remove(channel_id);
+        self.own_readable_effects.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
+        if self.channels.contains_key(channel_id) {
+            self.own_key_room_set_changed.send_replace(());
+        }
         if let Some(shared) = self.channels.remove(channel_id) {
-            let mut ch = shared.lock().await;
-            name = crate::node::resolver::room_shown(ch.name(), channel_id);
-            ch.lock_now();
+            if let Some((transition, mut ch)) = ready {
+                name = crate::node::resolver::room_shown(ch.name(), channel_id);
+                ch.lock_now();
+                drop(ch);
+                drop(transition);
+            } else {
+                let mut ch = shared.lock().await;
+                name = crate::node::resolver::room_shown(ch.name(), channel_id);
+                ch.lock_now();
+            }
         }
         // The read cursors and held-claim records agent sessions kept for it go too: nothing
         // filed under the room outlives it.
@@ -22635,7 +24691,7 @@ impl Node {
     ///   counts, up to [`WIND_DOWN`] — and is then deleted (the decider, 2026-10-03: "a room the
     ///   admin ended should not need a forget"). A room left is deleted by the leave itself.
     async fn tend_lifecycle(&mut self) -> bool {
-        let mut changed = false;
+        let changed = false;
         let now_ms = (self.millis_clock)();
         let rooms: Vec<(Digest32, Arc<tokio::sync::Mutex<ChannelState>>)> = self
             .channels
@@ -22763,14 +24819,8 @@ impl Node {
             {
                 continue;
             }
-            self.winding.remove(&cid);
-            let _ = self.event_tx.send(NodeEvent::RoomEnded {
-                channel_id: cid,
-                handed,
-                members: members.len(),
-            });
-            let _ = self.purge_room(&cid).await;
-            changed = true;
+            self.begin_own_key_ended_purge(cid, Arc::clone(&shared))
+                .await;
         }
         changed
     }

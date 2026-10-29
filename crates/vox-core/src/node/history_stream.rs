@@ -112,6 +112,7 @@ pub(crate) async fn serve(
     fence: std::sync::Arc<crate::transport::stream_transport::Fence>,
     inbox: std::sync::Arc<HintInbox>,
     departure_receipt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    availability_connection: Option<u64>,
 ) -> (Result<Status>, bool, bool) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let source = source::Source::new(
@@ -124,7 +125,8 @@ pub(crate) async fn serve(
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
-    let mut io = transport::Transport::new(send, recv, job, fence, deadline);
+    let mut io =
+        transport::Transport::new(send, recv, job, fence, deadline, availability_connection);
     let generation = inbox.generation(preamble.room, peer);
     let mut inventory_added = false;
     // Whether the round moved anything: an inventory exchange that added no hint on this side
@@ -675,6 +677,7 @@ pub enum Frame<'a> {
         /// a reason to query, never a receipt or an authorization decision.
         role: Option<HeadHint>,
         key_catalog: Option<([u8; 16], u64)>,
+        availability: Option<super::channel::availability::Token>,
     },
     KeyAvailability {
         request: RequestId,
@@ -745,7 +748,7 @@ impl<'a> Frame<'a> {
             Self::Hello(_) => MAX_HELLO_FRAME_BYTES,
             Self::KeyAvailability { .. } => 256,
             Self::Want { .. } => MAX_WANT_FRAME_BYTES,
-            Self::Have { hints, .. } => (HAVE_FRAME_FIXED_BYTES + 256 + HAVE_HINT_MAX_BYTES)
+            Self::Have { hints, .. } => (HAVE_FRAME_FIXED_BYTES + 280 + HAVE_HINT_MAX_BYTES)
                 .checked_add(
                     hints
                         .len()
@@ -790,11 +793,12 @@ impl<'a> Frame<'a> {
                 hints,
                 role,
                 key_catalog,
+                availability,
             } => {
                 if hints.len() > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
                 }
-                e.array(3).array(hints.len());
+                e.array(4).array(hints.len());
                 let mut previous = None;
                 for hint in hints {
                     if hint.size > MAX_SEQ || previous.is_some_and(|last| last >= hint.author) {
@@ -819,6 +823,13 @@ impl<'a> Frame<'a> {
                 e.array(usize::from(key_catalog.is_some()));
                 if let Some((instance, tip)) = key_catalog {
                     e.array(2).bytes(instance).uint(*tip);
+                }
+                e.array(usize::from(availability.is_some()));
+                if let Some(token) = availability {
+                    if token.open == 0 {
+                        return Err(invalid("availability lifetime"));
+                    }
+                    e.array(2).uint(token.open).uint(token.revision);
                 }
                 0x02
             }
@@ -972,7 +983,7 @@ impl<'a> Frame<'a> {
                 Self::Hello(u8::try_from(d.uint()?).map_err(|_| invalid("history hello bitmap"))?)
             }
             0x02 => {
-                arity(&mut d, 3)?;
+                arity(&mut d, 4)?;
                 let count = d.array()?;
                 if count > MAX_CONTEXT_AUTHORS {
                     return Err(invalid("history have authors"));
@@ -1018,10 +1029,26 @@ impl<'a> Frame<'a> {
                     }
                     _ => return Err(invalid("key catalog hint count")),
                 };
+                let availability = match d.array()? {
+                    0 => None,
+                    1 => {
+                        arity(&mut d, 2)?;
+                        let open = d.uint()?;
+                        if open == 0 {
+                            return Err(invalid("availability lifetime"));
+                        }
+                        Some(super::channel::availability::Token {
+                            open,
+                            revision: d.uint()?,
+                        })
+                    }
+                    _ => return Err(invalid("availability count")),
+                };
                 Self::Have {
                     hints,
                     role,
                     key_catalog,
+                    availability,
                 }
             }
             0x03 => {

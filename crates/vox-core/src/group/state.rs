@@ -348,6 +348,44 @@ impl core::fmt::Debug for ReceiverChain {
 }
 
 impl ReceiverChain {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Scalar binding for an auxiliary original release; the temporary body zeroizes and
+    /// no chain-key bytes escape this receiver.
+    pub(crate) fn history_release_binding(&self) -> (u64, crate::hash::Digest32) {
+        let body = crate::group::skdm::SkdmBody {
+            channel_id: self.channel_id,
+            epoch: self.epoch,
+            author_id: self.author_id,
+            chain_id: self.chain_id,
+            iteration: self.history_iteration,
+            chain_key: self.history_key.clone(),
+            signing_pubkey: self.signing_pubkey.to_bytes(),
+            algo_ids: [
+                crate::suite::algo::COMPOSITE_ED25519_ML_DSA_65,
+                crate::suite::algo::AES_256_GCM,
+            ],
+        };
+        (
+            self.history_iteration,
+            crate::hash::sha256(&body.canonical_body()),
+        )
+    }
+
+    /// An original root-signed release may be retained only for this exact installed floor.
+    /// This exposes no key bytes and never substitutes peer state for a root signature.
+    pub(crate) fn matches_history_release(&self, release: &Skdm) -> bool {
+        self.channel_id == release.body.channel_id
+            && self.epoch == release.body.epoch
+            && self.author_id == release.body.author_id
+            && self.chain_id == release.body.chain_id
+            && self.history_iteration == release.body.iteration
+            && self.history_key.bytes() == release.body.chain_key.bytes()
+            && self.signing_pubkey.to_bytes() == release.body.signing_pubkey
+    }
+
     /// An iteration at or after the verified key release, or an older one whose skipped key
     /// is still held. No iteration before the release can be derived from this chain.
     pub(crate) fn can_open_iteration(&self, iteration: u64) -> bool {
@@ -508,6 +546,19 @@ impl ReceiverChain {
         self.author_id
     }
 
+    pub(crate) fn bound_to(
+        &self,
+        room: &Digest32,
+        epoch: u64,
+        author: &Digest32,
+        chain: u64,
+    ) -> bool {
+        self.channel_id == *room
+            && self.epoch == epoch
+            && self.author_id == *author
+            && self.chain_id == chain
+    }
+
     /// The generation id this receiver reads.
     #[must_use]
     pub fn chain_id(&self) -> u64 {
@@ -609,7 +660,17 @@ impl ReceiverChain {
         if iteration >= self.next_iteration || self.skipped.contains_key(&iteration) {
             return self.decrypt(msg);
         }
-        let gap = iteration
+        self.decrypt_retained(msg)
+    }
+
+    /// Reopen an own-author retained message without changing its live replay/ratchet state.
+    /// Callers deduplicate canonical effects before this operation; the authenticated floor,
+    /// signature, AEAD and existing derivation bound still apply.
+    pub(crate) fn decrypt_retained(&self, msg: &GroupMessage) -> Result<Vec<u8>> {
+        self.check_binding(&msg.header)?;
+        let gap = msg
+            .header
+            .iteration
             .checked_sub(self.history_iteration)
             .ok_or(Error::MalformedBundle(
                 "group iteration before history release",

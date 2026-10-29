@@ -35,7 +35,14 @@ pub(crate) async fn exchange(
             result.map_err(|_| Error::Unreachable("history opening deadline elapsed"))??
         }
     };
-    let mut io = Transport::new(streams.0, streams.1, job, fence, deadline);
+    let mut io = Transport::new(
+        streams.0,
+        streams.1,
+        job,
+        fence,
+        deadline,
+        conn.supports_availability().then_some(conn.serial()),
+    );
     let kind_bytes = StreamKind::Sync.frame().len() + 4;
     drop(opening);
     let result = handshake_and_pull(
@@ -92,14 +99,17 @@ async fn handshake_and_pull(
     drop(encoded);
     let mut announcement = None;
     let mut catalog_announcement = None;
+    let mut offered_availability = None;
     if matches!(query, Query::Inventory) {
         let super::source::Lookup::Found(mut held) = receiver.inventory(io.job()).await? else {
             return Err(Error::Unreachable("history inventory buffers busy"));
         };
+        offered_availability = io.availability_connection.map(|_| held.value.4);
         let frame = Frame::Have {
             hints: std::mem::take(&mut held.value.0),
             role: held.value.1.as_ref().map(|notice| notice.head),
             key_catalog: held.value.2,
+            availability: offered_availability,
         };
         let encoded = frame.encode_required(io.job())?;
         overhead += encoded.as_slice().len() + 4;
@@ -113,8 +123,9 @@ async fn handshake_and_pull(
         drop(frame);
         drop(held);
     }
-    let result = receiver.pull(io, preamble.request, query, overhead).await?;
+    let mut result = receiver.pull(io, preamble.request, query, overhead).await?;
     if result.status == super::Status::Complete {
+        result.offered_availability = offered_availability;
         if let Some(announcement) = announcement {
             receiver.acknowledge_role(io.job(), announcement).await?;
         }

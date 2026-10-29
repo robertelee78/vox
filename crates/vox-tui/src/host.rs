@@ -170,13 +170,12 @@ enum Slot {
 struct ComputerReconciliation {
     target: vox_core::node::computer::ComputerPolicyTarget,
     pass: u64,
-    superseded: Arc<std::sync::atomic::AtomicBool>,
+    superseded: Arc<vox_core::node::actor::PolicySupersession>,
 }
 
 impl Drop for ComputerReconciliation {
     fn drop(&mut self) {
-        self.superseded
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.superseded.retire();
     }
 }
 

@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::{entry_store::sparse::CursorBinding, ChannelState};
+use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Active, Context};
 use crate::node::store::{ReceivedFlow, Store};
 use crate::wire::WireError;
@@ -80,6 +81,7 @@ pub(crate) enum LocalProof {
 /// All results are bounded scheduling information, not permission to fetch another page.
 pub(crate) struct Received {
     pub(crate) status: Status,
+    pub(crate) offered_availability: Option<super::super::channel::availability::Token>,
     pub(crate) continuation: Option<Continuation>,
     pub(crate) needs: Vec<Query>,
     pub(crate) verifiers: Vec<CursorBinding>,
@@ -101,6 +103,7 @@ impl Received {
     fn pending(status: Status) -> Self {
         Self {
             status,
+            offered_availability: None,
             continuation: None,
             needs: Vec::new(),
             verifiers: Vec::new(),
@@ -175,6 +178,7 @@ impl Receiver {
             Option<super::source::RoleAnnouncement>,
             Option<([u8; 16], u64)>,
             Option<super::source::CatalogAnnouncement>,
+            super::super::channel::availability::Token,
         )>,
     > {
         self.source.inventory(job).await
@@ -196,6 +200,17 @@ impl Receiver {
     ) -> Result<()> {
         self.source
             .acknowledge_key_catalog(job, notice, connection_serial)
+            .await
+    }
+
+    pub(super) async fn observe_availability(
+        &self,
+        job: &Job,
+        connection: u64,
+        token: super::super::channel::availability::Token,
+    ) -> Result<()> {
+        self.source
+            .observe_availability(job, connection, token)
             .await
     }
 
@@ -404,7 +419,8 @@ impl Receiver {
                         hints,
                         role,
                         key_catalog,
-                    } => Action::Inventory(hints, role, key_catalog),
+                        availability,
+                    } => Action::Inventory(hints, role, key_catalog, availability),
                     Frame::KeyAvailability { instance, page, .. } => {
                         Action::KeyAvailability(instance, page)
                     }
@@ -426,7 +442,11 @@ impl Receiver {
                 }
             };
             match action {
-                Action::Inventory(hints, role, key_catalog) => {
+                Action::Inventory(hints, role, key_catalog, token) => {
+                    if let (Some(connection), Some(token)) = (io.availability_connection, token) {
+                        self.observe_availability(io.job(), connection, token)
+                            .await?;
+                    }
                     let charge = io.job().reserve_or_pressure(
                         hints.capacity() * std::mem::size_of::<super::HeadHint>(),
                     )?;
@@ -854,6 +874,7 @@ enum Action {
         Vec<super::HeadHint>,
         Option<super::HeadHint>,
         Option<([u8; 16], u64)>,
+        Option<super::super::channel::availability::Token>,
     ),
     Meta,
     Chunk {
@@ -1391,7 +1412,76 @@ impl Receiver {
         let historical = self.historical;
         let received = self.received.clone();
         let committed = self.source.commit_ledger();
+        // A staged record may contain only a header. Inspect the authenticated stored body
+        // off actor so unrelated governance does not cancel an active key response.
+        let governance =
+            record.entry.skeleton.v2.as_ref().is_some_and(|header| {
+                header.kind == crate::log::history::SignedEntryKind::Governance
+            });
+        let (needs_transition, self_departure) = if governance {
+            let classified = self
+                .read_precharged(
+                    &job,
+                    64 * 1024,
+                    Arc::clone(&record),
+                    move |room, store, record| {
+                        let input = room.history_read(store)?;
+                        let hash = record.entry.entry_hash();
+                        if input.publication_busy() {
+                            return Ok(None);
+                        }
+                        if input.history_effect_finished(&hash)? {
+                            return Ok(Some((false, false)));
+                        }
+                        let entry = input.history_entry(&hash)?.ok_or(Error::MalformedAtRest(
+                            "pending history body record missing",
+                        ))?;
+                        // A join cannot narrow membership. If classification fails, gate
+                        // conservatively until the effect verifies or rejects the body.
+                        let needs_transition =
+                            match crate::governance::entry::GovEntry::body_bound_to(&entry) {
+                                Ok(crate::governance::entry::GovBody::Presence(presence)) => {
+                                    !presence.body.here
+                                }
+                                Ok(_) => false,
+                                Err(_) => true,
+                            };
+                        Ok(Some((
+                            needs_transition,
+                            record.entry.skeleton.author_id == room.me(),
+                        )))
+                    },
+                )
+                .await?;
+            match classified {
+                Lookup::Found(held) => held.value.1,
+                Lookup::Busy => return Ok(Lookup::Busy),
+                Lookup::Missing => return Ok(Lookup::Missing),
+            }
+        } else {
+            (false, false)
+        };
+        let transition = if needs_transition {
+            let gate = {
+                let room = tokio::select! {
+                    biased;
+                    () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                    room = self.source.room.lock() => room,
+                };
+                Arc::clone(&room.own_writer_gate)
+            };
+            let targets =
+                (!self_departure).then(|| std::slice::from_ref(&record.entry.skeleton.author_id));
+            Some(tokio::select! {
+                biased;
+                () = self.source.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                transition = gate.transition(targets) => transition,
+            })
+        } else {
+            None
+        };
         self.read_precharged(&job, 64 * 1024, record, move |room, store, record| {
+            let _transition = transition;
             let room_id = room.channel_id();
             let instance = room.history_instance(store)?;
             let epoch = room.epoch();

@@ -359,6 +359,11 @@ pub struct Port {
     /// This node's own appends in the room, counted (ADR-037 R7): what the peer is told of
     /// through an inventory exchange, the only exchange that carries this node's heads.
     pub own_seq: u64,
+    pub(crate) availability: std::sync::Arc<super::channel::availability::Peer>,
+    pub(crate) availability_enabled: bool,
+    pub(crate) availability_connection: Option<u64>,
+    pub(crate) availability_acked: Option<super::channel::availability::Token>,
+    pub(crate) availability_seen: Option<(u64, super::channel::availability::Token)>,
     /// `own_seq` when this port last began an inventory exchange. While `own_seq` is past it,
     /// the port owes the peer an announcement, and a parked hinted continuation waits one round.
     pub announced_seq: u64,
@@ -378,7 +383,13 @@ pub struct Port {
 impl Port {
     /// A fresh port for `room`, with a request raised: a new port syncs at once.
     #[must_use]
-    pub fn new(room: RoomRef, gen: Arc<AtomicU64>, epoch: u64, sparse: bool) -> Self {
+    pub(crate) fn new(
+        room: RoomRef,
+        gen: Arc<AtomicU64>,
+        epoch: u64,
+        sparse: bool,
+        availability: std::sync::Arc<super::channel::availability::Peer>,
+    ) -> Self {
         Self {
             room,
             gen,
@@ -422,6 +433,11 @@ impl Port {
             last_progress: None,
             last_clean_out: None,
             own_seq: 0,
+            availability,
+            availability_enabled: false,
+            availability_connection: None,
+            availability_acked: None,
+            availability_seen: None,
             announced_seq: 0,
             role_owed: false,
             key_catalog_owed: false,
@@ -435,7 +451,11 @@ impl Port {
     /// peer; a hinted drain of the peer's backlog must not hold that announcement back.
     #[must_use]
     pub fn announce_owed(&self) -> bool {
-        self.own_seq > self.announced_seq || self.role_owed || self.key_catalog_owed
+        self.own_seq > self.announced_seq
+            || self.role_owed
+            || self.key_catalog_owed
+            || (self.availability_enabled
+                && self.availability_acked != Some(self.availability.local()))
     }
 
     /// Whether the port needs a session (ADR-025 D1).

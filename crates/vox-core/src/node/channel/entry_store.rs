@@ -1244,6 +1244,8 @@ impl Source<'_> {
 pub(crate) struct EntryIndex {
     cache: RefCell<PageCache>,
     cache_revision: Cell<u64>,
+    /// In-memory signal for maintenance scans whose safety depends on retained bodies.
+    commit_generation: Cell<u64>,
     legacy_attached: Cell<Option<LegacyProvisionalOwner>>,
     provisional_hidden: Cell<bool>,
 }
@@ -1322,6 +1324,30 @@ impl Read<'_> {
                 &position(author, seq),
             )?
             .is_some())
+    }
+    pub(crate) fn payload_present(&self, hash: &Digest32) -> Result<bool> {
+        let Some(at) = self.source().find(
+            self.sek,
+            self.channel,
+            self.directory.active.hash,
+            &hashed(hash),
+        )?
+        else {
+            return Ok(false);
+        };
+        let wire = self
+            .source()
+            .open(self.sek, self.channel, SegmentKind::LogDb, at.log)?
+            .ok_or(invalid("indexed body source absent"))?;
+        let (header, held) = Entry::header_from_wire(&wire)?;
+        if header.entry_hash() != *hash
+            || header.skeleton.channel_id != *self.channel
+            || header.skeleton.author_id != at.author
+            || header.skeleton.seq != at.seq
+        {
+            return Err(invalid("indexed body source identity differs"));
+        }
+        Ok(held)
     }
     pub(crate) fn log_id(&self, hash: &Digest32) -> Result<Option<u64>> {
         Ok(self
@@ -1526,7 +1552,12 @@ impl EntryIndex {
             destination: None,
         })
     }
+    pub(crate) fn commit_generation(&self) -> u64 {
+        self.commit_generation.get()
+    }
     pub(crate) fn committed(&self) {
+        self.commit_generation
+            .set(self.commit_generation.get().wrapping_add(1));
         self.cache.borrow_mut().clear();
     }
 }
@@ -1691,6 +1722,17 @@ impl<'s> Write<'_, 's> {
             self.directory.active.sequence == 0 || self.directory.active.clock != 0;
         self.directory.phase = Phase::Idle;
         Ok(())
+    }
+    /// Strict old-wire inspection in the same Batch as the later exact refill.
+    pub(crate) fn refill_available(&self, entry: &Entry, log: u64) -> Result<bool> {
+        let old_wire = Source::Batch(self.batch)
+            .open(self.sek, self.channel, SegmentKind::LogDb, log)?
+            .ok_or(invalid("indexed refill source absent"))?;
+        let (old, held) = Entry::header_from_wire(&old_wire)?;
+        if old.header_wire() != entry.header_wire() {
+            return Err(invalid("refill header differs"));
+        }
+        Ok(!held && entry.payload.is_some())
     }
     pub(crate) fn put_committed(&mut self, entry: &Entry, log: u64) -> Result<()> {
         if self.directory.phase != Phase::Idle {

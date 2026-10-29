@@ -196,7 +196,7 @@ impl Router {
                     {
                         return None;
                     }
-                    let superseded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let superseded = Arc::new(vox_core::node::actor::PolicySupersession::default());
                     attached.computer_reconciliation = Some(ComputerReconciliation {
                         target,
                         pass,

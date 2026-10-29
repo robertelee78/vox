@@ -141,6 +141,17 @@ impl Queue {
     }
 
     fn save(&self, store: &Store, sek: &Sek, room: &Digest32) -> Result<()> {
+        let mut batch = store.batch()?;
+        self.queue_save(&mut batch, sek, room)?;
+        batch.commit()
+    }
+
+    fn queue_save(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        sek: &Sek,
+        room: &Digest32,
+    ) -> Result<()> {
         let mut e = Encoder::new();
         e.array(7).uint(1).uint(self.through);
         match self.replay {
@@ -159,7 +170,7 @@ impl Queue {
             e.array(2).bytes(author).uint(*id);
         }
         let segment = seal_segment(sek, SegmentKind::KeyMaterial, CHECKPOINT, &e.finish())?;
-        store.put_segment(room, SegmentKind::KeyMaterial, CHECKPOINT, &segment)
+        batch.put_segment(room, SegmentKind::KeyMaterial, CHECKPOINT, &segment)
     }
 
     pub(super) fn published(&mut self, _next_log_id: u64) {
@@ -209,6 +220,29 @@ impl Queue {
         *self = done;
         Ok(())
     }
+    pub(super) fn has_attempt(&self) -> bool {
+        self.attempt.is_some()
+    }
+
+    /// A physically available release slot and the durable replay request share the same
+    /// transaction. The actor finishes a selected package before entering room maintenance.
+    pub(super) fn capacity_retry(
+        &self,
+        batch: &mut crate::node::store::Batch<'_>,
+        sek: &Sek,
+        room: &Digest32,
+    ) -> Result<Self> {
+        if self.attempt.is_some() {
+            return Err(Error::MalformedAtRest(
+                "release cleanup crossed unfinished key-package attempt",
+            ));
+        }
+        let mut candidate = self.clone();
+        candidate.retry_retained();
+        candidate.queue_save(batch, sek, room)?;
+        Ok(candidate)
+    }
+
     pub(super) fn retry_retained(&mut self) {
         self.replay_requested = self.replay_requested.max(self.through);
         self.start_replay();

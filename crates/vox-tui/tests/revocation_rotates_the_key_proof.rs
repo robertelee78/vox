@@ -899,6 +899,20 @@ impl Dave {
                                 frozen_opened: false,
                                 fresh_opened: None,
                             },
+                            PairwiseFrame::RecoveryOpen { channel_id, .. } => Got {
+                                kind: "recovery-open",
+                                room: *channel_id,
+                                one_time: None,
+                                frozen_opened: false,
+                                fresh_opened: None,
+                            },
+                            PairwiseFrame::RecoveryReply { channel_id, .. } => Got {
+                                kind: "recovery-reply",
+                                room: *channel_id,
+                                one_time: None,
+                                frozen_opened: false,
+                                fresh_opened: None,
+                            },
                         };
                         let sealed = match &frame {
                             PairwiseFrame::RotationHello { sealed, .. }
