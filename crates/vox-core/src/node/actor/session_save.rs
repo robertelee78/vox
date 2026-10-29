@@ -162,9 +162,7 @@ impl Prepared {
 impl Completed {
     pub(super) fn package_confirmed(&self) -> bool {
         match self {
-            Self::Session(completed) => {
-                matches!(&completed.result, Ok(SessionSaved::Package { .. }))
-            }
+            Self::Session(completed) => completed.package_confirmed(),
             Self::Prelude { .. } => false,
         }
     }

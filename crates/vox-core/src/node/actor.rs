@@ -2031,7 +2031,6 @@ impl NetEvent {
                 | Self::OwnKeyComputerCancelled { .. }
                 | Self::OwnKeyOpenReady(..)
                 | Self::OwnKeyRequestReady(..)
-                | Self::OwnKeyResponseReady(..)
                 | Self::OwnKeyRequestFailed { .. }
         )
     }
@@ -5673,6 +5672,8 @@ struct RoomPublication {
     kind: RoomPublicationKind,
     /// The exact Computer projection which authorized creating/joining/opening this incarnation.
     authority: Option<RoomPublicationAuthority>,
+    /// Original joined-room compensation remains owned until the routing-terminal reply.
+    join_rollback: Option<Arc<metadata_save::CompletedJoinRollback>>,
 }
 
 impl RoomPublication {
@@ -8685,6 +8686,7 @@ impl Node {
                     authority: (kind == RoomPublicationKind::Open)
                         .then(|| self.room_publication_authority.remove(&room))
                         .flatten(),
+                    join_rollback: None,
                 },
             );
         }
@@ -8979,9 +8981,7 @@ impl Node {
             self.publish_waiters.insert(room, waiting);
             return;
         }
-        if let Some(reply) = waiting.reply {
-            let _ = reply.send(waiting.outcome);
-        }
+        self.finish_metadata_room_publication(room, waiting);
     }
 
     /// Publish only local settings while holding the checked room incarnation. The
@@ -9070,7 +9070,13 @@ impl Node {
         Ok(true)
     }
 
-    fn fail_room_publication(&mut self, room: Digest32, waiting: RoomPublication, fault: Fault) {
+    fn fail_room_publication(
+        &mut self,
+        room: Digest32,
+        mut waiting: RoomPublication,
+        fault: Fault,
+    ) {
+        self.abort_metadata_join_publication(room, &mut waiting, fault);
         if let Some(reply) = waiting.reply {
             let _ = reply.send(Outcome::Failed(fault));
         }
@@ -17653,6 +17659,7 @@ impl Node {
         }
         self.peer_book_save = peer_book_save::State::default();
         self.anchor_hints_save = peer_book_save::State::default();
+        self.retire_metadata_publications();
         if let Some(pending) = self.pending_metadata.take() {
             tokio::spawn(pending.retire());
         }
@@ -17698,11 +17705,6 @@ impl Node {
         self.legacy_cleanup_due = std::time::Instant::now();
         self.key_package_rooms.clear();
         self.key_package_after = None;
-        for (_, waiting) in std::mem::take(&mut self.publish_waiters) {
-            if let Some(reply) = waiting.reply {
-                let _ = reply.send(Outcome::Failed(Fault::Locked));
-            }
-        }
         self.room_publication_authority.clear();
         self.publication_after = None;
         self.publication_pending = false;
@@ -18298,9 +18300,7 @@ impl Node {
         let opening = self.opening_rooms.remove(id).is_some();
         self.room_publication_authority.remove(id);
         let publishing = if let Some(waiting) = self.publish_waiters.remove(id) {
-            if let Some(reply) = waiting.reply {
-                let _ = reply.send(Outcome::Failed(fault));
-            }
+            self.fail_room_publication(*id, waiting, fault);
             self.reopening.remove(id);
             true
         } else {
@@ -20827,13 +20827,15 @@ impl Node {
         if by != owner && !channel.is_member(&by) {
             return Err("attention requires current room membership".into());
         }
-        if let Some(expected) = expected_instance {
-            if channel
-                .history_instance(profile.store())
-                .map_err(|error| error.to_string())?
-                != expected
-            {
-                return Err("the selected room changed; refresh and retry".into());
+        if !matches!(&operation, crate::node::attention::Operation::Page(_)) {
+            if let Some(expected) = expected_instance {
+                if channel
+                    .history_instance(profile.store())
+                    .map_err(|error| error.to_string())?
+                    != expected
+                {
+                    return Err("the selected room changed; refresh and retry".into());
+                }
             }
         }
         if matches!(&operation, crate::node::attention::Operation::Page(_)) {
@@ -20843,15 +20845,28 @@ impl Node {
             if !self.computer_authority_current() {
                 return Err("attention waits for current computer trust".into());
             }
-            let result =
-                channel.attention(profile.store(), owner, operation, (self.millis_clock)());
+            let result = channel.attention(
+                profile.store(),
+                owner,
+                expected_instance,
+                operation,
+                (self.millis_clock)(),
+            );
             return if self.computer_authority_current() {
                 result
             } else {
                 Err("attention waits for current computer trust".into())
             };
         }
-        let write = || channel.attention(profile.store(), owner, operation, (self.millis_clock)());
+        let write = || {
+            channel.attention(
+                profile.store(),
+                owner,
+                expected_instance,
+                operation,
+                (self.millis_clock)(),
+            )
+        };
         self.with_current_computer_authority(write)
             .ok_or_else(|| "attention waits for current computer trust".to_owned())?
     }

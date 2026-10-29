@@ -387,6 +387,8 @@ struct Epochs {
     replacement: bool,
     replacement_generation: u64,
     replacement_completed: u64,
+    /// A pre-rename retention link whose removal failed; drain it before another rewrite.
+    redundant_retained: Option<PathBuf>,
     durable_changed: tokio::sync::watch::Sender<(u64, u64)>,
 }
 
@@ -400,6 +402,7 @@ impl Default for Epochs {
             replacement: false,
             replacement_generation: 0,
             replacement_completed: 0,
+            redundant_retained: None,
             durable_changed: tokio::sync::watch::channel((0, 0)).0,
         }
     }
@@ -762,12 +765,29 @@ impl Store {
 
     /// The caller owns the writer; never recursively acquire it during recovery.
     fn rewrite_fresh_locked(&self, epochs: &mut Epochs, retain_original: bool) -> Result<()> {
-        let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
-        let Backing::Writable(old) = &*backing else {
-            return Err(Error::Storage {
-                op: "rewrite store",
-                detail: "the store is not open for writing".to_owned(),
-            });
+        if let Some(retained) = epochs.redundant_retained.as_ref() {
+            match std::fs::remove_file(retained) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(Error::Path {
+                        op: "remove redundant failed-store link",
+                        detail: format!("{}: {error}", retained.display()),
+                    });
+                }
+                _ => {}
+            }
+            epochs.redundant_retained = None;
+        }
+        // The writer excludes every competing replacement. The owned read transaction
+        // retains its database/cache/profile without holding the backing lock through I/O.
+        let r = {
+            let backing = self.db.read().unwrap_or_else(PoisonError::into_inner);
+            let Backing::Writable(old) = &*backing else {
+                return Err(Error::Storage {
+                    op: "rewrite store",
+                    detail: "the store is not open for writing".to_owned(),
+                });
+            };
+            old.begin_read().map_err(storage("begin read"))?
         };
         let mut fresh_path = self.path.clone().into_os_string();
         fresh_path.push(".rewrite");
@@ -776,7 +796,6 @@ impl Store {
         let copied = (|| -> Result<Cached<Arc<Database>>> {
             let fresh = open_database(&fresh_path).map_err(open_error)?;
             super::paths::set_private_file_mode(&fresh_path)?;
-            let r = old.begin_read().map_err(storage("begin read"))?;
             let w = fresh.begin_write().map_err(storage("begin write"))?;
             {
                 if let Some(from) = source_table(&r, SEGMENTS, "open segments")? {
@@ -822,43 +841,72 @@ impl Store {
                     op: "replace store",
                     detail: "store replacement generation exhausted".into(),
                 })?;
-        if retain_original {
-            // Never discard the only forensic/restart copy after a native failure.
-            // Hard-link before replacing the directory entry; existing pins remain valid.
-            let mut suffix = replacement_generation;
-            loop {
-                let mut retained = self.path.clone().into_os_string();
-                retained.push(format!(".failed-{suffix}"));
-                match std::fs::hard_link(&self.path, PathBuf::from(retained)) {
-                    Ok(()) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        suffix = suffix.checked_add(1).ok_or(Error::Storage {
-                            op: "retain failed store",
-                            detail: "retained store generation exhausted".into(),
-                        })?;
-                    }
-                    Err(error) => {
-                        return Err(Error::Path {
-                            op: "retain failed store",
-                            detail: format!("{}: {error}", self.path.display()),
-                        });
+        let mut retained_path = None;
+        let install = (|| -> Result<()> {
+            if retain_original {
+                // Never discard the only forensic/restart copy after a native failure.
+                // Hard-link before replacing the directory entry; existing pins remain valid.
+                let mut suffix = replacement_generation;
+                loop {
+                    let mut retained = self.path.clone().into_os_string();
+                    retained.push(format!(".failed-{suffix}"));
+                    let retained = PathBuf::from(retained);
+                    match std::fs::hard_link(&self.path, &retained) {
+                        Ok(()) => {
+                            retained_path = Some(retained);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            suffix = suffix.checked_add(1).ok_or(Error::Storage {
+                                op: "retain failed store",
+                                detail: "retained store generation exhausted".into(),
+                            })?;
+                        }
+                        Err(error) => {
+                            return Err(Error::Path {
+                                op: "retain failed store",
+                                detail: format!("{}: {error}", self.path.display()),
+                            });
+                        }
                     }
                 }
+                super::paths::sync_dir(&self.path)?;
             }
-            super::paths::sync_dir(&self.path)?;
+            // Both handles remain open across rename, each on its own inode.
+            std::fs::rename(&fresh_path, &self.path).map_err(|error| Error::Path {
+                op: "replace store",
+                detail: format!("{}: {error}", self.path.display()),
+            })
+        })();
+        if let Err(error) = install {
+            // The original path still names this inode. The extra link is redundant until
+            // rename succeeds, and must not accumulate across automatic recovery attempts.
+            if let Some(retained) = retained_path {
+                match std::fs::remove_file(&retained) {
+                    Err(cleanup) if cleanup.kind() != std::io::ErrorKind::NotFound => {
+                        let detail = format!(
+                            "{}: {cleanup}; replacement failed: {error}",
+                            retained.display()
+                        );
+                        epochs.redundant_retained = Some(retained);
+                        return Err(Error::Path {
+                            op: "remove redundant failed-store link",
+                            detail,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            let _ = std::fs::remove_file(&fresh_path);
+            return Err(error);
         }
-        // Keep both handles open across rename. They refer to different inodes, so the
-        // replacement never needs to reopen an inode still held by an old MVCC pin.
-        std::fs::rename(&fresh_path, &self.path).map_err(|error| Error::Path {
-            op: "replace store",
-            detail: format!("{}: {error}", self.path.display()),
-        })?;
         // Rename has installed the new inode, but it is not durable until its directory is
         // synced. Record that exact debt before directory sync. A failed sync leaves the
         // new backing writable, but gates later writes and acknowledgements on this exact
         // replacement becoming durable.
         epochs.replacement = true;
         epochs.replacement_generation = replacement_generation;
+        let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         *backing = Backing::Writable(self.keep_profile(fresh));
         drop(backing);
         self.finish_replacement(epochs)?;

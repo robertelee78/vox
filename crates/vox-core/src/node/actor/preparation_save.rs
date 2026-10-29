@@ -514,9 +514,9 @@ impl Node {
                 }
                 (
                     Stage::Legacy,
-                    Saved::Governance(governance_save::Saved::Legacy { advanced, .. }),
+                    Saved::Governance(governance_save::Saved::Legacy { pending, .. }),
                 ) => {
-                    if advanced {
+                    if pending {
                         prepared.progressed("carrying its earlier Sessions over", now.get());
                         return Ok(false);
                     }
@@ -591,7 +591,11 @@ impl Node {
                         return Ok(false);
                     }
                 },
-                (Stage::Retention(step), Saved::Retention(_)) => {
+                (Stage::Retention(step), Saved::Retention(installed)) => {
+                    if step == Step::Projection && !installed.projection_ready {
+                        prepared.progressed("building its saved history projection", now.get());
+                        return Ok(false);
+                    }
                     prepared.save.stage = match step {
                         Step::OwedCleanup => Stage::Retention(Step::KeyDebt),
                         Step::KeyDebt => Stage::Retention(Step::Projection),

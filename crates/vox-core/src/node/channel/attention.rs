@@ -7,6 +7,7 @@ impl ChannelState {
         &mut self,
         store: &Store,
         owner: Digest32,
+        expected_instance: Option<[u8; 16]>,
         operation: Operation,
         now: u64,
     ) -> std::result::Result<Reply, String> {
@@ -19,18 +20,30 @@ impl ChannelState {
         // addressed, what is resolved. Nothing here releases a key or chooses an audience, so
         // it answers from known state while the fold catches up (ADR-037 R4); only the
         // legacy-recovery gate stays, as on every opened path (R3).
-        let instance = if saved_page {
-            if self
-                .legacy_cache_only(store)
-                .map_err(|error| error.to_string())?
-            {
-                return Err(super::legacy_provisional::LEGACY_HISTORY_REQUIRED.into());
-            }
-            let resource = self
-                .history_read_resource()
-                .ok_or_else(|| "the saved room is not ready".to_owned())?;
+        let page_resource = if saved_page {
+            Some(
+                self.history_read_resource()
+                    .ok_or_else(|| "the saved room is not ready".to_owned())?,
+            )
+        } else {
+            None
+        };
+        let instance = if let Some(resource) = &page_resource {
             resource
-                .with_snapshot(|_, view, _| Ok(view.history_instance()))
+                .with_snapshot(|_, view, _| {
+                    if view.legacy_cache_only() {
+                        return Err(Error::Profile(
+                            super::legacy_provisional::LEGACY_HISTORY_REQUIRED,
+                        ));
+                    }
+                    if expected_instance.is_some_and(|expected| expected != view.history_instance())
+                    {
+                        return Err(Error::Profile(
+                            "the selected room changed; refresh and retry",
+                        ));
+                    }
+                    Ok(view.history_instance())
+                })
                 .map_err(|error| error.to_string())?
         } else {
             self.require_legacy_current(store)
@@ -78,7 +91,15 @@ impl ChannelState {
             SessionReply::Lookup(Some(row)) if row.open => row,
             _ => return Err("the selected Session is no longer open".into()),
         };
-        let recipient = self.attention_recipient(store, instance, session, row.opening)?;
+        let recipient = if let Some(resource) = &page_resource {
+            resource
+                .with_snapshot(|_, view, _| {
+                    self.attention_recipient_in(view.snapshot(), instance, session, row.opening)
+                })
+                .map_err(|error| error.to_string())?
+        } else {
+            self.attention_recipient(store, instance, session, row.opening)?
+        };
         if operation.recipient().is_some_and(|r| *r != recipient)
             || matches!(&operation, Operation::Page(q) if q.opening != recipient.opening)
         {
@@ -87,28 +108,19 @@ impl ChannelState {
         if let Operation::Scan { harness, route, .. } = &operation {
             return self.scan_attention(store, owner, &recipient, harness, *route, now);
         }
-        if let Operation::Page(query) = &operation {
-            let read_page = |sek: &crate::atrest::sek::Sek,
-                             snapshot: &crate::node::store::Snapshot| {
-                Ledger::snapshot(snapshot, sek, self.channel_id, instance)?
-                    .page(&recipient, query.after)
-            };
-            let mut page = match self.history_read_resource() {
-                Some(resource) => {
-                    resource.with_snapshot(|sek, view, _| read_page(sek, view.snapshot()))
-                }
-                None => store
-                    .snapshot()
-                    .and_then(|snapshot| read_page(&self.sek, &snapshot)),
-            }
-            .map_err(|error| error.to_string())?;
+        if let (Operation::Page(query), Some(resource)) = (&operation, &page_resource) {
+            let mut page = resource
+                .with_snapshot(|sek, view, _| {
+                    Ledger::snapshot(view.snapshot(), sek, self.channel_id, instance)?
+                        .page(&recipient, query.after)
+                })
+                .map_err(|error| error.to_string())?;
             let paused = self.room_pause().paused;
             let cutoff = self.pause_resume_after();
             for row in &mut page.rows {
                 if row.state != crate::node::attention::State::Unavailable
                     && !matches!(
-                        self.saved_history_query(
-                            store,
+                        resource.query(
                             history::Query::NoticeExact { entry: row.source },
                             64 * 1024,
                             now,
@@ -542,11 +554,27 @@ impl ChannelState {
         session: String,
         opening: Digest32,
     ) -> std::result::Result<Recipient, String> {
-        let boundary = self
-            .private_attention_after(store, &opening)
-            .map_err(|e| e.to_string())?;
+        self.attention_recipient_in(
+            &store.snapshot().map_err(|error| error.to_string())?,
+            instance,
+            session,
+            opening,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn attention_recipient_in(
+        &self,
+        snapshot: &crate::node::store::Snapshot,
+        instance: [u8; 16],
+        session: String,
+        opening: Digest32,
+    ) -> Result<Recipient> {
+        let boundary = self.private_attention_after_in(snapshot, &opening)?;
         if boundary.is_some_and(|b| b.after.instance != instance) {
-            return Err("attention opening belongs to a different saved room".into());
+            return Err(Error::Profile(
+                "attention opening belongs to a different saved room",
+            ));
         }
         Ok(Recipient {
             room: self.channel_id,

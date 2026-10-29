@@ -268,21 +268,34 @@ impl ChannelState {
         store: &Store,
         opening: &Digest32,
     ) -> Result<Option<AttentionOpening>> {
-        let Some(id) = self.private_id(store, opening)? else {
+        self.private_attention_after_in(&store.snapshot()?, opening)
+    }
+
+    pub(super) fn private_attention_after_in(
+        &self,
+        snapshot: &crate::node::store::Snapshot,
+        opening: &Digest32,
+    ) -> Result<Option<AttentionOpening>> {
+        let Some(id) = private_index::find(snapshot, &self.sek, &self.channel_id, opening)? else {
             return Ok(None);
         };
-        let saved = self.private_at(store, id)?.ok_or(Error::MalformedAtRest(
-            "Session attention opening source missing",
-        ))?;
+        let saved = self
+            .private_at_in(snapshot, id)?
+            .ok_or(Error::MalformedAtRest(
+                "Session attention opening source missing",
+            ))?;
         if saved.record.hash() != *opening || saved.record.message.header.author_id != self.me() {
             return Err(Error::MalformedAtRest("Session attention opening binding"));
         }
         Ok(saved.attention_after)
     }
 
-    fn private_at(&self, store: &Store, id: u64) -> Result<Option<Stored>> {
-        store
-            .snapshot()?
+    fn private_at_in(
+        &self,
+        snapshot: &crate::node::store::Snapshot,
+        id: u64,
+    ) -> Result<Option<Stored>> {
+        snapshot
             .get_segment_bounded(
                 &self.channel_id,
                 SegmentKind::PrivateSession,

@@ -88,7 +88,7 @@ pub(crate) struct PendingSession {
     committed_rows: u64,
     news: Vec<String>,
     encrypted: bool,
-    package_attempted: bool,
+    package_hash: Option<Digest32>,
     refresh_changed: bool,
 }
 
@@ -108,12 +108,17 @@ pub(crate) struct CompletedSession {
     news: Vec<String>,
     failure: Option<String>,
     package_attempted: bool,
+    package_committed: bool,
     pub(crate) result: Result<SessionSaved>,
 }
 
 impl CompletedSession {
+    pub(crate) fn package_confirmed(&self) -> bool {
+        self.package_committed
+    }
+
     pub(crate) fn package_unconfirmed(&self) -> bool {
-        self.package_attempted && self.result.is_err()
+        self.package_attempted && !self.package_committed
     }
 
     pub(crate) fn take_history_pin(&mut self) -> Option<history::PendingHistoryRead> {
@@ -328,7 +333,7 @@ impl ChannelState {
             committed_rows: 0,
             news: Vec::new(),
             encrypted: false,
-            package_attempted: false,
+            package_hash: None,
             refresh_changed: false,
         })
     }
@@ -441,6 +446,11 @@ impl PendingSession {
                 None
             }
         };
+        let package_committed = self.package_hash.as_ref().is_some_and(|hash| {
+            self.controls.as_ref().is_some_and(|controls| {
+                controls.committed_control(hash, SignedEntryKind::KeyPackage)
+            })
+        });
         // Session failure poisoning belongs to this capsule; completed public floors still install.
         let controls = self
             .controls
@@ -462,7 +472,8 @@ impl PendingSession {
             } else {
                 None
             },
-            package_attempted: self.package_attempted,
+            package_attempted: self.package_hash.is_some(),
+            package_committed,
             committed_rows: self.committed_rows,
             news: self.news,
             failure,
@@ -485,11 +496,12 @@ impl PendingSession {
                 .controls
                 .as_mut()
                 .ok_or(Error::Profile("Session package owner missing"))?;
-            self.package_attempted = true;
+            let wire = package.to_wire();
+            self.package_hash = Some(crate::hash::sha256(&wire));
             controls.append_control_owned(
                 store,
                 signer,
-                package.to_wire(),
+                wire,
                 EntryKind::Content,
                 SignedEntryKind::KeyPackage,
                 crate::time::Ms(self.now),

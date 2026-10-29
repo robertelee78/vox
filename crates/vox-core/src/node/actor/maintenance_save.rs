@@ -451,6 +451,7 @@ pub(super) struct Pending {
     epoch: u64,
     preparing: bool,
     retention_owed: bool,
+    governance_owed: bool,
     result: Arc<std::sync::Mutex<Option<Returned>>>,
     task: tokio::task::JoinHandle<()>,
     continuation: Continuation,
@@ -458,6 +459,12 @@ pub(super) struct Pending {
 }
 
 impl Pending {
+    pub(super) fn owe_governance(&mut self, instance: &SharedChannel, attachment: u64) {
+        if attachment == self.epoch && Arc::ptr_eq(instance, &self.instance) {
+            self.governance_owed = true;
+        }
+    }
+
     pub(super) fn owe_retention(&mut self, instance: &SharedChannel, attachment: u64) {
         if attachment == self.epoch && Arc::ptr_eq(instance, &self.instance) {
             self.retention_owed = true;
@@ -786,6 +793,7 @@ impl Node {
                 epoch,
                 preparing,
                 retention_owed: false,
+                governance_owed: false,
                 result,
                 task,
                 continuation,
@@ -912,6 +920,9 @@ impl Node {
                 continuation,
                 pending.reply,
             );
+            if pending.governance_owed {
+                self.continue_deferred_governance(room, &instance, pending.epoch);
+            }
             return;
         };
         if !migrated
@@ -935,6 +946,9 @@ impl Node {
                 pending.reply,
             ))
             .await;
+            if pending.governance_owed {
+                self.continue_deferred_governance(room, &instance, pending.epoch);
+            }
             return;
         }
         match continuation {
@@ -1014,6 +1028,9 @@ impl Node {
                     .await
             }
             Continuation::AfterMigration(_) => unreachable!(),
+        }
+        if pending.governance_owed {
+            self.continue_deferred_governance(room, &instance, pending.epoch);
         }
     }
 

@@ -118,6 +118,19 @@ pub(super) enum Pending {
 }
 
 impl Pending {
+    pub(super) fn owe_governance(&mut self, instance: &SharedChannel, attachment: u64) {
+        match self {
+            Self::Append(pending) => {
+                if attachment == pending.epoch && Arc::ptr_eq(instance, &pending.instance) {
+                    pending.governance_owed = true;
+                }
+            }
+            Self::Maintenance(pending) => pending.owe_governance(instance, attachment),
+            // Constructors own unpublished rooms, not this admitted room incarnation.
+            Self::Metadata(_) => {}
+        }
+    }
+
     pub(super) fn owe_retention(&mut self, instance: &SharedChannel, attachment: u64) {
         match self {
             Self::Append(pending) => {
@@ -148,6 +161,7 @@ pub(super) struct AppendPending {
     store: Arc<Store>,
     epoch: u64,
     retention_owed: bool,
+    governance_owed: bool,
     result: Arc<std::sync::Mutex<Option<Returned>>>,
     task: tokio::task::JoinHandle<()>,
     reply: oneshot::Sender<Outcome>,
@@ -565,6 +579,7 @@ impl Node {
                 store,
                 epoch: self.delivery_epoch,
                 retention_owed: false,
+                governance_owed: false,
                 result,
                 task,
                 reply,
@@ -621,6 +636,7 @@ impl Node {
             let Some(Pending::Append(pending)) = pending else {
                 continue;
             };
+            let mut governance_owed = current && pending.governance_owed;
             let result = match returned {
                 Ok((mut completed, _publication, withdrawal))
                     if current && completed.can_install(&channel, &pending.owner) =>
@@ -662,6 +678,7 @@ impl Node {
                         })
                 }
                 Ok((completed, _publication, withdrawal)) => {
+                    governance_owed = false;
                     let result = completed
                         .result
                         .map(|saved| (saved, false, withdrawal, _publication))
@@ -767,6 +784,9 @@ impl Node {
                             )
                             .await;
                             self.continue_deferred_retention(room, retention).await;
+                            if governance_owed {
+                                self.continue_deferred_governance(room, &shared, pending.epoch);
+                            }
                             continue;
                         }
                     }
@@ -775,6 +795,32 @@ impl Node {
                 }
             }
             self.continue_deferred_retention(room, retention).await;
+            if governance_owed {
+                self.continue_deferred_governance(room, &shared, pending.epoch);
+            }
+        }
+    }
+
+    /// Carry a skipped governance turn across native successors without making an occupied
+    /// writer runnable. Lock and room replacement discard only the old attachment's debt.
+    pub(super) fn continue_deferred_governance(
+        &mut self,
+        room: Digest32,
+        instance: &SharedChannel,
+        attachment: u64,
+    ) {
+        if attachment != self.delivery_epoch
+            || !self
+                .channels
+                .get(&room)
+                .is_some_and(|current| Arc::ptr_eq(current, instance))
+        {
+            return;
+        }
+        if let Some(successor) = self.pending_posts.get_mut(&room) {
+            successor.owe_governance(instance, attachment);
+        } else {
+            self.governance_work.wake_room(room);
         }
     }
 

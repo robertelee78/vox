@@ -292,9 +292,10 @@ impl Node {
             self.governance_work.pending = false;
             return;
         }
-        // A retained completion already owns this room's exact selected turn. Do not turn a
-        // physical writer wait into another immediately runnable round-robin sweep.
-        if self.pending_posts.contains_key(&room) {
+        // Retain this exact skipped turn on the matching native owner. Its completion, not a
+        // physical writer wait, releases the wake for another bounded sweep.
+        if let Some(pending) = self.pending_posts.get_mut(&room) {
+            pending.owe_governance(&shared, self.delivery_epoch);
             return;
         }
         let Ok(channel) = shared.try_lock() else {

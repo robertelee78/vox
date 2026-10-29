@@ -229,7 +229,9 @@ impl Pending {
         let mut retiring = tokio::task::JoinSet::new();
         for (room, pending) in self.join_replies {
             match pending {
-                JoinPending::Reply(pending) => pending.retire(),
+                JoinPending::Reply(pending) => {
+                    retiring.spawn(pending.retire(room, Fault::Locked));
+                }
                 JoinPending::Adoption(pending) => {
                     retiring.spawn(pending.retire(room));
                 }
@@ -857,18 +859,19 @@ impl Node {
         match after {
             RoomAfter::Create { .. } => self.answer_when_published(room, reply, outcome).await,
             RoomAfter::Join(_) => {
-                self.finish_metadata_join_reply(room, reply, outcome, lifetime)
+                self.finish_metadata_join_reply(room, reply, outcome, lifetime, None)
                     .await
             }
         }
     }
 
-    pub(super) async fn finish_metadata_join_reply(
+    async fn finish_metadata_join_reply(
         &mut self,
         room: Digest32,
         reply: oneshot::Sender<Outcome>,
         outcome: Outcome,
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
+        completed: Option<Arc<CompletedJoinRollback>>,
     ) {
         self.joining.remove(&room);
         if self.joining.is_empty() {
@@ -885,6 +888,7 @@ impl Node {
                     reply,
                     outcome,
                     lifetime,
+                    completed,
                     phase: JoinReplyPhase::Held,
                 }),
             );
@@ -1705,9 +1709,24 @@ impl Node {
             } => {
                 #[cfg(feature = "test-knobs")]
                 self.hold_room_join_after_board_for_proof().await;
+                let Some(instance) = self.channels.get(&room).cloned() else {
+                    self.begin_metadata_abort_join(
+                        room,
+                        Fault::ChannelNotOpen,
+                        Some(reply),
+                        Some(lifetime),
+                    );
+                    return;
+                };
+                let epoch = instance.lock().await.epoch();
                 self.begin_metadata_journal(
                     room,
-                    JournalWork::Complete { room },
+                    JournalWork::Complete {
+                        room,
+                        instance,
+                        epoch,
+                        lifetime: Arc::clone(&lifetime),
+                    },
                     JournalAfter::Joined {
                         authority,
                         responder,
@@ -1763,7 +1782,16 @@ impl Node {
 struct JournalDelta {
     join: Option<Option<PendingWithdrawal>>,
     withdrawal: Option<Option<PendingWithdrawal>>,
+    completed_join: Option<Arc<CompletedJoinRollback>>,
     purged: bool,
+}
+// The original command owns this receipt through actor install, held-stream/consent completion,
+// and its actual routing publication terminal; retirement must still withdraw and purge it.
+pub(super) struct CompletedJoinRollback {
+    wrap: crate::atrest::sek::SekWrap,
+    instance: SharedChannel,
+    epoch: u64,
+    lifetime: Arc<maintenance_save::Lifetime>,
 }
 enum JournalWork {
     ForgetOpen {
@@ -1780,10 +1808,22 @@ enum JournalWork {
     },
     Complete {
         room: Digest32,
+        instance: SharedChannel,
+        epoch: u64,
+        lifetime: Arc<maintenance_save::Lifetime>,
     },
     Abort {
         room: Digest32,
         node: Digest32,
+    },
+    AbortCompleted {
+        room: Digest32,
+        node: Digest32,
+        completed: Arc<CompletedJoinRollback>,
+    },
+    AcceptCompleted {
+        room: Digest32,
+        completed: Arc<CompletedJoinRollback>,
     },
     PublicationReject {
         room: Digest32,
@@ -1844,6 +1884,23 @@ fn add_rollback_route(pending: &mut PendingWithdrawal, board: Digest32, route: S
         }
         routes.push(route);
     }
+}
+
+fn verify_join_rollback(
+    cleanup: &PendingWithdrawal,
+    signer: &VaultRootSigner,
+    room: Digest32,
+    epoch: u64,
+) -> crate::error::Result<()> {
+    let withdrawal = crate::nat::withdraw::BoardWithdraw::from_wire(&cleanup.wire)?;
+    if withdrawal.channel_id != room
+        || withdrawal.epoch != epoch
+        || withdrawal.scope != crate::nat::withdraw::WithdrawScope::Member
+        || withdrawal.author_id != crate::identity::composite::RootSigner::fingerprint(signer)
+    {
+        return Err(Error::Profile("join rollback identity changed"));
+    }
+    withdrawal.verify(&crate::identity::composite::RootSigner::public_key(signer))
 }
 impl JournalWork {
     fn run(self, store: &Store, signer: &VaultRootSigner) -> crate::error::Result<JournalDelta> {
@@ -1913,9 +1970,86 @@ impl JournalWork {
             }
             Self::Abort { room, node } => {
                 delta = queue_abort_join(store, signer, &mut batch, node, room)?;
+                if !delta.purged && store.get_sek_wrap(&room)?.is_some() {
+                    return Err(Error::Profile("stored join has no rollback journal"));
+                }
                 if delta.purged {
                     batch.commit()?;
                 }
+                return Ok(delta);
+            }
+            Self::AbortCompleted {
+                room,
+                node,
+                completed,
+            } => {
+                let epoch = completed.instance.blocking_lock().epoch();
+                if epoch != completed.epoch
+                    || store.get_sek_wrap(&room)?.as_ref() != Some(&completed.wrap)
+                {
+                    return Err(Error::Profile("completed join room incarnation changed"));
+                }
+                let mut unfinished = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
+                let cleanup = unfinished
+                    .remove(&room)
+                    .ok_or(Error::Profile("completed join has no rollback journal"))?;
+                verify_join_rollback(&cleanup, signer, room, completed.epoch)?;
+                delta = queue_join_rollback(
+                    store, signer, &mut batch, node, room, cleanup, unfinished,
+                )?;
+                batch.commit()?;
+                return Ok(delta);
+            }
+            Self::AcceptCompleted { room, completed } => {
+                let epoch = completed.instance.blocking_lock().epoch();
+                if epoch != completed.epoch
+                    || store.get_sek_wrap(&room)?.as_ref() != Some(&completed.wrap)
+                {
+                    return Err(Error::Profile("accepted join room incarnation changed"));
+                }
+                let mut pending = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
+                let cleanup = pending
+                    .remove(&room)
+                    .ok_or(Error::Profile("accepted join has no rollback journal"))?;
+                verify_join_rollback(&cleanup, signer, room, completed.epoch)?;
+                if durable_withdrawals() {
+                    batch.put_meta(
+                        PENDING_JOIN_CLEANUP_META_KEY,
+                        &pending_withdrawals_bytes(&pending)?,
+                    )?;
+                    batch.commit()?;
+                }
+                delta.join = Some(None);
+                return Ok(delta);
+            }
+            Self::Complete {
+                room,
+                instance,
+                epoch,
+                lifetime,
+            } => {
+                let room_epoch = instance.blocking_lock().epoch();
+                if room_epoch != epoch {
+                    return Err(Error::Profile("join room epoch changed before completion"));
+                }
+                let mut pending = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
+                let cleanup = pending
+                    .remove(&room)
+                    .ok_or(Error::Profile("join completion has no rollback journal"))?;
+                verify_join_rollback(&cleanup, signer, room, epoch)?;
+                // A fresh join seals a fresh wrap. Compare that exact saved incarnation before
+                // compensation, never just a room id that may already name a replacement join.
+                let wrap = store
+                    .get_sek_wrap(&room)?
+                    .ok_or(Error::Profile("join completion has no saved room"))?;
+                // Keep the durable journal through routing acceptance. A failed compensation
+                // must leave its original recovery authority intact, not only a dropped receipt.
+                delta.completed_join = Some(Arc::new(CompletedJoinRollback {
+                    wrap,
+                    instance,
+                    epoch,
+                    lifetime,
+                }));
                 return Ok(delta);
             }
             Self::PurgeUnpublished { room, node } => {
@@ -1980,10 +2114,6 @@ impl JournalWork {
                         }
                         room
                     }
-                    Self::Complete { room } => {
-                        pending.remove(&room);
-                        room
-                    }
                     Self::Retain {
                         room,
                         board,
@@ -2033,6 +2163,9 @@ impl JournalWork {
                         room
                     }
                     Self::Abort { .. }
+                    | Self::Complete { .. }
+                    | Self::AbortCompleted { .. }
+                    | Self::AcceptCompleted { .. }
                     | Self::RemoveWithdrawal { .. }
                     | Self::RejectCreated { .. }
                     | Self::ForgetOpen { .. }
@@ -2089,6 +2222,11 @@ enum JournalAfter {
         responder: Digest32,
         reply: oneshot::Sender<Outcome>,
     },
+    AcceptedJoined {
+        reply: oneshot::Sender<Outcome>,
+        outcome: Outcome,
+        completed: Arc<CompletedJoinRollback>,
+    },
     Abort {
         fault: Fault,
         reply: Option<oneshot::Sender<Outcome>>,
@@ -2140,6 +2278,32 @@ impl JournalPending {
         let signer = self.signer;
         let secret = self.secret;
         match self.after {
+            JournalAfter::AcceptedJoined {
+                reply,
+                outcome,
+                completed,
+            } => {
+                let result = returned
+                    .as_ref()
+                    .map(|(_, _, result)| result.as_ref().map(|_| ()).map_err(fault_of))
+                    .unwrap_or(Err(Fault::Internal));
+                match result {
+                    Ok(()) => {
+                        let _ = reply.send(outcome);
+                    }
+                    Err(fault) => {
+                        JoinReplyPending {
+                            reply,
+                            outcome,
+                            lifetime: Some(Arc::clone(&completed.lifetime)),
+                            completed: Some(completed),
+                            phase: JoinReplyPhase::Held,
+                        }
+                        .retire(room, fault)
+                        .await;
+                    }
+                }
+            }
             JournalAfter::Joined { reply, .. } => {
                 let original = returned
                     .as_ref()
@@ -2150,8 +2314,20 @@ impl JournalPending {
                     .unwrap_or(Fault::Internal);
                 let fault = match tokio::task::spawn_blocking(move || {
                     let _secret = secret;
+                    let completed = returned
+                        .as_mut()
+                        .and_then(|(_, _, result)| result.as_mut().ok())
+                        .and_then(|delta| delta.completed_join.take());
                     let _returned = returned;
-                    JournalWork::Abort { room, node }.run(&store, &signer)
+                    match completed {
+                        Some(completed) => JournalWork::AbortCompleted {
+                            room,
+                            node,
+                            completed,
+                        },
+                        None => JournalWork::Abort { room, node },
+                    }
+                    .run(&store, &signer)
                 })
                 .await
                 {
@@ -2260,6 +2436,14 @@ impl Node {
                     Arc::clone(&withdrawal.secret),
                 ));
             }
+            if let Some(held) = &lifetime {
+                return Some((
+                    crate::identity::composite::RootSigner::fingerprint(held.signer.as_ref()),
+                    Arc::clone(&held.store),
+                    Arc::clone(&held.signer),
+                    Arc::clone(&held.secret),
+                ));
+            }
             let profile = self
                 .profile
                 .as_ref()
@@ -2280,7 +2464,7 @@ impl Node {
         })();
         let Some((node, store, signer, secret)) = captured else {
             match after {
-                JournalAfter::Joined { reply, .. } => {
+                JournalAfter::Joined { reply, .. } | JournalAfter::AcceptedJoined { reply, .. } => {
                     let _ = reply.send(Outcome::Failed(Fault::Locked));
                 }
                 JournalAfter::Abort {
@@ -2304,7 +2488,14 @@ impl Node {
             return;
         };
         let epoch = self.delivery_epoch;
-        let instance = self.channels.get(&room).cloned();
+        let instance = match &work {
+            JournalWork::Complete { instance, .. } => Some(Arc::clone(instance)),
+            JournalWork::AbortCompleted { completed, .. }
+            | JournalWork::AcceptCompleted { completed, .. } => {
+                Some(Arc::clone(&completed.instance))
+            }
+            _ => self.channels.get(&room).cloned(),
+        };
         let mut attachment = self.pairwise_epoch.subscribe();
         let rejection = match &mut after {
             JournalAfter::PublicationRejected(rejected) => {
@@ -2348,7 +2539,13 @@ impl Node {
         let worker_secret = Arc::clone(&secret);
         let strict = matches!(
             &after,
-            JournalAfter::Joined { .. } | JournalAfter::Board { .. }
+            JournalAfter::Joined { .. }
+                | JournalAfter::AcceptedJoined { .. }
+                | JournalAfter::Board { .. }
+        );
+        let requires_lifetime = matches!(
+            &after,
+            JournalAfter::Joined { .. } | JournalAfter::AcceptedJoined { .. }
         );
         let task = tokio::spawn(async move {
             let (lifetime, withdrawal_fence) =
@@ -2468,6 +2665,7 @@ impl Node {
                 let _secret = worker_secret;
                 if strict
                     && (*attachment.borrow() != epoch
+                        || (requires_lifetime && held.is_none())
                         || held
                             .as_ref()
                             .is_some_and(|held| held.publish(|| ()).is_none()))
@@ -2475,6 +2673,15 @@ impl Node {
                     return Err(Error::ComputerPolicySuperseded);
                 }
                 work.run_admitted(&worker_store, &worker_signer, || {
+                    if strict
+                        && (*attachment.borrow() != epoch
+                            || (requires_lifetime && held.is_none())
+                            || held
+                                .as_ref()
+                                .is_some_and(|held| held.publish(|| ()).is_none()))
+                    {
+                        return Err(Error::ComputerPolicySuperseded);
+                    }
                     if let Some((room_cancel, instance, room_epoch, now, idle, authority)) =
                         &withdrawal_fence
                     {
@@ -2604,7 +2811,11 @@ impl Node {
         reply: Option<oneshot::Sender<Outcome>>,
         lifetime: Option<Arc<maintenance_save::Lifetime>>,
     ) {
-        let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
+        let Some(node) = lifetime
+            .as_ref()
+            .map(|held| crate::identity::composite::RootSigner::fingerprint(held.signer.as_ref()))
+            .or_else(|| self.profile.as_ref().map(Profile::fingerprint))
+        else {
             if let Some(reply) = reply {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
             }
@@ -2700,57 +2911,95 @@ impl Node {
                     });
                     let _ = ack.send(result);
                 }
+                JournalAfter::AcceptedJoined {
+                    reply,
+                    outcome,
+                    completed,
+                } => match result {
+                    Ok(delta) => {
+                        if current {
+                            self.install_metadata_journal(room, &delta);
+                        }
+                        let _ = reply.send(outcome);
+                    }
+                    Err(error) => self.begin_completed_join_abort(
+                        room,
+                        completed,
+                        Some(reply),
+                        fault_of(&error),
+                    ),
+                },
                 JournalAfter::Joined {
                     authority,
                     responder,
                     reply,
-                } => {
-                    let result = result.and_then(|delta| {
-                        if current
-                            && lifetime
-                                .as_ref()
-                                .is_some_and(|held| held.publish(|| ()).is_some())
-                        {
-                            Ok(delta)
-                        } else {
-                            Err(Error::ComputerPolicySuperseded)
-                        }
-                    });
-                    match result {
-                        Ok(delta) => {
-                            let Some(held) = lifetime else {
-                                self.begin_metadata_abort_join(
-                                    room,
-                                    Fault::Internal,
-                                    Some(reply),
-                                    None,
-                                );
-                                continue;
-                            };
-                            self.install_metadata_journal(room, &delta);
-                            let _ = self.event_tx.send(NodeEvent::Joined {
-                                channel_id: room,
-                                responder,
+                } => match result {
+                    Ok(mut delta) => {
+                        let channel = match &pending.instance {
+                            Some(instance) => Some(instance.lock().await),
+                            None => None,
+                        };
+                        let attached = current
+                            && delta.completed_join.as_ref().is_some_and(|completed| {
+                                channel
+                                    .as_ref()
+                                    .is_some_and(|channel| channel.epoch() == completed.epoch)
                             });
-                            self.room_publication_authority.insert(
+                        let installed = attached
+                            && lifetime.as_ref().is_some_and(|held| {
+                                held.publish(|| {
+                                    self.install_metadata_journal(room, &delta);
+                                    let _ = self.event_tx.send(NodeEvent::Joined {
+                                        channel_id: room,
+                                        responder,
+                                    });
+                                    self.room_publication_authority.insert(
+                                        room,
+                                        (
+                                            authority,
+                                            RoomPublicationOwnership::Joined,
+                                            Arc::clone(held),
+                                        ),
+                                    );
+                                })
+                                .is_some()
+                            });
+                        drop(channel);
+                        if installed {
+                            self.finish_metadata_join_reply(
                                 room,
-                                (
-                                    authority,
-                                    RoomPublicationOwnership::Joined,
-                                    Arc::clone(&held),
-                                ),
+                                reply,
+                                Outcome::Done,
+                                lifetime,
+                                delta.completed_join.take(),
+                            )
+                            .await;
+                        } else if let Some(completed) = delta.completed_join.take() {
+                            self.begin_metadata_journal(
+                                room,
+                                JournalWork::AbortCompleted {
+                                    room,
+                                    node: pending.node,
+                                    completed,
+                                },
+                                JournalAfter::Abort {
+                                    fault: Fault::ComputerPolicy,
+                                    reply: Some(reply),
+                                    joining: true,
+                                },
+                                lifetime,
                             );
-                            self.finish_metadata_join_reply(room, reply, Outcome::Done, Some(held))
-                                .await;
+                        } else {
+                            let _ = reply.send(Outcome::Failed(Fault::Internal));
                         }
-                        Err(error) => self.begin_metadata_abort_join(
-                            room,
-                            fault_of(&error),
-                            Some(reply),
-                            lifetime,
-                        ),
                     }
-                }
+                    Err(error) => self.begin_metadata_abort_join(
+                        room,
+                        fault_of(&error),
+                        Some(reply),
+                        lifetime,
+                    ),
+                },
                 JournalAfter::ForgetOpen => {}
                 JournalAfter::PublicationRejected(mut rejected) => {
                     let delta = match result {
@@ -2837,7 +3086,7 @@ impl Node {
                     };
                     if let Some(reply) = reply {
                         if joining {
-                            self.finish_metadata_join_reply(room, reply, outcome, lifetime)
+                            self.finish_metadata_join_reply(room, reply, outcome, lifetime, None)
                                 .await;
                         } else {
                             self.answer_when_published(room, reply, outcome).await;
@@ -3218,14 +3467,168 @@ struct JoinReplyPending {
     reply: oneshot::Sender<Outcome>,
     outcome: Outcome,
     lifetime: Option<Arc<maintenance_save::Lifetime>>,
+    completed: Option<Arc<CompletedJoinRollback>>,
     phase: JoinReplyPhase,
 }
 impl JoinReplyPending {
-    fn retire(self) {
-        let _ = self.reply.send(Outcome::Failed(Fault::Locked));
+    async fn retire(self, room: Digest32, original: Fault) {
+        if !self.outcome.is_done() {
+            let _ = self.reply.send(self.outcome);
+            return;
+        }
+        // Held streams and consent releases precede answer_when_published. Even an installed
+        // join cannot claim Done here while its first required anchor round is unfinished.
+        let Some(completed) = self.completed else {
+            let _ = self.reply.send(Outcome::Failed(Fault::Internal));
+            return;
+        };
+        let lifetime = Arc::clone(&completed.lifetime);
+        let node = crate::identity::composite::RootSigner::fingerprint(lifetime.signer.as_ref());
+        let returned = tokio::task::spawn_blocking(move || {
+            let saved = JournalWork::AbortCompleted {
+                room,
+                node,
+                completed,
+            }
+            .run(&lifetime.store, &lifetime.signer);
+            (lifetime, saved)
+        })
+        .await;
+        let fault = match &returned {
+            Ok((_, Ok(_))) => original,
+            Ok((_, Err(error))) => fault_of(error),
+            Err(_) => Fault::Internal,
+        };
+        let _ = self.reply.send(Outcome::Failed(fault));
     }
 }
 impl Node {
+    pub(super) fn retire_metadata_publications(&mut self) {
+        for (room, mut waiting) in std::mem::take(&mut self.publish_waiters) {
+            let Some(completed) = waiting.join_rollback.take() else {
+                if let Some(reply) = waiting.reply {
+                    let _ = reply.send(Outcome::Failed(Fault::Locked));
+                }
+                continue;
+            };
+            if let Some(reply) = waiting.reply {
+                let lifetime = Some(Arc::clone(&completed.lifetime));
+                self.pending_metadata
+                    .get_or_insert_with(Pending::default)
+                    .join_replies
+                    .insert(
+                        room,
+                        JoinPending::Reply(JoinReplyPending {
+                            reply,
+                            outcome: waiting.outcome,
+                            lifetime,
+                            completed: Some(completed),
+                            phase: JoinReplyPhase::Held,
+                        }),
+                    );
+            } else {
+                self.begin_completed_join_abort(room, completed, None, Fault::Locked);
+            }
+        }
+    }
+
+    fn begin_completed_join_abort(
+        &mut self,
+        room: Digest32,
+        completed: Arc<CompletedJoinRollback>,
+        reply: Option<oneshot::Sender<Outcome>>,
+        fault: Fault,
+    ) {
+        let lifetime = Arc::clone(&completed.lifetime);
+        let node = crate::identity::composite::RootSigner::fingerprint(lifetime.signer.as_ref());
+        self.begin_metadata_journal(
+            room,
+            JournalWork::AbortCompleted {
+                room,
+                node,
+                completed,
+            },
+            JournalAfter::Abort {
+                fault,
+                reply,
+                joining: false,
+            },
+            Some(lifetime),
+        );
+    }
+
+    pub(super) fn abort_metadata_join_publication(
+        &mut self,
+        room: Digest32,
+        waiting: &mut RoomPublication,
+        fault: Fault,
+    ) {
+        if let Some(completed) = waiting.join_rollback.take() {
+            self.begin_completed_join_abort(room, completed, waiting.reply.take(), fault);
+        }
+    }
+
+    pub(super) fn finish_metadata_room_publication(
+        &mut self,
+        room: Digest32,
+        mut waiting: RoomPublication,
+    ) {
+        if let Some(completed) = waiting.join_rollback.take() {
+            if let Some(reply) = waiting.reply {
+                let lifetime = Arc::clone(&completed.lifetime);
+                self.begin_metadata_journal(
+                    room,
+                    JournalWork::AcceptCompleted {
+                        room,
+                        completed: Arc::clone(&completed),
+                    },
+                    JournalAfter::AcceptedJoined {
+                        reply,
+                        outcome: waiting.outcome,
+                        completed,
+                    },
+                    Some(lifetime),
+                );
+            }
+        } else if let Some(reply) = waiting.reply {
+            let _ = reply.send(waiting.outcome);
+        }
+    }
+
+    fn queue_metadata_join_publication(&mut self, room: Digest32, mut pending: JoinReplyPending) {
+        let Some(completed) = pending.completed.take() else {
+            let _ = pending.reply.send(Outcome::Failed(Fault::Internal));
+            return;
+        };
+        if !self
+            .channels
+            .get(&room)
+            .is_some_and(|instance| Arc::ptr_eq(instance, &completed.instance))
+            || self
+                .publish_waiters
+                .get(&room)
+                .is_some_and(|waiting| waiting.reply.is_some())
+        {
+            self.begin_completed_join_abort(
+                room,
+                completed,
+                Some(pending.reply),
+                Fault::ChannelNotOpen,
+            );
+            return;
+        }
+        self.queue_room_publication(
+            room,
+            Some(pending.reply),
+            pending.outcome,
+            false,
+            RoomPublicationKind::Open,
+        );
+        if let Some(waiting) = self.publish_waiters.get_mut(&room) {
+            waiting.join_rollback = Some(completed);
+        }
+    }
+
     pub(super) fn defer_metadata_join_adoption(
         &mut self,
         room: Digest32,
@@ -3341,12 +3744,10 @@ impl Node {
                                 .join_replies
                                 .insert(room, JoinPending::Reply(pending));
                         }
-                        // The old owed-consent pass ignored individual release failures. Wait for
-                        // its actual terminal, but never turn an already-made join into a failure
-                        // or claim any grant/key delivery which that pass did not actually save.
+                        // Ignore individual release failures as before; only the actual routing
+                        // terminal may accept the original join and release its rollback receipt.
                         Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
-                            self.answer_when_published(room, pending.reply, pending.outcome)
-                                .await
+                            self.queue_metadata_join_publication(room, pending);
                         }
                     }
                 }
@@ -3553,11 +3954,24 @@ fn queue_abort_join(
     node: Digest32,
     room: Digest32,
 ) -> crate::error::Result<JournalDelta> {
-    let mut delta = JournalDelta::default();
+    let delta = JournalDelta::default();
     let mut unfinished = load_journal(store, PENDING_JOIN_CLEANUP_META_KEY)?;
     let Some(cleanup) = unfinished.remove(&room) else {
         return Ok(delta);
     };
+    queue_join_rollback(store, signer, batch, node, room, cleanup, unfinished)
+}
+
+fn queue_join_rollback(
+    store: &Store,
+    signer: &VaultRootSigner,
+    batch: &mut Batch<'_>,
+    node: Digest32,
+    room: Digest32,
+    cleanup: PendingWithdrawal,
+    unfinished: BTreeMap<Digest32, PendingWithdrawal>,
+) -> crate::error::Result<JournalDelta> {
+    let mut delta = JournalDelta::default();
     let mut withdrawn = load_journal(store, PENDING_WITHDRAWALS_META_KEY)?;
     let pending = withdrawn.entry(room).or_insert_with(|| cleanup.clone());
     for (board, routes) in &cleanup.routes {
@@ -3622,7 +4036,7 @@ impl Node {
     pub(super) async fn begin_metadata_publication_reject(
         &mut self,
         room: Digest32,
-        waiting: RoomPublication,
+        mut waiting: RoomPublication,
         transition: Option<crate::node::channel::own_writer_gate::Transition>,
     ) {
         if !publication_superseded(&waiting) {
@@ -3665,13 +4079,20 @@ impl Node {
         } else {
             crate::nat::withdraw::WithdrawScope::Member
         };
-        let work = JournalWork::PublicationReject {
-            room,
-            node,
-            epoch,
-            now: self.now_ms().get(),
-            scope,
-            routes: self.withdrawal_routes(&room),
+        let work = match waiting.join_rollback.take() {
+            Some(completed) => JournalWork::AbortCompleted {
+                room,
+                node,
+                completed,
+            },
+            None => JournalWork::PublicationReject {
+                room,
+                node,
+                epoch,
+                now: self.now_ms().get(),
+                scope,
+                routes: self.withdrawal_routes(&room),
+            },
         };
         self.begin_metadata_journal(
             room,
