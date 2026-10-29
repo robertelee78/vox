@@ -10,15 +10,20 @@
 //!
 //! - **`PUT <record>`** for any of the three record kinds — member address
 //!   (`0x0007`), pre-join (`0x0008`), member bundle (`0x0012`) — identified by the
-//!   record's own struct tag. The server answers `ACCEPTED` or `REJECTED <reason>`.
+//!   record's own struct tag. The server answers `ACCEPTED <previous, revision>`
+//!   for board writes or `REJECTED <reason>`.
 //!   Every PUT is gated by the existing [`RendezvousStore`] policy: member-only
 //!   for the two member kinds (via the [`MembershipOracle`] — the channel's
 //!   authenticated membership, ADR-007), self-verifying for pre-join, and the
 //!   anti-replay / refresh-floor / TTL / clock-skew / capacity rules for all. The
 //!   record is self-authenticating, so the connection's peer need not be its
 //!   author: a member may re-publish a peer's current record to a second anchor.
-//! - **`GET <channelID, epoch, kinds>`** returning every live record of the
-//!   requested kinds as a sequence of `RECORD <wire>` frames terminated by `END`.
+//! - **`GET <channelID, epoch, kinds, known_revision?>`** returns every live record
+//!   of the requested kinds as `RECORD <wire>` frames terminated by `END <revision>`.
+//!   An exact known revision returns only `END`, without scanning or serializing records.
+//!   Revisions change on effective record mutation, expiry and board restart. A client remembers
+//!   one only after a complete reply and successful validation/admission/mirroring, scoped to
+//!   the authenticated board, room, epoch and requested kinds.
 //!   Reading is open to any authenticated peer that knows the channelID (the
 //!   rendezvous half of the ADR-005 link **is** the read capability; the
 //!   passphrase, never in the link, gates the join). Records come back
@@ -167,6 +172,9 @@ pub enum RendezvousRequest {
         epoch: u64,
         /// The kinds wanted.
         kinds: RecordKinds,
+        /// The last complete revision this client processed for this exact query scope. Empty on
+        /// the first read; a matching token asks for no repeated record frames.
+        known_revision: Option<Digest32>,
     },
 }
 
@@ -178,11 +186,13 @@ impl std::fmt::Debug for RendezvousRequest {
                 channel_id,
                 epoch,
                 kinds,
+                known_revision,
             } => f
                 .debug_struct("Get")
                 .field("channel_id", channel_id)
                 .field("epoch", epoch)
                 .field("kinds", kinds)
+                .field("known_revision", known_revision)
                 .finish(),
             Self::ComputerRegister { .. } => f.write_str("ComputerRegister(<redacted>)"),
             Self::ComputerRedeem { .. } => f.write_str("ComputerRedeem(<redacted>)"),
@@ -279,14 +289,23 @@ impl RejectReason {
 /// A server → client response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RendezvousResponse {
-    /// The `PUT` was admitted.
+    /// A non-board operation was accepted without a board revision transition.
     Accepted,
+    /// A board `PUT` was admitted, with the exact room revision immediately before and after
+    /// that write. A client may advance a revision it already processed only when `previous`
+    /// matches it; an intervening writer instead makes the next exchange fetch the changed board.
+    BoardAccepted {
+        /// Revision immediately before this put was evaluated.
+        previous: Digest32,
+        /// Revision immediately after this put was evaluated.
+        revision: Digest32,
+    },
     /// The `PUT` was refused.
     Rejected(RejectReason),
     /// One live record (its wire bytes) answering a `GET`.
     Record(Vec<u8>),
-    /// End of a `GET` reply.
-    End,
+    /// End of a complete `GET` reply, with the opaque room revision of its atomic snapshot.
+    End(Digest32),
     /// Exact redeemed counterpart, absent until redemption or after expiry/revocation.
     ComputerPeer(Option<Digest32>),
 }
@@ -347,12 +366,18 @@ impl RendezvousRequest {
                 channel_id,
                 epoch,
                 kinds,
+                known_revision,
             } => {
-                e.array(4)
+                e.array(5)
                     .uint(OP_GET)
                     .bytes(channel_id)
                     .uint(*epoch)
-                    .uint(u64::from(kinds.bits()));
+                    .uint(u64::from(kinds.bits()))
+                    .bytes(
+                        known_revision
+                            .as_ref()
+                            .map_or(&[][..], |revision| &revision[..]),
+                    );
             }
         }
         e.finish()
@@ -410,17 +435,26 @@ impl RendezvousRequest {
             (OP_PUT, 2) => Self::Put {
                 record: d.bytes()?.to_vec(),
             },
-            (OP_GET, 4) => {
+            (OP_GET, 5) => {
                 let channel_id: Digest32 = d
                     .bytes()?
                     .try_into()
                     .map_err(|_| Error::MalformedRendezvous("rendezvous get room id length"))?;
                 let epoch = d.uint()?;
                 let kinds = RecordKinds::from_bits(d.uint()?)?;
+                let revision = d.bytes()?;
+                let known_revision = if revision.is_empty() {
+                    None
+                } else {
+                    Some(revision.try_into().map_err(|_| {
+                        Error::MalformedRendezvous("rendezvous get revision length")
+                    })?)
+                };
                 Self::Get {
                     channel_id,
                     epoch,
                     kinds,
+                    known_revision,
                 }
             }
             _ => return Err(Error::MalformedRendezvous("rendezvous request op")),
@@ -444,14 +478,17 @@ impl RendezvousResponse {
             Self::Accepted => {
                 e.array(1).uint(OP_ACCEPTED);
             }
+            Self::BoardAccepted { previous, revision } => {
+                e.array(3).uint(OP_ACCEPTED).bytes(previous).bytes(revision);
+            }
             Self::Rejected(r) => {
                 e.array(2).uint(OP_REJECTED).uint(u64::from(*r as u8));
             }
             Self::Record(w) => {
                 e.array(2).uint(OP_RECORD).bytes(w);
             }
-            Self::End => {
-                e.array(1).uint(OP_END);
+            Self::End(revision) => {
+                e.array(2).uint(OP_END).bytes(revision);
             }
         }
         e.finish()
@@ -474,6 +511,15 @@ impl RendezvousResponse {
                 })
             }
             (OP_ACCEPTED, 1) => Self::Accepted,
+            (OP_ACCEPTED, 3) => Self::BoardAccepted {
+                previous: d.bytes()?.try_into().map_err(|_| {
+                    Error::MalformedRendezvous("rendezvous put previous revision length")
+                })?,
+                revision: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedRendezvous("rendezvous put revision length"))?,
+            },
             (OP_REJECTED, 2) => {
                 let v = u8::try_from(d.uint()?)
                     .map_err(|_| Error::MalformedRendezvous("rendezvous reject reason"))?;
@@ -483,7 +529,11 @@ impl RendezvousResponse {
                 )
             }
             (OP_RECORD, 2) => Self::Record(d.bytes()?.to_vec()),
-            (OP_END, 1) => Self::End,
+            (OP_END, 2) => Self::End(
+                d.bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedRendezvous("rendezvous end revision length"))?,
+            ),
             _ => return Err(Error::MalformedRendezvous("rendezvous response op")),
         };
         d.finish()?;
@@ -506,9 +556,9 @@ pub trait MembershipOracle: Send + Sync {
     ) -> Option<CompositePublicKey>;
 }
 
-/// The live records a `GET` returned, parsed by kind (unverified — see the
-/// module docs; the genesis is the exception, verified and channel-bound on
-/// arrival because it is self-validating).
+/// The live records a `GET` returned, parsed by kind. Records whose signer is carried in the
+/// record itself (genesis and pre-join) are verified and room-bound on arrival; member-scoped
+/// records and withdrawals remain for the room holder to verify against its authenticated view.
 #[derive(Debug, Clone, Default)]
 pub struct RecordSet {
     /// Member address records.
@@ -523,10 +573,48 @@ pub struct RecordSet {
     /// board's word: it checked the withdraw against the room's creator or admin roster, which a
     /// joiner does not hold.
     pub ended_by: Option<Digest32>,
+    /// The complete signed room withdrawals. A room holder must verify and mirror these before
+    /// retaining the response's revision; `ended_by` is only the joiner's display consequence.
+    pub room_withdraws: Vec<crate::nat::withdraw::BoardWithdraw>,
     /// The members' own withdraws (#520), unverified: each is checked against the leaver's key.
     pub withdraws: Vec<crate::nat::withdraw::BoardWithdraw>,
     /// Admission notices (#520), unverified: each is checked against its witness's key.
     pub notices: Vec<crate::nat::notice::AdmissionNotice>,
+}
+
+impl RecordSet {
+    /// Record frames in this complete requested snapshot. This is exposed through shipped sync
+    /// status so an operator can distinguish a revision-only board read from repeated inventory.
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        usize::from(self.genesis.is_some())
+            + self.members.len()
+            + self.bundles.len()
+            + self.prejoins.len()
+            + self.withdraws.len()
+            + self.room_withdraws.len()
+            + self.notices.len()
+    }
+}
+
+/// One completely parsed board read. `records` is absent only when the peer authenticated on the
+/// typed connection returned the exact revision supplied by this client; callers must retain the
+/// new revision only after they have successfully processed any returned records.
+#[derive(Debug)]
+pub struct BoardRead {
+    /// Opaque causal token scoped by the serving board to this room.
+    pub revision: Digest32,
+    /// A full requested snapshot when changed or first read; no repeated records when unchanged.
+    pub records: Option<RecordSet>,
+}
+
+/// The exact causal transition made by one accepted board write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardWrite {
+    /// Revision immediately before the write was evaluated.
+    pub previous_revision: Digest32,
+    /// Revision immediately after the write was evaluated.
+    pub revision: Digest32,
 }
 
 /// Which rooms a board keeps for a peer that brings their genesis — the rooms it will
@@ -1138,6 +1226,13 @@ impl RendezvousService {
         &self.store
     }
 
+    /// The current opaque revision of this node's own board for `channel_id`, settling only a
+    /// due expiry boundary. Used to avoid offering an unchanged local board back to a peer.
+    pub fn revision(&self, channel_id: &Digest32) -> Digest32 {
+        let now = (self.clock)();
+        lock(&self.store).revision(channel_id, now)
+    }
+
     /// Evaluate one request against the store, producing the ordered responses
     /// the stream will carry. Pure with respect to the transport, so the policy
     /// is testable without QUIC.
@@ -1193,7 +1288,9 @@ impl RendezvousService {
             }
             RendezvousRequest::Put { record } => {
                 vec![match self.put(publisher, source, record, now, local) {
-                    Ok(()) => RendezvousResponse::Accepted,
+                    Ok((previous, revision)) => {
+                        RendezvousResponse::BoardAccepted { previous, revision }
+                    }
                     Err(e) => RendezvousResponse::Rejected(e),
                 }]
             }
@@ -1201,8 +1298,19 @@ impl RendezvousService {
                 channel_id,
                 epoch,
                 kinds,
+                known_revision,
             } => {
-                let store = lock(&self.store);
+                // Revision comparison and a changed snapshot share the one store lock. An
+                // unchanged room checks only its next-expiry scalar and causal token; it neither
+                // scans nor serializes its records.
+                let mut store = lock(&self.store);
+                let revision = store.revision(channel_id, now);
+                if known_revision
+                    .as_ref()
+                    .is_some_and(|known| bool::from(known.ct_eq(&revision)))
+                {
+                    return vec![RendezvousResponse::End(revision)];
+                }
                 let mut out = Vec::new();
                 if kinds.contains(RecordKinds::MEMBERS) {
                     out.extend(
@@ -1253,8 +1361,7 @@ impl RendezvousService {
                         out.push(RendezvousResponse::Record(ended.to_vec()));
                     }
                 }
-                drop(store);
-                out.push(RendezvousResponse::End);
+                out.push(RendezvousResponse::End(revision));
                 out
             }
         }
@@ -1330,7 +1437,7 @@ impl RendezvousService {
         record: &[u8],
         now: u64,
         local: bool,
-    ) -> std::result::Result<(), RejectReason> {
+    ) -> std::result::Result<(Digest32, Digest32), RejectReason> {
         let tag = parse_frame(record)
             .map(|f| f.tag)
             .map_err(|e| RejectReason::for_error(&e))?;
@@ -1346,12 +1453,17 @@ impl RendezvousService {
         // each wake cost the actor 3–40 ms that a local post then queued behind.
         let mut grew: Option<Digest32> = None;
         let mut withdrew: Option<Digest32> = None;
+        // The revision pair is observed under the same lock as the mutation. It lets an
+        // exchanging client prove that its own successful PUT is the only transition from the
+        // snapshot it read; if another writer intervened, the client keeps its old token and
+        // fetches the changed board next time.
         let res = match tag {
             StructTag::RendezvousRecord => {
                 let rec =
                     RendezvousRecord::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
                 let mut store = lock(&self.store);
+                let previous_revision = store.revision(&cid, now);
                 let key = self.known_key(&store, &cid, epoch, &author, now);
                 let res = store.accept_member(rec, |_| key.clone(), now);
                 if res.is_ok() && wrote(publisher, &author) {
@@ -1361,6 +1473,7 @@ impl RendezvousService {
                     if learned && publisher.is_some() {
                         grew = Some(cid);
                     }
+                    (previous_revision, store.revision(&cid, now))
                 })
             }
             StructTag::MemberBundleRecord => {
@@ -1368,6 +1481,7 @@ impl RendezvousService {
                     .map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch, author) = (rec.channel_id, rec.epoch, rec.author_id);
                 let mut store = lock(&self.store);
+                let previous_revision = store.revision(&cid, now);
                 let key = self
                     .known_key(&store, &cid, epoch, &author, now)
                     .or_else(|| self.witnessed_key(&store, &rec, now));
@@ -1379,6 +1493,7 @@ impl RendezvousService {
                     if learned && publisher.is_some() {
                         grew = Some(cid);
                     }
+                    (previous_revision, store.revision(&cid, now))
                 })
             }
             StructTag::PreJoinRecord => {
@@ -1391,7 +1506,12 @@ impl RendezvousService {
                 if publisher.is_some_and(|p| *p != rec.asserted_id()) {
                     return Err(RejectReason::Policy);
                 }
-                lock(&self.store).accept_prejoin(rec, now)
+                let cid = rec.channel_id;
+                let mut store = lock(&self.store);
+                let previous_revision = store.revision(&cid, now);
+                store
+                    .accept_prejoin(rec, now)
+                    .map(|()| (previous_revision, store.revision(&cid, now)))
             }
             // Self-validating: its hash is the channelID, so no author check is
             // needed or possible (ADR-007; see `accept_genesis`). Whether this board takes
@@ -1400,7 +1520,9 @@ impl RendezvousService {
             StructTag::GenesisRecord => {
                 let genesis =
                     Genesis::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                let cid = genesis.channel_id();
                 let mut store = lock(&self.store);
+                let previous_revision = store.revision(&cid, now);
                 if !local
                     && store.genesis(&genesis.channel_id()).is_none()
                     && !self.rooms.may_anchor(&genesis)
@@ -1410,7 +1532,9 @@ impl RendezvousService {
                 // Credited only to its creator: anyone can bring a room's genesis (see `wrote`).
                 let creator = genesis.body.creator_pubkey.fingerprint();
                 let source = source.filter(|_| wrote(publisher, &creator));
-                store.accept_genesis(genesis, local, now, source)
+                store
+                    .accept_genesis(genesis, local, now, source)
+                    .map(|()| (previous_revision, store.revision(&cid, now)))
             }
             // A signed withdraw (V030-14): a member's own records, or a whole room, off this
             // board at once — and kept off.
@@ -1418,12 +1542,13 @@ impl RendezvousService {
                 use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
                 let w =
                     BoardWithdraw::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
-                // A withdrawal is permanent negative state, so a rejected future-dated pre-join
-                // must not return after a crash as a future tombstone which blocks a corrected
-                // join. Check before both the authenticated and pending-withdraw paths mutate.
+                // Permanent negative state must pass the current signed-clock policy before
+                // either the authenticated or the pending-withdraw path mutates.
                 crate::nat::store::check_clock_sanity(w.timestamp_ms, now)
                     .map_err(|e| RejectReason::for_error(&e))?;
+                let cid = w.channel_id;
                 let mut store = lock(&self.store);
+                let previous_revision = store.revision(&cid, now);
                 let key = match w.scope {
                     WithdrawScope::Member => self
                         .known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
@@ -1443,38 +1568,40 @@ impl RendezvousService {
                         }
                     }
                 };
-                let Some(key) = key else {
-                    // A member's own withdraw for a member this board knows no key for yet is
-                    // held, unchecked, until a notice brings the key (#520): sent first so a
-                    // notice of a member that left is refused, it must not be lost for coming
-                    // first.
-                    if w.scope == WithdrawScope::Member {
+                match key {
+                    None if w.scope == WithdrawScope::Member => {
+                        // A member's own withdraw for a member this board knows no key for yet is
+                        // held, unchecked, until a notice brings the key (#520): sent first so a
+                        // notice of a member that left is refused, it must not be lost for coming
+                        // first.
                         store.hold_pending_withdraw(w);
-                        return Ok(());
+                        Ok((previous_revision, store.revision(&cid, now)))
                     }
-                    return Err(RejectReason::NotMember);
-                };
-                w.verify(&key).map_err(|e| RejectReason::for_error(&e))?;
-                match w.scope {
-                    WithdrawScope::Member => {
-                        store.withdraw_member(&w.channel_id, &w.author_id, w.timestamp_ms);
-                        // Kept to pass on with the room's notices (#520).
-                        if store.keep_member_withdraw(
-                            &w.channel_id,
-                            &w.author_id,
-                            w.timestamp_ms,
-                            record.to_vec(),
-                        ) && publisher.is_some()
-                        {
-                            grew = Some(w.channel_id);
+                    None => return Err(RejectReason::NotMember),
+                    Some(key) => {
+                        w.verify(&key).map_err(|e| RejectReason::for_error(&e))?;
+                        match w.scope {
+                            WithdrawScope::Member => {
+                                store.withdraw_member(&w.channel_id, &w.author_id, w.timestamp_ms);
+                                // Kept to pass on with the room's notices (#520).
+                                if store.keep_member_withdraw(
+                                    &w.channel_id,
+                                    &w.author_id,
+                                    w.timestamp_ms,
+                                    record.to_vec(),
+                                ) && publisher.is_some()
+                                {
+                                    grew = Some(w.channel_id);
+                                }
+                            }
+                            WithdrawScope::Room => {
+                                store.withdraw_room(&w.channel_id, Some(record.to_vec()));
+                            }
                         }
-                    }
-                    WithdrawScope::Room => {
-                        store.withdraw_room(&w.channel_id, Some(record.to_vec()));
+                        withdrew = Some(w.channel_id);
+                        Ok((previous_revision, store.revision(&cid, now)))
                     }
                 }
-                withdrew = Some(w.channel_id);
-                Ok(())
             }
             // A newcomer's admission, as its admitting member witnessed it (#520): taken only on a
             // witness this board can check, as a bundle is (V210-70), and never for a member
@@ -1484,6 +1611,7 @@ impl RendezvousService {
                     .map_err(|e| RejectReason::for_error(&e))?;
                 let (cid, epoch) = (notice.channel_id(), notice.witness.epoch);
                 let mut store = lock(&self.store);
+                let previous_revision = store.revision(&cid, now);
                 let Some(key) =
                     self.known_key(&store, &cid, epoch, &notice.witness.witness_id, now)
                 else {
@@ -1496,13 +1624,16 @@ impl RendezvousService {
                     if learned && publisher.is_some() {
                         grew = Some(cid);
                     }
+                    (previous_revision, store.revision(&cid, now))
                 })
             }
             // A room's admins, from its creator (V030-14).
             StructTag::AdminRoster => {
                 let r = crate::nat::withdraw::AdminRoster::from_wire(record)
                     .map_err(|e| RejectReason::for_error(&e))?;
+                let cid = r.channel_id;
                 let mut store = lock(&self.store);
+                let previous_revision = store.revision(&cid, now);
                 let Some(creator) = store
                     .genesis(&r.channel_id)
                     .map(|g| g.body.creator_pubkey.clone())
@@ -1511,12 +1642,12 @@ impl RendezvousService {
                 };
                 r.verify(&creator)
                     .map_err(|e| RejectReason::for_error(&e))?;
-                store.accept_roster(&r.channel_id, r.timestamp_ms, r.admins);
-                Ok(())
+                store.accept_roster(&cid, r.timestamp_ms, r.admins);
+                Ok((previous_revision, store.revision(&cid, now)))
             }
             _ => return Err(RejectReason::UnknownKind),
         };
-        // Fired **after** the match, so the store guard each arm took is already gone: a hook runs
+        // Fired after the match, so the store guard each arm took is already gone: a hook runs
         // node code, and holding a board lock into it is how a board lock ends up inside somebody
         // else's await. Only for a record whose author is not the publisher — that is precisely
         // the "somebody new landed here" case — and only on admission, so a refreshed record
@@ -1743,9 +1874,7 @@ impl RendezvousClient {
         }
     }
 
-    /// Publish one framed record. A refusal surfaces as
-    /// [`Error::RendezvousRejected`] carrying [`RejectReason::as_str`].
-    pub async fn put(&mut self, record: &[u8]) -> Result<()> {
+    async fn put_response(&mut self, record: &[u8]) -> Result<RendezvousResponse> {
         if record.len() > MAX_RENDEZVOUS_FRAME {
             return Err(Error::SizeLimitExceeded("rendezvous record"));
         }
@@ -1753,11 +1882,32 @@ impl RendezvousClient {
             record: record.to_vec(),
         };
         write_frame(&mut self.send, &req.to_frame()).await?;
-        match self.next_response().await? {
-            RendezvousResponse::Accepted => Ok(()),
+        self.next_response().await
+    }
+
+    /// Publish one framed record. A refusal surfaces as
+    /// [`Error::RendezvousRejected`] carrying [`RejectReason::as_str`].
+    pub async fn put(&mut self, record: &[u8]) -> Result<()> {
+        match self.put_response(record).await? {
+            RendezvousResponse::BoardAccepted { .. } => Ok(()),
             RendezvousResponse::Rejected(r) => Err(Error::RendezvousRejected(r.as_str())),
             _ => Err(Error::MalformedRendezvous(
                 "rendezvous put: unexpected response",
+            )),
+        }
+    }
+
+    /// Publish one framed board record and return its causal revision edge. A response without
+    /// the required transition is malformed. [`Self::put`] deliberately discards the edge.
+    pub async fn put_with_revision(&mut self, record: &[u8]) -> Result<Option<BoardWrite>> {
+        match self.put_response(record).await? {
+            RendezvousResponse::BoardAccepted { previous, revision } => Ok(Some(BoardWrite {
+                previous_revision: previous,
+                revision,
+            })),
+            RendezvousResponse::Rejected(r) => Err(Error::RendezvousRejected(r.as_str())),
+            _ => Err(Error::MalformedRendezvous(
+                "rendezvous put: response omitted its revision transition",
             )),
         }
     }
@@ -1771,17 +1921,49 @@ impl RendezvousClient {
         epoch: u64,
         kinds: RecordKinds,
     ) -> Result<RecordSet> {
+        self.get_if_changed(channel_id, epoch, kinds, None)
+            .await?
+            .records
+            .ok_or(Error::MalformedRendezvous(
+                "rendezvous first get omitted its snapshot",
+            ))
+    }
+
+    /// Fetch a full snapshot only when the authenticated board's room revision differs from
+    /// `known_revision`. The revision is returned only after the complete response parsed; the
+    /// caller decides when processing is durable enough to remember it.
+    pub async fn get_if_changed(
+        &mut self,
+        channel_id: &Digest32,
+        epoch: u64,
+        kinds: RecordKinds,
+        known_revision: Option<Digest32>,
+    ) -> Result<BoardRead> {
         let req = RendezvousRequest::Get {
             channel_id: *channel_id,
             epoch,
             kinds,
+            known_revision,
         };
         write_frame(&mut self.send, &req.to_frame()).await?;
         let mut set = RecordSet::default();
         let mut count = 0usize;
         loop {
             match self.next_response().await? {
-                RendezvousResponse::End => return Ok(set),
+                RendezvousResponse::End(revision) => {
+                    let unchanged = known_revision
+                        .as_ref()
+                        .is_some_and(|known| bool::from(known.ct_eq(&revision)));
+                    if unchanged && count != 0 {
+                        return Err(Error::MalformedRendezvous(
+                            "rendezvous unchanged get returned records",
+                        ));
+                    }
+                    return Ok(BoardRead {
+                        revision,
+                        records: (!unchanged).then_some(set),
+                    });
+                }
                 RendezvousResponse::Record(wire) => {
                     count += 1;
                     if count > MAX_GET_RECORDS {
@@ -1790,13 +1972,35 @@ impl RendezvousClient {
                     let tag = parse_frame(&wire)?.tag;
                     match tag {
                         StructTag::RendezvousRecord if kinds.contains(RecordKinds::MEMBERS) => {
-                            set.members.push(RendezvousRecord::from_wire(&wire)?);
+                            let record = RendezvousRecord::from_wire(&wire)?;
+                            if record.channel_id != *channel_id || record.epoch != epoch {
+                                return Err(Error::MalformedRendezvous(
+                                    "rendezvous get: member record is not this room epoch's",
+                                ));
+                            }
+                            set.members.push(record);
                         }
                         StructTag::MemberBundleRecord if kinds.contains(RecordKinds::BUNDLES) => {
-                            set.bundles.push(MemberBundleRecord::from_wire(&wire)?);
+                            let record = MemberBundleRecord::from_wire(&wire)?;
+                            if record.channel_id != *channel_id || record.epoch != epoch {
+                                return Err(Error::MalformedRendezvous(
+                                    "rendezvous get: bundle record is not this room epoch's",
+                                ));
+                            }
+                            set.bundles.push(record);
                         }
                         StructTag::PreJoinRecord if kinds.contains(RecordKinds::PREJOINS) => {
-                            set.prejoins.push(PreJoinRecord::from_wire(&wire)?);
+                            let record = PreJoinRecord::from_wire(&wire)?;
+                            if record.channel_id != *channel_id {
+                                return Err(Error::MalformedRendezvous(
+                                    "rendezvous get: prejoin record is not this room's",
+                                ));
+                            }
+                            // Unlike member-scoped evidence, a pre-join carries the exact key and
+                            // prekey bundle needed to verify itself. Do that before an End token
+                            // can make this response cacheable.
+                            record.verify()?;
+                            set.prejoins.push(record);
                         }
                         StructTag::GenesisRecord if kinds.contains(RecordKinds::GENESIS) => {
                             let g = Genesis::from_wire(&wire)?;
@@ -1821,6 +2025,7 @@ impl RendezvousClient {
                             match w.scope {
                                 WithdrawScope::Room if kinds.contains(RecordKinds::GENESIS) => {
                                     set.ended_by = Some(w.author_id);
+                                    set.room_withdraws.push(w);
                                 }
                                 WithdrawScope::Member if kinds.contains(RecordKinds::NOTICES) => {
                                     set.withdraws.push(w);

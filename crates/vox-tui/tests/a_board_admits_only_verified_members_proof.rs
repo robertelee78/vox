@@ -261,18 +261,31 @@ fn serve_board(
             tokio::spawn(async move {
                 while let Ok(Some(frame)) = read_frame(&mut recv, MAX_RENDEZVOUS_FRAME).await {
                     let replies = match RendezvousRequest::from_frame(&frame) {
-                        Ok(RendezvousRequest::Get { channel_id, .. }) if channel_id == room => {
+                        Ok(RendezvousRequest::Get {
+                            channel_id,
+                            known_revision,
+                            ..
+                        }) if channel_id == room => {
                             asked.fetch_add(1, Ordering::SeqCst);
-                            let mut r: Vec<_> = records
-                                .iter()
-                                .cloned()
-                                .map(RendezvousResponse::Record)
-                                .collect();
-                            r.push(RendezvousResponse::End);
+                            let mut r: Vec<_> = if known_revision == Some([0; 32]) {
+                                Vec::new()
+                            } else {
+                                records
+                                    .iter()
+                                    .cloned()
+                                    .map(RendezvousResponse::Record)
+                                    .collect()
+                            };
+                            r.push(RendezvousResponse::End([0; 32]));
                             r
                         }
-                        Ok(RendezvousRequest::Get { .. }) => vec![RendezvousResponse::End],
-                        Ok(RendezvousRequest::Put { .. }) => vec![RendezvousResponse::Accepted],
+                        Ok(RendezvousRequest::Get { .. }) => vec![RendezvousResponse::End([0; 32])],
+                        Ok(RendezvousRequest::Put { .. }) => {
+                            vec![RendezvousResponse::BoardAccepted {
+                                previous: [0; 32],
+                                revision: [0; 32],
+                            }]
+                        }
                         // This room-board apparatus provides no computer transport service.
                         Ok(
                             RendezvousRequest::ComputerRegister { .. }

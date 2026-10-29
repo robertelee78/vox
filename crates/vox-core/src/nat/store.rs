@@ -33,14 +33,14 @@
 //!   than refusing the newest; member buckets are bounded by
 //!   [`MAX_AUTHORS_PER_BUCKET`] as defense in depth.
 //!
-//! All time is caller-supplied `now` (milliseconds since the Unix epoch): the store is deterministic
-//! and has no ambient clock, which keeps it unit-testable and side-effect-free.
+//! All time is caller-supplied `now` (milliseconds since the Unix epoch): policy has no ambient
+//! clock. Construction draws only the random board incarnation used by opaque read revisions.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
-use crate::hash::Digest32;
+use crate::hash::{sha256_concat, Digest32};
 use crate::identity::composite::CompositePublicKey;
 use crate::nat::notice::AdmissionNotice;
 use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
@@ -286,8 +286,22 @@ fn check_time_validity(timestamp: u64, expiry: u64, now: u64) -> Result<()> {
 /// [`RendezvousStore::accept_member`] / [`RendezvousStore::accept_bundle`] /
 /// [`RendezvousStore::accept_prejoin`], and read current endpoints and bundles
 /// through the query methods.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RendezvousStore {
+    /// Random for this in-memory board lifetime. A restarted board can never present an old
+    /// client's room revision merely because a counter began at the same value again.
+    incarnation: Digest32,
+    /// Monotonic across every room mutation for this service lifetime. Evicting a room removes
+    /// its per-room bookkeeping but does not rewind this sequence, so re-adding the same room can
+    /// never reconstruct a token from its earlier residency.
+    revision_generation: u128,
+    /// One opaque causal token per live room. Only an effective change to that room's returned
+    /// records advances it; the service-global generation prevents token reuse after eviction.
+    revisions: HashMap<Digest32, Digest32>,
+    /// The next live record expiry per room. An unchanged GET compares this one scalar; only a
+    /// due room is scanned and pruned at its causal expiry boundary.
+    next_expiry: HashMap<Digest32, u64>,
+
     /// `(channelID, epoch)` → (`author_id` → current member record).
     members: HashMap<(Digest32, u64), HashMap<Digest32, RendezvousRecord>>,
     /// `(channelID, epoch)` → (`author_id` → current member bundle record).
@@ -383,6 +397,10 @@ impl RendezvousStore {
             .entry((*channel_id, *author))
             .or_insert(0);
         *at = (*at).max(timestamp);
+        if gone != 0 {
+            self.bump_revision(channel_id);
+            self.refresh_next_expiry(channel_id);
+        }
         gone
     }
 
@@ -391,6 +409,7 @@ impl RendezvousStore {
     /// a joiner. Returns how many records went.
     pub fn withdraw_room(&mut self, channel_id: &Digest32, ended: Option<Vec<u8>>) -> usize {
         let mut gone = usize::from(self.genesis.remove(channel_id).is_some());
+        let mut changed = gone != 0;
         self.members.retain(|(cid, _), b| {
             let keep = cid != channel_id;
             if !keep {
@@ -410,20 +429,32 @@ impl RendezvousStore {
         }
         self.withdrawn_members
             .retain(|(cid, _), _| cid != channel_id);
+        changed |= self
+            .member_withdraws
+            .keys()
+            .any(|(cid, _)| cid == channel_id);
         self.member_withdraws
             .retain(|(cid, _), _| cid != channel_id);
         self.pending_withdraws
             .retain(|(cid, _), _| cid != channel_id);
-        self.notices.remove(channel_id);
+        changed |= self
+            .notices
+            .remove(channel_id)
+            .is_some_and(|room| !room.is_empty());
         // The genesis's bookkeeping goes with it, so a board's count of rooms stays its rooms.
         self.pinned.remove(channel_id);
         self.genesis_arrived.remove(channel_id);
         self.genesis_sources.remove(channel_id);
         self.rosters.remove(channel_id);
         let kept = self.withdrawn_rooms.entry(*channel_id).or_default();
-        if ended.is_some() {
-            *kept = ended;
+        if let Some(ended) = ended {
+            changed |= kept.as_ref() != Some(&ended);
+            *kept = Some(ended);
         }
+        if changed || gone != 0 {
+            self.bump_revision(channel_id);
+        }
+        self.refresh_next_expiry(channel_id);
         gone
     }
 
@@ -490,6 +521,7 @@ impl RendezvousStore {
             _ => {}
         }
         room.insert(joiner, notice);
+        self.bump_revision(&cid);
         Ok(true)
     }
 
@@ -550,6 +582,7 @@ impl RendezvousStore {
             return false;
         }
         *held = (timestamp, wire);
+        self.bump_revision(channel_id);
         true
     }
 
@@ -598,10 +631,149 @@ impl RendezvousStore {
                 .is_some_and(|at| timestamp <= *at)
     }
 
-    /// A fresh, empty store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    /// A fresh, empty store with a collision-safe board incarnation.
+    pub fn new() -> Result<Self> {
+        let mut incarnation = [0u8; 32];
+        getrandom::fill(&mut incarnation).map_err(|_| Error::Rng)?;
+        Ok(Self {
+            incarnation,
+            revision_generation: 0,
+            revisions: HashMap::new(),
+            next_expiry: HashMap::new(),
+            members: HashMap::new(),
+            bundles: HashMap::new(),
+            prejoins: HashMap::new(),
+            prejoin_arrivals: 0,
+            genesis: HashMap::new(),
+            withdrawn_members: HashMap::new(),
+            member_withdraws: HashMap::new(),
+            notices: HashMap::new(),
+            pending_withdraws: HashMap::new(),
+            withdrawn_rooms: HashMap::new(),
+            rosters: HashMap::new(),
+            pinned: HashSet::new(),
+            genesis_arrived: HashMap::new(),
+            genesis_arrivals: 0,
+            genesis_sources: HashMap::new(),
+        })
+    }
+
+    fn initial_revision(&self, channel_id: &Digest32) -> Digest32 {
+        sha256_concat(&[
+            b"vox/board-revision/initial/v1\0",
+            &self.incarnation,
+            channel_id,
+        ])
+    }
+
+    fn current_revision(&self, channel_id: &Digest32) -> Digest32 {
+        self.revisions
+            .get(channel_id)
+            .copied()
+            .unwrap_or_else(|| self.initial_revision(channel_id))
+    }
+
+    fn bump_revision(&mut self, channel_id: &Digest32) {
+        // Keeping this sequence service-global is the bounded-state alternative to retaining one
+        // tombstone per evicted room forever. If a service somehow spans the whole u128 space,
+        // advance its opaque incarnation before reusing zero; tokens remain collision-resistant
+        // without refusing a valid mutation or adding a quota.
+        let (generation, wrapped) = self.revision_generation.overflowing_add(1);
+        if wrapped {
+            self.incarnation = sha256_concat(&[
+                b"vox/board-revision/incarnation-after-generation-wrap/v1\0",
+                &self.incarnation,
+            ]);
+        }
+        self.revision_generation = generation;
+        self.revisions.insert(
+            *channel_id,
+            sha256_concat(&[
+                b"vox/board-revision/next/v2\0",
+                &self.incarnation,
+                channel_id,
+                &self.revision_generation.to_be_bytes(),
+            ]),
+        );
+    }
+
+    fn refresh_next_expiry(&mut self, channel_id: &Digest32) {
+        let next = self
+            .members
+            .iter()
+            .filter(|((cid, _), _)| cid == channel_id)
+            .flat_map(|(_, bucket)| bucket.values().map(member_expiry))
+            .chain(
+                self.bundles
+                    .iter()
+                    .filter(|((cid, _), _)| cid == channel_id)
+                    .flat_map(|(_, bucket)| bucket.values().map(bundle_expiry)),
+            )
+            .chain(
+                self.prejoins
+                    .get(channel_id)
+                    .into_iter()
+                    .flat_map(|bucket| bucket.values().map(|(_, record)| prejoin_expiry(record))),
+            )
+            .min();
+        match next {
+            Some(expiry) => {
+                self.next_expiry.insert(*channel_id, expiry);
+            }
+            None => {
+                self.next_expiry.remove(channel_id);
+            }
+        }
+    }
+
+    fn prune_expired_room(&mut self, channel_id: &Digest32, now: u64) -> usize {
+        let mut removed = 0usize;
+        for ((cid, _), bucket) in &mut self.members {
+            if cid == channel_id {
+                let before = bucket.len();
+                bucket.retain(|_, record| now < member_expiry(record));
+                removed += before - bucket.len();
+            }
+        }
+        self.members.retain(|_, bucket| !bucket.is_empty());
+        for ((cid, _), bucket) in &mut self.bundles {
+            if cid == channel_id {
+                let before = bucket.len();
+                bucket.retain(|_, record| now < bundle_expiry(record));
+                removed += before - bucket.len();
+            }
+        }
+        self.bundles.retain(|_, bucket| !bucket.is_empty());
+        if let Some(bucket) = self.prejoins.get_mut(channel_id) {
+            let before = bucket.len();
+            bucket.retain(|_, (_, record)| now < prejoin_expiry(record));
+            removed += before - bucket.len();
+            if bucket.is_empty() {
+                self.prejoins.remove(channel_id);
+            }
+        }
+        if removed != 0 {
+            self.bump_revision(channel_id);
+        }
+        self.refresh_next_expiry(channel_id);
+        removed
+    }
+
+    fn settle_expiry(&mut self, channel_id: &Digest32, now: u64) {
+        if self
+            .next_expiry
+            .get(channel_id)
+            .is_some_and(|expiry| *expiry <= now)
+        {
+            self.prune_expired_room(channel_id, now);
+        }
+    }
+
+    /// The room's opaque revision after settling its one due expiry boundary. Call while holding
+    /// the store mutex through any snapshot built for this revision.
+    pub(crate) fn revision(&mut self, channel_id: &Digest32, now: u64) -> Digest32 {
+        self.settle_expiry(channel_id, now);
+        self.current_revision(channel_id)
     }
 
     /// Admit (or refresh) a **member** rendezvous record, enforcing the full
@@ -648,6 +820,7 @@ impl RendezvousStore {
             return Err(Error::RendezvousRejected("ttl exceeds maximum"));
         }
         check_time_validity(record.timestamp_ms, member_expiry(&record), now)?;
+        self.settle_expiry(&record.channel_id, now);
 
         let bucket_key = (record.channel_id, record.epoch);
         let bucket = self.members.entry(bucket_key).or_default();
@@ -676,6 +849,8 @@ impl RendezvousStore {
         //    longer waiting to join, so its pre-join record goes (V210-102).
         let (channel_id, author_id) = (record.channel_id, record.author_id);
         bucket.insert(author_id, record);
+        self.bump_revision(&channel_id);
+        self.refresh_next_expiry(&channel_id);
         self.forget_prejoin(&channel_id, &author_id);
         Ok(learned)
     }
@@ -718,6 +893,7 @@ impl RendezvousStore {
             return Err(Error::RendezvousRejected("ttl exceeds maximum"));
         }
         check_time_validity(record.timestamp_ms, bundle_expiry(&record), now)?;
+        self.settle_expiry(&record.channel_id, now);
 
         let bucket_key = (record.channel_id, record.epoch);
         let bucket = self.bundles.entry(bucket_key).or_default();
@@ -746,7 +922,10 @@ impl RendezvousStore {
         //    address. Dropped here, the joiner was neither a member nor a pending joiner in that
         //    gap, and its sync was refused as "authenticator invalid" (V210-43). The address
         //    record's admission drops it.
+        let channel_id = record.channel_id;
         bucket.insert(record.author_id, record);
+        self.bump_revision(&channel_id);
+        self.refresh_next_expiry(&channel_id);
         Ok(learned)
     }
 
@@ -817,6 +996,7 @@ impl RendezvousStore {
             self.pinned.insert(channel_id);
         }
         self.note_source(&channel_id, source);
+        self.bump_revision(&channel_id);
         Ok(())
     }
 
@@ -910,8 +1090,8 @@ impl RendezvousStore {
             .collect()
     }
 
-    /// Drop everything this board holds for `channel_id`: its genesis and every record filed
-    /// under it.
+    /// Evict the room's genesis and advertisements, retaining its existing signed authority and
+    /// withdrawal state so eviction cannot undo a leave.
     fn forget_channel(&mut self, channel_id: &Digest32) {
         self.genesis.remove(channel_id);
         self.genesis_arrived.remove(channel_id);
@@ -920,6 +1100,23 @@ impl RendezvousStore {
         self.prejoins.remove(channel_id);
         self.members.retain(|(cid, _), _| cid != channel_id);
         self.bundles.retain(|(cid, _), _| cid != channel_id);
+        if self
+            .member_withdraws
+            .keys()
+            .any(|(cid, _)| cid == channel_id)
+            || self
+                .notices
+                .get(channel_id)
+                .is_some_and(|room| !room.is_empty())
+            || self.room_ended(channel_id).is_some()
+        {
+            self.bump_revision(channel_id);
+        } else {
+            // An empty evicted room needs no retained token. Re-adding it consumes the
+            // service-global generation, never reconstructing an earlier populated revision.
+            self.revisions.remove(channel_id);
+        }
+        self.next_expiry.remove(channel_id);
     }
 
     /// Whether this node filed `channel_id`'s genesis itself (see
@@ -953,6 +1150,7 @@ impl RendezvousStore {
 
         // 2. Time sanity (store-applied default TTL).
         check_time_validity(record.timestamp_ms, prejoin_expiry(&record), now)?;
+        self.settle_expiry(&record.channel_id, now);
 
         // 2a. A pre-join is only meaningful for a channel this board actually serves.
         //
@@ -1028,7 +1226,10 @@ impl RendezvousStore {
         // 4. Admit.
         let arrived = self.prejoin_arrivals;
         self.prejoin_arrivals = self.prejoin_arrivals.wrapping_add(1);
+        let channel_id = record.channel_id;
         bucket.insert(asserted_id, (arrived, record));
+        self.bump_revision(&channel_id);
+        self.refresh_next_expiry(&channel_id);
         Ok(())
     }
 
@@ -1108,6 +1309,10 @@ impl RendezvousStore {
         if bucket.is_empty() {
             self.prejoins.remove(channel_id);
         }
+        if held {
+            self.bump_revision(channel_id);
+            self.refresh_next_expiry(channel_id);
+        }
         held
     }
 
@@ -1130,25 +1335,13 @@ impl RendezvousStore {
     /// empty. Idempotent; call periodically to reclaim memory. Returns the number
     /// of records removed.
     pub fn prune_expired(&mut self, now: u64) -> usize {
-        let mut removed = 0;
-        for bucket in self.members.values_mut() {
-            let before = bucket.len();
-            bucket.retain(|_, r| now < member_expiry(r));
-            removed += before - bucket.len();
-        }
-        self.members.retain(|_, b| !b.is_empty());
-        for bucket in self.bundles.values_mut() {
-            let before = bucket.len();
-            bucket.retain(|_, r| now < bundle_expiry(r));
-            removed += before - bucket.len();
-        }
-        self.bundles.retain(|_, b| !b.is_empty());
-        for bucket in self.prejoins.values_mut() {
-            let before = bucket.len();
-            bucket.retain(|_, (_, r)| now < prejoin_expiry(r));
-            removed += before - bucket.len();
-        }
-        self.prejoins.retain(|_, b| !b.is_empty());
-        removed
+        let due: Vec<Digest32> = self
+            .next_expiry
+            .iter()
+            .filter_map(|(channel, expiry)| (*expiry <= now).then_some(*channel))
+            .collect();
+        due.into_iter()
+            .map(|channel| self.prune_expired_room(&channel, now))
+            .sum()
     }
 }

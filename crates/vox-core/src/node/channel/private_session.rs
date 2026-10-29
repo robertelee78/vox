@@ -146,13 +146,13 @@ pub(super) struct PrivateSessions {
     pulling: BTreeSet<Digest32>,
     attempted: BTreeMap<Digest32, Instant>,
     revision: u64,
-    // A capability record is live traffic, not history: a member admitted after the previous
-    // record cannot learn it. Set on every admission and open, and clear only after the current
-    // node has appended a fresh authenticated announcement.
+    // Admission and open retain a capability recheck. Sparse controls deliver the existing
+    // authenticated statement to later members; this obligation cannot force a duplicate.
+    // Non-sparse rooms retain their existing live reannouncement behavior.
     support_owed: bool,
-    // A supported old snapshot cannot distinguish a real interrupted admission announcement
-    // from gratuitous reopen renewal. Only this automatic publication waits for a current
-    // recipient's authenticated own-head discovery; ordinary offline user actions do not.
+    // A missing first announcement must not append from a restored older own head.
+    // Only automatic capability publication waits for a current recipient's authenticated
+    // own-head discovery; ordinary offline user actions do not.
     support_rediscovery: bool,
 }
 
@@ -1249,7 +1249,13 @@ impl ChannelState {
         {
             return Ok(false);
         }
-        if !self.private_sessions.support_owed && self.supports_private(profile.store(), &me)? {
+        // A fresh admission or reopen rechecks durable support; it does not change capability.
+        // Incomplete controls keep their real wait rather than authorizing another append.
+        if (!self.private_sessions.support_owed || self.uses_sparse_history(profile.store())?)
+            && self.supports_private(profile.store(), &me)?
+        {
+            self.private_sessions.support_owed = false;
+            self.private_sessions.support_rediscovery = false;
             return Ok(false);
         }
         self.append_control_kind(
@@ -1281,8 +1287,8 @@ impl ChannelState {
         self.private_sessions.pending_active = state.pending;
         self.private_sessions.pending_after = state.pending_after;
         self.private_sessions.pending_through = state.pending_through;
-        // A restart may follow an admission that committed just before its capability
-        // announcement. Repeating this one small signed fact is bounded to one per open.
+        // A restart may follow admission but precede the first capability announcement.
+        // Retain its recheck; sparse history consults durable support before appending.
         self.private_sessions.support_owed = true;
         self.private_sessions.support_rediscovery = self.uses_sparse_history(store)?;
         self.restore_private_pulls(store)?;

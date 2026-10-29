@@ -1301,6 +1301,18 @@ pub struct PortCounters {
     pub skipped_at_cap: u64,
     /// Times a port waited in the outbound queue for a slot (ADR-025 D6).
     pub queued: u64,
+    /// Actual record frames received in complete board replies; unchanged replies add zero.
+    pub board_records_received: u64,
+    /// Received by anchor reads, rather than member-sync setup.
+    pub board_anchor_records_received: u64,
+    /// Received by member-sync setup.
+    pub board_sync_records_received: u64,
+    /// Member-sync setup encounters with an occupied exact room/peer exchange owner.
+    pub board_sync_owner_waits: u64,
+    /// Offered record frames for which the peer returned a complete acceptance or refusal.
+    pub board_records_offered: u64,
+    /// Board offers that failed or were cancelled before completion.
+    pub board_offer_failures: u64,
     /// The backoff the port is in now, and its consecutive failures.
     pub backoff: Option<(BackoffKind, u32)>,
     /// The sessions running on the port now, by token: which end opened each, the step it is at,
@@ -1731,7 +1743,10 @@ impl SyncBook {
                  \"history_declined\":{},\"history_offered\":{},\"history_rearmed\":{},\
                  \"history_refusal_stale\":{},\"history_refusal_saved\":{},\
                  \"partial\":{},\"failed\":{},\"last_failure\":{},\
-                 \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\"backoff\":{},\
+                 \"stale\":{},\"refused\":{},\"skipped_at_cap\":{},\"queued\":{},\
+                 \"board_records_received\":{},\"board_anchor_records_received\":{},\
+                 \"board_sync_records_received\":{},\"board_sync_owner_waits\":{},\
+                 \"board_records_offered\":{},\"board_offer_failures\":{},\"backoff\":{},\
                  \"running\":[{}]}}",
                 b32_encode(room),
                 b32_encode(peer),
@@ -1761,6 +1776,12 @@ impl SyncBook {
                 c.refused,
                 c.skipped_at_cap,
                 c.queued,
+                c.board_records_received,
+                c.board_anchor_records_received,
+                c.board_sync_records_received,
+                c.board_sync_owner_waits,
+                c.board_records_offered,
+                c.board_offer_failures,
                 c.backoff.map_or_else(
                     || "null".to_owned(),
                     |(k, n)| format!("{{\"kind\":\"{}\",\"failures\":{n}}}", k.name())

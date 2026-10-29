@@ -37,7 +37,7 @@ use tokio::task::JoinSet;
 
 use crate::error::{Error, Result};
 use crate::governance::genesis::Genesis;
-use crate::hash::Digest32;
+use crate::hash::{sha256_concat, Digest32};
 use crate::identity::composite::{CompositePublicKey, RootSigner};
 use crate::identity::keyagreement::X25519IdentityKey;
 use crate::join::pow::Difficulty;
@@ -46,7 +46,7 @@ use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::nat::reachability::{connect_direct, direct_candidates};
 use crate::nat::record::{Admission, MemberBundleRecord, RendezvousRecord};
 use crate::nat::service::{
-    MembershipOracle, RecordKinds, RecordSet, RendezvousClient, RendezvousService,
+    BoardRead, MembershipOracle, RecordKinds, RecordSet, RendezvousClient, RendezvousService,
 };
 use crate::nat::store::RendezvousStore;
 use crate::node::circuitstream;
@@ -426,6 +426,65 @@ pub enum Inbound {
     },
 }
 
+#[derive(Clone, Copy)]
+struct BoardExchangeRevision {
+    remote: Digest32,
+    local: Digest32,
+}
+
+#[derive(Clone)]
+struct BoardExchangeState {
+    revision: BoardExchangeRevision,
+    records: Arc<RecordSet>,
+}
+
+/// Created only by the actor, never by a detached exchange. Cancellation retires both owners
+/// and waiters without making node control wait for a peer or a contended exchange gate.
+#[derive(Clone)]
+pub(crate) struct BoardExchangeScope {
+    pub(crate) channel_id: Digest32,
+    pub(crate) epoch: u64,
+    lifetime: Digest32,
+    cancelled: tokio::sync::watch::Sender<bool>,
+    exchanges: Arc<Mutex<HashMap<Digest32, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl BoardExchangeScope {
+    pub(crate) fn is_live(&self) -> bool {
+        !*self.cancelled.borrow()
+    }
+    pub(crate) async fn retired(&self) {
+        let mut cancelled = self.cancelled.subscribe();
+        let _ = cancelled.wait_for(|retired| *retired).await;
+    }
+}
+
+#[derive(Default)]
+struct BoardExchangeCache {
+    rooms: HashMap<Digest32, BoardExchangeScope>,
+    generation: u128,
+    incarnation: Digest32,
+    states: HashMap<(Digest32, Digest32, u64, u8), BoardExchangeState>,
+}
+
+/// Actor-owned cancellation on unwind as well as graceful stop. Detached exchanges retain the
+/// network surface, but never this guard, so they cannot keep their own authority alive.
+pub(crate) struct BoardExchangeRetirement(std::sync::Weak<NodeNet>);
+
+impl BoardExchangeRetirement {
+    pub(crate) fn new(net: &Arc<NodeNet>) -> Self {
+        Self(Arc::downgrade(net))
+    }
+}
+
+impl Drop for BoardExchangeRetirement {
+    fn drop(&mut self) {
+        if let Some(net) = self.0.upgrade() {
+            net.forget_board_exchanges();
+        }
+    }
+}
+
 /// The node's network surface.
 pub struct NodeNet {
     manager: Arc<ConnectionManager>,
@@ -447,6 +506,7 @@ pub struct NodeNet {
     /// Where this node records what it decided (ADR-028 D-1), once the node has one: a relay
     /// circuit refused is decided here, off the actor.
     decisions: Mutex<Option<crate::node::decisions::DecisionLog>>,
+    board_revisions: Mutex<BoardExchangeCache>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
@@ -549,20 +609,19 @@ impl NodeNet {
 
     /// Build the surface over a bound endpoint. The board it serves is fresh
     /// in-memory state (an anchor that persists a board is M15).
-    #[must_use]
     pub fn new(
         endpoint: Arc<VoxEndpoint>,
         presence: Arc<crate::node::presence::NetPresence>,
         clock: Clock,
-    ) -> Self {
+    ) -> Result<Self> {
         let membership = SharedMembership::new();
         let mut service = RendezvousService::new(
-            Arc::new(Mutex::new(RendezvousStore::new())),
+            Arc::new(Mutex::new(RendezvousStore::new()?)),
             Arc::new(membership.clone()),
             Arc::clone(&clock),
         );
         service.computer_anchor(endpoint.local_id());
-        Self {
+        Ok(Self {
             manager: Arc::new(ConnectionManager::with_network(
                 endpoint,
                 Arc::clone(&clock),
@@ -573,12 +632,13 @@ impl NodeNet {
             reaching: Mutex::new(HashMap::new()),
             status: Mutex::new(None),
             decisions: Mutex::new(None),
+            board_revisions: Mutex::new(BoardExchangeCache::default()),
             service,
             membership,
             policy: SharedPolicy::new(),
             clock,
             untold: Arc::new(Mutex::new(HashSet::new())),
-        }
+        })
     }
 
     /// Install current manual and room provenance before dialing or using an anchor.
@@ -2612,7 +2672,7 @@ impl NodeNet {
             },
         );
         match responses.first() {
-            Some(RendezvousResponse::Accepted) => Ok(()),
+            Some(RendezvousResponse::Accepted | RendezvousResponse::BoardAccepted { .. }) => Ok(()),
             Some(RendezvousResponse::Rejected(r)) => {
                 Err(crate::error::Error::RendezvousRejected(r.as_str()))
             }
@@ -2818,6 +2878,270 @@ impl NodeNet {
         let res = client.get(channel_id, epoch, RecordKinds::ALL).await;
         client.finish();
         res
+    }
+
+    pub(crate) async fn fetch_channel_if_changed(
+        &self,
+        conn: &VoxConnection,
+        channel_id: &Digest32,
+        epoch: u64,
+        known_revision: Option<Digest32>,
+    ) -> Result<BoardRead> {
+        let mut client = RendezvousClient::open(conn).await?;
+        let result = client
+            .get_if_changed(channel_id, epoch, RecordKinds::ALL, known_revision)
+            .await;
+        client.finish();
+        result
+    }
+
+    /// Establish the exact live room epoch before spawning work. No network wait is involved.
+    pub(crate) fn activate_board_exchange_room(
+        &self,
+        channel_id: Digest32,
+        epoch: u64,
+    ) -> BoardExchangeScope {
+        let mut cache = lock(&self.board_revisions);
+        if let Some(scope) = cache.rooms.get(&channel_id) {
+            if scope.epoch == epoch {
+                return scope.clone();
+            }
+        }
+        if let Some(old) = cache.rooms.remove(&channel_id) {
+            old.cancelled.send_replace(true);
+        }
+        cache
+            .states
+            .retain(|(_, room, _, _), _| *room != channel_id);
+        let (generation, wrapped) = cache.generation.overflowing_add(1);
+        if wrapped {
+            cache.incarnation = sha256_concat(&[
+                b"vox/board-exchange-cache/incarnation/v1\0",
+                &cache.incarnation,
+            ]);
+        }
+        cache.generation = generation;
+        let lifetime = sha256_concat(&[
+            b"vox/board-exchange-cache/room-lifetime/v1\0",
+            &cache.incarnation,
+            &generation.to_be_bytes(),
+            &channel_id,
+            &epoch.to_be_bytes(),
+        ]);
+        let scope = BoardExchangeScope {
+            channel_id,
+            epoch,
+            lifetime,
+            cancelled: tokio::sync::watch::channel(false).0,
+            exchanges: Arc::new(Mutex::new(HashMap::new())),
+        };
+        cache.rooms.insert(channel_id, scope.clone());
+        scope
+    }
+
+    /// Only short RAM bookkeeping belongs in this gate. Room state/authority fences order
+    /// disk and cryptographic work; retirement never waits here on an exchange or its I/O.
+    fn with_board_exchange_scope<T>(
+        &self,
+        scope: &BoardExchangeScope,
+        effect: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let cache = lock(&self.board_revisions);
+        cache
+            .rooms
+            .get(&scope.channel_id)
+            .filter(|live| live.epoch == scope.epoch && live.lifetime == scope.lifetime)?;
+        Some(effect())
+    }
+
+    pub(crate) fn forget_board_exchange_room(&self, channel_id: &Digest32) {
+        let mut cache = lock(&self.board_revisions);
+        if let Some(scope) = cache.rooms.remove(channel_id) {
+            scope.cancelled.send_replace(true);
+        }
+        cache.states.retain(|(_, room, _, _), _| room != channel_id);
+    }
+
+    pub(crate) fn forget_board_exchanges(&self) {
+        let mut cache = lock(&self.board_revisions);
+        for (_, scope) in cache.rooms.drain() {
+            scope.cancelled.send_replace(true);
+        }
+        cache.states.clear();
+    }
+
+    pub(crate) async fn board_exchange_owner(
+        &self,
+        scope: &BoardExchangeScope,
+        board: Digest32,
+        observations: &crate::node::status::SharedSyncBook,
+        sync_path: bool,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let exchange = self.with_board_exchange_scope(scope, || {
+            Arc::clone(
+                lock(&scope.exchanges)
+                    .entry(board)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        })?;
+        match Arc::clone(&exchange).try_lock_owned() {
+            Ok(owner) => Some(owner),
+            Err(_) => {
+                if sync_path {
+                    self.with_board_exchange_scope(scope, || {
+                        crate::node::status::SyncBook::with(
+                            observations,
+                            scope.channel_id,
+                            board,
+                            |counts| {
+                                counts.board_sync_owner_waits =
+                                    counts.board_sync_owner_waits.saturating_add(1)
+                            },
+                        );
+                    });
+                }
+                tokio::select! {
+                    biased;
+                    () = scope.retired() => None,
+                    owner = exchange.lock_owned() => Some(owner),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn board_exchange_revision(
+        &self,
+        board: Digest32,
+        scope: &BoardExchangeScope,
+    ) -> Option<(Digest32, Digest32, Arc<RecordSet>)> {
+        let cache = lock(&self.board_revisions);
+        let live = cache.rooms.get(&scope.channel_id)?;
+        if live.lifetime != scope.lifetime || live.epoch != scope.epoch {
+            return None;
+        }
+        cache
+            .states
+            .get(&(
+                board,
+                scope.channel_id,
+                scope.epoch,
+                RecordKinds::ALL.bits(),
+            ))
+            .map(|state| {
+                (
+                    state.revision.remote,
+                    state.revision.local,
+                    Arc::clone(&state.records),
+                )
+            })
+    }
+
+    pub(crate) fn commit_board_exchange_revision(
+        &self,
+        board: Digest32,
+        scope: &BoardExchangeScope,
+        expected: Option<(Digest32, Digest32)>,
+        revision: (Digest32, Digest32),
+        records: Arc<RecordSet>,
+    ) {
+        let mut cache = lock(&self.board_revisions);
+        if !cache
+            .rooms
+            .get(&scope.channel_id)
+            .is_some_and(|live| live.lifetime == scope.lifetime && live.epoch == scope.epoch)
+        {
+            return;
+        }
+        let key = (
+            board,
+            scope.channel_id,
+            scope.epoch,
+            RecordKinds::ALL.bits(),
+        );
+        let matches = match (cache.states.get(&key), expected) {
+            (None, None) => true,
+            (Some(state), Some((remote, local))) => {
+                state.revision.remote == remote && state.revision.local == local
+            }
+            _ => false,
+        };
+        if matches {
+            cache.states.insert(
+                key,
+                BoardExchangeState {
+                    revision: BoardExchangeRevision {
+                        remote: revision.0,
+                        local: revision.1,
+                    },
+                    records,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn note_board_exchange(
+        &self,
+        scope: &BoardExchangeScope,
+        book: &crate::node::status::SharedSyncBook,
+        peer: Digest32,
+        traffic: (usize, usize, bool),
+        anchor_path: bool,
+    ) {
+        self.with_board_exchange_scope(scope, || {
+            let (received, offered, failed) = traffic;
+            crate::node::status::SyncBook::with(book, scope.channel_id, peer, |counts| {
+                let received = u64::try_from(received).unwrap_or(u64::MAX);
+                counts.board_records_received =
+                    counts.board_records_received.saturating_add(received);
+                if anchor_path {
+                    counts.board_anchor_records_received = counts
+                        .board_anchor_records_received
+                        .saturating_add(received);
+                } else {
+                    counts.board_sync_records_received =
+                        counts.board_sync_records_received.saturating_add(received);
+                }
+                counts.board_records_offered = counts
+                    .board_records_offered
+                    .saturating_add(u64::try_from(offered).unwrap_or(u64::MAX));
+                counts.board_offer_failures = counts
+                    .board_offer_failures
+                    .saturating_add(u64::from(failed));
+            });
+        });
+    }
+
+    pub(crate) fn local_board_revision(&self, channel_id: &Digest32) -> Digest32 {
+        self.service.revision(channel_id)
+    }
+
+    pub(crate) fn board_records_for_offer(
+        &self,
+        channel_id: &Digest32,
+        epoch: u64,
+    ) -> Vec<Vec<u8>> {
+        self.board_records_missing_from(channel_id, epoch, &RecordSet::default())
+    }
+
+    /// A self-validating prejoin is mirrored anonymously, not falsely attributed to this node.
+    pub(crate) fn mirror_board_record(&self, record: &[u8]) -> Result<()> {
+        use crate::nat::service::{RendezvousRequest, RendezvousResponse};
+        let responses = self.service.handle(
+            None,
+            None,
+            &RendezvousRequest::Put {
+                record: record.to_vec(),
+            },
+        );
+        match responses.first() {
+            Some(RendezvousResponse::Accepted | RendezvousResponse::BoardAccepted { .. }) => Ok(()),
+            Some(RendezvousResponse::Rejected(reason)) => {
+                Err(Error::RendezvousRejected(reason.as_str()))
+            }
+            _ => Err(Error::MalformedRendezvous(
+                "board mirror: unexpected response",
+            )),
+        }
     }
 }
 

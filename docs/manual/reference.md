@@ -207,6 +207,18 @@ gateway
 lapses and deletes each one when it stops. `vox status --json` carries the same, and the last
 network change under `network_changed`.
 
+The per-room/peer rows under `sync` also count actual board record traffic:
+`board_records_received`, split into `board_anchor_records_received` and
+`board_sync_records_received`, counts record frames in complete replies. A board whose revision
+is unchanged sends no record payload and adds zero. `board_records_offered` counts offered frames
+that received a complete acceptance or refusal; `board_offer_failures` counts offers that failed
+or were cancelled before completion. `board_sync_owner_waits` counts member-sync setups that encountered an already
+occupied exchange for that same room and peer. These are process-local observations, not history
+message counts or proof that a peer has admitted every author.
+
+Quiet rooms still send scheduled head checks and transport keepalives: zero record counts do not
+mean zero network bytes.
+
 Status output can reveal rooms, peers, addresses and paths. Share the smallest excerpt that shows
 the problem.
 

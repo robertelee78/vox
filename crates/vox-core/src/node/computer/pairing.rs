@@ -787,7 +787,7 @@ impl Management {
             link.endpoint,
             presence,
             crate::time::clock_with_test_skew(),
-        ));
+        )?);
         let mut policy = crate::node::net::PeerPolicy::new();
         for a in anchors.nodes() {
             policy.add_anchor(a.id);
