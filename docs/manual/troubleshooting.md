@@ -220,8 +220,9 @@ next new post.
 **Meaning:** your node has the message's signed envelope, and its text is still to come from a
 member. It does not mean missing trust or a bad signature.
 
-**Fix:** get the members who hold the message online. If no member holds it, it cannot be
-recovered: there is no server.
+**Fix:** get the members who hold the message online. A member busy saving room history can
+delay delivery; keep it online while its save finishes. If no member holds the message, it
+cannot be recovered: there is no server.
 
 **Check:** `vox status --json` lists each room and peer under `lanes.ports`. Its
 `last_recorded_unavailable_response`, when present, identifies a history request that peer
