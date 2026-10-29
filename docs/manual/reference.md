@@ -207,6 +207,14 @@ gateway
 lapses and deletes each one when it stops. `vox status --json` carries the same, and the last
 network change under `network_changed`.
 
+The top-level JSON field `full_flushes` counts successful store-backend `sync_data` calls across
+the daemon process, including all its nodes, database opening/recovery and temporary rewrite
+files. It resets when that process restarts. It counts completed flush I/O, not transactions
+selected as durable, and excludes failed or still-running flushes and non-store files. It is
+not a device-write count or evidence that a particular message survived power loss. Compare
+snapshots from the same daemon process: settled quiet sync must not increase it, while an
+acknowledged own post includes a completed durable flush.
+
 The per-room/peer rows under `sync` also count actual board record traffic:
 `board_records_received`, split into `board_anchor_records_received` and
 `board_sync_records_received`, counts record frames in complete replies. A board whose revision
