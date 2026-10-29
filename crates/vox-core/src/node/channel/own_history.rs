@@ -117,6 +117,14 @@ pub(crate) enum OwnReadability {
     Complete,
     Runnable,
     Waiting,
+    /// The authenticated own body now opens, but its sparse semantic effect has not settled.
+    /// Re-run the existing staged Page rather than queueing render backfill, which skips
+    /// unsettled effects and cannot advance the role-complete own prefix.
+    EffectReady {
+        target: Digest32,
+        seq: u64,
+        entry_hash: Digest32,
+    },
     BodyDebt {
         target: Digest32,
         seq: u64,
@@ -218,7 +226,8 @@ impl ChannelState {
         let rendered = self
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
-        if rendered.author_backfill_pending(&self.me())? {
+        let own_pending = rendered.author_backfill_pending(&self.me())?;
+        if own_pending {
             return Ok(OwnReadability::Waiting);
         }
         let mut outcome = OwnReadability::Runnable;
@@ -247,16 +256,20 @@ impl ChannelState {
                 let entry = read.history_entry(&hash)?;
                 let payload = entry.as_ref().and_then(|entry| entry.payload.as_deref());
                 let Some(payload) = payload else {
-                    // The signed claim is sufficient only if both possible retention classes
-                    // have expired; zero retention is unlimited and cannot discharge this debt.
-                    let ms = header.skeleton.claimed_ms;
-                    if effect_finished
-                        && self.governance_display_current(now.get())
-                        && expired_at(ms, now.get(), self.effective_retention())
-                        && expired_at(ms, now.get(), self.effective_step_retention())
-                    {
-                        cursor.next += 1;
-                        continue;
+                    // Match body pruning's age: a future signed claim cannot extend the
+                    // lifetime beyond this node's persisted first sight of the entry.
+                    if effect_finished && self.governance_display_current(now.get()) {
+                        if let Some(log) = read.log_id(&hash)? {
+                            let first_seen =
+                                history_first_seen_at(&snapshot, &self.sek, &self.channel_id, log)?;
+                            let base = header.skeleton.claimed_ms.min(first_seen);
+                            if expired_at(base, now.get(), self.effective_retention())
+                                && expired_at(base, now.get(), self.effective_step_retention())
+                            {
+                                cursor.next += 1;
+                                continue;
+                            }
+                        }
                     }
                     outcome = OwnReadability::BodyDebt {
                         target: target.id(),
@@ -315,6 +328,14 @@ impl ChannelState {
                         };
                         break;
                     };
+                    if !effect_finished {
+                        outcome = OwnReadability::EffectReady {
+                            target: target.id(),
+                            seq,
+                            entry_hash: hash,
+                        };
+                        break;
+                    }
                     if let Ok(Decoded::Text(content)) = crate::node::content::decode(&plaintext) {
                         let Some(entry) = entry.as_ref() else {
                             return Err(Error::MalformedAtRest("own readable entry missing"));
@@ -637,15 +658,13 @@ impl ChannelState {
             return Ok(None);
         }
         let lo = held.checked_add(1).ok_or(Error::OwnHistoryBehind)?;
-        let hi = head
-            .root
-            .leaves
-            .min(donor_through)
-            .min(lo.saturating_add(crate::log::history::MAX_PAGE_ENTRIES as u64 - 1));
+        // A Page serves its highest position first. Own recovery must settle the next
+        // contiguous entry before later sender generations: otherwise an unreadable later
+        // body can park the whole page before the readability audit reaches its key debt.
         Ok(Some(OwnRecoveryPage {
             head: head.id(),
             lo,
-            hi,
+            hi: lo,
             donor_through,
         }))
     }

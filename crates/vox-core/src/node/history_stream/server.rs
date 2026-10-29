@@ -528,7 +528,7 @@ async fn respond(
                         }),
                     ));
                 }
-                if credit.headers_left() == 0 || seq == hi {
+                if credit.headers_left() == 0 || seq == lo {
                     return Ok((Status::Complete, None));
                 }
                 // Each iteration consumes a header credit; the enclosing interval cannot turn

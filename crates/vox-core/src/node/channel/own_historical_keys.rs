@@ -6,6 +6,81 @@ use super::*;
 const KIND: SegmentKind = SegmentKind::OwnHistoricalKeys;
 const MAX_BYTES: usize = crate::node::pairwise_stream::MAX_PAIRWISE_FRAME;
 
+/// One bounded pass over the signed own feed per stored key. The cursor is deliberately
+/// volatile: after a restart it rechecks every candidate instead of trusting an old retention
+/// verdict. A completed pass sleeps until the feed, policy, or retained bodies change.
+#[derive(Default)]
+pub(super) struct Retirement {
+    pub(super) after: Option<[u8; 64]>,
+    pub(super) current: Option<([u8; 64], u64, u64)>,
+    pub(super) complete: bool,
+    pub(super) head: u64,
+    pub(super) epoch: u64,
+    pub(super) retention: (u64, u64),
+    pub(super) entry_generation: u64,
+    pub(super) wake_at: Option<u64>,
+}
+
+impl Retirement {
+    pub(super) fn reset(&mut self) {
+        self.after = None;
+        self.current = None;
+        self.complete = false;
+        self.wake_at = None;
+    }
+
+    pub(super) fn wait_until(&mut self, at: u64) {
+        self.wake_at = Some(self.wake_at.map_or(at, |prior| prior.min(at)));
+    }
+}
+
+pub(super) fn first_after(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    room: &Digest32,
+    after: Option<[u8; 64]>,
+) -> Result<Option<([u8; 64], u64)>> {
+    let Some(sealed) = snapshot.get_segment_bounded(room, KIND, 0, 128)? else {
+        return Ok(None);
+    };
+    let h = Header::decode(&open_segment(sek, KIND, 0, &sealed)?)?;
+    let next =
+        session_tree::Read::snapshot(snapshot, sek, room, KIND).first_after(h.root, after)?;
+    if let Some((_, id)) = next {
+        if id == 0 || id >= h.next {
+            return Err(bad());
+        }
+    }
+    Ok(next)
+}
+
+/// Called only after a bounded scan found no retained or owed own content for this key.
+pub(super) fn retire(
+    batch: &mut crate::node::store::Batch<'_>,
+    sek: &Sek,
+    room: &Digest32,
+    key: [u8; 64],
+    id: u64,
+) -> Result<()> {
+    let sealed = batch
+        .get_segment_bounded(room, KIND, 0, 128)?
+        .ok_or_else(bad)?;
+    let mut h = Header::decode(&open_segment(sek, KIND, 0, &sealed)?)?;
+    if id == 0
+        || id >= h.next
+        || h.count == 0
+        || session_tree::Read::batch(batch, sek, room, KIND).find(h.root, &key)? != Some(id)
+    {
+        return Err(bad());
+    }
+    let mut tree = session_tree::Write::new(batch, sek, room, KIND, h.next)?;
+    h.root = tree.set(h.root, key, None)?;
+    h.next = tree.next_page();
+    batch.delete_segment(room, KIND, id)?;
+    h.count -= 1;
+    h.seal(batch, sek, room)
+}
+
 fn bad() -> Error {
     Error::MalformedAtRest("own historical key index")
 }

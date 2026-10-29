@@ -1244,6 +1244,8 @@ impl Source<'_> {
 pub(crate) struct EntryIndex {
     cache: RefCell<PageCache>,
     cache_revision: Cell<u64>,
+    /// In-memory signal for maintenance scans whose safety depends on retained bodies.
+    commit_generation: Cell<u64>,
     legacy_attached: Cell<Option<LegacyProvisionalOwner>>,
     provisional_hidden: Cell<bool>,
 }
@@ -1550,7 +1552,12 @@ impl EntryIndex {
             destination: None,
         })
     }
+    pub(crate) fn commit_generation(&self) -> u64 {
+        self.commit_generation.get()
+    }
     pub(crate) fn committed(&self) {
+        self.commit_generation
+            .set(self.commit_generation.get().wrapping_add(1));
         self.cache.borrow_mut().clear();
     }
 }

@@ -157,6 +157,7 @@ async fn own_recovery_flow(
     );
     flow.automatic_own_recovery = true;
     flow.own_recovery_trigger = Some(trigger);
+    flow.own_recovery_page = (!cleanup).then_some((page.head, page.lo));
     flow.own_recovery_checkpoint = Some(checkpoint);
     if cleanup {
         flow.mark_own_recovery_cleanup();
@@ -2014,6 +2015,43 @@ fn foreground_reason(
 }
 
 impl Node {
+    /// A previously unavailable own body can become readable after its receiver changes.
+    /// Spend that edge once per donor and exact staged position; the normal Page still checks
+    /// its grant and settles the sparse effect before any role-complete receipt advances.
+    pub(super) fn retry_readable_own_effect(&mut self, room: Digest32) {
+        let current = self
+            .channels
+            .get(&room)
+            .zip(self.own_readable_effects.get(&room))
+            .is_some_and(|(channel, ready)| {
+                ready
+                    .instance
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(channel, &held))
+            });
+        if !current {
+            self.own_readable_effects.remove(&room);
+            return;
+        }
+        let Some(ready) = self.own_readable_effects.get_mut(&room) else {
+            return;
+        };
+        let mut woken = false;
+        for ((id, peer), port) in &mut self.ports {
+            if *id == room
+                && !ready.woken.contains(peer)
+                && port.own_recovery_parked.take().is_some()
+            {
+                ready.woken.insert(*peer);
+                port.raise();
+                woken = true;
+            }
+        }
+        if woken {
+            self.sched_rooms.insert(room);
+        }
+    }
+
     /// Name the exact bounded root whose next attempt is stopped before a `Flow` exists. This
     /// mirrors the starter's selection order so status can identify a retained admission rather
     /// than reporting only that some port is waiting.
@@ -3076,6 +3114,24 @@ impl Node {
                         } else {
                             port.own_recovery_parked = flow.own_recovery_trigger;
                         }
+                    }
+                    if !flow.own_recovery_progress
+                        && flow.own_recovery_page.is_some_and(|(target, seq)| {
+                            self.own_readable_effects
+                                .get(&work.room)
+                                .is_some_and(|ready| {
+                                    ready.target == target
+                                        && ready.seq == seq
+                                        && ready
+                                            .instance
+                                            .upgrade()
+                                            .is_some_and(|room| Arc::ptr_eq(&room, &flow.shared))
+                                })
+                        })
+                    {
+                        // Readability can change while this Page still owns the port. Its
+                        // no-progress completion is the first point a new Page may run.
+                        self.retry_readable_own_effect(work.room);
                     }
                     if flow.own_recovery_progress {
                         self.governance_work.wake_room(work.room);

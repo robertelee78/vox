@@ -224,6 +224,18 @@ fn parse_first_seen(bytes: &[u8]) -> Result<(u64, bool)> {
     Ok((t, steps))
 }
 
+fn history_first_seen_at(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    channel: &Digest32,
+    log: u64,
+) -> Result<u64> {
+    let saved = snapshot
+        .get_segment(channel, SegmentKind::Index, log)?
+        .ok_or(Error::MalformedAtRest("own history age missing"))?;
+    Ok(parse_first_seen(&open_segment(sek, SegmentKind::Index, log, &saved)?)?.0)
+}
+
 fn retained_control(body: &[u8]) -> bool {
     session_floor::is_session_floor(body)
         || private_session::is_support(body)
@@ -1214,6 +1226,8 @@ pub struct ChannelState {
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
     own_recovery: own_history::Recovery,
+    /// Volatile bounded retirement scan; restart begins a fresh safety audit, not a deletion.
+    historical_retirement: own_historical_keys::Retirement,
     availability: availability::State,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
@@ -2170,6 +2184,7 @@ impl ChannelState {
             ))),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
+            historical_retirement: own_historical_keys::Retirement::default(),
             availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
@@ -2990,6 +3005,7 @@ impl ChannelState {
             consent_facts,
             own_behind,
             own_recovery,
+            historical_retirement: own_historical_keys::Retirement::default(),
             availability: availability::State::new()?,
             presence,
             sparse_applied_tips,
@@ -3276,6 +3292,7 @@ impl ChannelState {
             ))),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
+            historical_retirement: own_historical_keys::Retirement::default(),
             availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
@@ -6437,10 +6454,14 @@ impl ChannelState {
         if self.poisoned {
             return Ok(0);
         }
-        let pruned =
-            self.prune_retention_page(store)? + self.sweep_private_sessions(store, now.get())?;
+        let retired = self.prune_retention_page(store)?;
+        let pruned = retired + self.sweep_private_sessions(store, now.get())?;
         if pruned > 0 {
             self.last_pruned_at = now.get();
+        }
+        if let Err(error) = self.retire_own_historical_keys(store) {
+            self.poison(&error);
+            return Err(error);
         }
         Ok(pruned)
     }
@@ -6574,6 +6595,144 @@ impl ChannelState {
             self.poison(error);
         }
         result
+    }
+
+    /// A recovered old-epoch receiver is never a live sender key. Retire one only after a
+    /// bounded scan proves that no signed own entry in that epoch still has retained content
+    /// for its chain, or an unresolved body/effect that may need the key. The newest own entry
+    /// must already be in the current epoch: only then can no later own entry use an old key.
+    fn retire_own_historical_keys(&mut self, store: &Store) -> Result<()> {
+        let me = self.me();
+        let head = self.dag.verified_head(&me);
+        let retention = (self.effective_retention(), self.effective_step_retention());
+        let generation = self.entries.commit_generation();
+        let scan = &mut self.historical_retirement;
+        if self.own_behind {
+            scan.reset();
+            return Ok(());
+        }
+        if scan.head != head
+            || scan.epoch != self.epoch
+            || scan.retention != retention
+            || scan.entry_generation != generation
+            || scan.wake_at.is_some_and(|at| self.now_hint >= at)
+        {
+            scan.reset();
+            scan.head = head;
+            scan.epoch = self.epoch;
+            scan.retention = retention;
+            scan.entry_generation = generation;
+        }
+        if scan.complete || head == 0 {
+            return Ok(());
+        }
+        let (key, id, mut next) = match scan.current {
+            Some(current) => current,
+            None => {
+                let snapshot = store.snapshot()?;
+                let Some((key, id)) = own_historical_keys::first_after(
+                    &snapshot,
+                    &self.sek,
+                    &self.channel_id,
+                    scan.after,
+                )?
+                else {
+                    scan.complete = true;
+                    return Ok(());
+                };
+                (key, id, 1)
+            }
+        };
+        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let Some(feed) = self.dag.feed(&me) else {
+            return Ok(());
+        };
+        if !feed
+            .get(&entries, head)?
+            .is_some_and(|entry| entry.skeleton.epoch == self.epoch)
+        {
+            // No own entry closes the old epoch yet. The next own append changes the head.
+            scan.complete = true;
+            return Ok(());
+        }
+        let epoch = u64::from_be_bytes(key[..8].try_into().expect("fixed epoch key width"));
+        let chain = u64::from_be_bytes(key[8..16].try_into().expect("fixed chain key width"));
+        if epoch >= self.epoch {
+            scan.after = Some(key);
+            scan.current = None;
+            return Ok(());
+        }
+        for _ in 0..64 {
+            if next > head {
+                drop(entries);
+                let mut batch = store.batch()?;
+                own_historical_keys::retire(&mut batch, &self.sek, &self.channel_id, key, id)?;
+                batch.commit()?;
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            }
+            let Some((_source, header)) = entries.history_validated_header(&me, next)? else {
+                // A signed position with no local header might yet hold this key's content.
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            };
+            next += 1;
+            if header.skeleton.epoch != epoch
+                || !header
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Content)
+            {
+                continue;
+            }
+            let hash = header.entry_hash();
+            let entry = entries.history_entry(&hash)?;
+            let Some(payload) = entry.as_ref().and_then(|entry| entry.payload.as_deref()) else {
+                if entries.history_effect_finished(&hash)? {
+                    if let Some(log) = entries.log_id(&hash)? {
+                        let first_seen = history_first_seen_at(
+                            &store.snapshot()?,
+                            &self.sek,
+                            &self.channel_id,
+                            log,
+                        )?;
+                        let base = header.skeleton.claimed_ms.min(first_seen);
+                        if expired_at(base, self.now_hint, retention.0)
+                            && expired_at(base, self.now_hint, retention.1)
+                        {
+                            continue;
+                        }
+                        if retention.0 != 0 && retention.1 != 0 {
+                            let due = base
+                                .saturating_add(retention.0.max(retention.1).saturating_mul(1_000));
+                            if due > self.now_hint {
+                                scan.wait_until(due);
+                            }
+                        }
+                    }
+                }
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            };
+            let message = GroupMessage::from_wire(payload)?;
+            if message.header.author_id != me || message.header.epoch != epoch {
+                return Err(Error::MalformedAtRest(
+                    "own historical receiver entry binding",
+                ));
+            }
+            if message.header.channel_id == self.channel_id && message.header.chain_id == chain {
+                // A retained message may need its receiver after a restart or re-projection.
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            }
+        }
+        scan.current = Some((key, id, next));
+        Ok(())
     }
 
     /// How long nothing new must have expired before a backlog smaller than
@@ -8042,6 +8201,7 @@ impl ChannelState {
             };
             if changed {
                 self.entries.committed();
+                self.historical_retirement.reset();
             }
             return Ok(AcceptedSkdm {
                 rendered: 0,

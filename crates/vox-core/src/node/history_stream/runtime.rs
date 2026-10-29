@@ -216,6 +216,7 @@ pub(crate) struct Flow {
     pub(crate) automatic_own_recovery: bool,
     pub(crate) own_recovery_cleanup: bool,
     pub(crate) own_recovery_trigger: Option<Digest32>,
+    pub(crate) own_recovery_page: Option<(Digest32, u64)>,
     pub(crate) own_recovery_checkpoint: Option<OwnRecoveryCheckpoint>,
     pub(crate) own_recovery_progress: bool,
     pub(crate) inventory: bool,
@@ -492,6 +493,7 @@ impl Flow {
             automatic_own_recovery: false,
             own_recovery_cleanup: false,
             own_recovery_trigger: None,
+            own_recovery_page: None,
             own_recovery_checkpoint: None,
             own_recovery_progress: false,
             inventory: hint.is_none() && required.is_none(),
@@ -675,6 +677,7 @@ impl Flow {
             automatic_own_recovery: false,
             own_recovery_cleanup: false,
             own_recovery_trigger: None,
+            own_recovery_page: None,
             own_recovery_checkpoint: None,
             own_recovery_progress: false,
             inventory: false,
@@ -750,7 +753,14 @@ impl Flow {
                 tasks.push(Task {
                     request,
                     purpose: Purpose::History,
-                    operation: Operation::Wire(query),
+                    // A resumed archive Entry may have a durably complete body but no room
+                    // effect yet. Re-enter its local admission instead of asking the donor
+                    // for an empty suffix and parking an unchanged request.
+                    operation: if matches!(&query, Query::Entry { .. }) {
+                        Operation::ResumeWire(query)
+                    } else {
+                        Operation::Wire(query)
+                    },
                 });
                 tasks
             },
@@ -2413,9 +2423,21 @@ impl Flow {
                             .lock()
                             .map_err(|_| Error::Profile("history activation lock failed"))?;
                         let state = snapshot.state();
+                        // Own recovery has a private, donor-independent audience; ordinary
+                        // archive and live/control stages remain bound to this node.
+                        let expected_binding = Binding {
+                            audience: if self.automatic_own_recovery
+                                && task.purpose == Purpose::History
+                            {
+                                [0; 32]
+                            } else {
+                                self.node
+                            },
+                            ..self.binding()
+                        };
                         if !active.matches(state)
                             || active.request() != task.request
-                            || active.binding() != self.binding()
+                            || active.binding() != expected_binding
                         {
                             return Err(Error::Profile("history retry activation changed"));
                         }

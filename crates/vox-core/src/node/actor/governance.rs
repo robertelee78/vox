@@ -646,6 +646,35 @@ impl Node {
         if matches!(audit, crate::node::channel::OwnReadability::Runnable) {
             self.governance_work.wake_room(room);
         }
+        if let crate::node::channel::OwnReadability::EffectReady {
+            target,
+            seq,
+            entry_hash,
+        } = audit
+        {
+            let same = self.own_readable_effects.get(&room).is_some_and(|ready| {
+                ready.target == target
+                    && ready.seq == seq
+                    && ready.entry_hash == entry_hash
+                    && ready
+                        .instance
+                        .upgrade()
+                        .is_some_and(|held| Arc::ptr_eq(&held, &shared))
+            });
+            if !same {
+                self.own_readable_effects.insert(
+                    room,
+                    ReadableOwnEffect {
+                        instance: Arc::downgrade(&shared),
+                        target,
+                        seq,
+                        entry_hash,
+                        woken: BTreeSet::new(),
+                    },
+                );
+            }
+            self.retry_readable_own_effect(room);
+        }
         if let crate::node::channel::OwnReadability::KeyDebt {
             target,
             epoch,
@@ -682,6 +711,9 @@ impl Node {
                 false
             }
         };
+        if completed || key.is_none() {
+            self.own_readable_effects.remove(&room);
+        }
         if progress || debt_changed {
             for ((r, _), port) in &mut self.ports {
                 if *r == room {

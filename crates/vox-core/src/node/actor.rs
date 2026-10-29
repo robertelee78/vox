@@ -146,6 +146,16 @@ const EVENT_QUEUE: usize = 256;
 /// milliseconds instead, which is the behaviour a client expects.
 type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 
+/// One authenticated own body whose effect can now finish from its staged Page. A donor
+/// receives at most one retry for this exact readability edge, not one per governance turn.
+struct ReadableOwnEffect {
+    instance: std::sync::Weak<Mutex<ChannelState>>,
+    target: Digest32,
+    seq: u64,
+    entry_hash: Digest32,
+    woken: BTreeSet<Digest32>,
+}
+
 /// How often the actor's timers run. Sync is not paced by it: a port is evaluated at the end of
 /// every event that can change what it needs (ADR-025 D6a); the tick retires attempts whose
 /// connection died and raises the periodic request (D7).
@@ -700,9 +710,9 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::SyncRequest { .. } => "answering a sync",
         NetEvent::Pairwise(..) => "taking a pairwise stream",
         NetEvent::OwnKeyDonorReady(..) => "replying to an own-key recovery request",
-        NetEvent::OwnKeyDonorBusy { .. } | NetEvent::OwnKeyDonorAvailable { .. } => {
-            "resuming own-key donor capacity"
-        }
+        NetEvent::OwnKeyDonorBusy { .. }
+        | NetEvent::OwnKeyDonorSlot { .. }
+        | NetEvent::OwnKeyDonorAvailable { .. } => "resuming own-key donor capacity",
         NetEvent::OwnKeyWriterInterrupted(..) => "resuming an interrupted own-key response",
         NetEvent::OwnKeyLeaveReady { .. } => "resuming a room leave",
         NetEvent::OwnKeyCloseReady { .. } => "resuming a room close",
@@ -1398,7 +1408,14 @@ enum NetEvent {
         room: Digest32,
         peer: Digest32,
         connection: Arc<VoxConnection>,
-        slots: Arc<Semaphore>,
+        overflow: Arc<own_keys::DonorOverflow>,
+    },
+    OwnKeyDonorSlot {
+        room: Digest32,
+        peer: Digest32,
+        connection: Arc<VoxConnection>,
+        instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+        capacity: OwnedSemaphorePermit,
     },
     OwnKeyDonorAvailable {
         room: Digest32,
@@ -1407,7 +1424,6 @@ enum NetEvent {
         instance: SharedChannel,
         owner: Arc<()>,
         from_wait: bool,
-        _secret: own_keys::SecretLease,
     },
     OwnKeyDonorReady(own_keys::DonorReady),
     OwnKeyWriterInterrupted(own_keys::InterruptedReady),
@@ -2754,6 +2770,41 @@ async fn read_pairwise_streams(
     // The existing per-connection queue allowance also bounds recovery requests retained
     // beyond actor dequeue while they wait on a real local admission edge.
     let recovery_slots = Arc::new(Semaphore::new(PAIRWISE_QUEUE));
+    let overflow = Arc::new(own_keys::DonorOverflow::default());
+    let overflow_worker = {
+        let overflow = Arc::clone(&overflow);
+        let slots = Arc::clone(&recovery_slots);
+        let connection = Arc::clone(&conn);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut after = None;
+            loop {
+                let changed = overflow.changed.notified();
+                let Some((room, instance)) = overflow.take(after) else {
+                    tokio::select! {
+                        _ = connection.quinn().closed() => return,
+                        _ = changed => continue,
+                    }
+                };
+                after = Some(room);
+                let capacity = tokio::select! {
+                    _ = connection.quinn().closed() => return,
+                    permit = Arc::clone(&slots).acquire_owned() => match permit { Ok(permit) => permit, Err(_) => return },
+                };
+                tokio::select! {
+                    _ = connection.quinn().closed() => return,
+                    result = tx.send(NetEvent::OwnKeyDonorSlot { room, peer, connection: Arc::clone(&connection), instance, capacity }) => if result.is_err() { return; },
+                }
+            }
+        })
+    };
+    struct AbortOverflow(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOverflow {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _overflow_worker = AbortOverflow(overflow_worker);
     while let Some((mut send, mut recv)) = streams.recv().await {
         let first = match recv_pairwise(&mut recv).await {
             Ok(Some(first)) => first,
@@ -2798,7 +2849,7 @@ async fn read_pairwise_streams(
                             room,
                             peer,
                             connection: Arc::clone(&conn),
-                            slots: Arc::clone(&recovery_slots),
+                            overflow: Arc::clone(&overflow),
                         })
                         .await
                         .is_err()
@@ -5641,8 +5692,10 @@ pub struct Node {
     own_recovery_rooms: BTreeMap<Digest32, (Digest32, u64, bool)>,
     /// The exact authenticated own message whose body the readability audit still needs.
     own_recovery_body_debts: BTreeMap<Digest32, (Digest32, u64, Digest32)>,
-    /// At most one exact self-author key request is physically in flight per room.
+    own_readable_effects: BTreeMap<Digest32, ReadableOwnEffect>,
+    /// One exact request per room/donor, including requests waiting for an opening turn.
     own_key_active: BTreeMap<(Digest32, Digest32), own_keys::ActiveAttempt>,
+    own_key_open: own_keys::OpenScheduler,
     own_key_completions: Arc<own_attempts::Completions>,
     own_key_credit_trust: BTreeMap<Digest32, BTreeSet<Digest32>>,
     own_key_credit_missing: BTreeMap<Digest32, (u64, BTreeSet<Digest32>)>,
@@ -6533,7 +6586,9 @@ impl Node {
             history_hints: crate::node::history_stream::HintInbox::new(),
             own_recovery_rooms: BTreeMap::new(),
             own_recovery_body_debts: BTreeMap::new(),
+            own_readable_effects: BTreeMap::new(),
             own_key_active: BTreeMap::new(),
+            own_key_open: own_keys::OpenScheduler::default(),
             own_key_completions: Arc::new(own_attempts::Completions::default()),
             own_key_credit_trust: BTreeMap::new(),
             own_key_credit_missing: BTreeMap::new(),
@@ -6964,11 +7019,13 @@ impl Node {
                 () = own_key_completions.notify.notified() => {
                     for completed in own_key_completions.take() {
                         let key = (completed.room, completed.peer);
+                        self.own_key_open.finished(completed.room, completed.peer, completed.request);
                         if self.own_key_active.get(&key).is_some_and(|active| active.request.id == completed.request) {
                             self.own_key_active.remove(&key);
                             if self.channels.contains_key(&completed.room) { self.governance_work.wake_room(completed.room); }
                         }
                     }
+                    self.schedule_own_key_open();
                 }
                 () = &mut governance_deadline => {
                     // Certificate expiry is its own causal wake. A quiet room does not wait for
@@ -10746,8 +10803,44 @@ impl Node {
                 room,
                 peer,
                 connection,
-                slots,
-            } => self.begin_own_key_donor_busy(room, peer, connection, slots),
+                overflow,
+            } => {
+                if self.trust.is_trusted(&peer)
+                    && self
+                        .net
+                        .as_ref()
+                        .and_then(|net| net.manager().existing(&peer))
+                        .is_some_and(|current| Arc::ptr_eq(&current, &connection))
+                {
+                    if let Some(instance) = self.channels.get(&room) {
+                        // A contended room may be retained as identity only. When readable,
+                        // reject a nonmember before it can occupy an overflow slot.
+                        let eligible = instance.try_lock().map_or(true, |channel| {
+                            !channel.has_left(&channel.me())
+                                && channel.is_member(&peer)
+                                && !channel.has_left(&peer)
+                        });
+                        if eligible {
+                            overflow.add(room, Arc::downgrade(instance));
+                        }
+                    }
+                }
+            }
+            NetEvent::OwnKeyDonorSlot {
+                room,
+                peer,
+                connection,
+                instance,
+                capacity,
+            } => {
+                if self.channels.get(&room).is_some_and(|current| {
+                    instance
+                        .upgrade()
+                        .is_some_and(|old| Arc::ptr_eq(current, &old))
+                }) {
+                    self.begin_own_key_donor_busy(room, peer, connection, capacity);
+                }
+            }
             NetEvent::OwnKeyDonorAvailable {
                 room,
                 peer,
@@ -10755,7 +10848,6 @@ impl Node {
                 instance,
                 owner,
                 from_wait,
-                _secret,
             } => self.finish_own_key_donor_busy(room, peer, connection, instance, owner, from_wait),
             NetEvent::OwnKeyDonorReady(ready) => self.finish_own_key_donor(ready),
             NetEvent::OwnKeyWriterInterrupted(ready) => self.finish_own_key_interruption(ready),
@@ -11301,7 +11393,7 @@ impl Node {
                     });
                 }
             }
-            NetEvent::OwnKeyOpenReady(ready) => self.finish_own_key_open(*ready),
+            NetEvent::OwnKeyOpenReady(ready) => self.handle_own_key_open(*ready),
             NetEvent::OwnKeyRequestReady(ready) => self.finish_own_key_request(*ready),
             NetEvent::OwnKeyResponseReady(ready) => self.receive_own_key_response(*ready),
             NetEvent::OwnKeyRequestFailed {
@@ -11310,7 +11402,9 @@ impl Node {
                 peer,
                 connection,
             } => {
+                self.own_key_open.finished(request.room, peer, request.id);
                 self.fail_own_key_request(request, peer, connection);
+                self.schedule_own_key_open();
             }
             NetEvent::HelloUndelivered {
                 channel_id,
@@ -17205,6 +17299,7 @@ impl Node {
                 attempt.cancel.send_replace(true);
             }
         }
+        self.own_key_open.drop_cancelled();
         self.own_key_pending
             .retain(|(_, peer), _| self.trust.is_trusted(peer));
         let revoked: Vec<_> = self
@@ -17346,6 +17441,7 @@ impl Node {
         if let Some(attempt) = self.own_key_active.get(&(*channel_id, *peer)) {
             attempt.cancel.send_replace(true);
         }
+        self.own_key_open.drop_peer(*channel_id, *peer);
         self.own_key_pending.remove(&(*channel_id, *peer));
         self.retire_own_key_donor_busy((*channel_id, *peer));
         if let Some((request, generation, fence)) = self
@@ -21303,11 +21399,13 @@ impl Node {
         self.delivery_epoch = self.delivery_epoch.wrapping_add(1);
         self.pairwise_epoch.send_replace(self.delivery_epoch);
         self.own_key_active.clear();
+        self.own_key_open.clear();
         self.own_key_parked.clear();
         self.own_key_pending.clear();
         self.own_key_interrupted_pending.clear();
         self.own_recovery_rooms.clear();
         self.own_recovery_body_debts.clear();
+        self.own_readable_effects.clear();
         self.history_in_flight.clear();
         // What the boards held was learnt over the network that goes down with the lock; an address
         // asked for meanwhile is not handed out by a locked node (V210-96).
@@ -22107,6 +22205,7 @@ impl Node {
         self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
+        self.own_readable_effects.remove(channel_id);
         if self.channels.contains_key(channel_id) {
             self.own_key_room_set_changed.send_replace(());
         }
@@ -23156,6 +23255,7 @@ impl Node {
         self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
+        self.own_readable_effects.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
         self.legacy_cleanup_rooms.remove(channel_id);
         let preparing = self.cancel_room_preparation(channel_id, Fault::ChannelNotOpen);
@@ -24472,6 +24572,7 @@ impl Node {
         self.cancel_own_key_room(*channel_id);
         self.own_recovery_rooms.remove(channel_id);
         self.own_recovery_body_debts.remove(channel_id);
+        self.own_readable_effects.remove(channel_id);
         self.governance_work.set_deadline(*channel_id, None);
         if self.channels.contains_key(channel_id) {
             self.own_key_room_set_changed.send_replace(());

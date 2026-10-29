@@ -64,7 +64,7 @@ impl Header {
             || next == 0
             || root >= next
             || count > MAX_RECEIVER_CHAINS
-            || (!cleanup && (after.is_some() || retry_owed))
+            || (!cleanup && after.is_some())
         {
             return Err(Error::MalformedAtRest("receiver release index bounds"));
         }
@@ -267,11 +267,6 @@ pub(super) fn remember(
             }
         }
     } else if header.count >= MAX_RECEIVER_CHAINS {
-        if !header.cleanup {
-            return Err(Error::MalformedAtRest(
-                "receiver release capacity has no retirement",
-            ));
-        }
         let changed = !header.retry_owed;
         if changed {
             header.retry_owed = true;
@@ -353,11 +348,9 @@ pub(super) fn advance(
         .first_after(header.root, header.after)?
     {
         None => {
-            if header.retry_owed {
-                return Err(Error::MalformedAtRest(
-                    "receiver release retry has no stale slot",
-                ));
-            }
+            // A stale descriptor may be replaced before this scan reaches it. A full index
+            // of current receivers is not corrupt: leave the owed release parked until
+            // receiver retirement frees a slot, without rescheduling this scan.
             header.cleanup = false;
             header.after = None;
         }
