@@ -22,7 +22,7 @@ pub(super) struct Floor {
 }
 
 impl Floor {
-    fn wire(&self) -> Vec<u8> {
+    pub(super) fn wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(9)
             .text(MARKER)
@@ -93,104 +93,6 @@ impl ChannelState {
     pub(super) fn index_session_floors(&self, store: &Store) -> Result<()> {
         if !self.current_session_controls_ready(store)? {
             return Err(Error::StreamRefused(floor_index::REFRESHING));
-        }
-        Ok(())
-    }
-
-    /// Whether this author's own floor boundary is publishable: this author's control effects
-    /// are complete through its committed head. Another author's still-building receipt never
-    /// blocks this author's own boundary; readiness of the whole room is an answer the
-    /// projection gives, not a gate on one author's own publication.
-    fn own_floor_ready(&self, store: &Store, author: &Digest32) -> Result<()> {
-        if !self.current_session_control_ready(store, author)? {
-            return Err(Error::StreamRefused(floor_index::REFRESHING));
-        }
-        Ok(())
-    }
-
-    /// Publish the boundary before releasing the matching key or writing a Session step.
-    pub(super) fn ensure_session_floors(
-        &mut self,
-        profile: &Profile,
-        holders: &BTreeSet<Digest32>,
-        now: u64,
-    ) -> Result<()> {
-        let me = self.me();
-        self.own_floor_ready(profile.store(), &me)?;
-        let members = self.drive_members();
-        let Some(generation) = self.drive.chain.as_ref().map(SenderChain::chain_id) else {
-            return Ok(());
-        };
-        // A room left and rejoined holds none of the old release. Detect its signed current
-        // membership before writing a step, even if the actor's next lifecycle tick is later.
-        for recipient in holders.iter().filter(|p| members.contains(*p)) {
-            if self
-                .session_floor(
-                    Transaction::Snapshot(&profile.store().snapshot()?),
-                    &(me, *recipient, self.epoch, generation),
-                )?
-                .is_some_and(|(membership, _, _)| membership != self.admission(recipient).0)
-            {
-                self.drive.forget(&[*recipient]);
-            }
-        }
-        let owed = self.drive.take_owed(&members, holders);
-        if !owed.is_empty() {
-            // Persist the new mark before its public floor: a restart cannot restore an old
-            // delivered mark beside a newer floor and silently skip the replacement release.
-            self.persist_drive(profile.store())?;
-        }
-        let mut marks = holders
-            .iter()
-            .filter(|p| members.contains(*p))
-            .filter_map(|p| self.drive.floor_mark(p).map(|(g, i)| (*p, g, i)))
-            .collect::<Vec<_>>();
-        // This also preserves the author's generation when every old step body is withheld
-        // on rejoin, including a Session with no other drive holders.
-        marks.push((me, generation, 0));
-        for (recipient, generation, iteration) in marks {
-            let key = (me, recipient, self.epoch, generation);
-            let membership = self.admission(&recipient).0;
-            if self
-                .session_floor(Transaction::Snapshot(&profile.store().snapshot()?), &key)?
-                .is_some_and(|(m, i, _)| m == membership && i >= iteration)
-            {
-                continue;
-            }
-            let head = self.dag.feed(&me).map_or(0, |feed| feed.max_seq());
-            let first_seq = floor_index::first_sequence(
-                profile.store(),
-                &self.sek,
-                &self.channel_id,
-                &me,
-                self.epoch,
-                generation,
-                iteration,
-                head,
-                |seq| {
-                    self.entries
-                        .read(profile.store(), &self.sek, &self.channel_id)?
-                        .get(&me, seq)?
-                        .ok_or(Error::MalformedAtRest("Session floor feed entry missing"))
-                },
-            )?
-            .ok_or(Error::StreamRefused(floor_index::REFRESHING))?
-            .map(Ok)
-            .unwrap_or_else(|| {
-                head.checked_add(2)
-                    .ok_or(Error::MalformedAtRest("feed sequence exhausted"))
-            })?;
-            let floor = Floor {
-                room: self.channel_id,
-                author: me,
-                recipient,
-                epoch: self.epoch,
-                generation,
-                iteration,
-                first_seq,
-                membership,
-            };
-            self.append_control_kind(profile, &floor.wire(), now, EntryKind::Content, false)?;
         }
         Ok(())
     }

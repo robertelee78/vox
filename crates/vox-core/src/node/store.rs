@@ -207,6 +207,8 @@ impl Drop for ProfileOwner {
 /// lease. Field order frees redb's owner before returning its last cache credits.
 struct Cached<T> {
     inner: T,
+    /// Keep Database::drop from closing the backend while an owned transaction still reads it.
+    database: Option<Arc<Database>>,
     cache: Arc<DatabaseCacheLease>,
     profile: Option<Arc<ProfileOwner>>,
 }
@@ -224,12 +226,13 @@ impl<T> std::ops::DerefMut for Cached<T> {
     }
 }
 
-impl Cached<Database> {
+impl Cached<Arc<Database>> {
     fn begin_read(
         &self,
     ) -> std::result::Result<Cached<redb::ReadTransaction>, redb::TransactionError> {
         Ok(Cached {
             inner: self.inner.begin_read()?,
+            database: Some(Arc::clone(&self.inner)),
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
         })
@@ -240,6 +243,7 @@ impl Cached<Database> {
     ) -> std::result::Result<Cached<redb::WriteTransaction>, redb::TransactionError> {
         Ok(Cached {
             inner: self.inner.begin_write()?,
+            database: Some(Arc::clone(&self.inner)),
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
         })
@@ -252,6 +256,7 @@ impl Cached<ReadOnlyDatabase> {
     ) -> std::result::Result<Cached<redb::ReadTransaction>, redb::TransactionError> {
         Ok(Cached {
             inner: self.inner.begin_read()?,
+            database: None,
             cache: Arc::clone(&self.cache),
             profile: self.profile.clone(),
         })
@@ -262,10 +267,12 @@ impl Cached<redb::WriteTransaction> {
     fn commit(self) -> std::result::Result<(), redb::CommitError> {
         let Self {
             inner,
+            database,
             cache,
             profile,
         } = self;
         let result = inner.commit();
+        drop(database);
         drop(cache);
         drop(profile);
         result
@@ -287,7 +294,7 @@ fn database_builder() -> (redb::Builder, Arc<DatabaseCacheLease>) {
     (builder, cache)
 }
 
-fn open_database(path: &Path) -> std::result::Result<Cached<Database>, redb::DatabaseError> {
+fn open_database(path: &Path) -> std::result::Result<Cached<Arc<Database>>, redb::DatabaseError> {
     let (builder, cache) = database_builder();
     // Match Builder::create's non-truncating open and native backend exactly.
     let file = std::fs::OpenOptions::new()
@@ -298,7 +305,8 @@ fn open_database(path: &Path) -> std::result::Result<Cached<Database>, redb::Dat
         .open(path)?;
     let backend = FlushObservedBackend(redb::backends::FileBackend::new(file)?);
     Ok(Cached {
-        inner: builder.create_with_backend(backend)?,
+        inner: Arc::new(builder.create_with_backend(backend)?),
+        database: None,
         cache,
         profile: None,
     })
@@ -310,6 +318,7 @@ fn open_read_only_database(
     let (builder, cache) = database_builder();
     Ok(Cached {
         inner: builder.open_read_only(path)?,
+        database: None,
         cache,
         profile: None,
     })
@@ -531,7 +540,7 @@ pub struct Store {
 /// The single-writer rule is unchanged: a read-only open of a file some process holds open
 /// for writing is refused just as a second writable open is, as [`Error::ProfileBusy`].
 enum Backing {
-    Writable(Cached<Database>),
+    Writable(Cached<Arc<Database>>),
     ReadOnly(Cached<ReadOnlyDatabase>),
     /// Only between releasing the read-only handle and taking the writable one.
     Closed,
@@ -638,17 +647,11 @@ impl Store {
         db
     }
 
-    /// Re-save a room after a failed write: rewrite this room's persisted sealed state durably
-    /// through the same allocation and commit path that failed, on the store as it is open.
-    /// An empty transaction can succeed on a full filesystem and cannot establish that a room
-    /// can save. The failed user operation is never replayed.
-    ///
-    /// The store is never closed for this (ADR-038 FX-33). It used to be closed and reopened
-    /// writable first; redb refuses that reopen while any other handle in the process is alive,
-    /// and the fallback left the whole node's store read-only or closed, every room of the node
-    /// answering "the store is being reopened" on each retry, for hours, on the decider's
-    /// daemon (2026-10-21 00:15Z). A failed commit leaves a redb database usable, so there is
-    /// nothing a reopen would mend that a fresh transaction does not.
+    /// Re-save the room's sealed state durably, without replaying the failed operation.
+    /// redb 4.3 latches native I/O failures and refuses every subsequent write. For that
+    /// specific latch, reconstruct all readable live rows on a fresh inode instead.
+    /// Old read transactions keep their original MVCC owner; recovery also retains the
+    /// original file beside the replacement. Any unreadable row aborts reconstruction.
     pub fn resave_room_after_write_failure(&self, channel: &Digest32) -> Result<()> {
         // Keep one lock order for every writer, including `rewrite_fresh`: writer before db.
         // Taking the read snapshot first would let a rewrite hold `writer` while waiting for
@@ -662,7 +665,15 @@ impl Store {
             });
         };
         let original = db.begin_read().map_err(storage("retry read"))?;
-        let txn = db.begin_write().map_err(storage("retry write"))?;
+        let txn = match db.begin_write() {
+            Ok(txn) => txn,
+            Err(redb::TransactionError::Storage(redb::StorageError::PreviousIo)) => {
+                drop(original);
+                drop(backing);
+                return self.rewrite_fresh_locked(&mut epochs, true);
+            }
+            Err(error) => return Err(storage("retry write")(error)),
+        };
         {
             let saved = original
                 .open_table(SEGMENTS)
@@ -740,12 +751,17 @@ impl Store {
     ///
     /// # Errors
     /// The store is not writable, or the new file cannot be written or put in place. The old
-    /// store is left open and unchanged in every case but a failed reopen after the rename.
+    /// backing stays installed until the durable replacement has been successfully renamed.
     pub fn rewrite_fresh(&self) -> Result<()> {
         // A write transaction can outlive the `db` guard that created it (`Cached` above).
         // Serialize the complete snapshot and replacement with every such transaction, or one
         // can commit to the old inode after the snapshot and disappear at the rename.
         let mut epochs = self.writer()?;
+        self.rewrite_fresh_locked(&mut epochs, false)
+    }
+
+    /// The caller owns the writer; never recursively acquire it during recovery.
+    fn rewrite_fresh_locked(&self, epochs: &mut Epochs, retain_original: bool) -> Result<()> {
         let mut backing = self.db.write().unwrap_or_else(PoisonError::into_inner);
         let Backing::Writable(old) = &*backing else {
             return Err(Error::Storage {
@@ -757,7 +773,7 @@ impl Store {
         fresh_path.push(".rewrite");
         let fresh_path = PathBuf::from(fresh_path);
         let _ = std::fs::remove_file(&fresh_path);
-        let copied = (|| -> Result<()> {
+        let copied = (|| -> Result<Cached<Arc<Database>>> {
             let fresh = open_database(&fresh_path).map_err(open_error)?;
             super::paths::set_private_file_mode(&fresh_path)?;
             let r = old.begin_read().map_err(storage("begin read"))?;
@@ -788,12 +804,16 @@ impl Store {
                     }
                 }
             }
-            w.commit().map_err(storage("commit"))
+            w.commit().map_err(storage("commit"))?;
+            Ok(fresh)
         })();
-        if let Err(e) = copied {
-            let _ = std::fs::remove_file(&fresh_path);
-            return Err(e);
-        }
+        let fresh = match copied {
+            Ok(fresh) => fresh,
+            Err(error) => {
+                let _ = std::fs::remove_file(&fresh_path);
+                return Err(error);
+            }
+        };
         let replacement_generation =
             epochs
                 .replacement_generation
@@ -802,28 +822,46 @@ impl Store {
                     op: "replace store",
                     detail: "store replacement generation exhausted".into(),
                 })?;
-        // Release the old file, then replace it.
-        drop(std::mem::replace(&mut *backing, Backing::Closed));
-        if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
-            let _ = std::fs::remove_file(&fresh_path);
-            *backing = Backing::Writable(
-                self.keep_profile(open_database(&self.path).map_err(open_error)?),
-            );
-            return Err(Error::Path {
-                op: "replace store",
-                detail: format!("{}: {e}", self.path.display()),
-            });
+        if retain_original {
+            // Never discard the only forensic/restart copy after a native failure.
+            // Hard-link before replacing the directory entry; existing pins remain valid.
+            let mut suffix = replacement_generation;
+            loop {
+                let mut retained = self.path.clone().into_os_string();
+                retained.push(format!(".failed-{suffix}"));
+                match std::fs::hard_link(&self.path, PathBuf::from(retained)) {
+                    Ok(()) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        suffix = suffix.checked_add(1).ok_or(Error::Storage {
+                            op: "retain failed store",
+                            detail: "retained store generation exhausted".into(),
+                        })?;
+                    }
+                    Err(error) => {
+                        return Err(Error::Path {
+                            op: "retain failed store",
+                            detail: format!("{}: {error}", self.path.display()),
+                        });
+                    }
+                }
+            }
+            super::paths::sync_dir(&self.path)?;
         }
+        // Keep both handles open across rename. They refer to different inodes, so the
+        // replacement never needs to reopen an inode still held by an old MVCC pin.
+        std::fs::rename(&fresh_path, &self.path).map_err(|error| Error::Path {
+            op: "replace store",
+            detail: format!("{}: {error}", self.path.display()),
+        })?;
         // Rename has installed the new inode, but it is not durable until its directory is
-        // synced. Record that exact debt before either fallible step. A failed reopen leaves the
-        // backing closed; a failed directory sync leaves it writable; both refuse a false peer
-        // acknowledgement and are retried by the next writer.
+        // synced. Record that exact debt before directory sync. A failed sync leaves the
+        // new backing writable, but gates later writes and acknowledgements on this exact
+        // replacement becoming durable.
         epochs.replacement = true;
         epochs.replacement_generation = replacement_generation;
-        *backing =
-            Backing::Writable(self.keep_profile(open_database(&self.path).map_err(open_error)?));
+        *backing = Backing::Writable(self.keep_profile(fresh));
         drop(backing);
-        self.finish_replacement(&mut epochs)?;
+        self.finish_replacement(epochs)?;
         Ok(())
     }
 
@@ -1421,7 +1459,13 @@ impl Store {
     /// Reclaim space after deletions. Returns whether anything was compacted.
     pub fn compact(&mut self) -> Result<bool> {
         match self.db.get_mut().unwrap_or_else(PoisonError::into_inner) {
-            Backing::Writable(db) => db.compact().map_err(storage("compact")),
+            Backing::Writable(db) => Arc::get_mut(&mut db.inner)
+                .ok_or_else(|| Error::Storage {
+                    op: "compact",
+                    detail: "the store still has active transactions".into(),
+                })?
+                .compact()
+                .map_err(storage("compact")),
             Backing::ReadOnly(_) | Backing::Closed => Ok(false),
         }
     }

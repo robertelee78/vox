@@ -39,12 +39,18 @@ fn key(id: u64) -> Key {
 impl ChannelState {
     /// The unexpired file row saved at `id`, whoever its author is; the caller decides whether
     /// that author's Sessions are readable here.
-    fn saved_file(&self, snapshot: &Snapshot, id: u64, now: u64) -> Result<Option<SessionRow>> {
+    fn saved_file(
+        &self,
+        snapshot: &Snapshot,
+        id: u64,
+        now: u64,
+        retention: (u64, u64),
+    ) -> Result<Option<SessionRow>> {
         let segment = snapshot
             .get_segment(&self.channel_id, SegmentKind::PrivateSession, id)?
             .ok_or(Error::MalformedAtRest("Session file locator has no record"))?;
         let saved = self.read_private(id, &segment)?;
-        if self.private_expired(&saved, now) {
+        if super::super::private_session::expired(&saved, now, retention) {
             return Ok(None);
         }
         let Some(row) = saved.row else {
@@ -63,20 +69,59 @@ impl ChannelState {
         max_bytes: usize,
         now: u64,
     ) -> std::result::Result<FileReply, String> {
-        if self.poisoned {
+        let resource = self.history_read_resource();
+        if self.poisoned
+            && !resource
+                .as_ref()
+                .is_some_and(|read| read.has_pending_snapshot())
+        {
             return Err(self.save_failure().to_string());
         }
-        let answer = (|| -> Result<FileReply> {
-            let instance = self.history_instance(store)?;
-            let (authors, refreshing) = self.drive_from_known(store)?;
-            let snapshot = store.snapshot()?;
-            let read = Read::existing(&snapshot, &self.sek, &self.channel_id)?;
+        let answer = match resource {
+            Some(resource) => resource.with_snapshot(|_, view, retention| {
+                self.session_file_query_view(view, query, max_bytes, now, retention)
+            }),
+            None => self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)
+                .and_then(|view| {
+                    self.session_file_query_view(
+                        &view,
+                        query,
+                        max_bytes,
+                        now,
+                        (self.effective_retention(), self.effective_step_retention()),
+                    )
+                }),
+        };
+        if let Err(error) = &answer {
+            // A refreshing author is not a local failure; a storage error still poisons.
+            if !matches!(error, Error::StreamRefused(_)) {
+                self.poison(error);
+            }
+        }
+        answer.map_err(|error| error.to_string())
+    }
+
+    fn session_file_query_view(
+        &self,
+        view: &super::super::entry_store::RenderView<'_>,
+        query: FileQuery,
+        max_bytes: usize,
+        now: u64,
+        retention: (u64, u64),
+    ) -> Result<FileReply> {
+        (|| -> Result<FileReply> {
+            let instance = view.history_instance();
+            let (authors, refreshing) = self.drive_from_known_view(view)?;
+            let snapshot = view.snapshot();
+            let read = Read::existing(snapshot, &self.sek, &self.channel_id)?;
             match query {
                 FileQuery::Exact(hash) => {
                     let id =
-                        super::private_index::find(&snapshot, &self.sek, &self.channel_id, &hash)?;
+                        super::private_index::find(snapshot, &self.sek, &self.channel_id, &hash)?;
                     let row = match id
-                        .map(|id| self.saved_file(&snapshot, id, now))
+                        .map(|id| self.saved_file(snapshot, id, now, retention))
                         .transpose()?
                     {
                         Some(Some(row)) if authors.contains(&row.author) => Some(row),
@@ -115,7 +160,7 @@ impl ChannelState {
                             return Err(Error::MalformedAtRest("Session file cursor differs"));
                         }
                         let row = self
-                            .saved_file(&snapshot, id, now)?
+                            .saved_file(snapshot, id, now, retention)?
                             .filter(|row| authors.contains(&row.author));
                         if let Some(row) = row {
                             let cost = row
@@ -145,13 +190,6 @@ impl ChannelState {
                     }))
                 }
             }
-        })();
-        if let Err(error) = &answer {
-            // A refreshing author is not a local failure; a storage error still poisons.
-            if !matches!(error, Error::StreamRefused(_)) {
-                self.poison(error);
-            }
-        }
-        answer.map_err(|error| error.to_string())
+        })()
     }
 }

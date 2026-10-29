@@ -831,6 +831,24 @@ pub(crate) struct RenderView<'a> {
     pub(super) order: OrderView<'a>,
 }
 impl RenderView<'_> {
+    pub(crate) fn read_index(&self) -> &Read<'_> {
+        &self.order.read
+    }
+    pub(crate) fn key(&self) -> &Sek {
+        self.order.read.sek
+    }
+    pub(crate) fn directory_revision(&self) -> u64 {
+        self.order.read.directory.revision
+    }
+    pub(crate) fn legacy_cache_only(&self) -> bool {
+        let read = &self.order.read;
+        !read.sparse_enabled()
+            && (read.legacy_provisional().is_some() || read.legacy_required_any())
+    }
+    pub(crate) fn retention_pending(&self, now: u64, ttl: u64, step_ttl: u64) -> Result<bool> {
+        Ok(self.order.read.retention_due(now, ttl, step_ttl, 0)?.1
+            || self.next_owed_expiry()?.is_some_and(|at| at <= now))
+    }
     pub(crate) fn snapshot(&self) -> &crate::node::store::Snapshot {
         &self.order.read.snapshot
     }
@@ -854,6 +872,18 @@ impl RenderView<'_> {
     }
     pub(crate) fn has_backfill(&self) -> bool {
         self.roots().backfill != 0
+    }
+    /// Discover the native writer's exact cursor from the committed tree.
+    pub(crate) fn next_backfill_after(
+        &self,
+        after: Option<Digest32>,
+    ) -> Result<Option<(Digest32, u64)>> {
+        self.source().backfill_after(
+            self.order.read.sek,
+            self.order.read.channel,
+            self.roots().backfill,
+            after,
+        )
     }
     pub(crate) fn transaction(&self) -> Transaction<'_, '_> {
         self.order.read.transaction()
@@ -1155,7 +1185,21 @@ impl EntryIndex {
         sek: &'a Sek,
         channel: &'a Digest32,
     ) -> Result<RenderView<'a>> {
-        let order = self.order_view(store, sek, channel)?;
+        Self::render_read(self.read(store, sek, channel)?)
+    }
+    pub(crate) fn render_snapshot<'a>(
+        &'a self,
+        snapshot: std::sync::Arc<crate::node::store::Snapshot>,
+        sek: &'a Sek,
+        channel: &'a Digest32,
+    ) -> Result<RenderView<'a>> {
+        Self::render_read(self.read_snapshot(snapshot, sek, channel)?)
+    }
+    fn render_read<'a>(read: Read<'a>) -> Result<RenderView<'a>> {
+        if !read.directory.graph_ready {
+            return Err(invalid("DAG facts not yet rebuilt"));
+        }
+        let order = OrderView { read };
         if !order.read.directory.render_ready {
             return Err(invalid("render facts not yet rebuilt"));
         }
@@ -1743,6 +1787,23 @@ impl Write<'_, '_> {
         &self,
         after: Option<Digest32>,
     ) -> Result<Option<(Digest32, u64)>> {
+        Source::Batch(self.batch).backfill_after(
+            self.sek,
+            self.channel,
+            self.render_roots()?.rendered.backfill,
+            after,
+        )
+    }
+}
+
+impl Source<'_> {
+    fn backfill_after(
+        &self,
+        sek: &Sek,
+        channel: &Digest32,
+        root: u64,
+        after: Option<Digest32>,
+    ) -> Result<Option<(Digest32, u64)>> {
         let key = match after {
             None => [0; 64],
             Some(author) => match successor(hashed(&author)) {
@@ -1750,14 +1811,7 @@ impl Write<'_, '_> {
                 None => return Ok(None),
             },
         };
-        Source::Batch(self.batch)
-            .first(
-                self.sek,
-                self.channel,
-                self.render_roots()?.rendered.backfill,
-                &key,
-                0,
-            )?
+        self.first(sek, channel, root, &key, 0)?
             .map(|(key, value)| match value {
                 Value::Number(seq) if seq != 0 => Ok((
                     key[..32]

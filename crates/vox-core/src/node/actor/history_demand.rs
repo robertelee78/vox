@@ -1853,7 +1853,6 @@ impl Node {
         let result = Arc::new(StdMutex::new(None));
         let output = result.clone();
         let tx = self.net_tx.clone();
-        let now = self.now_ms().get();
         let task = tokio::spawn(async move {
             let _slot = slot;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1875,9 +1874,21 @@ impl Node {
                 let active = dispatch.staging.active.clone();
                 let expected = dispatch.plan;
                 let checkpoint_job = job.clone();
-                private_room(shared, store, job, check, move |room, store| {
-                    let mut next = expected.clone();
-                    room.finish_private_history(store, bounds, &mut next, page, now, trust_nonce).map_err(|e| e.to_string())?;
+                let charge = job.reserve(4 * 1024 * 1024).ok_or("Private recovery disk buffers are busy.")?;
+                let (answer, wait) = tokio::sync::oneshot::channel();
+                tx.send(NetEvent::PrivateArchivePageReady {
+                    room: dispatch.room, instance: shared.clone(), bounds, plan: expected.clone(), page,
+                    nonce: trust_nonce, guard: check.clone(), job, charge, answer,
+                }).await.map_err(|_| "Private recovery actor stopped.")?;
+                let receipt = wait.await.map_err(|_| "Private recovery native completion stopped.")??;
+                let epoch = {
+                    let room = shared.lock().await;
+                    check.check(&room, &store)?;
+                    room.epoch()
+                };
+                tokio::task::spawn_blocking(move || {
+                    let super::private_save::ArchiveReceipt { plan: next, lifetime: _lifetime, charge: _charge } = receipt;
+                    check.check_native(&store, epoch)?;
                     let remaining = next.positions.len();
                     let progress = if next.inventory_done && remaining == 0 { demand::Progress::Complete } else { demand::Progress::More };
                     let mut active = active.lock().map_err(|_| "Private recovery state poisoned.")?;
@@ -1889,8 +1900,9 @@ impl Node {
                     } else {
                         "This private recovery quantum is retained. Resume explicitly to continue the same interval."
                     }.into();
+                    check.check_native(&store, epoch)?;
                     Ok(status)
-                }).await
+                }).await.map_err(|_| "Private recovery checkpoint worker stopped.")?
             }.await;
             if let Ok(mut result) = output.lock() {
                 *result = Some(work);
@@ -2177,7 +2189,7 @@ impl Node {
 }
 
 #[derive(Clone)]
-struct PrivateGuard {
+pub(super) struct PrivateGuard {
     node: Digest32,
     room: Digest32,
     instance: [u8; 16],
@@ -2187,7 +2199,7 @@ struct PrivateGuard {
     deadline: tokio::time::Instant,
 }
 impl PrivateGuard {
-    fn check(&self, room: &ChannelState, store: &Store) -> Result<(), String> {
+    pub(super) fn check(&self, room: &ChannelState, store: &Store) -> Result<(), String> {
         if self.fence.is_retired()
             || self.context.cancellation().is_cancelled()
             || tokio::time::Instant::now() >= self.deadline
@@ -2204,6 +2216,23 @@ impl PrivateGuard {
             )
             .ok()
                 != Some(self.generation)
+        {
+            return Err("Private recovery authority changed or request cancelled.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn secret(&self) -> Arc<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.context.secret_work()
+    }
+
+    pub(super) fn check_native(&self, store: &Store, epoch: u64) -> Result<(), String> {
+        if self.fence.is_retired()
+            || self.context.cancellation().is_cancelled()
+            || tokio::time::Instant::now() >= self.deadline
+            || stream::authorization_generation(store, self.node, self.room, self.instance, epoch)
+                .map_err(|error| error.to_string())?
+                != self.generation
         {
             return Err("Private recovery authority changed or request cancelled.".into());
         }
@@ -2247,15 +2276,25 @@ pub(super) struct CurrentPrivateGuard {
     deadline: tokio::time::Instant,
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum CurrentPrivateBoundary {
-    /// A page or request intent has not committed local semantic work. It may leave this worker
-    /// only if the same authority and observation deadline still hold after preparation.
-    Observing,
-    /// The callback performs its own captured-authority check inside each durable transaction.
-    /// Its committed result is not replaced by a later observation of elapsed time.
-    Applying,
+impl CurrentPrivateGuard {
+    pub(super) fn secret(&self) -> Arc<tokio::sync::OwnedRwLockReadGuard<()>> {
+        Arc::clone(&self.lease)
+    }
+
+    pub(super) fn check_native(&self, store: &Store) -> crate::error::Result<()> {
+        if tokio::time::Instant::now() >= self.deadline
+            || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )? != self.nonce
+        {
+            return Err(crate::error::Error::StreamRefused(
+                "private authority changed or request expired",
+            ));
+        }
+        Ok(())
+    }
 }
+
 impl Node {
     pub(super) fn current_private_context(&self) -> Option<(Arc<Store>, CurrentPrivateGuard)> {
         let profile = self.profile.as_ref().filter(|p| p.is_unlocked())?;
@@ -2281,7 +2320,6 @@ pub(super) async fn current_private_room<T: Send + 'static>(
     store: Arc<Store>,
     charge: crate::node::history_budget::BufferCharge,
     guard: CurrentPrivateGuard,
-    boundary: CurrentPrivateBoundary,
     work: impl FnOnce(&mut ChannelState, &Store) -> crate::error::Result<T> + Send + 'static,
 ) -> crate::error::Result<(crate::node::history_budget::BufferCharge, T)> {
     use crate::error::Error;
@@ -2300,19 +2338,15 @@ pub(super) async fn current_private_room<T: Send + 'static>(
             ));
         }
         let result = work(&mut room, &store)?;
-        if matches!(boundary, CurrentPrivateBoundary::Observing)
-            && (tokio::time::Instant::now() >= guard.deadline
-                || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
-                    crate::node::trust::TRUST_META_KEY,
-                )? != guard.nonce)
+        if tokio::time::Instant::now() >= guard.deadline
+            || store.get_meta_prefix::<{ crate::atrest::sek::NONCE_LEN }>(
+                crate::node::trust::TRUST_META_KEY,
+            )? != guard.nonce
         {
             return Err(Error::StreamRefused(
                 "private authority changed or request expired",
             ));
         }
-        // Applying callbacks own their durable result. finish_private_pull checks the captured
-        // trust nonce inside every record/cursor Batch before commit; a later observation cannot
-        // truthfully replace that committed outcome with a refusal.
         Ok((charge, result))
     })
     .await

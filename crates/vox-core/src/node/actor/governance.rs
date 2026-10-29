@@ -35,8 +35,8 @@ pub(super) struct Maintenance {
     /// Rooms whose checked governance fold is current. Other retained room work must not reopen
     /// and re-evaluate the same sealed facts; an exact governance input or authority deadline
     /// removes only its room from this set.
-    settled: BTreeSet<Digest32>,
-    consent_after: BTreeMap<Digest32, Digest32>,
+    pub(super) settled: BTreeSet<Digest32>,
+    pub(super) consent_after: BTreeMap<Digest32, Digest32>,
     deadlines: BTreeMap<Digest32, u64>,
     deadline_order: BTreeSet<(u64, Digest32)>,
     /// Admin changes already committed to the room log whose board roster still owes a
@@ -128,13 +128,13 @@ impl Maintenance {
 }
 
 pub(super) struct Removal {
-    room: Digest32,
-    member: Digest32,
-    instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
-    after: Option<Digest32>,
-    count: usize,
-    done: bool,
-    reply: oneshot::Sender<Outcome>,
+    pub(super) room: Digest32,
+    pub(super) member: Digest32,
+    pub(super) instance: std::sync::Weak<tokio::sync::Mutex<ChannelState>>,
+    pub(super) after: Option<Digest32>,
+    pub(super) count: usize,
+    pub(super) done: bool,
+    pub(super) reply: oneshot::Sender<Outcome>,
 }
 
 impl Node {
@@ -178,6 +178,10 @@ impl Node {
         let Some(mut work) = self.governance_work.removal.take() else {
             return;
         };
+        if self.pending_posts.contains_key(&work.room) {
+            self.governance_work.removal = Some(work);
+            return;
+        }
         let Some(profile) = self.profile.as_ref() else {
             let _ = work.reply.send(Outcome::Failed(Fault::Locked));
             return;
@@ -189,7 +193,7 @@ impl Node {
                 return;
             }
         };
-        let Ok(mut channel) = shared.try_lock() else {
+        let Ok(channel) = shared.try_lock() else {
             self.governance_work.removal = Some(work);
             return; // The regular tick retries a busy room; do not spin on its mutex.
         };
@@ -230,95 +234,34 @@ impl Node {
             let _ = work.reply.send(Outcome::Done);
             return;
         }
-        let result = self.with_current_computer_authority(|| {
-            channel.remove_admin(profile, &work.member, work.after, self.now_ms())
-        });
-        let Some(result) = result else {
-            // Keep the exact cursor and any already-durable certificates.  The queued policy
-            // event (or the ordinary tick) retries after reconciliation; re-arming this
-            // always-ready branch here would spin the actor and delay that very event.
-            self.governance_work.removal = Some(work);
-            return;
-        };
         drop(channel);
-        match result {
-            Err(error) if ChannelState::governance_refreshing(&error) => {
-                self.governance_work.removal = Some(work);
-            }
-            Err(error) => {
-                let _ = work.reply.send(Outcome::Failed(fault_of(&error)));
-            }
-            Ok((count, next)) => {
-                work.count = work.count.saturating_add(count);
-                if count > 0 {
-                    self.note_local_governance_append(&work.room);
-                    self.governance_work.again = true;
-                }
-                if let Some(next) = next {
-                    work.after = Some(next);
-                    self.governance_work.removal = Some(work);
-                    self.governance_work.again = true;
-                } else if work.count == 0 {
-                    let _ = work.reply.send(Outcome::Failed(Fault::NotAnAdmin));
-                } else {
-                    work.done = true;
-                    self.governance_work.removal = Some(work);
-                    self.governance_work.again = true;
-                }
-            }
-        }
-    }
-
-    /// An already open room examines one consent page and commits at most one narrowing
-    /// append per turn. Progress advances only after that append succeeds.
-    async fn revoke_untrusted_consents(&mut self, room: &Digest32) -> crate::error::Result<bool> {
-        let shared = self
-            .channels
-            .get(room)
-            .map(Arc::clone)
-            .ok_or(Error::Profile("room is not open"))?;
-        let page = {
-            let profile = self.profile.as_ref().ok_or(Error::AtRestLocked)?;
-            let Ok(channel) = shared.try_lock() else {
-                return Ok(true);
-            };
-            channel.consent_page(
-                profile.store(),
-                &channel.me(),
-                self.governance_work.consent_after.get(room).copied(),
-                64,
-            )?
+        let room = work.room;
+        let native = governance_save::Work::AdminRemoval {
+            member: work.member,
+            after: work.after,
         };
-        if let Some(member) = page
-            .targets
-            .iter()
-            .find(|member| !self.trust.is_trusted(member))
-            .copied()
-        {
-            self.withdraw_for_untrust_result(room, member).await?;
-            self.governance_work.consent_after.insert(*room, member);
-            Ok(true)
-        } else if let Some(next) = page.next {
-            self.governance_work.consent_after.insert(*room, next);
-            Ok(true)
-        } else {
-            self.governance_work.consent_after.remove(room);
-            Ok(false)
-        }
+        let continuation = governance_save::Continuation::admin(shared, self.delivery_epoch, work);
+        self.begin_pending_maintenance(
+            room,
+            maintenance_save::Work::Governance(native),
+            maintenance_save::Continuation::Governance(continuation),
+            None,
+        )
+        .await;
     }
 
     /// One room's fixed-size disk work per selection. A cycle retains only its cursor and a
     /// retry bit; ordinary commands and network events remain eligible between turns.
     pub(super) async fn advance_governance_turn(&mut self) {
         self.advance_admin_removal().await;
-        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
+        if self.profile.is_none() {
             self.governance_work.pending = false;
             self.governance_work.after = None;
             self.governance_work.settled.clear();
             self.governance_work.deadlines.clear();
             self.governance_work.deadline_order.clear();
             return;
-        };
+        }
         use std::ops::Bound::{Excluded, Unbounded};
         let next = match self.governance_work.after {
             Some(after) => self.channels.range((Excluded(after), Unbounded)).next(),
@@ -349,388 +292,23 @@ impl Node {
             self.governance_work.pending = false;
             return;
         }
-        let Ok(mut channel) = shared.try_lock() else {
-            // This room's durable work was selected but not examined. Carry the wake into the
-            // next round; a quiet room must not wait for a command, network event or timer tick
-            // merely because another bounded operation held its lock for this turn.
+        // A retained completion already owns this room's exact selected turn. Do not turn a
+        // physical writer wait into another immediately runnable round-robin sweep.
+        if self.pending_posts.contains_key(&room) {
+            return;
+        }
+        let Ok(channel) = shared.try_lock() else {
             self.governance_work.again = true;
             return;
         };
-        // Receiver access narrowed in its original transaction. Its independent index can
-        // retire one exact stale object per turn even while history/governance is rebuilding.
-        let own_retry_ready = match channel.advance_receiver_release_cleanup(&store) {
-            Ok((more, retry_ready, own_retry_ready)) => {
-                self.governance_work.again |= more;
-                if retry_ready {
-                    // A physically freed slot, not a periodic retry, replays packages which
-                    // could not retain their authenticated key at the earlier admission.
-                    self.key_package_rooms.entry(room).or_insert(false);
-                }
-                own_retry_ready
-            }
-            Err(error) => {
-                channel.poison(&error);
-                return;
-            }
-        };
-        if own_retry_ready {
-            // Only actual physical capacity release resumes the owed own receiver seed.
-            // The selected ordinary governance turn remains owed after this handoff.
-            self.governance_work.wake_room(room);
-            drop(channel);
-            self.advance_own_recovery(room).await;
-            return;
-        }
-        let (governance_ready, governance_pending, governance_changed) =
-            if self.governance_work.settled.contains(&room) {
-                (true, false, false)
-            } else {
-                match channel.advance_governance(&store, self.now_ms()) {
-                    Ok(progress) => {
-                        if progress.ready && !progress.pending {
-                            self.governance_work.settled.insert(room);
-                        }
-                        (progress.ready, progress.pending, progress.changed)
-                    }
-                    Err(error) => {
-                        channel.poison(&error);
-                        return;
-                    }
-                }
-            };
-        if governance_ready {
-            self.governance_work
-                .set_deadline(room, channel.governance_deadline());
-        }
-        self.governance_work.again |= governance_pending;
-        match channel.legacy_cache_only(&store) {
-            Ok(true) => {
-                // Current trust narrowing is still immediate; all publication-dependent
-                // writes await explicit recovery. Never busy-loop on a parked cursor.
-                match channel.forget_keys_except(&store, &self.trust.trusted()) {
-                    Ok(count) if count > 0 => self.governance_work.wake_room(room),
-                    Ok(_) => {}
-                    Err(error) => channel.poison(&error),
-                }
-                drop(channel);
-                if governance_changed {
-                    self.publish().await;
-                }
-                return;
-            }
-            Ok(false) => {}
-            Err(error) => {
-                channel.poison(&error);
-                return;
-            }
-        }
-        let backfilled = match channel.advance_governance_backfill(&store, self.now_ms()) {
-            Ok(count) => count,
-            Err(error) => {
-                channel.poison(&error);
-                0
-            }
-        };
-        match channel.governance_backfill_pending(&store) {
-            Ok(pending) => self.governance_work.again |= pending,
-            Err(error) => channel.poison(&error),
-        }
-        #[cfg(feature = "test-knobs")]
-        if channel.render_backfill_held_for_proof() {
-            // The durable queue and shipped status remain pending. Apparatus owns the next wake
-            // after it observes the causally held turn; do not spin while its marker is engaged.
-            drop(channel);
-            if governance_changed || backfilled > 0 {
-                self.publish().await;
-            }
-            self.governance_work.pending = false;
-            return;
-        }
-        // A settled suffix may span several bounded receipt-cursor pages. Continue it as
-        // durable room work, reconstructed on restart, rather than waiting for a timer or a
-        // fresh peer event. The channel rotates authors so one long suffix cannot starve another.
-        match channel.advance_pending_sparse_contiguous(&store) {
-            Ok(pending) => self.governance_work.again |= pending,
-            Err(error) => channel.poison(&error),
-        }
-        if governance_ready && channel.key_debt_retention_pending() {
-            match channel.prune_expired_key_body_debts(&store, self.now_ms()) {
-                Ok(()) => self.governance_work.again |= channel.key_debt_retention_pending(),
-                Err(error) => channel.poison(&error),
-            }
-        }
-        match channel.advance_key_provider_prune(&store) {
-            Ok(pending) => self.governance_work.again |= pending,
-            Err(error) => channel.poison(&error),
-        }
-        // Classification has no authority until governance is current. Continue its
-        // bounded sealed scan in this same round-robin room turn; a quiet room must not
-        // need another sync to finish, and an unresolved absent target is not busy work.
-        let mut legacy_finished = false;
-        if governance_ready {
-            let was_pending = channel.legacy_classification_pending(&store);
-            match was_pending.and_then(|pending| {
-                channel
-                    .advance_legacy_sessions(&store, self.now_ms().get())
-                    .map(|more| (pending, more))
-            }) {
-                Ok((was_pending, more)) => {
-                    self.governance_work.again |= more;
-                    legacy_finished = was_pending && !more;
-                }
-                Err(error) if ChannelState::legacy_classification_refreshing(&error) => {
-                    self.governance_work.again = true;
-                }
-                Err(error) => channel.poison(&error),
-            }
-        }
-        let mut views_finished = false;
-        if governance_ready {
-            match channel.advance_room_views(&store) {
-                Ok((more, finished)) => {
-                    self.governance_work.again |= more;
-                    views_finished = finished;
-                }
-                Err(error) => channel.poison(&error),
-            }
-        }
-        // An unsettled sparse room rechecks its durable exact own-head acknowledgement on
-        // every ready governance turn. Volatile hint-queue occupancy is not settlement state.
-        let settle_pending =
-            !channel.is_settled() && channel.uses_sparse_history(&store).unwrap_or(false);
         drop(channel);
-        if governance_ready && settle_pending {
-            self.settle_sparse_room(&room).await;
-        }
-        if governance_ready {
-            self.advance_own_recovery(room).await;
-            self.advance_support_discovery(room);
-        }
-        if governance_ready
-            && (governance_changed || self.governance_work.consent_after.contains_key(&room))
-        {
-            // A changed governance projection starts one bounded scan for stale consent; its
-            // retained cursor finishes that scan even after the causal change has settled. Do
-            // not restart a completed disk scan merely because unrelated room maintenance still
-            // has work: that made every continuation decrypt the same consent entries again and
-            // could monopolize the actor indefinitely. Reopen performs this scan during room
-            // preparation, and an explicit trust removal narrows the affected member directly.
-            match self.revoke_untrusted_consents(&room).await {
-                Ok(more) => self.governance_work.again |= more,
-                Err(error) => {
-                    shared.lock().await.poison(&error);
-                    return;
-                }
-            }
-        }
-        if governance_ready
-            && (governance_changed || self.governance_work.admin_rosters.contains(&room))
-        {
-            self.adopt_channel_anchors(&room).await;
-            self.refresh_network_view().await;
-            match self.publish_admin_roster(&room).await {
-                Ok(()) => {
-                    self.governance_work.admin_rosters.remove(&room);
-                }
-                Err(fault) => {
-                    self.governance_work.admin_rosters.insert(room);
-                    // A policy handoff is woken by its own event.  Immediate self-requeue here
-                    // can monopolize the actor while authority is necessarily stale. Permanent
-                    // faults likewise remain visible as owed work without spinning this actor.
-                    self.governance_work.again |= matches!(fault, Fault::GovernanceRefreshing);
-                }
-            }
-        }
-        if governance_changed || backfilled > 0 || legacy_finished || views_finished {
-            self.publish().await;
-        }
-    }
-}
-
-impl Node {
-    /// New targets, real role-prefix progress and reopen are producer edges. Equal observations
-    /// leave the existing immutable owner alone; a missing donor does not make a polling loop.
-    pub(super) async fn advance_own_recovery(&mut self, room: Digest32) {
-        // A decrypted response owns its peer credit and secret lease until its exact room can
-        // accept it. A real room-release edge reaches this same continuation.
-        self.try_install_own_key(room);
-        let Some(profile) = self.profile.as_ref() else {
-            return;
-        };
-        if self.locking != 0 || profile.signer().is_err() {
-            return;
-        }
-        let Some(shared) = self.channels.get(&room).cloned() else {
-            return;
-        };
-        let store = profile.store_handle();
-        let now = self.now_ms();
-        let mut authority_wait = false;
-        let (changed, completed, receiver_changed, audit, key) = {
-            let Ok(mut channel) = shared.try_lock() else {
-                // A read-only holder need not publish another event. Retain this exact room's
-                // release edge off actor; no other room or command waits on this mutex.
-                self.bounded_sync.wait_for_own_recovery_room(
-                    &self.net_tx,
-                    &mut self.next_token,
-                    profile.fingerprint(),
-                    room,
-                    shared.clone(),
-                );
-                return;
-            };
-            if !matches!(channel.uses_sparse_history(&store), Ok(true)) {
-                return;
-            }
-            let changed = match channel.refresh_own_recovery(&store) {
-                Ok(changed) => changed,
-                Err(error) => {
-                    channel.poison(&error);
-                    return;
-                }
-            };
-            let (completed, receiver_changed, audit) =
-                match self.with_current_computer_authority(|| {
-                    let receiver_changed = match channel.prepare_own_recovery_receiver(profile) {
-                        Ok(changed) => changed,
-                        Err(crate::error::Error::OwnHistoryBehind) => false,
-                        Err(error) => return Err(error),
-                    };
-                    let audit = channel.audit_own_readability(&store, now)?;
-                    if audit != crate::node::channel::OwnReadability::Complete {
-                        return Ok((false, receiver_changed, audit));
-                    }
-                    channel
-                        .complete_own_recovery(profile, now)
-                        .map(|done| (done, receiver_changed, audit))
-                        .or_else(|error| {
-                            if matches!(error, crate::error::Error::OwnHistoryBehind) {
-                                Ok((
-                                    false,
-                                    receiver_changed,
-                                    crate::node::channel::OwnReadability::Waiting,
-                                ))
-                            } else {
-                                Err(error)
-                            }
-                        })
-                }) {
-                    Some(Ok(result)) => result,
-                    Some(Err(error)) if ChannelState::receiver_release_cleanup_waiting(&error) => {
-                        // The seed persisted its exact retry bit. Park on bounded physical GC,
-                        // whose freed-slot result is the producer for another attempt.
-                        self.governance_work.wake_room(room);
-                        (false, false, crate::node::channel::OwnReadability::Waiting)
-                    }
-                    Some(Err(error)) => {
-                        channel.poison(&error);
-                        (false, false, crate::node::channel::OwnReadability::Waiting)
-                    }
-                    None => {
-                        authority_wait = true;
-                        (false, false, crate::node::channel::OwnReadability::Waiting)
-                    }
-                };
-            let key = match channel.own_recovery_key(&store) {
-                Ok(key) => key,
-                Err(error) => {
-                    channel.poison(&error);
-                    return;
-                }
-            };
-            (changed, completed, receiver_changed, audit, key)
-        };
-        if authority_wait {
-            self.defer_own_key_policy(room);
-        }
-        if matches!(audit, crate::node::channel::OwnReadability::Runnable) {
-            self.governance_work.wake_room(room);
-        }
-        if let crate::node::channel::OwnReadability::EffectReady {
-            target,
-            seq,
-            entry_hash,
-        } = audit
-        {
-            let same = self.own_readable_effects.get(&room).is_some_and(|ready| {
-                ready.target == target
-                    && ready.seq == seq
-                    && ready.entry_hash == entry_hash
-                    && ready
-                        .instance
-                        .upgrade()
-                        .is_some_and(|held| Arc::ptr_eq(&held, &shared))
-            });
-            if !same {
-                self.own_readable_effects.insert(
-                    room,
-                    ReadableOwnEffect {
-                        instance: Arc::downgrade(&shared),
-                        target,
-                        seq,
-                        entry_hash,
-                        woken: BTreeSet::new(),
-                    },
-                );
-            }
-            self.retry_readable_own_effect(room);
-        }
-        if let crate::node::channel::OwnReadability::KeyDebt {
-            target,
-            epoch,
-            chain,
-            iteration,
-            ..
-        } = audit
-        {
-            self.start_own_key_request(room, target, epoch, chain, iteration);
-        }
-        if receiver_changed {
-            // The committed key/cursor is the producer for ordinary bounded backfill.
-            self.governance_work.wake_room(room);
-        }
-        if completed {
-            self.note_local_governance_append(&room);
-        }
-        let debt = match audit {
-            crate::node::channel::OwnReadability::BodyDebt {
-                target,
-                seq,
-                entry_hash,
-            } => Some((target, seq, entry_hash)),
-            _ => None,
-        };
-        let debt_changed = match debt {
-            Some(debt) => self.own_recovery_body_debts.insert(room, debt) != Some(debt),
-            None => self.own_recovery_body_debts.remove(&room).is_some(),
-        };
-        let progress = match key {
-            Some(key) => self.own_recovery_rooms.insert(room, key) != Some(key),
-            None => {
-                self.own_recovery_rooms.remove(&room);
-                false
-            }
-        };
-        if completed || key.is_none() {
-            self.own_readable_effects.remove(&room);
-        }
-        if progress || debt_changed {
-            for ((r, _), port) in &mut self.ports {
-                if *r == room {
-                    port.raise();
-                }
-            }
-            self.sched_rooms.insert(room);
-        }
-        if changed || completed {
-            let note = if completed {
-                "this node recovered its own history; it can write here again"
-            } else {
-                "this node is behind its own history; it cannot write here until recovery completes"
-            };
-            let _ = self.event_tx.send(NodeEvent::NodeNote {
-                note: format!("room {}: {note}", crate::node::link::b32_encode(&room)),
-            });
-        }
+        let continuation = governance_save::Continuation::turn(shared, self.delivery_epoch);
+        self.begin_pending_maintenance(
+            room,
+            maintenance_save::Work::Consent(consent_save::Work::ReceiverCleanup),
+            maintenance_save::Continuation::Governance(continuation),
+            None,
+        )
+        .await;
     }
 }

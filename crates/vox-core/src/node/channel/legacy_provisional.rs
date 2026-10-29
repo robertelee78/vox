@@ -39,20 +39,6 @@ impl ChannelState {
         }
     }
 
-    /// Advance one local startup-cleanup quantum. `true` means accepted current room state is
-    /// usable; detached retired roots may still require later background turns.
-    pub(crate) fn advance_legacy_startup_cleanup(&mut self, store: &Store) -> Result<bool> {
-        if self.legacy_preparation == entry_store::Preparation::Ready {
-            return Ok(true);
-        }
-        let was_blocking = self.legacy_preparation == entry_store::Preparation::CleanupPending;
-        self.legacy_preparation = self.cleanup_legacy_orphan(store)?;
-        if was_blocking && self.legacy_preparation != entry_store::Preparation::CleanupPending {
-            self.history_publication_changed.notify_waiters();
-        }
-        Ok(self.legacy_preparation != entry_store::Preparation::CleanupPending)
-    }
-
     /// Record only the exact authenticated current v1 header, never its body or peer HAVE.
     pub(crate) fn note_legacy_required(&self, store: &Store, tip: &Entry) -> Result<bool> {
         if self.poisoned {
@@ -108,16 +94,6 @@ impl ChannelState {
         }
         Ok(changed)
     }
-    /// Background maintenance only advances a previously identified orphan, never a paused
-    /// owner's publication. Schedule another bounded local turn for CleanupPending or
-    /// ReadyWithCleanup; the latter permits current staging/reads immediately.
-    pub(crate) fn cleanup_legacy_orphan(&self, store: &Store) -> Result<entry_store::Preparation> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        self.entries
-            .cleanup_orphan_provisional(store, &self.sek, &self.channel_id)
-    }
     pub(crate) fn legacy_provisional_state(
         &self,
         store: &Store,
@@ -129,23 +105,5 @@ impl ChannelState {
             .entries
             .read(store, &self.sek, &self.channel_id)?
             .legacy_provisional())
-    }
-    /// True means the exact owner no longer occupies current staging. Retired ciphertext
-    /// can remain; call cleanup_legacy_orphan in later local maintenance turns to reclaim it.
-    pub(crate) fn cleanup_legacy_provisional(
-        &self,
-        store: &Store,
-        owner: LegacyProvisionalOwner,
-    ) -> Result<bool> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        let done =
-            self.entries
-                .cleanup_legacy_provisional(store, &self.sek, &self.channel_id, owner)?;
-        if done {
-            self.history_publication_changed.notify_waiters();
-        }
-        Ok(done)
     }
 }

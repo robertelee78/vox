@@ -304,6 +304,36 @@ impl DriveState {
         Zeroizing::new(e.finish())
     }
 
+    /// Encode only selected candidate replacements alongside borrowed unchanged receivers.
+    pub(crate) fn state_with_receivers(
+        &self,
+        replacements: &BTreeMap<(Digest32, u64), ReceiverChain>,
+    ) -> Zeroizing<Vec<u8>> {
+        let mut e = Encoder::for_secrets();
+        e.array(6).uint(DRIVE_VERSION);
+        match &self.chain {
+            Some(chain) => e.bytes(&chain.to_state()),
+            None => e.bytes(&[]),
+        };
+        match &self.origin {
+            Some(origin) => e.bytes(origin.bytes()),
+            None => e.bytes(&[]),
+        };
+        e.array(self.receivers.len());
+        for (slot, receiver) in &self.receivers {
+            e.bytes(&replacements.get(slot).unwrap_or(receiver).to_state());
+        }
+        e.array(self.delivered.len());
+        for (member, generation) in &self.delivered {
+            e.array(2).bytes(member).uint(*generation);
+        }
+        e.array(self.marks.len());
+        for (member, (generation, iteration)) in &self.marks {
+            e.array(3).bytes(member).uint(*generation).uint(*iteration);
+        }
+        Zeroizing::new(e.finish())
+    }
+
     /// Strict decode of [`Self::to_state`]. The Session rows come from the plaintext cache.
     pub fn from_state(bytes: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(bytes);

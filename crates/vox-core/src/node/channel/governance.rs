@@ -410,9 +410,7 @@ fn advance_source(
 }
 
 pub(super) use channel::{remember_presence, Presence};
-pub use channel::{
-    GovernanceCurrent, GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets,
-};
+pub use channel::{GovernanceNotices, GovernanceProgress, GovernanceShares, GovernanceTargets};
 pub(super) use view::{Display, View};
 
 /// Readiness and remaining background work are different: later ordinary chat

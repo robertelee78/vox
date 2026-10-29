@@ -9,6 +9,10 @@ use crate::node::api::{
     HistoryCursor, MessagePage, MessageRow, NoticePage, NoticeRevision, NoticeRow, NoticeState,
 };
 
+mod read_resource;
+use read_resource::ReadFacts;
+pub(crate) use read_resource::{PendingHistoryRead, ReadResource};
+
 pub(crate) enum Query {
     MemberHellos {
         instance: Option<[u8; 16]>,
@@ -208,23 +212,23 @@ pub(crate) struct Revision {
 }
 
 impl Revision {
-    fn of(ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> Result<Self> {
+    fn of(ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<Self> {
         Ok(Self {
             incarnation: ch.gen.clone(),
             facts: [
-                ch.gen.load(std::sync::atomic::Ordering::Relaxed),
+                ch.generation,
                 ch.display_rewrite,
                 rendered.count()?,
-                ch.dag.reorder_generation(),
-                ch.dag.body_generation(),
-                ch.legacy_sessions.display_revision(),
+                ch.reorder_generation,
+                ch.body_generation,
+                ch.classification_revision,
                 ch.effective_retention(),
                 ch.effective_step_retention(),
             ],
             rendered_roots: rendered.display_roots(),
         })
     }
-    fn current(&self, ch: &ChannelState, rendered: &entry_store::RenderView<'_>) -> Result<bool> {
+    fn current(&self, ch: &ReadFacts, rendered: &entry_store::RenderView<'_>) -> Result<bool> {
         let now = Self::of(ch, rendered)?;
         Ok(Arc::ptr_eq(&self.incarnation, &now.incarnation)
             && self.facts == now.facts
@@ -245,8 +249,7 @@ type Answer<T> = std::result::Result<T, Failure>;
 const CHANGED: &str = "the room changed while reading; refresh and retry";
 
 struct View<'a> {
-    ch: &'a ChannelState,
-    store: &'a Store,
+    ch: &'a ReadFacts,
     rendered: entry_store::RenderView<'a>,
     /// The room's fold was not current at read time (ADR-037 R3): the page is said to be
     /// provisional, never refused.
@@ -254,6 +257,150 @@ struct View<'a> {
 }
 
 impl View<'_> {
+    fn saved_answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
+        // Exact indexed aggregates cannot subtract bodies hidden at read time. Maintenance
+        // settles their projection; bounded exact/cursor body reads remain independently usable.
+        if matches!(
+            &query,
+            Query::Count { .. }
+                | Query::Older { .. }
+                | Query::ViewPage { .. }
+                | Query::Agreement { .. }
+                | Query::OperationPage { .. }
+                | Query::Order { .. }
+                | Query::ThreadPage { .. }
+                | Query::ThreadSummary { .. }
+        ) && (!self.ch.projection_ready
+            || self.rendered.retention_pending(
+                self.ch.now_hint,
+                self.ch.effective_retention(),
+                self.ch.effective_step_retention(),
+            )?)
+        {
+            return Err(Failure::Request(
+                "the room is refreshing saved history; retry",
+            ));
+        }
+        self.answer(query, bytes)
+    }
+
+    fn entry_retention(&self, entry: &Entry) -> Result<u64> {
+        if entry.payload.as_deref().is_some_and(retained_control) {
+            return Ok(0);
+        }
+        let steps = if let Some(tracked) = self.rendered.retention(&entry.entry_hash())? {
+            tracked.steps
+        } else if let Some(body) = entry.payload.as_deref() {
+            is_step_body(self.ch.channel_id(), body)
+        } else if let Some(log) = self.rendered.read_index().log_id(&entry.entry_hash())? {
+            self.rendered
+                .snapshot()
+                .get_segment(self.ch.channel_id(), SegmentKind::Index, log)?
+                .map(|segment| {
+                    open_segment(self.rendered.key(), SegmentKind::Index, log, &segment)
+                        .and_then(|bytes| parse_first_seen(&bytes).map(|fact| fact.1))
+                })
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        Ok(if steps {
+            self.ch.effective_step_retention()
+        } else {
+            self.ch.effective_retention()
+        })
+    }
+
+    fn entry_expiry(&self, entry: &Entry) -> Result<Option<u64>> {
+        if entry.payload.as_deref().is_some_and(retained_control) {
+            return Ok(None);
+        }
+        let tracked = self
+            .rendered
+            .retention(&entry.entry_hash())?
+            .ok_or(Error::MalformedAtRest("rendered row retention missing"))?;
+        let ttl = if tracked.steps {
+            self.ch.effective_step_retention()
+        } else {
+            self.ch.effective_retention()
+        };
+        if ttl == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            tracked.base().saturating_add(ttl.saturating_mul(1_000)),
+        ))
+    }
+
+    fn require_classification_complete(&self) -> Result<()> {
+        ChannelState::saved_classification_complete(&self.rendered, self.ch.channel_id())
+    }
+
+    fn legacy_is_session_current(&self, hash: &Digest32) -> Result<bool> {
+        if !self.ch.projection_ready {
+            return Err(Error::Profile(
+                "the room is refreshing saved history; retry",
+            ));
+        }
+        let entry = self
+            .rendered
+            .order()
+            .entry(hash)?
+            .ok_or(Error::MalformedAtRest(
+                "Session classification source missing",
+            ))?;
+        ChannelState::saved_owed_classification(
+            &self.rendered,
+            self.ch.channel_id(),
+            &entry,
+            self.ch
+                .verified
+                .get(&entry.skeleton.author_id)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
+    fn unread(&self) -> Result<Vec<Digest32>> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        for _ in 0..UNREAD_LOOKED {
+            let Some((key, _)) = self.rendered.step(None, true, cursor, true)? else {
+                break;
+            };
+            cursor = Some(key);
+            if self.rendered.was_read(&key.1, &self.ch.me())? {
+                break;
+            }
+            let author = self
+                .rendered
+                .order()
+                .author_position(&key.1)?
+                .ok_or(Error::MalformedAtRest("unread author missing"))?
+                .0;
+            if author == self.ch.me() || self.rendered.fact(&key.1)?.is_none() {
+                continue;
+            }
+            let tracked = self
+                .rendered
+                .retention(&key.1)?
+                .ok_or(Error::MalformedAtRest("rendered row retention missing"))?;
+            let ttl = if tracked.steps {
+                self.ch.effective_step_retention()
+            } else {
+                self.ch.effective_retention()
+            };
+            if ttl == 0
+                || self.ch.now_hint < tracked.base().saturating_add(ttl.saturating_mul(1_000))
+            {
+                out.push(key.1);
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
     fn accepted_cache_answer(&self, query: Query, bytes: usize) -> Answer<Reply> {
         use super::legacy_provisional::LEGACY_HISTORY_REQUIRED;
         // Counts, agreement and operation/attention authority require the completed current
@@ -277,11 +424,19 @@ impl View<'_> {
         ) {
             return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
         }
+        if matches!(&query, Query::ViewPage { .. } | Query::Older { .. })
+            && self.rendered.retention_pending(
+                self.ch.now_hint,
+                self.ch.effective_retention(),
+                self.ch.effective_step_retention(),
+            )?
+        {
+            return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
+        }
         // The completed current authority and consent projection are held by the open room.
         // This unchanged read must not open even the governance header: acceptance invalidates
         // readiness and the bounded governance turn publishes the next in-memory revision.
-        self.ch
-            .require_governance_display(self.store, crate::time::Ms(self.ch.now_hint))?;
+        self.ch.require_governance_display(self.ch.now_hint)?;
         let me = self.ch.me();
         let answer = self.answer(query, bytes)?;
         let facts = self.ch.consent_facts()?;
@@ -303,21 +458,15 @@ impl View<'_> {
             if row.author != me && !facts.can_read(&me, &row.author) {
                 return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
             }
-            let tracked = self
-                .rendered
-                .retention(&row.entry_hash)?
-                .ok_or(Error::MalformedAtRest("cached row retention missing"))?;
             let entry = self
                 .rendered
                 .order()
                 .entry(&row.entry_hash)?
                 .ok_or(Error::MalformedAtRest("cached row source missing"))?;
-            if expired_at(
-                tracked.base(),
-                self.ch.now_hint,
-                self.ch
-                    .entry_retention(self.rendered.transaction(), &entry)?,
-            ) {
+            if self
+                .entry_expiry(&entry)?
+                .is_some_and(|at| self.ch.now_hint >= at)
+            {
                 return Err(Failure::Request(LEGACY_HISTORY_REQUIRED));
             }
             Ok(())
@@ -358,6 +507,12 @@ impl View<'_> {
             if entry.skeleton.author_id != row.author {
                 return Err(Error::MalformedAtRest("rendering author differs"));
             }
+            if self
+                .entry_expiry(&entry)?
+                .is_some_and(|at| self.ch.now_hint >= at)
+            {
+                return Ok(None);
+            }
             return Ok(Some(Self::message(row)));
         }
         if !self.rendered.is_owed(hash)? {
@@ -373,12 +528,9 @@ impl View<'_> {
             || expired_at(
                 entry.skeleton.claimed_ms,
                 self.ch.now_hint,
-                self.ch
-                    .entry_retention(self.rendered.transaction(), &entry)?,
+                self.entry_retention(&entry)?,
             )
-            || self
-                .ch
-                .legacy_is_session_current_in(self.rendered.transaction(), hash)?
+            || self.legacy_is_session_current(hash)?
         {
             return Ok(None);
         }
@@ -433,7 +585,9 @@ impl View<'_> {
         };
         *cursor = Some(key);
         self.row(&key.1)?
-            .ok_or(Error::MalformedAtRest("visible row missing"))
+            .ok_or(Error::Profile(
+                "the room is removing expired saved history; retry",
+            ))
             .map(Some)
     }
 
@@ -444,8 +598,7 @@ impl View<'_> {
         };
         let owed = self.rendered.owed_before(before)?;
         if owed != 0 {
-            self.ch
-                .require_legacy_classification_complete_in(self.rendered.transaction())?;
+            self.require_classification_complete()?;
         }
         rendered
             .checked_add(owed)
@@ -531,8 +684,7 @@ impl View<'_> {
         if matches!(filter, Filter::General) {
             let owed = self.rendered.owed_before(cursor)?;
             if owed != 0 {
-                self.ch
-                    .require_legacy_classification_complete_in(self.rendered.transaction())?;
+                self.require_classification_complete()?;
             }
             total = total
                 .checked_add(owed)
@@ -655,9 +807,10 @@ impl View<'_> {
                 return Ok(Reply::Page { rows, next: None });
             };
             if selection.matches(&self.rendered, &hash)? {
-                let row = self
-                    .row(&hash)?
-                    .ok_or(Error::MalformedAtRest("filtered row missing"))?;
+                let Some(row) = self.row(&hash)? else {
+                    cursor = Some(arrival);
+                    continue;
+                };
                 let cost = row
                     .text
                     .len()
@@ -691,7 +844,7 @@ impl View<'_> {
                     self.ch.display_rewrite,
                     self.ch.effective_retention(),
                     self.ch.effective_step_retention(),
-                    self.ch.legacy_sessions.display_revision(),
+                    self.ch.classification_revision,
                 ],
             },
             now_ms: self.ch.now_hint,
@@ -706,18 +859,7 @@ impl View<'_> {
             .order()
             .entry(&row.entry_hash)?
             .ok_or(Error::MalformedAtRest("notice entry missing"))?;
-        let ttl = self
-            .ch
-            .entry_retention(self.rendered.transaction(), &entry)?;
-        let expires = if ttl == 0 {
-            None
-        } else {
-            let tracked = self
-                .rendered
-                .retention(&row.entry_hash)?
-                .ok_or(Error::MalformedAtRest("notice retention missing"))?;
-            Some(tracked.base().saturating_add(ttl.saturating_mul(1_000)))
-        };
+        let expires = self.entry_expiry(&entry)?;
         Ok(expires
             .is_none_or(|at| self.ch.now_hint < at)
             .then_some(NoticeRow { row, expires }))
@@ -763,6 +905,20 @@ impl View<'_> {
                 "member metadata continuation lacks its room/revision",
             ));
         }
+        // Track the earliest expiry of rows handed to clients, including earlier
+        // continuation pages. Pinned roots can outlive these rows; expiry must change
+        // the selection token even when no committed index has changed.
+        if self
+            .ch
+            .member_hello_expiry
+            .get()
+            .is_some_and(|at| self.ch.now_hint >= at)
+        {
+            self.ch
+                .member_hello_epoch
+                .set(self.ch.member_hello_epoch.get().wrapping_add(1));
+            self.ch.member_hello_expiry.set(None);
+        }
         let filter = Filter::Type(vox_agentcomms::envelope::HELLO.into());
         let members = self.ch.members();
         use sha2::{Digest, Sha256};
@@ -772,16 +928,17 @@ impl View<'_> {
         stamp.update(self.ch.me());
         stamp.update(self.rendered.history_instance());
         for value in [
-            self.ch.projection_state.incarnation,
+            self.ch.incarnation,
             self.rendered.filter_display_root(&filter)?,
             self.rendered.display_roots()[3],
             self.ch.effective_retention(),
             self.ch.effective_step_retention(),
+            self.ch.member_hello_epoch.get(),
         ] {
             stamp.update(value.to_be_bytes());
         }
         stamp.update((members.len() as u64).to_be_bytes());
-        for member in &members {
+        for member in members {
             stamp.update(member);
         }
         let revision: Digest32 = stamp.finalize().into();
@@ -816,17 +973,17 @@ impl View<'_> {
             let Some((key, _)) = self.rendered.step(Some(&filter), true, cursor, true)? else {
                 return Ok(Reply::MemberHellos(page));
             };
-            let author = self
+            let entry = self
                 .rendered
                 .order()
                 .entry(&key.1)?
-                .ok_or(Error::MalformedAtRest("member hello entry missing"))?
-                .skeleton
-                .author_id;
+                .ok_or(Error::MalformedAtRest("member hello entry missing"))?;
+            let author = entry.skeleton.author_id;
             if members.binary_search(&author).is_ok() {
-                let row = self
-                    .row(&key.1)?
-                    .ok_or(Error::MalformedAtRest("member hello row missing"))?;
+                let Some(row) = self.row(&key.1)? else {
+                    cursor = Some(key);
+                    continue;
+                };
                 let cost = row
                     .text
                     .len()
@@ -836,6 +993,14 @@ impl View<'_> {
                     return Ok(Reply::MemberHellos(page));
                 }
                 used = used.saturating_add(cost);
+                if let Some(at) = self.entry_expiry(&entry)? {
+                    self.ch.member_hello_expiry.set(Some(
+                        self.ch
+                            .member_hello_expiry
+                            .get()
+                            .map_or(at, |previous| previous.min(at)),
+                    ));
+                }
                 page.rows.push(row);
             }
             cursor = Some(key);
@@ -915,7 +1080,7 @@ impl View<'_> {
                 hash.update(b"vox-room-held-selection-v1");
                 hash.update(self.ch.channel_id());
                 hash.update(instance);
-                hash.update(self.ch.projection_state.incarnation.to_be_bytes());
+                hash.update(self.ch.incarnation.to_be_bytes());
                 hash.update(self.ch.effective_retention().to_be_bytes());
                 hash.update(self.ch.effective_step_retention().to_be_bytes());
                 // A render epoch is a rewrite, not an ordinary append. No whole-history
@@ -939,6 +1104,18 @@ impl View<'_> {
                     }
                     let fact = self.rendered.fact(&entry)?;
                     if let Some(fact) = fact {
+                        let source = self
+                            .rendered
+                            .order()
+                            .entry(&entry)?
+                            .ok_or(Error::MalformedAtRest("held selection entry missing"))?;
+                        if self
+                            .entry_expiry(&source)?
+                            .is_some_and(|at| self.ch.now_hint >= at)
+                        {
+                            hash.update([0]);
+                            continue;
+                        }
                         // The immutable entry/cache binding identifies the body without
                         // decrypting every selected body just to fingerprint the window.
                         hash.update([1]);
@@ -979,7 +1156,7 @@ impl View<'_> {
                 hash.update(b"vox-room-history-revision-v1");
                 hash.update(self.ch.channel_id());
                 hash.update(self.rendered.history_instance());
-                hash.update(self.ch.projection_state.incarnation.to_be_bytes());
+                hash.update(self.ch.incarnation.to_be_bytes());
                 for fact in revision.facts {
                     hash.update(fact.to_be_bytes());
                 }
@@ -988,8 +1165,8 @@ impl View<'_> {
                 }
                 Ok(Reply::DisplayRevision(hash.finalize().into()))
             }
-            Query::Governance(query) => Ok(Reply::Governance(
-                self.ch.governance_page(self.store, query)?,
+            Query::Governance(_) => Err(Failure::Request(
+                "governance requires its checked authority reader",
             )),
             Query::ArrivalHead => Ok(Reply::ArrivalHead(self.head()?)),
             Query::Footers {
@@ -1014,7 +1191,8 @@ impl View<'_> {
                 let others: Vec<_> = self
                     .ch
                     .members()
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .filter(|member| *member != me)
                     .collect();
                 let mut rows = Vec::new();
@@ -1196,11 +1374,17 @@ impl View<'_> {
                 let mut cursor = after;
                 let mut rows = Vec::new();
                 let mut used = 0usize;
-                while rows.len() < limit.min(crate::node::ipc::PAGE_ENTRIES)
-                    && (rows.is_empty() || used < bytes)
-                {
+                for _ in 0..crate::node::ipc::PAGE_ENTRIES {
+                    if rows.len() >= limit.min(crate::node::ipc::PAGE_ENTRIES)
+                        || (!rows.is_empty() && used >= bytes)
+                    {
+                        break;
+                    }
                     let before = cursor;
                     let Some(row) = self.arrival(&mut cursor)? else {
+                        if cursor != before {
+                            continue;
+                        }
                         return Ok(Reply::Page { rows, next: None });
                     };
                     let cost = row
@@ -1414,12 +1598,20 @@ impl View<'_> {
                 let mut rows = Vec::new();
                 let mut used = 0usize;
                 while rows.len() < limit && (rows.is_empty() || used < bytes) {
+                    let previous_arrival = arrival;
                     let next = if since.is_some() {
                         self.arrival(&mut arrival)?
                     } else {
                         self.display(&mut display, false)?
                     };
-                    let Some(row) = next else { break };
+                    let Some(row) = next else {
+                        if arrival != previous_arrival {
+                            return Err(Failure::Request(
+                                "the room is removing expired saved history; retry",
+                            ));
+                        }
+                        break;
+                    };
                     let cost = row
                         .text
                         .len()
@@ -1526,17 +1718,15 @@ impl View<'_> {
                 Ok(Reply::UnreadSummary(summary))
             }
             Query::LocateUnread => {
-                let entries = self.ch.unread(self.store)?;
+                let entries = self.unread()?;
                 let mut found = BTreeSet::new();
                 for hash in entries {
-                    if self.rendered.fact(&hash)?.is_some() {
-                        let key = self
-                            .rendered
-                            .order()
-                            .key(&hash)?
-                            .ok_or(Error::MalformedAtRest("unread order missing"))?;
-                        found.insert(key);
-                    }
+                    let key = self
+                        .rendered
+                        .order()
+                        .key(&hash)?
+                        .ok_or(Error::MalformedAtRest("unread order missing"))?;
+                    found.insert(key);
                 }
                 Ok(Reply::Located {
                     entries: found.into_iter().map(|(_, h)| h).collect(),
@@ -1576,22 +1766,6 @@ impl View<'_> {
 }
 
 impl ChannelState {
-    /// One bounded turn of derived view-index catch-up: (more work, just became ready).
-    pub(crate) fn advance_room_views(&self, store: &Store) -> Result<(bool, bool)> {
-        // A paused v1 request is not a scheduled view-rebuild job. Its accepted selector
-        // remains readable; an absent selector reports pending on that selected read.
-        if self.legacy_cache_only(store)? {
-            return Ok((false, false));
-        }
-        let was_ready = self
-            .entries
-            .render_view(store, &self.sek, &self.channel_id)?
-            .room_views_ready()?;
-        let more = self
-            .entries
-            .advance_room_views(store, &self.sek, &self.channel_id)?;
-        Ok((more, !was_ready && !more))
-    }
     pub(crate) fn history_instance(&self, store: &Store) -> Result<[u8; 16]> {
         Ok(self
             .entries
@@ -1605,16 +1779,18 @@ impl ChannelState {
             .map(|row| row.map(|(_, fact)| fact.cache))
     }
 
-    pub(crate) fn history_query(
-        &mut self,
+    /// Bounded saved selection only. Writer maintenance is owned by the room's sweep turn.
+    pub(crate) fn saved_history_query(
+        &self,
         store: &Store,
         query: Query,
         max_bytes: usize,
         now_ms: u64,
     ) -> std::result::Result<Reply, String> {
-        self.now_hint = self.now_hint.max(now_ms);
-        if self.poisoned {
-            return Err(self.save_failure().to_string());
+        if !matches!(&query, Query::Governance(_) | Query::Agreement { .. }) {
+            if let Some(resource) = &self.history_read {
+                return resource.query(query, max_bytes, now_ms);
+            }
         }
         let result = (|| -> Answer<Reply> {
             let query = match query {
@@ -1622,77 +1798,45 @@ impl ChannelState {
                     return self
                         .governance_page(store, query)
                         .map(Reply::Governance)
-                        .map_err(|e| match e {
-                            Error::Profile(why) => Failure::Request(why),
-                            e => Failure::Storage(e),
-                        })
+                        .map_err(Failure::Storage)
                 }
                 query => query,
             };
-            if self.legacy_cache_only(store)? {
-                // The currently accepted fold, never the unpublished witness, authorizes
-                // this bounded cache selection. It performs no EntryIndex mutation.
-                let view = View {
-                    rendered: self
-                        .entries
-                        .render_view(store, &self.sek, &self.channel_id)?,
-                    ch: self,
-                    store,
-                    provisional: !self.governance_ready,
-                };
-                return view.accepted_cache_answer(query, max_bytes);
-            }
-            // ADR-037 R3/R4: a page is answered from what this node holds; a fold behind its
-            // receipts marks the page provisional and never refuses it. The legacy-recovery
-            // gate above (`legacy_cache_only`) stays. Measured before this: a newcomer's
-            // `vox room read --json --limit 25` was refused "room governance is refreshing"
-            // while the control entries of the room he had just joined were still folding.
-            // Acceptance invalidates the in-memory publication before the source Batch can be
-            // used. The bounded governance turn restores it after publishing the new revision,
-            // so an unchanged read neither opens nor decrypts the governance header.
-            let provisional = !self.governance_display_current(now_ms);
-            self.prune_retention_page(store)?;
-            if self.retention_due(store, 0)?.1 {
-                return Err(Failure::Request(
-                    "the room is removing expired saved history; retry",
-                ));
-            }
-            if !self.refresh_projection(store)? {
-                return Err(Failure::Request(
-                    "the room is refreshing saved history; retry",
-                ));
-            }
+            let mut facts = ReadFacts::capture(self);
+            facts.now_hint = facts.now_hint.max(now_ms);
+            let rendered = self
+                .entries
+                .render_view(store, &self.sek, &self.channel_id)?;
+            let cache_only = rendered.legacy_cache_only();
             let view = View {
-                rendered: self
-                    .entries
-                    .render_view(store, &self.sek, &self.channel_id)?,
-                ch: self,
-                store,
-                provisional,
+                ch: &facts,
+                rendered,
+                provisional: !facts.governance_current(now_ms),
             };
-            view.answer(query, max_bytes)
-        })();
-        match result {
-            Ok(reply) => Ok(reply),
-            Err(Failure::Request(why)) => Err(why.into()),
-            Err(Failure::Storage(error)) => {
-                self.poison(&error);
-                Err(error.to_string())
+            if cache_only {
+                view.accepted_cache_answer(query, max_bytes)
+            } else {
+                view.saved_answer(query, max_bytes)
             }
-        }
+        })();
+        result.map_err(|failure| match failure {
+            Failure::Request(why) => why.to_owned(),
+            Failure::Storage(error) => error.to_string(),
+        })
     }
 }
 
 /// A bounded refresh cursor, never a copy of rows. Policy/classification changes must
 /// settle before exact projection answers; ordinary row changes update their own facts.
+#[derive(Clone)]
 pub(super) struct State {
     /// Unique for this open room in this process; the public token also binds the actor's
     /// random lifetime. An allocator address alone could be reused after closing the room.
     incarnation: u64,
-    policy: Option<[u64; 3]>,
-    pending: bool,
-    cursor: Option<(Digest32, u64)>,
-    through: Option<(Digest32, u64)>,
+    pub(super) policy: Option<[u64; 3]>,
+    pub(super) pending: bool,
+    pub(super) cursor: Option<(Digest32, u64)>,
+    pub(super) through: Option<(Digest32, u64)>,
     pub(super) cleanup_cursor: Option<(Digest32, u64)>,
 }
 impl Default for State {
@@ -1815,94 +1959,5 @@ impl ChannelState {
             created.saturating_add(ttl.saturating_mul(1_000))
         };
         Ok(Some((created, expires)))
-    }
-    /// At most 64 selected owed entries plus 64 expired visibility facts per actor turn.
-    /// Exact counts never decrypt/scan the remaining history while a client waits.
-    pub(crate) fn refresh_projection(&mut self, store: &Store) -> Result<bool> {
-        let result = (|| -> Result<bool> {
-            let before = self.projection_state.to_bytes();
-            let policy = [
-                self.effective_retention(),
-                self.effective_step_retention(),
-                self.legacy_sessions.display_revision(),
-            ];
-            // An unchanged, fully built projection can answer from the committed
-            // snapshot. Do not acquire the single Store writer merely to discover
-            // that there is no projection work: a slow unrelated durable save would
-            // otherwise stall this read. A missing/unready render view retains the
-            // existing rebuild path below.
-            if self.projection_state.policy == Some(policy) && !self.projection_state.pending {
-                if let Ok(rendered) = self.entries.render_view(store, &self.sek, &self.channel_id) {
-                    if rendered
-                        .next_owed_expiry()?
-                        .is_none_or(|expires| expires > self.now_hint)
-                    {
-                        return Ok(true);
-                    }
-                }
-            }
-            if self.projection_state.policy != Some(policy) {
-                self.projection_state.policy = Some(policy);
-                self.projection_state.pending = true;
-                self.projection_state.cursor = None;
-                self.projection_state.through = None;
-            }
-            let mut batch = store.batch()?;
-            batch.derived();
-            let mut writer = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            let mut changed = false;
-            if self.projection_state.pending {
-                let (positions, next) = writer.missing_page(self.projection_state.cursor, 64)?;
-                let mut through = false;
-                for (author, seq) in positions {
-                    if self
-                        .projection_state
-                        .through
-                        .is_some_and(|end| (author, seq) > end)
-                    {
-                        through = true;
-                        break;
-                    }
-                    self.projection_state.cursor = Some((author, seq));
-                    let entry = writer
-                        .get(&author, seq)?
-                        .ok_or(Error::MalformedAtRest("owed entry missing"))?;
-                    let visibility = self.owed_visibility(writer.batch(), &entry)?;
-                    writer.set_owed(entry.entry_hash(), visibility)?;
-                    changed = true;
-                }
-                self.projection_state.pending = !through
-                    && next.is_some()
-                    && self
-                        .projection_state
-                        .through
-                        .is_none_or(|end| self.projection_state.cursor < Some(end));
-            }
-            for _ in 0..64 {
-                let Some(hash) = writer.first_expired_owed(self.now_hint)? else {
-                    break;
-                };
-                writer.set_owed(hash, None)?;
-                changed = true;
-            }
-            let expired_remain = writer.first_expired_owed(self.now_hint)?.is_some();
-            let progress = self.projection_state.to_bytes();
-            if changed || before != progress {
-                writer.note_projection(progress)?;
-                writer.seal()?;
-                batch.commit()?;
-                self.entries.committed();
-                if changed {
-                    self.invalidate_display();
-                }
-            }
-            Ok(!self.projection_state.pending && !expired_remain)
-        })();
-        if let Err(ref error) = result {
-            self.poison(error);
-        }
-        result
     }
 }

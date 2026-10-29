@@ -321,23 +321,6 @@ impl ChannelState {
         updated
     }
 
-    /// One bounded render continuation. Consent can be current while the
-    /// authority fold still has work, so schedule this independently of pruning.
-    pub fn advance_governance_backfill(
-        &mut self,
-        store: &Store,
-        now: crate::time::Ms,
-    ) -> Result<usize> {
-        if self.legacy_cache_only(store)? {
-            return Ok(0);
-        }
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        self.now_hint = self.now_hint.max(now.get());
-        self.drain_backfill(store, now.get())
-    }
-
     /// Whether a bounded render turn still has work under current consent facts.
     pub fn governance_backfill_pending(&self, store: &Store) -> Result<bool> {
         if self.legacy_cache_only(store)? {

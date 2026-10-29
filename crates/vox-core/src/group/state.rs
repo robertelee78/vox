@@ -456,9 +456,7 @@ impl ReceiverChain {
         Zeroizing::new(e.finish())
     }
 
-    /// Restore a receiver chain from [`ReceiverChain::to_state`].
-    pub fn from_state(bytes: &[u8]) -> Result<Self> {
-        let mut d = Decoder::new(bytes);
+    fn read_state_binding(d: &mut Decoder<'_>) -> Result<(u64, Digest32, u64, Digest32, u64)> {
         let arity = d.array()?;
         if arity != 9 && arity != 11 {
             return Err(Error::MalformedBundle("receiver chain state arity"));
@@ -480,6 +478,13 @@ impl ReceiverChain {
             .try_into()
             .map_err(|_| Error::MalformedBundle("receiver chain state author_id"))?;
         let chain_id = d.uint()?;
+        Ok((version, channel_id, epoch, author_id, chain_id))
+    }
+
+    /// Restore a receiver chain from [`ReceiverChain::to_state`].
+    pub fn from_state(bytes: &[u8]) -> Result<Self> {
+        let mut d = Decoder::new(bytes);
+        let (version, channel_id, epoch, author_id, chain_id) = Self::read_state_binding(&mut d)?;
         let pk: [u8; crate::hash::COMPOSITE_PUB_LEN] = d
             .bytes()?
             .try_into()

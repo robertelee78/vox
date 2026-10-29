@@ -124,23 +124,6 @@ impl Gate {
         })
     }
 
-    /// Try without waiting on actor. Only affected writers receive cancellation.
-    pub(crate) fn try_transition(&self, targets: Option<&[Digest32]>) -> Option<Transition> {
-        let admission = Arc::clone(&self.admission).try_lock_owned().ok()?;
-        let peers = self.selected(targets);
-        for peer in &peers {
-            peer.cancel.send_replace(());
-        }
-        let mut writers = Vec::with_capacity(peers.len());
-        for peer in peers {
-            writers.push(Arc::clone(&peer.writers).try_write_owned().ok()?);
-        }
-        Some(Transition {
-            _writers: writers,
-            _admission: admission,
-        })
-    }
-
     /// Hold admission briefly while rechecking authority and publishing a resumed edge.
     pub(crate) fn try_open(&self) -> Option<OwnedMutexGuard<()>> {
         Arc::clone(&self.admission).try_lock_owned().ok()

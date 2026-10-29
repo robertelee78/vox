@@ -32,6 +32,8 @@ use crate::log::history::{
 pub type RequestId = [u8; 16];
 pub const MAX_PREAMBLE: usize = 128;
 pub const DONE_RESERVE: usize = 512;
+/// A captured flow grant no longer names current authorization; this is not a disk failure.
+pub(crate) const AUTHORIZATION_CHANGED: &str = "history authorization changed before publication";
 // One frame tag plus the canonical CBOR encoding of any u8 mode bitmap.
 const MAX_HELLO_FRAME_BYTES: usize = 3;
 // Tag + outer pair + request ID + the largest canonical Query (Page). Query's bounded u64 and

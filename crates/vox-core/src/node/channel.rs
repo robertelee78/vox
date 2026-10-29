@@ -59,8 +59,21 @@ pub(crate) const UNSUPPORTED_ROOM_FORMAT: &str =
     "This room uses an unsupported room or history format; leave it and create a new one.";
 mod legacy_session;
 mod legacy_session_sender;
+pub(crate) use legacy_session_sender::{CompletedAnnouncement, PendingAnnouncement};
 mod local_history;
+pub(crate) mod pending_cleanup;
+pub(crate) mod pending_governance;
+pub(crate) mod pending_key_prune;
+pub(crate) mod pending_metadata;
+pub(crate) mod pending_package;
+pub(crate) mod pending_received;
+pub(crate) mod pending_retention;
+pub(crate) mod pending_roster;
+pub(crate) mod pending_text;
+pub(crate) mod pending_trust;
 mod private_session;
+pub(crate) mod semantic_projection;
+pub(crate) use private_session::{pending_control, pending_session, pending_upgrade};
 pub(crate) mod role_owed;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
 pub(crate) mod availability;
@@ -78,8 +91,8 @@ pub(crate) use own_history::OwnReadability;
 pub(crate) use own_history::OwnRecoveryPage;
 pub(crate) use sparse_history::KeyDebtPage;
 pub(crate) use sparse_history::{
-    HistoryDeclineResult, HistoryEffectCursor, HistoryEffectProgress, HistoryPayload,
-    HistorySourceStart,
+    HistoryAdmission, HistoryAdmissionRoom, HistoryDeclineResult, HistoryEffectCursor,
+    HistoryEffectProgress, HistoryPayload, HistorySourceStart,
 };
 
 pub use diagnostics::SetAside;
@@ -98,7 +111,7 @@ use crate::error::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::governance::consent::{ConsentGrant, ConsentRevocation};
+use crate::governance::consent::ConsentRevocation;
 use crate::governance::entry::{GovBody, GovEntry};
 use crate::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use crate::governance::membership::{issue_consent_grant, issue_consent_revocation};
@@ -1244,7 +1257,6 @@ pub struct ChannelState {
     key_provider_prune_after: Option<Digest32>,
     key_provider_prune_pending: bool,
     key_debt_retention_pending: bool,
-    key_debt_retention_wait: Option<sparse_history::KeyProviderPruneWait>,
     key_provider_prune_wait: Option<sparse_history::KeyProviderPruneWait>,
     sender: SenderChain,
     /// The next `LogDb` / `PlaintextCache` segment id.
@@ -1395,8 +1407,8 @@ pub struct ChannelState {
     /// is an accepted head until the existing entry/sender transaction commits.
     local_pre_context: Option<crate::log::history::ControlContext>,
     local_append_budget: Option<crate::log::history::LocalAppendBudget>,
-    local_content_header: Option<(crate::log::history::EntryV2, Vec<Digest32>)>,
     local_history: Option<local_history::Prepared>,
+    pending_text: Option<Arc<()>>,
     /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
     history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
     role_owed: std::sync::Arc<role_owed::RoleOwed>,
@@ -1412,6 +1424,8 @@ pub struct ChannelState {
     /// In memory; a restart resets it together with every sync port. Shared with the actor, which
     /// reads it without the room's lock; it only changes under the lock.
     gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Revocable committed history publication, independent of the mutable room lane.
+    history_read: Option<Arc<history::ReadResource>>,
     /// Members that left and that this node let in again by answering their join (V030-08):
     /// members here until their signed return reaches it, which it then carries to the others.
     /// Each with the position in its feed of the departure the join undid: only that one. A
@@ -1419,6 +1433,15 @@ pub struct ChannelState {
     /// let in again kept its readmission for good, so a second leave was never applied (#564).
     /// In memory: a join is answered again after a restart.
     readmitted: BTreeMap<Digest32, u64>,
+}
+
+impl Drop for ChannelState {
+    fn drop(&mut self) {
+        if let Some(resource) = &self.history_read {
+            resource.revoke();
+        }
+        self.sek.lock_now();
+    }
 }
 
 impl std::fmt::Debug for ChannelState {
@@ -2077,8 +2100,32 @@ impl ChannelState {
         now: crate::time::Ms,
         anchors: &BootstrapSet,
     ) -> Result<Self> {
+        Self::create_from_sealed_owned(
+            &profile.store_handle(),
+            profile.signer()?,
+            name,
+            channel_passphrase,
+            genesis,
+            sek,
+            wrap,
+            now,
+            anchors,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_from_sealed_owned(
+        store: &Arc<Store>,
+        signer: &crate::atrest::vault::VaultRootSigner,
+        name: &str,
+        channel_passphrase: &[u8],
+        genesis: Genesis,
+        sek: Sek,
+        wrap: &crate::atrest::SekWrap,
+        now: crate::time::Ms,
+        anchors: &BootstrapSet,
+    ) -> Result<Self> {
         let now_ms = now.get();
-        let signer = profile.signer()?;
         let channel_id = genesis.channel_id();
         let epoch = 0u64;
         let me = signer.fingerprint();
@@ -2087,7 +2134,7 @@ impl ChannelState {
         // chain ratchets past iteration 0 the origin is unrecoverable, so it is kept
         // now or never (ADR-006 §History).
         let mut origins = OriginKeyStore::new();
-        let mint_seq = crate::node::consent_order::stamp_mint(profile.store(), signer, 0)?;
+        let mint_seq = crate::node::consent_order::stamp_mint(store, signer, 0)?;
         retain_generation(
             &mut origins,
             &channel_id,
@@ -2121,7 +2168,7 @@ impl ChannelState {
             &authors_bytes(&authors),
         )?;
 
-        let mut batch = profile.store().batch()?;
+        let mut batch = store.batch()?;
         batch.put_sek_wrap(&channel_id, wrap)?;
         batch.put_segment(
             &channel_id,
@@ -2163,7 +2210,7 @@ impl ChannelState {
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
         let origin_ms = genesis.body.created_ms;
-        governance::prepare(profile.store(), &sek, &channel_id)?;
+        governance::prepare(store, &sek, &channel_id)?;
         let governance_display = governance::Display::genesis(&genesis);
         let mut room = Self {
             channel_id,
@@ -2194,7 +2241,6 @@ impl ChannelState {
             key_provider_prune_after: None,
             key_provider_prune_pending: true,
             key_debt_retention_pending: false,
-            key_debt_retention_wait: None,
             key_provider_prune_wait: None,
             sender,
             next_log_id: 1,
@@ -2249,23 +2295,64 @@ impl ChannelState {
             save_error: None,
             local_pre_context: None,
             local_append_budget: None,
-            local_content_header: None,
             local_history: None,
+            pending_text: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            history_read: None,
             readmitted: BTreeMap::new(),
         };
         // The room's name is stated on its log as its first entry after the genesis, so every
         // member that joins reads it there (ADR-028 R-1).
         let statement = crate::governance::name::RoomName::build(signer, &channel_id, epoch, name)?;
-        room.append_governance(profile, &statement.to_wire(), now_ms)?;
+        room.append_unpublished_control(store, signer, statement.to_wire(), now)?;
         // Sign only the anchors its creator explicitly chose, including an empty set.
         // Machine configuration and join-link hints never supply room authority (AN-5/AN-9).
-        room.set_anchors(profile, anchors, now)?;
+        let statement =
+            crate::governance::anchors::RoomAnchors::build(signer, &channel_id, epoch, anchors)?;
+        room.append_unpublished_control(store, signer, statement.to_wire(), now)?;
         Ok(room)
+    }
+
+    /// Only for a freshly constructed, unpublished room on its physical native owner.
+    fn append_unpublished_control(
+        &mut self,
+        store: &Arc<Store>,
+        signer: &dyn RootSigner,
+        payload: Vec<u8>,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        let owner = Arc::new(());
+        let pending = self.prepare_pending_control(store, Arc::clone(&owner), now)?;
+        let completed = pending.run_governance(store, signer, payload);
+        let result = self.finish_pending_text(store, completed);
+        self.release_pending_text(&owner, result.is_err());
+        result.map(|_| ())
+    }
+
+    pub(crate) fn offer_unpublished_service(
+        &mut self,
+        store: &Arc<Store>,
+        signer: &dyn RootSigner,
+        tag: &str,
+        endpoint: SocketAddr,
+        kind: ServiceKind,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        self.add_service_owned(store, tag, endpoint, kind, true)?;
+        let statement = crate::governance::share::ServiceShare::build(
+            signer,
+            &self.channel_id,
+            self.epoch,
+            service_name(tag),
+            crate::tunnel::udp::is_udp(tag),
+            true,
+            self.kind_of(tag),
+        )?;
+        self.append_unpublished_control(store, signer, statement.to_wire(), now)
     }
 
     /// Open a channel from its sealed accepted-prefix state and on-disk indexes. A store
@@ -3015,7 +3102,6 @@ impl ChannelState {
             key_provider_prune_after: None,
             key_provider_prune_pending: true,
             key_debt_retention_pending: false,
-            key_debt_retention_wait: None,
             key_provider_prune_wait: None,
             sender,
             next_log_id,
@@ -3072,13 +3158,14 @@ impl ChannelState {
             save_error: None,
             local_pre_context: None,
             local_append_budget: None,
-            local_content_header: None,
             local_history: None,
+            pending_text: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            history_read: None,
             readmitted: BTreeMap::new(),
         };
         room.entries
@@ -3116,6 +3203,10 @@ impl ChannelState {
     /// The first of those that does not hold.
     pub fn join_checks(profile: &Profile, genesis: &Genesis, channel_id: &Digest32) -> Result<()> {
         profile.signer()?;
+        Self::join_checks_store(profile.store(), genesis, channel_id)
+    }
+
+    fn join_checks_store(store: &Store, genesis: &Genesis, channel_id: &Digest32) -> Result<()> {
         genesis.verify()?;
         if genesis.channel_id() != *channel_id {
             return Err(Error::MalformedGovernance(
@@ -3125,7 +3216,7 @@ impl ChannelState {
         if !genesis.body.authenticated_history() {
             return Err(Error::Profile(UNSUPPORTED_ROOM_FORMAT));
         }
-        if profile.store().get_sek_wrap(channel_id)?.is_some() {
+        if store.get_sek_wrap(channel_id)?.is_some() {
             return Err(Error::Profile("this room is already on this node"));
         }
         Ok(())
@@ -3145,8 +3236,9 @@ impl ChannelState {
     /// A failed check, a segment that cannot be sealed, or a store write that fails. On an error
     /// nothing of the room is written.
     #[allow(clippy::too_many_arguments)]
-    pub fn join_channel_from_sealed(
-        profile: &Profile,
+    pub(crate) fn join_channel_from_sealed_owned(
+        store: &Arc<Store>,
+        signer: &crate::atrest::vault::VaultRootSigner,
         genesis: &Genesis,
         channel_id: &Digest32,
         name_hint: Option<&str>,
@@ -3156,15 +3248,14 @@ impl ChannelState {
         own_admission: Admission,
     ) -> Result<Self> {
         let now_ms = now.get();
-        Self::join_checks(profile, genesis, channel_id)?;
+        Self::join_checks_store(store, genesis, channel_id)?;
         let name_hint = name_hint.unwrap_or_default();
         let (sek, wrap) = sealed;
-        let signer = profile.signer()?;
         let me = signer.fingerprint();
         let epoch = 0u64;
         let sender = SenderChain::new(channel_id, epoch, &me, 0, now_ms)?;
         let mut origins = OriginKeyStore::new();
-        let mint_seq = crate::node::consent_order::stamp_mint(profile.store(), signer, 0)?;
+        let mint_seq = crate::node::consent_order::stamp_mint(store, signer, 0)?;
         retain_generation(
             &mut origins,
             channel_id,
@@ -3206,7 +3297,7 @@ impl ChannelState {
             SEG_ADMISSION,
             &own_admission.body_bytes(),
         )?;
-        let mut batch = profile.store().batch()?;
+        let mut batch = store.batch()?;
         batch.put_sek_wrap(channel_id, &wrap)?;
         batch.put_segment(
             channel_id,
@@ -3248,8 +3339,8 @@ impl ChannelState {
         // two left a room in the profile that the restarted node did not reopen and every re-join
         // refused as already held: the member could not get back in. Now a crash leaves either no
         // room, which a re-join makes, or a room that reopens.
-        let mut open = crate::node::open_rooms::OpenRooms::load(profile.store(), signer)?;
-        open.remember(*channel_id, sek.key_bytes()?, channel_passphrase)?;
+        let mut open = crate::node::open_rooms::OpenRooms::load(store, signer)?;
+        open.remember(*channel_id, &sek.key_bytes()?, channel_passphrase)?;
         batch.put_meta(
             crate::node::open_rooms::OPEN_ROOMS_META_KEY,
             &open.sealed(signer)?,
@@ -3271,7 +3362,7 @@ impl ChannelState {
         for author in authors.keys() {
             admission.admit(*channel_id, epoch, *author);
         }
-        governance::prepare(profile.store(), &sek, channel_id)?;
+        governance::prepare(store, &sek, channel_id)?;
         let governance_display = governance::Display::genesis(genesis);
         Ok(Self {
             channel_id: *channel_id,
@@ -3302,7 +3393,6 @@ impl ChannelState {
             key_provider_prune_after: None,
             key_provider_prune_pending: true,
             key_debt_retention_pending: false,
-            key_debt_retention_wait: None,
             key_provider_prune_wait: None,
             sender,
             next_log_id: 1,
@@ -3356,13 +3446,14 @@ impl ChannelState {
             save_error: None,
             local_pre_context: None,
             local_append_budget: None,
-            local_content_header: None,
             local_history: None,
+            pending_text: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
             own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            history_read: None,
             readmitted: BTreeMap::new(),
         })
     }
@@ -3409,85 +3500,19 @@ impl ChannelState {
         admission: &Admission,
         now: crate::time::Ms,
     ) -> Result<bool> {
-        let fingerprint = key.fingerprint();
-        match admission {
-            Admission::Creator => {
-                if self.genesis.creator_pubkey().fingerprint() != fingerprint {
-                    return Err(Error::MalformedGovernance(
-                        "board record claims to be the creator and is not",
-                    ));
-                }
-            }
-            Admission::Witnessed(w) => {
-                // The signer must already be an author *here*. That is the whole
-                // mechanism: a stranger's signature convinces nobody, so a chain can
-                // only start at the creator, whom the genesis names.
-                let witness_key =
-                    self.authors
-                        .get(&w.witness_id)
-                        .cloned()
-                        .ok_or(Error::MalformedGovernance(
-                            "join witness signed by an unadmitted key",
-                        ))?;
-                w.verify(&witness_key, &self.channel_id, self.epoch, &fingerprint)?;
-                // **Never a member that left** (#520): its own withdraw, signed no earlier than
-                // the witness, refuses it, wherever the record came from. A member that joins again
-                // is witnessed again, later, and is taken.
-                if !self.authors.contains_key(&fingerprint)
-                    && self.withdrawn_since(&fingerprint, w.timestamp_ms)
-                {
-                    return Err(Error::MalformedGovernance(
-                        "admission withdrawn: the member left the room",
-                    ));
-                }
-                self.keep_notice(
-                    store,
-                    &crate::nat::notice::AdmissionNotice::new(key.clone(), (**w).clone())?,
-                )?;
-            }
+        if let Some(notice) = pending_roster::verify_admission(
+            &self.authors,
+            &self.board_kept,
+            self.genesis.creator_pubkey().fingerprint(),
+            self.channel_id,
+            self.epoch,
+            key,
+            admission,
+        )? {
+            self.keep_notice(store, &notice)?;
         }
-        // Past the cap if it must be: another member admitted it, on its own view that there was
-        // room. Refusing it here would split the room (V210-128).
+        // Another member already decided there was room.
         self.admit_within(store, key, now, AUTHORS_HARD_LIMIT)
-    }
-
-    /// Admit a newcomer **from its admission notice** (#520): the evidence its bundle record would
-    /// carry, the witness of a member this node already admits, without the bundle, so a newcomer
-    /// that is offline is still learned of. The same rules as [`ChannelState::admit_from_board`]:
-    /// the witness's signer must be an author here, the witness must bind this room, this epoch
-    /// and the key's fingerprint, a withdraw of the newcomer no older than the witness refuses it,
-    /// and the room's cap gives way only to what another member admitted. The notice is kept, to
-    /// pass on.
-    pub fn admit_from_notice(
-        &mut self,
-        store: &Store,
-        notice: &crate::nat::notice::AdmissionNotice,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
-        if notice.channel_id() != self.channel_id {
-            return Err(Error::MalformedGovernance(
-                "admission notice of another room",
-            ));
-        }
-        let w = &notice.witness;
-        let witness_key =
-            self.authors
-                .get(&w.witness_id)
-                .cloned()
-                .ok_or(Error::MalformedGovernance(
-                    "join witness signed by an unadmitted key",
-                ))?;
-        notice.verify(&witness_key, &self.channel_id, self.epoch)?;
-        let fingerprint = notice.joiner();
-        if !self.authors.contains_key(&fingerprint)
-            && self.withdrawn_since(&fingerprint, w.timestamp_ms)
-        {
-            return Err(Error::MalformedGovernance(
-                "admission withdrawn: the member left the room",
-            ));
-        }
-        self.keep_notice(store, notice)?;
-        self.admit_within(store, &notice.key, now, AUTHORS_HARD_LIMIT)
     }
 
     /// Whether this node holds a withdraw of `member` signed at or after `since` (#520).
@@ -3708,122 +3733,6 @@ impl ChannelState {
         self.admit_within(store, key, now, max_authors())
     }
 
-    /// Admit a joiner this node just authenticated and retain its witnessed admission in the
-    /// same transaction. The caller verifies the witness and the live join authority first.
-    /// A successful join must remain discoverable after this responder restarts while the
-    /// joiner is offline; neither author membership nor its notice may be committed alone.
-    /// Re-admitting the same key still succeeds at the room cap and returns `false`.
-    pub(crate) fn admit_author_with_notice(
-        &mut self,
-        store: &Store,
-        notice: &crate::nat::notice::AdmissionNotice,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
-        if self.is_poisoned() {
-            return Err(self.save_failure());
-        }
-        let fingerprint = notice.key.fingerprint();
-        if notice.channel_id() != self.channel_id
-            || notice.witness.epoch != self.epoch
-            || notice.joiner() != fingerprint
-        {
-            return Err(Error::MalformedGovernance(
-                "admission notice does not name this room, epoch and joiner",
-            ));
-        }
-        let added = match self.authors.get(&fingerprint) {
-            Some(existing) if existing.to_bytes() == notice.key.to_bytes() => false,
-            Some(_) => {
-                return Err(Error::MalformedGovernance(
-                    "another key is already admitted for this fingerprint",
-                ));
-            }
-            None if self.authors.len() >= max_authors() => {
-                return Err(Error::RoomFull {
-                    members: self.authors.len() as u64,
-                });
-            }
-            None => true,
-        };
-        let at = notice.witness.timestamp_ms;
-        if self.withdrawn_since(&fingerprint, at) {
-            return Err(Error::MalformedGovernance(
-                "admission withdrawn: the member left the room",
-            ));
-        }
-        let keep = self
-            .board_kept
-            .notices
-            .get(&fingerprint)
-            .is_none_or(|(held, _)| *held < at);
-        if !self.board_kept.notices.contains_key(&fingerprint)
-            && self.board_kept.notices.len() >= AUTHORS_HARD_LIMIT
-        {
-            return Err(Error::SizeLimitExceeded("kept notices"));
-        }
-        if !added && !keep {
-            self.now_hint = self.now_hint.max(now.get());
-            return Ok(false);
-        }
-
-        let mut authors = self.authors.clone();
-        authors.insert(fingerprint, notice.key.clone());
-        let mut board_kept = self.board_kept.clone();
-        if keep {
-            board_kept
-                .notices
-                .insert(fingerprint, (at, notice.to_wire()));
-        }
-        let authors_seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_AUTHORS,
-            &authors_bytes(&authors),
-        )?;
-        let board_seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_BOARD_KEPT,
-            &board_kept_bytes(&board_kept),
-        )?;
-        let committed = (|| {
-            let mut batch = store.batch()?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_AUTHORS,
-                &authors_seg,
-            )?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_BOARD_KEPT,
-                &board_seg,
-            )?;
-            batch.commit()
-        })();
-        if let Err(error) = committed {
-            self.poisoned = true;
-            self.save_error = Some(error.to_string());
-            return Err(error);
-        }
-        self.authors = authors;
-        self.role_owed
-            .retain_authors(|peer| self.authors.contains_key(peer));
-        self.board_kept = board_kept;
-        self.now_hint = self.now_hint.max(now.get());
-        if added {
-            self.admission
-                .admit(self.channel_id, self.epoch, fingerprint);
-            if self.is_member(&fingerprint) {
-                self.key_member_became_current(fingerprint);
-            }
-            self.owe_private_support();
-            self.governance_ready = false;
-        }
-        Ok(added)
-    }
-
     /// [`ChannelState::admit_author`], refused at `limit` authors. Keep the room's
     /// maintenance time in milliseconds, including after an admission (#562).
     fn admit_within(
@@ -3929,6 +3838,18 @@ impl ChannelState {
         kind: ServiceKind,
         persist: bool,
     ) -> Result<bool> {
+        let _ = profile;
+        self.add_service_owned(store, service_tag, local, kind, persist)
+    }
+
+    fn add_service_owned(
+        &mut self,
+        store: &Store,
+        service_tag: &str,
+        local: SocketAddr,
+        kind: ServiceKind,
+        persist: bool,
+    ) -> Result<bool> {
         if service_tag.is_empty() || service_tag.len() > crate::tunnel::session::MAX_SERVICE_TAG_LEN
         {
             return Err(Error::MalformedTunnel("service tag length"));
@@ -3943,7 +3864,6 @@ impl ChannelState {
         // both withdrawn — so a plain member could be reachable and still unable to offer
         // anything. A non-creator simply could not serve. Found by the agent-comms session
         // hitting it from the file-exchange side, which is where it bit first.
-        let _ = profile;
         let name = service_name(service_tag);
         if let Some((_, at)) = self
             .services
@@ -4079,50 +3999,9 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Read at most 64 committed log positions and return at most one valid delivery.
-    /// Unlinked rows kept for diagnostics never become key-delivery authority.
-    pub(crate) fn next_key_package(
-        &mut self,
-        store: &Store,
-        trust_digest: Digest32,
-    ) -> Result<key_package_queue::Progress> {
-        let room = self.channel_id;
-        let epoch = self.epoch;
-        let me = self.me();
-        let dag = &self.dag;
-        let read = self.entries.read(store, &self.sek, &room)?;
-        self.key_packages
-            .next(store, &self.sek, &room, &me, &read, trust_digest, |entry| {
-                Ok(entry.skeleton.channel_id == room
-                    && entry.skeleton.epoch == epoch
-                    && entry.skeleton.seq != 0
-                    && (entry.skeleton.seq <= dag.verified_head(&entry.skeleton.author_id)
-                        || read.history_effect_finished(&entry.entry_hash())?))
-            })
-    }
-
     /// Whether a bounded forward scan or a requested retained-package replay needs a turn.
     pub(crate) fn key_packages_pending(&self) -> bool {
         self.key_packages.pending()
-    }
-
-    /// Release the attempted locator's drive hint even when opening or trust checks refused it.
-    pub(crate) fn key_package_attempted(
-        &mut self,
-        store: &Store,
-        author: &Digest32,
-        log_id: u64,
-    ) -> Result<()> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        let result =
-            self.key_packages
-                .attempted(store, &self.sek, &self.channel_id, author, log_id);
-        if let Err(error) = &result {
-            self.poison(error);
-        }
-        result
     }
 
     /// A trust or prekey change retries retained packages from disk without retaining bodies.
@@ -4247,7 +4126,6 @@ impl ChannelState {
         self.local_history = None;
         self.local_pre_context = None;
         self.local_append_budget = None;
-        self.local_content_header = None;
         self.key_packages.published(self.next_log_id);
         // The caller committed the local append and all of its effects before entering here.
         // Remote effects advance this cache in `advance_history_effect`; advance the authored
@@ -4483,9 +4361,9 @@ impl ChannelState {
     /// position** — the forward-only release consent normally uses (ADR-006: the
     /// recipient reads from here on, never the history before it).
     ///
-    /// Deliver it over a `pairwise` stream ([`crate::node::pairwise_stream`]) and
-    /// record the consent with [`ChannelState::issue_consent`], passing the same
-    /// SKDM so the grant carries its `skdm_ref`.
+    /// The retained consent publication records this same SKDM's `skdm_ref` and entitlement
+    /// before enqueueing its delivery over a `pairwise` stream
+    /// ([`crate::node::pairwise_stream`]).
     pub fn skdm_for_consent(&self, profile: &Profile) -> Result<Skdm> {
         self.require_legacy_current(profile.store())?;
         if self.poisoned {
@@ -4495,42 +4373,6 @@ impl ChannelState {
         let signer = profile.signer()?;
         let (iteration, key) = self.sender.current_position();
         self.sender.skdm_for(signer, iteration, key)
-    }
-
-    /// Mint the SKDMs of a **full-history** grant (PRD-001 R12, ADR-023 decision 5):
-    /// every generation of this identity's sender key still retained, each at its
-    /// origin, oldest first, so the recipient reads this identity's messages from before
-    /// the approval as well as after. The **last** is the live generation — the one a
-    /// consent grant records.
-    ///
-    /// A live generation whose origin is not retained (a room from before M18.1) can
-    /// only be released from its current position, as [`Self::skdm_for_consent`] does;
-    /// that is the honest limit of "full", not a silent narrowing.
-    pub fn skdms_for_full_history(&self, profile: &Profile) -> Result<Vec<Skdm>> {
-        self.require_legacy_current(profile.store())?;
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        self.current_governance(profile.store())?;
-        let signer = profile.signer()?;
-        let live = self.sender.chain_id();
-        let mut out = Vec::new();
-        for (chain_id, _) in self
-            .origins
-            .generations(&self.channel_id, self.epoch, &self.me())
-        {
-            if chain_id != live {
-                out.push(self.origins.release_at(
-                    signer,
-                    &self.channel_id,
-                    self.epoch,
-                    chain_id,
-                    0,
-                )?);
-            }
-        }
-        out.push(self.rekey_skdm(profile)?);
-        Ok(out)
     }
 
     /// How many generations of this identity's sender key this node still holds the
@@ -4601,139 +4443,6 @@ impl ChannelState {
             0 => UNJOINED_HOLD_SECS,
             secs => secs,
         }
-    }
-
-    /// Delete every superseded generation's origin key (ADR-023 decision 4, PRD-001
-    /// R14) older than generation `keep_from`, and never the live one. The caller decides
-    /// *when* and *from where*: nothing a release still owes somebody —
-    /// [`Self::oldest_generation_needed`], or all of it while a full-history grant is owed
-    /// — because "no longer needed" is what R14 deletes. Returns how many were deleted.
-    pub fn prune_superseded_origins(&mut self, store: &Store, keep_from: u64) -> Result<usize> {
-        match self.require_governance_ready(store, crate::time::Ms(self.now_hint)) {
-            Ok(_) if self.governance_display_current(self.now_hint) => {}
-            Ok(_) => return Ok(0),
-            Err(error) if governance::refreshing(&error) => return Ok(0),
-            Err(error) => return Err(error),
-        }
-        let live = self.sender.chain_id();
-        let gone = self
-            .origins
-            .retain_from(&self.channel_id, self.epoch, keep_from.min(live));
-        if gone == 0 {
-            return Ok(0);
-        }
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_ORIGINS,
-            &self.origins.to_state(),
-        )?;
-        if let Err(e) = store.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_ORIGINS,
-            &seg,
-        ) {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        Ok(gone)
-    }
-
-    /// Issue a **consent grant** to `target`: the ADR-007 log fact that this
-    /// identity released its sender key to `target`, carrying the `skdm_ref` of the
-    /// SKDM actually delivered over the pairwise session and the history mode in
-    /// force. Appends it with its current consent fact in the same transaction.
-    /// An older source replay must finish before that checked view is available.
-    ///
-    /// The SKDM delivery itself is the caller's (M14.5b); this records the consent.
-    ///
-    /// `entitled_from` is the earliest `(chain_id, iteration)` this consent releases to
-    /// `target` (V210-45): the delivered key's own position, or earlier when history
-    /// is owed too. It is recorded, and no later release to `target` starts before it.
-    /// `full_history` is the approver's per-grant choice (PRD-001 R12), which the grant
-    /// records as its history mode.
-    ///
-    /// **It records nothing as delivered** (V210-88): the key is `delivered` only once `target`
-    /// has taken it, which [`Self::note_delivered`] records when it says so. Returns the grant, and
-    /// whether the consent owes `target` history, the generations before the key's own.
-    pub fn issue_consent(
-        &mut self,
-        profile: &Profile,
-        target: Digest32,
-        delivered_skdm: &Skdm,
-        full_history: bool,
-        entitled_from: (u64, u64),
-        now: crate::time::Ms,
-    ) -> Result<(ConsentGrant, bool)> {
-        let now_ms = now.get();
-        let signer = profile.signer()?;
-        // The grant records what this approval actually released (PRD-001 R12): the
-        // approver's per-grant choice, not a room-wide default.
-        let history_mode = if full_history {
-            HistoryMode::FullHistory
-        } else {
-            HistoryMode::ForwardOnly
-        };
-        let grant = issue_consent_grant(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            target,
-            delivered_skdm,
-            history_mode,
-        )?;
-        // **Not `delivered` yet** (V210-88). Recorded here, in the grant's transaction, a crash
-        // after the commit and before `target` took the key left a node that believed it had
-        // delivered a key the member never held: nothing owed it again, and the member read
-        // nothing from this identity for good. Until it is taken, the consenter is owed a re-key
-        // like any other, which releases from its entitlement, committed below with the grant.
-        //
-        // An entitlement already held (an earlier consent never revoked) stands: both were
-        // decided, and the earlier one released what it released.
-        let mut entitled = self.entitled.clone();
-        let from = entitled
-            .get(&target)
-            .map_or(entitled_from, |e| (*e).min(entitled_from));
-        entitled.insert(target, from);
-        // The generations before the key's own that the decision covers (V210-45), owed as
-        // history: in the same transaction, or a crash between the two lost them.
-        // As `owe_history`: only generations before the live one, and the oldest floor stands.
-        let floor = entitled_from.0;
-        let history_owed = floor < delivered_skdm.body.chain_id && floor < self.sender.chain_id();
-        let mut history = self.history.clone();
-        let history_changed = history_owed && history.get(&target).is_none_or(|f| *f > floor);
-        if history_changed {
-            history.insert(target, floor);
-        }
-        // **One transaction** with the grant (V210-76). Written one after another, a crash after
-        // the grant left no `entitled` row, so the re-key it was owed released the live
-        // generation from its origin: the posts sealed before the consent.
-        let mut rows = vec![(
-            SEG_ENTITLED,
-            seal_segment(
-                &self.sek,
-                SegmentKind::KeyMaterial,
-                SEG_ENTITLED,
-                &positions_bytes(&entitled),
-            )?,
-        )];
-        if history_changed {
-            rows.push((
-                SEG_HISTORY,
-                seal_segment(
-                    &self.sek,
-                    SegmentKind::KeyMaterial,
-                    SEG_HISTORY,
-                    &delivered_bytes(&history),
-                )?,
-            ));
-        }
-        self.append_governance_with(profile, &grant.to_wire(), now_ms, &rows)?;
-        self.entitled = entitled;
-        self.history = history;
-        Ok((grant, history_owed))
     }
 
     /// Whether this identity's sender key has reached its scheduled-rotation bound
@@ -5367,142 +5076,6 @@ impl ChannelState {
         Ok(self.owed_rekey(store, target)? || self.owed_history_for(store, target)?.is_some())
     }
 
-    /// Revoke `target`'s consent to read this identity's messages (ADR-007
-    /// §Revocation): rotate this identity's sender key and append the signed
-    /// revocation naming the generation that excludes `target`.
-    ///
-    /// Revocation *is* rotation with one member left out. The forward guarantee is
-    /// cryptographic and immediate — `target` holds no key for the new generation and
-    /// no key it holds derives one. What `target` already received is not recalled
-    /// and cannot be: ADR-007 §"Enforcement honesty" says so, and no protocol can
-    /// say otherwise.
-    ///
-    /// The remaining consenters are re-keyed by the caller (the node's tick, from
-    /// [`ChannelState::owed_rekeys`]); the rotation does not wait on that, because a
-    /// revocation that took effect only once everyone else was reachable would be no
-    /// revocation at all.
-    pub fn revoke_consent(
-        &mut self,
-        profile: &Profile,
-        target: Digest32,
-        now: crate::time::Ms,
-    ) -> Result<ConsentRevocation> {
-        let me = self.me();
-        if target == me {
-            return Err(Error::MalformedGovernance(
-                "an identity cannot withdraw trust in itself",
-            ));
-        }
-        if !self.has_consented(profile.store(), &target)? {
-            return Err(Error::MalformedGovernance("no trust to withdraw"));
-        }
-        self.revoke_consent_checked(profile, target, now, false)
-    }
-
-    /// A local trust withdrawal narrows access even while old consent facts replay.
-    /// A known absent consent is a no-op; unreadable/corrupt storage remains an error.
-    pub fn withdraw_consent(
-        &mut self,
-        profile: &Profile,
-        target: Digest32,
-        now: crate::time::Ms,
-    ) -> Result<Option<ConsentRevocation>> {
-        if target == self.me() {
-            return Err(Error::MalformedGovernance(
-                "an identity cannot withdraw trust in itself",
-            ));
-        }
-        match self.has_consented(profile.store(), &target) {
-            Ok(false) => {
-                // A prior attempt may have committed the revocation before its entitlement
-                // cleanup. Replay that cleanup before the durable withdrawal debt can clear.
-                self.clear_withdrawn_ledgers(profile.store(), &target)?;
-                return Ok(None);
-            }
-            Ok(true) => {}
-            Err(error) if governance::refreshing(&error) => {}
-            Err(error) => return Err(error),
-        }
-        self.revoke_consent_checked(profile, target, now, true)
-            .map(Some)
-    }
-
-    fn revoke_consent_checked(
-        &mut self,
-        profile: &Profile,
-        target: Digest32,
-        now: crate::time::Ms,
-        narrowing: bool,
-    ) -> Result<ConsentRevocation> {
-        let now_ms = now.get();
-        // Rotate first: the entry names the generation that excludes `target`, so
-        // that generation has to exist before the fact is signed.
-        let next = self.sender.rotated(now_ms)?;
-        let new_chain_id = self.rotate_sender_to_checked(profile, next, now_ms, narrowing)?;
-        let signer = profile.signer()?;
-        let revocation =
-            issue_consent_revocation(signer, &self.channel_id, self.epoch, target, new_chain_id)?;
-        self.append_governance(profile, &revocation.to_wire(), now_ms)?;
-        self.clear_withdrawn_ledgers(profile.store(), &target)?;
-        Ok(revocation)
-    }
-
-    /// Finish all ledgers as one transaction. If this follows an earlier durable revocation,
-    /// replay remains idempotent and preserves no entitlement from the excluded interval.
-    fn clear_withdrawn_ledgers(&mut self, store: &Store, target: &Digest32) -> Result<()> {
-        let mut next_delivered = self.delivered.clone();
-        let mut next_history = self.history.clone();
-        let mut next_entitled = self.entitled.clone();
-        let changed = next_delivered.remove(target).is_some()
-            | next_history.remove(target).is_some()
-            | next_entitled.remove(target).is_some();
-        if !changed {
-            return Ok(());
-        }
-        let delivered = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_DELIVERED,
-            &delivered_bytes(&next_delivered),
-        )?;
-        let history = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_HISTORY,
-            &delivered_bytes(&next_history),
-        )?;
-        let entitled = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_ENTITLED,
-            &positions_bytes(&next_entitled),
-        )?;
-        let mut batch = store.batch()?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_DELIVERED,
-            &delivered,
-        )?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_HISTORY,
-            &history,
-        )?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_ENTITLED,
-            &entitled,
-        )?;
-        batch.commit()?;
-        self.delivered = next_delivered;
-        self.history = next_history;
-        self.entitled = next_entitled;
-        Ok(())
-    }
-
     /// Forget that `target` holds this identity's current sender key, so the next
     /// re-key round delivers it again (ADR-004 O4).
     ///
@@ -6097,12 +5670,8 @@ impl ChannelState {
     }
 
     /// Apply the node's Session rule before its next sync or sweep.
-    pub fn set_node_step_retention(&mut self, store: &Store, seconds: u64) -> Result<()> {
+    pub fn set_node_step_retention(&mut self, seconds: u64) {
         self.node_step_retention = seconds;
-        if self.legacy_cache_only(store)? {
-            return Ok(());
-        }
-        self.forget_settled_owed(store)
     }
 
     /// Floor controls carry durable authorization, like governance: neither message nor
@@ -6124,40 +5693,13 @@ impl ChannelState {
         transaction: Transaction<'_, '_>,
         entry: &Entry,
     ) -> Result<bool> {
-        let hash = entry.entry_hash();
-        let index = self
-            .entries
-            .view(transaction, &self.sek, &self.channel_id)?;
-        Ok(if let Some(tracked) = index.retention(&hash)? {
-            tracked.steps
-        } else if let Some(body) = entry.payload.as_deref() {
-            is_step_body(&self.channel_id, body)
-        } else {
-            // Retention removes its own row but keeps this sealed first-seen subtype fact
-            // beside the log. A body never received has no log page and no such fact: it is
-            // not a Session step this node knows of, and the message lifetime (the longer one)
-            // applies; a disk error below is still an error. Measured 2026-10-20 on the
-            // decider's node (ADR-038 FX-33): a sweep poisoned the room with "retention entry
-            // missing" over an owed entry of a sparse room.
-            let Some(log) = index.log_id(&hash)? else {
-                return Ok(false);
-            };
-            let segment = match transaction {
-                Transaction::Snapshot(snapshot) => {
-                    snapshot.get_segment(&self.channel_id, SegmentKind::Index, log)?
-                }
-                Transaction::Batch(batch) => {
-                    batch.get_segment(&self.channel_id, SegmentKind::Index, log)?
-                }
-            };
-            match segment {
-                Some(segment) => {
-                    parse_first_seen(&open_segment(&self.sek, SegmentKind::Index, log, &segment)?)?
-                        .1
-                }
-                None => false,
-            }
-        })
+        legacy_session_sender::entry_steps_in(
+            &self.entries,
+            transaction,
+            &self.sek,
+            &self.channel_id,
+            entry,
+        )
     }
 
     /// `(this node's own retention, the room's)` when the node's own asks to keep messages longer
@@ -6170,13 +5712,9 @@ impl ChannelState {
     }
 
     /// Set this node's own retention for the room (from its config; `0` = no node limit).
-    /// Takes effect at the next [`ChannelState::sweep_retention`].
-    pub fn set_node_retention(&mut self, store: &Store, secs: u64) -> Result<()> {
+    /// Takes effect at the next owned retention maintenance turn.
+    pub fn set_node_retention(&mut self, secs: u64) {
         self.node_retention = secs;
-        if self.legacy_cache_only(store)? {
-            return Ok(());
-        }
-        self.forget_settled_owed(store)
     }
 
     /// Whether an entry claimed at `claimed_ms` has expired here by `now_ms`: past this node's
@@ -6356,391 +5894,12 @@ impl ChannelState {
         })
     }
 
-    /// Set the **room's** retention (PRD-001 R7): append an ADR-007 policy-update carrying
-    /// `ttl` seconds (`0` = forever). Only a holder of the `policy` capability may — the
-    /// room's admin; anyone else is refused here rather than writing an entry every other
-    /// node would ignore. It applies to what is already stored, at the next sweep (R8).
-    /// Returns whether a different signed rule was appended; equal canonical rules are no-ops.
-    pub fn set_retention(
-        &mut self,
-        profile: &Profile,
-        ttl: u64,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
-        let now_ms = now.get();
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
-        if !self.grants_policy(profile.store(), &me, now_ms)? {
-            return Err(Error::MalformedGovernance(
-                "only the room's admin may set its retention",
-            ));
-        }
-        drop(self.local_append_eligible_for(profile.store(), false)?);
-        self.ensure_governance_append_eligible(profile, false)?;
-        let ttl_ms = ttl.saturating_mul(1_000);
-        // Read the checked canonical rule, not the last display or a local TTL clamp.
-        let current = self
-            .checked_governance(profile.store(), now_ms)?
-            .display(&self.genesis)?;
-        if current.policy.ttl_ms == ttl_ms {
-            return Ok(false);
-        }
-        let update = crate::governance::policy::PolicyUpdate::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            ttl_ms,
-        )?;
-        self.append_governance(profile, &update.to_wire(), now_ms)?;
-        Ok(true)
-    }
-
-    /// Set the shared Session retention without changing message retention.
-    /// Returns whether a different signed rule was appended; equal canonical rules are no-ops.
-    pub fn set_step_retention(
-        &mut self,
-        profile: &Profile,
-        ttl: u64,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
-        let now_ms = now.get();
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
-        if !self.grants_policy(profile.store(), &me, now_ms)? {
-            return Err(Error::MalformedGovernance(
-                "only the room's admin may set its Session retention",
-            ));
-        }
-        drop(self.local_append_eligible_for(profile.store(), false)?);
-        self.ensure_governance_append_eligible(profile, false)?;
-        let ttl_ms = ttl.saturating_mul(1_000);
-        // Read the checked canonical rule, not the last display or a local TTL clamp.
-        let current = self
-            .checked_governance(profile.store(), now_ms)?
-            .display(&self.genesis)?;
-        if current.step_ttl_ms == ttl_ms {
-            return Ok(false);
-        }
-        let update = crate::governance::step_policy::StepPolicyUpdate::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            ttl_ms,
-        )?;
-        self.append_governance(profile, &update.to_wire(), now_ms)?;
-        Ok(true)
-    }
-
-    /// Prune one bounded due page, retaining signed skeletons. Repeated actor turns
-    /// finish a backlog; unrelated rooms do not wait on a whole-history expiry sweep.
-    pub fn sweep_retention(&mut self, store: &Store, now: crate::time::Ms) -> Result<usize> {
-        let now_ms = now.get();
-        self.now_hint = self.now_hint.max(now_ms);
-        if self.legacy_cache_only(store)? {
-            return Ok(0);
-        }
-        match self.require_governance_ready(store, now) {
-            Ok(_) => {}
-            Err(error) if governance::refreshing(&error) => return Ok(0),
-            Err(error) => return Err(error),
-        }
-        if !self.governance_display_current(now_ms) {
-            return Ok(0);
-        }
-        self.forget_settled_owed(store)?;
-        self.prune_expired_key_body_debts(store, now)?;
-        self.refresh_projection(store)?;
-        self.drain_backfill(store, now.get())?;
-        if self.poisoned {
-            return Ok(0);
-        }
-        let retired = self.prune_retention_page(store)?;
-        let pruned = retired + self.sweep_private_sessions(store, now.get())?;
-        if pruned > 0 {
-            self.last_pruned_at = now.get();
-        }
-        if let Err(error) = self.retire_own_historical_keys(store) {
-            self.poison(&error);
-            return Err(error);
-        }
-        Ok(pruned)
-    }
-
     /// Retire a bounded page of package-body recovery work only once this node's
     /// current effective message retention has expired the exact signed package.
     /// The index is ordered by signed time, so an idle sweep reads one next item
     /// and performs no write. The existing retention turn supplies the wake.
     pub(crate) fn key_debt_retention_pending(&self) -> bool {
-        self.key_debt_retention_pending || self.role_owed.key_retention_dirty()
-    }
-
-    pub(crate) fn prune_expired_key_body_debts(
-        &mut self,
-        store: &Store,
-        now: crate::time::Ms,
-    ) -> Result<()> {
-        if self.role_owed.take_key_retention_dirty() {
-            self.key_debt_retention_pending = true;
-        }
-        if !self.governance_display_current(now.get()) {
-            return Ok(());
-        }
-        let ttl = self.effective_retention();
-        if ttl == 0 {
-            self.key_debt_retention_pending = false;
-            return Ok(());
-        }
-        if let Some(wait) = self.key_debt_retention_wait.as_ref() {
-            if !wait.ready.load(std::sync::atomic::Ordering::Acquire) {
-                return Ok(());
-            }
-            self.key_debt_retention_wait = None;
-        }
-        let cutoff = now.get().saturating_sub(ttl.saturating_mul(1_000));
-        let wake = self.history_publication_wake();
-        let read = self.history_read(store)?;
-        let debts = read.expired_key_debts(cutoff, 16)?;
-        if debts.is_empty() {
-            drop(read);
-            self.key_debt_retention_pending = false;
-            return Ok(());
-        }
-        if read.publication_busy() {
-            drop(read);
-            let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let signal = Arc::clone(&ready);
-            let owner = Arc::clone(&self.role_owed);
-            let local = self.me();
-            let task = tokio::spawn(async move {
-                wake.await;
-                signal.store(true, std::sync::atomic::Ordering::Release);
-                owner.mark_key_retention_dirty(local);
-            });
-            self.key_debt_retention_wait =
-                Some(sparse_history::KeyProviderPruneWait { ready, task });
-            self.key_debt_retention_pending = false;
-            return Ok(());
-        }
-        let more = debts.len() == 16;
-        for debt in &debts {
-            let Some((head, entry)) = read.history_validated_header(&debt.author, debt.from)?
-            else {
-                return Err(Error::MalformedAtRest("expired key debt source missing"));
-            };
-            let log = read
-                .log_id(&debt.object)?
-                .ok_or(Error::MalformedAtRest("expired key debt log missing"))?;
-            let saved = store
-                .snapshot()?
-                .get_segment(&self.channel_id, SegmentKind::Index, log)?
-                .ok_or(Error::MalformedAtRest("expired key debt age missing"))?;
-            let (first_seen, _) =
-                parse_first_seen(&open_segment(&self.sek, SegmentKind::Index, log, &saved)?)?;
-            if debt.from != debt.through
-                || head != debt.head
-                || entry.entry_hash() != debt.object
-                || !entry
-                    .skeleton
-                    .v2
-                    .as_ref()
-                    .is_some_and(|v| v.kind == crate::log::history::SignedEntryKind::KeyPackage)
-                || !expired_at(entry.skeleton.claimed_ms.min(first_seen), now.get(), ttl)
-            {
-                return Err(Error::MalformedAtRest("expired key debt binding"));
-            }
-        }
-        drop(read);
-        self.key_debt_retention_pending = more;
-        let mut batch = store.batch()?;
-        batch.derived();
-        let mut index = self
-            .entries
-            .write(&mut batch, &self.sek, &self.channel_id)?;
-        for debt in &debts {
-            index.finish_history_obligation(debt)?;
-        }
-        index.seal()?;
-        batch.commit()?;
-        self.entries.committed();
-        Ok(())
-    }
-
-    fn retention_due(
-        &self,
-        store: &Store,
-        limit: usize,
-    ) -> Result<(Vec<(Digest32, Tracked)>, bool)> {
-        self.entries
-            .read(store, &self.sek, &self.channel_id)?
-            .retention_due(
-                self.now_hint,
-                self.effective_retention(),
-                self.effective_step_retention(),
-                limit,
-            )
-    }
-    fn prune_retention_page(&mut self, store: &Store) -> Result<usize> {
-        let result = (|| -> Result<usize> {
-            let (due, _) = self.retention_due(store, 64)?;
-            if due.is_empty() {
-                return Ok(0);
-            }
-            let pruned = self.prune(store, &due, false)?;
-            if pruned != 0 {
-                self.last_pruned_at = self.now_hint;
-            }
-            Ok(pruned)
-        })();
-        if let Err(ref error) = result {
-            self.poison(error);
-        }
-        result
-    }
-
-    /// A recovered old-epoch receiver is never a live sender key. Retire one only after a
-    /// bounded scan proves that no signed own entry in that epoch still has retained content
-    /// for its chain, or an unresolved body/effect that may need the key. The newest own entry
-    /// must already be in the current epoch: only then can no later own entry use an old key.
-    fn retire_own_historical_keys(&mut self, store: &Store) -> Result<()> {
-        let me = self.me();
-        let head = self.dag.verified_head(&me);
-        let retention = (self.effective_retention(), self.effective_step_retention());
-        let generation = self.entries.commit_generation();
-        let scan = &mut self.historical_retirement;
-        if self.own_behind {
-            scan.reset();
-            return Ok(());
-        }
-        if scan.head != head
-            || scan.epoch != self.epoch
-            || scan.retention != retention
-            || scan.entry_generation != generation
-            || scan.wake_at.is_some_and(|at| self.now_hint >= at)
-        {
-            scan.reset();
-            scan.head = head;
-            scan.epoch = self.epoch;
-            scan.retention = retention;
-            scan.entry_generation = generation;
-        }
-        if scan.complete || head == 0 {
-            return Ok(());
-        }
-        let (key, id, mut next) = match scan.current {
-            Some(current) => current,
-            None => {
-                let snapshot = store.snapshot()?;
-                let Some((key, id)) = own_historical_keys::first_after(
-                    &snapshot,
-                    &self.sek,
-                    &self.channel_id,
-                    scan.after,
-                )?
-                else {
-                    scan.complete = true;
-                    return Ok(());
-                };
-                (key, id, 1)
-            }
-        };
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        let Some(feed) = self.dag.feed(&me) else {
-            return Ok(());
-        };
-        if feed
-            .get(&entries, head)?
-            .is_none_or(|entry| entry.skeleton.epoch != self.epoch)
-        {
-            // No own entry closes the old epoch yet. The next own append changes the head.
-            scan.complete = true;
-            return Ok(());
-        }
-        let epoch = u64::from_be_bytes(
-            key[..8]
-                .try_into()
-                .map_err(|_| Error::MalformedAtRest("own historical epoch key width"))?,
-        );
-        let chain = u64::from_be_bytes(
-            key[8..16]
-                .try_into()
-                .map_err(|_| Error::MalformedAtRest("own historical chain key width"))?,
-        );
-        if epoch >= self.epoch {
-            scan.after = Some(key);
-            scan.current = None;
-            return Ok(());
-        }
-        for _ in 0..64 {
-            if next > head {
-                drop(entries);
-                let mut batch = store.batch()?;
-                own_historical_keys::retire(&mut batch, &self.sek, &self.channel_id, key, id)?;
-                batch.commit()?;
-                scan.after = Some(key);
-                scan.current = None;
-                return Ok(());
-            }
-            let Some((_source, header)) = entries.history_validated_header(&me, next)? else {
-                // A signed position with no local header might yet hold this key's content.
-                scan.after = Some(key);
-                scan.current = None;
-                return Ok(());
-            };
-            next += 1;
-            if header.skeleton.epoch != epoch
-                || !header
-                    .skeleton
-                    .v2
-                    .as_ref()
-                    .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Content)
-            {
-                continue;
-            }
-            let hash = header.entry_hash();
-            let entry = entries.history_entry(&hash)?;
-            let Some(payload) = entry.as_ref().and_then(|entry| entry.payload.as_deref()) else {
-                if entries.history_effect_finished(&hash)? {
-                    if let Some(log) = entries.log_id(&hash)? {
-                        let first_seen = history_first_seen_at(
-                            &store.snapshot()?,
-                            &self.sek,
-                            &self.channel_id,
-                            log,
-                        )?;
-                        let base = header.skeleton.claimed_ms.min(first_seen);
-                        if expired_at(base, self.now_hint, retention.0)
-                            && expired_at(base, self.now_hint, retention.1)
-                        {
-                            continue;
-                        }
-                        if retention.0 != 0 && retention.1 != 0 {
-                            let due = base
-                                .saturating_add(retention.0.max(retention.1).saturating_mul(1_000));
-                            if due > self.now_hint {
-                                scan.wait_until(due);
-                            }
-                        }
-                    }
-                }
-                scan.after = Some(key);
-                scan.current = None;
-                return Ok(());
-            };
-            let message = GroupMessage::from_wire(payload)?;
-            if message.header.author_id != me || message.header.epoch != epoch {
-                return Err(Error::MalformedAtRest(
-                    "own historical receiver entry binding",
-                ));
-            }
-            if message.header.channel_id == self.channel_id && message.header.chain_id == chain {
-                // A retained message may need its receiver after a restart or re-projection.
-                scan.after = Some(key);
-                scan.current = None;
-                return Ok(());
-            }
-        }
-        scan.current = Some((key, id, next));
-        Ok(())
+        self.key_debt_retention_pending
     }
 
     /// How long nothing new must have expired before a backlog smaller than
@@ -7078,11 +6237,6 @@ impl ChannelState {
         Ok(due.len())
     }
 
-    /// Read fixed-size retention metadata from one saved snapshot.
-    fn retention_get(&self, store: &Store, hash: &Digest32) -> Result<Option<Tracked>> {
-        let snapshot = store.snapshot()?;
-        self.retention_get_in(Transaction::Snapshot(&snapshot), hash)
-    }
     fn retention_get_in(
         &self,
         transaction: Transaction<'_, '_>,
@@ -7206,73 +6360,6 @@ impl ChannelState {
         )
     }
 
-    /// Queue the age of an exact, already-authenticated body while its sparse effect is still
-    /// being published. Sparse Content cannot be marked settled merely to make the ordinary
-    /// index lookup see it: settlement means its semantic projection completed. The caller's
-    /// typed effect owns this entry and the same Batch owns both its source and this retention
-    /// record, so the entry itself is the authoritative input until settlement is sealed.
-    fn track_known_body_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        entry: &Entry,
-        log_id: u64,
-    ) -> Result<()> {
-        let entry_hash = entry.entry_hash();
-        if entry.payload.as_deref().is_some_and(retained_control) {
-            return Ok(());
-        }
-        let body_steps = entry
-            .payload
-            .as_deref()
-            .is_some_and(|body| is_step_body(&self.channel_id, body));
-        let saved = batch
-            .get_segment(&self.channel_id, SegmentKind::Index, log_id)?
-            .ok_or(Error::MalformedAtRest("sparse Content age missing"))?;
-        let (source_first_seen, source_steps) = parse_first_seen(&open_segment(
-            &self.sek,
-            SegmentKind::Index,
-            log_id,
-            &saved,
-        )?)?;
-        let previous = self.retention_get_in(Transaction::Batch(batch), &entry_hash)?;
-        if previous.is_some_and(|tracked| tracked.log_id != log_id) {
-            return Err(Error::MalformedAtRest(
-                "sparse Content retention locator differs",
-            ));
-        }
-        let first_seen_ms = previous
-            .map(|tracked| tracked.first_seen_ms)
-            .unwrap_or(source_first_seen)
-            .min(source_first_seen);
-        let steps = body_steps || source_steps || previous.is_some_and(|tracked| tracked.steps);
-        if steps {
-            self.invalidate_display();
-            self.private_sessions.legacy_pending.insert(entry_hash);
-        }
-        let claimed_ms = previous
-            .and_then(|tracked| tracked.claimed_ms)
-            .or_else(|| steps.then_some(entry.skeleton.claimed_ms));
-        let cache_id = previous.and_then(|tracked| tracked.cache_id);
-        let seg = seal_segment(
-            &self.sek,
-            SegmentKind::Index,
-            log_id,
-            &first_seen_bytes(first_seen_ms, steps),
-        )?;
-        batch.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg)?;
-        self.queue_retention(
-            batch,
-            entry_hash,
-            Some(Tracked {
-                log_id,
-                steps,
-                first_seen_ms,
-                claimed_ms,
-                cache_id,
-            }),
-        )
-    }
-
     /// Append an already-built governance struct as a signed log entry.
     fn append_governance(
         &mut self,
@@ -7297,19 +6384,20 @@ impl ChannelState {
         )
     }
 
-    /// Non-mutating command eligibility shared with same-policy no-op decisions.
-    /// Physical publication/capacity admission remains specific to an actual append.
-    fn ensure_governance_append_eligible(
-        &self,
-        profile: &Profile,
-        settle_sparse: bool,
-    ) -> Result<()> {
-        self.ensure_governance_append_eligible_for(profile, settle_sparse, false)
-    }
-
     fn ensure_governance_append_eligible_for(
         &self,
         profile: &Profile,
+        settle_sparse: bool,
+        recover_own: bool,
+    ) -> Result<()> {
+        let me = profile.signer()?.fingerprint();
+        self.ensure_governance_append_eligible_by(profile.store(), &me, settle_sparse, recover_own)
+    }
+
+    fn ensure_governance_append_eligible_by(
+        &self,
+        store: &Store,
+        me: &Digest32,
         settle_sparse: bool,
         recover_own: bool,
     ) -> Result<()> {
@@ -7320,16 +6408,14 @@ impl ChannelState {
             return Err(Error::RoomNotSynced);
         }
         if recover_own {
-            self.require_own_recovery_complete(profile.store())?;
+            self.require_own_recovery_complete(store)?;
         } else {
             self.require_own_history_current()?;
         }
-        if settle_sparse && (!self.uses_sparse_history(profile.store())? || self.settled) {
+        if settle_sparse && (!self.uses_sparse_history(store)? || self.settled) {
             return Err(Error::MalformedBundle("sparse settlement state differs"));
         }
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
-        if !self.authors.contains_key(&me) {
+        if !self.authors.contains_key(me) {
             return Err(Error::Profile("this identity is not an author of the room"));
         }
         Ok(())
@@ -8123,25 +7209,6 @@ impl ChannelState {
         SessionReport::from_room(room.out.into_inner(), session, fatal)
     }
 
-    /// Accept a **sender-key distribution message** from `author` (ADR-006/ADR-007
-    /// step 2/3): the sender key that member released to this identity, delivered
-    /// over the ADR-004 pairwise session (M14.5b `node::pairwise`).
-    ///
-    /// The SKDM is verified against the author's admitted key and bound to this
-    /// channel and epoch. On acceptance the chain is persisted **and every content
-    /// entry already stored from that author is retried**, so a message that arrived
-    /// as ciphertext before consent renders as soon as the key arrives — the
-    /// monotone per-sender fill-in ADR-007 describes. Returns how many entries that
-    /// backfill rendered and whether key state actually changed.
-    pub fn accept_skdm(
-        &mut self,
-        store: &Store,
-        skdm: &Skdm,
-        now: crate::time::Ms,
-    ) -> Result<AcceptedSkdm> {
-        self.accept_skdm_mode(store, skdm, now, false)
-    }
-
     fn accept_skdm_mode(
         &mut self,
         store: &Store,
@@ -8163,11 +7230,6 @@ impl ChannelState {
             .get(&author)
             .ok_or(Error::MalformedGovernance("SKDM from an unadmitted author"))?
             .clone();
-        // A drive key (ADR-029 SC-2) comes by the same paths as a sender key and is told apart
-        // by what it is bound to.
-        if skdm.body.channel_id == drive_channel(&self.channel_id) {
-            return self.accept_drive_skdm(store, skdm, &key, now_ms);
-        }
         // Current peer authorization stays tied to this room's epoch. A self-author
         // recovery release may instead name the authenticated epoch of older content.
         let key_epoch = if own_recovery {
@@ -8427,47 +7489,10 @@ impl ChannelState {
     /// author is dropped silently (ADR-036 H-1). This node itself is always known: its own
     /// Sessions are its own durable fact (R5).
     pub fn drive_from_known(&self, store: &Store) -> Result<(Vec<Digest32>, Vec<Digest32>)> {
-        let me = self.me();
-        let held: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
-        let snapshot = store.snapshot()?;
-        let mut known = BTreeSet::new();
-        let mut refreshing = BTreeSet::new();
-        for author in held {
-            if author == me {
-                continue;
-            }
-            if !self.current_session_control_ready(store, &author)? {
-                refreshing.insert(author);
-                continue;
-            }
-            let announced = self
-                .floor_author(Transaction::Snapshot(&snapshot), &author)?
-                .announced;
-            // A signed current floor is authoritative in sparse rooms. Only an older author
-            // without floors needs the contiguous legacy encrypted-generation fallback, and
-            // that fallback's own refusal is this author's gap, not the room's.
-            let newest = match announced {
-                Some(generation) => Some(generation),
-                None => match self.legacy_drive_generation(store, &author) {
-                    Ok(generation) => generation,
-                    Err(Error::StreamRefused("Session control facts are refreshing")) => {
-                        refreshing.insert(author);
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                },
-            };
-            if newest.is_none_or(|g| self.drive.receivers.contains_key(&(author, g)))
-                || self.key_packages.pending_from(&author)
-            {
-                known.insert(author);
-            }
-        }
-        known.insert(me);
-        Ok((
-            known.into_iter().collect(),
-            refreshing.into_iter().collect(),
-        ))
+        let view = self
+            .entries
+            .render_view(store, &self.sek, &self.channel_id)?;
+        self.drive_from_known_view(&view)
     }
 
     /// The members a drive key may be owed to: every member admitted here that has not left,
@@ -8485,103 +7510,6 @@ impl ChannelState {
             .collect()
     }
 
-    /// The highest drive generation this identity's own feed shows it used here, if any: a node
-    /// in the room again must not reuse one the others still hold (as the sender key, V210-164).
-    fn drive_used(&self, store: &Store) -> Result<Option<u64>> {
-        let me = self.me();
-        let ns = drive_channel(&self.channel_id);
-        let mut used = self.private_drive_used(store)?;
-        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
-        if let Some(feed) = self.dag.feed(&me) {
-            for entry in feed.iter(&entries) {
-                let entry = entry?;
-                if let Some(msg) = entry
-                    .payload
-                    .as_deref()
-                    .and_then(|p| GroupMessage::from_wire(p).ok())
-                    .filter(|m| m.header.channel_id == ns)
-                {
-                    used =
-                        Some(used.map_or(msg.header.chain_id, |old| old.max(msg.header.chain_id)));
-                }
-            }
-        }
-        Ok(used)
-    }
-
-    /// A new drive generation for this node here: past every one it used, owed whole to
-    /// `holders`.
-    fn begin_drive(
-        &mut self,
-        store: &Store,
-        holders: &BTreeSet<Digest32>,
-        now_ms: u64,
-        _current: governance::GovernanceCurrent,
-    ) -> Result<()> {
-        let me = self.me();
-        // This author's own floor boundary waits only on this author's own control effects
-        // through its committed head; another author's still-building receipt is not this
-        // author's publication's to wait on.
-        if !self.current_session_control_ready(store, &me)? {
-            return Err(Error::StreamRefused(
-                session_projection::floor_index::REFRESHING,
-            ));
-        }
-        let published = self
-            .floor_author(Transaction::Snapshot(&store.snapshot()?), &me)?
-            .announced;
-        let floor = self
-            .drive
-            .chain
-            .as_ref()
-            .map(SenderChain::chain_id)
-            .into_iter()
-            .chain(self.drive_used(store)?)
-            .chain(published)
-            .max();
-        // A pre-upgrade departure has no public generation marker. Legacy generations began
-        // at zero and incremented; start its replacement in the upper half of the namespace
-        // rather than reusing the erased generation. Current departures use their signed floor.
-        let first = if self.admission(&me).0 == 0 {
-            0
-        } else {
-            1u64 << 63
-        };
-        let next = floor.map_or(Ok(first), |f| {
-            f.checked_add(1)
-                .ok_or(Error::MalformedBundle("drive chain_id overflow"))
-        })?;
-        let me = self.me();
-        let chain = SenderChain::new(
-            &drive_channel(&self.channel_id),
-            self.epoch,
-            &me,
-            next,
-            now_ms,
-        )?;
-        let members = self.drive_members();
-        self.drive.begin(
-            chain,
-            holders.iter().filter(|m| members.contains(*m)).copied(),
-        );
-        Ok(())
-    }
-
-    /// Append one entry of Session `session_id` (ADR-029 SC-1), sealed under this node's drive
-    /// key (SC-2): only members it trusts with drive (`holders`) open it. The drive key is begun
-    /// here at its first use, owed whole to `holders`, and rotated on the sender key's schedule.
-    /// Returns the entry's hash.
-    pub fn append_session(
-        &mut self,
-        profile: &Profile,
-        session_id: &str,
-        body: &str,
-        holders: &BTreeSet<Digest32>,
-        now_millis: u64,
-    ) -> Result<Digest32> {
-        self.append_private_session(profile, session_id, body, holders, now_millis)
-    }
-
     /// The sessions with an entry placed in this room since the last call, each once: what the
     /// node says as [`crate::node::api::NodeEvent::SessionEntry`] (ADR-029 CL-2).
     pub fn take_session_news(&mut self) -> Vec<String> {
@@ -8589,158 +7517,6 @@ impl ChannelState {
         news.sort_unstable();
         news.dedup();
         news
-    }
-
-    /// Whether this node's drive key here changed and nothing is written under the new one yet
-    /// ([`crate::node::drive::KEY_CHANGED`] is owed): a generation past the first with no entry of
-    /// this node's under it. Worked out from the log once, then kept up to date.
-    pub fn key_change_unsaid(&mut self, store: &Store) -> Result<bool> {
-        if let Some(unsaid) = self.drive.change_unsaid {
-            return Ok(unsaid);
-        }
-        let Some(live) = self
-            .drive
-            .chain
-            .as_ref()
-            .map(SenderChain::chain_id)
-            .filter(|g| *g > 0)
-        else {
-            // No key (or the initial generation) cannot owe a key-change notice.
-            // Its answer must not depend on an unrelated legacy control scan.
-            self.drive.change_unsaid = Some(false);
-            return Ok(false);
-        };
-        let used = self.drive_used(store)?;
-        let unsaid = used.is_none_or(|u| u < live);
-        self.drive.change_unsaid = Some(unsaid);
-        Ok(unsaid)
-    }
-
-    /// Begin this node's drive key here if it has none yet and a member of the room is in
-    /// `holders` (SC-2a): a member given drive on a Session that has written nothing is owed the
-    /// key at once, not at the Session's first entry. Whether a key was begun.
-    pub fn ensure_drive(
-        &mut self,
-        store: &Store,
-        holders: &BTreeSet<Digest32>,
-        now: crate::time::Ms,
-        current: governance::GovernanceCurrent,
-    ) -> Result<bool> {
-        if self.drive.chain.is_some() || self.poisoned {
-            return Ok(false);
-        }
-        let members = self.drive_members();
-        if !holders.iter().any(|h| members.contains(h)) {
-            return Ok(false);
-        }
-        self.begin_drive(store, holders, now.get(), current)?;
-        self.persist_drive(store)?;
-        self.drive.change_unsaid = None;
-        Ok(true)
-    }
-
-    /// Change this node's drive key if a member it was released to is no longer in `holders`
-    /// (SC-2b): a new generation, owed whole to the members that still are. Returns the members
-    /// that lost it; none, and nothing changes, when every holder still has drive.
-    pub fn rotate_drive_if_lost(
-        &mut self,
-        store: &Store,
-        holders: &BTreeSet<Digest32>,
-        now: crate::time::Ms,
-        current: governance::GovernanceCurrent,
-    ) -> Result<Vec<Digest32>> {
-        let now_ms = now.get();
-        let lost = self.drive.lost(holders);
-        if lost.is_empty() || self.drive.chain.is_none() {
-            return Ok(lost);
-        }
-        self.drive.forget(&lost);
-        self.begin_drive(store, holders, now_ms, current)?;
-        self.persist_drive(store)?;
-        self.drive.change_unsaid = Some(true);
-        Ok(lost)
-    }
-
-    /// The members owed this node's live drive key (SC-2a), each now marked owed from where the
-    /// key stands, if it was not before; the marks are kept, so a release made later is made
-    /// from them.
-    pub fn owed_drive(
-        &mut self,
-        profile: &Profile,
-        holders: &BTreeSet<Digest32>,
-        now: crate::time::Ms,
-    ) -> Result<Vec<Digest32>> {
-        self.ensure_session_floors(profile, holders, now.get())?;
-        let members = self.drive_members();
-        let owed = self.drive.take_owed(&members, holders);
-        if !owed.is_empty() {
-            self.persist_drive(profile.store())?;
-        }
-        Ok(owed)
-    }
-
-    /// The SKDM releasing this node's live drive key to `member` from its mark, and its
-    /// generation, for [`Self::note_drive_delivered`] once sent.
-    pub fn drive_skdm_for(
-        &self,
-        profile: &Profile,
-        member: &Digest32,
-        _current: governance::GovernanceCurrent,
-    ) -> Result<(Skdm, u64)> {
-        self.require_legacy_current(profile.store())?;
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        self.drive.release_for(profile.signer()?, member)
-    }
-
-    /// Record that `member` holds generation `generation` of this node's drive key.
-    pub fn note_drive_delivered(
-        &mut self,
-        store: &Store,
-        member: Digest32,
-        generation: u64,
-    ) -> Result<()> {
-        self.drive.note_delivered(member, generation);
-        self.persist_drive(store)
-    }
-
-    /// Take a drive key `author` released to this node (SC-2), verified against its admitted key
-    /// and bound to this room's drive namespace, and open what it can of `author`'s Sessions.
-    fn accept_drive_skdm(
-        &mut self,
-        store: &Store,
-        skdm: &Skdm,
-        key: &CompositePublicKey,
-        now_ms: u64,
-    ) -> Result<AcceptedSkdm> {
-        let chain =
-            ReceiverChain::from_skdm(skdm, key, &drive_channel(&self.channel_id), self.epoch)?;
-        let slot = (skdm.body.author_id, chain.chain_id());
-        if self.drive.receivers.contains_key(&slot) {
-            return Ok(AcceptedSkdm {
-                rendered: 0,
-                changed: false,
-            });
-        }
-        if self.drive.receivers.len() >= crate::node::drive::MAX_DRIVE_CHAINS {
-            return Err(Error::SizeLimitExceeded("room drive keys"));
-        }
-        self.drive.receivers.insert(slot, chain);
-        self.reset_private_pulls();
-        self.persist_drive(store)?;
-        self.drive.told_unheld.remove(&skdm.body.author_id);
-        let before = self.drive.news.len();
-        self.backfill(store, &skdm.body.author_id, now_ms)?;
-        self.render_pending_private(store, now_ms)?;
-        // What it opened of Sessions: a key-changed entry is none of theirs.
-        Ok(AcceptedSkdm {
-            rendered: self.drive.news[before..]
-                .iter()
-                .filter(|id| !crate::node::drive::is_key_changed(id))
-                .count(),
-            changed: true,
-        })
     }
 
     /// Open one Session entry with the drive key it names, if this node holds it, queueing its
@@ -8922,185 +7698,12 @@ impl ChannelState {
         )
     }
 
-    pub(crate) fn advance_receiver_release_cleanup(
-        &mut self,
-        store: &Store,
-    ) -> Result<(bool, bool, bool)> {
-        // A selected package owns its exact cursor until ordinary completion. Do not
-        // change the replay basis while preparation waits on that attempt's authority.
-        if self.key_packages.has_attempt() {
-            return Ok((false, false, false));
-        }
-        let mut batch = store.batch()?;
-        let progress =
-            receiver_releases::advance(&mut batch, &self.sek, &self.channel_id, &self.receivers)?;
-        if let Some((more, retry_ready)) = progress {
-            let replay = if retry_ready {
-                Some(
-                    self.key_packages
-                        .capacity_retry(&mut batch, &self.sek, &self.channel_id)?,
-                )
-            } else {
-                None
-            };
-            let more = more || receiver_overlay::pending(&batch, &self.sek, &self.channel_id)?;
-            batch.commit()?;
-            if let Some(replay) = replay {
-                self.key_packages = replay;
-            }
-            Ok((more, retry_ready, false))
-        } else if let Some((more, own_retry_ready)) =
-            receiver_overlay::advance(&mut batch, &self.sek, &self.channel_id)?
-        {
-            batch.commit()?;
-            Ok((more, false, own_retry_ready))
-        } else {
-            Ok((false, false, false))
-        }
-    }
-
     /// How many generations of other members' sender keys this node holds here: what `vox
     /// status` reports beside [`Self::key_generations`], and what R14 keeps down to the ones
-    /// still needed ([`Self::prune_superseded_receivers`]).
+    /// still needed (the native R14 key-pruning component).
     #[must_use]
     pub fn received_key_generations(&self) -> usize {
         self.receivers.len()
-    }
-
-    /// Delete every received sender-key generation this node no longer needs (PRD-001 R14 on
-    /// the receiving side): the sender prunes its own origins ([`Self::prune_superseded_origins`]),
-    /// and a receiver that kept every generation it was ever given still opened all of them.
-    ///
-    /// A generation `c` of `author` is no longer needed once this node holds `author`'s feed
-    /// without a gap up to an entry under a later generation, and every entry under `c` in that
-    /// stretch is rendered. A sender only moves forward, so no entry under `c` can follow one
-    /// under a later generation: none can still arrive. An entry whose body has expired here
-    /// (PRD-001 R10) needs no key. **An entry whose body has not arrived and has not expired is
-    /// not received yet** (V030-10): it fills in later, and which generation it is under is
-    /// unknown until it does, so it counts as a gap. Kept: the newest generation held, and every
-    /// generation with an entry not yet rendered — no consent on the log yet, say — or that may
-    /// still be followed by one (a gap, a body still to come, or no later generation yet).
-    /// Returns how many generations went.
-    pub fn prune_superseded_receivers(&mut self, store: &Store) -> Result<usize> {
-        if self.poisoned {
-            return Ok(0);
-        }
-        let rendered = self
-            .entries
-            .render_view(store, &self.sek, &self.channel_id)?;
-        let authors: BTreeSet<Digest32> = self.receivers.keys().map(|(a, _)| *a).collect();
-        let mut gone: Vec<(Digest32, u64)> = Vec::new();
-        for author in authors {
-            let held: Vec<u64> = self
-                .receivers
-                .range((author, 0)..=(author, u64::MAX))
-                .map(|((_, c), _)| *c)
-                .collect();
-            if held.len() <= 1 {
-                continue;
-            }
-            let Some(feed) = self.dag.feed(&author) else {
-                continue;
-            };
-            let mut newest: Option<u64> = None;
-            let mut unrendered: BTreeSet<u64> = BTreeSet::new();
-            for seq in 1..=self.dag.verified_head(&author) {
-                // A gap: what follows it is not known, so neither is what it still needs.
-                let Some(entry) =
-                    feed.get(&self.entries.read(store, &self.sek, &self.channel_id)?, seq)?
-                else {
-                    break;
-                };
-                let Some(payload) = entry.payload.as_deref() else {
-                    // Expired: its key is needed by nothing. Not expired: a body still to come,
-                    // under a generation not known yet — every generation from here on stays.
-                    if self.body_expired(entry.skeleton.claimed_ms, crate::time::Ms(self.now_hint))
-                    {
-                        continue;
-                    }
-                    break;
-                };
-                if !matches!(classify_payload(payload), Ok(EntryKind::Content)) {
-                    continue;
-                }
-                let Ok(msg) = GroupMessage::from_wire(payload) else {
-                    continue;
-                };
-                let c = msg.header.chain_id;
-                newest = Some(newest.map_or(c, |n| n.max(c)));
-                if rendered.fact(&entry.entry_hash())?.is_none() {
-                    unrendered.insert(c);
-                }
-            }
-            let Some(newest) = newest else {
-                continue;
-            };
-            let last_held = held.last().copied().unwrap_or(0);
-            gone.extend(
-                held.iter()
-                    .filter(|c| **c < newest && **c < last_held && !unrendered.contains(c))
-                    .map(|c| (author, *c)),
-            );
-        }
-        if gone.is_empty() {
-            return Ok(0);
-        }
-        for slot in &gone {
-            // `ReceiverChain` holds its chain and skipped keys zeroized on drop.
-            self.receivers.remove(slot);
-        }
-        self.persist_receivers(store)?;
-        Ok(gone.len())
-    }
-
-    fn backfill(&mut self, store: &Store, author: &Digest32, now_ms: u64) -> Result<usize> {
-        // Commit one bounded backfill chunk and its continuation together.
-        let mut rows: Vec<Rendered> = Vec::new();
-        let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
-        let result = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.derived();
-            rows =
-                self.backfill_into(&mut batch, author, &BTreeSet::new(), now_ms, &mut expired)?;
-            // Even an unrendered page advances the durable work cursor. Do not discard it
-            // merely because this chunk did not hold a newly readable body.
-            if self.chains_advanced {
-                self.queue_receivers(&mut batch)?;
-            }
-
-            batch.commit()
-        })();
-        if let Err(e) = result {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        // The cursor moves even when this page renders no plaintext row. Drop the entry-store
-        // read cache at the commit boundary or the next maintenance turn sees the old queue root
-        // and commits the same page forever.
-        self.entries.committed();
-        self.chains_advanced = false;
-        let rendered = rows.len();
-        self.place_committed(store, rows, &expired)?;
-        Ok(rendered)
-    }
-
-    /// Render every stored content entry from `author` not yet in the timeline (nor in `skip`)
-    /// into `batch`, without committing it.
-    fn backfill_into(
-        &mut self,
-        batch: &mut crate::node::store::Batch<'_>,
-        author: &Digest32,
-        skip: &BTreeSet<Digest32>,
-        now_ms: u64,
-        expired: &mut Vec<(Digest32, Tracked)>,
-    ) -> Result<Vec<Rendered>> {
-        {
-            let mut writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
-            writer.queue_backfill(*author, Some(1))?;
-            writer.seal()?;
-        }
-        self.drain_backfill_into(batch, skip, now_ms, expired)
     }
 
     fn drain_backfill_into(
@@ -9706,7 +8309,6 @@ impl ChannelState {
             if !expired.is_empty() {
                 self.prune(store, expired, true)?;
             }
-            self.migrate_legacy_steps(store, self.now_hint)?;
             Ok(())
         })();
         if let Err(ref error) = settled {
@@ -10025,168 +8627,6 @@ impl ChannelState {
             .unwrap_or_default()
     }
 
-    /// Author a text message: encrypt under this identity's sender chain, wrap in
-    /// a signed ADR-008 log entry, accept it into the DAG, and persist entry +
-    /// rendering + advanced chain state atomically. Returns the rendered message.
-    pub fn append_text(
-        &mut self,
-        profile: &Profile,
-        text: &str,
-        // **Milliseconds**, from one read of one clock. Renamed from `now_ms` rather than
-        // converted at the call site: this value becomes half the ADR-020 claim ordering key, and a
-        // caller still thinking in seconds should fail to compile rather than stamp 1970.
-        now_millis: u64,
-    ) -> Result<Rendered> {
-        // A person's post deliberately undoes a departure that no peer has acknowledged yet
-        // (V210-164). Automatic key, receipt, session, and share work has no such exception.
-        self.ensure_local_append_available_for(profile.store(), true)?;
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        if !self.settled {
-            return Err(Error::RoomNotSynced);
-        }
-        self.require_own_history_current()?;
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
-        if !self.authors.contains_key(&me) {
-            return Err(Error::Profile("this identity is not an author of the room"));
-        }
-        // An ended room takes no new message (V030-08). The actor says so to the person; this
-        // is the backstop. A post while a leave waits to be heard is allowed, and undoes the
-        // leave (V210-164).
-        if self.ended(now_millis).is_some() {
-            return Err(Error::Profile("this room has ended"));
-        }
-        let (now_millis, skipped) = self.stamp_after_held(profile.store(), now_millis)?;
-        let content = Content::text(now_millis, text)?;
-        self.prepare_content_context(profile, &me, now_millis, true)?;
-        let plaintext = Zeroizing::new(content.to_canonical_vec());
-        let msg = self.sender.encrypt(&plaintext)?;
-        let payload = msg.to_wire();
-        #[cfg(feature = "mutant-sender")]
-        let payload = crate::log::sync::mutant::authored(payload);
-        #[cfg(feature = "mutant-sender")]
-        let payload = if crate::log::sync::mutant::misbound() {
-            let skdm = self.skdm_for_consent(profile)?;
-            crate::governance::membership::issue_consent_grant(
-                signer,
-                &self.channel_id,
-                self.epoch + 7,
-                me,
-                &skdm,
-                self.genesis.body.policy.history_mode,
-            )?
-            .to_wire()
-        } else {
-            payload
-        };
-
-        let skeleton = self.next_skeleton(profile, &me, &payload, now_millis)?;
-        let entry = Entry::build_signed(signer, skeleton, payload)?;
-        let entry_hash = entry.entry_hash();
-        let wire = entry.to_wire();
-        let rendered = Rendered {
-            entry_hash,
-            author: me,
-            created_millis: now_millis,
-            text: content.text,
-            arrival: self.next_log_id,
-            shown_at_ms: 0,
-            late: false,
-            owed: false,
-        };
-
-        let id = self.next_log_id;
-        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
-        let cache_seg = seal_segment(
-            &self.sek,
-            SegmentKind::PlaintextCache,
-            id,
-            &cache_bytes(&rendered),
-        )?;
-        let sender_seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_SENDER,
-            &self.sender.to_state(),
-        )?;
-        let seen_seg = seal_segment(
-            &self.sek,
-            SegmentKind::Index,
-            id,
-            &first_seen_bytes(now_millis, false),
-        )?;
-
-        // Validate against the DAG first (structural), then persist, then commit
-        // to memory. A persist failure poisons the channel (see module docs).
-        let key = signer.public_key();
-
-        let persisted = (|| -> Result<()> {
-            self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
-            let mut batch = profile.store().batch()?;
-            let settlement = self.publish_entry_into(&mut batch, &entry)?;
-            self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
-            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::PlaintextCache,
-                id,
-                &cache_seg,
-            )?;
-            {
-                let mut index = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.put_rendered(&rendered, shown_now())?;
-                index.seal()?;
-            }
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_SENDER,
-                &sender_seg,
-            )?;
-            batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen_seg)?;
-            self.queue_retention(
-                &mut batch,
-                entry_hash,
-                Some(Tracked {
-                    log_id: id,
-                    first_seen_ms: now_millis,
-                    steps: false,
-                    claimed_ms: Some(now_millis),
-                    cache_id: Some(id),
-                }),
-            )?;
-            self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
-            batch.commit()
-        })();
-        if let Err(e) = persisted {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        self.entries.committed();
-        // The send is already durable. A display-finalization error poisons future reads,
-        // but must not tell the caller that this committed message was never sent.
-        let _ = self.seal_render_visibility(profile.store(), std::slice::from_ref(&rendered));
-        let _ = self.finish_entry_publication(profile.store());
-        self.next_log_id = id.saturating_add(1);
-        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !skipped.is_empty() {
-            if self.skipped.len() >= SKIPPED_KEPT {
-                self.skipped.pop_front();
-            }
-            self.skipped.push_back((entry_hash, skipped));
-        }
-
-        // Persistence succeeded; a later sealed-index read failure reports storage health,
-        // not an unsent post. The returned receipt needs no retained plaintext copy.
-        let _ = self.note_rendered(profile.store(), &rendered.entry_hash);
-        Ok(rendered)
-    }
-
     /// Read one message's readers from the same snapshot as its rendered row. Each index
     /// fetch is bounded; the returned identities are bounded by the admitted-author limit.
     fn read_by(rendered: &entry_store::RenderView<'_>, entry: &Digest32) -> Result<Vec<Digest32>> {
@@ -10362,343 +8802,6 @@ impl ChannelState {
         Ok(out)
     }
 
-    /// Durably mark one bounded request as locally read. Signed receipts are published
-    /// later; an already recorded mark is idempotent, and invalidated selections fail whole.
-    pub(crate) fn admit_read_marks(
-        &mut self,
-        profile: &Profile,
-        shown: &[Digest32],
-        now_ms: u64,
-    ) -> Result<()> {
-        self.require_legacy_current(profile.store())?;
-        if shown.len() > crate::node::content::MAX_READ_HASHES {
-            return Err(Error::SizeLimitExceeded("read marks"));
-        }
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        self.require_governance_display(profile.store(), crate::time::Ms(now_ms))?;
-        let me = profile.fingerprint();
-        if !self.authors.contains_key(&me) || self.has_left(&me) {
-            return Err(Error::Profile("this identity has left the room"));
-        }
-        if self.ended(now_ms).is_some() {
-            return Err(Error::Profile("this room has ended"));
-        }
-        let result = (|| -> Result<()> {
-            let rendered =
-                self.entries
-                    .render_view(profile.store(), &self.sek, &self.channel_id)?;
-            let facts = self.consent_facts()?;
-            let mut marks = BTreeSet::new();
-            for hash in shown {
-                if rendered.was_read(hash, &me)? {
-                    continue;
-                }
-                if rendered.fact(hash)?.is_none() {
-                    return Err(Error::Profile("read selection changed; refresh and retry"));
-                }
-                let entry = rendered
-                    .order()
-                    .entry(hash)?
-                    .ok_or(Error::MalformedAtRest("rendered read-mark entry missing"))?;
-                let retained = rendered.retention(hash)?.ok_or(Error::MalformedAtRest(
-                    "rendered read-mark retention missing",
-                ))?;
-                if expired_at(
-                    retained.base(),
-                    now_ms,
-                    self.entry_retention(rendered.transaction(), &entry)?,
-                ) {
-                    return Err(Error::Profile("read selection changed; refresh and retry"));
-                }
-                if entry.skeleton.author_id == me {
-                    continue;
-                }
-                if !facts.can_read(&me, &entry.skeleton.author_id) {
-                    return Err(Error::Profile("read selection changed; refresh and retry"));
-                }
-                marks.insert(*hash);
-            }
-            drop(rendered);
-            if marks.is_empty() {
-                return Ok(());
-            }
-            let mut batch = profile.store().batch()?;
-            let mut index = self
-                .entries
-                .write(&mut batch, &self.sek, &self.channel_id)?;
-            let mut changed = false;
-            for hash in marks {
-                changed |= index.put_read_mark(&hash, &me)?;
-            }
-            if changed {
-                index.seal()?;
-                batch.commit()?;
-                self.entries.committed();
-            }
-            Ok(())
-        })();
-        if let Err(ref error) = result {
-            if !matches!(
-                error,
-                Error::Profile("read selection changed; refresh and retry")
-            ) {
-                self.poison(error);
-            }
-        }
-        result
-    }
-
-    /// Examine one fixed-tail page of durable local marks and publish at most one receipt.
-    /// Skipped marks remain sealed. An unavailable room or failed append loses no accepted work.
-    pub(crate) fn flush_read_marks(
-        &mut self,
-        profile: &Profile,
-        now_ms: u64,
-        interval_ms: u64,
-    ) -> Result<bool> {
-        if self.legacy_cache_only(profile.store())? {
-            return Ok(false);
-        }
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        if !self.settled {
-            return Err(Error::RoomNotSynced);
-        }
-        self.require_own_history_current()?;
-        self.require_governance_display(profile.store(), crate::time::Ms(now_ms))?;
-        let me = profile.fingerprint();
-        if self.has_left(&me) || self.ended(now_ms).is_some() {
-            return Ok(false);
-        }
-        let selected = (|| -> Result<_> {
-            let rendered =
-                self.entries
-                    .render_view(profile.store(), &self.sek, &self.channel_id)?;
-            let last = rendered.read_sent_ms();
-            if last != 0 && now_ms < last.saturating_add(interval_ms) {
-                return Ok(None);
-            }
-            let facts = self.consent_facts()?;
-            let eligibility = ReadMarkEligibility {
-                reader: me,
-                pending: rendered.pending_reads_root()?,
-                rendered: rendered.display_roots(),
-                governance: self.governance_revision(crate::time::Ms(now_ms))?,
-                retention: (self.effective_retention(), self.effective_step_retention()),
-            };
-            if self.read_mark_scan.is_none() && self.read_mark_complete == Some(eligibility) {
-                return Ok(None);
-            }
-            let scan = match self.read_mark_scan {
-                Some(scan) => scan,
-                None => match rendered.pending_reads_tail(&me)? {
-                    Some(through) => ReadMarkScan {
-                        after: None,
-                        through,
-                        started: eligibility,
-                    },
-                    None => return Ok(Some((Vec::new(), None, Some(eligibility)))),
-                },
-            };
-            let (page, more) = rendered.pending_reads_page(&me, scan.after)?;
-            let mut read = Vec::new();
-            let mut cursor = scan.after;
-            let mut complete = !more;
-            for hash in page {
-                if hash > scan.through {
-                    complete = true;
-                    break;
-                }
-                cursor = Some(hash);
-                if hash == scan.through {
-                    complete = true;
-                }
-                if rendered.fact(&hash)?.is_none() {
-                    continue;
-                }
-                let entry = rendered
-                    .order()
-                    .entry(&hash)?
-                    .ok_or(Error::MalformedAtRest("pending read-mark entry missing"))?;
-                let retained = rendered.retention(&hash)?.ok_or(Error::MalformedAtRest(
-                    "pending read-mark retention missing",
-                ))?;
-                if entry.skeleton.author_id == me
-                    || expired_at(
-                        retained.base(),
-                        now_ms,
-                        self.entry_retention(rendered.transaction(), &entry)?,
-                    )
-                    || !facts.can_read(&me, &entry.skeleton.author_id)
-                {
-                    continue;
-                }
-                read.push(hash);
-            }
-            let next = if complete {
-                None
-            } else {
-                Some(ReadMarkScan {
-                    after: cursor,
-                    ..scan
-                })
-            };
-            // Changes during a pass can make an already examined mark eligible or add a
-            // mark behind its cursor. Finish the fixed tail fairly, then take another pass.
-            // Own receipt commits also change the pending root; at most one unchanged pass
-            // over the remaining skipped marks parks them without any postcommit read.
-            let finished =
-                (complete && read.is_empty() && scan.started == eligibility).then_some(eligibility);
-            Ok(Some((read, next, finished)))
-        })();
-        let selected = match selected {
-            Ok(selected) => selected,
-            Err(error) => {
-                self.poison(&error);
-                return Err(error);
-            }
-        };
-        let Some((read, next, finished)) = selected else {
-            return Ok(false);
-        };
-        if read.is_empty() {
-            self.read_mark_scan = next;
-            self.read_mark_complete = finished;
-            return Ok(false);
-        }
-        self.append_read(profile, read, now_ms)?;
-        self.read_mark_scan = next;
-        self.read_mark_complete = None;
-        Ok(true)
-    }
-
-    /// Author a read record naming `read` (ADR-028 RR-2): sealed under this identity's sender key
-    /// like a message, so only the members it trusts can open it, appended to its feed in this
-    /// room, and kept as a cache row that ages with the room's retention. Never a row of the
-    /// timeline. Returns the record's entry hash.
-    ///
-    /// Not in a room that has ended, nor one this identity has left: a record is an entry of its
-    /// feed, and an entry after a leave undoes the leave (V210-164). Reading says nothing.
-    pub fn append_read(
-        &mut self,
-        profile: &Profile,
-        read: Vec<Digest32>,
-        now_millis: u64,
-    ) -> Result<Digest32> {
-        self.ensure_local_append_available(profile.store())?;
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        if !self.settled {
-            return Err(Error::RoomNotSynced);
-        }
-        self.require_own_history_current()?;
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
-        if !self.authors.contains_key(&me) || self.left().contains(&me) {
-            return Err(Error::Profile("this identity is not an author of the room"));
-        }
-        if self.ended(now_millis).is_some() {
-            return Err(Error::Profile("this room has ended"));
-        }
-        let sent_ms = now_millis;
-        let (now_millis, _) = self.stamp_after_held(profile.store(), now_millis)?;
-        let record = crate::node::content::ReadRecord::new(now_millis, read)?;
-        self.prepare_content_context(profile, &me, now_millis, false)?;
-        let plaintext = Zeroizing::new(record.to_canonical_vec());
-        let msg = self.sender.encrypt(&plaintext)?;
-        let payload = msg.to_wire();
-        let skeleton = self.next_skeleton(profile, &me, &payload, now_millis)?;
-        let entry = Entry::build_signed(signer, skeleton, payload)?;
-        let entry_hash = entry.entry_hash();
-        let wire = entry.to_wire();
-        let row = ReadRow {
-            entry_hash,
-            reader: me,
-            created_millis: now_millis,
-            read: record.read,
-        };
-        let id = self.next_log_id;
-        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
-        let cache_seg = seal_segment(
-            &self.sek,
-            SegmentKind::PlaintextCache,
-            id,
-            &read_cache_bytes(&row),
-        )?;
-        let sender_seg = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_SENDER,
-            &self.sender.to_state(),
-        )?;
-        let seen_seg = seal_segment(
-            &self.sek,
-            SegmentKind::Index,
-            id,
-            &first_seen_bytes(now_millis, false),
-        )?;
-        let key = signer.public_key();
-
-        let persisted = (|| -> Result<()> {
-            self.prepare_local_entry(profile, &entry, EntryKind::Content, &key, now_millis)?;
-            let mut batch = profile.store().batch()?;
-            let settlement = self.publish_entry_into(&mut batch, &entry)?;
-            self.observe_governance_into(profile.store(), &mut batch, &entry, id)?;
-            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::PlaintextCache,
-                id,
-                &cache_seg,
-            )?;
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_SENDER,
-                &sender_seg,
-            )?;
-            batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen_seg)?;
-            self.queue_retention(
-                &mut batch,
-                entry_hash,
-                Some(Tracked {
-                    log_id: id,
-                    first_seen_ms: now_millis,
-                    steps: false,
-                    claimed_ms: Some(now_millis),
-                    cache_id: Some(id),
-                }),
-            )?;
-            {
-                let mut index = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.put_read_receipt(&row, id)?;
-                index.read_sent(sent_ms);
-                index.seal()?;
-            }
-            self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
-            batch.commit()
-        })();
-        if let Err(e) = persisted {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
-        }
-        self.entries.committed();
-        self.next_log_id = id.saturating_add(1);
-        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // The signed receipt and removal of its pending marks are already durable.
-        // Cleanup failure poisons the room but cannot turn that success into a lost mark.
-        let _ = self.finish_entry_publication(profile.store());
-
-        Ok(entry_hash)
-    }
-
     /// The next entry skeleton for `author`'s feed in this DAG, naming in `seen` the
     /// other authors' heads this node has applied (ADR-023 decision 1): that is what
     /// places the entry after everything its author could have read.
@@ -10804,31 +8907,6 @@ impl ChannelState {
         )?;
         self.append_governance(profile, &statement.to_wire(), now.get())?;
         Ok(())
-    }
-
-    /// Name the room `name` for every member (ADR-028 R-1): append a room-name statement. Only
-    /// the creator or an admin may; anyone else is refused here rather than writing an entry
-    /// every other node would ignore. `name` must already be a room name
-    /// ([`crate::governance::name::room_name`]).
-    ///
-    /// # Errors
-    /// Not an admin, not a room name, or an append that fails.
-    pub fn set_name(
-        &mut self,
-        profile: &Profile,
-        name: &str,
-        now: crate::time::Ms,
-    ) -> Result<Digest32> {
-        let now_ms = now.get();
-        let signer = profile.signer()?;
-        if !self.may_rename(profile.store(), &signer.fingerprint(), now)? {
-            return Err(Error::MalformedGovernance(
-                "only the room's creator or an admin may rename it",
-            ));
-        }
-        let statement =
-            crate::governance::name::RoomName::build(signer, &self.channel_id, self.epoch, name)?;
-        self.append_governance(profile, &statement.to_wire(), now_ms)
     }
 
     /// Creation time recorded in the manifest, milliseconds since the Unix epoch.
@@ -11046,45 +9124,6 @@ impl ChannelState {
         Ok(true)
     }
 
-    /// Record the exact sparse sender generation and mark settlement atomically. The
-    /// caller has checked current head/control readiness under this same room lock.
-    pub(crate) fn settle_sparse(
-        &mut self,
-        profile: &Profile,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
-        if self.settled {
-            return Ok(false);
-        }
-        #[cfg(feature = "test-knobs")]
-        if std::env::var_os(TEST_NEVER_SETTLE_ENV).is_some_and(|v| !v.is_empty()) {
-            return Ok(false);
-        }
-        if !self.uses_sparse_history(profile.store())? {
-            return Err(Error::MalformedBundle(
-                "sparse settlement requires sparse room",
-            ));
-        }
-        let me = self.me();
-        let seq = self.dag.verified_head(&me);
-        let previous_bound = seq
-            .checked_add(1)
-            .ok_or(Error::MalformedBundle("chain_id overflow"))?;
-        if self.sender.chain_id() > previous_bound {
-            return Err(Error::MalformedBundle(
-                "sender generation exceeds authenticated sparse sequence bound",
-            ));
-        }
-        // Even the initial generation may have been shared during join. Always choose
-        // a fresh generation, including at seq zero, and record it before becoming ready.
-        let next_id = previous_bound
-            .checked_add(1)
-            .ok_or(Error::MalformedBundle("chain_id overflow"))?;
-        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now.get())?;
-        self.rotate_sender_with_presence(profile, next, now.get(), false, true, false)?;
-        Ok(true)
-    }
-
     /// Whether this node may write in the room: see `settled`.
     #[must_use]
     pub fn is_settled(&self) -> bool {
@@ -11148,45 +9187,15 @@ impl ChannelState {
             .map(|ms| ms / 1_000)
     }
 
-    /// End the room for everyone (V030-08). Only its creator, or an admin the creator delegated,
-    /// may: anyone else is refused here rather than writing an entry every other node would
-    /// ignore.
-    pub fn end(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<Digest32> {
-        let now_ms = now.get();
-        let signer = profile.signer()?;
-        let me = signer.fingerprint();
-        if me != self.genesis.creator_pubkey().fingerprint()
-            && !self
-                .checked_governance(profile.store(), now_ms)?
-                .can_end(&me)?
-        {
-            return Err(Error::Profile(
-                "only the room's creator or an admin may end it",
-            ));
-        }
-        let fact = crate::governance::lifecycle::RoomLifecycle::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            crate::governance::lifecycle::LifecycleKind::End,
-        )?;
-        self.append_governance(profile, &fact.to_wire(), now_ms)
-    }
-
-    /// Make `member` an admin of the room (V030-08, the decider 2026-10-01): an admin
-    /// certificate from the creator, carrying what a delegated admin holds and never `delegate`
-    /// ([`Self::delegated_admin_caps`]). Only the creator may — not another admin —
-    /// and only for a member of the room.
-    pub fn add_admin(
-        &mut self,
-        profile: &Profile,
+    /// Prepare the creator's exact admin certificate without publishing room state.
+    fn admin_payload(
+        &self,
+        store: &Store,
+        signer: &dyn RootSigner,
         member: &Digest32,
         now: crate::time::Ms,
-    ) -> Result<Digest32> {
-        let now_ms = now.get();
-        let signer = profile.signer()?;
-        // The client's own check. The room's is the certificate: it carries no `delegate`, so an
-        // admin's certificate for anyone else verifies nowhere (#319).
+    ) -> Result<Vec<u8>> {
+        // An admin certificate never carries delegate, so another admin cannot extend it.
         #[cfg(feature = "mutant-sender")]
         let entitled = signer.fingerprint() == self.genesis.creator_pubkey().fingerprint()
             || crate::log::sync::mutant::admins_unentitled();
@@ -11203,13 +9212,13 @@ impl ChannelState {
         if !self.is_member(member) {
             return Err(Error::Profile("that identity is not a member of the room"));
         }
-        if self.is_admin(profile.store(), member, now)? {
+        if self.is_admin(store, member, now)? {
             return Err(Error::Profile("that identity is already a room admin"));
         }
         let mut after = None;
         let mut admins = 0_usize;
         loop {
-            let page = self.admin_page(profile.store(), after, 64, now)?;
+            let page = self.admin_page(store, after, 64, now)?;
             admins = admins.saturating_add(page.targets.len());
             if admins >= crate::nat::withdraw::MAX_ROSTER {
                 return Err(Error::Profile(
@@ -11229,7 +9238,7 @@ impl ChannelState {
         #[cfg(feature = "test-knobs")]
         let expiry =
             if std::env::var_os(TEST_EXPIRING_ADMIN_ENV).is_some_and(|value| !value.is_empty()) {
-                now_ms.saturating_add(
+                now.get().saturating_add(
                     u64::try_from(TEST_EXPIRING_ADMIN_LIFETIME.as_millis()).unwrap_or(u64::MAX),
                 )
             } else {
@@ -11245,7 +9254,7 @@ impl ChannelState {
             Self::delegated_admin_caps(),
             expiry,
         )?;
-        self.append_governance(profile, &cert.to_wire(), now_ms)
+        Ok(cert.to_wire())
     }
 
     /// What a delegated admin holds (#319): the room's policy, which is its retention — the one
@@ -11259,67 +9268,10 @@ impl ChannelState {
         ])
     }
 
-    /// Take `member`'s admin back (V030-08): revoke every admin certificate naming it, whoever
-    /// issued it. Only the creator may.
-    pub fn remove_admin(
-        &mut self,
-        profile: &Profile,
-        member: &Digest32,
-        after: Option<Digest32>,
-        now: crate::time::Ms,
-    ) -> Result<(usize, Option<Digest32>)> {
-        let signer = profile.signer()?;
-        if signer.fingerprint() != self.genesis.creator_pubkey().fingerprint() {
-            return Err(Error::Profile(
-                "only the room's creator may add or remove an admin",
-            ));
-        }
-        // One inspected certificate and at most one signed append per actor turn.
-        // The caller continues even through an empty, already-revoked slot.
-        let page = self
-            .current_governance(profile.store())?
-            .certificates(member, after, 1)?;
-        for hash in &page.rows {
-            let rev = crate::governance::cert::AdminRevocation::build(
-                signer,
-                &self.channel_id,
-                self.epoch,
-                *hash,
-                crate::governance::cert::RevocationReason::NoLongerNeeded,
-            )?;
-            self.append_governance(profile, &rev.to_wire(), now.get())?;
-        }
-        Ok((page.rows.len(), page.next))
-    }
-
     /// When the room's admins last changed, on the room's own clock (V030-14): the newest admin
     /// certificate or revocation on the log. `None` when the room never had one.
     pub fn admin_change_clock(&self, store: &Store) -> Result<Option<u64>> {
         Ok(self.checked_governance(store, self.now_hint)?.admin_clock())
-    }
-
-    /// Choose the room's idle end (V030-08): it ends after `idle_secs` with nothing said in it.
-    /// Only its creator may, and `vox room create` is where it does.
-    pub fn choose_idle_end(
-        &mut self,
-        profile: &Profile,
-        idle_secs: u64,
-        now: crate::time::Ms,
-    ) -> Result<Digest32> {
-        let now_ms = now.get();
-        let signer = profile.signer()?;
-        if signer.fingerprint() != self.genesis.creator_pubkey().fingerprint() {
-            return Err(Error::Profile(
-                "only the room's creator may choose its idle end",
-            ));
-        }
-        let fact = crate::governance::lifecycle::RoomLifecycle::build(
-            signer,
-            &self.channel_id,
-            self.epoch,
-            crate::governance::lifecycle::LifecycleKind::IdleEnd(idle_secs.saturating_mul(1_000)),
-        )?;
-        self.append_governance(profile, &fact.to_wire(), now_ms)
     }
 
     /// Number of accepted log entries.
@@ -11347,7 +9299,7 @@ impl ChannelState {
 
     /// Keys for reopening this same room after a failed store write; never leave the daemon.
     pub(crate) fn recovery_keys(&self) -> Result<crate::node::open_rooms::RoomKeys> {
-        let key = <[u8; crate::atrest::sek::SEK_LEN]>::try_from(self.sek.key_bytes()?)
+        let key = <[u8; crate::atrest::sek::SEK_LEN]>::try_from(&*self.sek.key_bytes()?)
             .map_err(|_| Error::MalformedAtRest("room SEK length"))?;
         Ok(crate::node::open_rooms::RoomKeys {
             sek: Zeroizing::new(key),
@@ -11364,7 +9316,7 @@ impl ChannelState {
     /// Whether this channel's SEK is `mlock`ed (ADR-010 best-effort; surfaced to
     /// This channel's SEK, so a daemon can keep it sealed under its identity and reopen the room
     /// after a restart without the room passphrase (#208).
-    pub fn sek_bytes(&self) -> Result<&[u8]> {
+    pub fn sek_bytes(&self) -> Result<crate::atrest::sek::KeyBytes<'_>> {
         self.sek.key_bytes()
     }
 
@@ -11378,7 +9330,9 @@ impl ChannelState {
     /// afterwards; any further seal/open fails with [`Error::AtRestLocked`].
     pub fn lock_now(&mut self) {
         self.key_provider_prune_wait = None;
-        self.key_debt_retention_wait = None;
+        if let Some(resource) = &self.history_read {
+            resource.revoke();
+        }
         self.sek.lock_now();
         self.history_publication_changed.notify_waiters();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel
@@ -11469,6 +9423,9 @@ impl ChannelSessionRoom<'_> {
             return Err(crate::wire::WireError::TransportFailed);
         }
 
+        if ch.post_pending() {
+            return Err(crate::wire::WireError::TransportFailed);
+        }
         if ch.poisoned {
             return Err(crate::wire::WireError::TransportFailed);
         }

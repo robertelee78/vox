@@ -24,7 +24,6 @@ pub(crate) struct RoleOwed {
     key_catalogs: Mutex<BTreeMap<Digest32, CatalogState>>,
     key_catalog_changed: Mutex<BTreeMap<Digest32, Arc<()>>>,
     provider_prune_dirty: std::sync::atomic::AtomicBool,
-    key_retention_dirty: std::sync::atomic::AtomicBool,
     wake: Mutex<Option<Weak<RoleWake>>>,
     room: Mutex<Option<Digest32>>,
 }
@@ -202,20 +201,6 @@ impl RoleOwed {
             .unwrap_or_else(|e| e.into_inner())
             .get(&peer)
             .and_then(|(_, _, catalog)| *catalog)
-    }
-
-    pub(crate) fn mark_key_retention_dirty(self: &Arc<Self>, local: Digest32) {
-        self.key_retention_dirty
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.signal(local);
-    }
-    pub(crate) fn key_retention_dirty(&self) -> bool {
-        self.key_retention_dirty
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-    pub(crate) fn take_key_retention_dirty(&self) -> bool {
-        self.key_retention_dirty
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     pub(crate) fn mark_key_provider_prune(self: &Arc<Self>, peer: Digest32) {

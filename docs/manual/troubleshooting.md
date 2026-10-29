@@ -175,6 +175,23 @@ nodes online and let them sync. Do not remove and add trust again.
 
 **Confirm:** post a new message and see it on the other node, then the other way round.
 
+## A post is waiting for disk, or the room cannot save
+
+**Meaning:** a post succeeds only after its own data is durably saved. A slow disk can also
+hold other writes using the same profile's store. It does not make already-saved messages,
+status, or Session attention selection wait for that flush.
+
+**Check:** run `vox status --node <name>` and `vox room read <room> --node <name>`.
+The pending post is not a successful post yet. A definitive save failure names the room and
+the storage error instead of reporting that the message was posted.
+
+**Fix:** resolve the underlying storage problem. Vox recovers the room automatically when
+writes succeed again; do not erase the profile or its store to clear the error. Already-saved
+history remains available while the room recovers.
+
+**Confirm:** the room can save a new post again, and `vox room read` shows that post together
+with its previously saved messages.
+
 ## A restored node writes nothing until its own history is recovered
 
 **Symptom:** `this node's record of its own history in this room is behind what a member holds`.

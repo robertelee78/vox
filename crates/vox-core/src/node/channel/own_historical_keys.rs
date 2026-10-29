@@ -9,7 +9,7 @@ const MAX_BYTES: usize = crate::node::pairwise_stream::MAX_PAIRWISE_FRAME;
 /// One bounded pass over the signed own feed per stored key. The cursor is deliberately
 /// volatile: after a restart it rechecks every candidate instead of trusting an old retention
 /// verdict. A completed pass sleeps until the feed, policy, or retained bodies change.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Retirement {
     pub(super) after: Option<[u8; 64]>,
     pub(super) current: Option<([u8; 64], u64, u64)>,

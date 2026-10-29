@@ -11,16 +11,33 @@ impl ChannelState {
         now: u64,
     ) -> std::result::Result<Reply, String> {
         use super::session_projection::{Query as SessionQuery, Reply as SessionReply};
-        if self.is_poisoned() {
+        let saved_page = matches!(operation, Operation::Page(_));
+        if !saved_page && self.is_poisoned() {
             return Err(self.save_failure().to_string());
         }
         // Attention is local bookkeeping over Sessions this node already holds: who is
         // addressed, what is resolved. Nothing here releases a key or chooses an audience, so
         // it answers from known state while the fold catches up (ADR-037 R4); only the
         // legacy-recovery gate stays, as on every opened path (R3).
-        self.require_legacy_current(store)
-            .map_err(|e| e.to_string())?;
-        let instance = self.history_instance(store).map_err(|e| e.to_string())?;
+        let instance = if saved_page {
+            if self
+                .legacy_cache_only(store)
+                .map_err(|error| error.to_string())?
+            {
+                return Err(super::legacy_provisional::LEGACY_HISTORY_REQUIRED.into());
+            }
+            let resource = self
+                .history_read_resource()
+                .ok_or_else(|| "the saved room is not ready".to_owned())?;
+            resource
+                .with_snapshot(|_, view, _| Ok(view.history_instance()))
+                .map_err(|error| error.to_string())?
+        } else {
+            self.require_legacy_current(store)
+                .map_err(|error| error.to_string())?;
+            self.history_instance(store)
+                .map_err(|error| error.to_string())?
+        };
         if matches!(operation, Operation::Maintain) {
             return self.maintain_attention(store, owner, instance, now);
         }
@@ -71,7 +88,52 @@ impl ChannelState {
             return self.scan_attention(store, owner, &recipient, harness, *route, now);
         }
         if let Operation::Page(query) = &operation {
-            self.refresh_attention_page(store, &recipient, query.after, now)?;
+            let read_page = |sek: &crate::atrest::sek::Sek,
+                             snapshot: &crate::node::store::Snapshot| {
+                Ledger::snapshot(snapshot, sek, self.channel_id, instance)?
+                    .page(&recipient, query.after)
+            };
+            let mut page = match self.history_read_resource() {
+                Some(resource) => {
+                    resource.with_snapshot(|sek, view, _| read_page(sek, view.snapshot()))
+                }
+                None => store
+                    .snapshot()
+                    .and_then(|snapshot| read_page(&self.sek, &snapshot)),
+            }
+            .map_err(|error| error.to_string())?;
+            let paused = self.room_pause().paused;
+            let cutoff = self.pause_resume_after();
+            for row in &mut page.rows {
+                if row.state != crate::node::attention::State::Unavailable
+                    && !matches!(
+                        self.saved_history_query(
+                            store,
+                            history::Query::NoticeExact { entry: row.source },
+                            64 * 1024,
+                            now,
+                        )?,
+                        history::Reply::NoticeExact(Some(_))
+                    )
+                {
+                    // Display-time expiry needs no writer. Ordinary maintenance seals the
+                    // retirement; no action may treat this transient row as an eligible source.
+                    row.state = crate::node::attention::State::Unavailable;
+                    row.wait = None;
+                    row.reason = Some("the source is no longer readable or retained".into());
+                    row.at_millis = now;
+                }
+                if row.state == crate::node::attention::State::Queued
+                    && row.wait != Some(Wait::Unknown)
+                {
+                    if paused {
+                        row.wait = Some(Wait::Paused);
+                    } else if !row.urgent && row.arrival <= cutoff && row.wait.is_none() {
+                        row.wait = Some(Wait::NextTurnAfterResume);
+                    }
+                }
+            }
+            return Ok(Reply::Page(page));
         }
         let initial = if matches!(operation, Operation::Resolve { .. }) {
             match self
@@ -142,7 +204,7 @@ impl ChannelState {
         };
         let mut readable = Vec::new();
         for (index, hash) in sources.iter().enumerate() {
-            if let history::Reply::NoticeExact(Some(notice)) = self.history_query(
+            if let history::Reply::NoticeExact(Some(notice)) = self.saved_history_query(
                 store,
                 history::Query::NoticeExact { entry: *hash },
                 64 * 1024,
@@ -206,23 +268,11 @@ impl ChannelState {
                     }
                     Reply::Page(page)
                 }
-                Operation::Maintain | Operation::Recipients { .. } | Operation::Scan { .. } => {
+                Operation::Maintain
+                | Operation::Recipients { .. }
+                | Operation::Scan { .. }
+                | Operation::Page(_) => {
                     return Err(Error::Profile("unexpected attention operation"))
-                }
-                Operation::Page(query) => {
-                    let mut page = ledger.page(&recipient, query.after)?;
-                    for row in &mut page.rows {
-                        if row.state == crate::node::attention::State::Queued
-                            && row.wait != Some(Wait::Unknown)
-                        {
-                            if paused {
-                                row.wait = Some(Wait::Paused);
-                            } else if !row.urgent && row.arrival <= cutoff && row.wait.is_none() {
-                                row.wait = Some(Wait::NextTurnAfterResume);
-                            }
-                        }
-                    }
-                    Reply::Page(page)
                 }
                 Operation::Begin { route, .. } => {
                     let eligible: Vec<_> = readable
@@ -295,7 +345,7 @@ impl ChannelState {
         hash: Digest32,
         now: u64,
     ) -> std::result::Result<Option<crate::node::api::MessageRow>, String> {
-        match self.history_query(
+        match self.saved_history_query(
             store,
             history::Query::NoticeExact { entry: hash },
             64 * 1024,
@@ -351,7 +401,7 @@ impl ChannelState {
                 if root.as_ref().is_some_and(&participant) {
                     Some(true)
                 } else {
-                    match self.history_query(
+                    match self.saved_history_query(
                         store,
                         history::Query::CursorPage {
                             after: Some(crate::node::api::HistoryCursor {
@@ -388,7 +438,7 @@ impl ChannelState {
             };
             audience_result = Some((pending, eligible));
         } else if !audience_turn {
-            let page = match self.history_query(
+            let page = match self.saved_history_query(
                 store,
                 history::Query::CursorPage {
                     after: Some(crate::node::api::HistoryCursor {
@@ -608,50 +658,6 @@ impl ChannelState {
             || (answers
                 && hops > 0
                 && !["ack", "status", "hello", "bye", "ping", "pong"].contains(&env.kind.as_str())))
-    }
-    fn refresh_attention_page(
-        &mut self,
-        store: &Store,
-        recipient: &Recipient,
-        after: Option<crate::node::attention::Cursor>,
-        now: u64,
-    ) -> std::result::Result<(), String> {
-        let page = {
-            let mut batch = store.batch().map_err(|e| e.to_string())?;
-            Ledger::open(&mut batch, &self.sek, self.channel_id, recipient.instance)
-                .and_then(|ledger| ledger.page(recipient, after))
-                .map_err(|e| e.to_string())?
-        };
-        let mut expired = Vec::new();
-        for row in page.rows {
-            if row.state != crate::node::attention::State::Unavailable
-                && self.attention_row(store, row.source, now)?.is_none()
-            {
-                expired.push(row.source);
-            }
-        }
-        if expired.is_empty() {
-            return Ok(());
-        }
-        let result = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.ruled();
-            let mut ledger =
-                Ledger::open(&mut batch, &self.sek, self.channel_id, recipient.instance)?;
-            for source in expired {
-                ledger.retire(recipient, source, false, now)?;
-            }
-            if ledger.finish()? {
-                batch.commit()?;
-            }
-            Ok(())
-        })();
-        result.map_err(|error| {
-            if !matches!(error, Error::Profile(_)) {
-                self.poison(&error);
-            }
-            error.to_string()
-        })
     }
     fn attention_reply_context(
         &mut self,

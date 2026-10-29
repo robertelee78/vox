@@ -73,6 +73,13 @@ impl<T> Held<T> {
     pub(super) fn job(&self) -> Job {
         self._charge.job()
     }
+
+    pub(super) fn map<U>(self, map: impl FnOnce(T) -> U) -> Held<U> {
+        Held {
+            value: map(self.value),
+            _charge: self._charge,
+        }
+    }
 }
 
 pub(super) enum Lookup<T> {
@@ -171,16 +178,32 @@ impl Source {
         ))?;
         let committed = Arc::clone(&self.work_committed);
         match self
-            .read_charged(job, 0, 0, move |room, store| {
-                Ok(Some(room.remember_history_decline(
-                    store,
-                    peer,
-                    author,
-                    head,
-                    (authorization.0, authorization.1, metadata),
-                    &committed,
-                )?))
-            })
+            .write_owned(
+                job,
+                (0, 0, false),
+                move |room, store| {
+                    room.prepare_history_decline(
+                        store,
+                        peer,
+                        author,
+                        head,
+                        (authorization.0, authorization.1, metadata),
+                    )
+                },
+                move |pending, store| pending.commit(store, &committed),
+                |room, _, result| {
+                    if matches!(
+                        &result,
+                        crate::node::channel::HistoryDeclineResult::Stored {
+                            remembered: true,
+                            ..
+                        }
+                    ) {
+                        room.history_index_committed();
+                    }
+                    Ok(result)
+                },
+            )
             .await?
         {
             Lookup::Found(saved) => match saved.value {
@@ -437,6 +460,292 @@ impl Source {
         result
     }
 
+    /// Prepare under the room mutex, then retain only operation-owned inputs through writer
+    /// acquisition and native commit. The physical worker also owns completion: cancellation of
+    /// its async waiter cannot strand the reservation or publish an uncommitted mirror.
+    pub(super) async fn write_owned<P, T, O, Prepare, Run, Install>(
+        &self,
+        job: &Job,
+        allocation: (usize, usize, bool),
+        prepare: Prepare,
+        run: Run,
+        install: Install,
+    ) -> Result<Lookup<O>>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+        O: Send + 'static,
+        Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
+        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
+        Install: FnOnce(&mut ChannelState, &Store, T) -> Result<O> + Send + 'static,
+    {
+        self.current()?;
+        let Some(admission) = self.reserve_read(job, allocation.0, allocation.1).await? else {
+            return Ok(Lookup::Busy);
+        };
+        self.write_owned_reserved(admission, allocation.2, None, prepare, run, install)
+            .await
+    }
+
+    /// Complete an already committed write's native follow-up using its original charge.
+    /// A retired transport cannot cancel physical postcommit work. The original room instance,
+    /// epoch and caller's in-batch grant still fence every effect; no new transport authority
+    /// or budget admission is acquired.
+    pub(super) async fn continue_owned<V, P, T, Prepare, Run, Install>(
+        &self,
+        held: Held<V>,
+        instance: [u8; 16],
+        prepare: Prepare,
+        run: Run,
+        install: Install,
+    ) -> Result<Held<V>>
+    where
+        V: Send + 'static,
+        P: Send + 'static,
+        T: Send + 'static,
+        Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
+        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
+        Install: FnOnce(&mut ChannelState, &Store, T) -> Result<()> + Send + 'static,
+    {
+        let Held {
+            value,
+            _charge: mut charge,
+        } = held;
+        let scratch = charge
+            .split_off(0)
+            .ok_or(Error::Profile("history continuation reservation changed"))?;
+        let admission = PreparedRead { charge, scratch };
+        match self
+            .write_owned_reserved(
+                admission,
+                false,
+                Some(instance),
+                prepare,
+                run,
+                move |room, store, completed| {
+                    install(room, store, completed)?;
+                    Ok(value)
+                },
+            )
+            .await?
+        {
+            Lookup::Found(held) => Ok(held),
+            Lookup::Busy | Lookup::Missing => {
+                Err(Error::Profile("history continuation lost its reservation"))
+            }
+        }
+    }
+
+    async fn write_owned_reserved<P, T, O, Prepare, Run, Install>(
+        &self,
+        admission: PreparedRead,
+        publication: bool,
+        continuation: Option<[u8; 16]>,
+        prepare: Prepare,
+        run: Run,
+        install: Install,
+    ) -> Result<Lookup<O>>
+    where
+        P: Send + 'static,
+        T: Send + 'static,
+        O: Send + 'static,
+        Prepare: FnOnce(&mut ChannelState, &Store) -> Result<P> + Send + 'static,
+        Run: FnOnce(P, &Store) -> Result<T> + Send + 'static,
+        Install: FnOnce(&mut ChannelState, &Store, T) -> Result<O> + Send + 'static,
+    {
+        let mut room = loop {
+            let room = if continuation.is_some() {
+                self.room.clone().lock_owned().await
+            } else {
+                tokio::select! {
+                    biased;
+                    () = self.fence.retired() => return Err(Error::Unreachable("history request cancelled")),
+                    room = self.room.clone().lock_owned() => room,
+                }
+            };
+            if let Some(instance) = continuation {
+                if room.epoch() != self.epoch || room.history_instance(&self.store)? != instance {
+                    return Err(Error::Unreachable("history continuation room changed"));
+                }
+            } else {
+                self.current()?;
+                let departed_receipt = self.own_head_receipt
+                    && room.is_author(&self.peer)
+                    && room.has_left(&self.peer);
+                if room.epoch() != self.epoch || (!room.is_member(&self.peer) && !departed_receipt)
+                {
+                    return Err(Error::Unreachable("history room access changed"));
+                }
+            }
+            if room.post_pending()
+                || (!publication && room.history_publication_busy(&self.store)?)
+            {
+                if continuation.is_none() {
+                    return Ok(Lookup::Missing);
+                }
+                let wake = room.history_publication_wake();
+                drop(room);
+                wake.await;
+                continue;
+            }
+            break room;
+        };
+        let room_instance = room.history_instance(&self.store)?;
+        let input_instance = room.generation();
+        let input_channel = room.channel_id();
+        let pending = prepare(&mut room, &self.store)?;
+        let owner = Arc::new(());
+        let pin =
+            room.reserve_pending_history_write(&self.store, Arc::clone(&owner), publication)?;
+        drop(room);
+        let source = self.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let PreparedRead { charge, scratch } = admission;
+            let input_source = source.clone();
+            let input_owner = Arc::clone(&owner);
+            let input_epoch = source.epoch;
+            let input_authorization = source.authorization;
+            let metadata_source = source.clone();
+            let metadata_owner = Arc::clone(&owner);
+            let metadata_instance = Arc::clone(&input_instance);
+            let input = crate::node::channel::semantic_projection::SelectedReceiverInput::new(
+                move |slot| {
+                    let room = input_source.room.blocking_lock();
+                    room.classification_receiver_bytes(
+                        slot,
+                        &input_owner,
+                        input_epoch,
+                        &input_instance,
+                    )
+                },
+                move |slot, iteration| {
+                    let room = metadata_source.room.blocking_lock();
+                    room.classification_receiver_metadata(
+                        slot,
+                        iteration,
+                        &metadata_owner,
+                        input_epoch,
+                        &metadata_instance,
+                    )
+                },
+                move |batch| {
+                    if let Some((node, generation)) = input_authorization {
+                        if super::authorization_generation_in(
+                            batch,
+                            node,
+                            input_channel,
+                            room_instance,
+                            input_epoch,
+                        )? != generation
+                        {
+                            return Err(Error::StreamRefused(super::AUTHORIZATION_CHANGED));
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                input.scope(|| run(pending, &source.store))
+            }));
+            let mut panicked = result.is_err();
+            let mut room = source.room.blocking_lock();
+            let owns = room.owns_pending_history_write(&owner);
+            if owns {
+                // A callback can commit evidence and subsequently report a verified conflict.
+                // Invalidate even on that honest failure; the pin still serves the prior view
+                // until this exact physical completion releases its publication reservation.
+                room.history_index_committed();
+            }
+            let result = match result {
+                Ok(result) => result.and_then(|value| {
+                    if !owns {
+                        return Err(Error::Unreachable("history publication owner changed"));
+                    }
+                    if room.epoch() != source.epoch
+                        || room.history_instance(&source.store)? != room_instance
+                    {
+                        return Err(Error::Unreachable("history publication room changed"));
+                    }
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        install(&mut room, &source.store, value)
+                    })) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            panicked = true;
+                            Err(Error::Profile("history publication install stopped"))
+                        }
+                    }
+                }),
+                Err(_) => Err(Error::Profile("history save worker stopped")),
+            };
+            if panicked {
+                if let Err(error) = &result {
+                    room.fail_pending_history_write(&owner, error);
+                }
+            }
+            room.release_pending_text(&owner, false);
+            let publication = if owns {
+                room.history_write_released(&source.store)
+            } else {
+                Ok(())
+            };
+            let result = result.and_then(|value| publication.map(|()| value));
+            drop(room);
+            drop(pin);
+            drop(scratch);
+            result.map(|value| {
+                Lookup::Found(Held {
+                    value,
+                    _charge: charge,
+                })
+            })
+        });
+        task.await
+            .map_err(|_| Error::Unreachable("history save completion stopped"))?
+    }
+
+    pub(super) async fn write_admission<T, F>(
+        &self,
+        job: &Job,
+        allocation: (usize, usize),
+        operation: F,
+    ) -> Result<Lookup<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&crate::node::channel::HistoryAdmission<'_>, &Store) -> Result<T>
+            + Send
+            + 'static,
+    {
+        let authorization = self.authorization;
+        let result = self
+            .write_owned(
+                job,
+                (allocation.0, allocation.1, false),
+                move |room, store| {
+                    if let Some((node, expected)) = authorization {
+                        if super::authorization_generation(
+                            store,
+                            node,
+                            room.channel_id(),
+                            room.history_instance(store)?,
+                            room.epoch(),
+                        )? != expected
+                        {
+                            return Err(Error::Profile("history authorization changed"));
+                        }
+                    }
+                    room.prepare_history_admission(store, authorization)
+                },
+                move |pending, store| pending.with(|room| operation(room, store)),
+                |_, _, value| Ok(value),
+            )
+            .await?;
+        Ok(match result {
+            Lookup::Missing => Lookup::Busy,
+            result => result,
+        })
+    }
+
     pub(super) async fn authorize(&self, job: &Job) -> Result<bool> {
         Ok(matches!(
             self.read_charged(job, 0, 0, |_, _| Ok(Some(()))).await?,
@@ -456,16 +765,27 @@ impl Source {
             self.current()?;
             let ledger = self.commit_ledger();
             let peer = self.peer;
+            let authorization = self.authorization;
             // One bounded physical step: Directory scratch is separately reserved by read;
             // this envelope covers the two contexts/join/encoded context and scalar DFS.
             let step = self
-                .read(
+                .write_owned(
                     job,
-                    crate::node::channel::ProofRangeRestore::WORK_BYTES,
+                    (
+                        crate::node::channel::ProofRangeRestore::WORK_BYTES,
+                        DIRECTORY_ENVELOPE,
+                        false,
+                    ),
                     move |room, store| {
-                        let step = room.restore_proof_range(store, peer, &mut cursor, &ledger)?;
-                        Ok(Some((cursor, step)))
+                        let pending =
+                            room.prepare_proof_range(store, peer, &cursor, authorization)?;
+                        Ok((cursor, pending))
                     },
+                    move |(mut cursor, pending), store| {
+                        let step = pending.advance(store, &mut cursor, &ledger)?;
+                        Ok((cursor, step))
+                    },
+                    |_, _, value| Ok(value),
                 )
                 .await?;
             let Lookup::Found(step) = step else {

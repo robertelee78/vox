@@ -139,8 +139,12 @@ fn bad() -> Error {
 }
 
 fn scope(profile: &Profile, session: &str) -> Digest32 {
+    scope_for(&profile.fingerprint(), session)
+}
+
+fn scope_for(node: &Digest32, session: &str) -> Digest32 {
     let mut bytes = b"vox/session-ingress-scope/v1".to_vec();
-    bytes.extend_from_slice(&profile.fingerprint());
+    bytes.extend_from_slice(node);
     bytes.extend_from_slice(session.as_bytes());
     sha256(&bytes)
 }
@@ -582,7 +586,7 @@ pub fn pending(profile: &Profile, cursor: &mut usize) -> Result<Option<Pending>>
 // Other rooms and every session's next sequence survive. The inbox is capped at 64 MiB;
 // visits retain one sealed item and the at-most-256 scheduling directory.
 fn purge_pending(
-    profile: &Profile,
+    node: &Digest32,
     key: &Sek,
     batch: &mut Batch<'_>,
     d: &mut Directory,
@@ -595,7 +599,7 @@ fn purge_pending(
         let mut session: Session = decode(key, &scope, HEADER, &segment)?;
         if session.head == 0
             || session.head >= session.next
-            || scope != self::scope(profile, &session.name)
+            || scope != scope_for(node, &session.name)
         {
             return Err(bad());
         }
@@ -630,16 +634,17 @@ fn purge_pending(
     Ok(())
 }
 
-/// Explicit deletion and its outstanding owner cleanup share one atomic transaction.
-pub(crate) fn remove_room(
-    profile: &Profile,
+/// Queue explicit deletion and its outstanding owner cleanup in the caller's admitted batch.
+/// Reopen-map, consent and pending-lock removals join this same transaction.
+pub(crate) fn queue_remove_room(
+    batch: &mut Batch<'_>,
+    signer: &dyn crate::identity::composite::RootSigner,
     room: &Digest32,
     hosted: bool,
 ) -> Result<Option<Retirement>> {
-    let key = key(profile)?;
-    let node = profile.fingerprint();
-    let mut batch = profile.store().batch()?;
-    let mut d = directory(&batch, &key, &node)?;
+    let key = crate::atrest::seal::sek(signer, b"vox/session-ingress-sek/v1")?;
+    let node = signer.fingerprint();
+    let mut d = directory(batch, &key, &node)?;
     let retirement = if hosted {
         if d.retiring.len() == 2 || d.retiring.iter().any(|item| item.room == *room) {
             return Err(Error::Profile("earlier Session room cleanup is pending"));
@@ -657,10 +662,9 @@ pub(crate) fn remove_room(
     } else {
         None
     };
-    purge_pending(profile, &key, &mut batch, &mut d, room)?;
+    purge_pending(&node, &key, batch, &mut d, room)?;
     batch.purge_channel(room)?;
-    put(&mut batch, &key, &node, HEADER, &d)?;
-    batch.commit()?;
+    put(batch, &key, &node, HEADER, &d)?;
     Ok(retirement)
 }
 
@@ -682,7 +686,7 @@ pub(crate) fn complete_retirement(profile: &Profile, retirement: Retirement) -> 
     if !d.retiring.contains(&retirement) {
         return Ok(());
     }
-    purge_pending(profile, &key, &mut batch, &mut d, &retirement.room)?;
+    purge_pending(&node, &key, &mut batch, &mut d, &retirement.room)?;
     d.retiring.retain(|item| *item != retirement);
     put(&mut batch, &key, &node, HEADER, &d)?;
     batch.commit()

@@ -1,4 +1,5 @@
 //! Own-feed recovery is a durable write fence, not authority supplied by an inventory hint.
+use super::pending_text::recovery::{Audit, AuditWrite, Ranges};
 use super::*;
 use crate::log::history::{
     inclusion_ranges, ContextSource, ControlContext, Descriptor, HistoryStep, LocalAppendBudget,
@@ -77,7 +78,7 @@ impl Recovery {
         d.finish()?;
         Ok(recovery)
     }
-    fn bytes(&self) -> Vec<u8> {
+    pub(super) fn bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(3).uint(2);
         match self {
@@ -93,12 +94,31 @@ impl Recovery {
         }
         e.finish()
     }
-    fn same(&self, other: &Self) -> bool {
+    pub(super) fn same(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::UnknownBehind, Self::UnknownBehind) | (Self::Fork, Self::Fork) => true,
             (Self::Head(a), Self::Head(b)) => a.id() == b.id(),
             _ => false,
         }
+    }
+}
+
+/// A sealed recovery fence. It contains no room guard or mutable room projection.
+pub(crate) struct PendingOwnRecovery {
+    room: Digest32,
+    epoch: u64,
+    next: Recovery,
+    sealed: SealedSegment,
+}
+
+impl PendingOwnRecovery {
+    pub(crate) fn commit(&self, store: &Store) -> Result<()> {
+        store.put_segment(
+            &self.room,
+            SegmentKind::KeyMaterial,
+            SEG_OWN_BEHIND,
+            &self.sealed,
+        )
     }
 }
 
@@ -173,22 +193,22 @@ impl ReadabilityCursor {
 impl ChannelState {
     /// Check one bounded chunk of the exact own-author prefix. An already-settled receipt
     /// alone is not evidence that ciphertext from a later sender generation can be read.
-    pub(crate) fn audit_own_readability(
-        &mut self,
+    pub(crate) fn prepare_own_readability(
+        &self,
         store: &Store,
         now: crate::time::Ms,
-    ) -> Result<OwnReadability> {
+    ) -> Result<Audit> {
         if !self.own_behind {
-            return Ok(OwnReadability::Waiting);
+            return Ok(Audit::unchanged(OwnReadability::Waiting));
         }
         let Recovery::Head(target) = &self.own_recovery else {
-            return Ok(OwnReadability::Waiting);
+            return Ok(Audit::unchanged(OwnReadability::Waiting));
         };
         let target = target.clone();
         self.checked_own_head(&target)?;
         let read = self.history_read(store)?;
         if read.publication_busy() || !read.history_head_accepted(&target.id(), target.binding)? {
-            return Ok(OwnReadability::Waiting);
+            return Ok(Audit::unchanged(OwnReadability::Waiting));
         }
         let snapshot = store.snapshot()?;
         let stored = snapshot.get_segment_bounded(
@@ -228,7 +248,7 @@ impl ChannelState {
             .render_view(store, &self.sek, &self.channel_id)?;
         let own_pending = rendered.author_backfill_pending(&self.me())?;
         if own_pending {
-            return Ok(OwnReadability::Waiting);
+            return Ok(Audit::unchanged(OwnReadability::Waiting));
         }
         let mut outcome = OwnReadability::Runnable;
         let mut render_from = None;
@@ -370,33 +390,21 @@ impl ChannelState {
         drop(rendered);
         drop(read);
         drop(snapshot);
-        if cursor.next != start || initialize || render_from.is_some() {
-            let mut batch = store.batch()?;
-            self.check_own_recovery_marker_in(&batch)?;
-            if let Some(seq) = render_from {
-                let mut index = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                index.queue_backfill(self.me(), Some(seq))?;
-                index.seal()?;
-            }
-            batch.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_OWN_READABILITY,
-                &seal_segment(
+        let write = if cursor.next != start || initialize || render_from.is_some() {
+            Some(AuditWrite {
+                marker: self.own_recovery.bytes(),
+                cursor: seal_segment(
                     &self.sek,
                     SegmentKind::KeyMaterial,
                     SEG_OWN_READABILITY,
                     &cursor.bytes(),
                 )?,
-            )?;
-            batch.commit()?;
-            if render_from.is_some() {
-                self.entries.committed();
-            }
-        }
-        Ok(outcome)
+                render_from,
+            })
+        } else {
+            None
+        };
+        Ok(Audit { outcome, write })
     }
 
     /// An authenticated high observation fences the next append even before the actor has
@@ -516,14 +524,14 @@ impl ChannelState {
         Ok(self.own_recovery_evidence(store)?.is_some())
     }
 
-    /// Whether the durable fence changed. Repeated observations are write-free.
-    pub(crate) fn refresh_own_recovery(&mut self, store: &Store) -> Result<bool> {
+    /// Prepare the exact durable fence without changing its published in-memory mirror.
+    pub(crate) fn prepare_own_recovery(&self, store: &Store) -> Result<Option<PendingOwnRecovery>> {
         let Some(mut next) = self.own_recovery_evidence(store)? else {
-            return Ok(false);
+            return Ok(None);
         };
         // Missing evidence cannot lower a previously authenticated target.
         if matches!(next, Recovery::UnknownBehind) && self.own_behind {
-            return Ok(false);
+            return Ok(None);
         }
         if let (Recovery::Head(old), Recovery::Head(new)) = (&self.own_recovery, &next) {
             if self.own_behind && old.root.leaves > new.root.leaves {
@@ -531,22 +539,29 @@ impl ChannelState {
             }
         }
         if self.own_behind && self.own_recovery.same(&next) {
-            return Ok(false);
+            return Ok(None);
         }
-        store.put_segment(
-            &self.channel_id,
+        let sealed = seal_segment(
+            &self.sek,
             SegmentKind::KeyMaterial,
             SEG_OWN_BEHIND,
-            &seal_segment(
-                &self.sek,
-                SegmentKind::KeyMaterial,
-                SEG_OWN_BEHIND,
-                &next.bytes(),
-            )?,
+            &next.bytes(),
         )?;
+        Ok(Some(PendingOwnRecovery {
+            room: self.channel_id,
+            epoch: self.epoch,
+            next,
+            sealed,
+        }))
+    }
+
+    pub(crate) fn install_own_recovery(&mut self, pending: PendingOwnRecovery) -> Result<()> {
+        if pending.room != self.channel_id || pending.epoch != self.epoch {
+            return Err(Error::Unreachable("own recovery room changed"));
+        }
         self.own_behind = true;
-        self.own_recovery = next;
-        Ok(true)
+        self.own_recovery = pending.next;
+        Ok(())
     }
 
     pub(crate) fn own_recovery_key(&self, store: &Store) -> Result<Option<(Digest32, u64, bool)>> {
@@ -667,77 +682,6 @@ impl ChannelState {
             hi: lo,
             donor_through,
         }))
-    }
-
-    /// Seed only a locally retained generation, using its backup live position plus its
-    /// authenticated origin as the history floor. No remote key is minted or released.
-    pub(crate) fn prepare_own_recovery_receiver(&mut self, profile: &Profile) -> Result<bool> {
-        if !self.own_behind || !matches!(self.own_recovery, Recovery::Head(_)) {
-            return Ok(false);
-        }
-        let me = self.me();
-        let slot = (me, self.sender.chain_id());
-        if self
-            .receivers
-            .get(&slot)
-            .is_some_and(|chain| chain.recovers_own_sender(&self.sender))
-        {
-            return Ok(false);
-        }
-        if !self.origins.has(&self.channel_id, self.epoch, slot.1)
-            || (!self.receivers.contains_key(&slot) && self.receivers.len() >= MAX_RECEIVER_CHAINS)
-        {
-            return Err(Error::OwnHistoryBehind);
-        }
-        let signer = profile.signer()?;
-        let root = self.authors.get(&me).ok_or(Error::OwnHistoryBehind)?;
-        let (iteration, key) = self.sender.current_position();
-        let current = self.sender.skdm_for(signer, iteration, key)?;
-        let live = ReceiverChain::from_skdm(&current, root, &self.channel_id, self.epoch)?;
-        let origin =
-            self.origins
-                .full_history_skdm(signer, &self.channel_id, self.epoch, slot.1)?;
-        let floor = ReceiverChain::from_skdm(&origin, root, &self.channel_id, self.epoch)?;
-        let mut candidate = if let Some(existing) = self
-            .receivers
-            .get(&slot)
-            .filter(|existing| existing.next_iteration() >= live.next_iteration())
-        {
-            let mut existing = ReceiverChain::from_state(&existing.to_state())?;
-            existing.retain_history_release(&live)?;
-            existing
-        } else {
-            live
-        };
-        candidate.retain_history_release(&floor)?;
-        if !candidate.recovers_own_sender(&self.sender) {
-            return Err(Error::OwnHistoryBehind);
-        }
-        let mut batch = profile.store().batch()?;
-        let stored = receiver_overlay::put(
-            &mut batch,
-            &self.sek,
-            &self.channel_id,
-            &me,
-            self.epoch,
-            self.receiver_persistence.base,
-            &candidate,
-        )?;
-        if let receiver_overlay::Put::Busy { changed } = stored {
-            if changed {
-                batch.commit()?;
-            }
-            return Err(Error::StreamRefused(receiver_overlay::CLEANUP_PENDING));
-        }
-        let mut index = self
-            .entries
-            .write(&mut batch, &self.sek, &self.channel_id)?;
-        index.queue_backfill(me, Some(1))?;
-        index.seal()?;
-        batch.commit()?;
-        self.entries.committed();
-        self.receivers.insert(slot, candidate);
-        Ok(true)
     }
 
     /// This path is exclusively an original author's authenticated recovery response, not a
@@ -866,7 +810,7 @@ impl ChannelState {
     /// This is mathematical preparation for the existing local append, not new head/source
     /// admission. Missing serving metadata keeps the exact recovery debt instead of poisoning
     /// a room whose restored canonical prefix legitimately lacks subtree indices.
-    fn prepare_own_append_ranges(&mut self, store: &Store) -> Result<()> {
+    pub(super) fn prepare_own_append_ranges(&self, store: &Store) -> Result<Ranges> {
         let Recovery::Head(target) = &self.own_recovery else {
             return Err(Error::OwnHistoryBehind);
         };
@@ -926,45 +870,11 @@ impl ChannelState {
             .ok_or(Error::OwnHistoryBehind)?;
         drop(source);
         drop(read);
-        // Room serialization plus the current Computer fence are held by recovery's caller.
-        // Recheck its exact durable marker in this same batch before making any index visible.
-        let mut batch = store.batch()?;
-        self.check_own_recovery_marker_in(&batch)?;
-        let mut index = self
-            .entries
-            .write(&mut batch, &self.sek, &self.channel_id)?;
-        index.keep_history_context(&root_context)?;
-        for (start, descriptor) in forest {
-            index.keep_history_range(target.binding, start, descriptor)?;
-        }
-        index.seal()?;
-        batch.commit()?;
-        self.entries.committed();
-        Ok(())
-    }
-
-    /// The marker, signed return Presence and fresh sender/origins share the effects Batch.
-    /// Ordinary append guards never observe a clear-first intermediate state.
-    pub(crate) fn complete_own_recovery(
-        &mut self,
-        profile: &Profile,
-        now: crate::time::Ms,
-    ) -> Result<bool> {
-        if !self.own_behind {
-            return Ok(false);
-        }
-        self.require_own_recovery_complete(profile.store())?;
-        self.prepare_own_append_ranges(profile.store())?;
-        let me = self.me();
-        let used = self.dag.verified_head(&me);
-        let next_id = used
-            .checked_add(2)
-            .ok_or(Error::MalformedBundle("chain_id overflow"))?;
-        if self.sender.chain_id() >= next_id {
-            return Err(Error::OwnHistoryBehind);
-        }
-        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now.get())?;
-        self.rotate_sender_with_presence(profile, next, now.get(), false, false, true)?;
-        Ok(true)
+        Ok(Ranges {
+            marker: self.own_recovery.bytes(),
+            binding: target.binding,
+            context: root_context,
+            forest,
+        })
     }
 }

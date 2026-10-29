@@ -7,7 +7,7 @@ resolver = "2"
 members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms", "crates/vox-ffi", "crates/vox-text", "crates/vox-theme", "crates/vox-sockdrops"]
 # Test apparatus only (V210-55, #242): built on its own by the proofs that need it, never a member,
 # never linked into vox.
-exclude = ["crates/vox-test-interpose"]
+exclude = ["crates/vox-test-interpose", "vendor/redb"]
 
 [workspace.package]
 version = "0.4.9"
@@ -224,3 +224,9 @@ lto = "thin"
 # "Vox:"; still so in quinn-udp 0.6.3 and upstream main.
 [patch.crates-io]
 quinn-udp = { path = "vendor/quinn-udp" }
+# Native failures fence writes while immutable MVCC reads remain available for exact
+# live-snapshot recovery onto a fresh inode (ADR-038 S8).
+# Upstream redb-4.3.0.crate SHA-256:
+# fb338a6c67830a61bed824b78c2bb034ab1ff401a20616bd7957524f4fdc2f22
+# Source is byte-identical except CheckedBackend::read's closed-only precheck.
+redb = { path = "vendor/redb" }

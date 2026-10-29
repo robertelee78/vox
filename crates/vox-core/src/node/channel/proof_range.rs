@@ -1,5 +1,6 @@
 //! Cooperative repair of one proof-serving range from independently committed source metadata.
 //! No pending header, payload, missing-body request, or newly computed prefix grants authority.
+use super::sparse_history::HistoryAdmissionRoom;
 use super::*;
 use crate::log::history::{
     join_descriptors, leaf_descriptor, split, Descriptor, HistoryStep, SignedHead, TreeBinding,
@@ -58,13 +59,56 @@ impl ProofRangeRestore {
         })
     }
 }
+pub(crate) struct PendingProofRange {
+    admission: super::sparse_history::PendingHistoryAdmission,
+    authority: Option<(u64, u64, u64, bool)>,
+}
+
+impl PendingProofRange {
+    pub(crate) fn advance(
+        self,
+        store: &Store,
+        cursor: &mut ProofRangeRestore,
+        committed: &std::sync::atomic::AtomicBool,
+    ) -> Result<ProofRangeStep> {
+        self.admission
+            .with(|room| ProofRangeRestore::restore(room, store, self.authority, cursor, committed))
+    }
+}
+
 impl ChannelState {
-    /// At most one newly reconstructed node commits per call. Cache/index/context reads and
-    /// reconstruction consume the existing WorkBudget; total old-data work can be O(interval).
-    pub(crate) fn restore_proof_range(
+    pub(crate) fn prepare_proof_range(
         &self,
         store: &Store,
         peer: Digest32,
+        cursor: &ProofRangeRestore,
+        authorization: Option<(Digest32, Digest32)>,
+    ) -> Result<PendingProofRange> {
+        let authority = self
+            .history_inventory_incarnation(&peer)
+            .zip(self.history_author_inventory_incarnation(&cursor.binding.author))
+            .map(|(peer, author)| {
+                (
+                    self.epoch(),
+                    peer,
+                    author,
+                    self.dag.is_frozen(&cursor.binding.author),
+                )
+            });
+        Ok(PendingProofRange {
+            admission: self.prepare_history_admission(store, authorization)?,
+            authority,
+        })
+    }
+}
+
+impl ProofRangeRestore {
+    /// At most one newly reconstructed node commits per call. Cache/index/context reads and
+    /// reconstruction consume the existing WorkBudget; total old-data work can be O(interval).
+    fn restore(
+        room: &impl HistoryAdmissionRoom,
+        store: &Store,
+        authority: Option<(u64, u64, u64, bool)>,
         cursor: &mut ProofRangeRestore,
         committed: &std::sync::atomic::AtomicBool,
     ) -> Result<ProofRangeStep> {
@@ -75,19 +119,16 @@ impl ChannelState {
                 return Ok(ProofRangeStep::Progress);
             }
         }
-        let read = self.history_read(store)?;
+        let read = room.history_read(store)?;
         if read.publication_busy() {
             return Ok(ProofRangeStep::Busy);
         }
-        let Some((peer_life, author_life)) = self
-            .history_inventory_incarnation(&peer)
-            .zip(self.history_author_inventory_incarnation(&cursor.binding.author))
-        else {
+        let Some((epoch, peer_life, author_life, frozen)) = authority else {
             return Ok(ProofRangeStep::Missing);
         };
         let scope = (
             read.sparse_history_instance(),
-            self.epoch(),
+            epoch,
             peer_life,
             author_life,
         );
@@ -97,7 +138,7 @@ impl ChannelState {
             ));
         }
         cursor.scope = Some(scope);
-        if cursor.binding.room != self.channel_id {
+        if cursor.binding.room != room.channel_id() {
             return Ok(ProofRangeStep::Missing);
         }
         let target = read
@@ -107,7 +148,7 @@ impl ChannelState {
             return Err(Error::MalformedAtRest("proof repair target changed"));
         }
         let reconstruction_allowed = read.history_head_committed(&cursor.head, cursor.binding)?
-            && !self.dag.is_frozen(&cursor.binding.author)
+            && !frozen
             && read
                 .sparse_author(&cursor.binding.author, cursor.binding.scope)?
                 .is_none_or(|state| state.observed_conflict.is_none());
@@ -214,7 +255,7 @@ impl ChannelState {
                             "proof repair canonical inclusion differs",
                         ));
                     }
-                    let key = self
+                    let key = room
                         .history_author_key(&cursor.binding.author)
                         .ok_or(Error::MalformedAtRest("proof repair author key missing"))?;
                     let HistoryStep::Complete(verified) =
@@ -254,7 +295,7 @@ impl ChannelState {
             drop(read);
             // No scalar progress is installed until both the descriptor and its generated
             // context commit. These objects never populate the acceptance-range namespace.
-            self.history_write_tracked(store, committed, |index| {
+            room.history_write_tracked(store, committed, |index| {
                 index.keep_history_context(&context)?;
                 index.keep_history_proof_range(cursor.head, cursor.binding, start, descriptor)
             })?;

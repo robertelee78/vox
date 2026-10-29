@@ -21,7 +21,7 @@
 //!
 //! **Not driven here:** a generation kept because an entry under it is **not received yet**
 //! (V030-10). Its body is still to come and its generation unknown until it does, so the prune
-//! keeps every generation from that entry on (`ChannelState::prune_superseded_receivers`).
+//! keeps every generation from that entry on (the native R14 key-pruning selector).
 //!
 //! Mutation (red): receiver pruning disabled leaves bob's count at 2.
 

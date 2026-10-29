@@ -611,6 +611,10 @@ pub enum GovernancePage {
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
+    /// Revocable committed saved-read lane; not an authority or a plaintext room mirror.
+    pub(crate) history_read: Option<std::sync::Arc<crate::node::channel::history::ReadResource>>,
+    /// Exact metadata publication that belongs to this view's Computer-policy projection.
+    pub(crate) history_read_revision: u64,
     /// This node's durable room pause. It never gates direct operator input.
     pub pause: vox_agentcomms::drive::PauseState,
     /// Ordinary reply wakes at/below this saved readable-arrival boundary are held for a turn.
@@ -1099,6 +1103,14 @@ pub enum NodeCommand {
         /// The saved room incarnation observed before sending.
         instance: [u8; 16],
     },
+    /// Internal retained ownership of the existing post admission, including caller cancellation.
+    #[doc(hidden)]
+    SendTextAdmitted {
+        channel_id: Digest32,
+        text: String,
+        instance: Option<[u8; 16]>,
+        permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    },
     /// Capture the exact open room incarnation before a plain post may wait. Internal to node
     /// clients; the result crosses its own typed reply and is never accepted from IPC.
     PreparePost {
@@ -1377,6 +1389,11 @@ pub enum NodeCommand {
         types: Vec<String>,
         /// Where the report goes.
         report: tokio::sync::oneshot::Sender<crate::node::agreestream::Report>,
+    },
+    /// Read the actor's fenced status without waiting behind durable writers.
+    Status {
+        /// The live status reply; no mutation acknowledgement is required.
+        reply: tokio::sync::oneshot::Sender<crate::node::status::StatusReport>,
     },
     /// Stop the actor (locks first).
     Shutdown,

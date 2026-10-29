@@ -291,6 +291,7 @@ pub struct Shares {
     paths: Paths,
     /// Weak, so the shares never keep a stopped node's command queue open.
     cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    read: mpsc::WeakSender<crate::node::actor::ReadRequest>,
     post_slots: Arc<tokio::sync::Semaphore>,
     view: watch::Receiver<NodeView>,
     events: broadcast::Sender<NodeEvent>,
@@ -327,6 +328,7 @@ impl Shares {
     pub(crate) fn spawn(
         paths: Paths,
         cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
+        read: mpsc::WeakSender<crate::node::actor::ReadRequest>,
         view: watch::Receiver<NodeView>,
         events: broadcast::Sender<NodeEvent>,
         post_slots: Arc<tokio::sync::Semaphore>,
@@ -344,6 +346,7 @@ impl Shares {
             ))),
             paths,
             cmd,
+            read,
             post_slots,
             view,
             events,
@@ -668,8 +671,12 @@ impl Shares {
         let Some(cmd) = self.cmd.upgrade() else {
             return Err(Outcome::Failed(Fault::ShuttingDown).to_string());
         };
+        let Some(read) = self.read.upgrade() else {
+            return Err(Outcome::Failed(Fault::ShuttingDown).to_string());
+        };
         match crate::node::actor::apply_post_command(
             &cmd,
+            &read,
             &self.post_slots,
             channel_id,
             text.to_owned(),

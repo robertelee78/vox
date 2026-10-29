@@ -5,7 +5,7 @@ use crate::atrest::store::{open_segment, seal_segment, SegmentKind};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::channel::entry_store::session_tree;
-use crate::node::store::Batch;
+use crate::node::store::{Batch, Snapshot};
 use serde::{Deserialize, Serialize};
 
 const KIND: SegmentKind = SegmentKind::SessionAttention;
@@ -134,9 +134,32 @@ fn reason(mut s: String) -> String {
     s
 }
 
+enum Source<'a, 's> {
+    Batch(&'a mut Batch<'s>),
+    Snapshot(&'a Snapshot),
+}
+impl<'s> Source<'_, 's> {
+    fn segment(
+        &self,
+        room: &Digest32,
+        id: u64,
+    ) -> Result<Option<crate::atrest::store::SealedSegment>> {
+        match self {
+            Self::Batch(batch) => batch.get_segment_bounded(room, KIND, id, RECORD_BYTES),
+            Self::Snapshot(snapshot) => snapshot.get_segment_bounded(room, KIND, id, RECORD_BYTES),
+        }
+    }
+    fn writer(&mut self) -> Result<&mut Batch<'s>> {
+        match self {
+            Self::Batch(batch) => Ok(batch),
+            Self::Snapshot(_) => Err(Error::Profile("attention snapshot is read-only")),
+        }
+    }
+}
+
 /// A fresh transaction's bounded working set. The caller commits before any external action.
 pub(crate) struct Ledger<'a, 's> {
-    batch: &'a mut Batch<'s>,
+    source: Source<'a, 's>,
     sek: &'a Sek,
     room: Digest32,
     header: Header,
@@ -149,7 +172,23 @@ impl<'a, 's> Ledger<'a, 's> {
         room: Digest32,
         instance: [u8; 16],
     ) -> Result<Self> {
-        let header: Header = match batch.get_segment(&room, KIND, 0)? {
+        Self::from_source(Source::Batch(batch), sek, room, instance)
+    }
+    pub(crate) fn snapshot(
+        snapshot: &'a Snapshot,
+        sek: &'a Sek,
+        room: Digest32,
+        instance: [u8; 16],
+    ) -> Result<Self> {
+        Self::from_source(Source::Snapshot(snapshot), sek, room, instance)
+    }
+    fn from_source(
+        source: Source<'a, 's>,
+        sek: &'a Sek,
+        room: Digest32,
+        instance: [u8; 16],
+    ) -> Result<Self> {
+        let header: Header = match source.segment(&room, 0)? {
             Some(segment) => {
                 if segment.ciphertext.len() > RECORD_BYTES + 32 {
                     return Err(bad());
@@ -171,7 +210,7 @@ impl<'a, 's> Ledger<'a, 's> {
             return Err(bad());
         }
         Ok(Self {
-            batch,
+            source,
             sek,
             room,
             header,
@@ -179,13 +218,15 @@ impl<'a, 's> Ledger<'a, 's> {
         })
     }
     fn tree(&self) -> session_tree::Read<'_> {
-        session_tree::Read::batch(self.batch, self.sek, &self.room, KIND)
+        match &self.source {
+            Source::Batch(batch) => session_tree::Read::batch(batch, self.sek, &self.room, KIND),
+            Source::Snapshot(snapshot) => {
+                session_tree::Read::snapshot(snapshot, self.sek, &self.room, KIND)
+            }
+        }
     }
     fn get<T: serde::de::DeserializeOwned>(&self, id: u64) -> Result<T> {
-        let seg = self
-            .batch
-            .get_segment(&self.room, KIND, id)?
-            .ok_or_else(bad)?;
+        let seg = self.source.segment(&self.room, id)?.ok_or_else(bad)?;
         if seg.ciphertext.len() > RECORD_BYTES + 32 {
             return Err(bad());
         }
@@ -204,7 +245,7 @@ impl<'a, 's> Ledger<'a, 's> {
         if body.len() > RECORD_BYTES {
             return Err(bad());
         }
-        self.batch.put_segment(
+        self.source.writer()?.put_segment(
             &self.room,
             KIND,
             id,
@@ -220,8 +261,13 @@ impl<'a, 's> Ledger<'a, 's> {
         Ok(id)
     }
     fn set(&mut self, root: u64, key: Key, value: Option<u64>) -> Result<u64> {
-        let mut w =
-            session_tree::Write::new(self.batch, self.sek, &self.room, KIND, self.header.next)?;
+        let mut w = session_tree::Write::new(
+            self.source.writer()?,
+            self.sek,
+            &self.room,
+            KIND,
+            self.header.next,
+        )?;
         let root = w.set(root, key, value)?;
         self.header.next = w.next_page();
         self.dirty = true;
@@ -441,7 +487,7 @@ impl<'a, 's> Ledger<'a, 's> {
         self.header.ordered =
             self.set(self.header.ordered, ordered(&rkey, record.ordinal), None)?;
         self.header.queued = self.set(self.header.queued, ordered(&rkey, record.ordinal), None)?;
-        self.batch.delete_segment(&self.room, KIND, id)?;
+        self.source.writer()?.delete_segment(&self.room, KIND, id)?;
         if record.audience.is_some() {
             let (sid, mut s) = self.session(recipient)?;
             s.audiences = s.audiences.checked_sub(1).ok_or_else(bad)?;
@@ -1026,7 +1072,7 @@ impl<'a, 's> Ledger<'a, 's> {
             .is_none_or(|(k, _)| k[..32] != rkey);
         if let Some(id) = id.filter(|_| empty) {
             self.header.ordered = self.set(self.header.ordered, ordered(&rkey, 0), None)?;
-            self.batch.delete_segment(&self.room, KIND, id)?;
+            self.source.writer()?.delete_segment(&self.room, KIND, id)?;
         }
         Ok(())
     }
@@ -1056,7 +1102,7 @@ impl<'a, 's> Ledger<'a, 's> {
                 ordered(&recipient_key, record.ordinal),
                 None,
             )?;
-            self.batch.delete_segment(&self.room, KIND, id)?;
+            self.source.writer()?.delete_segment(&self.room, KIND, id)?;
             if closed
                 && self
                     .tree()
@@ -1066,7 +1112,9 @@ impl<'a, 's> Ledger<'a, 's> {
                 self.header.ordered =
                     self.set(self.header.ordered, ordered(&recipient_key, 0), None)?;
                 if let Some(sid) = sid {
-                    self.batch.delete_segment(&self.room, KIND, sid)?;
+                    self.source
+                        .writer()?
+                        .delete_segment(&self.room, KIND, sid)?;
                 }
                 return Ok(());
             }
