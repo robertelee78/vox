@@ -544,11 +544,45 @@ lessons. It changes neither this record's decision status nor any requirement or
   Content remains incomplete until the selected body is semantically admitted, and its retention
   and expiry decisions consume the transaction's already-authenticated exact entry rather than
   pretending it was settled. They preserve the source publication's sealed earliest first-seen
-  fact across every deferred retry and restart. A deferred or unavailable body therefore commits
-  neither a false receipt nor a public effect marker, and cannot extend its retention lifetime by
-  retrying. The shipped proof binds its Content verdict to one exact accepted entry hash observed
-  at Bob's effect outcome and then performs one `vox room read`; a polling read may not relabel a
-  later unrelated refusal as this defect.
+  fact across every deferred retry and restart. A deferred or unavailable Content body therefore
+  commits neither a false receipt nor a public effect marker, and cannot extend its retention
+  lifetime by retrying. The shipped proof binds its Content verdict to one exact accepted entry
+  hash observed at Bob's effect outcome and then performs one `vox room read`; a polling read may
+  not relabel a later unrelated refusal as this defect.
+
+  **Causal handoffs and access.** A response already consumed from a peer MUST retain its exact
+  local continuation until its result is committed or the request is invalidated; local
+  publication being busy MUST NOT require fetching that same response again. Work that is only
+  waiting MUST release its physical worker and no-longer-needed buffers and reservations;
+  retained bytes remain charged, and a worker still running retains its resources until it exits.
+  Resumption MUST recheck current room and authority, and
+  peer work MUST also recheck the connection. An actual change MUST retain the wake needed to make
+  progress; unchanged information MUST NOT recreate a completed need or spin empty rounds.
+  A signed Head or inventory hint is not a receipt: only authenticated, role-complete evidence
+  for the matching chain may advance `held_through` (FX-15), and status MUST name actual round
+  needs rather than credit uncommitted work as transferred history.
+
+  ADR-036 H-2 and H-6 distinguish the public authenticated position of an addressed key package
+  from its recipient's private key application. Public authenticated position and control-source
+  metadata progress MUST NOT depend on obtaining that private body. For the signed recipient,
+  H-6's body-before-effect requirement applies to the recipient's key effect, control-effect
+  readiness and role-complete receipt: none completes without the exact authorized body and
+  its effect. A nonrecipient MUST NOT obtain the body or
+  gain private access from the public header. This clarifies the scope of H-6's reference to
+  publishing the semantic effect or advancing the live window; it does not waive recipient
+  checks or authorize missing evidence.
+
+  An explicit requested-history Resume MUST recheck current authority without widening the
+  saved request's node, room, audience, interval or content, and MUST preserve its progress. A
+  renewed activation MUST
+  fence older workers so they cannot publish through it. A reachable authorized source MUST be
+  able to serve the same request without being starved by an obsolete unavailable source; its
+  retained authenticated current-format history MUST support the required proofs or bounded
+  reconstruction from already held metadata, without fetching unrequested unrelated public or
+  private bodies. Source unavailability, invalid or contradictory evidence, storage failure and
+  authorization failure MUST remain distinct and MUST NOT be misreported as one another. These
+  are user and security outcomes under ADR-036 H-2, H-4 and H-8, not a prescribed queue, donor
+  algorithm or on-disk index. Active private-transfer fairness remains separate work under #1047.
 - **FX-30.** What a person would lose MUST survive a crash of the daemon, of the machine, or a
   power loss: a node's own entries, consent, trust, keys, Session records and the format marker
   are on disk before the command that wrote them returns (ruled 2026-10-20: "only what a person
@@ -568,17 +602,21 @@ lessons. It changes neither this record's decision status nor any requirement or
   `sync_data` → `fcntl(F_FULLFSYNC)` (vox-core never calls `set_durability`); the process spent
   0.65 thread-seconds per wall second inside `F_FULLFSYNC` (about 0.5 ms per call back to back;
   an isolated 8 KiB probe cost 7.6 ms), and that flush was most of the 1,367 commits' cost.
-- **FX-31.** A flush to disk of one commit MUST NOT delay what does not depend on it: while a
-  flush is held (apparatus: the store's flush stalled by a `VOX_TEST_*` knob of the `test-knobs`
-  build, the way every held-step proof here stages a stall), the daemon's status
-  publication, a member's read in that room, a post in that room or any other, and attention
-  selection MUST answer within FX-17's bound ("publications, reads, posts and attention never
-  wait on" a flush, ruled 2026-10-20: "sounds right"), and `vox status` MUST NOT say "room
-  publication is busy" for a room whose only activity is a flush. Decision: no commit's flush
-  runs while the room's lock is held; a post's batch is written under the lock and its own
-  flush completes after the lock is released, so the post is accepted, and durable, within the
-  bound while an earlier flush is still held. Measured cause, the same daemon: every commit ran inside `history_write` with
-  the room mutex held (the `read_charged` closure owns the `lock_owned()` guard), so the daemon
+- **FX-31.** A flush to disk of one commit MUST NOT delay work that does not depend on that
+  flush. While a save is stalled, status publication and `vox status` queries, reads of
+  already-saved messages, attention selection and other unrelated non-disk work MUST remain
+  responsive; `vox status` MUST NOT say "room publication is busy" for a room whose only activity
+  is a flush. No commit's flush runs while the room's lock is held. A new post stays pending while
+  its own save can still complete and reports success only after that save is durable, as FX-30
+  requires. If its save definitively fails, the post reports failure and MUST NOT be reported as
+  saved. Any surface that reports save or recovery state MUST report it truthfully. The
+  2026-10-27 decider ruling supersedes the earlier promise that every post completes while an
+  earlier flush is held; no fixed elapsed cutoff or new capacity limit determines this behavior.
+  The existing real-binary journey may
+  hold a flush using the `test-knobs` build to show that unrelated work progresses, then release
+  it and verify that the post completes durably. Measured cause, the same daemon: every commit
+  ran inside `history_write` with the room mutex held (the `read_charged` closure owns the
+  `lock_owned()` guard), so the daemon
   log said `room publication is busy; retry this operation` 424 times and `attention selection
   remains pending`, and the app's member list flickered (#983).
 - **FX-32.** A node that finds a member holding more of its own feed than it does (a restored
