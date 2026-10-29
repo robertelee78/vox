@@ -6647,16 +6647,24 @@ impl ChannelState {
         let Some(feed) = self.dag.feed(&me) else {
             return Ok(());
         };
-        if !feed
+        if feed
             .get(&entries, head)?
-            .is_some_and(|entry| entry.skeleton.epoch == self.epoch)
+            .is_none_or(|entry| entry.skeleton.epoch != self.epoch)
         {
             // No own entry closes the old epoch yet. The next own append changes the head.
             scan.complete = true;
             return Ok(());
         }
-        let epoch = u64::from_be_bytes(key[..8].try_into().expect("fixed epoch key width"));
-        let chain = u64::from_be_bytes(key[8..16].try_into().expect("fixed chain key width"));
+        let epoch = u64::from_be_bytes(
+            key[..8]
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("own historical epoch key width"))?,
+        );
+        let chain = u64::from_be_bytes(
+            key[8..16]
+                .try_into()
+                .map_err(|_| Error::MalformedAtRest("own historical chain key width"))?,
+        );
         if epoch >= self.epoch {
             scan.after = Some(key);
             scan.current = None;

@@ -195,7 +195,7 @@ pub(super) struct RequestReady {
 }
 
 pub(super) enum OwnKeyReply {
-    Available(crate::group::skdm::Skdm),
+    Available(Box<crate::group::skdm::Skdm>),
     Unavailable,
     DonorStorageFault,
 }
@@ -873,7 +873,7 @@ impl Node {
                     peer,
                     connection,
                     room: Arc::downgrade(&room),
-                    context: context.clone(),
+                    context,
                     bundle,
                     peer_jobs,
                     queue,
@@ -1953,7 +1953,7 @@ impl Node {
         let refused_room_id = context.channel_id;
         let response_room = Arc::clone(&room);
         let response_connection = Arc::clone(&connection);
-        let response_context = context.clone();
+        let response_context = context;
         let tx = self.net_tx.clone();
         let event_tx = self.event_tx.clone();
         let admitted = self.with_current_computer_authority(|| {
@@ -2416,7 +2416,7 @@ pub(super) fn decode_response(
                     "own-key release does not satisfy request",
                 ));
             }
-            OwnKeyReply::Available(release)
+            OwnKeyReply::Available(Box::new(release))
         }
         _ => return Err(Error::MalformedBundle("own-key response status")),
     };
