@@ -262,26 +262,6 @@ impl ReadResource {
         }
     }
 
-    fn pin_pending_snapshot(&self) -> Result<Arc<crate::node::store::Snapshot>> {
-        let mut publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
-        let publication = publication.as_mut().ok_or(Error::AtRestLocked)?;
-        let store = self.store.upgrade().ok_or(Error::AtRestLocked)?;
-        let snapshot = Arc::new(store.snapshot()?);
-        self.sek.with(|sek| {
-            let rendered = publication.entries.render_snapshot(
-                snapshot.clone(),
-                sek,
-                &publication.facts.channel,
-            )?;
-            if rendered.directory_revision() != publication.directory_revision {
-                return Err(Error::Profile(CHANGED));
-            }
-            Ok(())
-        })?;
-        publication.pending_snapshot = Some(snapshot.clone());
-        Ok(snapshot)
-    }
-
     fn release_pending_snapshot(&self, snapshot: &Arc<crate::node::store::Snapshot>) {
         if let Some(publication) = self
             .publication
@@ -401,19 +381,20 @@ impl ChannelState {
     /// Publish only after the committed mutation has been applied to this room. A pending
     /// authored transaction leaves the preceding publication untouched.
     pub(crate) fn publish_history_read(&mut self, store: Arc<Store>) -> Result<Arc<ReadResource>> {
-        self.publish_history_read_inner(store, None)
+        self.publish_history_read_inner(store, None, false)
     }
     pub(crate) fn publish_history_read_trusted(
         &mut self,
         store: Arc<Store>,
         trusted: &BTreeSet<Digest32>,
     ) -> Result<Arc<ReadResource>> {
-        self.publish_history_read_inner(store, Some(trusted))
+        self.publish_history_read_inner(store, Some(trusted), false)
     }
     fn publish_history_read_inner(
         &mut self,
         store: Arc<Store>,
         trusted: Option<&BTreeSet<Digest32>>,
+        retain_snapshot: bool,
     ) -> Result<Arc<ReadResource>> {
         if self.poisoned {
             // A definitive failed write cannot certify whatever roots redb exposes after
@@ -426,6 +407,11 @@ impl ChannelState {
             return Err(self.save_failure());
         }
         if self.post_pending() {
+            if retain_snapshot {
+                return Err(Error::Profile(
+                    "room publication is busy; retry this operation",
+                ));
+            }
             let resource = self
                 .history_read
                 .clone()
@@ -434,7 +420,18 @@ impl ChannelState {
             return Ok(resource);
         }
         let entries = self.entries.fork_reader();
-        let rendered = entries.render_view(&store, &self.sek, &self.channel_id)?;
+        // Admission derives its publication and retained roots from one MVCC generation.
+        let pending_snapshot = if retain_snapshot {
+            Some(Arc::new(store.snapshot()?))
+        } else {
+            None
+        };
+        let rendered = match &pending_snapshot {
+            Some(snapshot) => {
+                entries.render_snapshot(Arc::clone(snapshot), &self.sek, &self.channel_id)?
+            }
+            None => entries.render_view(&store, &self.sek, &self.channel_id)?,
+        };
         let directory_revision = rendered.directory_revision();
         let cache_only = rendered.legacy_cache_only();
         drop(rendered);
@@ -444,7 +441,7 @@ impl ChannelState {
             directory_revision,
             cache_only,
             revision: 1,
-            pending_snapshot: None,
+            pending_snapshot,
         };
         if let Some(trusted) = trusted {
             publication.facts.legacy_cache_trusted = Some(trusted.clone());
@@ -494,8 +491,14 @@ impl ChannelState {
         Ok(resource)
     }
     pub(crate) fn pin_history_read(&mut self, store: Arc<Store>) -> Result<PendingHistoryRead> {
-        let resource = self.publish_history_read(store)?;
-        let snapshot = resource.pin_pending_snapshot()?;
+        let resource = self.publish_history_read_inner(store, None, true)?;
+        let snapshot = resource
+            .publication
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(|publication| publication.pending_snapshot.clone())
+            .ok_or(Error::Profile("saved history snapshot unavailable"))?;
         Ok(PendingHistoryRead { resource, snapshot })
     }
     pub(crate) fn history_read_resource(&self) -> Option<Arc<ReadResource>> {

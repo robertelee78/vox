@@ -4,6 +4,8 @@ use super::super::own_history::{PendingOwnRecovery, Recovery};
 use super::*;
 use crate::log::history::{ControlContext, Descriptor, TreeBinding};
 
+type SettlementOffer = (Option<(Digest32, Digest32, u64)>, Vec<Digest32>);
+
 pub(crate) enum Work {
     Offer(Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>),
     Settle,
@@ -240,6 +242,92 @@ struct CompletedComponent {
 }
 
 impl ChannelState {
+    /// The ordinary settlement producer must not occupy the native save owner for a no-op:
+    /// that owner is also what the following automatic key releases need.
+    pub(crate) fn settlement_work_pending(
+        &self,
+        store: &Store,
+        now: crate::time::Ms,
+        peers: impl FnOnce() -> Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
+    ) -> Result<bool> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        let sparse = self.uses_sparse_history(store)?;
+        if !self.settled && self.recovery_settlement_eligible(store, now, sparse)? {
+            return Ok(true);
+        }
+        let (_, targets) = self.recovery_settlement_offer(store, peers)?;
+        if !targets.is_empty() {
+            return Ok(true);
+        }
+        if sparse && self.settled {
+            return self.visit_unsaid_recovery_shares(store, |_| {});
+        }
+        Ok(false)
+    }
+
+    fn recovery_settlement_offer(
+        &self,
+        store: &Store,
+        peers: impl FnOnce() -> Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)>,
+    ) -> Result<SettlementOffer> {
+        let hint = if self.uses_sparse_history(store)? {
+            self.sparse_settlement_pending_own_head(store)
+        } else {
+            None
+        };
+        let targets = match hint {
+            Some((_, head, size)) => {
+                self.history_own_receipt_targets(store, peers(), head, size)?
+            }
+            None => Vec::new(),
+        };
+        Ok((hint, targets))
+    }
+
+    fn recovery_settlement_eligible(
+        &self,
+        store: &Store,
+        now: crate::time::Ms,
+        sparse: bool,
+    ) -> Result<bool> {
+        #[cfg(feature = "test-knobs")]
+        let held = std::env::var_os(TEST_NEVER_SETTLE_ENV).is_some_and(|v| !v.is_empty());
+        #[cfg(not(feature = "test-knobs"))]
+        let held = false;
+        Ok(!held
+            && if sparse {
+                self.settled || self.sparse_settlement_local_ready(store, now)?
+            } else {
+                !self.settled
+            })
+    }
+
+    fn visit_unsaid_recovery_shares(
+        &self,
+        store: &Store,
+        mut visit: impl FnMut(&str),
+    ) -> Result<bool> {
+        let mut tags = self
+            .services
+            .keys()
+            .filter(|tag| !self.transient.contains(*tag));
+        let Some(first) = tags.next() else {
+            return Ok(false);
+        };
+        let view = self.current_governance(store)?;
+        let me = self.me();
+        let mut unsaid = false;
+        for tag in std::iter::once(first).chain(tags) {
+            if view.share(&me, service_name(tag))?.is_none() {
+                unsaid = true;
+                visit(tag);
+            }
+        }
+        Ok(unsaid)
+    }
+
     pub(crate) fn prepare_pending_recovery_work(
         &mut self,
         store: &Arc<Store>,
@@ -249,17 +337,7 @@ impl ChannelState {
     ) -> Result<Option<Prepared>> {
         let operation = match work {
             Work::Offer(peers) => {
-                let hint = if self.uses_sparse_history(store)? {
-                    self.sparse_settlement_pending_own_head(store)
-                } else {
-                    None
-                };
-                let targets = match hint {
-                    Some((_, head, size)) => {
-                        self.history_own_receipt_targets(store, peers, head, size)?
-                    }
-                    None => Vec::new(),
-                };
+                let (hint, targets) = self.recovery_settlement_offer(store, || peers)?;
                 Operation::Unchanged(Saved::Offered { hint, targets })
             }
             Work::Fence => {
@@ -315,16 +393,7 @@ impl ChannelState {
             }
             Work::Settle => {
                 let sparse = self.uses_sparse_history(store)?;
-                #[cfg(feature = "test-knobs")]
-                let held = std::env::var_os(TEST_NEVER_SETTLE_ENV).is_some_and(|v| !v.is_empty());
-                #[cfg(not(feature = "test-knobs"))]
-                let held = false;
-                if held
-                    || (!sparse && self.settled)
-                    || (sparse
-                        && !self.settled
-                        && !self.sparse_settlement_local_ready(store, now)?)
-                {
+                if !self.recovery_settlement_eligible(store, now, sparse)? {
                     Operation::Unchanged(Saved::Settlement {
                         changed: false,
                         sparse,
@@ -456,19 +525,10 @@ impl ChannelState {
                 }
             }
             Work::Shares => {
-                let view = self.current_governance(store)?;
-                let me = self.me();
                 let mut unsaid = Vec::new();
-                for tag in self
-                    .services
-                    .keys()
-                    .filter(|tag| !self.transient.contains(*tag))
-                {
-                    if view.share(&me, service_name(tag))?.is_none() {
-                        unsaid.push((tag.clone(), self.kind_of(tag)));
-                    }
-                }
-                drop(view);
+                self.visit_unsaid_recovery_shares(store, |tag| {
+                    unsaid.push((tag.to_owned(), self.kind_of(tag)));
+                })?;
                 if unsaid.is_empty() {
                     Operation::Unchanged(Saved::Shares(false))
                 } else {

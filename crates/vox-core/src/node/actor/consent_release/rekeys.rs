@@ -3,6 +3,9 @@ use super::*;
 
 pub(in crate::node::actor) enum RekeyAfter {
     Automatic,
+    Settlement {
+        lifetime: Arc<Lifetime>,
+    },
     Consent {
         next: Box<Continuation>,
         reply: Reply,
@@ -616,6 +619,11 @@ impl Node {
     ) {
         match after {
             RekeyAfter::Automatic => {}
+            RekeyAfter::Settlement { lifetime } => {
+                if result.is_ok() {
+                    Box::pin(self.begin_owned_consent_pass(None, Some(lifetime), None)).await;
+                }
+            }
             RekeyAfter::Consent { next, reply } => match result {
                 Ok(_) => self.finish_owned_consent_tail(*next, reply).await,
                 Err(error) => {
@@ -640,7 +648,7 @@ impl Node {
 
     pub(super) fn reject_owned_rekeys(&mut self, target: Target, error: Error) {
         match target.pass.after {
-            RekeyAfter::Automatic => {}
+            RekeyAfter::Automatic | RekeyAfter::Settlement { .. } => {}
             RekeyAfter::Consent { next, reply } => {
                 self.reject_owned_consent(target.pass.room, error, *next, reply)
             }
@@ -658,7 +666,7 @@ impl Node {
 
 pub(super) fn retire(target: Target, error: Error) {
     match target.pass.after {
-        RekeyAfter::Automatic => {}
+        RekeyAfter::Automatic | RekeyAfter::Settlement { .. } => {}
         RekeyAfter::Consent { next, reply } => super::retire_detached(Err(error), *next, reply),
         RekeyAfter::Packages { reply, .. } => {
             if let Some(reply) = reply {

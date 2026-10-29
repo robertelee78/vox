@@ -56,6 +56,7 @@ pub(super) struct Continuation {
     lifetime: Option<Arc<maintenance_save::Lifetime>>,
     after: After,
     stage: Stage,
+    settle: bool,
     recover: bool,
     offer: Option<Offer>,
     back: bool,
@@ -81,6 +82,7 @@ impl Continuation {
             lifetime,
             after,
             stage: if settle { Stage::Offer } else { Stage::Fence },
+            settle,
             recover,
             offer: None,
             back: false,
@@ -150,6 +152,25 @@ impl Node {
             None,
             self.now_ms(),
         );
+        if settle && !recover {
+            let pending = {
+                let channel = continuation.instance.lock().await;
+                let Some(profile) = self.profile.as_ref() else {
+                    return;
+                };
+                channel.settlement_work_pending(profile.store(), continuation.now, || {
+                    self.recovery_offer_peers(room)
+                })
+            };
+            match pending {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    self.reject_owned_recovery(room, error, continuation, None);
+                    return;
+                }
+            }
+        }
         self.continue_recovery_stage(room, continuation, None).await;
     }
     pub(super) async fn continue_governance_recovery(
@@ -173,6 +194,28 @@ impl Node {
         self.continue_recovery_stage(room, continuation, reply)
             .await;
     }
+    fn recovery_offer_peers(
+        &self,
+        room: Digest32,
+    ) -> Vec<(Digest32, Option<(u64, crate::node::ports::OwnProbe)>)> {
+        self.connected_peers()
+            .into_iter()
+            .map(|peer| {
+                let parked = self
+                    .ports
+                    .get(&(room, peer))
+                    .and_then(|port| port.own_receipt_lower)
+                    .zip(
+                        self.net
+                            .as_ref()
+                            .and_then(|net| net.manager().existing(&peer)),
+                    )
+                    .map(|(probe, connection)| (connection.serial(), probe));
+                (peer, parked)
+            })
+            .collect()
+    }
+
     async fn continue_recovery_stage(
         &mut self,
         room: Digest32,
@@ -180,24 +223,7 @@ impl Node {
         reply: Option<oneshot::Sender<Outcome>>,
     ) {
         let step = match continuation.stage {
-            Stage::Offer => Step::Offer(
-                self.connected_peers()
-                    .into_iter()
-                    .map(|peer| {
-                        let parked = self
-                            .ports
-                            .get(&(room, peer))
-                            .and_then(|port| port.own_receipt_lower)
-                            .zip(
-                                self.net
-                                    .as_ref()
-                                    .and_then(|net| net.manager().existing(&peer)),
-                            )
-                            .map(|(probe, connection)| (connection.serial(), probe));
-                        (peer, parked)
-                    })
-                    .collect(),
-            ),
+            Stage::Offer => Step::Offer(self.recovery_offer_peers(room)),
             Stage::Settle => Step::Settle,
             Stage::CatchUp => Step::CatchUp,
             Stage::Presence => Step::Presence,
@@ -455,6 +481,18 @@ impl Node {
             After::Producer => {
                 if let Some(reply) = reply {
                     let _ = reply.send(Outcome::Done);
+                }
+                if let Some(lifetime) = continuation.lifetime.filter(|_| continuation.settle) {
+                    // The synchronous producer used to return before its caller released
+                    // owed keys. Transfer that causal tail only after the real native
+                    // settlement terminal, under its original publication/secret lifetime.
+                    Box::pin(self.begin_owned_rekeys_for(
+                        room,
+                        false,
+                        Some(Arc::clone(&lifetime)),
+                        consent_release::RekeyAfter::Settlement { lifetime },
+                    ))
+                    .await;
                 }
             }
         }
