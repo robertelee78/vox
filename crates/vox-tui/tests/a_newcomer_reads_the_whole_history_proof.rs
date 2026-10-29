@@ -932,6 +932,25 @@ fn wait_trust_detail(dir: &Path, reader: &str, room: &str, member: &str, expecte
     }
 }
 
+/// A newly joined room can briefly lack the reader's own published consent even after its
+/// node-wide trust command succeeded. Wait for that exact room fact; mutual trust would mean
+/// the missing-consent staging failed.
+fn wait_reader_one_way_trust(dir: &Path, reader: &str, room: &str, member: &str) {
+    loop {
+        let actual = trust_detail(dir, reader, room, member);
+        match actual.as_str() {
+            "you trust it, but it has not trusted you: it cannot read you" => return,
+            "you have not trusted it: it cannot read you, and you do not read it" => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            detail if detail.starts_with("that room is preparing its saved history") => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => panic!("APPARATUS: required missing-consent boundary was not staged for {reader}/{member} in {room}: {actual}"),
+        }
+    }
+}
+
 /// The post numbers in `1..=posts` that `seen` lacks, as a few ranges for a failure message.
 fn missing_ranges(seen: &BTreeSet<usize>, posts: usize) -> Vec<(usize, usize)> {
     let mut out: Vec<(usize, usize)> = Vec::new();
@@ -6628,13 +6647,7 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: Bob could not join consent-last: {out}{err}");
-    wait_trust_detail(
-        &bob,
-        "bob",
-        &room,
-        "alice",
-        "you trust it, but it has not trusted you: it cannot read you",
-    );
+    wait_reader_one_way_trust(&bob, "bob", &room, "alice");
     wait_for_held_rows(&bob, &room, &hashes, "author-governance");
     wait_room_status(
         &alice,
@@ -6678,11 +6691,7 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         "Bob never accepted the retained sender key before consent",
         |status| status.received_key_generations >= 1,
     );
-    assert_eq!(
-        trust_detail(&bob, "bob", &room, "alice"),
-        "you trust it, but it has not trusted you: it cannot read you",
-        "APPARATUS: Bob's consent fold did not hold after the key arrived"
-    );
+    wait_reader_one_way_trust(&bob, "bob", &room, "alice");
     wait_for_held_rows(&bob, &room, &hashes, "consent-fold");
     assert!(
         with_key.received_key_generations >= 1,
@@ -6793,7 +6802,6 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         (&bob, &fps[0], "alice"),
         (&bob, &fps[2], "carol"),
         (&carol, &fps[0], "alice"),
-        (&carol, &fps[1], "bob"),
     ] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
@@ -6962,18 +6970,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
             "Bob never retained Alice's pre-key room prefix",
             |status| status.log_entries > 0,
         );
-        let held_trust = trust_detail(&bob, "bob", room, "alice");
-        assert_eq!(
-            held_trust, "you trust it, but it has not trusted you: it cannot read you",
-            "APPARATUS: Alice's governance fold was not visibly held after Bob accepted her \
-             existing LogDb prefix in room {room}"
-        );
+        wait_reader_one_way_trust(&bob, "bob", room, "alice");
         wait_for_held_rows(&bob, room, &late_hashes[i], "governance-fold");
-        assert_eq!(
-            trust_detail(&bob, "bob", room, "carol"),
-            "you trust it, but it has not trusted you: it cannot read you",
-            "APPARATUS: Carol's governance fold was not visibly held in room {room}"
-        );
+        wait_reader_one_way_trust(&bob, "bob", room, "carol");
         wait_for_held_rows(&bob, room, &competing_hashes[i], "Carol-governance-fold");
         // Membership, not counts over two different retained collections, is the precondition
         // for Alice to issue Bob's consent after the fold is released.
@@ -7057,6 +7056,25 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
 
     std::fs::remove_file(&carol_fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
+    // Carol must not have consented before the missing-fact boundary. Her earlier room join
+    // can already publish off-roster consent when Bob is in her keyring.
+    let (ok, out, err) = vox(
+        &carol,
+        &[
+            "trust",
+            "add",
+            &fps[1],
+            "--name",
+            "bob",
+            "--history",
+            "full",
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: Carol could not grant Bob her retained history: {out}{err}"
+    );
     // Carol's authenticated same-name action is the independent causal wake for her released
     // fold; it cannot add another Alice-authored candidate to the grant1 boundary above.
     for room in &rooms {
