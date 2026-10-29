@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.10.
 
 Find the message or behaviour you see, then follow its steps. Each entry says what the symptom
 means, what to check, how to fix it, and how to confirm the fix.
