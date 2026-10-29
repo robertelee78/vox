@@ -219,6 +219,10 @@ message counts or proof that a peer has admitted every author.
 Quiet rooms still send scheduled head checks and transport keepalives: zero record counts do not
 mean zero network bytes.
 
+An ongoing `sync-failing` problem must clear after a successful current bounded or legacy
+completion. Historical `last_failure` values and cumulative failure counts remain diagnostic
+history, not current-health verdicts.
+
 Status output can reveal rooms, peers, addresses and paths. Share the smallest excerpt that shows
 the problem.
 

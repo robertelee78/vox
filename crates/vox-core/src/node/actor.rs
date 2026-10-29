@@ -12831,6 +12831,10 @@ impl Node {
                         |counts| match result {
                             Ok(crate::node::history_stream::Status::Complete) => {
                                 counts.completed += 1;
+                                // A current authenticated bounded completion settles the same
+                                // failure streak as a successful legacy session.
+                                counts.consecutive_failures = 0;
+                                counts.failing_since = None;
                                 counts
                                     .reasons
                                     .count(crate::node::status::RoundReason::Served);
