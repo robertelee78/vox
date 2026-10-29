@@ -165,13 +165,23 @@ impl Eq for ReadResource {}
 
 /// The admitted save carries this lease through physical completion and delta installation.
 /// Its native snapshot contains sealed storage only and is never held by a waiting client.
+/// Failed republication leaves the preceding view with the resource until replacement or revoke.
 pub(crate) struct PendingHistoryRead {
     resource: Arc<ReadResource>,
     snapshot: Arc<crate::node::store::Snapshot>,
+    release_snapshot: bool,
+}
+impl PendingHistoryRead {
+    /// Keep the prior committed view in its resource until republication or revocation.
+    pub(crate) fn retain_saved_read(&mut self) {
+        self.release_snapshot = false;
+    }
 }
 impl Drop for PendingHistoryRead {
     fn drop(&mut self) {
-        self.resource.release_pending_snapshot(&self.snapshot);
+        if self.release_snapshot {
+            self.resource.release_pending_snapshot(&self.snapshot);
+        }
     }
 }
 
@@ -495,7 +505,11 @@ impl ChannelState {
             .as_ref()
             .and_then(|publication| publication.pending_snapshot.clone())
             .ok_or(Error::Profile("saved history snapshot unavailable"))?;
-        Ok(PendingHistoryRead { resource, snapshot })
+        Ok(PendingHistoryRead {
+            resource,
+            snapshot,
+            release_snapshot: true,
+        })
     }
     pub(crate) fn history_read_resource(&self) -> Option<Arc<ReadResource>> {
         self.history_read.clone()

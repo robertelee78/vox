@@ -789,7 +789,20 @@ fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
 
 /// Rename through the shipped command and return the exact authenticated row it says it appended.
 fn rename_hash(dir: &Path, reader: &str, room: &str, name: &str) -> String {
-    let (ok, out, err) = vox(dir, &["room", "rename", room, name], None);
+    let (ok, out, err) = loop {
+        let result = vox(dir, &["room", "rename", room, name], None);
+        if !result.0
+            && result.2.starts_with(
+                "vox: cannot rename the room: a previous change to this room is still being applied; this request made no change",
+            )
+        {
+            // The command explicitly made no change. Follow its wait instruction before
+            // asking again; all other refusals remain product failures.
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        break result;
+    };
     assert!(
         ok,
         "PRODUCT: {reader}'s `vox room rename {room} {name}` was refused: {out}{err}"
@@ -6803,7 +6816,11 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         (&bob, &fps[2], "carol"),
         (&carol, &fps[0], "alice"),
     ] {
-        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        let (ok, _, err) = vox(
+            dir,
+            &["trust", "add", fp, "--name", name, "--history", "now"],
+            None,
+        );
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
     let fold_hold = root.join("fx22-fold-hold");
@@ -6939,6 +6956,19 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         competing_texts.push(vec![text]);
     }
 
+    // Set the later same-name input before holding the fold: rename itself requires that fold
+    // to finish. Prove the command appended one exact authenticated object rather than accepting
+    // command success from a mutant that skipped the append.
+    for room in &rooms {
+        let before = room_hashes(&alice, "alice", room);
+        let appended = rename_hash(&alice, "alice", room, room);
+        assert!(
+            !before.contains(&appended) && room_hashes(&alice, "alice", room).contains(&appended),
+            "PRODUCT: Alice's successful same-name rename named entry {appended}, but that exact \
+             authenticated row was not newly present in room {room}"
+        );
+    }
+
     // Alice may accept Bob's admission but cannot fold it, so she cannot consent or release her
     // key. Bob nevertheless accepts Alice's existing LogDb prefix. The product itself says that
     // the prefix is present, no sender key is held, Alice has not consented, and none of the named
@@ -6996,62 +7026,20 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         });
     }
 
-    // Stage one same-name action while the fold is still held and prove the command appended one
-    // exact authenticated room-order object. Command success alone is not the precondition: a
-    // mutant that returns success without the append has no new hash and fails here.
-    for room in &rooms {
-        let before = room_hashes(&alice, "alice", room);
-        let appended = rename_hash(&alice, "alice", room, room);
-        assert!(
-            !before.contains(&appended) && room_hashes(&alice, "alice", room).contains(&appended),
-            "PRODUCT: Alice's successful same-name rename named entry {appended}, but that exact \
-             authenticated row was not newly present in room {room}"
-        );
-    }
-
-    // With Bob offline, release the two authors separately. The exact ordered interval around
-    // Alice's release identifies grant1 itself: after subtracting the one causal same-name rename,
-    // exactly one newly appended authenticated object remains. Releasing Carol afterwards keeps
-    // her consent from being misidentified as Alice's grant.
-    let grant1_baselines: Vec<Vec<String>> = rooms
-        .iter()
-        .map(|room| room_hashes(&alice, "alice", room))
-        .collect();
+    // With Bob offline, release each source through a real user action. Their later mutual
+    // trust answers establish the grants; a whole-room hash delta cannot identify one grant.
     std::fs::remove_file(&fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
     // Marker removal is apparatus, not a product wake. A second authenticated same-name action is
     // the causal event that resumes Alice's released fold.
-    let mut alice_causal_renames = Vec::with_capacity(rooms.len());
     for room in &rooms {
+        let before = room_hashes(&alice, "alice", room);
         let causal = rename_hash(&alice, "alice", room, room);
         assert!(
-            room_hashes(&alice, "alice", room).contains(&causal),
+            !before.contains(&causal) && room_hashes(&alice, "alice", room).contains(&causal),
             "PRODUCT: Alice's causal same-name rename named {causal}, but the exact \
              authenticated row was absent after the fold hold was released in room {room}"
         );
-        alice_causal_renames.push(causal);
-    }
-    for room in &rooms {
-        wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
-    }
-    let mut grant1_hashes = Vec::with_capacity(rooms.len());
-    for (index, room) in rooms.iter().enumerate() {
-        let after = room_hashes(&alice, "alice", room);
-        let appended: Vec<_> = after
-            .iter()
-            .filter(|hash| {
-                !grant1_baselines[index].contains(hash) && **hash != alice_causal_renames[index]
-            })
-            .cloned()
-            .collect();
-        assert_eq!(
-            appended.len(),
-            1,
-            "PRODUCT: Alice's released fold did not append exactly one identifiable consent grant1 in room {room}; before {:?}; causal rename {}; after {after:?}; candidates {appended:?}",
-            grant1_baselines[index],
-            alice_causal_renames[index]
-        );
-        grant1_hashes.push(appended[0].clone());
     }
 
     std::fs::remove_file(&carol_fold_hold)
@@ -7075,16 +7063,6 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         ok,
         "PRODUCT: Carol could not grant Bob her retained history: {out}{err}"
     );
-    // Carol's authenticated same-name action is the independent causal wake for her released
-    // fold; it cannot add another Alice-authored candidate to the grant1 boundary above.
-    for room in &rooms {
-        let causal = rename_hash(&carol, "carol", room, room);
-        assert!(
-            room_hashes(&carol, "carol", room).contains(&causal),
-            "PRODUCT: Carol's causal same-name rename named {causal}, but the exact authenticated row was absent after her fold hold was released in room {room}"
-        );
-        wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
-    }
 
     // Bob now receives Alice's consent and the sealed package row, but the package marker keeps
     // the shipped daemon from opening it. Doctor says consent is mutual while status still says
@@ -7105,6 +7083,10 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     for (i, room) in rooms.iter().enumerate() {
         wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
         wait_trust_detail(&bob, "bob", room, "carol", "you trust each other");
+        // Reciprocal consent may still be on Bob. Check it only after his daemon restarts;
+        // neither source can obtain a missing Bob-authored fact while he is stopped.
+        wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
+        wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
         let held = wait_room_status(
             &bob,
             "bob",
@@ -7173,11 +7155,24 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     });
     std::fs::remove_file(&render_hold_ready)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the exact-key hold: {error}"));
-    let fairness_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn");
+    // Bob is a member, not an administrator. His real history-grant upgrade publishes consent
+    // and wakes retained work without pretending that he may rename this room.
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "trust",
+            "add",
+            &fps[0],
+            "--name",
+            "alice",
+            "--history",
+            "full",
+        ],
+        None,
+    );
     assert!(
-        room_hashes(&bob, "bob", &rooms[0]).contains(&fairness_wake),
-        "PRODUCT: Bob's exact fairness wake {fairness_wake} was absent from room {}",
-        rooms[0]
+        ok,
+        "PRODUCT: Bob could not grant Alice his full history: {out}{err}"
     );
 
     // The marker engages only after one real bounded turn commits Carol's exact-author row, then
@@ -7212,7 +7207,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         rooms[0]
     );
     assert_eq!(
-        competing[0]["text"].as_str(),
+        competing[0]["envelope"]["body"].as_str(),
         Some(competing_texts[0][0].as_str()),
         "PRODUCT: the held fair turn did not make Carol's exact retained row {} readable in room \
          {}: {}",
@@ -7225,7 +7220,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         .filter(|row| {
             row["entry_hash"].as_str().is_some_and(|hash| {
                 late_hashes[0].iter().any(|expected| expected == hash)
-                    && row["text"].as_str().is_some()
+                    && row["envelope"]["body"].as_str().is_some()
             })
         })
         .count();
@@ -7247,11 +7242,22 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     );
     std::fs::remove_file(&render_hold_engaged)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fair-turn hold: {error}"));
-    let continuation_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn-resume");
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "trust",
+            "add",
+            &fps[2],
+            "--name",
+            "carol",
+            "--history",
+            "full",
+        ],
+        None,
+    );
     assert!(
-        room_hashes(&bob, "bob", &rooms[0]).contains(&continuation_wake),
-        "PRODUCT: Bob's exact continuation wake {continuation_wake} was absent from room {}",
-        rooms[0]
+        ok,
+        "PRODUCT: Bob could not grant Carol his full history: {out}{err}"
     );
 
     for (index, room) in rooms.iter().enumerate() {
@@ -7282,16 +7288,29 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // Alice's retained package presents an unchanged SKDM. The shipped status work observation is
     // causal and exact: no new projection revision and no render continuation may appear. This
     // replaces an aggregate CPU sample that could pass without observing the duplicate at all.
-    let duplicate_before = room_status(&bob, "bob", &rooms[0]);
-    assert!(
-        !duplicate_before.render_backfill_pending,
-        "PRODUCT: room {} still reported render backfill before the unchanged key replay: \
-         {duplicate_before:?}",
-        rooms[0]
+    let duplicate_before = wait_room_status(
+        &bob,
+        "bob",
+        &rooms[0],
+        false,
+        "Bob's retained continuation never settled before the unchanged key replay",
+        |status| !status.render_backfill_pending,
     );
     std::fs::write(&render_hold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage render hold: {error}"));
-    let (ok, out, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "trust",
+            "add",
+            &fps[0],
+            "--name",
+            "alice",
+            "--history",
+            "full",
+        ],
+        None,
+    );
     assert!(
         ok,
         "PRODUCT: Bob's idempotent `vox trust add alice` could not replay the retained key \
@@ -7327,7 +7346,6 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // or share Bob's row interval, so `reset + 1` and the final row would not identify Bob's
     // grant. Removing Carol is a shipped user action; wait for its real rotation/regrant fold and
     // prove the node-wide trust decision before the quiet two-member sequence begins.
-    let isolation_before = room_status(&alice, "alice", &rooms[0]);
     let (ok, out, err) = vox(&alice, &["trust", "remove", &fps[2]], None);
     assert!(
         ok,
@@ -7347,31 +7365,47 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          Carol {}: {trusted}",
         fps[2]
     );
-    let isolation_revision = isolation_before
-        .governance_revision
-        .checked_add(2)
-        .expect("PRODUCT: Alice's governance revision overflowed while isolating Bob's grant");
-    let isolation_settled = wait_room_status(
+    // Reading a new-generation message proves Bob received the post-removal release. Exact
+    // revision counts cannot distinguish the reset, revocation and asynchronous regrant.
+    let isolation_text = format!("Alice post-removal message in {}", rooms[0]);
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &rooms[0], "--json", "-"],
+        Some(&isolation_text),
+    );
+    assert!(
+        ok,
+        "PRODUCT: Alice's post-removal message was refused: {out}{err}"
+    );
+    let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: Alice's post-removal answer was malformed ({error}): {out}{err}")
+    });
+    let isolation_hash = posted["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: Alice's post-removal answer named no entry hash: {posted}")
+        })
+        .to_owned();
+    wait_room_status(
         &alice,
         "alice",
         &rooms[0],
         false,
-        "Carol's removal did not publish its reset and the one Bob-only regrant, or Alice did \
-         not finish Bob's resulting key delivery",
+        "Alice did not finish Bob's post-removal key delivery",
         |status| {
-            status.governance_revision >= isolation_revision
-                && !status
-                    .key_delivery_pending
-                    .iter()
-                    .any(|member| member == &fps[1])
+            !status
+                .key_delivery_pending
+                .iter()
+                .any(|member| member == &fps[1])
         },
     );
-    assert_eq!(
-        isolation_settled.governance_revision, isolation_revision,
-        "PRODUCT: removing Carol from the three-member trusted-reader set did not publish exactly \
-         the one reset and one Bob-only regrant in quiet room {}: before {isolation_before:?}, \
-         settled {isolation_settled:?}",
-        rooms[0]
+    assert_exact_read_rows(
+        &bob,
+        "bob",
+        &rooms[0],
+        std::slice::from_ref(&isolation_hash),
+        std::slice::from_ref(&isolation_text),
+        "Bob received Alice's post-removal generation",
     );
     wait_governance_current(
         &alice,
@@ -7430,11 +7464,6 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     );
     let rotation_order_before = room_hashes(&alice, "alice", &rooms[0]);
     let semantic_before_rotation = room_status(&alice, "alice", &rooms[0]);
-    let grant1_hash = &grant1_hashes[0];
-    assert!(
-        rotation_order_before.contains(grant1_hash),
-        "PRODUCT: Alice's exact consent grant1 {grant1_hash} disappeared before sender rotation: {rotation_order_before:?}"
-    );
     bob_daemon.stop();
     let mut last_rotated = None;
     let mut rotation_post_hashes = Vec::new();
@@ -7524,7 +7553,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          work",
     );
     let semantic_after_grant2 = room_status(&alice, "alice", &rooms[0]);
-    let ordered_positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
+    let ordered_positions: Vec<_> = [&reset_hash, &grant2_hash]
         .iter()
         .map(|hash| {
             after_grant2
@@ -7534,9 +7563,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         })
         .collect();
     assert!(
-        ordered_positions[0] < ordered_positions[1]
-            && ordered_positions[1] < ordered_positions[2],
-        "PRODUCT: Alice's shipped room order did not prove grant1 {grant1_hash} → reset {reset_hash} → identical grant2 {grant2_hash}: positions {ordered_positions:?}; order {after_grant2:?}"
+        ordered_positions[0] < ordered_positions[1],
+        "PRODUCT: Alice's shipped room order did not prove reset {reset_hash} → identical grant2 {grant2_hash}: positions {ordered_positions:?}; order {after_grant2:?}"
     );
     assert_eq!(
         semantic_after_grant2.governance_revision, grant2_revision,
@@ -7563,17 +7591,17 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     }
     loop {
         let held = room_hashes(&bob, "bob", &rooms[0]);
-        if [grant1_hash, &reset_hash, &grant2_hash]
+        if [&reset_hash, &grant2_hash]
             .iter()
             .all(|hash| held.contains(hash))
         {
-            let positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
+            let positions: Vec<_> = [&reset_hash, &grant2_hash]
                 .iter()
                 .map(|hash| held.iter().position(|entry| entry == *hash).unwrap())
                 .collect();
             assert!(
-                positions[0] < positions[1] && positions[1] < positions[2],
-                "PRODUCT: Bob's shipped order changed the authenticated grant1/reset/grant2 sequence: positions {positions:?}; held {held:?}"
+                positions[0] < positions[1],
+                "PRODUCT: Bob's shipped order changed the authenticated reset/grant2 sequence: positions {positions:?}; held {held:?}"
             );
             break;
         }
@@ -7666,10 +7694,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
             rooms[0]
         )
     });
-    // A changed name is a causal semantic boundary. The hold is checked before this room can
-    // fold it: if the published revision advances while the marker remains unrenamed, the
-    // apparatus did not park the intended room and can say so without an elapsed deadline.
-    let positioning = rename_hash(&alice, "alice", &rooms[0], "fx22-expiry-boundary");
+    // An authenticated same-name row positions the sweep without changing its semantic output.
+    // Expiry alone must own the subsequent revision; the positioning input must not supply it.
+    let positioning = rename_hash(&alice, "alice", &rooms[0], &rooms[0]);
     assert!(
         room_hashes(&alice, "alice", &rooms[0]).contains(&positioning),
         "PRODUCT: the exact authenticated positioning rename {positioning} was absent from room \

@@ -184,6 +184,8 @@ refreshing`, or a read says `the room changed while reading; refresh and retry`.
 Vox must not answer an authorization question using superseded grants or an expired
 administrator certificate. Unchanged questions use the completed in-memory room facts;
 after restart those facts are rebuilt from the sealed index.
+A refresh request alone is not a disk-save failure. Already-saved history stays available
+while incoming history is saved and its room view is updated.
 
 **Fix:** refresh the question as instructed. Do not remove and re-add trust or erase the
 profile to clear it. Once the changed decision is current, `vox room admin list <room>`,
