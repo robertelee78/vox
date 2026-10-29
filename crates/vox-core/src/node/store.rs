@@ -27,11 +27,14 @@
 //! the node schedules it after pruning (ADR-016 §Consequences).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
+};
 
 use crate::atrest::sek::SekWrap;
 use crate::atrest::store::{
@@ -48,6 +51,94 @@ const SEGMENTS: TableDefinition<SegmentKey, &[u8]> = TableDefinition::new("segme
 const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wraps");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
+
+/// Successful store-backend flush calls across this process, including opening, recovery and
+/// rewrite files. Count the completed I/O, not transactions classified as durable.
+static FULL_FLUSHES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn full_flushes() -> u64 {
+    FULL_FLUSHES.load(Ordering::Relaxed)
+}
+
+/// Preserve redb's native file and locking behavior, observing only successful sync_data calls.
+#[derive(Debug)]
+struct FlushObservedBackend(redb::backends::FileBackend);
+
+impl StorageBackend for FlushObservedBackend {
+    fn len(&self) -> std::io::Result<u64> {
+        self.0.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.0.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.0.sync_data()?;
+        FULL_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.0.write(offset, data)
+    }
+
+    fn close(&self) -> std::io::Result<()> {
+        self.0.close()
+    }
+
+    fn try_lock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<bool, redb::BackendError> {
+        self.0.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<bool, redb::BackendError> {
+        self.0.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<(), redb::BackendError> {
+        self.0.lock_range(start, end)
+    }
+
+    fn lock_shared_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<(), redb::BackendError> {
+        self.0.lock_shared_range(start, end)
+    }
+
+    fn unlock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<(), redb::BackendError> {
+        self.0.unlock_range(start, end)
+    }
+
+    fn query_lock_range(
+        &self,
+        start: Bound<u64>,
+        end: Bound<u64>,
+    ) -> std::result::Result<bool, redb::BackendError> {
+        self.0.query_lock_range(start, end)
+    }
+}
 
 /// Cache credits are shared by all stores in this process, including temporary rewrite
 /// handles. Exhaustion opens another database uncached; it never refuses a node or waits.
@@ -198,8 +289,16 @@ fn database_builder() -> (redb::Builder, Arc<DatabaseCacheLease>) {
 
 fn open_database(path: &Path) -> std::result::Result<Cached<Database>, redb::DatabaseError> {
     let (builder, cache) = database_builder();
+    // Match Builder::create's non-truncating open and native backend exactly.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let backend = FlushObservedBackend(redb::backends::FileBackend::new(file)?);
     Ok(Cached {
-        inner: builder.create(path)?,
+        inner: builder.create_with_backend(backend)?,
         cache,
         profile: None,
     })

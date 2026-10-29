@@ -461,6 +461,7 @@ impl StatusReport {
     pub fn to_json(&self) -> String {
         let mut j = String::from("{\"status\":\"Ready\",");
         let _ = write!(j, "\"now_ms\":{},", self.now);
+        let _ = write!(j, "\"full_flushes\":{},", super::store::full_flushes());
         let _ = write!(j, "\"log_path\":{},", q(&self.log_path));
         let _ = write!(
             j,
