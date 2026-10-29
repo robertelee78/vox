@@ -228,14 +228,10 @@ impl ReadResource {
         // consent projection. Read its current cache directly; rebuilding governance still
         // fails closed, and its current expiry/membership fences remain mandatory below.
         let consent = if ch.governance_ready {
-            match &*ch
-                .consent_facts
+            ch.governance_semantic
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-            {
-                ConsentFactsState::Ready(facts) => Some(Arc::clone(facts)),
-                ConsentFactsState::Building(_) => None,
-            }
+                .consent_facts()
         } else {
             None
         };

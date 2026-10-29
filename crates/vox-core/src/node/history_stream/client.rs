@@ -1367,6 +1367,53 @@ impl Receiver {
         if binding.generation != self.generation {
             return Err(Error::Profile("history publication activation changed"));
         }
+        // Hold this exact signed consent before writer admission; sender-key delivery remains
+        // independent. The optional retained-row journey observes real rows on both sides.
+        #[cfg(feature = "test-knobs")]
+        if let Ok(crate::governance::entry::GovBody::ConsentGrant(consent)) =
+            crate::governance::entry::GovEntry::body_bound_to(&record.entry)
+        {
+            if consent.body.target_id == self.node {
+                if let Some(path) = std::env::var_os("VOX_TEST_HOLD_INCOMING_CONSENT_FILE")
+                    .filter(|path| !path.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| path.is_file())
+                {
+                    let encode = crate::node::link::b32_encode;
+                    let scope = format!(
+                        "{} {} {}",
+                        encode(&record.entry.skeleton.channel_id),
+                        encode(&record.entry.skeleton.author_id),
+                        encode(&consent.body.target_id)
+                    );
+                    if std::fs::read_to_string(&path).ok().as_deref() == Some(scope.as_str()) {
+                        let entered = path.with_extension("entered");
+                        static NEXT_MARKER: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let temporary = path.with_extension(format!(
+                            "entered.{}.{}.tmp",
+                            std::process::id(),
+                            NEXT_MARKER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        ));
+                        std::fs::write(
+                            &temporary,
+                            format!("{} {}", scope, encode(&record.entry.entry_hash())),
+                        )
+                        .map_err(|_| Error::Profile("consent hold could not record engagement"))?;
+                        std::fs::rename(&temporary, &entered).map_err(|_| {
+                            Error::Profile("consent hold could not publish engagement")
+                        })?;
+                        while path.is_file() {
+                            tokio::select! {
+                                biased;
+                                () = self.source.fence.retired() => return Err(Error::Unreachable("consent hold cancelled")),
+                                () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let job = record.job.clone();
         let grant = self.grant();
         let received = self.received.clone();

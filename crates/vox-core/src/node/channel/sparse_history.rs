@@ -435,6 +435,7 @@ pub(crate) struct PendingHistorySource {
 pub(crate) struct CommittedHistorySource {
     next_log: u64,
     current_advanced: bool,
+    governance_changed: bool,
 }
 
 impl PendingHistorySource {
@@ -504,6 +505,7 @@ impl PendingHistorySource {
             Ok(CommittedHistorySource {
                 next_log,
                 current_advanced: accepted.current_advanced,
+                governance_changed: accepted.work_changed,
             })
         })
     }
@@ -1856,6 +1858,9 @@ impl ChannelState {
         }
         // Advance the in-memory mirror only after this path's Batch commits. Unlike the ordinary
         // publication paths, a sparse history caller does not poison the room on commit failure.
+        if completed.governance_changed {
+            self.retire_governance()?;
+        }
         if completed.current_advanced {
             self.note_committed_consent(entry)?;
         }

@@ -25,6 +25,16 @@ pub(crate) enum ProjectionProgress {
     Sessions { advanced: bool },
 }
 
+/// Only one source basis travels to the native worker; these payloads never coexist.
+enum ProjectionInput {
+    Governance {
+        semantic: governance::SemanticWork,
+        display: Option<governance::Display>,
+    },
+    Sessions(crate::log::dag::Dag),
+    RoomViews,
+}
+
 pub(crate) struct PendingProjection {
     owner: Option<Arc<()>>,
     room: Digest32,
@@ -38,7 +48,7 @@ pub(crate) struct PendingProjection {
     paused_views: bool,
     work: ProjectionWork,
     entries: entry_store::EntryIndex,
-    sources: Option<crate::log::dag::Dag>,
+    input: ProjectionInput,
     history_pin: Option<history::PendingHistoryRead>,
 }
 
@@ -106,8 +116,20 @@ impl ChannelState {
             entries: entry_store::EntryIndex::default(),
             history_pin: Some(pin),
             paused_views,
-            sources: matches!(work, ProjectionWork::Sessions)
-                .then(|| self.dag.authored_candidate()),
+            input: match work {
+                ProjectionWork::Governance => ProjectionInput::Governance {
+                    semantic: self
+                        .governance_semantic
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take_work(),
+                    display: Some(governance::Display::genesis(&self.genesis)),
+                },
+                ProjectionWork::Sessions => {
+                    ProjectionInput::Sessions(self.dag.authored_candidate())
+                }
+                ProjectionWork::RoomViews => ProjectionInput::RoomViews,
+            },
         })
     }
 
@@ -131,33 +153,55 @@ impl ChannelState {
 
     fn install_projection_result(
         &mut self,
-        store: &Store,
+        _store: &Store,
         completed: CompletedProjection,
     ) -> Result<ProjectionProgress> {
         if completed.entries_changed {
             self.entries.committed();
         }
         let CompletedProjection {
-            pending, result, ..
+            mut pending,
+            result,
+            ..
         } = completed;
         let result = result.and_then(|progress| {
             let ProjectionProgress::Governance(mut progress) = progress else {
                 return Ok(progress);
             };
-            // These are checked reads only. Keep the established display/consent
-            // publication order and the admitted-pair cursor on ChannelState; no
-            // retained-history or consent projection clone crosses the worker.
+            let expired = matches!(&pending.input,
+                ProjectionInput::Governance { display: Some(display), .. }
+                    if display.valid_until != 0 && self.now_hint >= display.valid_until);
+            if progress.ready && expired {
+                self.governance_ready = false;
+                progress.ready = false;
+                progress.pending = true;
+                return Ok(ProjectionProgress::Governance(progress));
+            }
+            let ProjectionInput::Governance {
+                semantic,
+                mut display,
+            } = std::mem::replace(&mut pending.input, ProjectionInput::RoomViews)
+            else {
+                return Err(Error::MalformedAtRest("governance semantic worker missing"));
+            };
+            let installed = self
+                .governance_semantic
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .install(semantic);
+            if !installed {
+                progress.ready = false;
+                progress.pending = true;
+                return Ok(ProjectionProgress::Governance(progress));
+            }
             if progress.ready {
-                let was_ready = self.governance_ready;
-                let view = self.checked_governance(store, pending.now)?;
-                let display = view.display(&self.genesis)?;
-                let consent_ready = self.advance_consent_facts(&view)?;
-                progress.changed = self.governance_display.revision != display.revision
-                    || (!was_ready && consent_ready);
+                let display = display
+                    .take()
+                    .ok_or(Error::MalformedAtRest("governance display worker missing"))?;
+                progress.changed =
+                    self.governance_display.revision != display.revision || !self.governance_ready;
                 self.governance_display = display;
-                self.governance_ready = consent_ready;
-                progress.ready = consent_ready;
-                progress.pending |= !consent_ready;
+                self.governance_ready = true;
             }
             Ok(ProjectionProgress::Governance(progress))
         });
@@ -198,7 +242,14 @@ impl ChannelState {
             paused_views: false,
             entries: entry_store::EntryIndex::default(),
             history_pin: None,
-            sources: None,
+            input: ProjectionInput::Governance {
+                semantic: self
+                    .governance_semantic
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take_work(),
+                display: Some(governance::Display::genesis(&self.genesis)),
+            },
         })
     }
 
@@ -217,7 +268,7 @@ impl ChannelState {
 impl PendingProjection {
     /// Run in the native blocking pool, outside room/actor/Computer.state. Persisted
     /// fold/build cursors and every original bounded helper remain the sole continuation.
-    pub(crate) fn run(self, store: &Store) -> CompletedProjection {
+    pub(crate) fn run(mut self, store: &Store) -> CompletedProjection {
         let sek = self.sek.clone();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -233,10 +284,26 @@ impl PendingProjection {
                         &self.me,
                         self.now,
                     )?;
+                    let mut ready = progress.ready;
+                    if ready {
+                        let view =
+                            governance::View::open(store, sek, &self.room, self.root, self.now)?;
+                        let ProjectionInput::Governance { semantic, display } = &mut self.input
+                        else {
+                            return Err(Error::MalformedAtRest(
+                                "governance semantic worker missing",
+                            ));
+                        };
+                        ready = semantic.advance(&view)?;
+                        let basis = display
+                            .take()
+                            .ok_or(Error::MalformedAtRest("governance display basis missing"))?;
+                        *display = Some(view.display_from(basis)?);
+                    }
                     Ok(ProjectionProgress::Governance(
                         governance::GovernanceProgress {
-                            ready: progress.ready,
-                            pending: progress.pending,
+                            ready,
+                            pending: progress.pending || (progress.ready && !ready),
                             changed: false,
                         },
                     ))
@@ -259,9 +326,11 @@ impl PendingProjection {
                     })
                 }
                 ProjectionWork::Sessions => {
-                    let dag = self.sources.as_ref().ok_or(Error::MalformedAtRest(
-                        "Session projection source basis missing",
-                    ))?;
+                    let ProjectionInput::Sessions(dag) = &self.input else {
+                        return Err(Error::MalformedAtRest(
+                            "Session projection source basis missing",
+                        ));
+                    };
                     let metadata = super::build::advance_owned(
                         &self.entries,
                         dag,

@@ -175,6 +175,20 @@ nodes online and let them sync. Do not remove and add trust again.
 
 **Confirm:** post a new message and see it on the other node, then the other way round.
 
+## A room question says governance is refreshing
+
+**Symptom:** a room, administrator, trust or service question says `room governance is
+refreshing`, or a read says `the room changed while reading; refresh and retry`.
+
+**Meaning:** a changed room decision is being applied, or the read's selected view changed.
+Vox must not answer an authorization question using superseded grants or an expired
+administrator certificate. Unchanged questions use the completed in-memory room facts;
+after restart those facts are rebuilt from the sealed index.
+
+**Fix:** refresh the question as instructed. Do not remove and re-add trust or erase the
+profile to clear it. Once the changed decision is current, `vox room admin list <room>`,
+`vox room roster <room>` and `vox service list <room>` show it without a restart.
+
 ## A post is waiting for disk, or the room cannot save
 
 **Meaning:** a post succeeds only after its own data is durably saved. A slow disk can also

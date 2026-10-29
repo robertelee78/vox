@@ -491,11 +491,6 @@ impl Completed {
                     channel.key_member_became_current(fingerprint);
                 }
             }
-            *channel
-                .consent_facts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                ConsentFactsState::Building(ConsentFactsBuild::new(&channel.authors));
             channel.owe_private_support();
             channel.governance_ready = false;
         }

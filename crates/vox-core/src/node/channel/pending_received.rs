@@ -56,6 +56,7 @@ pub(crate) struct CompletedReceived {
     effect: Option<(Digest32, u64, u64, SignedEntryKind, bool)>,
     presence: Option<(Digest32, governance::Presence)>,
     consent: bool,
+    governance_changed: bool,
     contiguous: Option<(Digest32, entry_store::sparse::ContiguousAdvance)>,
     private: Vec<Digest32>,
     available: Option<Digest32>,
@@ -394,6 +395,7 @@ impl ChannelState {
             effect,
             presence,
             consent,
+            governance_changed,
             contiguous,
             private,
             available,
@@ -435,6 +437,9 @@ impl ChannelState {
             let projection_result =
                 projection.map_or(Ok(()), |projection| projection.install(self, store));
             let install = (|| {
+                if governance_changed {
+                    self.retire_governance()?;
+                }
                 if let Some((author, state)) = presence {
                     self.presence.insert(author, state);
                 }
@@ -531,6 +536,7 @@ impl PendingReceived {
         let mut effect = None;
         let mut presence = None;
         let mut consent = false;
+        let mut governance_changed = false;
         let mut contiguous = None;
         let mut private = Vec::new();
         let mut available = None;
@@ -725,6 +731,7 @@ impl PendingReceived {
                             self.late,
                         )?;
                         consent = accepted.current_advanced;
+                        governance_changed = accepted.work_changed;
                         if let Ok(GovBody::Presence(body)) = GovEntry::body_bound_to(entry) {
                             let old = self.presence;
                             let mut state = old.unwrap_or(governance::Presence {
@@ -902,6 +909,7 @@ impl PendingReceived {
             effect,
             presence,
             consent,
+            governance_changed,
             contiguous,
             private,
             available,

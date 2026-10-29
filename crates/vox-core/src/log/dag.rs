@@ -327,32 +327,6 @@ impl Dag {
         Ok(())
     }
 
-    /// Bootstrap only after the complete historical acceptance pass has discarded all
-    /// unverified tails. Live publication derives each changed author from its own witness.
-    pub(crate) fn published_feeds(&self) -> Result<BTreeMap<Digest32, PublishedFeed>> {
-        if !self.unverified_from.is_empty() {
-            return Err(Error::MalformedAtRest("unverified feed in restart state"));
-        }
-        Ok(self
-            .feeds
-            .iter()
-            .filter(|(_, feed)| !feed.is_empty())
-            .map(|(author, feed)| {
-                (
-                    *author,
-                    PublishedFeed {
-                        seq: feed.max_seq(),
-                        hash: feed.head_hash(),
-                        first_claimed_ms: feed.first_claimed_ms().unwrap_or(0),
-                        ended: feed.ended(),
-                        checkpoint: self.checkpoints.get(author).copied(),
-                        swept_to: self.swept_to.get(author).copied().unwrap_or(0),
-                    },
-                )
-            })
-            .collect())
-    }
-
     /// Restore sealed accepted metadata. Head/source authentication is checked by the room
     /// loader; incoming entries still pass the unchanged acceptance predicate.
     pub(crate) fn restore_published(feeds: &BTreeMap<Digest32, PublishedFeed>) -> Result<Self> {
