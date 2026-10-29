@@ -581,7 +581,10 @@ impl Source {
                 || (!publication && room.history_publication_busy(&self.store)?)
             {
                 if continuation.is_none() {
-                    return Ok(Lookup::Missing);
+                    // This operation has not inspected evidence: another native publication
+                    // owns the room. Proof serving must not turn that wait into a durable
+                    // EvidenceUnavailable refusal for an otherwise retained signed head.
+                    return Ok(Lookup::Busy);
                 }
                 let wake = room.history_publication_wake();
                 drop(room);
@@ -717,33 +720,28 @@ impl Source {
             + 'static,
     {
         let authorization = self.authorization;
-        let result = self
-            .write_owned(
-                job,
-                (allocation.0, allocation.1, false),
-                move |room, store| {
-                    if let Some((node, expected)) = authorization {
-                        if super::authorization_generation(
-                            store,
-                            node,
-                            room.channel_id(),
-                            room.history_instance(store)?,
-                            room.epoch(),
-                        )? != expected
-                        {
-                            return Err(Error::Profile("history authorization changed"));
-                        }
+        self.write_owned(
+            job,
+            (allocation.0, allocation.1, false),
+            move |room, store| {
+                if let Some((node, expected)) = authorization {
+                    if super::authorization_generation(
+                        store,
+                        node,
+                        room.channel_id(),
+                        room.history_instance(store)?,
+                        room.epoch(),
+                    )? != expected
+                    {
+                        return Err(Error::Profile("history authorization changed"));
                     }
-                    room.prepare_history_admission(store, authorization)
-                },
-                move |pending, store| pending.with(|room| operation(room, store)),
-                |_, _, value| Ok(value),
-            )
-            .await?;
-        Ok(match result {
-            Lookup::Missing => Lookup::Busy,
-            result => result,
-        })
+                }
+                room.prepare_history_admission(store, authorization)
+            },
+            move |pending, store| pending.with(|room| operation(room, store)),
+            |_, _, value| Ok(value),
+        )
+        .await
     }
 
     pub(super) async fn authorize(&self, job: &Job) -> Result<bool> {
