@@ -12,9 +12,52 @@ const TEST_HOLD_AFTER_COMPUTER_APPLICATION_RECEIPT_ENV: &str =
 use crate::identity::composite::RootSigner;
 use crate::node::trust::HistoryGrant;
 
+pub(super) struct OwnKeyComputerTransitions {
+    pub(super) rooms: Vec<(Digest32, std::sync::Weak<tokio::sync::Mutex<ChannelState>>)>,
+    pub(super) removed: Vec<Digest32>,
+    pub(super) transitions: Vec<crate::node::channel::own_writer_gate::Transition>,
+}
+
+pub(super) struct OwnKeyPolicyWork {
+    pub(super) owner: Arc<()>,
+    pub(super) guard: ComputerPolicyGuard,
+    pub(super) reply: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
+    pub(super) targets: Vec<Digest32>,
+}
+
 pub(super) struct KeyringApplication {
     pub(super) changes: Vec<(Digest32, crate::node::consent_order::Stamp)>,
     pub(super) settled: bool,
+}
+
+/// Causal cancellation of one host-owned Computer reconciliation.
+#[derive(Debug, Default)]
+pub struct PolicySupersession {
+    retired: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl PolicySupersession {
+    /// Retire this exact policy owner and wake any admission or drain wait.
+    pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+    pub(crate) fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn retired(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_retired() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Ownership of one actor-side Computer application. A causal command deadline can still cancel
@@ -28,7 +71,7 @@ pub(super) enum ComputerPolicyGuard {
     },
     Current {
         change: crate::node::computer::ComputerChange,
-        superseded: Arc<std::sync::atomic::AtomicBool>,
+        superseded: Arc<PolicySupersession>,
     },
 }
 
@@ -53,7 +96,7 @@ impl ComputerPolicyGuard {
                 }
             }
             Self::Current { change, superseded } => {
-                if superseded.load(std::sync::atomic::Ordering::Acquire)
+                if superseded.is_retired()
                     || computer.is_some_and(|computer| !computer.policy_target_is(change.target()))
                 {
                     Err(Error::ComputerPolicySuperseded)
@@ -97,7 +140,7 @@ impl ComputerPolicyGuard {
         if crate::node::computer::fx28_mutant("late-application-abandons-work")
             && std::time::Instant::now() >= change.apply_deadline()
         {
-            superseded.store(true, std::sync::atomic::Ordering::Release);
+            superseded.retire();
         }
     }
 }
@@ -763,10 +806,8 @@ impl NodeHandle {
             );
             // This is the same accepted startup, including after a real target change. Its
             // original observation end can report lateness but never cancels its continuation.
-            let application = self.reconcile_computer_current_inner(
-                change,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            );
+            let application = self
+                .reconcile_computer_current_inner(change, Arc::new(PolicySupersession::default()));
             tokio::pin!(application);
             let result = tokio::select! {
                 result = &mut application => result,
@@ -793,6 +834,15 @@ impl NodeHandle {
         &self,
         deadline: std::time::Instant,
     ) -> crate::error::Result<()> {
+        let permit = tokio::time::timeout_at(
+            deadline.into(),
+            Arc::clone(&self.computer_policy_slots).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            Error::Profile("computer trust did not enter the actor before its causal deadline")
+        })?
+        .map_err(|_| Error::Unreachable("the node has stopped"))?;
         let (reply, rx) = oneshot::channel();
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let send = self.net_tx.send(NetEvent::ComputerPolicy {
@@ -801,6 +851,7 @@ impl NodeHandle {
                 cancelled: Arc::clone(&cancelled),
             },
             reply,
+            permit,
         });
         tokio::pin!(send);
         tokio::select! {
@@ -836,7 +887,7 @@ impl NodeHandle {
     pub async fn reconcile_computer_current(
         &self,
         change: crate::node::computer::ComputerChange,
-        superseded: Arc<std::sync::atomic::AtomicBool>,
+        superseded: Arc<PolicySupersession>,
     ) -> crate::error::Result<()> {
         #[cfg(feature = "test-knobs")]
         self.hold_computer_reconcile_send_for_proof().await?;
@@ -844,25 +895,66 @@ impl NodeHandle {
             .await
     }
 
+    /// Wait for this exact target to cease being current, including a host detach.
+    async fn current_policy_invalidated(
+        &self,
+        change: crate::node::computer::ComputerChange,
+        superseded: &PolicySupersession,
+    ) -> Error {
+        let Some(computer) = self.computer.as_ref() else {
+            superseded.retired().await;
+            return Error::ComputerPolicySuperseded;
+        };
+        let mut changes = computer.changes();
+        loop {
+            if superseded.is_retired() || !computer.policy_target_is(change.target()) {
+                return Error::ComputerPolicySuperseded;
+            }
+            tokio::select! {
+                biased;
+                () = superseded.retired() => return Error::ComputerPolicySuperseded,
+                changed = changes.recv() => match changed {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Error::Unreachable("computer policy notifications stopped"),
+                },
+            }
+        }
+    }
+
     /// Startup uses the same owned actor work without the later-Attached proof hold.
     async fn reconcile_computer_current_inner(
         &self,
         change: crate::node::computer::ComputerChange,
-        superseded: Arc<std::sync::atomic::AtomicBool>,
+        superseded: Arc<PolicySupersession>,
     ) -> crate::error::Result<()> {
-        if superseded.load(std::sync::atomic::Ordering::Acquire) {
+        if superseded.is_retired() {
             return Err(Error::ComputerPolicySuperseded);
         }
+        let permit = tokio::select! {
+            biased;
+            error = self.current_policy_invalidated(change, &superseded) => return Err(error),
+            permit = Arc::clone(&self.computer_policy_slots).acquire_owned() =>
+                permit.map_err(|_| Error::Unreachable("the node has stopped"))?,
+        };
         let (reply, rx) = oneshot::channel();
-        self.net_tx
-            .send(NetEvent::ComputerPolicy {
-                guard: ComputerPolicyGuard::Current { change, superseded },
-                reply,
-            })
-            .await
-            .map_err(|_| Error::Unreachable("the node has stopped"))?;
-        rx.await
-            .map_err(|_| Error::Unreachable("the node has stopped"))?
+        let send = self.net_tx.send(NetEvent::ComputerPolicy {
+            guard: ComputerPolicyGuard::Current {
+                change,
+                superseded: Arc::clone(&superseded),
+            },
+            reply,
+            permit,
+        });
+        tokio::select! {
+            biased;
+            error = self.current_policy_invalidated(change, &superseded) => return Err(error),
+            result = send => result.map_err(|_| Error::Unreachable("the node has stopped"))?,
+        }
+        tokio::select! {
+            biased;
+            error = self.current_policy_invalidated(change, &superseded) => Err(error),
+            result = rx => result.map_err(|_| Error::Unreachable("the node has stopped"))?,
+        }
     }
 
     /// Run the daemon's synchronous Ready publication only while the exact durable application
@@ -899,7 +991,7 @@ impl Node {
             );
             let guard = ComputerPolicyGuard::Current {
                 change,
-                superseded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                superseded: Arc::new(PolicySupersession::default()),
             };
             let result = (|| {
                 // Binding belongs to this pass too: a remote revision may have moved after
@@ -1367,6 +1459,39 @@ impl Node {
             // Exact replacement consumes a stronger manual drive grant. There is no shadow grant.
             next.trust_as(id, &name, history, capability)?;
         }
+        // Only an actual removal needs a writer fence. Try without waiting on actor;
+        // a busy writer is cancelled and the exact policy owner must resume after drain.
+        let _own_key_transitions = if removed.is_empty() {
+            self.own_key_computer_transitions = None;
+            None
+        } else if let Some(owned) = self.own_key_computer_transitions.take() {
+            let mut removed_now = removed.clone();
+            removed_now.sort_unstable();
+            let rooms_match = owned.rooms.len() == self.channels.len()
+                && owned.rooms.iter().all(|(id, old)| {
+                    self.channels
+                        .get(id)
+                        .zip(old.upgrade())
+                        .is_some_and(|(current, old)| Arc::ptr_eq(current, &old))
+                });
+            if removed_now != owned.removed || !rooms_match {
+                return Err(Error::OwnKeyWriterDrainRequired(removed.clone()));
+            }
+            Some(owned.transitions)
+        } else {
+            let mut transitions = Vec::with_capacity(self.channels.len());
+            for shared in self.channels.values() {
+                let channel = shared
+                    .try_lock()
+                    .map_err(|_| Error::OwnKeyWriterDrainRequired(removed.clone()))?;
+                let transition = channel
+                    .own_writer_gate
+                    .try_transition(Some(&removed))
+                    .ok_or(Error::OwnKeyWriterDrainRequired(removed.clone()))?;
+                transitions.push(transition);
+            }
+            Some(transitions)
+        };
         let profile = self
             .profile
             .as_ref()
@@ -1395,6 +1520,7 @@ impl Node {
                 settled: false,
             });
         };
+        drop(_own_key_transitions);
         // The keyring commit is now irreversible. Always classify it against durable Computer
         // policy and, when needed, perform its rollback before consulting the caller's deadline.
         // The previous applied marker no longer describes this changed keyring. Invalidate it

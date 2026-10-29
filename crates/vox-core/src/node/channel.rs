@@ -63,12 +63,18 @@ mod local_history;
 mod private_session;
 pub(crate) mod role_owed;
 pub(crate) use private_session::{SessionAdvance, SessionRefresh};
+pub(crate) mod availability;
+mod own_historical_keys;
 mod own_history;
+pub(crate) mod own_writer_gate;
 mod proof_range;
+mod receiver_overlay;
+mod receiver_releases;
 pub(crate) use proof_range::{ProofRangeRestore, ProofRangeStep};
 pub(crate) mod session_floor;
 pub(crate) mod session_projection;
 mod sparse_history;
+pub(crate) use own_history::OwnReadability;
 pub(crate) use own_history::OwnRecoveryPage;
 pub(crate) use sparse_history::KeyDebtPage;
 pub(crate) use sparse_history::{
@@ -218,6 +224,18 @@ fn parse_first_seen(bytes: &[u8]) -> Result<(u64, bool)> {
     Ok((t, steps))
 }
 
+fn history_first_seen_at(
+    snapshot: &crate::node::store::Snapshot,
+    sek: &Sek,
+    channel: &Digest32,
+    log: u64,
+) -> Result<u64> {
+    let saved = snapshot
+        .get_segment(channel, SegmentKind::Index, log)?
+        .ok_or(Error::MalformedAtRest("own history age missing"))?;
+    Ok(parse_first_seen(&open_segment(sek, SegmentKind::Index, log, &saved)?)?.0)
+}
+
 fn retained_control(body: &[u8]) -> bool {
     session_floor::is_session_floor(body)
         || private_session::is_support(body)
@@ -266,6 +284,9 @@ const SEG_UNSETTLED: u64 = 13;
 // 18 is the legacy Session announcement cursor; it was also used by older recovery markers.
 const SEG_OLD_OWN_BEHIND: u64 = 18;
 const SEG_OWN_BEHIND: u64 = 25;
+/// Target-bound progress for checking that recovered own content is actually readable.
+// KeyMaterial slots 21 and 23 belong to the key-package queue and private pulls.
+const SEG_OWN_READABILITY: u64 = 24;
 
 /// How far each member's node holds this identity's feed here, as that node last said in a sync
 /// (ADR-028 R-6, #482), within [`SegmentKind::KeyMaterial`]: what "on N of M members' nodes" is
@@ -1205,6 +1226,9 @@ pub struct ChannelState {
     /// R5): durable in `SEG_OWN_BEHIND`; every write here refuses with `OwnHistoryBehind`.
     own_behind: bool,
     own_recovery: own_history::Recovery,
+    /// Volatile bounded retirement scan; restart begins a fresh safety audit, not a deletion.
+    historical_retirement: own_historical_keys::Retirement,
+    availability: availability::State,
     /// A completed authenticated current-head flow may settle after bounded maintenance.
     /// Current presence per admitted author, bounded by AUTHORS_HARD_LIMIT; no event history.
     presence: BTreeMap<Digest32, governance::Presence>,
@@ -1235,6 +1259,7 @@ pub struct ChannelState {
     /// uses its message key up even when what it opened does not render, so a pass that rendered
     /// nothing must write the chains too, or a restart could derive that key again.
     chains_advanced: bool,
+    receiver_persistence: receiver_overlay::Persistence,
     /// A render backfill was drained while the governance view was refreshing: nothing
     /// rendered, the queue kept; the next governance turn drains it (ADR-038 FX-22, #1007).
     backfill_refreshing: bool,
@@ -1375,6 +1400,7 @@ pub struct ChannelState {
     /// Exact publication completion/key-erasure edge for cleanup blocked behind this room.
     history_publication_changed: std::sync::Arc<tokio::sync::Notify>,
     role_owed: std::sync::Arc<role_owed::RoleOwed>,
+    pub(crate) own_writer_gate: std::sync::Arc<own_writer_gate::Gate>,
     /// Whether this node holds its own feed in the room as the room does (V210-164). A room
     /// joined starts without: this identity may have been in it before — it left, or its
     /// profile is new — and its earlier entries are with the other members. Writing before they
@@ -2158,6 +2184,8 @@ impl ChannelState {
             ))),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
+            historical_retirement: own_historical_keys::Retirement::default(),
+            availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
@@ -2174,6 +2202,9 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
+            receiver_persistence: receiver_overlay::Persistence::new(receiver_overlay::digest(
+                None,
+            ))?,
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -2222,6 +2253,7 @@ impl ChannelState {
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -2779,15 +2811,30 @@ impl ChannelState {
         let sender = SenderChain::from_state(&sender_state)?;
         drop(sender_state);
 
-        // Sender keys other members released to us (M14.5b).
-        let receivers =
-            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_RECEIVERS)? {
-                Some(seg) => {
-                    let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_RECEIVERS, &seg)?;
-                    parse_receivers(&bytes)?
-                }
-                None => BTreeMap::new(),
-            };
+        // Validate the override basis against the exact sealed base in the same snapshot.
+        let receiver_snapshot = store.snapshot()?;
+        let receiver_segment =
+            receiver_snapshot.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_RECEIVERS)?;
+        let receiver_base = receiver_overlay::digest(receiver_segment.as_ref());
+        let mut receivers = match receiver_segment {
+            Some(seg) => parse_receivers(&open_segment(
+                &sek,
+                SegmentKind::KeyMaterial,
+                SEG_RECEIVERS,
+                &seg,
+            )?)?,
+            None => BTreeMap::new(),
+        };
+        receiver_overlay::merge(
+            &receiver_snapshot,
+            &sek,
+            channel_id,
+            &me,
+            epoch,
+            receiver_base,
+            &mut receivers,
+        )?;
+        drop(receiver_snapshot);
         // The services this node offers here (ADR-013 M16.1).
         let (services, kinds) =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SERVICES)? {
@@ -2958,6 +3005,8 @@ impl ChannelState {
             consent_facts,
             own_behind,
             own_recovery,
+            historical_retirement: own_historical_keys::Retirement::default(),
+            availability: availability::State::new()?,
             presence,
             sparse_applied_tips,
             sparse_contiguous_pending,
@@ -2974,6 +3023,7 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside,
             chains_advanced: false,
+            receiver_persistence: receiver_overlay::Persistence::new(receiver_base)?,
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -3026,6 +3076,7 @@ impl ChannelState {
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -3241,6 +3292,8 @@ impl ChannelState {
             ))),
             own_behind: false,
             own_recovery: own_history::Recovery::UnknownBehind,
+            historical_retirement: own_historical_keys::Retirement::default(),
+            availability: availability::State::new()?,
             presence: BTreeMap::new(),
             sparse_applied_tips: BTreeMap::new(),
             sparse_contiguous_pending: BTreeSet::new(),
@@ -3257,6 +3310,9 @@ impl ChannelState {
             read_mark_complete: None,
             set_aside: SetAside::default(),
             chains_advanced: false,
+            receiver_persistence: receiver_overlay::Persistence::new(receiver_overlay::digest(
+                None,
+            ))?,
             backfill_refreshing: false,
             backfill_after: None,
             legacy_sessions: legacy_session::LegacySessions::default(),
@@ -3304,6 +3360,7 @@ impl ChannelState {
             local_history: None,
             history_publication_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             role_owed: std::sync::Arc::new(role_owed::RoleOwed::default()),
+            own_writer_gate: std::sync::Arc::new(own_writer_gate::Gate::default()),
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeMap::new(),
@@ -4222,6 +4279,7 @@ impl ChannelState {
                 batch.commit()?;
                 self.entries.committed();
                 if done {
+                    self.flush_available(store)?;
                     self.history_publication_changed.notify_waiters();
                     let read = self.entries.read(store, &self.sek, &self.channel_id)?;
                     self.dag.set_order_revision(
@@ -5588,6 +5646,7 @@ impl ChannelState {
                 | Error::Profile(crate::node::history_demand::CANCELLED)
                 | Error::OwnHistoryBehind
                 | Error::RoomNotSynced
+                | Error::StreamRefused(receiver_releases::CLEANUP_PENDING)
         ) || governance::refreshing(e)
             || Self::legacy_classification_refreshing(e)
             || Self::authorization_refreshing(e)
@@ -6395,10 +6454,14 @@ impl ChannelState {
         if self.poisoned {
             return Ok(0);
         }
-        let pruned =
-            self.prune_retention_page(store)? + self.sweep_private_sessions(store, now.get())?;
+        let retired = self.prune_retention_page(store)?;
+        let pruned = retired + self.sweep_private_sessions(store, now.get())?;
         if pruned > 0 {
             self.last_pruned_at = now.get();
+        }
+        if let Err(error) = self.retire_own_historical_keys(store) {
+            self.poison(&error);
+            return Err(error);
         }
         Ok(pruned)
     }
@@ -6532,6 +6595,144 @@ impl ChannelState {
             self.poison(error);
         }
         result
+    }
+
+    /// A recovered old-epoch receiver is never a live sender key. Retire one only after a
+    /// bounded scan proves that no signed own entry in that epoch still has retained content
+    /// for its chain, or an unresolved body/effect that may need the key. The newest own entry
+    /// must already be in the current epoch: only then can no later own entry use an old key.
+    fn retire_own_historical_keys(&mut self, store: &Store) -> Result<()> {
+        let me = self.me();
+        let head = self.dag.verified_head(&me);
+        let retention = (self.effective_retention(), self.effective_step_retention());
+        let generation = self.entries.commit_generation();
+        let scan = &mut self.historical_retirement;
+        if self.own_behind {
+            scan.reset();
+            return Ok(());
+        }
+        if scan.head != head
+            || scan.epoch != self.epoch
+            || scan.retention != retention
+            || scan.entry_generation != generation
+            || scan.wake_at.is_some_and(|at| self.now_hint >= at)
+        {
+            scan.reset();
+            scan.head = head;
+            scan.epoch = self.epoch;
+            scan.retention = retention;
+            scan.entry_generation = generation;
+        }
+        if scan.complete || head == 0 {
+            return Ok(());
+        }
+        let (key, id, mut next) = match scan.current {
+            Some(current) => current,
+            None => {
+                let snapshot = store.snapshot()?;
+                let Some((key, id)) = own_historical_keys::first_after(
+                    &snapshot,
+                    &self.sek,
+                    &self.channel_id,
+                    scan.after,
+                )?
+                else {
+                    scan.complete = true;
+                    return Ok(());
+                };
+                (key, id, 1)
+            }
+        };
+        let entries = self.entries.read(store, &self.sek, &self.channel_id)?;
+        let Some(feed) = self.dag.feed(&me) else {
+            return Ok(());
+        };
+        if !feed
+            .get(&entries, head)?
+            .is_some_and(|entry| entry.skeleton.epoch == self.epoch)
+        {
+            // No own entry closes the old epoch yet. The next own append changes the head.
+            scan.complete = true;
+            return Ok(());
+        }
+        let epoch = u64::from_be_bytes(key[..8].try_into().expect("fixed epoch key width"));
+        let chain = u64::from_be_bytes(key[8..16].try_into().expect("fixed chain key width"));
+        if epoch >= self.epoch {
+            scan.after = Some(key);
+            scan.current = None;
+            return Ok(());
+        }
+        for _ in 0..64 {
+            if next > head {
+                drop(entries);
+                let mut batch = store.batch()?;
+                own_historical_keys::retire(&mut batch, &self.sek, &self.channel_id, key, id)?;
+                batch.commit()?;
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            }
+            let Some((_source, header)) = entries.history_validated_header(&me, next)? else {
+                // A signed position with no local header might yet hold this key's content.
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            };
+            next += 1;
+            if header.skeleton.epoch != epoch
+                || !header
+                    .skeleton
+                    .v2
+                    .as_ref()
+                    .is_some_and(|v2| v2.kind == crate::log::history::SignedEntryKind::Content)
+            {
+                continue;
+            }
+            let hash = header.entry_hash();
+            let entry = entries.history_entry(&hash)?;
+            let Some(payload) = entry.as_ref().and_then(|entry| entry.payload.as_deref()) else {
+                if entries.history_effect_finished(&hash)? {
+                    if let Some(log) = entries.log_id(&hash)? {
+                        let first_seen = history_first_seen_at(
+                            &store.snapshot()?,
+                            &self.sek,
+                            &self.channel_id,
+                            log,
+                        )?;
+                        let base = header.skeleton.claimed_ms.min(first_seen);
+                        if expired_at(base, self.now_hint, retention.0)
+                            && expired_at(base, self.now_hint, retention.1)
+                        {
+                            continue;
+                        }
+                        if retention.0 != 0 && retention.1 != 0 {
+                            let due = base
+                                .saturating_add(retention.0.max(retention.1).saturating_mul(1_000));
+                            if due > self.now_hint {
+                                scan.wait_until(due);
+                            }
+                        }
+                    }
+                }
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            };
+            let message = GroupMessage::from_wire(payload)?;
+            if message.header.author_id != me || message.header.epoch != epoch {
+                return Err(Error::MalformedAtRest(
+                    "own historical receiver entry binding",
+                ));
+            }
+            if message.header.channel_id == self.channel_id && message.header.chain_id == chain {
+                // A retained message may need its receiver after a restart or re-projection.
+                scan.after = Some(key);
+                scan.current = None;
+                return Ok(());
+            }
+        }
+        scan.current = Some((key, id, next));
+        Ok(())
     }
 
     /// How long nothing new must have expired before a backlog smaller than
@@ -7175,6 +7376,11 @@ impl ChannelState {
             }
             if recover_own {
                 batch.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_OWN_BEHIND)?;
+                batch.delete_segment(
+                    &self.channel_id,
+                    SegmentKind::KeyMaterial,
+                    SEG_OWN_READABILITY,
+                )?;
             }
             self.finish_local_history_effect_into(&mut batch, &entry, settlement)?;
             batch.commit()
@@ -7925,6 +8131,19 @@ impl ChannelState {
         skdm: &Skdm,
         now: crate::time::Ms,
     ) -> Result<AcceptedSkdm> {
+        self.accept_skdm_mode(store, skdm, now, false)
+    }
+
+    fn accept_skdm_mode(
+        &mut self,
+        store: &Store,
+        skdm: &Skdm,
+        now: crate::time::Ms,
+        own_recovery: bool,
+    ) -> Result<AcceptedSkdm> {
+        if own_recovery && skdm.body.author_id != self.me() {
+            return Err(Error::OwnHistoryBehind);
+        }
         self.require_legacy_current(store)?;
         let now_ms = now.get();
         if self.poisoned {
@@ -7941,69 +8160,183 @@ impl ChannelState {
         if skdm.body.channel_id == drive_channel(&self.channel_id) {
             return self.accept_drive_skdm(store, skdm, &key, now_ms);
         }
-        let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
-        let chain_id = chain.chain_id();
-        let slot = (author, chain_id);
-        // A second SKDM for a generation we already hold would rewind the chain
-        // head and re-enable consumed iterations; keep the live one. An earlier authenticated
-        // history release widens only the separate history floor. Persist that floor with the
-        // bounded rendering obligation so an upgraded v1 profile can recover old cache rows.
-        if let Some(existing) = self.receivers.get_mut(&slot) {
-            let widened = existing.retain_history_release(&chain)?;
-            if !widened {
-                return Ok(AcceptedSkdm {
-                    rendered: 0,
-                    changed: false,
-                });
-            }
-            let saved = (|| -> Result<()> {
+        // Current peer authorization stays tied to this room's epoch. A self-author
+        // recovery release may instead name the authenticated epoch of older content.
+        let key_epoch = if own_recovery {
+            skdm.body.epoch
+        } else {
+            self.epoch
+        };
+        if key_epoch > self.epoch {
+            return Err(Error::OwnHistoryBehind);
+        }
+        let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, key_epoch)?;
+        if own_recovery && key_epoch < self.epoch {
+            let saved = (|| -> Result<bool> {
                 let mut batch = store.batch()?;
+                let changed = own_historical_keys::put(
+                    &mut batch,
+                    &self.sek,
+                    &self.channel_id,
+                    &key,
+                    &author,
+                    skdm,
+                )?;
+                if changed {
+                    let mut writer = self
+                        .entries
+                        .write(&mut batch, &self.sek, &self.channel_id)?;
+                    writer.queue_backfill(author, Some(1))?;
+                    writer.seal()?;
+                    batch.commit()?;
+                }
+                Ok(changed)
+            })();
+            let changed = match saved {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.poison(&error);
+                    return Err(error);
+                }
+            };
+            if changed {
+                self.entries.committed();
+                self.historical_retirement.reset();
+            }
+            return Ok(AcceptedSkdm {
+                rendered: 0,
+                changed,
+            });
+        }
+        let slot = (author, chain.chain_id());
+        // The existing receiver index is chain-keyed, not epoch-keyed. Never replace or
+        // merge a different epoch's live chain under the same slot.
+        if self
+            .receivers
+            .get(&slot)
+            .is_some_and(|existing| existing.epoch() != key_epoch)
+        {
+            return Err(Error::OwnHistoryBehind);
+        }
+        // Prepare without changing the live map: release retention can wait on bounded
+        // cleanup, and neither a refused capacity attempt nor a failed commit rewinds a ratchet.
+        let (candidate, changed) = if let Some(existing) = self.receivers.get(&slot) {
+            let mut candidate = ReceiverChain::from_state(&existing.to_state())?;
+            let changed = candidate.retain_history_release(&chain)?;
+            (candidate, changed)
+        } else {
+            if self.receivers.len() >= MAX_RECEIVER_CHAINS {
+                return Err(Error::SizeLimitExceeded("room receiver chains"));
+            }
+            (chain, true)
+        };
+        let mut release_retained = false;
+        let saved = (|| -> Result<bool> {
+            let mut batch = store.batch()?;
+            if own_recovery && changed {
+                if let Some(changed) = receiver_overlay::capacity(
+                    &mut batch,
+                    &self.sek,
+                    &self.channel_id,
+                    candidate.chain_id(),
+                )? {
+                    if changed {
+                        batch.commit()?;
+                    }
+                    return Ok(false);
+                }
+            }
+            let retained = receiver_releases::remember(
+                &mut batch,
+                &self.sek,
+                &self.channel_id,
+                &key,
+                skdm,
+                self.receivers.get(&slot),
+                &candidate,
+            )?;
+            match &retained {
+                receiver_releases::Remember::Busy { changed } => {
+                    if *changed {
+                        batch.commit()?;
+                    }
+                    return Ok(false);
+                }
+                receiver_releases::Remember::Unchanged if !changed => return Ok(true),
+                _ => {}
+            }
+            if changed {
                 batch.ruled();
-                self.queue_receivers(&mut batch)?;
+                if own_recovery {
+                    let stored = receiver_overlay::put(
+                        &mut batch,
+                        &self.sek,
+                        &self.channel_id,
+                        &self.me(),
+                        key_epoch,
+                        self.receiver_persistence.base,
+                        &candidate,
+                    )?;
+                    if !matches!(stored, receiver_overlay::Put::Stored) {
+                        return Err(Error::MalformedAtRest("own receiver reserved slot changed"));
+                    }
+                } else {
+                    let sealed = seal_segment(
+                        &self.sek,
+                        SegmentKind::KeyMaterial,
+                        SEG_RECEIVERS,
+                        &receivers_bytes_with(&self.receivers, Some((&slot, &candidate))),
+                    )?;
+                    receiver_overlay::rewrite(
+                        &mut batch,
+                        &self.sek,
+                        &self.channel_id,
+                        &sealed,
+                        self.receiver_persistence.next_normal()?,
+                    )?;
+                }
                 let mut writer = self
                     .entries
                     .write(&mut batch, &self.sek, &self.channel_id)?;
                 writer.queue_backfill(author, Some(1))?;
                 writer.seal()?;
-                batch.commit()
-            })();
-            if let Err(error) = saved {
+            }
+            batch.commit()?;
+            release_retained = matches!(retained, receiver_releases::Remember::Retained);
+            Ok(true)
+        })();
+        match saved {
+            Ok(false) => return Err(Error::StreamRefused(receiver_releases::CLEANUP_PENDING)),
+            Ok(true) => {}
+            Err(error @ Error::StreamRefused(receiver_overlay::CLEANUP_PENDING)) => {
+                return Err(error)
+            }
+            Err(error) => {
                 self.poison(&error);
                 return Err(error);
             }
-            self.entries.committed();
-            return self
-                .backfill(store, &author, now_ms)
-                .map(|rendered| AcceptedSkdm {
-                    rendered,
-                    changed: true,
-                });
         }
-        if self.receivers.len() >= MAX_RECEIVER_CHAINS {
-            return Err(Error::SizeLimitExceeded("room receiver chains"));
+        if release_retained {
+            self.note_available(store, author)?;
         }
-        self.receivers.insert(slot, chain);
-        // The key and the durable rendering cursor are one crash boundary. Startup already
-        // drains this bounded cursor; it must never reopen with a held key and no obligation to
-        // retry ciphertext accepted before the key arrived.
-        let queued = (|| -> Result<()> {
-            let mut batch = store.batch()?;
-            batch.ruled();
-            self.queue_receivers(&mut batch)?;
-            {
-                let mut writer = self
-                    .entries
-                    .write(&mut batch, &self.sek, &self.channel_id)?;
-                writer.queue_backfill(author, Some(1))?;
-                writer.seal()?;
-            }
-            batch.commit()
-        })();
-        if let Err(error) = queued {
-            self.poison(&error);
-            return Err(error);
+        if !changed {
+            return Ok(AcceptedSkdm {
+                rendered: 0,
+                changed: false,
+            });
+        }
+        self.receivers.insert(slot, candidate);
+        if !own_recovery {
+            self.receiver_persistence.advance_normal()?;
         }
         self.entries.committed();
+        if own_recovery {
+            // Existing bounded maintenance owns the queued author cursor, not this install.
+            return Ok(AcceptedSkdm {
+                rendered: 0,
+                changed: true,
+            });
+        }
         self.drain_backfill(store, now_ms)
             .map(|rendered| AcceptedSkdm {
                 rendered,
@@ -8428,6 +8761,7 @@ impl ChannelState {
         let Ok(plaintext) = chain.decrypt(msg).map(Zeroizing::new) else {
             return Ok(());
         };
+        self.receiver_persistence.advance_drive()?;
         self.chains_advanced = true;
         // Only a Session entry opens under a drive key: a node's message to the room is sealed
         // under its sender key, for every reader.
@@ -8476,15 +8810,11 @@ impl ChannelState {
     }
 
     fn persist_drive(&mut self, store: &Store) -> Result<()> {
-        let saved = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_DRIVE,
-            &self.drive.to_state(),
-        )
-        .and_then(|seg| {
-            store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
-        });
+        let saved = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            self.queue_drive(&mut batch)?;
+            batch.commit()
+        })();
         if let Err(e) = saved {
             self.poisoned = true;
             self.save_error = Some(e.to_string());
@@ -8524,26 +8854,101 @@ impl ChannelState {
 
     /// Persist the receiver chains, poisoning the channel if sealing or writing fails.
     fn persist_receivers(&mut self, store: &Store) -> Result<()> {
-        let saved = seal_segment(
-            &self.sek,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &receivers_bytes(&self.receivers),
-        )
-        .and_then(|seg| {
-            store.put_segment(
-                &self.channel_id,
-                SegmentKind::KeyMaterial,
-                SEG_RECEIVERS,
-                &seg,
-            )
-        });
-        if let Err(e) = saved {
-            self.poisoned = true;
-            self.save_error = Some(e.to_string());
-            return Err(e);
+        self.receiver_persistence.advance_normal()?;
+        let saved = (|| -> Result<()> {
+            let mut batch = store.batch()?;
+            self.queue_receivers(&mut batch)?;
+            // All callers of this helper have removed receiver slots. Permission and the
+            // bounded physical retirement debt change atomically; no history publication gate.
+            receiver_releases::retire(&mut batch, &self.sek, &self.channel_id)?;
+            batch.commit()
+        })();
+        if let Err(error) = saved {
+            self.poison(&error);
+            return Err(error);
         }
         Ok(())
+    }
+
+    /// Only the authenticated original author can receive its own retained release. Ordinary
+    /// third-party key acceptance, consent and delivery ledgers are not involved.
+    pub(crate) fn own_original_release(
+        &self,
+        store: &Store,
+        author: Digest32,
+        key_epoch: u64,
+        chain: u64,
+        floor: u64,
+    ) -> Result<Option<Skdm>> {
+        if self.poisoned {
+            return Err(self.save_failure());
+        }
+        self.require_legacy_current(store)?;
+        self.current_governance(store)?;
+        if !self.is_member(&author) || self.has_left(&self.me()) {
+            return Ok(None);
+        }
+        let Some(receiver) = self.receivers.get(&(author, chain)) else {
+            return Ok(None);
+        };
+        if receiver.epoch() != key_epoch || key_epoch > self.epoch {
+            return Ok(None);
+        }
+        let root = self
+            .authors
+            .get(&author)
+            .ok_or(Error::MalformedAtRest("own release author missing"))?;
+        // Everything read below is a local sealed-store artifact, not peer input. Preserve
+        // corruption/decryption/signature failures as storage health rather than peer refusal.
+        receiver_releases::lookup(store, &self.sek, &self.channel_id, receiver, root, floor)
+            .map_err(|error| Error::Storage {
+                op: "read retained sender release",
+                detail: error.to_string(),
+            })
+    }
+
+    pub(crate) fn receiver_release_cleanup_waiting(error: &Error) -> bool {
+        matches!(
+            error,
+            Error::StreamRefused(receiver_releases::CLEANUP_PENDING)
+        )
+    }
+
+    pub(crate) fn advance_receiver_release_cleanup(
+        &mut self,
+        store: &Store,
+    ) -> Result<(bool, bool, bool)> {
+        // A selected package owns its exact cursor until ordinary completion. Do not
+        // change the replay basis while preparation waits on that attempt's authority.
+        if self.key_packages.has_attempt() {
+            return Ok((false, false, false));
+        }
+        let mut batch = store.batch()?;
+        let progress =
+            receiver_releases::advance(&mut batch, &self.sek, &self.channel_id, &self.receivers)?;
+        if let Some((more, retry_ready)) = progress {
+            let replay = if retry_ready {
+                Some(
+                    self.key_packages
+                        .capacity_retry(&mut batch, &self.sek, &self.channel_id)?,
+                )
+            } else {
+                None
+            };
+            let more = more || receiver_overlay::pending(&batch, &self.sek, &self.channel_id)?;
+            batch.commit()?;
+            if let Some(replay) = replay {
+                self.key_packages = replay;
+            }
+            Ok((more, retry_ready, false))
+        } else if let Some((more, own_retry_ready)) =
+            receiver_overlay::advance(&mut batch, &self.sek, &self.channel_id)?
+        {
+            batch.commit()?;
+            Ok((more, false, own_retry_ready))
+        } else {
+            Ok((false, false, false))
+        }
     }
 
     /// How many generations of other members' sender keys this node holds here: what `vox
@@ -9043,7 +9448,8 @@ impl ChannelState {
             return Ok(ContentProjection::Applied);
         }
         let slot = (author, msg.header.chain_id);
-        if historical {
+        let own = author == me;
+        if historical || own {
             let writer = self.entries.write(batch, &self.sek, &self.channel_id)?;
             let already = writer.has_rendered(&entry_hash)?
                 || writer.read_receipt_cache(&entry_hash)?.is_some()
@@ -9060,7 +9466,29 @@ impl ChannelState {
                 return Ok(ContentProjection::Applied);
             }
         }
-        let Some(chain) = self.receivers.get_mut(&slot) else {
+        let mut historical_own = if own && msg.header.epoch < self.epoch {
+            let root = self
+                .authors
+                .get(&author)
+                .ok_or(Error::MalformedGovernance("own history author missing"))?;
+            own_historical_keys::lookup_batch(
+                batch,
+                &self.sek,
+                &self.channel_id,
+                root,
+                &author,
+                msg.header.epoch,
+                msg.header.chain_id,
+            )?
+        } else {
+            None
+        };
+        let chain = historical_own.as_mut().or_else(|| {
+            self.receivers
+                .get_mut(&slot)
+                .filter(|chain| chain.epoch() == msg.header.epoch)
+        });
+        let Some(chain) = chain else {
             if author == me && self.own_behind {
                 // Retaining ciphertext is not readable recovery. A generation minted after
                 // the backup may have no local origin; never give it a role-complete receipt.
@@ -9071,16 +9499,21 @@ impl ChannelState {
             // so a key cannot commit and drain between this check and this row's acceptance.
             return Ok(ContentProjection::Applied);
         };
-        let plaintext = match if historical {
+        let plaintext = match if own {
+            chain.decrypt_retained(&msg)
+        } else if historical {
             chain.decrypt_history(&msg)
         } else {
             chain.decrypt(&msg)
         } {
             Ok(p) => Zeroizing::new(p),
-            Err(_) if historical => return Ok(ContentProjection::Unavailable),
+            Err(_) if historical || own => return Ok(ContentProjection::Unavailable),
             Err(_) => return Ok(ContentProjection::Applied),
         };
-        self.chains_advanced = true;
+        if !own {
+            self.receiver_persistence.advance_normal()?;
+            self.chains_advanced = true;
+        }
         // **Skipped, not propagated** — matching the three `Ok(None)` paths above it.
         //
         // An entry this node cannot render is one entry it cannot show, and every other reason for
@@ -9274,24 +9707,17 @@ impl ChannelState {
         settled
     }
 
-    /// Queue the receiver chains, as they stand now, into `batch`.
+    /// Durable written stamps acknowledge only the same transaction as the state. An
+    /// aborted render cannot clear dirty state, and own read-only decrypt writes neither map.
     fn queue_receivers(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
-        // Persist the current receiver state in the caller's transaction. A newly accepted key
-        // marks that exact transaction ruled; ordinary chain/cursor
-        // advances remain part of their receive flow and are flushed once before its ACK.
-        let receivers_seg = seal_segment(
+        let normal = self.receiver_persistence.normal();
+        let segment = seal_segment(
             &self.sek,
             SegmentKind::KeyMaterial,
             SEG_RECEIVERS,
             &receivers_bytes(&self.receivers),
         )?;
-        batch.put_segment(
-            &self.channel_id,
-            SegmentKind::KeyMaterial,
-            SEG_RECEIVERS,
-            &receivers_seg,
-        )?;
-        // The drive keys advance in the same passes.
+        receiver_overlay::rewrite(batch, &self.sek, &self.channel_id, &segment, normal)?;
         self.queue_drive(batch)
     }
 
@@ -9302,7 +9728,13 @@ impl ChannelState {
             SEG_DRIVE,
             &self.drive.to_state(),
         )?;
-        batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
+        batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)?;
+        receiver_overlay::wrote_drive(
+            batch,
+            &self.sek,
+            &self.channel_id,
+            self.receiver_persistence.drive(),
+        )
     }
 
     /// Note only the committed row's sealed ordering and shown-time facts. No plaintext is

@@ -131,13 +131,16 @@ impl Node {
                         reply: None,
                         reopening: false,
                         recovery: Some(original),
+                        recovery_writer_gate: None,
                         trusted: None,
                         removal_after: None,
                         consent_after: None,
                     },
                 );
             }
-            Err(error) => self.complete_store_recovery(id, Err(error)).await,
+            Err(error) => {
+                self.complete_store_recovery(id, Err(error), None).await;
+            }
         }
     }
 
@@ -145,13 +148,14 @@ impl Node {
         &mut self,
         id: Digest32,
         opened: crate::error::Result<ChannelState>,
-    ) {
+        transition: Option<crate::node::channel::own_writer_gate::Transition>,
+    ) -> Outcome {
         match opened {
             Ok(channel) => {
                 let name = self
                     .store_recovery
-                    .remove(&id)
-                    .map(|r| r.name)
+                    .get(&id)
+                    .map(|r| r.name.clone())
                     .unwrap_or_else(|| crate::node::link::b32_encode(&id));
                 let peers = self
                     .ports
@@ -162,7 +166,28 @@ impl Node {
                 for peer in peers {
                     self.drop_port(&id, &peer);
                 }
-                self.publish_open_channel(channel).await;
+                let outcome = self.publish_open_channel(channel, transition).await;
+                if !outcome.is_done() {
+                    let cause = match outcome {
+                        Outcome::Failed(fault) => fault.to_string(),
+                        other => format!("room publication returned {other:?}"),
+                    };
+                    if self.channels.contains_key(&id) {
+                        if let Some(retry) = self.store_recovery.get_mut(&id) {
+                            retry.cause = cause;
+                            retry.busy = false;
+                            retry.due =
+                                Instant::now() + Duration::from_secs(1u64 << retry.attempts.min(6));
+                        }
+                    } else {
+                        self.store_recovery.remove(&id);
+                        let _ = self.event_tx.send(NodeEvent::NodeNote {
+                            note: format!("room {} could not finish recovery: {cause}; it remains closed. Reopen it to try again.", crate::node::link::b32_encode(&id)),
+                        });
+                    }
+                    return outcome;
+                }
+                self.store_recovery.remove(&id);
                 self.store_recovered
                     .insert(id, format!("{name} recovered; it can save again"));
                 eprintln!(
@@ -174,13 +199,16 @@ impl Node {
                         .unwrap_or("unknown"),
                     crate::node::link::b32_encode(&id)
                 );
+                outcome
             }
             Err(e) => {
+                let fault = fault_of(&e);
                 if let Some(retry) = self.store_recovery.get_mut(&id) {
                     retry.cause = e.to_string();
                     retry.busy = false;
                     retry.due = Instant::now() + Duration::from_secs(1u64 << retry.attempts.min(6));
                 }
+                Outcome::Failed(fault)
             }
         }
     }

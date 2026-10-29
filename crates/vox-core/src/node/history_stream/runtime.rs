@@ -216,9 +216,13 @@ pub(crate) struct Flow {
     pub(crate) automatic_own_recovery: bool,
     pub(crate) own_recovery_cleanup: bool,
     pub(crate) own_recovery_trigger: Option<Digest32>,
+    pub(crate) own_recovery_page: Option<(Digest32, u64)>,
     pub(crate) own_recovery_checkpoint: Option<OwnRecoveryCheckpoint>,
     pub(crate) own_recovery_progress: bool,
     pub(crate) inventory: bool,
+    pub(crate) availability_captured: Option<crate::node::channel::availability::Token>,
+    pub(crate) availability_connection: u64,
+    pub(crate) availability_ack: Option<crate::node::channel::availability::Token>,
     /// This node has a key delivery to the peer waiting on its prekey bundle (ADR-038 FX-35):
     /// the round reads the peer's board whatever kind of flow this is, until the bundle is
     /// held. Set by the actor at each start from the fact `vox status` reports as `key_waits`.
@@ -243,7 +247,11 @@ pub(crate) struct Flow {
     /// A newly constructed inventory took precedence over an already eligible local probe.
     /// Its real completion owns exactly one subsequent port request.
     pub(crate) local_own_after_inventory: bool,
-    discovery_reply: Option<(super::HeadHint, u64)>,
+    discovery_reply: Option<(
+        super::HeadHint,
+        u64,
+        Option<crate::node::channel::availability::Token>,
+    )>,
     /// The advertising peer that owns `hint` in the inbox, even while one exact dependency is
     /// temporarily routed over its author's port.
     pub(crate) hint_peer: Digest32,
@@ -274,7 +282,8 @@ pub(crate) struct Flow {
     /// Changed, signature-verified own observation committed by the physical receiver.
     pub(crate) own_head_observed: Arc<std::sync::atomic::AtomicBool>,
     /// Exact connection which returned unavailable for this startup metadata probe.
-    pub(crate) discovery_unavailable: Option<u64>,
+    pub(crate) discovery_unavailable:
+        Option<(u64, Option<crate::node::channel::availability::Token>)>,
     pub(crate) discovery_incarnations: Option<(u64, u64)>,
     pub(crate) receipt_lower: Option<(u64, (u64, u64))>,
     /// Exact unavailable advertised heads declined during this retained flow. The actor reports
@@ -405,8 +414,19 @@ impl Flow {
     }
     pub(crate) fn completed_support_discovery(&self) -> Option<u64> {
         self.discovery_reply
-            .filter(|(head, _)| self.local_own_discovery && Some(*head) == self.authenticated_head)
-            .map(|(_, connection)| connection)
+            .filter(|(head, _, _)| {
+                self.local_own_discovery && Some(*head) == self.authenticated_head
+            })
+            .map(|(_, connection, _)| connection)
+    }
+    pub(crate) fn completed_support_availability(
+        &self,
+    ) -> Option<crate::node::channel::availability::Token> {
+        self.discovery_reply
+            .filter(|(head, _, _)| {
+                self.local_own_discovery && Some(*head) == self.authenticated_head
+            })
+            .and_then(|(_, _, availability)| availability)
     }
     pub(crate) fn root_name(&self) -> &'static str {
         if self.announcement_pending() && self.announcement_can_run() {
@@ -473,6 +493,7 @@ impl Flow {
             automatic_own_recovery: false,
             own_recovery_cleanup: false,
             own_recovery_trigger: None,
+            own_recovery_page: None,
             own_recovery_checkpoint: None,
             own_recovery_progress: false,
             inventory: hint.is_none() && required.is_none(),
@@ -493,6 +514,9 @@ impl Flow {
             local_own_verification,
             local_own_discovery,
             local_own_after_inventory: false,
+            availability_captured: None,
+            availability_connection: 0,
+            availability_ack: None,
             discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
@@ -653,6 +677,7 @@ impl Flow {
             automatic_own_recovery: false,
             own_recovery_cleanup: false,
             own_recovery_trigger: None,
+            own_recovery_page: None,
             own_recovery_checkpoint: None,
             own_recovery_progress: false,
             inventory: false,
@@ -673,6 +698,9 @@ impl Flow {
             local_own_verification: false,
             local_own_discovery: false,
             local_own_after_inventory: false,
+            availability_captured: None,
+            availability_connection: 0,
+            availability_ack: None,
             discovery_reply: None,
             hint_peer: peer,
             authenticated_head: None,
@@ -725,7 +753,14 @@ impl Flow {
                 tasks.push(Task {
                     request,
                     purpose: Purpose::History,
-                    operation: Operation::Wire(query),
+                    // A resumed archive Entry may have a durably complete body but no room
+                    // effect yet. Re-enter its local admission instead of asking the donor
+                    // for an empty suffix and parking an unchanged request.
+                    operation: if matches!(&query, Query::Entry { .. }) {
+                        Operation::ResumeWire(query)
+                    } else {
+                        Operation::Wire(query)
+                    },
                 });
                 tasks
             },
@@ -2388,9 +2423,21 @@ impl Flow {
                             .lock()
                             .map_err(|_| Error::Profile("history activation lock failed"))?;
                         let state = snapshot.state();
+                        // Own recovery has a private, donor-independent audience; ordinary
+                        // archive and live/control stages remain bound to this node.
+                        let expected_binding = Binding {
+                            audience: if self.automatic_own_recovery
+                                && task.purpose == Purpose::History
+                            {
+                                [0; 32]
+                            } else {
+                                self.node
+                            },
+                            ..self.binding()
+                        };
                         if !active.matches(state)
                             || active.request() != task.request
-                            || active.binding() != self.binding()
+                            || active.binding() != expected_binding
                         {
                             return Err(Error::Profile("history retry activation changed"));
                         }
@@ -2588,6 +2635,9 @@ impl Flow {
                         _ => None,
                     };
                 }
+                if let Some(token) = result.offered_availability {
+                    self.availability_ack = Some(token);
+                }
                 self.body_progress |= result.body_progress;
                 if let Some(inventory) = result.inventory.as_ref() {
                     source
@@ -2679,7 +2729,8 @@ impl Flow {
                         if head.author == author {
                             if author == self.node {
                                 if self.local_own_discovery {
-                                    self.discovery_reply = Some((*head, conn.serial()));
+                                    self.discovery_reply =
+                                        Some((*head, conn.serial(), self.availability_captured));
                                 }
                                 if task.purpose == Purpose::Control && !self.local_own_discovery {
                                     if self.hint.is_some_and(|hint| {
@@ -2851,7 +2902,8 @@ impl Flow {
                 }
                 if result.status == Status::EvidenceUnavailable && !self.archive {
                     if self.local_own_discovery {
-                        self.discovery_unavailable = Some(conn.serial());
+                        self.discovery_unavailable =
+                            Some((conn.serial(), self.availability_captured));
                     }
                     if matches!(query, Query::Head(author) if (author == self.peer || author == self.node) && self.hint.is_some_and(|hint| hint.author == author))
                         && !self.departure_probe

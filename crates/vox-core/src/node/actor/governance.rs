@@ -356,6 +356,31 @@ impl Node {
             self.governance_work.again = true;
             return;
         };
+        // Receiver access narrowed in its original transaction. Its independent index can
+        // retire one exact stale object per turn even while history/governance is rebuilding.
+        let own_retry_ready = match channel.advance_receiver_release_cleanup(&store) {
+            Ok((more, retry_ready, own_retry_ready)) => {
+                self.governance_work.again |= more;
+                if retry_ready {
+                    // A physically freed slot, not a periodic retry, replays packages which
+                    // could not retain their authenticated key at the earlier admission.
+                    self.key_package_rooms.entry(room).or_insert(false);
+                }
+                own_retry_ready
+            }
+            Err(error) => {
+                channel.poison(&error);
+                return;
+            }
+        };
+        if own_retry_ready {
+            // Only actual physical capacity release resumes the owed own receiver seed.
+            // The selected ordinary governance turn remains owed after this handoff.
+            self.governance_work.wake_room(room);
+            drop(channel);
+            self.advance_own_recovery(room).await;
+            return;
+        }
         let (governance_ready, governance_pending, governance_changed) =
             if self.governance_work.settled.contains(&room) {
                 (true, false, false)
@@ -382,8 +407,10 @@ impl Node {
             Ok(true) => {
                 // Current trust narrowing is still immediate; all publication-dependent
                 // writes await explicit recovery. Never busy-loop on a parked cursor.
-                if let Err(error) = channel.forget_keys_except(&store, &self.trust.trusted()) {
-                    channel.poison(&error);
+                match channel.forget_keys_except(&store, &self.trust.trusted()) {
+                    Ok(count) if count > 0 => self.governance_work.wake_room(room),
+                    Ok(_) => {}
+                    Err(error) => channel.poison(&error),
                 }
                 drop(channel);
                 if governance_changed {
@@ -524,6 +551,9 @@ impl Node {
     /// New targets, real role-prefix progress and reopen are producer edges. Equal observations
     /// leave the existing immutable owner alone; a missing donor does not make a polling loop.
     pub(super) async fn advance_own_recovery(&mut self, room: Digest32) {
+        // A decrypted response owns its peer credit and secret lease until its exact room can
+        // accept it. A real room-release edge reaches this same continuation.
+        self.try_install_own_key(room);
         let Some(profile) = self.profile.as_ref() else {
             return;
         };
@@ -535,7 +565,8 @@ impl Node {
         };
         let store = profile.store_handle();
         let now = self.now_ms();
-        let (changed, completed, receiver_changed, key) = {
+        let mut authority_wait = false;
+        let (changed, completed, receiver_changed, audit, key) = {
             let Ok(mut channel) = shared.try_lock() else {
                 // A read-only holder need not publish another event. Retain this exact room's
                 // release edge off actor; no other room or command waits on this mutex.
@@ -558,26 +589,48 @@ impl Node {
                     return;
                 }
             };
-            let (completed, receiver_changed) = match self.with_current_computer_authority(|| {
-                let receiver_changed = channel.prepare_own_recovery_receiver(profile)?;
-                channel
-                    .complete_own_recovery(profile, now)
-                    .map(|done| (done, receiver_changed))
-                    .or_else(|error| {
-                        if matches!(error, crate::error::Error::OwnHistoryBehind) {
-                            Ok((false, receiver_changed))
-                        } else {
-                            Err(error)
-                        }
-                    })
-            }) {
-                Some(Ok(result)) => result,
-                Some(Err(error)) => {
-                    channel.poison(&error);
-                    (false, false)
-                }
-                None => (false, false),
-            };
+            let (completed, receiver_changed, audit) =
+                match self.with_current_computer_authority(|| {
+                    let receiver_changed = match channel.prepare_own_recovery_receiver(profile) {
+                        Ok(changed) => changed,
+                        Err(crate::error::Error::OwnHistoryBehind) => false,
+                        Err(error) => return Err(error),
+                    };
+                    let audit = channel.audit_own_readability(&store, now)?;
+                    if audit != crate::node::channel::OwnReadability::Complete {
+                        return Ok((false, receiver_changed, audit));
+                    }
+                    channel
+                        .complete_own_recovery(profile, now)
+                        .map(|done| (done, receiver_changed, audit))
+                        .or_else(|error| {
+                            if matches!(error, crate::error::Error::OwnHistoryBehind) {
+                                Ok((
+                                    false,
+                                    receiver_changed,
+                                    crate::node::channel::OwnReadability::Waiting,
+                                ))
+                            } else {
+                                Err(error)
+                            }
+                        })
+                }) {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) if ChannelState::receiver_release_cleanup_waiting(&error) => {
+                        // The seed persisted its exact retry bit. Park on bounded physical GC,
+                        // whose freed-slot result is the producer for another attempt.
+                        self.governance_work.wake_room(room);
+                        (false, false, crate::node::channel::OwnReadability::Waiting)
+                    }
+                    Some(Err(error)) => {
+                        channel.poison(&error);
+                        (false, false, crate::node::channel::OwnReadability::Waiting)
+                    }
+                    None => {
+                        authority_wait = true;
+                        (false, false, crate::node::channel::OwnReadability::Waiting)
+                    }
+                };
             let key = match channel.own_recovery_key(&store) {
                 Ok(key) => key,
                 Err(error) => {
@@ -585,8 +638,53 @@ impl Node {
                     return;
                 }
             };
-            (changed, completed, receiver_changed, key)
+            (changed, completed, receiver_changed, audit, key)
         };
+        if authority_wait {
+            self.defer_own_key_policy(room);
+        }
+        if matches!(audit, crate::node::channel::OwnReadability::Runnable) {
+            self.governance_work.wake_room(room);
+        }
+        if let crate::node::channel::OwnReadability::EffectReady {
+            target,
+            seq,
+            entry_hash,
+        } = audit
+        {
+            let same = self.own_readable_effects.get(&room).is_some_and(|ready| {
+                ready.target == target
+                    && ready.seq == seq
+                    && ready.entry_hash == entry_hash
+                    && ready
+                        .instance
+                        .upgrade()
+                        .is_some_and(|held| Arc::ptr_eq(&held, &shared))
+            });
+            if !same {
+                self.own_readable_effects.insert(
+                    room,
+                    ReadableOwnEffect {
+                        instance: Arc::downgrade(&shared),
+                        target,
+                        seq,
+                        entry_hash,
+                        woken: BTreeSet::new(),
+                    },
+                );
+            }
+            self.retry_readable_own_effect(room);
+        }
+        if let crate::node::channel::OwnReadability::KeyDebt {
+            target,
+            epoch,
+            chain,
+            iteration,
+            ..
+        } = audit
+        {
+            self.start_own_key_request(room, target, epoch, chain, iteration);
+        }
         if receiver_changed {
             // The committed key/cursor is the producer for ordinary bounded backfill.
             self.governance_work.wake_room(room);
@@ -594,6 +692,18 @@ impl Node {
         if completed {
             self.note_local_governance_append(&room);
         }
+        let debt = match audit {
+            crate::node::channel::OwnReadability::BodyDebt {
+                target,
+                seq,
+                entry_hash,
+            } => Some((target, seq, entry_hash)),
+            _ => None,
+        };
+        let debt_changed = match debt {
+            Some(debt) => self.own_recovery_body_debts.insert(room, debt) != Some(debt),
+            None => self.own_recovery_body_debts.remove(&room).is_some(),
+        };
         let progress = match key {
             Some(key) => self.own_recovery_rooms.insert(room, key) != Some(key),
             None => {
@@ -601,7 +711,10 @@ impl Node {
                 false
             }
         };
-        if progress {
+        if completed || key.is_none() {
+            self.own_readable_effects.remove(&room);
+        }
+        if progress || debt_changed {
             for ((r, _), port) in &mut self.ports {
                 if *r == room {
                     port.raise();

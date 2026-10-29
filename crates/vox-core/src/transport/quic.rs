@@ -1592,7 +1592,7 @@ fn finish_connection(
     let peer_id = proven.peer;
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
     // actually negotiated; a session under any group but the post-quantum hybrid is refused.
-    let group = confirm_handshake(&connection)?;
+    let (group, own_recovery, availability) = confirm_handshake(&connection)?;
     let session = SessionEstablishment::observed(peer_id, group, now_ms)?;
     let peer_process = connection
         .peer_identity()
@@ -1612,6 +1612,8 @@ fn finish_connection(
         peer_id,
         peer_process,
         session,
+        own_recovery,
+        availability,
         via_circuit,
         circuit_origin: None,
         router: DatagramRouter::start(connection.clone(), overflow),
@@ -1639,7 +1641,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// [`SessionEstablishment::observed`] refuses a session under any group but X25519MLKEM768 —
 /// defence in depth beneath the provider, which offers no other group
 /// (`provider::assert_pq_only`), and TLS 1.3, which binds the group into the Finished MAC.
-fn confirm_handshake(connection: &Connection) -> Result<u16> {
+fn confirm_handshake(connection: &Connection) -> Result<(u16, bool, bool)> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
@@ -1648,7 +1650,13 @@ fn confirm_handshake(connection: &Connection) -> Result<u16> {
     };
     match &hd.protocol {
         Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => {
-            Ok(u16::from(hd.negotiated_key_exchange_group))
+            Ok((u16::from(hd.negotiated_key_exchange_group), false, false))
+        }
+        Some(p) if p.as_slice() == crate::transport::provider::VOX_OWN_RECOVERY_ALPN => {
+            Ok((u16::from(hd.negotiated_key_exchange_group), true, false))
+        }
+        Some(p) if p.as_slice() == crate::transport::provider::VOX_AVAILABILITY_ALPN => {
+            Ok((u16::from(hd.negotiated_key_exchange_group), true, true))
         }
         _ => Err(Error::SignatureInvalid),
     }
@@ -1671,6 +1679,8 @@ pub struct VoxConnection {
     /// certificate (see [`Self::peer_process`]).
     peer_process: Digest32,
     session: SessionEstablishment,
+    own_recovery: bool,
+    availability: bool,
     /// Whether this connection was set up over a relay circuit (see [`Self::via_circuit`]).
     via_circuit: bool,
     /// Where an inbound circuit's far end comes from (see [`Self::circuit_origin`]).
@@ -2266,6 +2276,15 @@ impl VoxConnection {
     #[must_use]
     pub fn session(&self) -> &SessionEstablishment {
         &self.session
+    }
+    /// Whether this exact authenticated TLS connection negotiated availability notifications.
+    pub(crate) fn supports_availability(&self) -> bool {
+        self.availability
+    }
+
+    /// Whether this exact authenticated TLS connection negotiated own-key recovery.
+    pub(crate) fn supports_own_recovery(&self) -> bool {
+        self.own_recovery
     }
 
     /// The TLS key-exchange group this session negotiated, as rustls observed it in the

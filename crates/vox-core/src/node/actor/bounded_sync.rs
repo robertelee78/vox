@@ -157,6 +157,7 @@ async fn own_recovery_flow(
     );
     flow.automatic_own_recovery = true;
     flow.own_recovery_trigger = Some(trigger);
+    flow.own_recovery_page = (!cleanup).then_some((page.head, page.lo));
     flow.own_recovery_checkpoint = Some(checkpoint);
     if cleanup {
         flow.mark_own_recovery_cleanup();
@@ -989,6 +990,16 @@ impl Controller {
     ) -> bool {
         self.release_local_admission_kind(token, room, node, LocalAdmissionKind::Room)
     }
+    pub(super) fn cancel_own_recovery_admission(&mut self, room: Digest32, node: Digest32) {
+        if self
+            .local_admission
+            .get(&(room, node))
+            .is_some_and(|entry| entry.kind == LocalAdmissionKind::Room)
+        {
+            self.cancel_local_admission(room, node);
+        }
+    }
+
     /// One actual room-lock release edge, coalesced in the existing cancellable admission
     /// owner. The self-node key cannot collide with a remote peer's secret admission.
     pub(super) fn wait_for_own_recovery_room(
@@ -2004,6 +2015,43 @@ fn foreground_reason(
 }
 
 impl Node {
+    /// A previously unavailable own body can become readable after its receiver changes.
+    /// Spend that edge once per donor and exact staged position; the normal Page still checks
+    /// its grant and settles the sparse effect before any role-complete receipt advances.
+    pub(super) fn retry_readable_own_effect(&mut self, room: Digest32) {
+        let current = self
+            .channels
+            .get(&room)
+            .zip(self.own_readable_effects.get(&room))
+            .is_some_and(|(channel, ready)| {
+                ready
+                    .instance
+                    .upgrade()
+                    .is_some_and(|held| Arc::ptr_eq(channel, &held))
+            });
+        if !current {
+            self.own_readable_effects.remove(&room);
+            return;
+        }
+        let Some(ready) = self.own_readable_effects.get_mut(&room) else {
+            return;
+        };
+        let mut woken = false;
+        for ((id, peer), port) in &mut self.ports {
+            if *id == room
+                && !ready.woken.contains(peer)
+                && port.own_recovery_parked.take().is_some()
+            {
+                ready.woken.insert(*peer);
+                port.raise();
+                woken = true;
+            }
+        }
+        if woken {
+            self.sched_rooms.insert(room);
+        }
+    }
+
     /// Name the exact bounded root whose next attempt is stopped before a `Flow` exists. This
     /// mirrors the starter's selection order so status can identify a retained admission rather
     /// than reporting only that some port is waiting.
@@ -2346,6 +2394,24 @@ impl Node {
                         }
                     }
                 }
+                if let Some(token) = flow.availability_ack.take() {
+                    if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
+                        let current_connection = self
+                            .net
+                            .as_ref()
+                            .and_then(|net| net.manager().existing(&work.peer))
+                            .is_some_and(|c| {
+                                c.serial() == flow.availability_connection
+                                    && c.supports_availability()
+                            });
+                        if current_connection
+                            && port.availability_acked.is_none_or(|old| old < token)
+                        {
+                            port.availability_connection = Some(flow.availability_connection);
+                            port.availability_acked = Some(token);
+                        }
+                    }
+                }
                 if let Some(hint) = flow.hint {
                     if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                         let scope = |connection| crate::node::ports::SupportDiscovery {
@@ -2354,17 +2420,19 @@ impl Node {
                             epoch: flow.epoch,
                             authorization: flow.generation,
                         };
-                        if let Some((connection, incarnations)) = flow
+                        if let Some(((connection, availability), incarnations)) = flow
                             .discovery_unavailable
                             .take()
                             .zip(flow.discovery_incarnations)
                         {
-                            port.support_discovery_unavailable =
-                                Some(crate::node::ports::OwnProbe {
-                                    scope: scope(connection),
-                                    head: hint.head,
-                                    incarnations,
-                                });
+                            if port.availability.remote(connection) == availability {
+                                port.support_discovery_unavailable =
+                                    Some(crate::node::ports::OwnProbe {
+                                        scope: scope(connection),
+                                        head: hint.head,
+                                        incarnations,
+                                    });
+                            }
                         }
                         if let Some((connection, incarnations)) = flow.receipt_lower.take() {
                             port.own_receipt_lower = Some(crate::node::ports::OwnProbe {
@@ -2385,6 +2453,7 @@ impl Node {
                 }
                 if flow.admitted_authors > 0 {
                     flow.admitted_authors = 0;
+                    self.role_wake.board_growth(work.room);
                     let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                         channel_id: work.room,
                     });
@@ -2577,6 +2646,7 @@ impl Node {
             }
             if flow.admitted_authors > 0 {
                 flow.admitted_authors = 0;
+                self.role_wake.board_growth(work.room);
                 let _ = self.net_tx.try_send(NetEvent::BoardGrew {
                     channel_id: work.room,
                 });
@@ -3044,6 +3114,24 @@ impl Node {
                             port.own_recovery_parked = flow.own_recovery_trigger;
                         }
                     }
+                    if !flow.own_recovery_progress
+                        && flow.own_recovery_page.is_some_and(|(target, seq)| {
+                            self.own_readable_effects
+                                .get(&work.room)
+                                .is_some_and(|ready| {
+                                    ready.target == target
+                                        && ready.seq == seq
+                                        && ready
+                                            .instance
+                                            .upgrade()
+                                            .is_some_and(|room| Arc::ptr_eq(&room, &flow.shared))
+                                })
+                        })
+                    {
+                        // Readability can change while this Page still owns the port. Its
+                        // no-progress completion is the first point a new Page may run.
+                        self.retry_readable_own_effect(work.room);
+                    }
                     if flow.own_recovery_progress {
                         self.governance_work.wake_room(work.room);
                         self.sched_rooms.insert(work.room);
@@ -3060,6 +3148,7 @@ impl Node {
                             generation: flow.generation,
                             peer: work.peer,
                             discovery_connection: flow.completed_support_discovery(),
+                            availability: flow.completed_support_availability(),
                         };
                         if self.net_tx.try_send(event).is_err() {
                             // Retain the charged completed flow and its in-flight hint until
@@ -3602,7 +3691,11 @@ impl Node {
                                     && self.bounded_sync.ready[1].is_none()
                                     && self.bounded_sync.running[1].is_none()
                                 {
-                                    match channel.own_recovery_page(&store, &peer) {
+                                    match channel.own_recovery_page(
+                                        &store,
+                                        &peer,
+                                        self.own_recovery_body_debts.get(&room).copied(),
+                                    ) {
                                         Ok(page) => page.map(|p| (instance, p)),
                                         Err(_) => return false,
                                     }
@@ -3650,7 +3743,7 @@ impl Node {
                         };
                     let mut encoded = crate::cbor::Encoder::new();
                     encoded
-                        .array(7)
+                        .array(9)
                         .bytes(&page.head)
                         .uint(page.lo)
                         .uint(page.donor_through)
@@ -3658,6 +3751,13 @@ impl Node {
                         .bytes(&instance)
                         .uint(epoch)
                         .uint(conn.serial());
+                    let availability = self
+                        .ports
+                        .get(&(room, peer))
+                        .and_then(|p| p.availability.remote(conn.serial()));
+                    encoded
+                        .uint(availability.map_or(0, |t| t.open))
+                        .uint(availability.map_or(0, |t| t.revision));
                     let trigger = crate::hash::sha256(&encoded.finish());
                     if self
                         .ports
@@ -4386,6 +4486,11 @@ impl Node {
         // A key to this peer waiting on its bundle makes this round read the peer's board,
         // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.
         flow.wants_board = self.key_waiting.contains_key(&(room, peer));
+        flow.availability_connection = conn.serial();
+        flow.availability_captured = self
+            .ports
+            .get(&(room, peer))
+            .and_then(|p| p.availability.remote(conn.serial()));
         let flow = Arc::new(tokio::sync::Mutex::new(Some(flow)));
         let result = Arc::new(StdMutex::new(None));
         let worker_flow = Arc::clone(&flow);

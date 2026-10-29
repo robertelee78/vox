@@ -60,6 +60,8 @@ const OP_OPEN: u64 = 3;
 /// W-1). A node that predates ADR-030 ends its stream unanswered, as for any frame it cannot read;
 /// its sender then sends it its keys in the pair's long-lived session, and says so (W-4).
 const OP_ROTATION_HELLO: u64 = 4;
+const OP_RECOVERY_OPEN: u64 = 5;
+const OP_RECOVERY_REPLY: u64 = 6;
 
 /// One frame on a `pairwise` stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,23 @@ pub enum PairwiseFrame {
         /// `Message::to_wire` bytes of a sealed, empty-plaintext ratchet message.
         sealed: Vec<u8>,
     },
+    /// One connection-negotiated self-author request in its own PQXDH session. It never
+    /// installs the transport peer's key and uses no ordinary key-delivery ACK namespace.
+    RecoveryOpen {
+        /// The authenticated room binding.
+        channel_id: crate::hash::Digest32,
+        /// The exact one-shot PQXDH opening.
+        initial: Vec<u8>,
+        /// Encrypted, typed request bytes.
+        sealed: Vec<u8>,
+    },
+    /// The encrypted response in that same one-shot session, never a KEY_TAKEN receipt.
+    RecoveryReply {
+        /// The same room binding as the request.
+        channel_id: crate::hash::Digest32,
+        /// Encrypted, typed response echoing the entire request.
+        sealed: Vec<u8>,
+    },
     /// **One key delivery, in a session of its own** (ADR-030 W-1): the PQXDH opening of a session
     /// the sender opened for this key alone (D-1, D-2), and the key sealed in it, together.
     ///
@@ -137,6 +156,23 @@ impl PairwiseFrame {
     pub fn to_frame(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         match self {
+            Self::RecoveryOpen {
+                channel_id,
+                initial,
+                sealed,
+            } => {
+                e.array(4)
+                    .uint(OP_RECOVERY_OPEN)
+                    .bytes(channel_id)
+                    .bytes(initial)
+                    .bytes(sealed);
+            }
+            Self::RecoveryReply { channel_id, sealed } => {
+                e.array(3)
+                    .uint(OP_RECOVERY_REPLY)
+                    .bytes(channel_id)
+                    .bytes(sealed);
+            }
             Self::Skdm { channel_id, sealed } => {
                 e.array(3).uint(OP_SKDM).bytes(channel_id).bytes(sealed);
             }
@@ -170,6 +206,21 @@ impl PairwiseFrame {
         let n = d.array()?;
         let op = d.uint()?;
         let frame = match (op, n) {
+            (OP_RECOVERY_OPEN, 4) => Self::RecoveryOpen {
+                channel_id: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedBundle("recovery room id length"))?,
+                initial: d.bytes()?.to_vec(),
+                sealed: d.bytes()?.to_vec(),
+            },
+            (OP_RECOVERY_REPLY, 3) => Self::RecoveryReply {
+                channel_id: d
+                    .bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedBundle("recovery room id length"))?,
+                sealed: d.bytes()?.to_vec(),
+            },
             (OP_OPEN, 3) => Self::Open {
                 channel_id: d
                     .bytes()?

@@ -175,6 +175,27 @@ nodes online and let them sync. Do not remove and add trust again.
 
 **Confirm:** post a new message and see it on the other node, then the other way round.
 
+## A restored node writes nothing until its own history is recovered
+
+**Symptom:** `this node's record of its own history in this room is behind what a member holds`.
+
+**Meaning:** a member holds signed entries from this node that its restored profile does not.
+Writing from the older position would reuse its own history. Vox refuses writes in this room
+until it verifies the missing prefix and recovers the content and sender state needed to resume
+safely. Held messages and incoming peer messages remain readable during recovery.
+
+**Check:** run `vox status --node <name>` for the affected node. A connected member's held
+position is not a promise that it still has every missing body or historical key.
+
+**Fix:** keep a trusted room member that retains the missing entries and keys online and reachable.
+Recovery runs automatically, including gaps older than the live window, and resumes after restart.
+Do not remove trust, leave and rejoin, erase the profile, or run another copy of the same node
+to bypass the refusal. Missing data cannot be recreated if no member retains it.
+
+**Confirm:** the daemon says `this node recovered its own history; it can write here again`.
+`vox room read` shows the recovered messages as this node's own, and another member reads its
+next new post.
+
 ## A message says not received yet
 
 **Symptom:** `(not received yet)` in a room.

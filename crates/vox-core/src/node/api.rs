@@ -1026,6 +1026,12 @@ pub enum NodeCommand {
         /// The identity passphrase.
         passphrase: Secret,
     },
+    /// Internal bounded ownership for an accepted unlock while policy work is pending.
+    #[doc(hidden)]
+    UnlockAdmitted {
+        passphrase: Secret,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
     /// Create a channel (needs the unlocked identity).
     CreateChannel {
         /// The room's shared name, one DNS label (ADR-028 R-1, R-2).
@@ -1789,7 +1795,7 @@ impl Fault {
                 "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
             }
             Fault::OwnHistoryBehind => {
-                "this node's record of its own history in this room is behind what a member holds, as after restoring an older backup; it writes nothing here until that is resolved\n       `vox room status` names the room; a profile restored from a backup must not write where a newer copy of it already has"
+                "this node's record of its own history in this room is behind what a member holds, as after restoring an older backup; it writes nothing here until that is resolved\n       `vox status --node <name>` names the room; a profile restored from a backup must not write where a newer copy of it already has"
             }
             Fault::LeaveNotHeard => {
                 "no other member of the room could be told within 30s, so this node still holds it\n       it leaves as soon as one can be told, and the members see it then"
