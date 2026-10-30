@@ -632,7 +632,6 @@ struct LocalAdmission {
     task: tokio::task::JoinHandle<()>,
 }
 struct ByteAdmission {
-    token: u64,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
     owner: Option<ByteOwner>,
@@ -848,7 +847,7 @@ pub(super) struct Controller {
     /// port; the scheduler tick is neither its notifier nor a correctness fallback.
     foreground_admission: [Option<ForegroundAdmission>; 4],
     local_admission: BTreeMap<(Digest32, Digest32), LocalAdmission>,
-    byte_admission: BTreeMap<(Digest32, Digest32), ByteAdmission>,
+    byte_admission: BTreeMap<(Digest32, Digest32, u64), ByteAdmission>,
     pool_admission: BTreeMap<(Digest32, Digest32), PoolAdmission>,
     deferred: VecDeque<Flow>,
     body_slots: Arc<stream::runtime::BodySlots>,
@@ -995,7 +994,11 @@ impl Controller {
                 .flatten()
                 .any(|admission| admission.room == room && admission.peer == peer)
             || self.local_admission.contains_key(&(room, peer))
-            || self.byte_admission.contains_key(&(room, peer))
+            || self
+                .byte_admission
+                .range((room, peer, 0)..=(room, peer, u64::MAX))
+                .next()
+                .is_some()
             || self.pool_admission.contains_key(&(room, peer))
     }
 
@@ -1073,17 +1076,17 @@ impl Controller {
         {
             return;
         }
-        if self.ready[0]
-            .as_ref()
-            .is_some_and(|flow| flow.room == room && flow.peer == peer)
-        {
+        if self.ready[0].as_ref().is_some_and(|flow| {
+            flow.room == room && flow.peer == peer && !self.record_bytes_blocked(flow)
+        }) {
             return;
         }
-        let Some(at) = self
-            .deferred
-            .iter()
-            .position(|flow| !flow.archive && flow.room == room && flow.peer == peer)
-        else {
+        let Some(at) = self.deferred.iter().position(|flow| {
+            !flow.archive
+                && flow.room == room
+                && flow.peer == peer
+                && !self.record_bytes_blocked(flow)
+        }) else {
             return;
         };
         let Some(flow) = self.deferred.remove(at) else {
@@ -1301,9 +1304,14 @@ impl Controller {
         );
     }
     fn cancel_byte_admission(&mut self, room: Digest32, peer: Digest32) {
-        if let Some(admission) = self.byte_admission.remove(&(room, peer)) {
-            admission.task.abort();
-        }
+        self.byte_admission
+            .retain(|(waiting_room, waiting_peer, _), admission| {
+                let keep = *waiting_room != room || *waiting_peer != peer;
+                if !keep {
+                    admission.task.abort();
+                }
+                keep
+            });
     }
     pub(super) fn release_byte_admission(
         &mut self,
@@ -1311,36 +1319,43 @@ impl Controller {
         room: Digest32,
         peer: Digest32,
     ) -> Option<bool> {
-        if self
-            .byte_admission
-            .get(&(room, peer))
-            .is_some_and(|admission| admission.token == token)
-        {
-            let record = self.byte_admission.get(&(room, peer))?.owner.is_some();
-            if record && !self.record_bytes_blocked(room, peer) {
-                return None;
-            }
-            self.cancel_byte_admission(room, peer);
-            Some(record)
+        let admission = self.byte_admission.remove(&(room, peer, token))?;
+        admission.task.abort();
+        if let Some(owner) = admission.owner {
+            self.record_retained(room, peer, owner).then_some(true)
         } else {
-            None
+            Some(false)
         }
     }
-    fn record_bytes_blocked(&mut self, room: Digest32, peer: Digest32) -> bool {
-        let Some(owner) = self.byte_admission.get(&(room, peer)).and_then(|a| a.owner) else {
-            return false;
-        };
-        let retained = self
-            .ready
+    fn record_retained(&self, room: Digest32, peer: Digest32, owner: ByteOwner) -> bool {
+        self.ready
             .iter()
             .filter_map(Option::as_ref)
             .chain(self.deferred.iter())
-            .any(|flow| flow.room == room && flow.peer == peer && ByteOwner::of(flow) == owner);
-        if !retained {
-            // A retired room/generation must not park its replacement behind an old release.
-            self.cancel_byte_admission(room, peer);
-        }
-        retained
+            .any(|flow| flow.room == room && flow.peer == peer && ByteOwner::of(flow) == owner)
+    }
+    fn record_bytes_blocked(&self, flow: &Flow) -> bool {
+        self.byte_admission
+            .range((flow.room, flow.peer, 0)..=(flow.room, flow.peer, u64::MAX))
+            .any(|(_, admission)| admission.owner == Some(ByteOwner::of(flow)))
+    }
+    fn prune_byte_admissions(&mut self, room: Digest32, peer: Digest32) {
+        let ready = &self.ready;
+        let deferred = &self.deferred;
+        self.byte_admission
+            .retain(|(waiting_room, waiting_peer, _), admission| {
+                let stale = *waiting_room == room
+                    && *waiting_peer == peer
+                    && admission.owner.is_some_and(|owner| {
+                        !ready.iter().flatten().chain(deferred.iter()).any(|flow| {
+                            flow.room == room && flow.peer == peer && ByteOwner::of(flow) == owner
+                        })
+                    });
+                if stale {
+                    admission.task.abort();
+                }
+                !stale
+            });
     }
     fn take_superseded_byte_hint(
         &mut self,
@@ -1348,10 +1363,7 @@ impl Controller {
         peer: Digest32,
         inbox: &stream::HintInbox,
     ) -> Option<(Flow, u64)> {
-        let admission = self.byte_admission.get(&(room, peer))?;
-        let owner = admission.owner?;
-        let port_request = admission.port_request?;
-        let superseded = |flow: &Flow| {
+        let superseded = |flow: &Flow, owner: ByteOwner| {
             flow.room == room
                 && flow.peer == peer
                 && ByteOwner::of(flow) == owner
@@ -1363,21 +1375,42 @@ impl Controller {
                     inbox.newer_pending(room, flow.hint_peer, hint.author, hint.size)
                 })
         };
+        let (key, admission) = self
+            .byte_admission
+            .range((room, peer, 0)..=(room, peer, u64::MAX))
+            .find(|(_, admission)| {
+                admission.owner.is_some_and(|owner| {
+                    self.ready
+                        .iter()
+                        .flatten()
+                        .chain(self.deferred.iter())
+                        .any(|flow| superseded(flow, owner))
+                })
+            })?;
+        let token = key.2;
+        let owner = admission.owner?;
+        let port_request = admission.port_request?;
         // Only the exact byte waiter's parked hinted owner can be replaced. Archive and
         // required roots, other ports and replacement generations keep their continuations.
         let flow = if let Some(index) = self
             .ready
             .iter()
-            .position(|slot| slot.as_ref().is_some_and(superseded))
+            .position(|slot| slot.as_ref().is_some_and(|flow| superseded(flow, owner)))
         {
             self.ready[index].take()?
         } else {
-            let index = self.deferred.iter().position(superseded)?;
+            let index = self
+                .deferred
+                .iter()
+                .position(|flow| superseded(flow, owner))?;
             self.deferred.remove(index)?
         };
         // No await occurs between identity selection and cancellation. A queued old ready
         // event cannot consume a future replacement, because its unique token no longer exists.
-        self.cancel_byte_admission(room, peer);
+        self.byte_admission
+            .remove(&(room, peer, token))?
+            .task
+            .abort();
         Some((flow, port_request))
     }
     fn wait_for_bytes(
@@ -1389,7 +1422,11 @@ impl Controller {
         work: AdmissionWork,
         waiting: ByteWait,
     ) {
-        if self.byte_admission.contains_key(&(room, peer)) {
+        if self
+            .byte_admission
+            .range((room, peer, 0)..=(room, peer, u64::MAX))
+            .any(|(_, admission)| admission.owner == waiting.owner)
+        {
             return;
         }
         let token = *next_token;
@@ -1407,9 +1444,8 @@ impl Controller {
                 .await;
         });
         self.byte_admission.insert(
-            (room, peer),
+            (room, peer, token),
             ByteAdmission {
-                token,
                 root: work.root,
                 lane: work.lane,
                 owner,
@@ -1787,15 +1823,14 @@ impl Controller {
         for (room, peer) in waiting {
             self.cancel_local_admission(room, peer);
         }
-        let waiting: Vec<(Digest32, Digest32)> = self
-            .byte_admission
-            .keys()
-            .filter(|(waiting_room, _)| *waiting_room == room)
-            .copied()
-            .collect();
-        for (room, peer) in waiting {
-            self.cancel_byte_admission(room, peer);
-        }
+        self.byte_admission
+            .retain(|(waiting_room, _, _), admission| {
+                let keep = *waiting_room != room;
+                if !keep {
+                    admission.task.abort();
+                }
+                keep
+            });
         let waiting: Vec<(Digest32, Digest32)> = self
             .pool_admission
             .keys()
@@ -3358,8 +3393,6 @@ impl Node {
                 } else {
                     self.bounded_sync.ready[index] = Some(flow);
                 }
-                self.bounded_sync
-                    .cancel_byte_admission(work.room, work.peer);
                 self.bounded_sync.wait_for_bytes(
                     &self.net_tx,
                     &mut self.next_token,
@@ -3388,8 +3421,6 @@ impl Node {
                 // The worker has finished and parked: neither this future nor the retained
                 // Flow owns reconstruction buffers or a worker slot. Subscribe/recheck the
                 // full retry peak, without turning byte pressure into a timed Busy retry.
-                self.bounded_sync
-                    .cancel_byte_admission(work.room, work.peer);
                 self.bounded_sync.wait_for_bytes(
                     &self.net_tx,
                     &mut self.next_token,
@@ -3717,11 +3748,18 @@ impl Node {
         }
         // Only the exact release handoff may make an impossible-path continuation runnable.
         // Generic actor traffic still evaluates queued ports, but cannot stand in for that edge.
-        if self.bounded_sync.pool_admission_blocked(room, peer)
-            || self.bounded_sync.record_bytes_blocked(room, peer)
-        {
+        if self.bounded_sync.pool_admission_blocked(room, peer) {
             return false;
         }
+        self.bounded_sync.prune_byte_admissions(room, peer);
+        let record_waiting = self
+            .bounded_sync
+            .byte_admission
+            .range((room, peer, 0)..=(room, peer, u64::MAX))
+            .any(|(_, admission)| admission.owner.is_some());
+        // The release belongs to one retained record, not every continuation on its port.
+        // A runnable sibling must drain: it can occupy the ready position needed by the
+        // body-slot owner whose release the blocked record is waiting for.
         let Some(profile) = self.profile.as_ref() else {
             return false;
         };
@@ -3730,12 +3768,11 @@ impl Node {
         self.bounded_sync
             .prioritize_control_admission_owner(room, peer);
         if self.bounded_sync.ready[0].is_none() && self.bounded_sync.running[0].is_none() {
-            if let Some(at) = self
-                .bounded_sync
-                .deferred
-                .iter()
-                .position(|flow| flow.room == room && flow.peer == peer)
-            {
+            if let Some(at) = self.bounded_sync.deferred.iter().position(|flow| {
+                flow.room == room
+                    && flow.peer == peer
+                    && !self.bounded_sync.record_bytes_blocked(flow)
+            }) {
                 self.bounded_sync.ready[0] = self.bounded_sync.deferred.remove(at);
             }
         }
@@ -3776,6 +3813,7 @@ impl Node {
         let announcement_preempts = self.bounded_sync.ready[0].as_ref().is_some_and(|flow| {
             flow.room == room
                 && flow.peer == peer
+                && !self.bounded_sync.record_bytes_blocked(flow)
                 && !flow.inventory
                 && flow.announcement_can_run()
                 && (flow.announcement_pending() || (announce_first && !flow.ordinary_turn_due()))
@@ -3787,6 +3825,7 @@ impl Node {
                     .is_some_and(|flow| {
                         flow.room == room
                             && flow.peer == peer
+                            && !self.bounded_sync.record_bytes_blocked(flow)
                             && (!flow.waiting || announcement_preempts)
                     })
         });
@@ -3807,6 +3846,7 @@ impl Node {
                         && self.bounded_sync.ready[*i].as_ref().is_some_and(|flow| {
                             flow.room == room
                                 && flow.peer == peer
+                                && !self.bounded_sync.record_bytes_blocked(flow)
                                 && (!flow.archive || self.bounded_sync.required.is_empty())
                         })
                 })
@@ -3816,6 +3856,9 @@ impl Node {
                 };
                 flow
             } else {
+                if record_waiting {
+                    return false;
+                }
                 if self.bounded_sync.flow_count() >= RETAINED_FLOW_LIMIT {
                     // This is controller retention preflight, before a Flow/start attempt owns
                     // the port. Its release is driven by the exact retiring/completion owner;
@@ -5193,19 +5236,23 @@ impl Controller {
                 None,
             )
         }));
-        admissions.extend(self.byte_admission.iter().map(|((room, peer), waiting)| {
-            admission(
-                "bytes",
-                waiting.token,
-                *room,
-                *peer,
-                waiting.root,
-                waiting.lane,
-                None,
-                None,
-                None,
-            )
-        }));
+        admissions.extend(
+            self.byte_admission
+                .iter()
+                .map(|((room, peer, token), waiting)| {
+                    admission(
+                        "bytes",
+                        *token,
+                        *room,
+                        *peer,
+                        waiting.root,
+                        waiting.lane,
+                        None,
+                        None,
+                        None,
+                    )
+                }),
+        );
         admissions.extend(self.pool_admission.iter().map(|((room, peer), waiting)| {
             admission(
                 waiting.gate,

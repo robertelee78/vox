@@ -103,6 +103,22 @@ bit through the existing deferred-governance path. Ordinary text does not invali
 stale attachments cannot wake a replacement room, and a later append failure cannot discard a
 governance change that already committed. The stalled journey remains unaccepted until rerun.
 
+The next run exposed a retained-slot cycle. A deferred recipient-body request waited for a
+key-slot release, but its port-wide admission also blocked a different runnable hint. That
+hint occupied the ready position needed by the deferred slot owner. Read-only native capture
+identified the exact request owners and key-slot notification; both shared byte counters were
+zero. Admissions now retain each record's independent token and dependency, and continuation
+selection excludes only that exact blocked record. Sibling refusals cannot replace its waiter.
+
+A normal-feature binary with SHA-256
+`ffb0f28c305296d461a90e6d979794994e196b1b446aeffa7e6a2ab37bd9391d`
+was run against the preserved stalled scratch profiles after an explicit restart. All three
+rooms drained, Alice's shipped trust answers became mutual, and a newly accepted message was
+readable at Bob under its exact hash and body with `owed: false`. The first read preceded
+asynchronous delivery; the accepted post was not replayed. All three scratch daemons stopped
+and no profile handles remained. This is focused normal-binary recovery evidence, not an
+uninterrupted-connection claim or acceptance of the full retained-row journey and its controls.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at
