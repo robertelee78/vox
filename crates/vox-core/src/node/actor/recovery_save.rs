@@ -578,7 +578,7 @@ impl Node {
         if progress || debt_changed {
             for ((r, _), port) in &mut self.ports {
                 if *r == room {
-                    port.raise();
+                    port.own_recovery_checked = false;
                 }
             }
             self.sched_rooms.insert(room);

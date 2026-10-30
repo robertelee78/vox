@@ -44,6 +44,7 @@ use crate::node::net::PeerPolicy;
 use crate::node::network::{BoardExchangeScope, Inbound, NodeNet};
 use crate::node::open_rooms::OpenRooms;
 use crate::node::paths::Paths;
+use crate::node::ports::{BackoffScope, OutboundService};
 
 mod bounded_sync;
 mod computer;
@@ -580,12 +581,14 @@ fn detail_of(
     })
 }
 
-/// A pending bounded Session fold is not an I/O failure. Keep the last good
-/// display while exact Session queries refuse; real local failures still poison.
+/// A pending Session fold or replaced read publication is not an I/O failure.
+/// Keep the last good display; real local failures still poison.
 fn detail_failed(ch: &mut ChannelState, error: &Error) {
     if !matches!(
         error,
-        Error::StreamRefused("Session control facts are refreshing")
+        Error::StreamRefused(
+            "Session control facts are refreshing" | crate::node::channel::history::CHANGED
+        )
     ) {
         ch.poison(error);
     }
@@ -790,8 +793,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::PrivateSessionDone { .. } => "filing private Session records",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
-        NetEvent::ArchiveAdmissionReady { .. } => "starting admitted archive work",
-        NetEvent::ForegroundAdmissionReady { .. } => "starting admitted foreground work",
+        NetEvent::BoundedAdmissionReady { .. } => "starting admitted archive work",
+        NetEvent::BoundedForegroundReady { .. } => "starting admitted foreground work",
         NetEvent::OwnRecoveryRoomReady { .. } => "resuming own recovery after room release",
         NetEvent::BoundedSecretReady { .. } => "retrying work after secret access was released",
         NetEvent::BoundedBytesReady { .. } => "retrying work after bounded bytes were released",
@@ -1593,16 +1596,18 @@ enum NetEvent {
     /// An outbound slot was given back (ADR-025 D6).
     SlotFreed,
     /// This node's retained archive request reached the head of the daemon-wide fair queue.
-    ArchiveAdmissionReady {
+    BoundedAdmissionReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: OutboundService,
     },
     /// This node's retained Control or Live ticket observed a relevant capacity release.
-    ForegroundAdmissionReady {
+    BoundedForegroundReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: OutboundService,
     },
     /// The exact identity-secret writer a bounded port met was released.
     OwnRecoveryRoomReady {
@@ -1615,12 +1620,14 @@ enum NetEvent {
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: OutboundService,
     },
     /// The exact shared byte reservation a bounded port met was released.
     BoundedBytesReady {
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: OutboundService,
     },
     /// A port's backoff is due (ADR-025 D5).
     BackoffExpired {
@@ -1628,6 +1635,7 @@ enum NetEvent {
         channel_id: Digest32,
         /// The peer.
         peer: Digest32,
+        scope: BackoffScope,
         /// The wakeup's identity; a stale one is ignored.
         timer: u64,
     },
@@ -2031,6 +2039,9 @@ impl NetEvent {
                 | Self::LocalTrustBlacklist(_)
                 | Self::AppDial(_)
                 | Self::Stream { .. }
+                // Retiring an actor-owned seat promise does not touch the store.
+                | Self::SeatRelease { .. }
+                | Self::SeatAbort { .. }
                 // Original physical owners must retire without waiting behind their own save.
                 | Self::OwnKeyWriterInterrupted(..)
                 | Self::OwnKeyComputerCancelled { .. }
@@ -3385,6 +3396,13 @@ async fn seat_round(
 
 /// The room's epoch, and the members to ask for a newcomer's place, each with its connection.
 type SeatsToAsk = (u64, Vec<(Digest32, Arc<VoxConnection>)>);
+
+/// A seat decision either completes under its room lock or retains the original queue admission.
+enum SeatEvent {
+    Unhandled(NetEvent),
+    Handled,
+    Deferred(NetEvent),
+}
 
 /// A place promised in a room to a newcomer (V030-30, #366): by whom it was asked, this node or
 /// another member, and until when it counts.
@@ -5935,7 +5953,7 @@ pub struct Node {
     /// ADR-025's sync ports, one per `(room, peer)`: see `node::ports`.
     ports: BTreeMap<(Digest32, Digest32), crate::node::ports::Port>,
     /// Ports waiting for an outbound slot (ADR-025 D6).
-    port_queue: crate::node::ports::Queue,
+    port_queue: [crate::node::ports::Queue; 3],
     /// Outbound slots in use (ADR-025 D6).
     slots: crate::node::ports::SharedSlots,
     /// The next session token.
@@ -6669,7 +6687,7 @@ impl Node {
             offline_fallbacks: BTreeMap::new(),
             records_renew_at: BTreeMap::new(),
             ports: BTreeMap::new(),
-            port_queue: crate::node::ports::Queue::default(),
+            port_queue: std::array::from_fn(|_| crate::node::ports::Queue::default()),
             slots: Arc::new(std::sync::Mutex::new(crate::node::ports::Slots::default())),
             next_token: 1,
             sched_rooms: std::collections::BTreeSet::new(),
@@ -7063,10 +7081,18 @@ impl Node {
         )> = std::collections::VecDeque::new();
         loop {
             let save_pending = self.store_save_pending();
-            let receive_net = !save_pending
-                || saved_events
-                    .back()
-                    .is_none_or(|(_, credit)| credit.is_some());
+            let saved_ready = if !save_pending {
+                saved_events
+                    .iter()
+                    .position(|(event, _)| self.seat_waits_for_install(event) != Some(true))
+            } else {
+                // A seat can pass blocked Store events once its own roster is installed.
+                // Ordinary Store events keep FIFO order and their original admission credit.
+                saved_events
+                    .iter()
+                    .position(|(event, _)| self.seat_waits_for_install(event) == Some(false))
+            };
+            let receive_net = saved_events.iter().all(|(_, credit)| credit.is_some());
             let journal_busy = self.deferred_commands.front().is_some_and(|deferred| {
                 Self::command_needs_journal(&deferred.command.0)
                     && self
@@ -7464,20 +7490,26 @@ impl Node {
                     let _ = reply.send(outcome);
                     self.schedule().await;
                 }
-                Some(event) = async {
-                    if !save_pending {
-                        if let Some((event, credit)) = saved_events.pop_front() {
-                            drop(credit);
-                            return Some(event);
+                Some((event, credit, parked)) = async {
+                    if let Some(index) = saved_ready {
+                        if let Some((event, credit)) = saved_events.remove(index) {
+                            return Some((event, credit, true));
                         }
                     }
-                    net_rx.recv().await
-                }, if receive_net => {
-                    if save_pending && (event.waits_for_store()
-                        || matches!(&event, NetEvent::LocalTrustBlacklist(_)
-                            if !self.trust.local_history_imported()))
+                    net_rx.recv().await.map(|event| (event, None, false))
+                }, if receive_net || saved_ready.is_some() => {
+                    let waits_for_store = self.seat_waits_for_install(&event).unwrap_or_else(|| {
+                        save_pending && (event.waits_for_store()
+                            || matches!(&event, NetEvent::LocalTrustBlacklist(_)
+                                if !self.trust.local_history_imported()))
+                    });
+                    if waits_for_store
                     {
-                        let credit = self.net_tx.clone().try_reserve_owned().ok();
+                        let credit = if parked {
+                            credit
+                        } else {
+                            self.net_tx.clone().try_reserve_owned().ok()
+                        };
                         saved_events.push_back((event, credit));
                         continue;
                     }
@@ -7485,7 +7517,22 @@ impl Node {
                     self.publication_again |= !self.publish_waiters.is_empty();
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
-                    self.handle_net(event).await;
+                    match self.handle_seat_event(event) {
+                        SeatEvent::Unhandled(event) => {
+                            drop(credit);
+                            self.handle_net(event).await;
+                        }
+                        SeatEvent::Handled => drop(credit),
+                        SeatEvent::Deferred(event) => {
+                            let credit = if parked {
+                                credit
+                            } else {
+                                self.net_tx.clone().try_reserve_owned().ok()
+                            };
+                            saved_events.push_back((event, credit));
+                            continue;
+                        }
+                    }
                     self.note_if_stalled(name, started);
                     self.publish().await;
                     self.schedule().await;
@@ -8846,6 +8893,7 @@ impl Node {
                 return Ok(None);
             };
             channel.require_governance_ready(profile.store(), self.now_ms())?;
+            channel.publish_history_read_trusted(profile.store_handle(), &self.trust.trusted())?;
             let view = self.view_tx.borrow();
             let previous = view
                 .open_channels
@@ -9368,11 +9416,8 @@ impl Node {
         self.sync_dials.clear();
         self.member_reaches.clear();
         for ((room, peer), port) in &mut self.ports {
-            if port
-                .backoff
-                .is_some_and(|b| b.kind == crate::node::status::BackoffKind::Unreachable)
-            {
-                port.backoff = None;
+            if port.transport_backoff.is_some() {
+                port.transport_backoff = None;
                 crate::node::status::SyncBook::with(&self.sync_book, *room, *peer, |c| {
                     c.backoff = None;
                     c.consecutive_failures = 0;
@@ -10198,13 +10243,8 @@ impl Node {
                     });
                 });
             }
-            NetEvent::SeatReserve {
-                channel_id,
-                joiner,
-                ack,
-            } => {
-                let held = self.reserve_seat(channel_id, joiner).await;
-                let _ = ack.send(held);
+            NetEvent::SeatReserve { .. } | NetEvent::SeatAsk { .. } => {
+                unreachable!("seat decisions retain admission in the actor loop")
             }
             NetEvent::SeatRelease { channel_id, joiner } => {
                 let me = self.profile.as_ref().map(Profile::fingerprint);
@@ -10216,12 +10256,6 @@ impl Node {
                     self.seat_promises.remove(&(channel_id, joiner));
                 }
             }
-            NetEvent::SeatAsk {
-                peer,
-                ask,
-                send,
-                recv,
-            } => self.answer_seat(peer, ask, send, recv).await,
             NetEvent::SeatAbort { peer, abort } => {
                 if self
                     .seat_promises
@@ -10801,6 +10835,7 @@ impl Node {
                         self.enter_backoff(
                             room,
                             peer,
+                            OutboundService::Public,
                             crate::node::status::BackoffKind::Unreachable,
                         );
                     }
@@ -11577,24 +11612,34 @@ impl Node {
             NetEvent::SlotFreed => {
                 // Queued ports are evaluated at the end of every event; nothing more to do here.
             }
-            NetEvent::ArchiveAdmissionReady { token, room, peer } => {
-                if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+            NetEvent::BoundedAdmissionReady {
+                token,
+                room,
+                peer,
+                service,
+            } => {
+                if self.port_runnable(&(room, peer), service, std::time::Instant::now()) {
                     self.sched_rooms.insert(room);
                 } else {
                     // Admission happened after this exact port stopped being runnable. Return the
                     // permit now; the event that makes the retained flow eligible queues it again.
                     self.bounded_sync
-                        .release_archive_admission(token, room, peer);
+                        .release_archive_admission(token, room, peer, service);
                 }
             }
-            NetEvent::ForegroundAdmissionReady { token, room, peer } => {
-                if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+            NetEvent::BoundedForegroundReady {
+                token,
+                room,
+                peer,
+                service,
+            } => {
+                if self.port_runnable(&(room, peer), service, std::time::Instant::now()) {
                     self.sched_rooms.insert(room);
                 } else {
                     // The exact port disappeared or stopped needing a round before its lane
                     // changed. Cancel the retained queue position; a later need queues anew.
                     self.bounded_sync
-                        .release_foreground_admission(token, room, peer);
+                        .release_foreground_admission(token, room, peer, service);
                 }
             }
             NetEvent::OwnRecoveryRoomReady {
@@ -11629,26 +11674,39 @@ impl Node {
                     self.sched_rooms.insert(room);
                 }
             }
-            NetEvent::BoundedSecretReady { token, room, peer } => {
+            NetEvent::BoundedSecretReady {
+                token,
+                room,
+                peer,
+                service,
+            } => {
                 if self
                     .bounded_sync
-                    .release_secret_admission(token, room, peer)
-                    && self.port_eligible(&(room, peer), std::time::Instant::now())
+                    .release_secret_admission(token, room, peer, service)
+                    && self.port_eligible(&(room, peer), service, std::time::Instant::now())
                 {
                     self.sched_rooms.insert(room);
                 }
             }
-            NetEvent::BoundedBytesReady { token, room, peer } => {
-                if let Some(record) = self.bounded_sync.release_byte_admission(token, room, peer) {
+            NetEvent::BoundedBytesReady {
+                token,
+                room,
+                peer,
+                service,
+            } => {
+                if let Some(record) = self
+                    .bounded_sync
+                    .release_byte_admission(token, room, peer, service)
+                {
                     // Only an exact retained record's byte-release edge disproves a previous
                     // capacity backoff. Transport/policy pacing keeps its separate meaning.
                     if record
                         && self.ports.get_mut(&(room, peer)).is_some_and(|port| {
-                            if port
-                                .backoff
+                            let backoff = port.backoff_mut(BackoffScope::Service(service));
+                            if backoff
                                 .is_some_and(|b| b.kind == crate::node::status::BackoffKind::Busy)
                             {
-                                port.clear_backoff();
+                                *backoff = None;
                                 true
                             } else {
                                 false
@@ -11664,7 +11722,7 @@ impl Node {
                             },
                         );
                     }
-                    if self.port_eligible(&(room, peer), std::time::Instant::now()) {
+                    if self.port_eligible(&(room, peer), service, std::time::Instant::now()) {
                         self.sched_rooms.insert(room);
                     }
                 }
@@ -11673,9 +11731,14 @@ impl Node {
                 channel_id,
                 peer,
                 timer,
+                scope,
             } => {
                 if let Some(port) = self.ports.get_mut(&(channel_id, peer)) {
-                    if let Some(b) = port.backoff.as_mut().filter(|b| b.timer == timer) {
+                    if let Some(b) = port
+                        .backoff_mut(scope)
+                        .as_mut()
+                        .filter(|b| b.timer == timer)
+                    {
                         b.until = None;
                         crate::node::status::SyncBook::with(
                             &self.sync_book,
@@ -15011,7 +15074,9 @@ impl Node {
                 a.retire();
             }
         }
-        self.port_queue.remove(channel_id, peer);
+        for queue in &mut self.port_queue {
+            queue.remove(channel_id, peer);
+        }
         crate::node::status::SyncBook::with(&self.sync_book, *channel_id, *peer, |c| {
             c.backoff = None;
             c.consecutive_failures = 0;
@@ -15025,7 +15090,9 @@ impl Node {
         for (room, peer) in keys {
             self.drop_port(&room, &peer);
         }
-        self.port_queue.clear();
+        for queue in &mut self.port_queue {
+            queue.clear();
+        }
         self.connected.clear();
         self.discovered.clear();
         self.discover_rooms.clear();
@@ -15133,7 +15200,7 @@ impl Node {
                     port.support_discovery = None;
                     port.support_discovery_unavailable = None;
                     port.raise();
-                    port.clear_backoff();
+                    *port.backoff_mut(BackoffScope::Service(OutboundService::Public)) = None;
                     self.governance_work.wake_room(*room);
                     self.sched_rooms.insert(*room);
                 }
@@ -15175,12 +15242,15 @@ impl Node {
             .filter(|(r, _)| all || rooms.contains(r))
             .copied()
             .collect();
-        let queued_before: std::collections::BTreeSet<(Digest32, Digest32)> =
-            self.port_queue.all().into_iter().collect();
+        let queued_before: std::collections::BTreeSet<(Digest32, Digest32)> = self
+            .port_queue
+            .iter()
+            .flat_map(|queue| queue.all())
+            .collect();
         scope.extend(queued_before.iter().copied());
         scope.sort_unstable();
         scope.dedup();
-        let mut newly_queued: Vec<(Digest32, Digest32)> = Vec::new();
+        let mut newly_queued = Vec::new();
         for key in scope {
             let (room, peer) = key;
             // A port whose room was closed or held again starts over.
@@ -15196,35 +15266,33 @@ impl Node {
                 }
                 Some(_) => {}
             }
-            let eligible = self.port_eligible(&key, now);
-            // A retained flow-state continuation belongs to this exact startable port. Once the
-            // connection or any other eligibility gate disappears it cannot keep a release-edge
-            // promise: dropping the ticket returns an already-granted promise to the next actor
-            // immediately, while the parked Flow remains the port's work for a later reconnect.
             #[cfg(feature = "test-knobs")]
             let cancel_ineligible =
                 std::env::var_os("VOX_TEST_FX35_KEEP_CLOSED_POOL_ADMISSION").is_none();
             #[cfg(not(feature = "test-knobs"))]
             let cancel_ineligible = true;
-            if !eligible && cancel_ineligible {
-                self.bounded_sync.cancel_pool_admission(room, peer);
-            }
-            if let Some(p) = self.ports.get(&key) {
-                let wants = p.needs()
-                    || self.bounded_sync.needs_port(key.0, key.1)
-                    || self.history_hints.pending(key.0, key.1);
-                if wants || eligible {}
-            }
-            let Some(port) = self.ports.get_mut(&key) else {
-                continue;
-            };
-            if eligible && !port.queued {
-                port.queued = true;
-                self.port_queue.push(room, peer);
-                newly_queued.push(key);
-            } else if !eligible && port.queued && port.out.is_none() {
-                port.queued = false;
-                self.port_queue.remove(&room, &peer);
+            for service in [
+                OutboundService::Public,
+                OutboundService::Private,
+                OutboundService::Archive,
+            ] {
+                let eligible = self.port_eligible(&key, service, now);
+                if !self.port_runnable(&key, service, now) && cancel_ineligible {
+                    self.bounded_sync
+                        .cancel_pool_admission_for(room, peer, service);
+                }
+                let Some(port) = self.ports.get_mut(&key) else {
+                    continue;
+                };
+                let index = service.index();
+                if eligible && !port.queued[index] {
+                    port.queued[index] = true;
+                    self.port_queue[index].push(room, peer);
+                    newly_queued.push((key, service));
+                } else if !eligible && port.queued[index] {
+                    port.queued[index] = false;
+                    self.port_queue[index].remove(&room, &peer);
+                }
             }
         }
         // **A port with no connection reaches its peer** (ADR-025 D2, V210-58 #246). A port runs
@@ -15242,14 +15310,22 @@ impl Node {
             .ports
             .iter()
             .filter(|(key, port)| {
-                port.out.is_none()
-                    && (port.needs()
-                        || self.bounded_sync.needs_port(key.0, key.1)
-                        || self.history_hints.pending(key.0, key.1)
-                        || (self.trust.is_trusted(&key.1)
-                            && self.history_demand.unstarted_dial_binding(key.0, key.1)))
-                    && (!port.backing_off(now) || port.busy_bypass(now))
-                    && !self.publishing.contains(*key)
+                [
+                    OutboundService::Public,
+                    OutboundService::Private,
+                    OutboundService::Archive,
+                ]
+                .into_iter()
+                .any(|service| {
+                    port.out.can_start(service)
+                        && self.port_needs(**key, service)
+                        && (!port.backing_off_for(service, now) || port.busy_bypass(service, now))
+                }) || (self.trust.is_trusted(&key.1)
+                    && self.history_demand.unstarted_dial_binding(key.0, key.1)
+                    && !port.backing_off_for(OutboundService::Archive, now))
+            })
+            .filter(|(key, _)| {
+                !self.publishing.contains(*key)
                     && self
                         .net
                         .as_ref()
@@ -15261,45 +15337,55 @@ impl Node {
             self.reach_for_sync(&room, peer);
         }
         let mut ran = false;
-        let mut unstarted: Vec<(Digest32, Digest32)> = Vec::new();
-        loop {
-            let slots = Arc::clone(&self.slots);
-            let Some((room, peer)) = self
-                .port_queue
-                .pop(|p| crate::node::ports::Slots::free_for(&slots, p))
-            else {
-                break;
-            };
-            if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                port.queued = false;
+        let preferred = self.bounded_sync.background_preference();
+        let other = if preferred == OutboundService::Private {
+            OutboundService::Archive
+        } else {
+            OutboundService::Private
+        };
+        for service in [OutboundService::Public, preferred, other] {
+            let mut unstarted = Vec::new();
+            loop {
+                let slots = Arc::clone(&self.slots);
+                let Some((room, peer)) = self.port_queue[service.index()]
+                    .pop(|p| crate::node::ports::Slots::free_for(&slots, p))
+                else {
+                    break;
+                };
+                if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                    port.queued[service.index()] = false;
+                }
+                if !self.port_eligible(&(room, peer), service, std::time::Instant::now()) {
+                    continue;
+                }
+                if self.start_outbound(room, peer, service).await {
+                    ran = true;
+                    // A successful Background admission advances the arbitration cursor.
+                    // Do not drain the old class if the worker completes while this scan runs.
+                    if service != OutboundService::Public {
+                        break;
+                    }
+                } else {
+                    unstarted.push((room, peer));
+                }
             }
-            // Its turn: does it still need a session?
-            if !self.port_eligible(&(room, peer), std::time::Instant::now()) {
-                continue;
-            }
-            if self.start_outbound(room, peer).await {
-                ran = true;
-            } else {
-                unstarted.push((room, peer));
-            }
-        }
-        // A port whose turn found the one foreground lane taken keeps its place, ahead of the
-        // ports that become eligible after it. Re-queueing every eligible port in id order at
-        // the next evaluation let the port sorted first retake the lane round after round: a
-        // peer's flow waiting on a held fold ran 77 rounds a second and the node's other peer
-        // never got one, so a post made while the fold was held reached no one (ADR-037 R11).
-        for (room, peer) in unstarted {
-            if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                if port.out.is_none() && !port.queued {
-                    port.queued = true;
-                    self.port_queue.push(room, peer);
+            for (room, peer) in unstarted {
+                if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                    if port.out.can_start(service) && !port.queued[service.index()] {
+                        port.queued[service.index()] = true;
+                        self.port_queue[service.index()].push(room, peer);
+                    }
                 }
             }
         }
-        for key in newly_queued {
-            if self.ports.get(&key).is_some_and(|p| p.queued) {
+        for (key, service) in newly_queued {
+            if self
+                .ports
+                .get(&key)
+                .is_some_and(|p| p.queued[service.index()])
+            {
                 crate::node::status::SyncBook::with(&self.sync_book, key.0, key.1, |c| {
-                    c.queued += 1;
+                    c.queued += 1
                 });
             }
         }
@@ -15310,22 +15396,55 @@ impl Node {
     /// backing off, its peer is connected, and no publish round to that peer for the room is in
     /// flight (the round's records must reach the board before a session reads it). Inbound
     /// attempts are ignored (ADR-025 D4: full duplex).
-    fn port_eligible(&self, key: &(Digest32, Digest32), now: std::time::Instant) -> bool {
+    fn port_needs(&self, key: (Digest32, Digest32), service: OutboundService) -> bool {
+        let Some(port) = self.ports.get(&key) else {
+            return false;
+        };
+        if port.poisoned || (!port.sparse && service != OutboundService::Public) {
+            return false;
+        }
+        self.bounded_sync.needs_port_for(key.0, key.1, service)
+            || match service {
+                OutboundService::Public => {
+                    port.needs_public() || self.history_hints.pending(key.0, key.1)
+                }
+                OutboundService::Private => port.needs_private(),
+                OutboundService::Archive => {
+                    self.history_demand.ready_binding(key.0, key.1).is_some()
+                        || (self.own_recovery_rooms.contains_key(&key.0)
+                            && !port.own_recovery_checked)
+                }
+            }
+    }
+
+    fn port_runnable(
+        &self,
+        key: &(Digest32, Digest32),
+        service: OutboundService,
+        now: std::time::Instant,
+    ) -> bool {
         let Some(port) = self.ports.get(key) else {
             return false;
         };
-        let eligible = port.out.is_none()
-            && (port.needs()
-                || self.bounded_sync.needs_port(key.0, key.1)
-                || self.history_hints.pending(key.0, key.1)
-                || self.history_demand.ready_binding(key.0, key.1).is_some())
-            && (!port.backing_off(now) || port.busy_bypass(now))
+        self.port_needs(*key, service)
+            && (!port.backing_off_for(service, now) || port.busy_bypass(service, now))
             && !self.publishing.contains(key)
             && self
                 .net
                 .as_ref()
-                .is_some_and(|n| n.manager().existing(&key.1).is_some());
-        eligible
+                .is_some_and(|n| n.manager().existing(&key.1).is_some())
+    }
+
+    fn port_eligible(
+        &self,
+        key: &(Digest32, Digest32),
+        service: OutboundService,
+        now: std::time::Instant,
+    ) -> bool {
+        self.ports
+            .get(key)
+            .is_some_and(|port| port.out.can_start(service))
+            && self.port_runnable(key, service, now)
     }
 
     /// The tick's part in sync (ADR-025 D1a, D7): retire attempts whose connection died, and every
@@ -15340,6 +15459,7 @@ impl Node {
             .flat_map(|(k, p)| {
                 p.out
                     .iter()
+                    .map(|out| &out.attempt)
                     .chain(p.inbound.values())
                     .filter(|a| a.conn.quinn().close_reason().is_some())
                     .map(move |a| (*k, a.token))
@@ -15478,32 +15598,36 @@ impl Node {
         &mut self,
         channel_id: Digest32,
         peer: Digest32,
+        service: OutboundService,
         kind: crate::node::status::BackoffKind,
     ) {
         let Some(port) = self.ports.get_mut(&(channel_id, peer)) else {
             return;
         };
-        let prior = port.backoff;
+        let scope = if kind == crate::node::status::BackoffKind::Unreachable {
+            BackoffScope::Transport
+        } else {
+            BackoffScope::Service(service)
+        };
+        let prior = port.backoff(scope);
         let failures = prior.map_or(0, |b| b.failures).saturating_add(1);
-        let timer = prior.map_or(0, |b| b.timer).wrapping_add(1);
+        let timer = self.next_token;
+        self.next_token += 1;
+        let now = std::time::Instant::now();
+        let since = prior.filter(|b| b.failures > 0).map_or(now, |b| b.since);
         let mut wait = crate::node::ports::backoff_wait(kind, failures);
-        crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
-            if c.consecutive_failures >= 2
-                && c.failing_since
-                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
-            {
-                // A persistently failing peer costs at most one retry per half minute, growing
-                // to five minutes. A new live connection or a successful sync still clears it.
-                wait = wait.max(Duration::from_secs(
-                    30u64
-                        .saturating_mul(1 << failures.saturating_sub(7).min(4))
-                        .min(300),
-                ));
-            }
-        });
-        port.backoff = Some(crate::node::ports::Backoff {
+        if failures >= 2 && now.saturating_duration_since(since) >= Duration::from_secs(30) {
+            // Keep the existing persistent-failure pacing, scoped to this owner.
+            wait = wait.max(Duration::from_secs(
+                30u64
+                    .saturating_mul(1 << failures.saturating_sub(7).min(4))
+                    .min(300),
+            ));
+        }
+        *port.backoff_mut(scope) = Some(crate::node::ports::Backoff {
             until: Some(std::time::Instant::now() + wait),
             failures,
+            since,
             kind,
             timer,
         });
@@ -15517,6 +15641,7 @@ impl Node {
                 .send(NetEvent::BackoffExpired {
                     channel_id,
                     peer,
+                    scope,
                     timer,
                 })
                 .await;
@@ -15530,9 +15655,15 @@ impl Node {
     /// Not awaited — see [`NetEvent::SyncDone`] for why awaiting deadlocks two nodes that start
     /// at the same moment.
     /// Note why `start_outbound` for the port ended as it did (`vox status --json`, `lanes`).
-    fn note_start(&mut self, room: Digest32, peer: Digest32, why: &'static str) {
+    fn note_start(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        service: OutboundService,
+        why: &'static str,
+    ) {
         if let Some(port) = self.ports.get_mut(&(room, peer)) {
-            port.last_start = Some((why, std::time::Instant::now()));
+            port.last_start = Some((service, why, std::time::Instant::now()));
         }
     }
 
@@ -15581,13 +15712,13 @@ impl Node {
                 // The port's last start: never attempted, started, or not started and why
                 // (ADR-038 FX-35); a later attempt replaces the earlier.
                 let last = port.last_start.map_or_else(
-                    || "\"start_outcome\":\"never_attempted\"".to_owned(),
-                    |(why, at)| {
+                    || "\"start_outcome\":\"never_attempted\",\"start_service\":null".to_owned(),
+                    |(service, why, at)| {
                         if why == "started" {
-                            format!("\"start_outcome\":\"started\",\"start_age_ms\":{}", age(at))
+                            format!("\"start_outcome\":\"started\",\"start_service\":\"{service:?}\",\"start_age_ms\":{}", age(at))
                         } else {
                             format!(
-                                "\"start_outcome\":\"not_started\",\"start_reason\":\"{why}\",\"start_age_ms\":{}",
+                                "\"start_outcome\":\"not_started\",\"start_service\":\"{service:?}\",\"start_reason\":\"{why}\",\"start_age_ms\":{}",
                                 age(at)
                             )
                         }
@@ -15600,10 +15731,11 @@ impl Node {
                             owner.node == me && owner.room == *room && owner.peer == *peer
                         })
                         .map(|owner| format!(
-                            "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\"}}",
+                            "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"slot\":{}}}",
                             owner.actor,
                             owner.request.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-                            owner.instance.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+                            owner.instance.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                            owner.slot.index()
                         ))
                         .collect::<Vec<_>>()
                 });
@@ -15620,18 +15752,28 @@ impl Node {
                         )
                     },
                 );
+                let out = port.out.iter().map(|out| format!(
+                    "{{\"service\":\"{:?}\",\"age_ms\":{}}}", out.service, age(out.attempt.started)
+                )).collect::<Vec<_>>().join(",");
                 format!(
-                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"last_recorded_unavailable_response\":{},\"needs\":{},\"queued\":{},\"out_age_ms\":{},\"inbound\":{},\"backing_off\":{},\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],{}}}",
+                    "{{\"room\":\"{}\",\"peer\":\"{}\",\"last_recorded_unavailable_response\":{},\"needs\":{},\"needs_classes\":[{},{},{}],\"queued\":{},\"queued_classes\":[{},{},{}],\"out_age_ms\":{},\"out_attempts\":[{}],\"inbound\":{},\"backing_off\":{},\"backing_off_classes\":[{},{},{}],\"publishing\":{},\"connected\":{},\"round_running\":{},\"round_running_owners\":[{}],{}}}",
                     b32_encode(room),
                     b32_encode(peer),
                     unavailable,
-                    port.needs(),
-                    port.queued,
-                    port.out
-                        .as_ref()
-                        .map_or_else(|| "null".to_owned(), |a| age(a.started).to_string()),
+                    self.port_needs((*room, *peer), OutboundService::Public) || self.port_needs((*room, *peer), OutboundService::Private) || self.port_needs((*room, *peer), OutboundService::Archive),
+                    self.port_needs((*room, *peer), OutboundService::Public),
+                    self.port_needs((*room, *peer), OutboundService::Private),
+                    self.port_needs((*room, *peer), OutboundService::Archive),
+                    port.queued.iter().any(|queued| *queued),
+                    port.queued[0], port.queued[1], port.queued[2],
+                    port.out.iter().find(|out| out.service == OutboundService::Public)
+                        .map_or_else(|| "null".to_owned(), |out| age(out.attempt.started).to_string()),
+                    out,
                     port.inbound.len(),
-                    port.backing_off(now),
+                    [OutboundService::Public, OutboundService::Private, OutboundService::Archive].into_iter().any(|service| port.backing_off_for(service, now)),
+                    port.backing_off_for(OutboundService::Public, now),
+                    port.backing_off_for(OutboundService::Private, now),
+                    port.backing_off_for(OutboundService::Archive, now),
                     self.publishing.contains(&(*room, *peer)),
                     connected,
                     !round_owners.is_empty(),
@@ -15718,8 +15860,8 @@ impl Node {
                 .join(","),
             b.flow_state_waiting
                 .iter()
-                .map(|(order, actor, node, room, peer, request, instance, granted)| format!(
-                    "{{\"order\":{order},\"actor\":{actor},\"node\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"request\":\"{}\",\"instance\":\"{}\",\"granted\":{granted}}}",
+                .map(|(order, actor, node, room, peer, request, instance, granted, slot)| format!(
+                    "{{\"order\":{order},\"actor\":{actor},\"node\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"request\":\"{}\",\"instance\":\"{}\",\"granted\":{granted},\"slot\":{slot}}}",
                     b32_encode(node),
                     b32_encode(room),
                     b32_encode(peer),
@@ -15743,7 +15885,12 @@ impl Node {
         )
     }
 
-    async fn start_outbound(&mut self, channel_id: Digest32, peer: Digest32) -> bool {
+    async fn start_outbound(
+        &mut self,
+        channel_id: Digest32,
+        peer: Digest32,
+        service: OutboundService,
+    ) -> bool {
         if !self.board_exchange_allowed(&channel_id) {
             return false;
         }
@@ -15771,8 +15918,11 @@ impl Node {
             // again under the room mutex by its first local slice; the actor never waits on that
             // mutex merely to start a worker.
             return self
-                .start_bounded_outbound(channel_id, peer, epoch, shared, store, conn)
+                .start_bounded_outbound((channel_id, peer, service), epoch, shared, store, conn)
                 .await;
+        }
+        if service != OutboundService::Public {
+            return false;
         }
         let Some(node) = self.profile.as_ref().map(Profile::fingerprint) else {
             return false;
@@ -15781,11 +15931,21 @@ impl Node {
             .history_budget
             .try_start(node, crate::node::history_budget::Lane::Archive)
         else {
-            self.note_start(channel_id, peer, "archive_budget_busy");
+            self.note_start(
+                channel_id,
+                peer,
+                OutboundService::Public,
+                "archive_budget_busy",
+            );
             return false;
         };
         let Some(buffers) = job.reserve(crate::log::sync::LEGACY_BUFFER_ENVELOPE) else {
-            self.note_start(channel_id, peer, "archive_budget_busy");
+            self.note_start(
+                channel_id,
+                peer,
+                OutboundService::Public,
+                "archive_budget_busy",
+            );
             return false;
         };
         if !shared
@@ -15807,13 +15967,22 @@ impl Node {
                 let _ = wake.try_send(NetEvent::SlotFreed);
             }),
         ) else {
-            self.note_start(channel_id, peer, "no_outbound_slot");
+            self.note_start(
+                channel_id,
+                peer,
+                OutboundService::Public,
+                "no_outbound_slot",
+            );
             return false;
         };
         let Some(port) = self.ports.get_mut(&(channel_id, peer)) else {
             return false;
         };
-        port.last_start = Some(("started", std::time::Instant::now()));
+        port.last_start = Some((
+            OutboundService::Public,
+            "started",
+            std::time::Instant::now(),
+        ));
         let token = self.next_token;
         self.next_token += 1;
         let fence = crate::transport::stream_transport::Fence::new();
@@ -15834,7 +16003,7 @@ impl Node {
             crate::node::status::RoundReason::Request
         };
         let generation = port.gen.load(std::sync::atomic::Ordering::Relaxed);
-        port.out = Some(crate::node::ports::Attempt {
+        let mut attempt = Some(crate::node::ports::Attempt {
             token,
             dir: crate::node::ports::Dir::Out,
             conn: Arc::clone(&conn),
@@ -15846,6 +16015,9 @@ impl Node {
             departure_receipt: None,
             reason,
         });
+        if !port.out.install(service, &mut attempt) {
+            return false;
+        }
         port.note_foreground_attempt(generation);
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admission = self.profile.as_ref().and_then(|profile| {
@@ -15947,10 +16119,9 @@ impl Node {
         if let Some(a) = self
             .ports
             .get_mut(&(channel_id, peer))
-            .and_then(|p| p.out.as_mut())
-            .filter(|a| a.token == token)
+            .and_then(|p| p.out.get_token_mut(token))
         {
-            a.abort = Some(task.abort_handle());
+            a.attempt.abort = Some(task.abort_handle());
         }
         true
     }
@@ -16061,6 +16232,11 @@ impl Node {
     ) -> bool {
         use crate::node::channel::SyncFailure;
         let key = (channel_id, peer);
+        let service = self
+            .ports
+            .get(&key)
+            .and_then(|port| port.out.iter().find(|out| out.attempt.token == token))
+            .map_or(OutboundService::Public, |out| out.service);
         let attempt = self.ports.get_mut(&key).and_then(|p| p.take(token));
         let Some(attempt) = attempt else {
             // A session of a room this node has since left is not counted: its counts went
@@ -16115,9 +16291,11 @@ impl Node {
                     for a in p.take_attempts() {
                         a.retire();
                     }
-                    p.queued = false;
+                    p.queued = [false; 3];
                 }
-                self.port_queue.remove(&k.0, &k.1);
+                for queue in &mut self.port_queue {
+                    queue.remove(&k.0, &k.1);
+                }
             }
             return true;
         }
@@ -16126,8 +16304,8 @@ impl Node {
         };
         if progress {
             port.last_progress = Some(std::time::Instant::now());
-            if let Some(b) = port.backoff.as_mut() {
-                b.failures = 0;
+            if let Some(backoff) = port.backoff_mut(BackoffScope::Service(service)).as_mut() {
+                backoff.failures = 0;
             }
         }
         // **A clean session the peer opened releases a backoff that said the peer could not take
@@ -16140,16 +16318,24 @@ impl Node {
         // post made there 6 s later reached the joiner after 24 s, although the joiner had synced
         // with the host in between. `NoProgress` is kept: a peer that syncs *from* this node says
         // nothing about whether it serves what it advertises (P10).
-        if attempt.dir == crate::node::ports::Dir::In
-            && report.fail.is_none()
-            && port
-                .backoff
-                .is_some_and(|b| b.kind != crate::node::status::BackoffKind::NoProgress)
-        {
-            port.clear_backoff();
+        if attempt.dir == crate::node::ports::Dir::In && report.fail.is_none() {
+            for scope in [
+                BackoffScope::Transport,
+                BackoffScope::Service(OutboundService::Public),
+                BackoffScope::Service(OutboundService::Private),
+                BackoffScope::Service(OutboundService::Archive),
+            ] {
+                let backoff = port.backoff_mut(scope);
+                if backoff.is_some_and(|b| b.kind != crate::node::status::BackoffKind::NoProgress) {
+                    *backoff = None;
+                }
+            }
             crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
                 c.backoff = None;
             });
+        }
+        if service != OutboundService::Public {
+            return true;
         }
         match &report.fail {
             None if o.legacy_required.is_some() => {
@@ -16197,6 +16383,7 @@ impl Node {
                     self.enter_backoff(
                         channel_id,
                         peer,
+                        service,
                         crate::node::status::BackoffKind::NoProgress,
                     );
                 }
@@ -16211,7 +16398,7 @@ impl Node {
                 port.raise();
                 if !beaten {
                     if let Some(kind) = crate::node::ports::backoff_kind(fail) {
-                        self.enter_backoff(channel_id, peer, kind);
+                        self.enter_backoff(channel_id, peer, service, kind);
                     }
                 }
             }
@@ -16238,7 +16425,9 @@ impl Node {
         let mut synced = 0usize;
         self.sync_with(channel_id, &peers).await;
         for ((room, _), port) in &self.ports {
-            if room == channel_id && (port.out.is_some() || port.queued) {
+            if room == channel_id
+                && (!port.out.is_empty() || port.queued.iter().any(|queued| *queued))
+            {
                 synced += 1;
             }
         }
@@ -16355,21 +16544,68 @@ impl Node {
         Ok(())
     }
 
+    fn handle_seat_event(&mut self, event: NetEvent) -> SeatEvent {
+        match event {
+            NetEvent::SeatReserve {
+                channel_id,
+                joiner,
+                ack,
+            } => {
+                let held = match self.reserve_seat(channel_id, joiner) {
+                    Ok(Some(held)) => Ok(held),
+                    Err(error) => Err(error),
+                    Ok(None) => {
+                        return SeatEvent::Deferred(NetEvent::SeatReserve {
+                            channel_id,
+                            joiner,
+                            ack,
+                        })
+                    }
+                };
+                let _ = ack.send(held);
+                SeatEvent::Handled
+            }
+            NetEvent::SeatAsk {
+                peer,
+                ask,
+                send,
+                recv,
+            } => {
+                if let Some((send, recv)) = self.answer_seat(peer, ask, send, recv) {
+                    SeatEvent::Deferred(NetEvent::SeatAsk {
+                        peer,
+                        ask,
+                        send,
+                        recv,
+                    })
+                } else {
+                    SeatEvent::Handled
+                }
+            }
+            event => SeatEvent::Unhandled(event),
+        }
+    }
+
     /// **The asker's first step** (V030-30, #366): hold a place for `joiner` under this node's own
     /// name, and say which members to ask: every other member of the room this node holds a
     /// connection to. A joiner already an author needs no place and no one asked.
-    async fn reserve_seat(
+    fn reserve_seat(
         &mut self,
         channel_id: Digest32,
         joiner: Digest32,
-    ) -> crate::error::Result<SeatsToAsk> {
+    ) -> crate::error::Result<Option<SeatsToAsk>> {
         let Some(me) = self.profile.as_ref().map(Profile::fingerprint) else {
             return Err(crate::error::Error::Profile("locked"));
         };
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             return Err(Error::Profile("no such room on this node"));
         };
-        let c = shared.lock().await;
+        let Ok(c) = shared.try_lock() else {
+            return Ok(None);
+        };
+        if c.post_pending() {
+            return Ok(None);
+        }
         if c.ended((self.millis_clock)()).is_some() {
             return Err(Error::JoinRoomEnded);
         }
@@ -16382,7 +16618,7 @@ impl Node {
             ));
         }
         if c.is_author(&joiner) {
-            return Ok((c.epoch(), Vec::new()));
+            return Ok(Some((c.epoch(), Vec::new())));
         }
         self.seat_count(&c, &channel_id, &joiner)?;
         self.seat_promises.insert(
@@ -16404,22 +16640,27 @@ impl Node {
                 .collect(),
             None => Vec::new(),
         };
-        Ok((c.epoch(), members))
+        Ok(Some((c.epoch(), members)))
     }
 
     /// **A member's answer to another's newcomer** (V030-30, #366): a place promised, or why not.
     /// A promised place waits, off the actor, for the asker's abort, which frees it.
-    async fn answer_seat(
+    fn answer_seat(
         &mut self,
         peer: Digest32,
         ask: crate::node::seatstream::Ask,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-    ) {
+    ) -> Option<(quinn::SendStream, quinn::RecvStream)> {
         use crate::node::seatstream::{answer_and_wait, Answer};
         let answer = match self.channels.get(&ask.channel_id).map(Arc::clone) {
             Some(shared) => {
-                let c = shared.lock().await;
+                let Ok(c) = shared.try_lock() else {
+                    return Some((send, recv));
+                };
+                if c.post_pending() {
+                    return Some((send, recv));
+                }
                 if c.epoch() != ask.epoch || !c.is_member(&peer) {
                     Answer::NotHeld
                 } else if c.is_author(&ask.joiner) {
@@ -16451,7 +16692,7 @@ impl Node {
                 let _held = (send, recv);
                 tokio::time::sleep(crate::node::seatstream::PROMISE_TTL).await;
             });
-            return;
+            return None;
         }
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -16459,6 +16700,7 @@ impl Node {
                 let _ = tx.send(NetEvent::SeatAbort { peer, abort }).await;
             }
         });
+        None
     }
 
     async fn answer_agree(

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::sync::Notify;
 
 use crate::hash::Digest32;
+use crate::node::ports::PhysicalSlot;
 
 const MIB: usize = 1024 * 1024;
 /// Archive rounds the daemon may run together. Exported so shipped-binary proofs derive their
@@ -717,17 +718,17 @@ impl Job {
     }
 
     /// Record one exact retained Flow after the impossible pool/source-slot refusal. Enrollment
-    /// carries the refusing reservation's release-edge identity, so only an intervening running
-    /// release can grant it while closing the check/enroll race.
+    /// carries the refusing reservation's release-edge identity, so an intervening charge release
+    /// or returned release promise can grant it while closing the check/enroll race.
     pub(crate) fn flow_wait_ticket(
         &self,
-        room: Digest32,
-        peer: Digest32,
+        port: (Digest32, Digest32, PhysicalSlot),
         request: [u8; 16],
         instance: [u8; 16],
         token: u64,
         refused_at: &FlowReleaseEdge,
     ) -> Result<FlowReleaseTicket, FlowWaitError> {
+        let (room, peer, slot) = port;
         let owner = self.0.flow_owner.ok_or(FlowWaitError::OwnerMissing)?;
         let budget = Arc::clone(&self.0.budget);
         let mut pool = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
@@ -751,14 +752,15 @@ impl Job {
                 id,
                 room,
                 peer,
+                slot,
                 request,
                 instance,
                 token,
                 granted: false,
             },
         );
-        // Enrollment itself is not a wake. It dispatches only when a running-round release
-        // happened after the refusing snapshot, closing that exact check/enroll race without
+        // Enrollment itself is not a wake. It dispatches only when a charge or release promise
+        // was returned after the refusing snapshot, closing the check/enroll race without
         // letting registration, resizing or a tick stand in for the release edge.
         if !Arc::ptr_eq(&pool.release_edge, &refused_at.0) {
             pool.handoff_continuations();
@@ -935,18 +937,17 @@ impl Job {
     /// reserved by the caller (the control budget's refusal is its own gate, never the pool's).
     /// The charge is the round's: it is recorded as running in the same step, under the one
     /// lock, and is given back when the charge drops. `NodeBusy` when this fingerprint's current
-    /// and retiring generations already hold its source-owned running slots. `PoolFull` when
-    /// every pool charge is held by a running round, which the per-fingerprint limit and pool
-    /// capacity is currently occupied; the bytes go back on either refusal.
+    /// and retiring generations already hold the requested physical position or both running slots.
+    /// `PoolFull` when every pool position is occupied; the bytes go back on either refusal.
     pub(crate) fn reserve_flow_state(
         &self,
-        room: Digest32,
-        peer: Digest32,
+        port: (Digest32, Digest32, PhysicalSlot),
         request: [u8; 16],
         instance: [u8; 16],
         bytes: BufferCharge,
         waiter: Option<&mut FlowReleaseTicket>,
     ) -> FlowStateTry {
+        let (room, peer, slot) = port;
         let budget = Arc::clone(&self.0.budget);
         let mut p = budget.pool.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(owner) = self.0.flow_owner else {
@@ -957,15 +958,16 @@ impl Job {
             node: self.0.node,
             room,
             peer,
+            slot,
             request,
             instance,
         };
         let Some(node) = p.owners.get(&owner).map(|owner| owner.node) else {
             return FlowStateTry::OwnerMissing;
         };
-        let granted = waiter.as_ref().is_some_and(|waiter| {
-            waiter.take_grant_locked(&mut p, owner, room, peer, request, instance)
-        });
+        let granted = waiter
+            .as_ref()
+            .is_some_and(|waiter| waiter.take_grant_locked(&mut p, owner, port, request, instance));
         // Actor replacement does not create a second pair of bounded slots for one hosted
         // fingerprint. Retiring and current generations share the same source-owned slot count;
         // the old charge's exact Drop wakes the replacement without a tick or elapsed escape.
@@ -982,6 +984,9 @@ impl Job {
             .flat_map(|owner| owner.continuations.values())
             .filter(|continuation| continuation.granted)
             .count();
+        if !granted && p.slot_occupied(node, slot) {
+            return FlowStateTry::NodeBusy(FlowReleaseEdge(Arc::clone(&p.release_edge)));
+        }
         if !granted && node_in_use + promised_for_node >= BOUNDED_SYNC_RUNNING_SLOTS {
             return FlowStateTry::NodeBusy(FlowReleaseEdge(Arc::clone(&p.release_edge)));
         }
@@ -1363,8 +1368,7 @@ impl Drop for OutputCharge {
 struct Pool {
     limit: usize,
     in_use: usize,
-    /// A port can run its live and archive slots together, so retain multiplicity here while
-    /// status needs only the key to say that the port has a running round.
+    /// Exact running owners, including their physical positions across actor generations.
     running: BTreeMap<FlowStateOwner, usize>,
     next_owner: u64,
     /// The current actor generation for each hosted fingerprint.
@@ -1374,7 +1378,7 @@ struct Pool {
     /// continuations remain actor-owned here, never in a daemon-wide wait queue.
     owners: BTreeMap<u64, PoolOwner>,
     next_continuation: u64,
-    /// Identity of the most recent running-round charge release. Pointer identity cannot wrap.
+    /// Identity of the most recent charge release or returned release promise.
     release_edge: Arc<()>,
 }
 
@@ -1382,6 +1386,7 @@ struct FlowContinuation {
     id: u64,
     room: Digest32,
     peer: Digest32,
+    slot: PhysicalSlot,
     request: [u8; 16],
     instance: [u8; 16],
     token: u64,
@@ -1407,6 +1412,7 @@ pub(crate) struct FlowRelease {
     pub(crate) token: u64,
     pub(crate) room: Digest32,
     pub(crate) peer: Digest32,
+    pub(crate) slot: PhysicalSlot,
 }
 
 /// Exact running-round ownership published in the same pool snapshot as its charge.
@@ -1416,6 +1422,7 @@ pub struct FlowStateOwner {
     pub(crate) node: Digest32,
     pub(crate) room: Digest32,
     pub(crate) peer: Digest32,
+    pub(crate) slot: PhysicalSlot,
     pub(crate) request: [u8; 16],
     pub(crate) instance: [u8; 16],
 }
@@ -1448,6 +1455,22 @@ impl Pool {
             .len();
         self.limit = flow_state_limit(hosted);
     }
+    /// Running charges and granted continuations share the same physical position.
+    fn slot_occupied(&self, node: Digest32, slot: PhysicalSlot) -> bool {
+        self.running
+            .keys()
+            .any(|owner| owner.node == node && owner.slot == slot)
+            || self
+                .owners
+                .values()
+                .filter(|owner| owner.node == node)
+                .any(|owner| {
+                    owner
+                        .continuations
+                        .values()
+                        .any(|continuation| continuation.granted && continuation.slot == slot)
+                })
+    }
 
     /// Select the earliest actor-owned continuation which can use a daemon charge and one of its
     /// node's two source-owned running slots. A successful synchronous send is a promise counted
@@ -1473,9 +1496,11 @@ impl Pool {
                         .continuations
                         .values()
                         .filter(|continuation| !continuation.granted)
-                        .map(move |continuation| (*generation, owner.node, continuation.id))
+                        .map(move |continuation| {
+                            (*generation, owner.node, continuation.slot, continuation.id)
+                        })
                 })
-                .filter(|(_, node, _)| {
+                .filter(|(_, node, slot, _)| {
                     let in_use: usize = self
                         .owners
                         .values()
@@ -1490,9 +1515,10 @@ impl Pool {
                         .filter(|continuation| continuation.granted)
                         .count();
                     in_use + promised < BOUNDED_SYNC_RUNNING_SLOTS
+                        && !self.slot_occupied(*node, *slot)
                 })
-                .min_by_key(|(_, _, order)| *order);
-            let Some((generation, _, order)) = candidate else {
+                .min_by_key(|(_, _, _, order)| *order);
+            let Some((generation, _, _, order)) = candidate else {
                 return;
             };
             let sent = {
@@ -1510,6 +1536,7 @@ impl Pool {
                         token: continuation.token,
                         room: continuation.room,
                         peer: continuation.peer,
+                        slot: continuation.slot,
                     })
                     .is_ok()
             };
@@ -1540,8 +1567,8 @@ pub(crate) enum FlowWaitError {
     OrderExhausted,
 }
 
-/// Snapshot of the last running-round release when a reservation was refused. A later
-/// enrollment may dispatch only if pointer identity proves such a release intervened.
+/// Snapshot of the last charge release or returned promise when a reservation was refused.
+/// A later enrollment may dispatch only if pointer identity proves such an edge intervened.
 #[derive(Clone)]
 pub(crate) struct FlowReleaseEdge(Arc<()>);
 
@@ -1550,11 +1577,11 @@ impl FlowReleaseTicket {
         &self,
         pool: &mut Pool,
         owner: u64,
-        room: Digest32,
-        peer: Digest32,
+        port: (Digest32, Digest32, PhysicalSlot),
         request: [u8; 16],
         instance: [u8; 16],
     ) -> bool {
+        let (room, peer, slot) = port;
         let Some(owner_state) = pool.owners.get_mut(&owner) else {
             return false;
         };
@@ -1565,6 +1592,7 @@ impl FlowReleaseTicket {
             || !continuation.granted
             || continuation.room != room
             || continuation.peer != peer
+            || continuation.slot != slot
             || continuation.request != request
             || continuation.instance != instance
         {
@@ -1611,6 +1639,7 @@ impl Drop for FlowReleaseTicket {
         // Cancelling ungranted work creates no release edge. A granted ticket, however, returns
         // the exact earlier release promise, which remains causal when passed to the next owner.
         if returned_grant {
+            pool.release_edge = Arc::new(());
             pool.handoff_continuations();
         }
     }
@@ -1659,8 +1688,8 @@ pub(crate) enum FlowStateTry {
     /// Accounting already exceeds the current limit. This is not falsely called PoolFull,
     /// whose displayed contract is exact equality.
     PoolOvercommitted(FlowReleaseEdge),
-    /// Both bounded running slots of this fingerprint belong to its current or retiring actor
-    /// generation. The retiring charge's release wakes the exact retained replacement work.
+    /// The requested physical position or both bounded running slots of this fingerprint belong
+    /// to its current or retiring actor generation, including release-edge promises.
     NodeBusy(FlowReleaseEdge),
     /// The admitted worker no longer belongs to a pool actor generation. Pool occupancy says
     /// nothing about this lifecycle invariant failure.
@@ -1700,8 +1729,8 @@ impl Drop for FlowStateCharge {
             p.owners.remove(&self.owner);
         }
         p.resize();
-        // This is the only edge which creates a new grant: a running round stopped owning its
-        // charge. Registration and pool resizing update accounting but dispatch no work.
+        // A physical charge release creates a new grant edge. Registration and pool resizing
+        // update accounting but dispatch no work.
         p.release_edge = Arc::new(());
         p.handoff_continuations();
     }
@@ -1745,7 +1774,7 @@ pub struct BudgetSnapshot {
     pub flow_state_waiting: Vec<FlowContinuationSnapshot>,
 }
 
-/// Monotonic order, actor, node, room, peer, request, incarnation and release grant.
+/// Monotonic order, actor, node, room, peer, request, incarnation, release grant and slot index.
 pub type FlowContinuationSnapshot = (
     u64,
     u64,
@@ -1755,6 +1784,7 @@ pub type FlowContinuationSnapshot = (
     [u8; 16],
     [u8; 16],
     bool,
+    usize,
 );
 
 impl Budget {
@@ -1889,6 +1919,7 @@ impl Budget {
                                 continuation.request,
                                 continuation.instance,
                                 continuation.granted,
+                                continuation.slot.index(),
                             )
                         })
                     })

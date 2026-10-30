@@ -141,7 +141,7 @@ struct SessionListing {
     next: Option<Digest32>,
     revision: Digest32,
     rows: Vec<vox_core::node::sessions::SessionRow>,
-    summaries: Vec<vox_core::node::ipc::SessionSummary>,
+    summaries: Vec<Option<vox_core::node::ipc::SessionSummary>>,
 }
 
 /// The TUI's binding to the daemon.
@@ -3380,7 +3380,12 @@ impl DaemonCore {
                                 .iter()
                                 .zip(&p.summaries)
                                 .map(|(row, summary)| {
-                                    session_view(row, summary.waiting > 0, &snap.trusted, me)
+                                    session_view(
+                                        row,
+                                        summary.as_ref().is_some_and(|summary| summary.waiting > 0),
+                                        &snap.trusted,
+                                        me,
+                                    )
                                 })
                                 .collect()
                         })
@@ -3413,7 +3418,12 @@ impl DaemonCore {
                                 .zip(&p.summaries)
                                 .filter(|(row, _)| !row.open && row.can_drive)
                                 .map(|(row, summary)| {
-                                    session_view(row, summary.waiting > 0, &snap.trusted, me)
+                                    session_view(
+                                        row,
+                                        summary.as_ref().is_some_and(|summary| summary.waiting > 0),
+                                        &snap.trusted,
+                                        me,
+                                    )
                                 })
                                 .collect()
                         })

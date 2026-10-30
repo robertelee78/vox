@@ -442,11 +442,8 @@ fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
         let (ok, out, err) = vox(dir, &args, None);
         if !ok
             && err.lines().any(|line| {
-                matches!(
-                    line.trim(),
-                    "vox: the room changed while reading; refresh and retry"
-                        | "vox: node: the room changed while reading; refresh and retry"
-                )
+                line.trim()
+                    .ends_with("the room changed while reading; refresh and retry")
             })
         {
             before = None;
@@ -1871,6 +1868,17 @@ fn converged(staged: &Staged) {
         for room in rooms {
             for (dir, node, reader, _) in everyone {
                 let (ok, out, err) = vox(dir, &as_node(&["room", "read", room], *node), None);
+                if !ok
+                    && err.lines().any(|line| {
+                        line.trim()
+                            .ends_with("the room changed while reading; refresh and retry")
+                    })
+                {
+                    // Follow the same explicit refresh instruction as room_rows; a refused
+                    // observation supplies no delivery evidence and cannot complete this journey.
+                    unread.push(format!("{reader} must refresh its read of {room}"));
+                    continue;
+                }
                 assert!(
                     ok,
                     "PRODUCT: {reader}'s `vox room read` refused: {out}{err}"
@@ -2047,9 +2055,23 @@ fn start_words(name: &str, v: &serde_json::Value) -> Vec<String> {
                 port["round_running"]
             ));
         }
-        // A round running on this port's attempt out (a port made anew while an earlier
-        // port's round still runs has no attempt out, and no outcome yet).
-        if running == Some(true) && port["out_age_ms"].is_u64() && outcome != Some("started") {
+        if outcome != Some("never_attempted")
+            && !matches!(
+                port["start_service"].as_str(),
+                Some("Public" | "Private" | "Archive")
+            )
+        {
+            broken.push(format!(
+                "{name}: port {id}: start evaluation omitted its service"
+            ));
+        }
+        // The latest evaluation may belong to Background while Public is already running.
+        // Compare a running Public attempt only with the diagnostic for that same service.
+        if running == Some(true)
+            && port["out_age_ms"].is_u64()
+            && port["start_service"] == "Public"
+            && outcome != Some("started")
+        {
             broken.push(format!("{name}: port {id}: a round runs, yet {said}"));
         }
     }

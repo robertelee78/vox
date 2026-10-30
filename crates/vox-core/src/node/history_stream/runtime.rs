@@ -12,6 +12,7 @@ use crate::node::channel::entry_store::sparse::LiveWindow;
 use crate::node::channel::{ChannelState, HistoryAdmissionRoom};
 use crate::node::history_budget::Job;
 use crate::node::history_demand::{self as demand, Binding, Bounds, Context};
+use crate::node::ports::OutboundService;
 use crate::node::store::{ReceivedFlow, Store};
 use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
@@ -212,6 +213,7 @@ pub(crate) struct Flow {
     pub(crate) instance: [u8; 16],
     pub(crate) generation: Digest32,
     pub(crate) shared: Arc<Mutex<ChannelState>>,
+    pub(crate) service: OutboundService,
     pub(crate) archive: bool,
     pub(crate) automatic_own_recovery: bool,
     pub(crate) own_recovery_cleanup: bool,
@@ -232,6 +234,8 @@ pub(crate) struct Flow {
     /// Exact required control root removed from the actor queue when this foreground flow was
     /// built. An authorization retirement must return this owner just as it returns a hint.
     pub(crate) required_root: Option<(Digest32, u64)>,
+    /// Exact retained request whose prerequisite this Public control root satisfies.
+    pub(crate) required_owner_request: Option<RequestId>,
     pub(crate) key_body_root: Option<super::KeyBodyNeed>,
     pub(crate) key_body_token: Option<Arc<()>>,
     pub(crate) key_body_unavailable: Option<KeyBodyUnavailable>,
@@ -489,6 +493,7 @@ impl Flow {
             instance: [0; 16],
             generation: [0; 32],
             shared,
+            service: OutboundService::Public,
             archive: false,
             automatic_own_recovery: false,
             own_recovery_cleanup: false,
@@ -501,6 +506,7 @@ impl Flow {
             departure_probe,
             archive_request: None,
             required_root: required,
+            required_owner_request: None,
             key_body_root: None,
             key_body_token: None,
             key_body_unavailable: None,
@@ -673,6 +679,7 @@ impl Flow {
             instance,
             generation,
             shared,
+            service: OutboundService::Archive,
             archive: true,
             automatic_own_recovery: false,
             own_recovery_cleanup: false,
@@ -685,6 +692,7 @@ impl Flow {
             departure_probe: false,
             archive_request: Some(request),
             required_root: None,
+            required_owner_request: None,
             key_body_root: None,
             key_body_token: None,
             key_body_unavailable: None,
@@ -792,6 +800,7 @@ impl Flow {
         context: Arc<Context>,
         token: Arc<()>,
     ) -> Self {
+        self.service = OutboundService::Private;
         self.tasks.clear();
         self.tasks.push(Task {
             request: self.request,
@@ -817,6 +826,7 @@ impl Flow {
 
     /// An exact receiver-owned cursor asks for one provider catalog page.
     pub(crate) fn with_key_availability(mut self, after: Option<u64>, token: Arc<()>) -> Self {
+        self.service = OutboundService::Private;
         self.tasks.clear();
         self.tasks.push(Task {
             request: self.request,
@@ -936,8 +946,7 @@ impl Flow {
             return Resumed::Held;
         }
         match job.reserve_flow_state(
-            self.room,
-            self.peer,
+            (self.room, self.peer, self.service.slot()),
             self.retirement_request,
             self.instance,
             bytes,
@@ -1096,9 +1105,9 @@ impl Flow {
     /// Prepend one real inventory exchange to this retained foreground owner. A failed prefix
     /// remains this same scalar; it never consumes, rebuilds or retires the ordinary root.
     pub(crate) fn arm_announcement(&mut self, through: u64) -> Result<()> {
-        if self.archive || self.inventory {
+        if self.service != OutboundService::Public || self.inventory {
             return Err(Error::Profile(
-                "history announcement prefix requires a retained foreground root",
+                "history announcement prefix requires a retained Public root",
             ));
         }
         if self.announcement.is_some() {
@@ -1129,7 +1138,7 @@ impl Flow {
 
     #[must_use]
     pub(crate) fn announcement_can_run(&self) -> bool {
-        !self.archive
+        self.service == OutboundService::Public
             && !self.inventory
             && !self.publication_wait
             && self.active_publication_owner().is_none()
@@ -1141,6 +1150,9 @@ impl Flow {
     }
 
     pub(crate) fn retain_failed_announcement(&mut self) -> Result<()> {
+        if self.service != OutboundService::Public {
+            return Err(Error::Profile("history announcement owner is not Public"));
+        }
         let Some(announcement) = self.announcement.as_mut() else {
             return Err(Error::Profile("history announcement owner missing"));
         };
@@ -1164,6 +1176,9 @@ impl Flow {
     }
 
     pub(crate) fn take_announcement_receipt(&mut self) -> Option<AnnouncementReceipt> {
+        if self.service != OutboundService::Public {
+            return None;
+        }
         let announcement = self
             .announcement
             .take_if(|announcement| announcement.complete)?;
@@ -1175,6 +1190,9 @@ impl Flow {
     }
 
     fn restore_announcement_task(&mut self, task: Task) -> Result<()> {
+        if self.service != OutboundService::Public {
+            return Err(Error::Profile("history announcement owner is not Public"));
+        }
         let Some(announcement) = self.announcement.as_mut() else {
             return Err(Error::Profile("history announcement owner missing"));
         };
@@ -1901,7 +1919,9 @@ impl Flow {
         // A publication Begin..Cleanup owner is correctness-critical and remains ahead of the
         // announcement prefix. Once no exact publication phase is active, the scalar inventory
         // task gets one response quantum ahead of the ordinary retained stack.
-        let announcement_task = if self.active_publication_owner().is_none() {
+        let announcement_task = if self.service == OutboundService::Public
+            && self.active_publication_owner().is_none()
+        {
             self.announcement
                 .as_mut()
                 .and_then(|announcement| announcement.task.take())

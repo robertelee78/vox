@@ -399,7 +399,7 @@ const T_SESSION_PAGE: u64 = 5436;
 /// `[5437, channel_id, after]` — [`Request::SessionsPage`]; an empty `after` is the start
 /// (ADR-034 FR-1).
 const T_SESSIONS_PAGE_REQ: u64 = 5437;
-/// `[5438, [session, …], [[entries, newest, waiting], …], more, [member, …], provisional]` —
+/// `[5438, [session, …], [[entries, newest, waiting] | [], …], more, [member, …], provisional]` —
 /// [`Frame::SessionsPage`]; the members are the ones the page could not answer for yet.
 const T_SESSIONS_PAGE: u64 = 5438;
 /// A page names at most this many refreshing members; the count is checked before anything
@@ -3404,8 +3404,8 @@ pub enum Frame {
     SessionsPage {
         /// Each Session, oldest opening first.
         sessions: Vec<crate::node::sessions::SessionRow>,
-        /// What the daemon's index says of each, in the same order.
-        summaries: Vec<SessionSummary>,
+        /// Authorized private summaries in row order; absent for metadata-only rows.
+        summaries: Vec<Option<SessionSummary>>,
         /// Whether more follow the last: ask again with its opening as `after`.
         more: bool,
         /// The members whose Sessions this page could not answer for yet: their Session
@@ -3846,11 +3846,15 @@ impl Frame {
                 e.array(6).uint(T_SESSIONS_PAGE);
                 crate::node::sessions::put_rows(&mut e, sessions);
                 e.array(summaries.len());
-                for s in summaries {
-                    e.array(3)
-                        .uint(s.entries)
-                        .bytes(s.newest.as_ref().map_or(&[][..], |d| &d[..]))
-                        .uint(u64::from(s.waiting));
+                for summary in summaries {
+                    if let Some(summary) = summary {
+                        e.array(3)
+                            .uint(summary.entries)
+                            .bytes(summary.newest.as_ref().map_or(&[][..], |d| &d[..]))
+                            .uint(u64::from(summary.waiting));
+                    } else {
+                        e.array(0);
+                    }
                 }
                 e.uint(u64::from(*more));
                 e.array(refreshing.len());
@@ -5032,18 +5036,22 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 return Err(bad());
             }
             let mut summaries = Vec::with_capacity(n);
-            for _ in 0..n {
-                if d.array().map_err(|_| bad())? != 3 {
-                    return Err(bad());
+            for session in &sessions {
+                match d.array().map_err(|_| bad())? {
+                    0 if !session.can_drive => summaries.push(None),
+                    3 if session.can_drive => {
+                        let entries = d.uint().map_err(|_| bad())?;
+                        let newest = optional_digest(d)?;
+                        let waiting =
+                            u32::try_from(d.uint().map_err(|_| bad())?).map_err(|_| bad())?;
+                        summaries.push(Some(SessionSummary {
+                            entries,
+                            newest,
+                            waiting,
+                        }));
+                    }
+                    _ => return Err(bad()),
                 }
-                let entries = d.uint().map_err(|_| bad())?;
-                let newest = optional_digest(d)?;
-                let waiting = u32::try_from(d.uint().map_err(|_| bad())?).map_err(|_| bad())?;
-                summaries.push(SessionSummary {
-                    entries,
-                    newest,
-                    waiting,
-                });
             }
             let more = flag(d, "ipc sessions page more")?;
             // At most one member per held drive key; a page never names more members
@@ -6143,17 +6151,21 @@ async fn write_sessions(
             }
         }
         if !whole && cursors.is_none() {
-            let summary = tokio::select! {
-                answer=handle.session_projection(room,Query::Summary{opening:row.opening,revision:revision.clone()})=>answer,
-                ()=subscriber_gone(stream)=>return Ok(false),
-            };
-            match summary {
-                Ok(Reply::Summary(summary)) => summaries.push(summary),
-                Ok(_) => return Err(Error::MalformedIpc("unexpected Session summary answer")),
-                Err(reason) => {
-                    found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
-                    return Ok(true);
+            if row.can_drive {
+                let summary = tokio::select! {
+                    answer=handle.session_projection(room,Query::Summary{opening:row.opening,revision:revision.clone()})=>answer,
+                    ()=subscriber_gone(stream)=>return Ok(false),
+                };
+                match summary {
+                    Ok(Reply::Summary(summary)) => summaries.push(Some(summary)),
+                    Ok(_) => return Err(Error::MalformedIpc("unexpected Session summary answer")),
+                    Err(reason) => {
+                        found_frame(stream, &Frame::Error { reason }.to_bytes(), writing).await?;
+                        return Ok(true);
+                    }
                 }
+            } else {
+                summaries.push(None);
             }
         }
         let mut suffix = Encoder::new();
@@ -6163,7 +6175,7 @@ async fn write_sessions(
             .uint(row.ended_millis.unwrap_or(0))
             .bytes(&row.opening)
             .bytes(row.ended.as_ref().map_or(&[][..], |hash| &hash[..]))
-            .uint(1);
+            .uint(u64::from(row.can_drive));
         reply_part(
             stream,
             &suffix.finish(),
@@ -6184,11 +6196,15 @@ async fn write_sessions(
         } else {
             suffix.array(summaries.len());
             for summary in summaries {
-                suffix
-                    .array(3)
-                    .uint(summary.entries)
-                    .bytes(summary.newest.as_ref().map_or(&[][..], |hash| &hash[..]))
-                    .uint(u64::from(summary.waiting));
+                if let Some(summary) = summary {
+                    suffix
+                        .array(3)
+                        .uint(summary.entries)
+                        .bytes(summary.newest.as_ref().map_or(&[][..], |hash| &hash[..]))
+                        .uint(u64::from(summary.waiting));
+                } else {
+                    suffix.array(0);
+                }
             }
         }
         suffix.uint(u64::from(more));
