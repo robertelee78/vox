@@ -850,10 +850,8 @@ impl Node {
                 let pin = completed.take_history_pin();
                 let receipt = completed.finish(&mut channel, &pending.store);
                 held = receipt.held;
-                if channel
-                    .publish_history_read(Arc::clone(&pending.store))
-                    .is_err()
-                {
+                let publication = channel.publish_history_read(Arc::clone(&pending.store));
+                if publication.is_err() {
                     if let Some(pin) = pin {
                         self.failed_post_reads.insert(
                             room,
@@ -863,6 +861,16 @@ impl Node {
                                 _pin: pin,
                             },
                         );
+                    }
+                }
+                #[cfg(feature = "test-knobs")]
+                if publication.is_ok() {
+                    if let Ok(Saved::Governance(governance_save::Saved::Backfill {
+                        render_hold: Some(path),
+                        ..
+                    })) = &receipt.result
+                    {
+                        crate::node::channel::engage_render_hold(path);
                     }
                 }
                 receipt.result

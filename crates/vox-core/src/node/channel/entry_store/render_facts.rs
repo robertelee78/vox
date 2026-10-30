@@ -1394,63 +1394,20 @@ impl EntryIndex {
         Ok(pending)
     }
 
-    /// Only a missing derived index is rebuilt. Each transaction visits a bounded cache
-    /// prefix and stores its exact continuation; a restart resumes without resetting history.
-    pub(crate) fn prepare_rendered(
+    /// Prior-open rows become visible through the new epoch without scanning cache bodies
+    /// or rewriting ranked leaves. Current rooms publish the rendered index at creation.
+    pub(crate) fn reopen_rendered(
         &self,
         store: &Store,
         sek: &Sek,
         channel: &Digest32,
-        retained: impl Fn(&Batch<'_>, &Digest32, u64) -> Result<bool>,
     ) -> Result<()> {
-        loop {
-            let mut batch = store.batch()?;
-            batch.derived();
-            let mut writer = self.write(&mut batch, sek, channel)?;
-            if writer.directory.render_ready {
-                break;
-            }
-            let mut bytes = 0usize;
-            for _ in 0..PROMOTION_ENTRIES {
-                let next = writer.batch.segment_after(
-                    channel,
-                    SegmentKind::PlaintextCache,
-                    writer.directory.render_cursor,
-                )?;
-                let Some((id, sealed)) = next else {
-                    writer.directory.render_ready = true;
-                    break;
-                };
-                let opened = open_segment(sek, SegmentKind::PlaintextCache, id, &sealed)?;
-                if bytes != 0 && bytes.saturating_add(opened.len()) > PROMOTION_BYTES {
-                    break;
-                }
-                bytes = bytes.saturating_add(opened.len());
-                match super::super::parse_cache(&opened)? {
-                    super::super::CacheRow::Text(mut row) => {
-                        row.arrival = id;
-                        if retained(writer.batch, &row.entry_hash, id)? {
-                            writer.put_rendered(&row, 0)?;
-                        }
-                    }
-                    super::super::CacheRow::Read(row) => {
-                        if retained(writer.batch, &row.entry_hash, id)? {
-                            writer.put_read_receipt(&row, id)?;
-                        }
-                    }
-                    super::super::CacheRow::Session(_) => {}
-                }
-                writer.directory.render_cursor = Some(id);
-            }
-            writer.seal()?;
-            batch.commit()?;
-            self.committed();
-        }
-        // Prior-open rows were already visible on restart. Their old epoch derives a zero
-        // shown time without rewriting either all cache bodies or all ranked leaves.
         let mut batch = store.batch()?;
         batch.derived();
         let mut writer = self.write(&mut batch, sek, channel)?;
+        if !writer.directory.render_ready {
+            return Err(invalid("published rendered index incomplete"));
+        }
         writer.directory.render_epoch = writer
             .directory
             .render_epoch

@@ -33,6 +33,7 @@ pub(crate) struct PendingText {
     now_millis: u64,
     rotation_now: u64,
     committed: Vec<Entry>,
+    governance_changed: bool,
     rotation: Option<Rotation>,
     committed_feed: Option<PublishedFeed>,
     durable_text: Option<Rendered>,
@@ -133,6 +134,13 @@ pub(crate) struct CompletedText {
 }
 
 impl CompletedText {
+    /// A rotation can commit governance before the final append result is known.
+    pub(crate) fn governance_changed(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.governance_changed)
+    }
+
     pub(crate) fn take_history_pin(&mut self) -> Option<history::PendingHistoryRead> {
         self.pending
             .as_mut()
@@ -303,6 +311,7 @@ impl ChannelState {
             now_millis,
             rotation_now,
             committed: Vec::with_capacity(3),
+            governance_changed: false,
             rotation,
             committed_feed: None,
             durable_text: None,
@@ -509,6 +518,11 @@ impl ChannelState {
                 }
                 if pending.sparse {
                     self.sparse_applied_tips.insert(me, feed.seq);
+                }
+            }
+            if pending.governance_changed {
+                if let Err(error) = self.retire_governance() {
+                    failure = Some(error.to_string());
                 }
             }
             for entry in &pending.committed {
@@ -927,7 +941,7 @@ impl PendingText {
         // Acquisition and commit are outside every room/actor/key-byte guard. Batch stays on
         // this physical thread, preserving the existing durable received-debt settlement.
         let mut batch = store.batch()?;
-        self.sek.with(|sek| {
+        let accepted = self.sek.with(|sek| {
             if let Some(boundary) = boundary {
                 boundary.check(&batch, sek, &self.room)?;
             }
@@ -1080,9 +1094,10 @@ impl PendingText {
                 index.finish_local_history_effect(&entry, settlement)?;
                 index.seal()?;
             }
-            Ok(())
+            Ok(accepted)
         })?;
         batch.commit()?;
+        self.governance_changed |= accepted.work_changed;
         self.encrypted_control_committed |= self.encrypted_control;
         self.read_committed |= self.read_append.is_some();
         if rendered.is_some() {

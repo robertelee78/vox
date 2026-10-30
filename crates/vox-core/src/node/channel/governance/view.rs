@@ -1,5 +1,5 @@
-//! Bounded checked reads of published governance. Historical bodies remain in
-//! the source log; callers retain only their scalar view or one requested page.
+//! Bounded named-index reconstruction of current semantic governance facts. Historical notices
+//! and durable authority checks use ephemeral checked readers; none survives a turn.
 
 use super::authority::Grant;
 use super::facts::{hash_key, Read, Table};
@@ -7,9 +7,8 @@ use super::fold::{self, kind_key};
 use crate::atrest::sek::Sek;
 use crate::cbor::Decoder;
 use crate::error::{Error, Result};
-use crate::governance::capability::Capability;
 use crate::governance::entry::{GovBody, GovEntry};
-use crate::governance::evaluator::{DenyReason, Lifecycle, Verdict};
+use crate::governance::evaluator::{DenyReason, Lifecycle};
 use crate::governance::genesis::{ChannelPolicy, Genesis};
 use crate::hash::Digest32;
 use crate::log::entry::Entry;
@@ -27,6 +26,33 @@ fn pair(left: &Digest32, right: &Digest32) -> [u8; 64] {
     let mut key = hash_key(left);
     key[32..].copy_from_slice(right);
     key
+}
+
+// A blocking task can be rejected or cancelled when its runtime shuts down. If that happens,
+// its captured value must still leave the caller's critical section before it is destroyed.
+struct Retire<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> Retire<T> {
+    fn release(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl<T: Send + 'static> Drop for Retire<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            drop(std::thread::spawn(move || drop(value)));
+        }
+    }
+}
+
+fn retire_native<T: Send + 'static>(value: T) {
+    let retired = Retire(Some(value));
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        drop(runtime.spawn_blocking(move || retired.release()));
+    } else {
+        drop(retired);
+    }
 }
 
 /// No historical event list, no snapshot and no Store reference survives in the
@@ -55,16 +81,30 @@ impl Display {
     }
 }
 
-/// A room's admitted-member consent facts held in memory (ADR-038 FX-22): per author, the readers
-/// it has consented to with that fact's sequence; each author's reset; every admitted pair ever
-/// revoked. Admission bounds this projection by [`AUTHORS_HARD_LIMIT`](super::super::AUTHORS_HARD_LIMIT)
-/// squared. Explicit user pagination still reads the sealed index a bounded page at a time, so
-/// departed and not-yet-admitted targets keep their cursor semantics without living in RAM.
+/// A room's current consent facts held in memory (ADR-038 FX-22): each author/target's
+/// granted or revoked sequence, each author's reset, and every pair ever revoked. This same
+/// projection serves saved readers and user pagination, including off-roster identities.
+/// Reconstruction is bounded per turn, rather than narrowing the identities callers may query.
+/// Persistent ordered trees keep snapshots immutable without copying the full projection:
+/// cloning this value shares roots, and mutation copies only the affected search paths.
+/// The nested target maps also share roots when an author-map node is copied.
 #[derive(Clone, Default)]
 pub(in crate::node::channel) struct ConsentFacts {
-    consent: std::collections::BTreeMap<Digest32, std::collections::BTreeMap<Digest32, Consent>>,
-    resets: std::collections::BTreeMap<Digest32, u64>,
-    revoked: std::collections::BTreeSet<[u8; 64]>,
+    consent: imbl::OrdMap<Digest32, imbl::OrdMap<Digest32, Consent>>,
+    resets: imbl::OrdMap<Digest32, u64>,
+    revoked: imbl::OrdSet<[u8; 64]>,
+}
+
+impl Drop for ConsentFacts {
+    fn drop(&mut self) {
+        if !self.consent.is_empty() || !self.resets.is_empty() || !self.revoked.is_empty() {
+            retire_native((
+                std::mem::take(&mut self.consent),
+                std::mem::take(&mut self.resets),
+                std::mem::take(&mut self.revoked),
+            ));
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -74,10 +114,6 @@ pub(in crate::node::channel) enum Consent {
 }
 
 impl ConsentFacts {
-    pub(in crate::node::channel) fn empty() -> Self {
-        Self::default()
-    }
-
     pub(in crate::node::channel) fn set_consent(
         &mut self,
         author: Digest32,
@@ -161,12 +197,12 @@ impl ConsentFacts {
         }
     }
 
-    /// What [`View::can_read`] answers from the index, from memory.
+    /// Whether the reader holds a current grant after the author's reset.
     pub(in crate::node::channel) fn can_read(&self, reader: &Digest32, author: &Digest32) -> bool {
         self.grant_sequence(author, reader).is_some()
     }
 
-    /// What [`View::grant_sequence`] answers from the index, from memory.
+    /// The current granted sequence, after applying the author's reset.
     pub(in crate::node::channel) fn grant_sequence(
         &self,
         author: &Digest32,
@@ -184,7 +220,7 @@ impl ConsentFacts {
         }
     }
 
-    /// What [`View::ever_revoked`] answers from the index, from memory.
+    /// Whether any authenticated revocation for this pair has been recorded.
     pub(in crate::node::channel) fn ever_revoked(
         &self,
         author: &Digest32,
@@ -194,9 +230,406 @@ impl ConsentFacts {
     }
 }
 
+/// Folded current values, not index rows or retained source bodies. Off-roster identities keep
+/// their exact lookup and pagination semantics; only reconstruction work is page-bounded.
+#[derive(Default)]
+pub(in crate::node::channel) struct SemanticFacts {
+    authority: std::collections::BTreeMap<Digest32, Grant>,
+    shares: std::collections::BTreeMap<(Digest32, Digest32), Option<super::super::Share>>,
+    fingerprints: std::collections::BTreeMap<(Digest32, Digest32), Digest32>,
+    consent: std::sync::Arc<ConsentFacts>,
+    admin_clock: Option<u64>,
+}
+
+impl Drop for SemanticFacts {
+    fn drop(&mut self) {
+        if !self.authority.is_empty() || !self.shares.is_empty() || !self.fingerprints.is_empty() {
+            retire_native((
+                std::mem::take(&mut self.authority),
+                std::mem::take(&mut self.shares),
+                std::mem::take(&mut self.fingerprints),
+            ));
+        }
+    }
+}
+
+#[derive(Default)]
+pub(in crate::node::channel) struct SemanticState {
+    source: Option<(u64, u64)>,
+    ready: bool,
+    facts: SemanticFacts,
+    building: Option<SemanticBuild>,
+    serial: u64,
+}
+
+struct SemanticBuild {
+    source: (u64, u64),
+    phase: usize,
+    after: Option<[u8; 64]>,
+    facts: SemanticFacts,
+}
+
+/// Owned rebuild continuation. Preparation moves only partial semantic maps; the published
+/// last-good values remain available in the room throughout native worker execution.
+pub(in crate::node::channel) struct SemanticWork {
+    serial: u64,
+    source: Option<(u64, u64)>,
+    building: Option<SemanticBuild>,
+    ready: bool,
+    completed: bool,
+    admin_clock: Option<Option<u64>>,
+}
+
+impl SemanticState {
+    pub(in crate::node::channel) fn invalidate(&mut self) -> Result<()> {
+        self.serial = self
+            .serial
+            .checked_add(1)
+            .ok_or(invalid("governance semantic input generation exhausted"))?;
+        Ok(())
+    }
+
+    /// Withdraw public authority but retain the last completed basis for comparison after
+    /// canonical work settles. Sequence-only receipts fence workers without retiring it.
+    pub(in crate::node::channel) fn retire(&mut self) -> Result<()> {
+        self.invalidate()?;
+        self.ready = false;
+        self.building = None;
+        Ok(())
+    }
+
+    pub(in crate::node::channel) fn observe_consent(
+        &mut self,
+        author: Digest32,
+        seq: u64,
+        body: &GovBody,
+    ) -> Result<()> {
+        self.invalidate()?;
+        let changes_consent = match body {
+            GovBody::ConsentGrant(grant) => grant.body.epoch == 0,
+            GovBody::ConsentRevocation(_) => true,
+            GovBody::Presence(presence) => presence.body.here && presence.body.epoch == 0,
+            _ => false,
+        };
+        if !changes_consent {
+            return Ok(());
+        }
+        std::sync::Arc::make_mut(&mut self.facts.consent).observe(author, seq, body);
+        if let Some(build) = &mut self.building {
+            std::sync::Arc::make_mut(&mut build.facts.consent).observe(author, seq, body);
+        }
+        Ok(())
+    }
+
+    pub(in crate::node::channel) fn consent_facts(&self) -> Option<std::sync::Arc<ConsentFacts>> {
+        self.source
+            .filter(|_| self.ready)
+            .map(|_| std::sync::Arc::clone(&self.facts.consent))
+    }
+
+    pub(in crate::node::channel) fn take_work(&mut self) -> SemanticWork {
+        SemanticWork {
+            serial: self.serial,
+            source: self.source,
+            building: self.building.take(),
+            ready: false,
+            completed: false,
+            admin_clock: None,
+        }
+    }
+
+    pub(in crate::node::channel) fn matches(&self, work: &SemanticWork) -> bool {
+        self.serial == work.serial
+    }
+
+    pub(in crate::node::channel) fn install(&mut self, mut work: SemanticWork) -> bool {
+        if !self.matches(&work) {
+            return false;
+        }
+        if work.completed {
+            let Some(mut build) = work.building.take() else {
+                return false;
+            };
+            std::mem::swap(&mut self.facts, &mut build.facts);
+            self.source = work.source;
+        }
+        if let Some(clock) = work.admin_clock {
+            self.facts.admin_clock = clock;
+        }
+        self.ready = work.ready;
+        self.building = work.building;
+        true
+    }
+
+    pub(in crate::node::channel) fn advance(&mut self, view: &View<'_>) -> Result<bool> {
+        let mut work = self.take_work();
+        let ready = work.advance(view)?;
+        self.install(work);
+        Ok(ready)
+    }
+
+    pub(in crate::node::channel) fn current(
+        &self,
+        revision: u64,
+        deadline: u64,
+    ) -> Result<&SemanticFacts> {
+        if !self.ready || self.source != Some((revision, deadline)) {
+            return Err(Error::Profile(REFRESHING));
+        }
+        Ok(&self.facts)
+    }
+}
+
+impl SemanticWork {
+    /// Named current-index slots only, never historical log replay. A turn retains folded
+    /// values and a scalar cursor and inspects at most one production page in total.
+    pub(in crate::node::channel) fn advance(&mut self, view: &View<'_>) -> Result<bool> {
+        self.ready = false;
+        let source = (view.revision(), view.facts.deadline());
+        self.admin_clock = Some(view.admin_clock());
+        if self.source == Some(source) {
+            self.ready = true;
+            return Ok(true);
+        }
+        if self
+            .building
+            .as_ref()
+            .is_none_or(|build| build.source != source)
+        {
+            let mut facts = SemanticFacts::default();
+            facts.admin_clock = view.admin_clock();
+            self.building = Some(SemanticBuild {
+                source,
+                phase: 0,
+                after: None,
+                facts,
+            });
+        }
+        let build = self
+            .building
+            .as_mut()
+            .ok_or(invalid("governance semantic build"))?;
+        let tables = [
+            Table::CurrentAuthority,
+            Table::Shares,
+            Table::Consent,
+            Table::ConsentReset,
+            Table::EverRevoked,
+        ];
+        let mut inspected = 0;
+        while build.phase < tables.len() && inspected < PAGE_ROWS {
+            let Some((key, log)) = view.facts.first(tables[build.phase], build.after)? else {
+                build.phase += 1;
+                build.after = None;
+                continue;
+            };
+            inspected += 1;
+            build.after = Some(key);
+            let author: Digest32 = key[..32]
+                .try_into()
+                .map_err(|_| invalid("governance semantic author"))?;
+            let target: Digest32 = key[32..]
+                .try_into()
+                .map_err(|_| invalid("governance semantic target"))?;
+            match build.phase {
+                0 => {
+                    if target != [0; 32] {
+                        return Err(invalid("governance authority key padding"));
+                    }
+                    let grant = view.authority(&author)?.0;
+                    if grant.present && author != view.root {
+                        build.facts.authority.insert(author, grant);
+                    }
+                }
+                1 => {
+                    let share = view.share_record(log, &author, &target)?;
+                    if let Some(share) = &share {
+                        let fingerprint = crate::governance::share::service_fingerprint(
+                            view.room,
+                            &author,
+                            &share.name,
+                        );
+                        build
+                            .facts
+                            .fingerprints
+                            .insert((author, fingerprint), target);
+                    }
+                    build.facts.shares.insert((author, target), share);
+                }
+                2 => {
+                    std::sync::Arc::make_mut(&mut build.facts.consent).set_consent(
+                        author,
+                        target,
+                        view.consent_state(&author, &target)?,
+                    );
+                }
+                3 => {
+                    if target != [0; 32] {
+                        return Err(invalid("governance reset key padding"));
+                    }
+                    std::sync::Arc::make_mut(&mut build.facts.consent)
+                        .set_reset(author, view.consent_reset(&author)?);
+                }
+                4 => {
+                    std::sync::Arc::make_mut(&mut build.facts.consent).set_ever_revoked(
+                        author,
+                        target,
+                        view.ever_revoked(&author, &target)?,
+                    );
+                }
+                _ => return Err(invalid("governance semantic phase")),
+            }
+        }
+        if build.phase != tables.len() {
+            return Ok(false);
+        }
+        self.source = Some(build.source);
+        // The same owned maps become the completed result; never reserve a second
+        // inline SemanticFacts payload or allocate another capsule at this boundary.
+        self.completed = true;
+        self.ready = true;
+        Ok(true)
+    }
+}
+
+impl SemanticFacts {
+    pub(in crate::node::channel) fn admin_clock(&self) -> Option<u64> {
+        self.admin_clock
+    }
+
+    pub(in crate::node::channel) fn is_admin(&self, target: &Digest32, root: &Digest32) -> bool {
+        target == root
+            || self
+                .authority
+                .get(target)
+                .is_some_and(|grant| grant.present)
+    }
+
+    pub(in crate::node::channel) fn grants_policy(
+        &self,
+        target: &Digest32,
+        root: &Digest32,
+    ) -> bool {
+        target == root
+            || self
+                .authority
+                .get(target)
+                .is_some_and(|grant| grant.present && grant.grants_policy())
+    }
+
+    pub(in crate::node::channel) fn share_exact(
+        &self,
+        host: &Digest32,
+        name: &str,
+    ) -> Result<Option<super::super::Share>> {
+        let hash = crate::hash::sha256(name.as_bytes());
+        let share = self.shares.get(&(*host, hash)).and_then(Option::as_ref);
+        if share.is_some_and(|share| share.name != name) {
+            return Err(invalid("governance share name binding"));
+        }
+        Ok(share.cloned())
+    }
+
+    pub(in crate::node::channel) fn share_selector(
+        &self,
+        host: &Digest32,
+        selector: &str,
+    ) -> Result<Option<super::super::Share>> {
+        if let Some(share) = self.share_exact(host, selector)? {
+            return Ok(Some(share));
+        }
+        let Ok(fingerprint) = crate::node::link::b32_decode(selector, "service fingerprint") else {
+            return Ok(None);
+        };
+        let Some(name) = self.fingerprints.get(&(*host, fingerprint)) else {
+            return Ok(None);
+        };
+        Ok(self.shares.get(&(*host, *name)).and_then(Clone::clone))
+    }
+
+    pub(in crate::node::channel) fn admins(
+        &self,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> TargetPage {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut rows = Vec::new();
+        for (target, _) in self
+            .authority
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+        {
+            rows.push(*target);
+            if rows.len() == limit.clamp(1, PAGE_ROWS) {
+                return TargetPage {
+                    rows,
+                    next: Some(*target),
+                };
+            }
+        }
+        TargetPage { rows, next: None }
+    }
+
+    pub(in crate::node::channel) fn shares(
+        &self,
+        after: Option<(Digest32, Digest32)>,
+        limit: usize,
+    ) -> SharePage {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut rows = Vec::new();
+        for (inspected, (key, share)) in self
+            .shares
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .enumerate()
+        {
+            if let Some(share) = share {
+                rows.push(share.clone());
+            }
+            if inspected + 1 == limit.clamp(1, PAGE_ROWS) {
+                return SharePage {
+                    rows,
+                    next: Some(*key),
+                };
+            }
+        }
+        SharePage { rows, next: None }
+    }
+
+    pub(in crate::node::channel) fn consenters(
+        &self,
+        author: &Digest32,
+        after: Option<Digest32>,
+        limit: usize,
+    ) -> TargetPage {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let Some(readers) = self.consent.consent.get(author) else {
+            return TargetPage {
+                rows: Vec::new(),
+                next: None,
+            };
+        };
+        let mut rows = Vec::new();
+        for (inspected, (target, _)) in readers
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .enumerate()
+        {
+            if self.consent.can_read(target, author) {
+                rows.push(*target);
+            }
+            if inspected + 1 == limit.clamp(1, PAGE_ROWS) {
+                return TargetPage {
+                    rows,
+                    next: Some(*target),
+                };
+            }
+        }
+        TargetPage { rows, next: None }
+    }
+}
+
 pub(in crate::node::channel) struct View<'a> {
     facts: Read<'a>,
     root: Digest32,
+    room: &'a Digest32,
 }
 impl<'a> View<'a> {
     pub(in crate::node::channel) fn revision(&self) -> u64 {
@@ -214,7 +647,7 @@ impl<'a> View<'a> {
         if !facts.ready(now)? {
             return Err(Error::Profile(REFRESHING));
         }
-        Ok(Self { facts, root })
+        Ok(Self { facts, root, room })
     }
 
     /// Single-writer consent/presence/share facts do not depend on the admin
@@ -229,7 +662,7 @@ impl<'a> View<'a> {
         if !facts.current_ready()? {
             return Err(Error::Profile(REFRESHING));
         }
-        Ok(Self { facts, root })
+        Ok(Self { facts, root, room })
     }
 
     /// The exact current single-writer Presence source, not the last-good display or an
@@ -257,32 +690,6 @@ impl<'a> View<'a> {
 
     pub(in crate::node::channel) fn admin_clock(&self) -> Option<u64> {
         self.facts.admin_clock()
-    }
-
-    pub(in crate::node::channel) fn admins(
-        &self,
-        after: Option<Digest32>,
-        limit: usize,
-    ) -> Result<TargetPage> {
-        let mut cursor = after;
-        let mut rows = Vec::new();
-        for _ in 0..limit.clamp(1, PAGE_ROWS) {
-            let Some((key, _)) = self
-                .facts
-                .first(Table::ActiveAdmins, cursor.as_ref().map(hash_key))?
-            else {
-                return Ok(TargetPage { rows, next: None });
-            };
-            let target = key[..32]
-                .try_into()
-                .map_err(|_| invalid("governance admin cursor"))?;
-            cursor = Some(target);
-            if target == self.root || !self.is_admin(&target)? {
-                return Err(invalid("governance active admin binding"));
-            }
-            rows.push(target);
-        }
-        Ok(TargetPage { rows, next: cursor })
     }
 
     /// Preserve the existing remove-admin selection: every certificate naming
@@ -327,54 +734,6 @@ impl<'a> View<'a> {
         Ok(TargetPage { rows, next: cursor })
     }
 
-    pub(in crate::node::channel) fn share(
-        &self,
-        host: &Digest32,
-        name: &str,
-    ) -> Result<Option<super::super::Share>> {
-        let name_hash = crate::hash::sha256(name.as_bytes());
-        let Some(log) = self.facts.get(Table::Shares, &pair(host, &name_hash))? else {
-            return Ok(None);
-        };
-        let row = self.share_record(log, host, &name_hash)?;
-        if row.as_ref().is_some_and(|row| row.name != name) {
-            return Err(invalid("governance share name binding"));
-        }
-        Ok(row)
-    }
-
-    pub(in crate::node::channel) fn share_selector(
-        &self,
-        host: &Digest32,
-        selector: &str,
-    ) -> Result<Option<super::super::Share>> {
-        if let Some(share) = self.share(host, selector)? {
-            return Ok(Some(share));
-        }
-        let Ok(fingerprint) = crate::node::link::b32_decode(selector, "service fingerprint") else {
-            return Ok(None);
-        };
-        let Some(log) = self
-            .facts
-            .get(Table::ShareFingerprints, &pair(host, &fingerprint))?
-        else {
-            return Ok(None);
-        };
-        let entry = self.facts.entry(log)?;
-        let GovBody::ServiceShare(share) = GovEntry::body_bound_to(&entry)? else {
-            return Err(invalid("governance share fingerprint kind"));
-        };
-        if crate::governance::share::service_fingerprint(
-            &entry.skeleton.channel_id,
-            host,
-            &share.body.name,
-        ) != fingerprint
-        {
-            return Err(invalid("governance share fingerprint binding"));
-        }
-        self.share_record(log, host, &crate::hash::sha256(share.body.name.as_bytes()))
-    }
-
     fn share_record(
         &self,
         log: u64,
@@ -399,36 +758,11 @@ impl<'a> View<'a> {
         }))
     }
 
-    pub(in crate::node::channel) fn shares(
-        &self,
-        after: Option<(Digest32, Digest32)>,
-        limit: usize,
-    ) -> Result<SharePage> {
-        let mut cursor = after;
-        let mut rows = Vec::new();
-        for _ in 0..limit.clamp(1, PAGE_ROWS) {
-            let Some((key, log)) = self
-                .facts
-                .first(Table::Shares, cursor.map(|(host, name)| pair(&host, &name)))?
-            else {
-                return Ok(SharePage { rows, next: None });
-            };
-            let host = key[..32]
-                .try_into()
-                .map_err(|_| invalid("governance share host cursor"))?;
-            let name = key[32..]
-                .try_into()
-                .map_err(|_| invalid("governance share name cursor"))?;
-            cursor = Some((host, name));
-            if let Some(row) = self.share_record(log, &host, &name)? {
-                rows.push(row);
-            }
-        }
-        Ok(SharePage { rows, next: cursor })
+    pub(in crate::node::channel) fn display(&self, genesis: &Genesis) -> Result<Display> {
+        self.display_from(Display::genesis(genesis))
     }
 
-    pub(in crate::node::channel) fn display(&self, genesis: &Genesis) -> Result<Display> {
-        let mut display = Display::genesis(genesis);
+    pub(in crate::node::channel) fn display_from(&self, mut display: Display) -> Result<Display> {
         display.revision = self.facts.revision();
         display.valid_until = self.facts.deadline();
         for kind in [
@@ -519,78 +853,13 @@ impl<'a> View<'a> {
         Ok((grant, deny))
     }
 
-    pub(in crate::node::channel) fn is_admin(&self, target: &Digest32) -> Result<bool> {
-        Ok(self.authority(target)?.0.present)
-    }
-
     pub(in crate::node::channel) fn can_end(&self, target: &Digest32) -> Result<bool> {
         let grant = self.authority(target)?.0;
         Ok(grant.present && (grant.admin || grant.policy))
     }
 
-    pub(in crate::node::channel) fn grants(
-        &self,
-        target: &Digest32,
-        cap: &Capability,
-    ) -> Result<Verdict> {
-        let (grant, denied) = self.authority(target)?;
-        if !grant.present {
-            return Ok(Verdict::Denied(denied));
-        }
-        let set = grant.capabilities();
-        if !set.grants(cap) {
-            return Ok(Verdict::Denied(DenyReason::CapabilityNotHeld));
-        }
-        Ok(Verdict::Granted {
-            governing: if grant.admin {
-                Capability::Admin
-            } else {
-                cap.clone()
-            },
-            effective_set: set,
-        })
-    }
-
-    pub(in crate::node::channel) fn can_read(
-        &self,
-        reader: &Digest32,
-        author: &Digest32,
-    ) -> Result<bool> {
-        let Some(log) = self.facts.get(Table::Consent, &pair(author, reader))? else {
-            return Ok(false);
-        };
-        let entry = self.facts.entry(log)?;
-        if entry.skeleton.author_id != *author {
-            return Err(invalid("governance consent author"));
-        }
-        let grant = match GovEntry::body_bound_to(&entry)? {
-            GovBody::ConsentGrant(grant) => grant,
-            GovBody::ConsentRevocation(revoke)
-                if revoke.body.author_id == *author
-                    && revoke.body.target_id == *reader
-                    && revoke.body.epoch == 0 =>
-            {
-                return Ok(false)
-            }
-            _ => return Err(invalid("governance consent locator kind")),
-        };
-        if grant.body.target_id != *reader
-            || grant.body.author_id != *author
-            || grant.body.epoch != 0
-        {
-            return Err(invalid("governance consent locator binding"));
-        }
-        let reset = self
-            .facts
-            .get(Table::ConsentReset, &hash_key(author))?
-            .map(|log| self.facts.entry(log))
-            .transpose()?
-            .map_or(0, |entry| entry.skeleton.seq);
-        Ok(entry.skeleton.seq > reset)
-    }
-
     /// The exact current consent slot, before applying the author's reset. Used only by the
-    /// bounded admitted-member projection rebuild.
+    /// bounded semantic projection rebuild.
     pub(in crate::node::channel) fn consent_state(
         &self,
         author: &Digest32,
@@ -648,39 +917,6 @@ impl<'a> View<'a> {
             }
             _ => Err(invalid("governance revoked locator binding")),
         }
-    }
-
-    /// The cursor advances over at most one bounded page of index slots, including withdrawn or
-    /// reset consent. Explicit pagination preserves off-roster targets without retaining them in
-    /// the admitted-member in-memory projection.
-    pub(in crate::node::channel) fn consenters(
-        &self,
-        author: &Digest32,
-        after: Option<Digest32>,
-        limit: usize,
-    ) -> Result<TargetPage> {
-        let mut after = after;
-        let mut rows = Vec::new();
-        for _ in 0..limit.clamp(1, PAGE_ROWS) {
-            let row = match after {
-                Some(target) => self
-                    .facts
-                    .first(Table::Consent, Some(pair(author, &target)))?,
-                None => self.facts.at_or_after(Table::Consent, hash_key(author))?,
-            }
-            .filter(|(key, _)| key[..32] == author[..]);
-            let Some((key, _)) = row else {
-                return Ok(TargetPage { rows, next: None });
-            };
-            let target = key[32..]
-                .try_into()
-                .map_err(|_| invalid("governance consenter cursor"))?;
-            after = Some(target);
-            if self.can_read(&target, author)? {
-                rows.push(target);
-            }
-        }
-        Ok(TargetPage { rows, next: after })
     }
 
     /// Newest-first disk continuation returned in chronological order. Caller

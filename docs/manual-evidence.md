@@ -38,6 +38,159 @@ followed; accepted posts were not replayed. The bounded smoke receipt is
 `/private/tmp/vox996-main-smoke-517a2d5f/operator-result.json`. It does not repeat or relabel the
 complete role, inverse, requested-history-overlap or restart journeys.
 
+## v0.4.10 protected trust-removal contention (#1007)
+
+A focused three-room scratch journey reproduced the retained proof's trust-removal refusal:
+after the protected node restarted, typed removal of an offline member returned exit 1 and
+the shipped "an internal error" message. Temporary diagnosis captured
+`StreamRefused("a room change is pending")`. The sole producer was the native policy room
+reservation's `try_lock`, before the keyring transaction; the removed member still appeared
+in the shipped trust list. This was transient room-mutex contention, not failed authority.
+
+Untrust now uses the same blocking room-mutex acquisition already used by decision-bearing
+grants in the existing off-actor preparation worker. It retains no room mutex while waiting
+for another room or while committing the global policy transaction. Append eligibility,
+original publication/secret ownership, exact instance checks, cancellation and partial-reservation
+cleanup remain. No fault mapping, retry, timeout or queue was added.
+
+The normal-feature corrected CLI, SHA-256
+`0792bcdb0cc88b1c8f29b4baa4fa9ddd1d75910a596f3fc3e11682c359c24180`, was run against the
+same stopped scratch profiles without deleting or recreating their data. Typed removal returned
+exit 0, the member disappeared from the actual keyring, and the remaining trusted member read
+the exact post-removal sender-generation message in each of the three rooms. Both nodes reported
+Ready without preparing or unhealthy rooms. The focused receipt is
+`/private/tmp/vox1007-focused-native-vjdn4pex/fixed-operator-result.json`; the original terminal
+and native-cause log remain alongside it. The terminal driver's exit is recorded separately
+from the actual typed command's exit. Temporary diagnostics were removed before this normal
+build. This focused repair smoke is not whole-#1007 acceptance or a replacement for the
+retained-history and semantic-query evidence.
+
+## v0.4.10 integrated semantic-governance smoke (#1007)
+
+The normal-feature release CLI built from integration candidate
+`0d4f152c640aa8188e7a0694369f0d9c86ac6aa6`, SHA-256
+`fc41be8a42fcf97e1a49b9c71feb3ba57e9beef36eae11766c567f35c7a61fac`, ran against two
+fresh scratch profiles with separate data/config directories and no proof knobs. Actual trust,
+room creation and direct joining succeeded. Each node read both accepted messages with their
+exact hashes, envelope bodies and `owed:false`; accepted posts were not replayed.
+
+A same-name authenticated rename remained absent from the notices page by its exact action
+hash, while the preceding exact message remained readable. The creator then granted the other
+member administrator authority, observed that fingerprint in the shipped administrator list,
+removed it, and observed its absence.
+
+The spike's initial plain-text and single-row assumptions were corrected against retained JSON:
+`text` carries the serialized envelope, and `--notices` can include earlier notices alongside a
+message page. Those were apparatus mistakes, not product failures. The receipt is
+`/private/tmp/vox1007-final-normal-3jai5a5j/normal-operator-result.json`. Frontends and the actual
+auto-started scratch owners were stopped; profiles and output were preserved.
+
+This is focused normal operator use, not a whole retained-history, restart, late-reset or
+authority-expiry acceptance result. The later paging-refresh parser correction changes only
+the proof; it does not rebind this binary receipt to another source.
+
+Source review subsequently found that replacing the completed semantic cache could destroy
+unbounded authority, share and fingerprint maps on the actor while holding the room mutex.
+Displaced maps, discarded partial builds and final immutable consent roots now transfer their
+destruction to native work, including cancellation and runtime-shutdown paths. This ownership
+repair does not change the revision, deadline, serial or readiness fences. The normal smoke
+above predates this repair; it is not runtime evidence for the changed destruction path.
+
+The retained journey also exposed a missing source-rotation wake: a text append could commit a
+Presence and retire its semantic cache, while the actor still considered that room's governance
+settled. Matching native text completion now carries the actual committed governance-change
+bit through the existing deferred-governance path. Ordinary text does not invalidate the cache;
+stale attachments cannot wake a replacement room, and a later append failure cannot discard a
+governance change that already committed. The stalled journey remains unaccepted until rerun.
+
+The next run exposed a retained-slot cycle. A deferred recipient-body request waited for a
+key-slot release, but its port-wide admission also blocked a different runnable hint. That
+hint occupied the ready position needed by the deferred slot owner. Read-only native capture
+identified the exact request owners and key-slot notification; both shared byte counters were
+zero. Admissions now retain each record's independent token and dependency, and continuation
+selection excludes only that exact blocked record. Sibling refusals cannot replace its waiter.
+
+A normal-feature binary with SHA-256
+`ffb0f28c305296d461a90e6d979794994e196b1b446aeffa7e6a2ab37bd9391d`
+was run against the preserved stalled scratch profiles after an explicit restart. All three
+rooms drained, Alice's shipped trust answers became mutual, and a newly accepted message was
+readable at Bob under its exact hash and body with `owed: false`. The first read preceded
+asynchronous delivery; the accepted post was not replayed. All three scratch daemons stopped
+and no profile handles remained. This is focused normal-binary recovery evidence, not an
+uninterrupted-connection claim or acceptance of the full retained-row journey and its controls.
+
+The fresh full journey then reported a post-999 refresh refusal. One normal-binary diagnostic
+with observers armed before posting reproduced a refusal at action 935. Native capture showed
+the server-selected publication revision was 938 while the current resource revision was 939;
+the physical directory-consistency guard did not fire. This was a fresh request, not an explicit
+caller continuation. Binding it to NodeView's older mirrored revision caused the refusal.
+
+Fresh reads now select one publication under the existing reader mutex on the bounded worker.
+Explicit caller cursors/revisions, physical directory binding, SEK, lock/resource lifetime and
+the originally selected Computer policy/identity checks remain unchanged. No retry was added.
+A normal-feature binary with SHA-256
+`d4989dacce7d0c795310ec7372d9ce162bbddc1c5b9d12c33cd9b0ad01b3d22b`
+ran on that preserved failed scratch profile after restart: 1,000 new posts succeeded and the
+exact final row was readable under its returned hash and body with `owed: false`. No accepted
+action was replayed; the daemon stopped and no profile handles remained. The earlier full-run
+failure remains a failure; this focused smoke is not a full journey or negative-control verdict.
+
+The uncapped quiet-transition run subsequently reached mutual trust and current governance but
+reported a missing final rotation message. Its final status held 89 log entries; the fresh post
+was not among the control transitions whose arrival had been staged. A normal-binary restart
+on a clone of the retained recipient profile, with no source peer started, returned a complete
+`room read --hashes` successfully without that exact expected hash. The original failure data
+was not changed. This establishes missing input evidence at the caller, not a render defect or
+a passing full journey. Fresh message canaries must establish their first exact readable
+hash/body with `owed: false` while the source is available, before the separate source-off
+restart assertions. The original held-input continuation assertion remains unchanged.
+
+
+The corrected journey next reached the forced expiry setup but did not engage its marker.
+Read-only shipped authority pages on both scratch peers already excluded the expired
+administrator, with both nodes Ready and governance idle. The native sample located the
+operator at the unengaged marker wait. Its only arming call was on legacy sync completion;
+sparse accepted-governance publication did not arm it. The run was stopped as APPARATUS
+NO RESULT, not a product expiry failure or a full pass. All original profiles were preserved,
+and no profile handles remained. The existing test-only marker must also arm at the two
+actual sparse published-governance boundaries; ordinary content and deadline wakes cannot
+arm it. No normal-product path, consumer assertion, knob or timing is changed.
+
+The next full run reported an explicit no-change refusal while staging the administrator
+grant immediately after Alice reopened: a preceding room change was still being applied.
+That run remains unaccepted. This setup must follow only that exact wait instruction, using
+the existing rename-staging pacing. An accepted grant is never replayed, and every other
+refusal still fails its assertion. This does not change the expiry claim or its deadline.
+
+The next run reached the final revocation-descendant check and remained structurally
+waiting: Alice held the exact new hash, while Bob did not and still reported mutual trust.
+Read-only inspection of that original process found a stable catalog-announcement token
+bound to connection serial 0 after the current primary became serial 1. Its exact ACK was
+correctly refused; repeated Inventory announcements displaced the missing-head work.
+The candidate correction is to rebind existing role/catalog state on primary adoption and
+on the close event that promotes a surviving connection, using the manager's current
+primary. ACK, authorization and physical-tail fences are unchanged. Both independent
+source reviews accepted the complete correction. A normal-feature explicit-restart
+recovery on copies of the retained profiles restored Bob's current revocation answer and
+the exact retained descendant without revealing its body; it is not an uninterrupted
+connection or full-journey result. The original stalled run and profiles remain retained.
+The diagnostic TempDir-retention line was removed before the next full journey.
+
+Exact candidate `376088bf5dd4342151b699e5869da0faefa7713d` subsequently passed the complete
+release-profile retained-history journey once (395.23 s), strict workspace/all-target Clippy
+and the normal release build. Its ordinary-feature binary, SHA-256
+`73cebb8e90e658c60e367064073cce744a7a4e7be0537bf3c589e3780e4f3dba`, also restored the copied
+stalled profiles: Bob reported revoked consent, retained the exact descendant hash and did not
+show its body. Both scratch owners stopped cleanly with no remaining profile handles.
+Independent complete exact-head authority and consumer source reviews accepted that source.
+
+The isolated continuation mutant failed on exact original retained rows after source-offline
+restart; the same-name mutant failed on the additional visible notice. The behind-cursor-only
+expiry mutant survived, and removing settlement invalidation produced a nonterminal maintenance
+observation, not a valid consumer red. Neither is credited. The expiry journey is to stage its
+final roster assertion on the next published semantic meaning, rather than waiting for the
+expected roster answer or a transient refreshing response. Its semantic control is to omit
+effective-grant filtering when rebuilding the cached administrator roster.
 
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
@@ -81,7 +234,8 @@ with “the room's Sessions changed while selecting; try again”; following tha
 on the same read returned the exact typed prompt, reply and turn-end rows. Both daemons
 exited 0, and the binary remained unchanged. The complete result is retained at
 `/private/tmp/vox1047-active-wire-7m1luh8k/provider-publication-fixed-result.json`.
-This is a bounded provider-publication result, not a correction of the first-Session refusal.
+This is a bounded provider-publication result, not a correction of the first-Session refusal
+or proof of private delivery to an offline peer.
 
 The diagnosis establishes the producer of the recorded c778 inconsistency, not the cause
 of the earlier 9ec Dave/first-Session observations. It does not establish whole #934

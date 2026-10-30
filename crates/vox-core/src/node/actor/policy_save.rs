@@ -391,7 +391,7 @@ impl Node {
                             &save.store,
                             worker_owner,
                             require_append,
-                            grant_decision,
+                            grant_decision || require_append,
                         )?;
                     }
                     if let Policy::Grant { floor, .. } = &mut policy {

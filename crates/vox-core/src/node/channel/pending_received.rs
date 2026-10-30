@@ -56,6 +56,7 @@ pub(crate) struct CompletedReceived {
     effect: Option<(Digest32, u64, u64, SignedEntryKind, bool)>,
     presence: Option<(Digest32, governance::Presence)>,
     consent: bool,
+    governance_changed: bool,
     contiguous: Option<(Digest32, entry_store::sparse::ContiguousAdvance)>,
     private: Vec<Digest32>,
     available: Option<Digest32>,
@@ -394,6 +395,7 @@ impl ChannelState {
             effect,
             presence,
             consent,
+            governance_changed,
             contiguous,
             private,
             available,
@@ -435,6 +437,9 @@ impl ChannelState {
             let projection_result =
                 projection.map_or(Ok(()), |projection| projection.install(self, store));
             let install = (|| {
+                if governance_changed {
+                    self.retire_governance()?;
+                }
                 if let Some((author, state)) = presence {
                     self.presence.insert(author, state);
                 }
@@ -531,6 +536,7 @@ impl PendingReceived {
         let mut effect = None;
         let mut presence = None;
         let mut consent = false;
+        let mut governance_changed = false;
         let mut contiguous = None;
         let mut private = Vec::new();
         let mut available = None;
@@ -725,6 +731,7 @@ impl PendingReceived {
                             self.late,
                         )?;
                         consent = accepted.current_advanced;
+                        governance_changed = accepted.work_changed;
                         if let Ok(GovBody::Presence(body)) = GovEntry::body_bound_to(entry) {
                             let old = self.presence;
                             let mut state = old.unwrap_or(governance::Presence {
@@ -851,6 +858,30 @@ impl PendingReceived {
                 committed = true;
                 committed_ledger.store(true, Ordering::Release);
                 projection.committed = true;
+                #[cfg(feature = "test-knobs")]
+                if kind == SignedEntryKind::KeyPackage
+                    && entry.payload.is_some()
+                    && key_package_for(entry, &self.me)
+                {
+                    if let Some(path) = std::env::var_os(crate::node::actor::TEST_HOLD_PACKAGES_ENV)
+                        .filter(|path| !path.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .filter(|path| path.exists())
+                    {
+                        let mut engaged = path.into_os_string();
+                        engaged.push(".engaged");
+                        if let Ok(mut receipt) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(std::path::PathBuf::from(engaged))
+                        {
+                            let mut record = [0; 64];
+                            record[..32].copy_from_slice(&self.room);
+                            record[32..].copy_from_slice(&author);
+                            let _ = std::io::Write::write_all(&mut receipt, &record);
+                        }
+                    }
+                }
                 if !is_refill || settled {
                     effect = Some((
                         author,
@@ -902,6 +933,7 @@ impl PendingReceived {
             effect,
             presence,
             consent,
+            governance_changed,
             contiguous,
             private,
             available,

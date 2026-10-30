@@ -234,9 +234,10 @@ const PREPARE_WAIT: Duration = Duration::from_secs(1);
 
 /// Test-only: while the file this names exists, the node accepts no sender-key delivery: neither
 /// the ordinary logged-package worker, a package opened during room preparation, nor a live
-/// pairwise delivery. The first real attempt writes the same path with `.engaged` appended, so a
-/// proof can observe that the apparatus intercepted an acceptance rather than infer it from time.
-/// Logged work stays queued; live delivery answers not-accepted so the sender retains/retries it.
+/// pairwise delivery. The first real attempt creates the same path with `.engaged` appended.
+/// Committed recipient package bodies append raw room/author pairs to that receipt; an empty
+/// receipt proves only interception. Logged work stays queued; live delivery answers not-accepted
+/// so the sender retains/retries it.
 /// **For proofs; nothing in a real deployment sets it.** Not compiled in without the
 /// `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
@@ -254,7 +255,10 @@ fn held_packages_path() -> Option<std::path::PathBuf> {
 fn note_package_hold_engaged(path: &std::path::Path) {
     let mut engaged = path.as_os_str().to_owned();
     engaged.push(".engaged");
-    let _ = std::fs::write(std::path::PathBuf::from(engaged), b"");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(engaged));
 }
 
 /// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
@@ -11027,45 +11031,7 @@ impl Node {
                 // A fresh connection syncs at once (ADR-016): a request on every port it shares,
                 // with any backoff cleared (ADR-025 D2, D5).
                 self.connected.insert(peer);
-                let changed_connection = conn.as_ref().is_some_and(|conn| {
-                    self.role_connection_serials.insert(peer, conn.serial()) != Some(conn.serial())
-                });
-                if changed_connection {
-                    for room in self.channels.keys().copied() {
-                        if self.ports.contains_key(&(room, peer))
-                            && (self.own_key_active.keys().any(|(r, _)| *r == room)
-                                || self.own_key_credit_missing.contains_key(&room)
-                                || self.own_recovery_rooms.contains_key(&room))
-                        {
-                            self.governance_work.wake_room(room);
-                        }
-                        if let Some(owner) = self.role_wake.owner(room) {
-                            owner.on_connect(peer);
-                            if let Some(conn) = conn.as_ref() {
-                                if let Err(error) =
-                                    owner.key_catalog_on_connect(peer, conn.serial())
-                                {
-                                    eprintln!("vox: key catalog connection could not be initialized: {error}");
-                                }
-                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                                    port.key_catalog_seen = None;
-                                    port.key_availability_exhausted = None;
-                                    port.key_availability_request = None;
-                                    port.key_availability_page = None;
-                                    port.key_remote_selected = None;
-                                    port.key_remote_advance = None;
-                                    port.raise();
-                                    self.sched_rooms.insert(room);
-                                }
-                            }
-                            if self.trust.is_trusted(&peer)
-                                && self.ports.contains_key(&(room, peer))
-                            {
-                                owner.mark_key_dirty(peer);
-                            }
-                        }
-                    }
-                }
+                self.note_role_connection(peer, conn.as_ref());
                 self.discover_peers.insert(peer);
                 self.probe_older(peer);
                 if let Some(conn) = conn {
@@ -11081,14 +11047,14 @@ impl Node {
                 }
             }
             NetEvent::ConnectionClosed { peer, serial } => {
-                let replacement_is_live = self
+                let current = self
                     .net
                     .as_ref()
-                    .and_then(|net| net.manager().existing(&peer))
-                    .is_some_and(|conn| {
-                        conn.serial() != serial && conn.quinn().close_reason().is_none()
-                    });
-                if replacement_is_live {
+                    .and_then(|net| net.manager().existing(&peer));
+                if current.as_ref().is_some_and(|conn| {
+                    conn.serial() != serial && conn.quinn().close_reason().is_none()
+                }) {
+                    self.note_role_connection(peer, current.as_ref());
                     return;
                 }
                 if self.role_connection_serials.get(&peer) == Some(&serial) {
@@ -12212,6 +12178,8 @@ impl Node {
                         // publication, rather than every network event or the one-second ticker,
                         // wakes its bounded settlement. A superseded current fact still settles
                         // its frontier but does not revise/invalidate the checked projection.
+                        #[cfg(feature = "test-knobs")]
+                        governance::ready_sweep_after(&channel_id);
                         self.governance_work.wake_room(channel_id);
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(
@@ -13167,6 +13135,47 @@ impl Node {
         }
     }
 
+    /// Rebind connection-scoped role and catalog state to the manager's current primary.
+    /// An adopted path can replace that primary without emitting `Connected`.
+    fn note_role_connection(&mut self, peer: Digest32, conn: Option<&Arc<VoxConnection>>) {
+        let changed_connection = conn.is_some_and(|conn| {
+            self.role_connection_serials.insert(peer, conn.serial()) != Some(conn.serial())
+        });
+        if !changed_connection {
+            return;
+        }
+        for room in self.channels.keys().copied() {
+            if self.ports.contains_key(&(room, peer))
+                && (self.own_key_active.keys().any(|(r, _)| *r == room)
+                    || self.own_key_credit_missing.contains_key(&room)
+                    || self.own_recovery_rooms.contains_key(&room))
+            {
+                self.governance_work.wake_room(room);
+            }
+            if let Some(owner) = self.role_wake.owner(room) {
+                owner.on_connect(peer);
+                if let Some(conn) = conn {
+                    if let Err(error) = owner.key_catalog_on_connect(peer, conn.serial()) {
+                        eprintln!("vox: key catalog connection could not be initialized: {error}");
+                    }
+                    if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                        port.key_catalog_seen = None;
+                        port.key_availability_exhausted = None;
+                        port.key_availability_request = None;
+                        port.key_availability_page = None;
+                        port.key_remote_selected = None;
+                        port.key_remote_advance = None;
+                        port.raise();
+                        self.sched_rooms.insert(room);
+                    }
+                }
+                if self.trust.is_trusted(&peer) && self.ports.contains_key(&(room, peer)) {
+                    owner.mark_key_dirty(peer);
+                }
+            }
+        }
+    }
+
     fn adopt_connection(&mut self, conn: Arc<VoxConnection>) {
         self.note_peer_endpoint(&conn);
         let peer = conn.peer_id();
@@ -13179,6 +13188,12 @@ impl Node {
                 spawn_stream_loop(net, conn, self.net_tx.clone());
             }
         }
+        // `conn` may be a retiring path; only the manager's primary owns catalog ACKs.
+        let primary = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer));
+        self.note_role_connection(peer, primary.as_ref());
         // A new connection syncs at once, then on the interval (ADR-016; ADR-025 D2, D5).
         self.connected.insert(peer);
         self.discover_peers.insert(peer);
@@ -22930,8 +22945,9 @@ impl HistoryReader {
     }
 }
 
-/// The saved-read lane captures one publication and classifies that exact policy after
-/// bounded evaluation. Neither the actor queue nor the mutable room/writer is acquired.
+/// A fresh saved read selects its publication under the resource mutex on the bounded worker,
+/// then checks the originally selected policy. NodeView's mirrored revision is not a cursor.
+/// Neither the actor queue nor the mutable room/writer is acquired.
 async fn saved_history_query(
     view_rx: &watch::Receiver<NodeView>,
     computer: Option<&std::sync::Weak<crate::node::computer::Computer>>,
@@ -22940,7 +22956,7 @@ async fn saved_history_query(
     now: u64,
 ) -> std::result::Result<crate::node::channel::history::Reply, String> {
     use crate::node::channel::history::Reply;
-    let (resource, revision, policy, identity, names) = {
+    let (resource, policy, identity, names) = {
         let view = view_rx.borrow();
         if view.locked || view.locking {
             return Err("the node is locked".into());
@@ -22961,7 +22977,6 @@ async fn saved_history_query(
         .then(|| (view.trusted.clone(), view.presented.clone()));
         (
             resource,
-            detail.history_read_revision,
             view.computer_policy,
             view.identity.as_ref().map(|id| id.fingerprint),
             names,
@@ -22969,7 +22984,7 @@ async fn saved_history_query(
     };
     let selected = resource.clone();
     let answer = tokio::task::spawn_blocking(move || {
-        selected.query_at(revision, query, crate::node::ipc::rows_budget(), now)
+        selected.query(query, crate::node::ipc::rows_budget(), now)
     })
     .await
     .map_err(|error| format!("saved history reader stopped: {error}"))??;
