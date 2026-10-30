@@ -2,12 +2,26 @@
 
 use super::*;
 
-/// **Test-only**: the named marker contains one raw room id. When a bounded governance sweep
-/// selects that room, rename the marker with `.engaged` appended and park with the cursor already
-/// after it. The FX-22 journey then lets that room's real authority deadline supply the only wake,
-/// proving an expiry behind an in-progress cursor cannot be lost.
+/// **Test-only**: the named marker contains one raw room id. Accepted remote governance input
+/// renames it with `.ready` appended; unrelated room work and deadline wakes cannot arm it.
+/// A bounded sweep selecting that ready room renames it with `.engaged` appended and parks beyond
+/// the room. The FX-22 journey then requires the real authority deadline to supply another sweep.
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_SWEEP_AFTER_ENV: &str = "VOX_TEST_HOLD_GOVERNANCE_SWEEP_AFTER_FILE";
+
+#[cfg(feature = "test-knobs")]
+pub(super) fn ready_sweep_after(room: &Digest32) {
+    let Some(path) = std::env::var_os(TEST_HOLD_SWEEP_AFTER_ENV).filter(|path| !path.is_empty())
+    else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    if std::fs::read(&path).is_ok_and(|held| held.as_slice() == room) {
+        let mut ready = path.as_os_str().to_owned();
+        ready.push(".ready");
+        let _ = std::fs::rename(path, ready);
+    }
+}
 
 #[cfg(feature = "test-knobs")]
 fn hold_sweep_after(room: &Digest32) -> bool {
@@ -16,7 +30,9 @@ fn hold_sweep_after(room: &Digest32) -> bool {
         return false;
     };
     let path = std::path::PathBuf::from(path);
-    let Ok(held) = std::fs::read(&path) else {
+    let mut ready = path.as_os_str().to_owned();
+    ready.push(".ready");
+    let Ok(held) = std::fs::read(&ready) else {
         return false;
     };
     if held.as_slice() != room {
@@ -24,7 +40,7 @@ fn hold_sweep_after(room: &Digest32) -> bool {
     }
     let mut engaged = path.as_os_str().to_owned();
     engaged.push(".engaged");
-    std::fs::rename(path, engaged).is_ok()
+    std::fs::rename(ready, engaged).is_ok()
 }
 
 #[derive(Default)]

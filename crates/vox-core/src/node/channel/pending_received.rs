@@ -858,6 +858,30 @@ impl PendingReceived {
                 committed = true;
                 committed_ledger.store(true, Ordering::Release);
                 projection.committed = true;
+                #[cfg(feature = "test-knobs")]
+                if kind == SignedEntryKind::KeyPackage
+                    && entry.payload.is_some()
+                    && key_package_for(entry, &self.me)
+                {
+                    if let Some(path) = std::env::var_os(crate::node::actor::TEST_HOLD_PACKAGES_ENV)
+                        .filter(|path| !path.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .filter(|path| path.exists())
+                    {
+                        let mut engaged = path.into_os_string();
+                        engaged.push(".engaged");
+                        if let Ok(mut receipt) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(std::path::PathBuf::from(engaged))
+                        {
+                            let mut record = [0; 64];
+                            record[..32].copy_from_slice(&self.room);
+                            record[32..].copy_from_slice(&author);
+                            let _ = std::io::Write::write_all(&mut receipt, &record);
+                        }
+                    }
+                }
                 if !is_refill || settled {
                     effect = Some((
                         author,
