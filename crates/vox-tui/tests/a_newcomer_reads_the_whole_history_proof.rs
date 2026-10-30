@@ -7429,6 +7429,12 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
             panic!("PRODUCT: Alice's post-removal answer named no entry hash: {posted}")
         })
         .to_owned();
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "Carol's removal and the resulting Bob-only regrant never completed their bounded fold",
+    );
     wait_room_status(
         &alice,
         "alice",
@@ -7442,6 +7448,18 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
                 .any(|member| member == &fps[1])
         },
     );
+    // Source key-delivery settlement does not establish receipt of this fresh post or its
+    // current consent at Bob. Stage those inputs before judging a render continuation.
+    while !room_hashes(&bob, "bob", &rooms[0]).contains(&isolation_hash) {
+        std::thread::yield_now();
+    }
+    wait_trust_detail(&bob, "bob", &rooms[0], "alice", "you trust each other");
+    wait_governance_current(
+        &bob,
+        "bob",
+        &rooms[0],
+        "Bob's post-removal authority facts never became current",
+    );
     assert_exact_read_rows(
         &bob,
         "bob",
@@ -7450,13 +7468,6 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         std::slice::from_ref(&isolation_text),
         "Bob received Alice's post-removal generation",
     );
-    wait_governance_current(
-        &alice,
-        "alice",
-        &rooms[0],
-        "Carol's removal and the resulting Bob-only regrant never completed their bounded fold",
-    );
-    wait_trust_detail(&bob, "bob", &rooms[0], "alice", "you trust each other");
 
     // A same-value authenticated action remains in the immutable room order. Its exact row and
     // authority-page completion stage the later sequence; revision cardinality is not a verdict.
