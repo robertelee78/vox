@@ -4,6 +4,40 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.10 catch-up integration (#996)
+
+The standalone integration removes an online-consent preflight that queried the signed-prekey
+wait state before the real frame selected its bundle. The frame remains the sole selection and
+reservation point; its actual wait still produces the existing key-wait diagnostic. Trust,
+current room authority, role-complete settlement and one-time-prekey ownership checks remain.
+
+The accepted evidence retains its original binaries and scopes:
+
+- `/Users/robert.lee/vox-coord/fx996-acceptance-result-20261029.json` binds the complete criterion
+  map, normal role/private-header/restart observations and the inventory-credit PRODUCT inverse.
+- The ordinary `4a0405f7` overlap receipt at
+  `/Users/robert.lee/vox-coord/fx996-overlap-4a040-20261029-overlap/receipt.json` records both exact
+  opposite-reader live messages and eleven newly readable requested originals inside the same
+  positive-debt request. Seven saved intervals end Complete/0 without matching retained owners.
+- Named-round totals alone are not proof that pages manufacture no extra live round. The
+  accepted interpretation also inspects exact page-only dispatch and completion obligations.
+- The original composed #986 restart journey remains bound to its original `9ec3ed699` binary;
+  it is not a new-main restart run.
+
+Independent source bridges found no required dependency on #1007's different semantic-cache
+implementation. The current integration retains its own authenticated consent projection and
+the separately reviewed #934 coherent-read and public-History audience repairs. This is
+criterion-level evidence reuse, not whole-program equivalence or transferred performance.
+
+On 2026-10-30, the ordinary integration CLI, SHA-256
+`32db8bc577b6de1445e19b6f4109f9c0739ff6dc7dc77468e011c03a70413a4d`, was run with separate fresh
+scratch data/config roots. Both members read three exact pre-join messages and both new live
+messages with their original hashes, exact bodies and `owed:false`. Both reported Ready and
+current peer receipt positions. Explicit refresh instructions and asynchronous settlement were
+followed; accepted posts were not replayed. The bounded smoke receipt is
+`/private/tmp/vox996-main-smoke-517a2d5f/operator-result.json`. It does not repeat or relabel the
+complete role, inverse, requested-history-overlap or restart journeys.
+
 
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
