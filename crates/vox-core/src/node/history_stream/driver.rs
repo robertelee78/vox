@@ -78,17 +78,9 @@ async fn handshake_and_pull(
     overhead += encoded.as_slice().len() + 4;
     io.write_encoded(&encoded).await?;
     drop(encoded);
-    let reply = match io.read_hello_required().await? {
-        Read::Frame(frame) => frame,
-        Read::Busy => return Err(Error::Unreachable("history HELLO reader busy")),
-        Read::End => return Err(Error::Unreachable("history closed before HELLO")),
-    };
-    if !matches!(reply.frame()?, Frame::Hello(mode) if mode == crate::wire::SYNC_MODE_BOUNDED_HISTORY)
-    {
-        return Err(Error::MalformedBundle("history HELLO mode"));
-    }
-    overhead += reply.wire_len();
-    drop(reply);
+    // The authenticated peer already has the room-bound preamble and fixed mode.
+    // Pipeline WANT/HAVE so a Public announcement need not wait behind bytes on
+    // the reverse path. Validate the peer's HELLO before accepting its response.
     let want = Frame::Want {
         request: preamble.request,
         query: query.clone(),
@@ -113,7 +105,9 @@ async fn handshake_and_pull(
         };
         let encoded = frame.encode_required(io.job())?;
         overhead += encoded.as_slice().len() + 4;
-        if overhead + super::DONE_RESERVE > super::MAX_RESPONSE_BYTES {
+        if overhead + super::MAX_HELLO_FRAME_BYTES + 4 + super::DONE_RESERVE
+            > super::MAX_RESPONSE_BYTES
+        {
             return Err(Error::SizeLimitExceeded("inventory handshake quantum"));
         }
         io.write_encoded(&encoded).await?;
@@ -123,6 +117,17 @@ async fn handshake_and_pull(
         drop(frame);
         drop(held);
     }
+    let reply = match io.read_hello_required().await? {
+        Read::Frame(frame) => frame,
+        Read::Busy => return Err(Error::Unreachable("history HELLO reader busy")),
+        Read::End => return Err(Error::Unreachable("history closed before HELLO")),
+    };
+    if !matches!(reply.frame()?, Frame::Hello(mode) if mode == crate::wire::SYNC_MODE_BOUNDED_HISTORY)
+    {
+        return Err(Error::MalformedBundle("history HELLO mode"));
+    }
+    overhead += reply.wire_len();
+    drop(reply);
     let mut result = receiver.pull(io, preamble.request, query, overhead).await?;
     if result.status == super::Status::Complete {
         result.offered_availability = offered_availability;

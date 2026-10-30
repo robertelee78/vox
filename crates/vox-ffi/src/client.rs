@@ -1098,7 +1098,7 @@ pub struct FfiSession {
 
 fn ffi_session(
     s: &vox_core::node::sessions::SessionRow,
-    t: &SessionSummary,
+    t: Option<&SessionSummary>,
     known: &Known,
 ) -> FfiSession {
     FfiSession {
@@ -1113,7 +1113,7 @@ fn ffi_session(
         opened_at_ms: s.opened_millis,
         ended_at_ms: s.ended_millis,
         can_drive: s.can_drive,
-        pending: t.waiting,
+        pending: t.map_or(0, |summary| summary.waiting),
     }
 }
 
@@ -1410,7 +1410,7 @@ async fn room_sessions_page(
 ) -> Result<
     (
         Vec<vox_core::node::sessions::SessionRow>,
-        Vec<SessionSummary>,
+        Vec<Option<SessionSummary>>,
         Option<Digest32>,
     ),
     VoxError,
@@ -1445,7 +1445,7 @@ async fn exact_session(
 ) -> Result<
     (
         Vec<vox_core::node::sessions::SessionRow>,
-        Vec<SessionSummary>,
+        Vec<Option<SessionSummary>>,
     ),
     VoxError,
 > {
@@ -5727,7 +5727,7 @@ impl VoxClient {
                 sessions: sessions
                     .iter()
                     .zip(&summaries)
-                    .map(|(s, t)| ffi_session(s, t, &known))
+                    .map(|(s, t)| ffi_session(s, t.as_ref(), &known))
                     .collect(),
                 next: next.map(|id| b32_encode(&id)),
             })
@@ -5776,7 +5776,7 @@ impl VoxClient {
                 sessions: sessions
                     .iter()
                     .zip(&summaries)
-                    .map(|(session, summary)| ffi_session(session, summary, &known))
+                    .map(|(session, summary)| ffi_session(session, summary.as_ref(), &known))
                     .collect(),
                 next: next.as_ref().map(b32_encode),
             })
@@ -5863,7 +5863,7 @@ impl VoxClient {
             Ok(sessions
                 .first()
                 .zip(summaries.first())
-                .map(|(s, t)| ffi_session(s, t, &known)))
+                .map(|(s, t)| ffi_session(s, t.as_ref(), &known)))
         })
     }
 

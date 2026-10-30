@@ -147,6 +147,69 @@ restart assertions. The original held-input continuation assertion remains uncha
 
 ## v0.4.10 Public/Background concurrency evidence boundary (#1047)
 
+### Current operator criterion and completed original-message correlation
+
+The operator removed the paired sole-port timing control, then clarified that Vox must work
+correctly against the baseline: reasonable speed is desirable, but correctness comes first.
+The borrowed ten-second slow-link assertion below remains a historical measurement, not a new
+product latency guarantee. This changes neither authorization nor resource/lifetime obligations.
+Decision: https://github.com/robertelee78/vox/issues/1047#issuecomment-6533146464.
+
+The ordinary release candidate, SHA-256
+`7ba570f41f447c6f9118fb0a8959778eeabb1a9e2a497c13fc8c57b0e0f528bd`, pipelines its existing
+HELLO/WANT/optional HAVE writes before reading the fixed peer HELLO. It still validates the
+peer's mode before consuming responses, reserves the unread HELLO envelope, and acknowledges
+role/catalog announcements only after their exact successful exchange. Opus and Fable accepted
+that source change; this review does not establish runtime acceptance by itself.
+
+The completed native trace maps original Public hash
+`fjkjs4icb4ew7gfuyujwu2slzxty5ieaf22y4aojvhxovd65m35q` to head
+`df41f22352eee018cc8832dede2882c70472f09033ec7c7f5d518eca31ff3126`, sequence 10.
+Its authenticated head receipt occurred 1,043.695 ms after the original Private WANT and
+1,881.225 ms before the conservative requester persistence/final-ACK terminal. The later exact
+Entry mapping identifies the original message; it does not move either timestamp or extend the
+Private interval. The original exact body was readable later without reposting; the measured
+10.124718542 s deadline miss is unchanged. One subsequently submitted original authorized
+Session prompt/reply was readable at source and on the first metadata-ready remote body query.
+Raw records: `/private/tmp/vox1047-pipeline-normal-_n0e73rk/`, including
+`original-mapping-followthrough.json` and `first-remote-authorized-session.json`.
+
+A separate fresh two-room operator run delivered exact older originals, continuing Public posts
+and authorized private Session bodies while an explicit Older selection progressed, with actual
+Archive → Private KeyBody → Archive wire service and a persisted 6,829-byte Private ACK.
+It did not establish simultaneous exact eligibility at both Archive completions. Its stricter
+fairness-measurement verdict remains NORESULT, not a starvation finding or an alternation proof.
+Records: `/private/tmp/vox1047-final-fair-sharing-b163m88c/`. Another ordinary scene recovered
+the same original Public/private bodies after idle lock/unlock; active-service cancellation and
+lock retirement were not observed. Its later post-downgrade Session refresh refusals identified
+a separate metadata/authority bug. Records: `/private/tmp/vox1047-lifecycle-p10rc23l/`.
+Both scenes stopped their actual owned processes and released their scratch profile handles.
+
+The listing selected current-member metadata after Drive withdrawal, but fetching its
+name/harness/path still required Drive; an unconditional private-summary read then failed too.
+The repair captures `can_drive` with the row's projection revision, materializes retained
+current-member metadata, and omits private summaries for metadata-only rows. SessionsPage keeps
+one positional summary slot per row: an empty array means no authorized summary, not zero
+private activity. Both encoders, the decoder, TUI and Rust/macOS FFI consumers are migrated.
+Private Summary/Lookup/Exact/activity checks remain unchanged; old decoders are not supported
+by this wire cutover. Independent source review accepted the complete correction.
+
+Ordinary release SHA-256
+`5542da5b1c57c63bad5b5875a89dc636ae56e50b5c0d348e4277d96445e986fe` passed the failed
+listing on complete copies of the stopped original profiles, without replaying grants, hooks
+or posts. Carol's first actual listing returned the retained Session with `can_drive:false`;
+its body query returned the metadata-only privacy notice, not private activity. The original
+Public marker remained readable. Alice still listed and read her exact original private
+prompt/reply with Drive. The actual TUI displayed the room and read-only member, and refused
+the selected private Session without a refresh loop; it exited normally. The native macOS app
+was not launched. Strict workspace/all-target Clippy and the ordinary release build passed.
+Receipts: `/private/tmp/vox1047-downgrade-fixed-3wmkde6h/`. An initial throwaway assertion
+incorrectly expected nonzero exit for the CLI's successful metadata-only privacy notice; this
+apparatus expectation was corrected from the existing output, without repeating the command.
+
+The older measurements and acceptance wording below retain their original revision and scope;
+none is retrospectively promoted to a concurrency, timing, fairness or lifecycle pass.
+
 The independently reviewed design fixes two physical positions, Public and Background, within
 the unchanged two-per-identity and `2 × active-or-retiring identities` daemon pool. Background
 arbitrates addressed recipient-key work and Archive at successful existing quantum boundaries.
@@ -208,16 +271,15 @@ without raising Public credit; `Review1047ServiceIsolation` accepted that exact 
 It has not been rebuilt or exercised. The frozen candidate and its earlier source export remain
 separate from this repair and the lead-owned exact-flow byte-admission integration.
 
-The acceptance interval is the exact Private physical outbound token plus wire request. The
-requester queues its final persisted ACK and FIN and returns `ControlPending` without awaiting
-provider DONE; later reuse of the logical request, a local continuation or a delayed DONE cannot
-extend that wire interval. Productive authenticated Public wire progress must occur before that
-terminal, followed by the unchanged original-hash/body 10 s read and eventual legitimate original
-private Session readability. If the private operation ends before the Public read, that ordering
-must be reported explicitly. A same-setup sole-port inverse must fail that same consumer bound.
-Neither simultaneous charged owners nor the retained preimplementation runs establish #1047
-acceptance. The warm fixture also does not retire the separate cold/Dave and first-Session
-selector observations, whose source, commands and profiles remain preserved.
+The original acceptance interval was the exact Private physical outbound token plus wire
+request. The requester queues its final persisted ACK and FIN and returns `ControlPending`
+without awaiting provider DONE; later reuse of the logical request, a local continuation or a
+delayed DONE cannot extend that wire interval. That physical-ownership rule remains unchanged.
+The then-current proof additionally required the original-hash/body read in ten seconds and a
+same-setup sole-port inverse failing that bound. The later operator ruling above supersedes those
+timing/control requirements, not exact delivery, legitimate original private readability or
+ownership. Simultaneous charged owners alone never establish productive concurrency. The
+separate cold/Dave and first-Session observations retain their original commands and profiles.
 
 The composed candidate next exposed delayed seat handling during the hosted journey.
 The revised candidate fences seat decisions against their own actor-admitted roster save

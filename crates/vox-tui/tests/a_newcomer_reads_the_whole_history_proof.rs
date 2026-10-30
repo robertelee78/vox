@@ -442,11 +442,8 @@ fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
         let (ok, out, err) = vox(dir, &args, None);
         if !ok
             && err.lines().any(|line| {
-                matches!(
-                    line.trim(),
-                    "vox: the room changed while reading; refresh and retry"
-                        | "vox: node: the room changed while reading; refresh and retry"
-                )
+                line.trim()
+                    .ends_with("the room changed while reading; refresh and retry")
             })
         {
             before = None;
@@ -1873,11 +1870,8 @@ fn converged(staged: &Staged) {
                 let (ok, out, err) = vox(dir, &as_node(&["room", "read", room], *node), None);
                 if !ok
                     && err.lines().any(|line| {
-                        matches!(
-                            line.trim(),
-                            "vox: the room changed while reading; refresh and retry"
-                                | "vox: node: the room changed while reading; refresh and retry"
-                        )
+                        line.trim()
+                            .ends_with("the room changed while reading; refresh and retry")
                     })
                 {
                     // Follow the same explicit refresh instruction as room_rows; a refused

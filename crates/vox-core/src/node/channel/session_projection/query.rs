@@ -97,10 +97,11 @@ pub(crate) struct Row {
     pub ended_millis: Option<u64>,
     pub opening: Digest32,
     pub ended: Option<Digest32>,
+    pub can_drive: bool,
 }
 
-impl From<Descriptor> for Row {
-    fn from(row: Descriptor) -> Self {
+impl Row {
+    fn new(row: Descriptor, can_drive: bool) -> Self {
         let text = |field: Field| Text {
             bytes: field.bytes,
             hash: field.hash,
@@ -116,6 +117,7 @@ impl From<Descriptor> for Row {
             ended_millis: row.ended.map(|end| end.position.created),
             opening: row.opening.position.hash,
             ended: row.ended.map(|end| end.position.hash),
+            can_drive,
         }
     }
 }
@@ -796,7 +798,7 @@ impl ChannelState {
                         opening: row.opening.position.hash,
                         ended,
                     };
-                    rows.push((Row::from(row), cursor));
+                    rows.push((Row::new(row, true), cursor));
                 }
                 rows.reverse();
                 Ok(Reply::Lifecycle {
@@ -850,7 +852,7 @@ impl ChannelState {
                     return Err(Failure::Request("Session join metadata exceeds one page"));
                 }
                 Ok(Reply::Page {
-                    rows: row.map(Row::from).into_iter().collect(),
+                    rows: row.map(|row| Row::new(row, true)).into_iter().collect(),
                     more: false,
                     revision: Revision {
                         member: Some(node),
@@ -877,7 +879,9 @@ impl ChannelState {
                     .authors
                     .keys()
                     .copied()
-                    .filter(|member| !self.has_left(member))
+                    .filter(|member| {
+                        !self.has_left(member) && (!open_only || authors.contains(member))
+                    })
                     .collect();
                 let mut cursor = match after {
                     None => 0,
@@ -916,7 +920,8 @@ impl ChannelState {
                     }
                     bytes = bytes.saturating_add(cost);
                     cursor = id;
-                    rows.push(Row::from(row));
+                    let can_drive = authors.contains(&row.node);
+                    rows.push(Row::new(row, can_drive));
                     candidate = next(&read, &listed, cursor, open_only, &mut retired_remaining)?;
                 }
                 Ok(Reply::Page {
@@ -937,7 +942,7 @@ impl ChannelState {
                     .map(|id| live_descriptor(&read, id))
                     .transpose()?
                     .flatten()
-                    .map(Row::from);
+                    .map(|row| Row::new(row, true));
                 proven(row.is_some())?;
                 Ok(Reply::Page {
                     rows: row.into_iter().collect(),
@@ -953,7 +958,7 @@ impl ChannelState {
                     .map(|id| live_descriptor(&read, id))
                     .transpose()?
                     .flatten()
-                    .map(Row::from);
+                    .map(|row| Row::new(row, true));
                 proven(row.is_some())?;
                 Ok(Reply::Lookup(row))
             }
@@ -971,7 +976,7 @@ impl ChannelState {
                 if !read.retained(row.opening)? {
                     return Err(Failure::Request(CHANGED));
                 }
-                if !authors.contains(&row.node) {
+                if !self.authors.contains_key(&row.node) || self.has_left(&row.node) {
                     return Err(Failure::Request(CHANGED));
                 }
                 let field = match field {
