@@ -7448,11 +7448,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
                 .any(|member| member == &fps[1])
         },
     );
-    // Source key-delivery settlement does not establish receipt of this fresh post or its
-    // current consent at Bob. Stage those inputs before judging a render continuation.
-    while !room_hashes(&bob, "bob", &rooms[0]).contains(&isolation_hash) {
-        std::thread::yield_now();
-    }
+    // This fresh message is a key-arrival canary for the following semantic checks, not an
+    // already-retained-input continuation claim. Establish its actual readable baseline.
     wait_trust_detail(&bob, "bob", &rooms[0], "alice", "you trust each other");
     wait_governance_current(
         &bob,
@@ -7460,14 +7457,35 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         &rooms[0],
         "Bob's post-removal authority facts never became current",
     );
-    assert_exact_read_rows(
-        &bob,
-        "bob",
-        &rooms[0],
-        std::slice::from_ref(&isolation_hash),
-        std::slice::from_ref(&isolation_text),
-        "Bob received Alice's post-removal generation",
-    );
+    loop {
+        let rows = room_rows(&bob, &rooms[0]);
+        let canary: Vec<_> = rows
+            .iter()
+            .filter(|row| row["entry_hash"] == isolation_hash)
+            .collect();
+        if canary
+            .iter()
+            .any(|row| row["envelope"]["body"].as_str().is_some())
+        {
+            assert_eq!(
+                canary.len(),
+                1,
+                "PRODUCT: Bob showed the exact post-removal canary more than once: {canary:?}"
+            );
+            assert_eq!(
+                canary[0]["envelope"]["body"].as_str(),
+                Some(isolation_text.as_str()),
+                "PRODUCT: Bob's exact post-removal canary had the wrong readable body: {canary:?}"
+            );
+            assert_eq!(
+                canary[0]["owed"].as_bool(),
+                Some(false),
+                "PRODUCT: Bob's readable post-removal canary still said its body was owed: {canary:?}"
+            );
+            break;
+        }
+        std::thread::yield_now();
+    }
 
     // A same-value authenticated action remains in the immutable room order. Its exact row and
     // authority-page completion stage the later sequence; revision cardinality is not a verdict.
@@ -7538,10 +7556,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // package from Carol's removal can enter the interval below and masquerade as reset or grant2.
     // The original Alice→Bob grant is already user-visible and its sender key is held. Take Bob
     // offline, then drive one source-owned sender-generation bound through the shipped post
-    // command. The rotation appends an authenticated Presence reset between the original grant
-    // and Alice's automatic, equal grant to every still-trusted reader. Bob's sparse catch-up
-    // admits the newest control fact before filling the older reset, which is the reachable
-    // grant₁ → reset → identical grant₂ → late-reset order: sequence, not arrival, must win.
+    // command. Rotation appends a Presence reset between the original grant and Alice's equal
+    // grant to each still-trusted reader. The live and restarted answers must agree with that
+    // authenticated sequence; a diagnostic room-order read does not prove network arrival order.
     assert_eq!(
         trust_detail(&bob, "bob", &rooms[0], "alice"),
         "you trust each other",
@@ -7581,7 +7598,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     let (last_rotated_hash, last_rotated_text) = last_rotated
         .unwrap_or_else(|| panic!("APPARATUS: the source-owned rotation bound was empty"));
     // The source transaction appends Presence, an optional key package, then consent. Capture
-    // that quiet interval to identify the reset and grant before staging their late arrival.
+    // that quiet interval to identify the exact reset and newer grant for the peer's catch-up.
     let (after_grant2, transition_rows) = loop {
         let order = room_hashes(&alice, "alice", &rooms[0]);
         let rows: Vec<_> = order
@@ -7643,22 +7660,8 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
     attached(&bob, "bob-repeated-grant");
     // A responding daemon may still be reopening this room. Stage its shipped open state
-    // before asking the late-reset ordering question; preparation is not that claim's verdict.
+    // before observing the authenticated sequence; preparation is not a semantic verdict.
     wait_room_open(&bob, &rooms[0], "bob-repeated-grant");
-    // Sparse catch-up must first expose the newest grant2 while the older Presence reset is still
-    // absent. This is the apparatus boundary that makes the later reset genuinely late rather than
-    // merely asserting an eventual set. If reset arrives first, this run did not stage the claim.
-    loop {
-        let held = room_hashes(&bob, "bob", &rooms[0]);
-        if held.contains(&grant2_hash) && !held.contains(&reset_hash) {
-            break;
-        }
-        assert!(
-            !held.contains(&reset_hash),
-            "APPARATUS: Bob received Presence reset {reset_hash} before the newer grant2 {grant2_hash}, so late-reset arrival was not staged; held order {held:?}"
-        );
-        std::thread::yield_now();
-    }
     loop {
         let held = room_hashes(&bob, "bob", &rooms[0]);
         if [&reset_hash, &grant2_hash]
@@ -7681,13 +7684,13 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         &bob,
         "bob",
         &rooms[0],
-        "the equal repeated grant and late reset never completed their bounded governance fold",
+        "the source-generated reset and newer equal grant never completed their governance fold",
     );
     assert_eq!(
         trust_detail(&bob, "bob", &rooms[0], "alice"),
         "you trust each other",
-        "PRODUCT: after the equal repeated grant and late reset completed, Bob no longer saw \
-         Alice's newer grant as effective"
+        "PRODUCT: after the source-generated reset and newer equal grant completed, Bob no \
+         longer saw Alice's newer grant as effective"
     );
     assert_exact_read_rows(
         &bob,
@@ -7695,12 +7698,12 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         &rooms[0],
         std::slice::from_ref(&last_rotated_hash),
         std::slice::from_ref(&last_rotated_text),
-        "the newer equal grant and late older reset reached Bob",
+        "the source-generated reset and newer equal grant reached Bob",
     );
 
     // Restart with Alice unavailable. The same exact retained object still reading proves the
-    // durable Consent locator advanced to grant₂; the pre-restart observation above proves the
-    // live RAM sequence also rejected the late, older reset.
+    // durable Consent locator names grant₂. The pre-restart observation proves the live answer
+    // agrees with the authenticated sequence; no particular network arrival order is claimed.
     alice_restarted.stop();
     bob_daemon.stop();
     bob_daemon = daemon_env(&bob, "bob-repeated-grant-restarted", &package_knob);
