@@ -276,6 +276,22 @@ the exact retained descendant without revealing its body; it is not an uninterru
 connection or full-journey result. The original stalled run and profiles remain retained.
 The diagnostic TempDir-retention line was removed before the next full journey.
 
+Exact candidate `376088bf5dd4342151b699e5869da0faefa7713d` subsequently passed the complete
+release-profile retained-history journey once (395.23 s), strict workspace/all-target Clippy
+and the normal release build. Its ordinary-feature binary, SHA-256
+`73cebb8e90e658c60e367064073cce744a7a4e7be0537bf3c589e3780e4f3dba`, also restored the copied
+stalled profiles: Bob reported revoked consent, retained the exact descendant hash and did not
+show its body. Both scratch owners stopped cleanly with no remaining profile handles.
+Independent complete exact-head authority and consumer source reviews accepted that source.
+
+The isolated continuation mutant failed on exact original retained rows after source-offline
+restart; the same-name mutant failed on the additional visible notice. The behind-cursor-only
+expiry mutant survived, and removing settlement invalidation produced a nonterminal maintenance
+observation, not a valid consumer red. Neither is credited. The expiry journey is to stage its
+final roster assertion on the next published semantic meaning, rather than waiting for the
+expected roster answer or a transient refreshing response. Its semantic control is to omit
+effective-grant filtering when rebuilding the cached administrator roster.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at
