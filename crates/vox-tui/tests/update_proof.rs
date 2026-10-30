@@ -43,7 +43,10 @@ mod release_server;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
-optional_proof::not_run!(an_older_release_updates_itself_and_refuses_a_bad_download);
+optional_proof::not_run!(
+    an_older_release_updates_itself_and_refuses_a_bad_download,
+    an_update_and_rollback_leave_one_launchable_vox,
+);
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -408,8 +411,11 @@ fn dispose(title: &str, claims: &[Claim], receipts: &BTreeMap<String, String>, a
 
 /// `vox --version` as the binary at `path` answers it, or empty if it cannot be run.
 fn reports(path: &Path) -> String {
+    let scratch = tmpdir();
     Command::new(path)
         .arg("--version")
+        .env("VOX_DATA_DIR", scratch.path().join("data"))
+        .env("VOX_CONFIG_DIR", scratch.path().join("config"))
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default()
@@ -670,6 +676,20 @@ fn app_says(app: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// A retained bundle is not an application, but preserves its original plist for rollback.
+#[cfg(target_os = "macos")]
+fn kept_app_says(app: &Path) -> String {
+    if app.join("Contents/Info.plist").exists() {
+        return String::new();
+    }
+    Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", "Print :CFBundleShortVersionString"])
+        .arg(app.join("Contents/Info.plist.kept"))
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default()
+}
+
 #[cfg(target_os = "macos")]
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -696,9 +716,16 @@ fn bundle_release(root: &Path, channels: &[(&str, Option<&str>)]) {
 /// [`bundle_release`] of `version`, its app carrying `helper` as its vox.
 #[cfg(target_os = "macos")]
 fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&str, Option<&str>)]) {
-    let triple = target_triple();
     let work = tmpdir();
     let app = app_bundle(work.path(), version, helper);
+    bundle_release_app(root, version, &app, channels);
+}
+
+/// Serve the exact signed bundle bytes; neither the helper nor the plist is rewritten.
+#[cfg(target_os = "macos")]
+fn bundle_release_app(root: &Path, version: &str, app: &Path, channels: &[(&str, Option<&str>)]) {
+    let triple = target_triple();
+    let work = tmpdir();
     let zip_name = format!("Vox-{version}-{triple}.zip");
     let zip = work.path().join(&zip_name);
     let zipped = Command::new("/usr/bin/ditto")
@@ -828,7 +855,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
         let prev_cli = reports(&apps.join(".Vox.app.previous/Contents/Helpers/vox"));
-        let prev_app = app_says(&apps.join(".Vox.app.previous"));
+        let prev_app = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.update_replaces_the_whole_bundle",
             out.status.success()
@@ -1011,7 +1038,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let text = said(&out);
         let cli = reports(&link);
         let app = app_says(&apps.join("Vox.app"));
-        let kept = app_says(&apps.join(".Vox.app.previous"));
+        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.rollback_restores_the_whole_previous_bundle",
             out.status.success()
@@ -1047,7 +1074,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         let out = vox(&link, home, &["update", "--rollback"], &base);
         let text = said(&out);
         let app = app_says(&apps.join("Vox.app"));
-        let kept = app_says(&apps.join(".Vox.app.previous"));
+        let kept = kept_app_says(&apps.join(".Vox.app.previous"));
         claims.push(claim(
             "bundle.a_cut_update_keeps_the_bundle_it_replaced",
             !cut.status.success()
@@ -1735,4 +1762,875 @@ fn assert_light_hooks(home: &Path, said: &str) {
             && said.contains(path.to_str().expect("APPARATUS: UTF-8 scratch path")),
             "PRODUCT: vox update must install {harness}'s light hook and name {path:?}; file={content:?}; output={said}");
     }
+}
+
+/// LaunchServices' own registration tool. Every call in this proof names one exact scratch
+/// bundle; cleanup never resets the database and never unregisters the person's Vox.app.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/\
+                          LaunchServices.framework/Support/lsregister";
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn lsregister(flag: &str, bundle: &Path) -> Result<(), String> {
+    let out = Command::new(LSREGISTER)
+        .arg(flag)
+        .arg(bundle)
+        .output()
+        .map_err(|e| format!("could not run lsregister for {}: {e}", bundle.display()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "lsregister {flag} {} exited {}: {}",
+            bundle.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Exact paths LaunchServices currently associates with `identifier`.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn launch_services_paths(identifier: &str) -> Result<Vec<PathBuf>, String> {
+    let out = Command::new(LSREGISTER)
+        .arg("-dump")
+        .output()
+        .map_err(|e| format!("could not ask LaunchServices for its records: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("lsregister -dump exited {}", out.status));
+    }
+    let dump = String::from_utf8(out.stdout)
+        .map_err(|e| format!("LaunchServices returned a non-UTF-8 database dump: {e}"))?;
+    let mut path = None;
+    let mut found = Vec::new();
+    let mut parsed_paths = 0_usize;
+    let mut parsed_identifiers = 0_usize;
+    for line in dump.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("path:") {
+            let value = value.trim();
+            let value = value.split_once(" (0x").map_or(value, |(before, _)| before);
+            path = Some(PathBuf::from(value));
+            parsed_paths += 1;
+        } else if line
+            .strip_prefix("identifier:")
+            .is_some_and(|value| value.trim() == identifier)
+        {
+            parsed_identifiers += 1;
+            if let Some(value) = path.take() {
+                found.push(value);
+            }
+        } else if line.starts_with("identifier:") {
+            parsed_identifiers += 1;
+        }
+    }
+    if parsed_paths == 0 || parsed_identifiers == 0 {
+        return Err(format!(
+            "could not parse LaunchServices' database dump (paths={parsed_paths}, identifiers={parsed_identifiers})"
+        ));
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+/// Paths this proof may have registered. Drop removes each embedded extension by its exact path,
+/// then repeats `lsregister -u` on the exact outer paths only, as app-proofs.sh does.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+struct LaunchServicesCleanup {
+    bundles: Vec<PathBuf>,
+    extensions: Vec<PathBuf>,
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl LaunchServicesCleanup {
+    fn new() -> Self {
+        Self {
+            bundles: Vec::new(),
+            extensions: Vec::new(),
+        }
+    }
+
+    fn register(&mut self, bundle: &Path) -> Result<(), String> {
+        lsregister("-f", bundle)?;
+        self.remember(bundle);
+        Ok(())
+    }
+
+    fn remember(&mut self, bundle: &Path) {
+        self.bundles.push(bundle.to_path_buf());
+        let plugins = bundle.join("Contents/PlugIns");
+        match std::fs::read_dir(&plugins) {
+            Ok(entries) => {
+                self.extensions.extend(
+                    entries
+                        .map(|entry| {
+                            entry.unwrap_or_else(|e| {
+                                panic!(
+                                    "APPARATUS: could not enumerate {} for cleanup: {e}",
+                                    plugins.display()
+                                )
+                            })
+                        })
+                        .map(|entry| entry.path())
+                        .filter(|path| path.extension().is_some_and(|ext| ext == "appex")),
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!(
+                "APPARATUS: could not inspect {} for cleanup: {e}",
+                plugins.display()
+            ),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl Drop for LaunchServicesCleanup {
+    fn drop(&mut self) {
+        self.extensions.sort(); self.extensions.dedup();
+        self.bundles.sort(); self.bundles.dedup();
+        for extension in &self.extensions {
+            let _ = Command::new("/usr/bin/pluginkit").arg("-r").arg(extension).output();
+        }
+        for bundle in &self.bundles { let _ = lsregister("-u", bundle); }
+        // Both tools return nonzero for an already absent path. Determine cleanup from their
+        // databases rather than treating that exit status as evidence a registration remains.
+        let plugins = Command::new("/usr/bin/pluginkit").args(["-m", "-A", "-D", "-v"]).output();
+        let records = Command::new(LSREGISTER).arg("-dump").output();
+        let check = |out: std::io::Result<Output>, paths: &[PathBuf], label: &str| -> Result<(), String> {
+            let out = out.map_err(|e| format!("{label}: {e}"))?;
+            if !out.status.success() { return Err(format!("{label}: query exited {}", out.status)); }
+            let text = String::from_utf8(out.stdout).map_err(|_| format!("{label}: non-UTF-8 output"))?;
+            for path in paths {
+                let logical = path.to_string_lossy();
+                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
+                    let value = logical.as_ref();
+                    if value.starts_with("/var/") { PathBuf::from(format!("/private{value}")) } else { path.clone() }
+                });
+                if text.lines().any(|line| line.contains(logical.as_ref()) || line.contains(canonical.to_string_lossy().as_ref())) {
+                    return Err(format!("{label}: scratch path {} remains registered", path.display()));
+                }
+            }
+            Ok(())
+        };
+        let problems = [check(plugins, &self.extensions, "pluginkit"), check(records, &self.bundles, "LaunchServices")];
+        for problem in problems.into_iter().filter_map(Result::err) {
+            let message = format!("APPARATUS: cleanup not confirmed: {problem}");
+            if std::thread::panicking() { eprintln!("{message}"); } else { panic!("{message}"); }
+        }
+    }
+}
+
+/// What `open -b` and LaunchServices' resulting application record said.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+struct OpenedBundle {
+    ok: bool,
+    path: Option<PathBuf>,
+    error: String,
+}
+
+/// Ask LaunchServices to open one identifier and observe the exact application from
+/// `NSWorkspace.didLaunchApplicationNotification`. The observer is subscribed before `open`,
+/// announces that subscription before the request is submitted, and terminates only the exact
+/// launched process after recording its bundle path. `open -W` and that notification are the two
+/// structural outcomes: a refused request is PRODUCT evidence, while an observer/setup failure is
+/// APPARATUS. There is no polling, repeated process spawn, silence threshold, or elapsed verdict.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn opened_bundle(
+    identifier: &str,
+    data: &Path,
+    config: &Path,
+    home: &Path,
+) -> Result<OpenedBundle, String> {
+    use std::io::BufRead as _;
+
+    std::fs::create_dir_all(home)
+        .map_err(|e| format!("could not make scratch HOME {}: {e}", home.display()))?;
+
+    // This process is proof apparatus, not the product oracle. It reports the exact launch event
+    // that `open -b` caused and then asks that scratch process to terminate so `open -W` can join.
+    const OBSERVER: &str = r#"
+import AppKit
+import Darwin
+
+let wanted = ProcessInfo.processInfo.environment["VOX_PROOF_OBSERVER_IDENTIFIER"]!
+let center = NSWorkspace.shared.notificationCenter
+var token: NSObjectProtocol?
+token = center.addObserver(
+    forName: NSWorkspace.didLaunchApplicationNotification,
+    object: nil,
+    queue: nil
+) { note in
+    guard
+        let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+        app.bundleIdentifier == wanted
+    else { return }
+    print("LAUNCHED")
+    print(app.bundleIdentifier ?? "")
+    print(app.processIdentifier)
+    print(app.bundleURL?.path ?? "")
+    print(app.forceTerminate() ? "TERMINATED" : "TERMINATE_FAILED")
+    fflush(stdout)
+    exit(0)
+}
+print("READY")
+fflush(stdout)
+withExtendedLifetime(token) { RunLoop.main.run() }
+"#;
+    let mut observer = Command::new("/usr/bin/swift")
+        .args(["-e", OBSERVER])
+        .env("VOX_PROOF_OBSERVER_IDENTIFIER", identifier)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start the LaunchServices observer: {e}"))?;
+    let observer_stdout = observer
+        .stdout
+        .take()
+        .ok_or_else(|| "LaunchServices observer had no stdout".to_owned())?;
+    let mut observer_lines = std::io::BufReader::new(observer_stdout).lines();
+    let ready = observer_lines
+        .next()
+        .transpose()
+        .map_err(|e| format!("could not read LaunchServices observer readiness: {e}"))?;
+    if ready.as_deref() != Some("READY") {
+        let _ = observer.kill();
+        let status = observer.wait();
+        let mut error = String::new();
+        if let Some(mut stderr) = observer.stderr.take() {
+            use std::io::Read as _;
+            let _ = stderr.read_to_string(&mut error);
+        }
+        return Err(format!(
+            "LaunchServices observer did not become ready: line={ready:?}, status={status:?}, stderr={:?}",
+            error.trim()
+        ));
+    }
+
+    enum Observation {
+        Launch(Result<(String, u32, PathBuf, bool), String>),
+        Open(std::io::Result<std::process::Output>),
+    }
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let launch_tx = observed_tx.clone();
+    let observer_reader = std::thread::spawn(move || {
+        let mut read = || -> Result<(String, u32, PathBuf, bool), String> {
+            let mut next = |what: &str| {
+                observer_lines
+                    .next()
+                    .transpose()
+                    .map_err(|e| format!("could not read observer {what}: {e}"))?
+                    .ok_or_else(|| format!("observer ended before reporting {what}"))
+            };
+            if next("event")? != "LAUNCHED" {
+                return Err("observer reported an unknown launch event".to_owned());
+            }
+            let launched_identifier = next("bundle identifier")?;
+            let pid = next("process identifier")?
+                .parse::<u32>()
+                .map_err(|e| format!("observer reported an invalid process identifier: {e}"))?;
+            let path = PathBuf::from(next("bundle path")?);
+            let terminated = match next("termination result")?.as_str() {
+                "TERMINATED" => true,
+                "TERMINATE_FAILED" => false,
+                other => {
+                    return Err(format!(
+                        "observer reported unknown termination result {other:?}"
+                    ))
+                }
+            };
+            Ok((launched_identifier, pid, path, terminated))
+        };
+        let _ = launch_tx.send(Observation::Launch(read()));
+    });
+
+    let mut opened = Command::new("/usr/bin/open");
+    opened
+        .args(["-n", "-W", "-b", identifier, "--env"])
+        .arg(format!("VOX_DATA_DIR={}", data.display()))
+        .arg("--env")
+        .arg(format!("VOX_CONFIG_DIR={}", config.display()))
+        .arg("--env")
+        .arg(format!("HOME={}", home.display()))
+        .arg("--env")
+        .arg(format!(
+            "CLAUDE_CONFIG_DIR={}",
+            home.join(".claude").display()
+        ))
+        .arg("--env")
+        .arg(format!("CODEX_HOME={}", home.join(".codex").display()))
+        .arg("--env")
+        .arg(format!(
+            "OPENCODE_CONFIG_DIR={}",
+            home.join(".config/opencode").display()
+        ))
+        .arg("--env")
+        .arg(format!(
+            "XDG_CONFIG_HOME={}",
+            home.join(".config").display()
+        ))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = match opened.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = observer.kill();
+            let _ = observer.wait();
+            let _ = observer_reader.join();
+            return Err(format!(
+                "could not submit the open request for {identifier}: {e}"
+            ));
+        }
+    };
+    let open_pid = child.id();
+    let open_tx = observed_tx;
+    let open_waiter = std::thread::spawn(move || {
+        let _ = open_tx.send(Observation::Open(child.wait_with_output()));
+    });
+
+    let mut open_output = None;
+    let launch = loop {
+        match observed_rx
+            .recv()
+            .map_err(|_| "launch observers ended without an outcome".to_owned())?
+        {
+            Observation::Open(Ok(out)) if !out.status.success() => {
+                let _ = observer.kill();
+                let _ = observer.wait();
+                let _ = observer_reader.join();
+                let _ = open_waiter.join();
+                return Ok(OpenedBundle {
+                    ok: false,
+                    path: None,
+                    error: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+                });
+            }
+            Observation::Open(Ok(out)) => open_output = Some(out),
+            Observation::Open(Err(e)) => {
+                let _ = observer.kill();
+                let _ = observer.wait();
+                let _ = observer_reader.join();
+                let _ = open_waiter.join();
+                return Err(format!("could not collect open -W for {identifier}: {e}"));
+            }
+            Observation::Launch(Ok(result)) => break result,
+            Observation::Launch(Err(why)) => {
+                let stop_open = Command::new("/bin/kill")
+                    .args(["-TERM", &open_pid.to_string()])
+                    .output();
+                let stop_observer = observer.kill();
+                let observer_status = observer.wait();
+                let reader_joined = observer_reader.join().is_ok();
+                let open_joined = open_waiter.join().is_ok();
+                return Err(format!(
+                    "LaunchServices observation failed ({why}); cleanup: open={stop_open:?}, observer_stop={stop_observer:?}, observer_status={observer_status:?}, reader_joined={reader_joined}, open_joined={open_joined}"
+                ));
+            }
+        }
+    };
+    let (launched_identifier, pid, path, terminated) = launch;
+    if !terminated {
+        let killed = Command::new("/bin/kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .map_err(|e| format!("could not terminate launched scratch app {pid}: {e}"))?;
+        if !killed.status.success() {
+            let stop_open = Command::new("/bin/kill")
+                .args(["-TERM", &open_pid.to_string()])
+                .output();
+            let observer_status = observer.wait();
+            let reader_joined = observer_reader.join().is_ok();
+            let open_joined = open_waiter.join().is_ok();
+            return Err(format!(
+                "could not terminate launched scratch app {pid}: {}; cleanup: open={stop_open:?}, observer_status={observer_status:?}, reader_joined={reader_joined}, open_joined={open_joined}",
+                String::from_utf8_lossy(&killed.stderr).trim(),
+            ));
+        }
+    }
+    let out = match open_output {
+        Some(out) => out,
+        None => match observed_rx
+            .recv()
+            .map_err(|_| "open -W ended without an outcome".to_owned())?
+        {
+            Observation::Open(result) => result.map_err(|e| e.to_string())?,
+            Observation::Launch(_) => {
+                return Err("LaunchServices observer reported the same launch twice".to_owned())
+            }
+        },
+    };
+    let observer_status = observer
+        .wait()
+        .map_err(|e| format!("could not join LaunchServices observer: {e}"))?;
+    observer_reader
+        .join()
+        .map_err(|_| "LaunchServices observer reader panicked".to_owned())?;
+    open_waiter
+        .join()
+        .map_err(|_| "open -W waiter panicked".to_owned())?;
+    if !observer_status.success() {
+        return Err(format!(
+            "LaunchServices observer exited {observer_status} after reporting a launch"
+        ));
+    }
+    Ok(OpenedBundle {
+        ok: launched_identifier == identifier,
+        path: Some(path),
+        error: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn plist_value(app: &Path, key: &str) -> Result<String, String> {
+    let out = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", &format!("Print :{key}")])
+        .arg(app.join("Contents/Info.plist"))
+        .output()
+        .map_err(|e| format!("could not read {key} from {}: {e}", app.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} has no readable {key}", app.display()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn expected_build_version(version: &str) -> Result<String, String> {
+    let parsed = semver::Version::parse(version)
+        .map_err(|e| format!("the app version {version:?} is not SemVer: {e}"))?;
+    Ok(format!(
+        "{}.{}.{}",
+        parsed
+            .major
+            .checked_add(1)
+            .ok_or_else(|| "the app version's major component cannot be raised".to_owned())?,
+        parsed.minor,
+        parsed.patch
+    ))
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn signed(path: &Path) -> Result<(), String> {
+    let out = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "--deep", "--all-architectures"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not run codesign for {}: {e}", path.display()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the restored {} does not verify: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+fn shipped_notarized(path: &Path) -> Result<(), String> {
+    signed(path)?;
+    let notarized = Command::new("/usr/bin/codesign")
+        .args([
+            "--verify",
+            "--strict",
+            "--deep",
+            "--all-architectures",
+            "--check-notarization",
+            "--test-requirement",
+            "=notarized",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not ask Apple about {}: {e}", path.display()))?;
+    if !notarized.status.success() {
+        return Err(format!(
+            "Apple did not verify {} as notarized: {}",
+            path.display(),
+            String::from_utf8_lossy(&notarized.stderr).trim()
+        ));
+    }
+    let details = Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(path)
+        .output()
+        .map_err(|e| {
+            format!(
+                "could not inspect {}'s signing identity: {e}",
+                path.display()
+            )
+        })?;
+    let words = String::from_utf8_lossy(&details.stderr);
+    if !details.status.success()
+        || !words
+            .lines()
+            .any(|line| line.starts_with("Authority=Developer ID Application:"))
+        || words.lines().any(|line| line == "TeamIdentifier=not set")
+        || !words.lines().any(|line| {
+            line.strip_prefix("TeamIdentifier=")
+                .is_some_and(|team| !team.is_empty() && team != "not set")
+        })
+    {
+        return Err(format!(
+            "{} is not a Developer ID Application artifact with a team identity: {}",
+            path.display(),
+            words.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// A native application opened by its installed path, held until the proof asks it to quit.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+struct HeldApp {
+    observer: std::process::Child,
+    path: PathBuf,
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl HeldApp {
+    fn launch(home: &Path, active: &Path, owned_paths: &[PathBuf]) -> Self {
+        use std::io::BufRead as _;
+        const OBSERVER: &str = r#"
+import AppKit
+import Foundation
+import Darwin
+let wanted = CommandLine.arguments[1]
+let ownedPaths = Set(CommandLine.arguments.dropFirst(2))
+let center = NSWorkspace.shared.notificationCenter
+var launched: NSRunningApplication?
+var ownsLaunch = false
+var askedToQuit = false
+var processExit: DispatchSourceProcess?
+let launchToken = center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { note in
+    guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+          app.bundleIdentifier == wanted else { return }
+    launched = app
+    ownsLaunch = ownedPaths.contains(app.bundleURL?.path ?? "")
+    let pid = app.processIdentifier
+    guard pid > 0 else { exit(4) }
+    // Unregistering the live displaced app can remove its LaunchServices application record.
+    // Observe its physical process, not a later LS termination notification for that record.
+    let monitor = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
+    monitor.setEventHandler { processExit?.cancel(); exit(askedToQuit ? 0 : 4) }
+    processExit = monitor
+    monitor.resume()
+    print(app.bundleURL?.path ?? "")
+    fflush(stdout)
+}
+DispatchQueue.global().async {
+    _ = readLine()
+    DispatchQueue.main.async {
+        guard ownsLaunch, let app = launched else { exit(2) }
+        askedToQuit = true
+        if !app.terminate() { _ = app.forceTerminate(); exit(3) }
+    }
+}
+print("READY")
+fflush(stdout)
+withExtendedLifetime(launchToken) { RunLoop.main.run() }
+"#;
+        let mut observer = Command::new("/usr/bin/swift")
+            .args(["-e", OBSERVER, "us.vox.app"])
+            .arg(active)
+            .args(owned_paths)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn().expect("APPARATUS: start native launch observer");
+        let mut lines = std::io::BufReader::new(observer.stdout.take().expect("APPARATUS: observer stdout"));
+        let mut line = String::new();
+        lines.read_line(&mut line).expect("APPARATUS: observer readiness");
+        assert_eq!(line.trim(), "READY", "APPARATUS: observer did not subscribe");
+        let opened = Command::new("/usr/bin/open")
+            .args(["-n", "--env"])
+            .arg(format!("VOX_DATA_DIR={}", home.join("data").display()))
+            .arg("--env").arg(format!("VOX_CONFIG_DIR={}", home.join("config").display()))
+            .arg("--env").arg(format!("HOME={}", home.display()))
+            .arg(active)
+            .output().expect("APPARATUS: open installed scratch application by path");
+        assert!(opened.status.success(), "PRODUCT: installed app path launch refused: {}", said(&opened));
+        line.clear();
+        lines.read_line(&mut line).expect("APPARATUS: exact native launch event");
+        let path = PathBuf::from(line.trim());
+        let app = Self { observer, path };
+        assert_eq!(app.path, active, "PRODUCT: path launch selected the wrong Vox.app");
+        app
+    }
+
+    fn quit(mut self) {
+        use std::io::Write as _;
+        if let Some(mut input) = self.observer.stdin.take() {
+            let _ = writeln!(input, "QUIT");
+        }
+        let status = self.observer.wait().expect("APPARATUS: observe graceful app termination");
+        assert!(status.success(), "PRODUCT: scratch Vox did not quit gracefully: {status}, launched {:?}", self.path);
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl Drop for HeldApp {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        if let Some(mut input) = self.observer.stdin.take() {
+            let _ = writeln!(input, "QUIT");
+        }
+        let _ = self.observer.wait();
+    }
+}
+
+/// Cleanup observes only this invocation's authenticated scratch control socket. No pid from
+/// another profile, a process-name search, or an identifier-wide operation is used.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+struct ScratchDaemonCleanup(PathBuf);
+
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+impl Drop for ScratchDaemonCleanup {
+    fn drop(&mut self) {
+        let stop = || -> Result<(), String> {
+            let data = self.0.join("data");
+            let config = self.0.join("config");
+            let account = vox_core::node::paths::Account::of(Some(&data), Some(&config))
+                .map_err(|e| e.to_string())?;
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|e| e.to_string())?;
+            let hello = match rt.block_on(vox_core::node::daemonipc::DaemonClient::observe(&account.socket())) {
+                Ok(hello) => hello,
+                Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            };
+            Command::new("/bin/kill").args(["-TERM", &hello.pid.to_string()]).status()
+                .map_err(|e| e.to_string())?;
+            // The daemon owns this lock for its physical lifetime, including store shutdown.
+            let lock = std::fs::OpenOptions::new().read(true).write(true).open(account.lock_file())
+                .map_err(|e| e.to_string())?;
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+                .map_err(|e| e.to_string())
+        };
+        if let Err(error) = stop() {
+            let message = format!("APPARATUS: scratch daemon cleanup not confirmed: {error}");
+            if std::thread::panicking() { eprintln!("{message}"); } else { panic!("{message}"); }
+        }
+    }
+}
+
+/// Source-bound signed install/update/identifier-open/rollback, plus real transition recovery.
+/// The prior artifact is built with the existing test-knobs feature; the candidate is a normal
+/// release-feature build. Neither signed artifact is modified after signing or notarization.
+#[cfg(all(target_os = "macos", feature = "optional-proofs"))]
+#[test]
+#[ignore = "optional signed macOS guest journey; docs/release/optional-proofs.md"]
+fn an_update_and_rollback_leave_one_launchable_vox() {
+    use std::io::BufRead as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let model = Command::new("/usr/sbin/sysctl").args(["-n", "hw.model"]).output()
+        .expect("APPARATUS: query guest hardware");
+    assert!(String::from_utf8_lossy(&model.stdout).trim().starts_with("VirtualMac"),
+        "APPARATUS: this identifier proof runs only in the dedicated macOS guest");
+    let prior = PathBuf::from(std::env::var_os("VOX_PROOF_PREVIOUS_SHIPPED_APP")
+        .expect("APPARATUS: missing exact signed prior artifact"));
+    let candidate = PathBuf::from(std::env::var_os("VOX_PROOF_SHIPPED_APP")
+        .expect("APPARATUS: missing exact signed candidate artifact"));
+    let before_version = plist_value(&prior, "CFBundleShortVersionString")
+        .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    let after_version = plist_value(&candidate, "CFBundleShortVersionString")
+        .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    let prior_semver = semver::Version::parse(&before_version).expect("APPARATUS: prior SemVer");
+    let candidate_semver = semver::Version::parse(&after_version).expect("APPARATUS: candidate SemVer");
+    assert!(candidate_semver > prior_semver, "APPARATUS: candidate must be newer than prior");
+    for app in [&prior, &candidate] {
+        assert_eq!(plist_value(app, "CFBundleIdentifier").as_deref(), Ok("us.vox.app"),
+            "APPARATUS: artifact identifier is not the real app identifier");
+        shipped_notarized(app).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    }
+    let mut extension_names = Vec::new();
+    for app in [&prior, &candidate] {
+        let plugins = app.join("Contents/PlugIns");
+        for entry in std::fs::read_dir(&plugins).expect("APPARATUS: signed artifact extensions") {
+            let entry = entry.expect("APPARATUS: signed extension entry");
+            if entry.path().extension().is_some_and(|ext| ext == "appex") {
+                extension_names.push(entry.file_name());
+            }
+        }
+    }
+    extension_names.sort();
+    extension_names.dedup();
+    assert!(launch_services_paths("us.vox.app").expect("APPARATUS: read initial registration").is_empty(),
+        "APPARATUS: dedicated guest already has us.vox.app registrations; do not clear another run's paths");
+    let prior_tree = tmpdir();
+    let candidate_tree = tmpdir();
+    bundle_release_app(prior_tree.path(), &before_version, &prior, &[("stable", None)]);
+    bundle_release_app(candidate_tree.path(), &after_version, &candidate, &[("stable", None)]);
+    let prior_release = release_server::serve(prior_tree.path()).expect("APPARATUS: serve prior signed artifact");
+    let release = release_server::serve(candidate_tree.path()).expect("APPARATUS: serve signed candidate");
+    let mut claims = Vec::new();
+    let mut receipts = BTreeMap::new();
+    let prior_build = plist_value(&prior, "CFBundleVersion").expect("APPARATUS: prior build number");
+    let candidate_build = plist_value(&candidate, "CFBundleVersion").expect("APPARATUS: candidate build number");
+    let components = |value: &str| value.split('.').map(str::parse::<u64>).collect::<Result<Vec<_>, _>>();
+    claims.push(claim("bundle.signed_build_numbers_follow_release_versions",
+        expected_build_version(&before_version).as_deref() == Ok(prior_build.as_str())
+            && expected_build_version(&after_version).as_deref() == Ok(candidate_build.as_str())
+            && components(&candidate_build).expect("PRODUCT: candidate build number is not numeric")
+                > components(&prior_build).expect("PRODUCT: prior build number is not numeric"),
+        format!("prior={before_version}/{prior_build}, candidate={after_version}/{candidate_build}")));
+
+    for scenario in ["update-and-rollback", "interrupted-publish", "read-only-and-live-retirement"] {
+        let scratch = tempfile::Builder::new().prefix("vox-m29a-").tempdir_in("/Users/Shared")
+            .expect("APPARATUS: visible dedicated scratch root");
+        let home = scratch.path();
+        let apps = home.join("Applications");
+        std::fs::create_dir_all(&apps).expect("APPARATUS: scratch Applications");
+        std::fs::create_dir_all(home.join("config/app")).expect("APPARATUS: scratch app config");
+        write(&home.join("config/app/login-item"), "no\n");
+        let active = apps.join("Vox.app");
+        let previous = apps.join(".Vox.app.previous");
+        let partial = apps.join(".Vox.app.partial");
+        let journal_bundle = apps.join(".Vox.app.publishing/Vox.app");
+        let helper = active.join("Contents/Helpers/vox");
+        let mut cleanup = LaunchServicesCleanup::new();
+        let _daemons = ScratchDaemonCleanup(home.to_path_buf());
+        // Record exact extension paths before a transition can rename the signed bundle.
+        for path in [&active, &previous, &partial, &journal_bundle] {
+            cleanup.remember(path);
+            for name in &extension_names {
+                cleanup.extensions.push(path.join("Contents/PlugIns").join(name));
+            }
+        }
+        let install = Command::new("/bin/sh").arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"))
+            .env_clear().env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", home).env("SHELL", "/bin/zsh")
+            .env("VOX_DATA_DIR", home.join("data")).env("VOX_CONFIG_DIR", home.join("config"))
+            .env("VOX_APPLICATIONS_DIR", &apps).env("VOX_INSTALL_DIR", home.join("bin"))
+            .env("VOX_RELEASE_BASE", &prior_release.base).env("VOX_PROOF_APPLE_VERIFY", "1")
+            .env("VOX_NO_SHELL_SETUP", "1").env("VOX_NO_SKILL_INSTALL", "1")
+            .output().expect("APPARATUS: launch real scratch installer");
+        println!("{scenario} install {}: {}", install.status, said(&install));
+        assert!(install.status.success(), "PRODUCT: signed scratch install failed: {}", said(&install));
+        cleanup.remember(&active);
+        let env = [("VOX_TEST_RELEASE_BASE", release.base.as_str()), ("VOX_TEST_APPLE_VERIFY", "1"),
+            ("VOX_NO_SHELL_SETUP", "1"), ("VOX_NO_SKILL_INSTALL", "1")];
+
+        if scenario == "interrupted-publish" {
+            let mut daemon = vox_command(&helper, home, &["daemon", "--listen", "127.0.0.1:0"], &env)
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit())
+                .spawn().expect("APPARATUS: start scratch foreground daemon");
+            let mut ready = String::new();
+            std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: daemon stdout"))
+                .read_line(&mut ready).expect("APPARATUS: daemon startup event");
+            assert!(ready.starts_with("vox daemon: control socket "), "APPARATUS: daemon did not start: {ready}");
+            let cut_env: Vec<_> = env.iter().copied().chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")]).collect();
+            let cut = vox(&helper, home, &["update"], &cut_env);
+            assert!(!cut.status.success() && partial.is_dir(), "APPARATUS: real publish did not reach the cut-after-swap boundary: {}", said(&cut));
+            let inode = std::fs::metadata(&active).expect("APPARATUS: published inode").ino();
+            let repaired = vox(&helper, home, &["update"], &env);
+            let text = said(&repaired);
+            println!("interrupted publish repair {}: {text}", repaired.status);
+            let last = text.lines().last().unwrap_or("");
+            claims.push(claim("bundle.recovery_finishes_a_real_cut_without_another_swap",
+                repaired.status.success()
+                    && inode == std::fs::metadata(&active).expect("APPARATUS: repaired inode").ino()
+                    && kept_app_says(&previous) == before_version
+                    && !apps.join(".Vox.app.publishing").exists()
+                    && text.contains(&format!("the vox daemon was restarted and runs vox {after_version}"))
+                    && last.contains("without swapping Vox.app") && last.contains("cut short"),
+                text.clone()));
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            receipts.insert(scenario.to_owned(), text);
+            continue;
+        }
+
+        let old_app = HeldApp::launch(home, &active, &cleanup.bundles);
+        let updated = vox(&helper, home, &["update"], &env);
+        println!("{scenario} update {}: {}", updated.status, said(&updated));
+        claims.push(claim("bundle.kept_bundle_is_not_an_application",
+            updated.status.success() && kept_app_says(&previous) == before_version,
+            format!("update={}, kept version {:?}: {}", updated.status, kept_app_says(&previous), said(&updated))));
+        // A failed product prerequisite must reach its own verdict before later apparatus
+        // depends on the retained plist. Unwinding still owns the running scratch app.
+        if kept_app_says(&previous) != before_version || !updated.status.success() {
+            dispose("signed one-launchable-app journey", &claims, &receipts, false);
+        }
+        old_app.quit();
+        claims.push(claim("bundle.quitting_the_renamed_app_does_not_register_it",
+            !launch_services_paths("us.vox.app").expect("APPARATUS: records after graceful quit").contains(&previous),
+            format!("records={:?}", launch_services_paths("us.vox.app"))));
+        let opened = opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
+            .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        claims.push(claim("bundle.identifier_launches_the_signed_updated_bundle",
+            opened.ok && opened.path.as_deref() == Some(active.as_path())
+                && app_says(&active) == after_version && shipped_notarized(&active).is_ok(),
+            format!("selected={:?}, error={:?}", opened.path, opened.error)));
+
+        // Hold the genuinely signed candidate across rollback. The following real update must
+        // retire it, not remove code from under the still-running application.
+        let live_candidate = if scenario == "read-only-and-live-retirement" {
+            Some(HeldApp::launch(home, &active, &cleanup.bundles))
+        } else { None };
+        let rollback = vox(&helper, home, &["update", "--rollback"], &env);
+        println!("{scenario} rollback {}: {}", rollback.status, said(&rollback));
+        claims.push(claim("bundle.rollback_restores_the_signed_bundle_and_disarms_the_displaced_one",
+            rollback.status.success() && app_says(&active) == before_version
+                && shipped_notarized(&active).is_ok() && kept_app_says(&previous) == after_version,
+            said(&rollback)));
+        if scenario == "update-and-rollback" {
+            let opened = opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
+                .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+            claims.push(claim("bundle.identifier_launches_the_signed_rollback",
+                opened.ok && opened.path.as_deref() == Some(active.as_path()),
+                format!("selected={:?}, error={:?}", opened.path, opened.error)));
+        } else {
+            let updated = vox(&helper, home, &["update"], &env);
+            assert!(updated.status.success(), "PRODUCT: second real update failed: {}", said(&updated));
+            let retired: Vec<_> = std::fs::read_dir(&apps).expect("APPARATUS: retired directory")
+                .map(|e| e.expect("APPARATUS: retired entry").path())
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".Vox.app.retired."))).collect();
+            assert_eq!(retired.len(), 1, "PRODUCT: real update removed the still-running retired bundle");
+            let retired = &retired[0];
+            cleanup.remember(retired);
+            // Reproduce a legacy live application record, not a fabricated transition journal.
+            std::fs::rename(retired.join("Contents/Info.plist.kept"), retired.join("Contents/Info.plist"))
+                .expect("APPARATUS: restore original signed plist to reproduce failed legacy set-aside");
+            cleanup.register(retired).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+            assert!(launch_services_paths("us.vox.app").expect("APPARATUS: seeded record").contains(retired),
+                "APPARATUS: exact retained registration was not staged");
+            let mode = std::fs::metadata(retired.join("Contents")).expect("APPARATUS: Contents mode").permissions().mode();
+            std::fs::set_permissions(retired.join("Contents"), std::fs::Permissions::from_mode(mode & !0o222))
+                .expect("APPARATUS: make Contents read-only");
+            let refused = vox(&helper, home, &["update"], &env);
+            std::fs::set_permissions(retired.join("Contents"), std::fs::Permissions::from_mode(mode))
+                .expect("APPARATUS: remove the exact permission obstruction");
+            // Unregister happened before the failed rename. Seed the exact record again so the
+            // unregister inverse has its own causally staged, independent product assertion.
+            cleanup.register(retired).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+            assert!(launch_services_paths("us.vox.app").expect("APPARATUS: re-seeded record").contains(retired),
+                "APPARATUS: registration inverse was not staged before repair");
+            let inode = std::fs::metadata(&active).expect("APPARATUS: active inode").ino();
+            let ready = vox(&helper, home, &["daemon", "--detach", "--listen", "127.0.0.1:0"], &env);
+            assert!(ready.status.success(),
+                "APPARATUS: authenticated scratch daemon was not ready before restart measurement: {}", said(&ready));
+            let repaired = vox(&helper, home, &["update"], &env);
+            let text = said(&repaired);
+            println!("read-only repair {}: {text}; refusal: {}", repaired.status, said(&refused));
+            let records = launch_services_paths("us.vox.app").expect("APPARATUS: records after retained repair");
+            claims.push(claim("bundle.kept_bundle_has_no_launchservices_record", !records.contains(retired),
+                format!("seeded exact path={}, records={records:?}", retired.display())));
+            claims.push(claim("bundle.recovery_repairs_read_only_and_live_retirement_without_a_swap",
+                !refused.status.success() && repaired.status.success() && retired.is_dir()
+                    && kept_app_says(retired) == after_version
+                    && inode == std::fs::metadata(&active).expect("APPARATUS: repaired active inode").ino()
+                    && text.contains(&format!("the vox daemon was restarted and runs vox {after_version}"))
+                    && text.lines().last().unwrap_or("").contains("without swapping Vox.app")
+                    && text.lines().last().unwrap_or("").contains("retired bundle"),
+                format!("refusal={}; repair={text}", said(&refused))));
+            live_candidate.expect("APPARATUS: owned live candidate").quit();
+            let swept = vox(&helper, home, &["update"], &env);
+            claims.push(claim("bundle.recovery_removes_retired_code_only_after_graceful_exit",
+                swept.status.success() && !retired.exists()
+                    && said(&swept).lines().last().unwrap_or("").contains("removed 1 retired bundle"), said(&swept)));
+        }
+        receipts.insert(scenario.to_owned(), format!("update={}\nrollback={}", said(&updated), said(&rollback)));
+    }
+    dispose("signed one-launchable-app journey", &claims, &receipts, false);
 }

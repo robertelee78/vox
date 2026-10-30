@@ -17,6 +17,61 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+### macOS update recovery (ADR-014 M-29a)
+
+A plain `vox update` first repairs the local install under its transition lock, before asking
+GitHub for release metadata. If an earlier publish was interrupted, a previous bundle still has
+its live `Contents/Info.plist`, or a retired bundle needs disarming or removal, this invocation
+finishes that repair **without another bundle exchange**. It restarts a running scratch daemon
+through the active bundle's helper, refreshes shell integration, and ends with
+`repaired an earlier app transition without swapping Vox.app`, naming the repaired state.
+Run `vox update` again when a separate release update is wanted. `--check` remains read-only.
+
+On macOS, daemon restart recognizes a kernel zombie state or native process-lookup `ESRCH`
+as stopped even if the terminal or service-manager parent has not reaped the PID yet.
+A live process, permission refusal, or unknown query failure is still waited for; this does
+not change the existing shutdown bound.
+
+A repaired retired bundle remains on disk while code from it is running. Recovery of an
+interrupted publish applies the same rule to the older rollback bundle held in the journal:
+it retires that bundle rather than deleting live code with the journal.
+
+This behavior is not signed-artifact evidence. A signed update/identifier-launch/rollback
+measurement must retain both release bundles' original signed helpers, verify the restored
+signature, inspect the kept plist and exact LaunchServices records, and observe the bundle
+actually selected by identifier. An ad-hoc fixture or a rewritten helper cannot establish that
+claim. Perform identifier and registration work only in a dedicated proof guest; clean only the
+run's remembered scratch bundle and extension paths.
+
+Run the optional signed journey in that guest:
+
+```sh
+VOX_DATA_DIR=/absolute/scratch/data VOX_CONFIG_DIR=/absolute/scratch/config \
+VOX_PROOF_PREVIOUS_SHIPPED_APP=/absolute/signed-prior/Vox.app \
+VOX_PROOF_SHIPPED_APP=/absolute/signed-candidate/Vox.app \
+cargo test --release -p vox-tui --features optional-proofs,test-knobs \
+  --test update_proof -- --ignored --exact \
+  an_update_and_rollback_leave_one_launchable_vox --nocapture
+```
+
+For current-source recovery evidence, assemble a genuine native prior bundle at the current
+workspace version with the existing `test-knobs` feature in its helper, and a newer candidate
+from the same source with only the workspace-version delta and **normal release features**.
+Developer ID sign and notarize the helpers and complete bundles before supplying them. Record
+the source patch, both versions, feature selections, artifact digests and Apple's receipts.
+The prior's existing loopback-release selector serves the signed candidate; the normal candidate
+repairs local interrupted state before networking. No apps-directory selector is needed.
+These are source-bound signed artifacts, not a claim that the proof-only prior was a published
+release. Keep previously published-artifact runs separately attributed.
+
+The journey drives `install.sh`, the physically installed helpers, real publish interruption,
+identifier launches, rollback, graceful quit, a real live retirement, and a read-only-Contents
+failure whose exact permission obstruction is then removed. It fabricates no journal and
+rewrites no signed helper. Its independent registration inverse seeds and reads back the exact
+retired path before repair. Pair the run with separately built/signed source inverses omitting
+unregister, plist rename, and recovery repair; each must fail its corresponding named product
+assertion, not staging, signature verification, or cleanup.
+
 ## Manual checks (Vox.app, macOS): run by a person before tagging
 
 No automated proof reaches these, so a person runs each of them before a release that ships Vox.app is tagged (ADR-014 M-33). A manual check is **never** reported as proven by automation, and nothing here passes because a proof was green. Each check is either run and recorded, or the tag waits.
