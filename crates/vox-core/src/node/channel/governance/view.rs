@@ -205,6 +205,7 @@ pub(in crate::node::channel) struct SemanticFacts {
 #[derive(Default)]
 pub(in crate::node::channel) struct SemanticState {
     source: Option<(u64, u64)>,
+    ready: bool,
     facts: SemanticFacts,
     building: Option<SemanticBuild>,
     serial: u64,
@@ -223,6 +224,7 @@ pub(in crate::node::channel) struct SemanticWork {
     serial: u64,
     source: Option<(u64, u64)>,
     building: Option<SemanticBuild>,
+    ready: bool,
     completed: bool,
     admin_clock: Option<Option<u64>>,
 }
@@ -236,11 +238,11 @@ impl SemanticState {
         Ok(())
     }
 
-    /// Withdraw public authority while retaining immutable facts already owned by saved reads.
-    /// Sequence-only receipts fence workers with `invalidate` without retiring this source.
+    /// Withdraw public authority but retain the last completed basis for comparison after
+    /// canonical work settles. Sequence-only receipts fence workers without retiring it.
     pub(in crate::node::channel) fn retire(&mut self) -> Result<()> {
         self.invalidate()?;
-        self.source = None;
+        self.ready = false;
         self.building = None;
         Ok(())
     }
@@ -270,6 +272,7 @@ impl SemanticState {
 
     pub(in crate::node::channel) fn consent_facts(&self) -> Option<std::sync::Arc<ConsentFacts>> {
         self.source
+            .filter(|_| self.ready)
             .map(|_| std::sync::Arc::clone(&self.facts.consent))
     }
 
@@ -278,6 +281,7 @@ impl SemanticState {
             serial: self.serial,
             source: self.source,
             building: self.building.take(),
+            ready: false,
             completed: false,
             admin_clock: None,
         }
@@ -301,6 +305,7 @@ impl SemanticState {
         if let Some(clock) = work.admin_clock {
             self.facts.admin_clock = clock;
         }
+        self.ready = work.ready;
         self.building = work.building;
         true
     }
@@ -317,7 +322,7 @@ impl SemanticState {
         revision: u64,
         deadline: u64,
     ) -> Result<&SemanticFacts> {
-        if self.source != Some((revision, deadline)) {
+        if !self.ready || self.source != Some((revision, deadline)) {
             return Err(Error::Profile(REFRESHING));
         }
         Ok(&self.facts)
@@ -328,9 +333,11 @@ impl SemanticWork {
     /// Named current-index slots only, never historical log replay. A turn retains folded
     /// values and a scalar cursor and inspects at most one production page in total.
     pub(in crate::node::channel) fn advance(&mut self, view: &View<'_>) -> Result<bool> {
+        self.ready = false;
         let source = (view.revision(), view.facts.deadline());
         self.admin_clock = Some(view.admin_clock());
         if self.source == Some(source) {
+            self.ready = true;
             return Ok(true);
         }
         if self
@@ -430,6 +437,7 @@ impl SemanticWork {
         // The same owned maps become the completed result; never reserve a second
         // inline SemanticFacts payload or allocate another capsule at this boundary.
         self.completed = true;
+        self.ready = true;
         Ok(true)
     }
 }
