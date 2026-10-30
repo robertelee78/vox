@@ -134,6 +134,13 @@ pub(crate) struct CompletedText {
 }
 
 impl CompletedText {
+    /// A rotation can commit governance before the final append result is known.
+    pub(crate) fn governance_changed(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.governance_changed)
+    }
+
     pub(crate) fn take_history_pin(&mut self) -> Option<history::PendingHistoryRead> {
         self.pending
             .as_mut()

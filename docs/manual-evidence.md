@@ -96,6 +96,13 @@ destruction to native work, including cancellation and runtime-shutdown paths. T
 repair does not change the revision, deadline, serial or readiness fences. The normal smoke
 above predates this repair; it is not runtime evidence for the changed destruction path.
 
+The retained journey also exposed a missing source-rotation wake: a text append could commit a
+Presence and retire its semantic cache, while the actor still considered that room's governance
+settled. Matching native text completion now carries the actual committed governance-change
+bit through the existing deferred-governance path. Ordinary text does not invalidate the cache;
+stale attachments cannot wake a replacement room, and a later append failure cannot discard a
+governance change that already committed. The stalled journey remains unaccepted until rerun.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at

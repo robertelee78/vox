@@ -643,6 +643,7 @@ impl Node {
                 {
                     #[cfg(feature = "test-knobs")]
                     let rotated = completed.rotated;
+                    governance_owed |= completed.governance_changed();
                     let pin = completed.take_history_pin();
                     let result = channel.finish_pending_text(&pending.store, completed);
                     if channel
