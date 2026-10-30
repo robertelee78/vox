@@ -7426,6 +7426,52 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         &rooms[0],
         "the exact same-name rename never completed its bounded governance fold",
     );
+    let noop_page = loop {
+        let (ok, out, err) = vox(
+            &alice,
+            &[
+                "room",
+                "read",
+                &rooms[0],
+                "--json",
+                "--notices",
+                "--limit",
+                "1",
+            ],
+            None,
+        );
+        if ok {
+            break out;
+        }
+        assert!(
+            err.contains("governance") && err.contains("refreshing"),
+            "PRODUCT: Alice could not read notices after the same-name rename: {out}{err}"
+        );
+        std::thread::yield_now();
+    };
+    let noop_rows: Vec<serde_json::Value> = noop_page
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("PRODUCT: Alice's same-name notice page was malformed ({error}): {line}")
+            })
+        })
+        .collect();
+    assert!(
+        noop_rows.iter().any(|row| {
+            row["schema"] == "vox.room.row/1" && row["entry_hash"] == isolation_hash
+        }),
+        "PRODUCT: Alice's same-name notice page omitted the preceding exact message \
+         {isolation_hash}: {noop_page}"
+    );
+    assert!(
+        !noop_rows.iter().any(|row| {
+            row["schema"] == "vox.room.notice/1" && row["entry_hash"] == semantic_noop
+        }),
+        "PRODUCT: Alice displayed another room-change notice for the authenticated same-name \
+         rename {semantic_noop}: {noop_page}"
+    );
 
     // Alice's shipped status above is the source-owned terminal observation for the prior re-key:
     // its durable ledger and live delivery machinery both say Bob is owed nothing. Thus no delayed

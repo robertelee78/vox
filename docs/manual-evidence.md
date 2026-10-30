@@ -38,6 +38,32 @@ followed; accepted posts were not replayed. The bounded smoke receipt is
 `/private/tmp/vox996-main-smoke-517a2d5f/operator-result.json`. It does not repeat or relabel the
 complete role, inverse, requested-history-overlap or restart journeys.
 
+## v0.4.10 protected trust-removal contention (#1007)
+
+A focused three-room scratch journey reproduced the retained proof's trust-removal refusal:
+after the protected node restarted, typed removal of an offline member returned exit 1 and
+the shipped "an internal error" message. Temporary diagnosis captured
+`StreamRefused("a room change is pending")`. The sole producer was the native policy room
+reservation's `try_lock`, before the keyring transaction; the removed member still appeared
+in the shipped trust list. This was transient room-mutex contention, not failed authority.
+
+Untrust now uses the same blocking room-mutex acquisition already used by decision-bearing
+grants in the existing off-actor preparation worker. It retains no room mutex while waiting
+for another room or while committing the global policy transaction. Append eligibility,
+original publication/secret ownership, exact instance checks, cancellation and partial-reservation
+cleanup remain. No fault mapping, retry, timeout or queue was added.
+
+The normal-feature corrected CLI, SHA-256
+`0792bcdb0cc88b1c8f29b4baa4fa9ddd1d75910a596f3fc3e11682c359c24180`, was run against the
+same stopped scratch profiles without deleting or recreating their data. Typed removal returned
+exit 0, the member disappeared from the actual keyring, and the remaining trusted member read
+the exact post-removal sender-generation message in each of the three rooms. Both nodes reported
+Ready without preparing or unhealthy rooms. The focused receipt is
+`/private/tmp/vox1007-focused-native-vjdn4pex/fixed-operator-result.json`; the original terminal
+and native-cause log remain alongside it. The terminal driver's exit is recorded separately
+from the actual typed command's exit. Temporary diagnostics were removed before this normal
+build. This focused repair smoke is not whole-#1007 acceptance or a replacement for the
+retained-history and semantic-query evidence.
 
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
@@ -81,7 +107,8 @@ with “the room's Sessions changed while selecting; try again”; following tha
 on the same read returned the exact typed prompt, reply and turn-end rows. Both daemons
 exited 0, and the binary remained unchanged. The complete result is retained at
 `/private/tmp/vox1047-active-wire-7m1luh8k/provider-publication-fixed-result.json`.
-This is a bounded provider-publication result, not a correction of the first-Session refusal.
+This is a bounded provider-publication result, not a correction of the first-Session refusal
+or proof of private delivery to an offline peer.
 
 The diagnosis establishes the producer of the recorded c778 inconsistency, not the cause
 of the earlier 9ec Dave/first-Session observations. It does not establish whole #934
