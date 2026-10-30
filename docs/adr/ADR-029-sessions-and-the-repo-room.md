@@ -2,7 +2,8 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.0 (the decider, 2026-10-06). Nothing in this ADR is built.
+**Status**: Accepted for v0.4.0 (the decider, 2026-10-06); ST-4 added for v0.4.11
+(the decider, 2026-10-30). Acceptance of a requirement is not implementation evidence.
 **Date**: 2026-10-06
 **Deciders**: Robert E. Lee
 **Tags**: sessions, agents, rooms, drive, setup, tui, macos
@@ -247,6 +248,19 @@ me specify one if not".)
 - **ST-3.** Setup MUST end by printing, for every node it created, its fingerprint (grouped, with
   its art, ADR-028 K-1) with the facts a person needs to recognise it: alias, harness, host, OS and
   Vox version.
+- **ST-4.** Oh My Pi MUST be a first-class harness peer of Claude Code, Codex and OpenCode:
+  setup, installation, diagnostics, room binding, real session identity and lifecycle, activity
+  publication, discovery and authorized Session interaction MUST cover it, not merely rename
+  another harness's messages. Integration MUST use Oh My Pi's actual supported session and
+  extension contracts. In particular, eligible urgent room messages MUST reach the intended
+  already-running Oh My Pi session through native message delivery, without tmux or simulated
+  terminal input. Normal room attention MUST retain its existing read/addressing authorization;
+  private Session content and driving MUST retain their separate drive authorization. Session
+  switches and restarts MUST NOT send a message to the wrong session. Delivery reporting MUST
+  distinguish acceptance or queueing from observed consumption or a reply, and MUST NOT advertise
+  a control capability the native harness cannot perform. Research MUST include Oh My Pi's IRC
+  implementation without assuming that its in-process bus is an external transport API.
+
 
 ### 8. In the TUI and the app
 

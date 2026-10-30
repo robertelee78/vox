@@ -3,7 +3,8 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: Accepted for v0.4.0 (the decider, 2026-10-05); M-15, M-20 and M-21 amended to remove
-the lanes view (the decider, 2026-10-06). Nothing in this ADR is built unless a requirement says so.
+the lanes view (the decider, 2026-10-06); M-29b added for v0.4.11 (the decider, 2026-10-30).
+Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
 **Tags**: client, macos, swiftui, appkit, daemon-client, packaging
@@ -199,6 +200,13 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
   both bundles were registered as `us.vox.app` with the same `CFBundleVersion`, LaunchServices
   opened `.Vox.app.previous` (0.4.4) when the decider reopened Vox, and that app reported the
   0.4.6 daemon as not answering.
+- **M-29b.** `vox update` alone MUST complete the upgrade of the CLI, app and daemon. When
+  Vox.app was running, the updater MUST hand it off to the newly installed app without requiring
+  a manual quit, restart, kill or repair command. It MUST target only the app belonging to the
+  installation being updated, MUST NOT launch an app that was not running, and MUST report an
+  unsuccessful handoff rather than claim completion. This supersedes M-29's instruction to ask
+  the person to restart; bundle verification, atomic replacement and rollback still apply.
+
 
 ### 6. Proof
 
