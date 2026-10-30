@@ -441,11 +441,13 @@ fn room_rows(dir: &Path, room: &str) -> Vec<serde_json::Value> {
         }
         let (ok, out, err) = vox(dir, &args, None);
         if !ok
-            && matches!(
-                err.trim(),
-                "vox: the room changed while reading; refresh and retry"
-                    | "vox: node: the room changed while reading; refresh and retry"
-            )
+            && err.lines().any(|line| {
+                matches!(
+                    line.trim(),
+                    "vox: the room changed while reading; refresh and retry"
+                        | "vox: node: the room changed while reading; refresh and retry"
+                )
+            })
         {
             before = None;
             pages_newest_first.clear();
