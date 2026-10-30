@@ -7077,6 +7077,19 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // the race without ever publishing the recipient package this restart claim requires.
     for (dir, reader) in [(&alice, "alice"), (&carol, "carol")] {
         for room in &rooms {
+            // No delivery debt exists before this room's grant is published. First observe
+            // the source's actual outbound consent, then take a fresh delivery-status read.
+            loop {
+                let consent = trust_detail(dir, reader, room, "bob");
+                if matches!(
+                    consent.as_str(),
+                    "you trust each other"
+                        | "you trust it, but it has not trusted you: it cannot read you"
+                ) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
             wait_room_status(
                 dir,
                 reader,
