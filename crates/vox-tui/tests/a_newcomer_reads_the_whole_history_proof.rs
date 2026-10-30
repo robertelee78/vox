@@ -7597,8 +7597,17 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     }
     let (last_rotated_hash, last_rotated_text) = last_rotated
         .unwrap_or_else(|| panic!("APPARATUS: the source-owned rotation bound was empty"));
-    // The source transaction appends Presence, an optional key package, then consent. Capture
-    // that quiet interval to identify the exact reset and newer grant for the peer's catch-up.
+    wait_governance_current(
+        &alice,
+        "alice",
+        &rooms[0],
+        "the source-complete Presence→grant2 sequence never settled its bounded governance \
+         work",
+    );
+    wait_trust_detail(&alice, "alice", &rooms[0], "bob", "you trust each other");
+    // A current source fold can still precede the asynchronous regrant. Its affirmative
+    // consent above is the witness. Capture every quiet transition, not a guessed grant hash:
+    // an optional logged package may appear before or after the grant.
     let (after_grant2, transition_rows) = loop {
         let order = room_hashes(&alice, "alice", &rooms[0]);
         let rows: Vec<_> = order
@@ -7622,39 +7631,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     };
     assert!(
         matches!(transition_rows.len(), 2 | 3),
-        "APPARATUS: the source-owned sequence could not identify Presence, optional key package, \
-         then consent in Alice's shipped room order; before {rotation_order_before:?}; posts \
+        "APPARATUS: the source-owned sequence did not expose its reset/regrant transitions \
+         in Alice's shipped order; before {rotation_order_before:?}; posts \
          {rotation_post_hashes:?}; after {after_grant2:?}; transition rows {transition_rows:?}"
-    );
-    let reset_hash = transition_rows
-        .first()
-        .expect("APPARATUS: source-owned sequence has no identifiable Presence row")
-        .clone();
-    // The fallback awaits the optional key-package append before it records consent. Room order
-    // is causal, so the final row at the exact two-transition boundary uniquely names grant₂.
-    let grant2_hash = transition_rows
-        .last()
-        .expect("APPARATUS: source-owned sequence has no identifiable consent row")
-        .clone();
-    wait_governance_current(
-        &alice,
-        "alice",
-        &rooms[0],
-        "the source-complete Presence→grant2 sequence never settled its bounded governance \
-         work",
-    );
-    let ordered_positions: Vec<_> = [&reset_hash, &grant2_hash]
-        .iter()
-        .map(|hash| {
-            after_grant2
-                .iter()
-                .position(|entry| entry == *hash)
-                .unwrap_or_else(|| panic!("APPARATUS: exact sequence row {hash} missing"))
-        })
-        .collect();
-    assert!(
-        ordered_positions[0] < ordered_positions[1],
-        "APPARATUS: Alice's shipped room order did not stage reset {reset_hash} → identical grant2 {grant2_hash}: positions {ordered_positions:?}; order {after_grant2:?}"
     );
 
     bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
@@ -7664,17 +7643,16 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     wait_room_open(&bob, &rooms[0], "bob-repeated-grant");
     loop {
         let held = room_hashes(&bob, "bob", &rooms[0]);
-        if [&reset_hash, &grant2_hash]
-            .iter()
-            .all(|hash| held.contains(hash))
-        {
-            let positions: Vec<_> = [&reset_hash, &grant2_hash]
+        if transition_rows.iter().all(|hash| held.contains(hash)) {
+            let actual: Vec<_> = held
                 .iter()
-                .map(|hash| held.iter().position(|entry| entry == *hash).unwrap())
+                .filter(|hash| transition_rows.contains(hash))
                 .collect();
-            assert!(
-                positions[0] < positions[1],
-                "PRODUCT: Bob's shipped order changed the authenticated reset/grant2 sequence: positions {positions:?}; held {held:?}"
+            assert_eq!(
+                actual,
+                transition_rows.iter().collect::<Vec<_>>(),
+                "PRODUCT: Bob's shipped order changed the authenticated quiet transitions: \
+                 expected {transition_rows:?}; held {held:?}"
             );
             break;
         }
