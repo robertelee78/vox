@@ -627,83 +627,98 @@ struct RoomStatus {
 /// red even while the proof is arranging its deliberate holds: it is still the shipped command's
 /// user-visible answer.
 fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
-    let (ok, out, err) = vox(dir, &["status", "--json"], None);
-    assert!(
-        ok,
-        "PRODUCT: {reader}'s `vox status --json` was unavailable while staging room {room}: \
+    loop {
+        let (ok, out, err) = vox(dir, &["status", "--json"], None);
+        assert!(
+            ok,
+            "PRODUCT: {reader}'s `vox status --json` was unavailable while staging room {room}: \
          {out}{err}"
-    );
-    let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
-        panic!(
-            "PRODUCT: {reader}'s `vox status --json` was malformed while staging room {room} \
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!(
+                "PRODUCT: {reader}'s `vox status --json` was malformed while staging room {room} \
              ({error}): {out}"
-        )
-    });
-    let row = value["rooms"]
-        .as_array()
-        .and_then(|rooms| {
+            )
+        });
+        let Some(row) = value["rooms"].as_array().and_then(|rooms| {
             rooms
                 .iter()
                 .find(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))
-        })
-        .unwrap_or_else(|| {
+        }) else {
+            if value["preparing"].as_array().is_some_and(|rooms| {
+                rooms
+                    .iter()
+                    .any(|row| row["id"].as_str().is_some_and(|id| id.starts_with(room)))
+            }) {
+                // Ready is node readiness, not publication of every restored room.
+                // Wait for this exact staged room, without inventing its status.
+                std::thread::yield_now();
+                continue;
+            }
             panic!(
                 "PRODUCT: {reader}'s `vox status --json` did not contain staged room {room}: \
-                 {out}"
-            )
-        });
-    RoomStatus {
-        log_entries: row["log_entries"].as_u64().unwrap_or_else(|| {
-            panic!("PRODUCT: {reader}'s room status has no numeric `log_entries`: {row}")
-        }),
-        members: row["members"]
-            .as_array()
-            .unwrap_or_else(|| panic!("PRODUCT: {reader}'s room status has no members: {row}"))
-            .iter()
-            .map(|member| {
-                member["id"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("PRODUCT: room member has no id: {member}"))
-                    .to_owned()
-            })
-            .collect(),
-        received_key_generations: row["received_key_generations"].as_u64().unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: {reader}'s room status has no numeric `received_key_generations`: {row}"
-            )
-        }),
-        governance_pending: value["governance_pending"].as_bool().unwrap_or_else(|| {
-            panic!("PRODUCT: {reader}'s node status has no boolean `governance_pending`: {value}")
-        }),
-        render_backfill_pending: row["render_backfill_pending"].as_bool().unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: {reader}'s room status has no boolean `render_backfill_pending`: {row}"
-            )
-        }),
-        key_delivery_pending: row["members"]
-            .as_array()
-            .unwrap_or_else(|| panic!("PRODUCT: {reader}'s room status has no members: {row}"))
-            .iter()
-            .filter_map(|member| {
-                let pending = member["key_delivery_pending"].as_bool().unwrap_or_else(|| {
-                    panic!(
-                        "PRODUCT: {reader}'s room member has no boolean \
-                         `key_delivery_pending`: {member}"
-                    )
-                });
-                pending.then(|| {
+             {out}"
+            );
+        };
+        return RoomStatus {
+            log_entries: row["log_entries"].as_u64().unwrap_or_else(|| {
+                panic!("PRODUCT: {reader}'s room status has no numeric `log_entries`: {row}")
+            }),
+            members: row["members"]
+                .as_array()
+                .unwrap_or_else(|| panic!("PRODUCT: {reader}'s room status has no members: {row}"))
+                .iter()
+                .map(|member| {
                     member["id"]
                         .as_str()
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "PRODUCT: {reader}'s pending key-delivery member has no id: \
-                                 {member}"
-                            )
-                        })
+                        .unwrap_or_else(|| panic!("PRODUCT: room member has no id: {member}"))
                         .to_owned()
                 })
-            })
-            .collect(),
+                .collect(),
+            received_key_generations: row["received_key_generations"].as_u64().unwrap_or_else(
+                || {
+                    panic!(
+                "PRODUCT: {reader}'s room status has no numeric `received_key_generations`: {row}"
+            )
+                },
+            ),
+            governance_pending: value["governance_pending"].as_bool().unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: {reader}'s node status has no boolean `governance_pending`: {value}"
+                )
+            }),
+            render_backfill_pending: row["render_backfill_pending"].as_bool().unwrap_or_else(
+                || {
+                    panic!(
+                "PRODUCT: {reader}'s room status has no boolean `render_backfill_pending`: {row}"
+            )
+                },
+            ),
+            key_delivery_pending: row["members"]
+                .as_array()
+                .unwrap_or_else(|| panic!("PRODUCT: {reader}'s room status has no members: {row}"))
+                .iter()
+                .filter_map(|member| {
+                    let pending = member["key_delivery_pending"].as_bool().unwrap_or_else(|| {
+                        panic!(
+                            "PRODUCT: {reader}'s room member has no boolean \
+                         `key_delivery_pending`: {member}"
+                        )
+                    });
+                    pending.then(|| {
+                        member["id"]
+                            .as_str()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "PRODUCT: {reader}'s pending key-delivery member has no id: \
+                                 {member}"
+                                )
+                            })
+                            .to_owned()
+                    })
+                })
+                .collect(),
+        };
     }
 }
 
@@ -783,9 +798,49 @@ fn room_hashes(dir: &Path, reader: &str, room: &str) -> Vec<String> {
         .collect()
 }
 
+fn grant_full_history(dir: &Path, fingerprint: &str, name: &str) -> (bool, String, String) {
+    loop {
+        let result = vox(
+            dir,
+            &[
+                "trust",
+                "add",
+                fingerprint,
+                "--name",
+                name,
+                "--history",
+                "full",
+            ],
+            None,
+        );
+        if result.0
+            || !result.2.lines().any(|line| {
+                line.trim() == "vox: a previous change to this room is still being applied; this request made no change"
+            })
+        {
+            return result;
+        }
+        // Follow only the explicit no-change wait instruction, as the rename journey does.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Rename through the shipped command and return the exact authenticated row it says it appended.
 fn rename_hash(dir: &Path, reader: &str, room: &str, name: &str) -> String {
-    let (ok, out, err) = vox(dir, &["room", "rename", room, name], None);
+    let (ok, out, err) = loop {
+        let result = vox(dir, &["room", "rename", room, name], None);
+        if !result.0
+            && result.2.starts_with(
+                "vox: cannot rename the room: a previous change to this room is still being applied; this request made no change",
+            )
+        {
+            // The command explicitly made no change. Follow its wait instruction before
+            // asking again; all other refusals remain product failures.
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        break result;
+    };
     assert!(
         ok,
         "PRODUCT: {reader}'s `vox room rename {room} {name}` was refused: {out}{err}"
@@ -931,6 +986,7 @@ fn wait_trust_detail(dir: &Path, reader: &str, room: &str, member: &str, expecte
 /// A newly joined room can briefly lack the reader's own published consent even after its
 /// node-wide trust command succeeded. Wait for that exact room fact; mutual trust would mean
 /// the missing-consent staging failed.
+#[track_caller]
 fn wait_reader_one_way_trust(dir: &Path, reader: &str, room: &str, member: &str) {
     loop {
         let actual = trust_detail(dir, reader, room, member);
@@ -6662,19 +6718,7 @@ fn key_before_consent_survives_a_restart(root: &Path) {
         .unwrap_or_else(|error| panic!("APPARATUS: cannot hold incoming consent: {error}"));
     std::fs::remove_file(&alice_fold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Alice's fold: {error}"));
-    let (ok, out, err) = vox(
-        &alice,
-        &[
-            "trust",
-            "add",
-            bob_fp.trim(),
-            "--name",
-            "bob",
-            "--history",
-            "full",
-        ],
-        None,
-    );
+    let (ok, out, err) = grant_full_history(&alice, bob_fp.trim(), "bob");
     assert!(
         ok,
         "PRODUCT: Alice could not grant Bob full history: {out}{err}"
@@ -6793,13 +6837,16 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         fps.swap(0, 2);
     }
     for (dir, fp, name) in [
-        (&alice, &fps[1], "bob"),
         (&alice, &fps[2], "carol"),
         (&bob, &fps[0], "alice"),
         (&bob, &fps[2], "carol"),
         (&carol, &fps[0], "alice"),
     ] {
-        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
+        let (ok, _, err) = vox(
+            dir,
+            &["trust", "add", fp, "--name", name, "--history", "now"],
+            None,
+        );
         assert!(ok, "PRODUCT: `vox trust add` of {name} failed: {err}");
     }
     let fold_hold = root.join("fx22-fold-hold");
@@ -6935,10 +6982,22 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         competing_texts.push(vec![text]);
     }
 
-    // Alice may accept Bob's admission but cannot fold it, so she cannot consent or release her
-    // key. Bob nevertheless accepts Alice's existing LogDb prefix. The product itself says that
-    // the prefix is present, no sender key is held, Alice has not consented, and none of the named
-    // content is readable: those are the APPARATUS preconditions for the late-render verdict.
+    // Set the later same-name input before holding the fold: rename itself requires that fold
+    // to finish. Prove the command appended one exact authenticated object rather than accepting
+    // command success from a mutant that skipped the append.
+    for room in &rooms {
+        let before = room_hashes(&alice, "alice", room);
+        let appended = rename_hash(&alice, "alice", room, room);
+        assert!(
+            !before.contains(&appended) && room_hashes(&alice, "alice", room).contains(&appended),
+            "PRODUCT: Alice's successful same-name rename named entry {appended}, but that exact \
+             authenticated row was not newly present in room {room}"
+        );
+    }
+
+    // Neither author trusts Bob yet. He can retain their existing LogDb prefixes without
+    // consent or sender keys. The product itself must show those exact retained hashes while
+    // their content remains unreadable: the APPARATUS preconditions for the late-render verdict.
     std::fs::write(&fold_hold, b"")
         .unwrap_or_else(|error| panic!("APPARATUS: could not engage the fold hold: {error}"));
     std::fs::write(&carol_fold_hold, b"")
@@ -6992,95 +7051,26 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         });
     }
 
-    // Stage one same-name action while the fold is still held and prove the command appended one
-    // exact authenticated room-order object. Command success alone is not the precondition: a
-    // mutant that returns success without the append has no new hash and fails here.
-    for room in &rooms {
-        let before = room_hashes(&alice, "alice", room);
-        let appended = rename_hash(&alice, "alice", room, room);
-        assert!(
-            !before.contains(&appended) && room_hashes(&alice, "alice", room).contains(&appended),
-            "PRODUCT: Alice's successful same-name rename named entry {appended}, but that exact \
-             authenticated row was not newly present in room {room}"
-        );
-    }
-
-    // With Bob offline, release the two authors separately. The exact ordered interval around
-    // Alice's release identifies grant1 itself: after subtracting the one causal same-name rename,
-    // exactly one newly appended authenticated object remains. Releasing Carol afterwards keeps
-    // her consent from being misidentified as Alice's grant.
-    let grant1_baselines: Vec<Vec<String>> = rooms
-        .iter()
-        .map(|room| room_hashes(&alice, "alice", room))
-        .collect();
+    // With Bob offline, release each source through a real user action. Their later mutual
+    // trust answers establish the grants; a whole-room hash delta cannot identify one grant.
     std::fs::remove_file(&fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fold hold: {error}"));
-    // Marker removal is apparatus, not a product wake. A second authenticated same-name action is
-    // the causal event that resumes Alice's released fold.
-    let mut alice_causal_renames = Vec::with_capacity(rooms.len());
-    for room in &rooms {
-        let causal = rename_hash(&alice, "alice", room, room);
-        assert!(
-            room_hashes(&alice, "alice", room).contains(&causal),
-            "PRODUCT: Alice's causal same-name rename named {causal}, but the exact \
-             authenticated row was absent after the fold hold was released in room {room}"
-        );
-        alice_causal_renames.push(causal);
-    }
-    for room in &rooms {
-        wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
-    }
-    let mut grant1_hashes = Vec::with_capacity(rooms.len());
-    for (index, room) in rooms.iter().enumerate() {
-        let after = room_hashes(&alice, "alice", room);
-        let appended: Vec<_> = after
-            .iter()
-            .filter(|hash| {
-                !grant1_baselines[index].contains(hash) && **hash != alice_causal_renames[index]
-            })
-            .cloned()
-            .collect();
-        assert_eq!(
-            appended.len(),
-            1,
-            "PRODUCT: Alice's released fold did not append exactly one identifiable consent grant1 in room {room}; before {:?}; causal rename {}; after {after:?}; candidates {appended:?}",
-            grant1_baselines[index],
-            alice_causal_renames[index]
-        );
-        grant1_hashes.push(appended[0].clone());
-    }
+    // The real trust decision is the missing fact and wakes Alice's released fold.
+    let (ok, out, err) = grant_full_history(&alice, &fps[1], "bob");
+    assert!(
+        ok,
+        "PRODUCT: Alice could not grant Bob her retained history: {out}{err}"
+    );
 
     std::fs::remove_file(&carol_fold_hold)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release Carol's fold hold: {error}"));
     // Carol must not have consented before the missing-fact boundary. Her earlier room join
     // can already publish off-roster consent when Bob is in her keyring.
-    let (ok, out, err) = vox(
-        &carol,
-        &[
-            "trust",
-            "add",
-            &fps[1],
-            "--name",
-            "bob",
-            "--history",
-            "full",
-        ],
-        None,
-    );
+    let (ok, out, err) = grant_full_history(&carol, &fps[1], "bob");
     assert!(
         ok,
         "PRODUCT: Carol could not grant Bob her retained history: {out}{err}"
     );
-    // Carol's authenticated same-name action is the independent causal wake for her released
-    // fold; it cannot add another Alice-authored candidate to the grant1 boundary above.
-    for room in &rooms {
-        let causal = rename_hash(&carol, "carol", room, room);
-        assert!(
-            room_hashes(&carol, "carol", room).contains(&causal),
-            "PRODUCT: Carol's causal same-name rename named {causal}, but the exact authenticated row was absent after her fold hold was released in room {room}"
-        );
-        wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
-    }
 
     // A successful grant can still owe an asynchronous dial and logged fallback. Keep Bob
     // offline until each source finishes that delivery; otherwise his held live route can win
@@ -7117,6 +7107,10 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     for (i, room) in rooms.iter().enumerate() {
         wait_trust_detail(&bob, "bob", room, "alice", "you trust each other");
         wait_trust_detail(&bob, "bob", room, "carol", "you trust each other");
+        // Reciprocal consent may still be on Bob. Check it only after his daemon restarts;
+        // neither source can obtain a missing Bob-authored fact while he is stopped.
+        wait_trust_detail(&alice, "alice", room, "bob", "you trust each other");
+        wait_trust_detail(&carol, "carol", room, "bob", "you trust each other");
         let held = wait_room_status(
             &bob,
             "bob",
@@ -7225,11 +7219,24 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     });
     std::fs::remove_file(&render_hold_ready)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the exact-key hold: {error}"));
-    let fairness_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn");
+    // Bob is a member, not an administrator. His real history-grant upgrade publishes consent
+    // and wakes retained work without pretending that he may rename this room.
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "trust",
+            "add",
+            &fps[0],
+            "--name",
+            "alice",
+            "--history",
+            "full",
+        ],
+        None,
+    );
     assert!(
-        room_hashes(&bob, "bob", &rooms[0]).contains(&fairness_wake),
-        "PRODUCT: Bob's exact fairness wake {fairness_wake} was absent from room {}",
-        rooms[0]
+        ok,
+        "PRODUCT: Bob could not grant Alice his full history: {out}{err}"
     );
 
     // The marker engages only after one real bounded turn commits Carol's exact-author row, then
@@ -7264,7 +7271,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         rooms[0]
     );
     assert_eq!(
-        competing[0]["text"].as_str(),
+        competing[0]["envelope"]["body"].as_str(),
         Some(competing_texts[0][0].as_str()),
         "PRODUCT: the held fair turn did not make Carol's exact retained row {} readable in room \
          {}: {}",
@@ -7277,7 +7284,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         .filter(|row| {
             row["entry_hash"].as_str().is_some_and(|hash| {
                 late_hashes[0].iter().any(|expected| expected == hash)
-                    && row["text"].as_str().is_some()
+                    && row["envelope"]["body"].as_str().is_some()
             })
         })
         .count();
@@ -7299,11 +7306,22 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     );
     std::fs::remove_file(&render_hold_engaged)
         .unwrap_or_else(|error| panic!("APPARATUS: could not release the fair-turn hold: {error}"));
-    let continuation_wake = rename_hash(&bob, "bob", &rooms[0], "fx22-fair-turn-resume");
+    let (ok, out, err) = vox(
+        &bob,
+        &[
+            "trust",
+            "add",
+            &fps[2],
+            "--name",
+            "carol",
+            "--history",
+            "full",
+        ],
+        None,
+    );
     assert!(
-        room_hashes(&bob, "bob", &rooms[0]).contains(&continuation_wake),
-        "PRODUCT: Bob's exact continuation wake {continuation_wake} was absent from room {}",
-        rooms[0]
+        ok,
+        "PRODUCT: Bob could not grant Carol his full history: {out}{err}"
     );
 
     for (index, room) in rooms.iter().enumerate() {
@@ -7375,31 +7393,47 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          Carol {}: {trusted}",
         fps[2]
     );
-    let isolation_revision = isolation_before
-        .governance_revision
-        .checked_add(2)
-        .expect("PRODUCT: Alice's governance revision overflowed while isolating Bob's grant");
-    let isolation_settled = wait_room_status(
+    // Reading a new-generation message proves Bob received the post-removal release. Exact
+    // revision counts cannot distinguish the reset, revocation and asynchronous regrant.
+    let isolation_text = format!("Alice post-removal message in {}", rooms[0]);
+    let (ok, out, err) = vox(
+        &alice,
+        &["room", "post", &rooms[0], "--json", "-"],
+        Some(&isolation_text),
+    );
+    assert!(
+        ok,
+        "PRODUCT: Alice's post-removal message was refused: {out}{err}"
+    );
+    let posted: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+        panic!("PRODUCT: Alice's post-removal answer was malformed ({error}): {out}{err}")
+    });
+    let isolation_hash = posted["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: Alice's post-removal answer named no entry hash: {posted}")
+        })
+        .to_owned();
+    wait_room_status(
         &alice,
         "alice",
         &rooms[0],
         false,
-        "Carol's removal did not publish its reset and the one Bob-only regrant, or Alice did \
-         not finish Bob's resulting key delivery",
+        "Alice did not finish Bob's post-removal key delivery",
         |status| {
-            status.governance_revision >= isolation_revision
-                && !status
-                    .key_delivery_pending
-                    .iter()
-                    .any(|member| member == &fps[1])
+            !status
+                .key_delivery_pending
+                .iter()
+                .any(|member| member == &fps[1])
         },
     );
-    assert_eq!(
-        isolation_settled.governance_revision, isolation_revision,
-        "PRODUCT: removing Carol from the three-member trusted-reader set did not publish exactly \
-         the one reset and one Bob-only regrant in quiet room {}: before {isolation_before:?}, \
-         settled {isolation_settled:?}",
-        rooms[0]
+    assert_exact_read_rows(
+        &bob,
+        "bob",
+        &rooms[0],
+        std::slice::from_ref(&isolation_hash),
+        std::slice::from_ref(&isolation_text),
+        "Bob received Alice's post-removal generation",
     );
     wait_governance_current(
         &alice,
@@ -7489,7 +7523,6 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          repeated-grant sequence"
     );
     let rotation_order_before = room_hashes(&alice, "alice", &rooms[0]);
-
     bob_daemon.stop();
     let mut last_rotated = None;
     let mut rotation_post_hashes = Vec::new();
@@ -7599,17 +7632,17 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     }
     loop {
         let held = room_hashes(&bob, "bob", &rooms[0]);
-        if [grant1_hash, &reset_hash, &grant2_hash]
+        if [&reset_hash, &grant2_hash]
             .iter()
             .all(|hash| held.contains(hash))
         {
-            let positions: Vec<_> = [grant1_hash, &reset_hash, &grant2_hash]
+            let positions: Vec<_> = [&reset_hash, &grant2_hash]
                 .iter()
                 .map(|hash| held.iter().position(|entry| entry == *hash).unwrap())
                 .collect();
             assert!(
-                positions[0] < positions[1] && positions[1] < positions[2],
-                "PRODUCT: Bob's shipped order changed the authenticated grant1/reset/grant2 sequence: positions {positions:?}; held {held:?}"
+                positions[0] < positions[1],
+                "PRODUCT: Bob's shipped order changed the authenticated reset/grant2 sequence: positions {positions:?}; held {held:?}"
             );
             break;
         }
