@@ -162,6 +162,20 @@ That run remains unaccepted. This setup must follow only that exact wait instruc
 the existing rename-staging pacing. An accepted grant is never replayed, and every other
 refusal still fails its assertion. This does not change the expiry claim or its deadline.
 
+The next run reached the final revocation-descendant check and remained structurally
+waiting: Alice held the exact new hash, while Bob did not and still reported mutual trust.
+Read-only inspection of that original process found a stable catalog-announcement token
+bound to connection serial 0 after the current primary became serial 1. Its exact ACK was
+correctly refused; repeated Inventory announcements displaced the missing-head work.
+The candidate correction is to rebind existing role/catalog state on primary adoption and
+on the close event that promotes a surviving connection, using the manager's current
+primary. ACK, authorization and physical-tail fences are unchanged. Both independent
+source reviews accepted the complete correction. A normal-feature explicit-restart
+recovery on copies of the retained profiles restored Bob's current revocation answer and
+the exact retained descendant without revealing its body; it is not an uninterrupted
+connection or full-journey result. The original stalled run and profiles remain retained.
+The diagnostic TempDir-retention line was removed before the next full journey.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at
