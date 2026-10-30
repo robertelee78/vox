@@ -146,6 +146,16 @@ hash/body with `owed: false` while the source is available, before the separate 
 restart assertions. The original held-input continuation assertion remains unchanged.
 
 
+The corrected journey next reached the forced expiry setup but did not engage its marker.
+Read-only shipped authority pages on both scratch peers already excluded the expired
+administrator, with both nodes Ready and governance idle. The native sample located the
+operator at the unengaged marker wait. Its only arming call was on legacy sync completion;
+sparse accepted-governance publication did not arm it. The run was stopped as APPARATUS
+NO RESULT, not a product expiry failure or a full pass. All original profiles were preserved,
+and no profile handles remained. The existing test-only marker must also arm at the two
+actual sparse published-governance boundaries; ordinary content and deadline wakes cannot
+arm it. No normal-product path, consumer assertion, knob or timing is changed.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at
