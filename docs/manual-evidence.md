@@ -119,6 +119,22 @@ asynchronous delivery; the accepted post was not replayed. All three scratch dae
 and no profile handles remained. This is focused normal-binary recovery evidence, not an
 uninterrupted-connection claim or acceptance of the full retained-row journey and its controls.
 
+The fresh full journey then reported a post-999 refresh refusal. One normal-binary diagnostic
+with observers armed before posting reproduced a refusal at action 935. Native capture showed
+the server-selected publication revision was 938 while the current resource revision was 939;
+the physical directory-consistency guard did not fire. This was a fresh request, not an explicit
+caller continuation. Binding it to NodeView's older mirrored revision caused the refusal.
+
+Fresh reads now select one publication under the existing reader mutex on the bounded worker.
+Explicit caller cursors/revisions, physical directory binding, SEK, lock/resource lifetime and
+the originally selected Computer policy/identity checks remain unchanged. No retry was added.
+A normal-feature binary with SHA-256
+`d4989dacce7d0c795310ec7372d9ce162bbddc1c5b9d12c33cd9b0ad01b3d22b`
+ran on that preserved failed scratch profile after restart: 1,000 new posts succeeded and the
+exact final row was readable under its returned hash and body with `owed: false`. No accepted
+action was replayed; the daemon stopped and no profile handles remained. The earlier full-run
+failure remains a failure; this focused smoke is not a full journey or negative-control verdict.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at

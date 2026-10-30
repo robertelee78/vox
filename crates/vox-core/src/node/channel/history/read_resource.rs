@@ -327,31 +327,10 @@ impl ReadResource {
         bytes: usize,
         now_ms: u64,
     ) -> std::result::Result<Reply, String> {
-        self.query_inner(None, query, bytes, now_ms)
-    }
-    pub(crate) fn query_at(
-        &self,
-        revision: u64,
-        query: Query,
-        bytes: usize,
-        now_ms: u64,
-    ) -> std::result::Result<Reply, String> {
-        self.query_inner(Some(revision), query, bytes, now_ms)
-    }
-    fn query_inner(
-        &self,
-        revision: Option<u64>,
-        query: Query,
-        bytes: usize,
-        now_ms: u64,
-    ) -> std::result::Result<Reply, String> {
         let mut publication = self.publication.lock().unwrap_or_else(|e| e.into_inner());
         let publication = publication
             .as_mut()
             .ok_or_else(|| "the room is locked".to_owned())?;
-        if revision.is_some_and(|revision| revision != publication.revision) {
-            return Err(CHANGED.to_owned());
-        }
         let store = self
             .store
             .upgrade()

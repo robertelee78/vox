@@ -22936,8 +22936,9 @@ impl HistoryReader {
     }
 }
 
-/// The saved-read lane captures one publication and classifies that exact policy after
-/// bounded evaluation. Neither the actor queue nor the mutable room/writer is acquired.
+/// A fresh saved read selects its publication under the resource mutex on the bounded worker,
+/// then checks the originally selected policy. NodeView's mirrored revision is not a cursor.
+/// Neither the actor queue nor the mutable room/writer is acquired.
 async fn saved_history_query(
     view_rx: &watch::Receiver<NodeView>,
     computer: Option<&std::sync::Weak<crate::node::computer::Computer>>,
@@ -22946,7 +22947,7 @@ async fn saved_history_query(
     now: u64,
 ) -> std::result::Result<crate::node::channel::history::Reply, String> {
     use crate::node::channel::history::Reply;
-    let (resource, revision, policy, identity, names) = {
+    let (resource, policy, identity, names) = {
         let view = view_rx.borrow();
         if view.locked || view.locking {
             return Err("the node is locked".into());
@@ -22967,7 +22968,6 @@ async fn saved_history_query(
         .then(|| (view.trusted.clone(), view.presented.clone()));
         (
             resource,
-            detail.history_read_revision,
             view.computer_policy,
             view.identity.as_ref().map(|id| id.fingerprint),
             names,
@@ -22975,7 +22975,7 @@ async fn saved_history_query(
     };
     let selected = resource.clone();
     let answer = tokio::task::spawn_blocking(move || {
-        selected.query_at(revision, query, crate::node::ipc::rows_budget(), now)
+        selected.query(query, crate::node::ipc::rows_budget(), now)
     })
     .await
     .map_err(|error| format!("saved history reader stopped: {error}"))??;
