@@ -74,7 +74,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     func postAttach(node: String) {
         let content = UNMutableNotificationContent()
         content.title = "Node \(node) needs its passphrase"
-        content.body = "This node is unavailable. Unlock it in Vox."
+        content.body = "Open Vox to check this node and unlock it."
         content.categoryIdentifier = Notifier.attachCategory
         content.userInfo = ["attachNode": node]
         content.sound = .default

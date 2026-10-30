@@ -12,6 +12,19 @@ import ServiceManagement
 /// 'subsystem == "us.vox.app"'`): ids and counts only, never message text.
 let readLog = Logger(subsystem: "us.vox.app", category: "read")
 
+extension NodeSummary {
+    /// Only an explicit detached answer supplies "unavailable"; absent facts stay unknown.
+    var availabilityWords: String {
+        if let status { return status }
+        switch state {
+        case "detached": return "unavailable"
+        case "attaching": return "attaching"
+        case "detaching": return "detaching"
+        default: return "state unknown"
+        }
+    }
+}
+
 /// A room's composer as it was left: its text, To:, Urgent and the reply being written (D12).
 struct RoomDraft {
     var text = ""
@@ -934,6 +947,14 @@ final class NodeModel: ObservableObject {
     }
     @Published private(set) var machineStateKnown = false
     @Published private(set) var daemonFailure: String?
+    /// Elapsed communication time is an observation, never a node-state deadline.
+    @Published private(set) var controlReadStarted: ContinuousClock.Instant?
+    private var controlReads: [UUID: ContinuousClock.Instant] = [:]
+
+    private func finishControlRead(_ request: UUID) {
+        controlReads.removeValue(forKey: request)
+        controlReadStarted = controlReads.values.min()
+    }
     var peerWords: String { daemonReachable ? (peers == 1 ? "1 peer" : "\(peers) peers") : "peers unknown" }
     struct HealthNotice: Decodable, Identifiable, Equatable {
         let key: String
@@ -1490,12 +1511,21 @@ final class NodeModel: ObservableObject {
         return nodes.first(where: { $0.name == node })?.status
     }
 
+    var nodeAvailabilityWords: String {
+        guard daemonReachable, machineStateKnown else { return "state unknown" }
+        return nodes.first(where: { $0.name == node })?.availabilityWords ?? "state unknown"
+    }
+
     func refreshMachineState() async { await readFacts() }
 
     private var observationNeedsRestart = false
 
     private func readFacts(restartObservation: Bool = true) async {
         let epoch = nodeObservationEpoch
+        let request = UUID()
+        controlReads[request] = .now
+        controlReadStarted = controlReads.values.min()
+        defer { finishControlRead(request) }
         // Reachability first: failed reads must not leave stale node/peer states visible.
         do {
             let fresh = try await client.nodes()
@@ -1504,19 +1534,39 @@ final class NodeModel: ObservableObject {
             machineStateKnown = true
             daemonFailure = nil
             if fresh != nodes { nodes = fresh }
-            if fresh.first(where: { $0.name == node })?.state != "attached" {
+            let listedNode = fresh.first(where: { $0.name == node })
+            if listedNode?.status == "Locked" || listedNode?.state != "attached" {
+                finishControlRead(request)
                 nodeObservationEpoch = UUID()
                 invalidateRoomAnchorState(preservingSnapshot: true)
                 invalidateMemberRoles()
                 daemonReachable = true
-                ended = fresh.first(where: { $0.name == node })?.status == "Locked"
-                    ? "Node \(node) is Locked." : "Node \(node) is unavailable."
-                releaseHistoryViews()
-                peers = 0
+                observationNeedsRestart = true
+                if listedNode?.status == "Locked" || listedNode?.state == "detached" {
+                    ended = listedNode?.status == "Locked"
+                        ? "Node \(node) is Locked." : "Node \(node) is unavailable."
+                    releaseHistoryViews()
+                    peers = 0
+                } else {
+                    // Transitions and absent listings do not establish detach. Protected
+                    // Session views still need fresh authority; ordinary history stays visible.
+                    let snapshot = showingSession ? [] : messages
+                    releaseHistoryViews()
+                    messages = snapshot
+                    if case .room = selection { roomNeedsPage = true }
+                    switch listedNode?.state {
+                    case "attaching": ended = "Node \(node) is attaching."
+                    case "detaching": ended = "Node \(node) is detaching."
+                    default:
+                        ended = "Node \(node) state is unknown. Checking again."
+                        machineStateKnown = false
+                    }
+                }
                 return
             }
             let view = try await client.view()
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
+            finishControlRead(request)
             daemonReachable = true
             // Both public daemon and held-node reads succeeded for this observation epoch.
             // Retire only a typed background connection fault, even when another poll never
@@ -1564,8 +1614,10 @@ final class NodeModel: ObservableObject {
             guard epoch == nodeObservationEpoch, !Task.isCancelled else { return }
             daemonReachable = false
             individualTrustFacts = [:]
+            observationNeedsRestart = true
             individualTrustReads = [:]
             machineStateKnown = false
+            ended = "The daemon did not answer. Checking its state."
             nodeObservationEpoch = UUID()
             threadDisplayRevision = nil
             invalidateRoomAnchorState(preservingSnapshot: true)
@@ -3733,7 +3785,13 @@ final class NodeModel: ObservableObject {
         await refresh()
     }
 
-    fileprivate func stopped(_ text: String) async {
+    fileprivate enum ObservationStop {
+        case ended
+        case detached
+        case roomChanged
+    }
+
+    fileprivate func stopped(_ reason: ObservationStop) async {
         observationNeedsRestart = true
         waitingLedger = nil
         nodeObservationEpoch = UUID()
@@ -3746,16 +3804,28 @@ final class NodeModel: ObservableObject {
         // The room's actions remain unavailable until its page and inspector replace the snapshot
         // together. A confirmed detach/lock releases the rest after the node state is known.
         if case .room = selection {
-            let snapshot = messages
+            let snapshot = showingSession ? [] : messages
             releaseHistoryViews()
             messages = snapshot
             roomNeedsPage = true
         }
-        ended = "Node \(node) is unavailable."
+        // Observer termination describes communication, not the daemon's node verdict.
+        switch reason {
+        case .ended:
+            ended = "Node observation ended. Checking its state."
+            daemonReachable = false
+            daemonFailure = ended
+        case .roomChanged:
+            ended = "The saved room changed. Refreshing its history and observation."
+        case .detached:
+            // This case comes only from the daemon's typed NodeDetached frame.
+            ended = "Node \(node) is unavailable."
+            daemonReachable = true
+            daemonFailure = nil
+            releaseHistoryViews()
+            peers = 0
+        }
         machineStateKnown = false
-        daemonReachable = text.localizedCaseInsensitiveContains("detached")
-            || text.localizedCaseInsensitiveContains("Locked")
-        if !daemonReachable { daemonFailure = text }
         // Resubscribing aborts the old Rust observer, which is awaiting this callback.
         // Read readiness here; the existing follow loop (or an independent user action)
         // performs the pending restart and authoritative refresh outside that callback.
@@ -3859,7 +3929,7 @@ private final class Listener: ClientListener {
     func onMessage(room: String, instance: Data, message: RoomMessage) async -> Bool {
         guard let model = current() else { return false }
         guard model.acceptsArrivalInstance(instance, room: room) else {
-            await model.stopped("The saved room changed; refreshing its history and restarting observation.")
+            await model.stopped(.roomChanged)
             return false
         }
         readLog.debug("follow: event message \(message.id, privacy: .public) in \(room, privacy: .public)")
@@ -3876,7 +3946,12 @@ private final class Listener: ClientListener {
 
     func onEnded(text: String) async {
         guard let model = current() else { return }
-        await model.stopped(text)
+        await model.stopped(.ended)
+    }
+
+    func onDetached() async {
+        guard let model = current() else { return }
+        await model.stopped(.detached)
     }
 
     func onSessions(room: String) async -> Bool {

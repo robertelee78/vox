@@ -1,6 +1,6 @@
 # The Vox app on a Mac
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.10.
 
 This page says where each thing is in Vox.app. The app does what the `vox` commands do. The other
 chapters explain nodes, rooms, trust, services and files. The app runs on Macs with Apple Silicon
@@ -34,6 +34,16 @@ A new node is in no room yet. Its window offers **New Roomâ€¦** and **Join Roomâ
 
 If the app cannot reach the daemon, it shows a card with a headline, a likely cause and **Try
 Again**. **DETAILS** holds the daemon's own sentence, with **Copy** for a report.
+
+While a daemon control answer is pending, the window keeps the last known rooms and ordinary
+timeline visible. **Daemon slow to answer, N s** reports the elapsed wait; the clock does not
+declare the node detached or Locked. Failed communication or an ended observation says what
+happened and Vox checks again. Only the daemon's explicit detached answer means **unavailable**;
+an explicit **Locked** answer still asks you to Unlock. Protected Session views continue to need
+current authorization after an interrupted observation.
+Opening the selected node also waits for its actual computer-trust application to finish.
+A busy room does not turn that elapsed wait into a failed selection; a node that actually
+stops or changes during selection still requires a fresh choice.
 
 ## Open, quit and lock
 

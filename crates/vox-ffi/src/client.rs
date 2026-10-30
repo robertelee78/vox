@@ -1666,9 +1666,12 @@ pub trait ClientListener: Send + Sync {
     async fn on_message(&self, room: String, instance: Vec<u8>, message: RoomMessage) -> bool;
     /// Anything else the node reports. Await consumption; false retires an obsolete listener.
     async fn on_notice(&self, text: String) -> bool;
-    /// The node was detached, or the daemon stopped: nothing more will come. Check the captured
+    /// Observation stopped without an authoritative node-state verdict. Check the captured
     /// actor/observation generation and cancellation before applying this terminal notification.
     async fn on_ended(&self, text: String);
+    /// The daemon explicitly reported this observation's node detached. This is not a
+    /// transport failure; check the same actor/observation fences before applying it.
+    async fn on_detached(&self);
     /// A Session's metadata, activity or drive authority in `room` changed. Await the bounded
     /// refresh, preserving room/node/selection fences; false retires an obsolete listener.
     async fn on_sessions(&self, room: String) -> bool;
@@ -8022,8 +8025,11 @@ async fn follow(
                 ).await { return Ok(()); }
                 open
             }
-            Ok(Some(Frame::NodeDetached { node })) => {
-                return Err(format!("the connection to node {node} ended"));
+            Ok(Some(Frame::NodeDetached { .. })) => {
+                if owner.current() {
+                    listener.on_detached().await;
+                }
+                return Ok(());
             }
             Ok(Some(_)) => continue,
             Ok(None) | Err(_) => return Err("the vox daemon stopped".into()),

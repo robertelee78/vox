@@ -649,6 +649,11 @@ fn delayed_app_reply(fault: AppReplyFault) {
         async fn on_ended(&self, said: String) {
             let _ = self.0.send(said);
         }
+        async fn on_detached(&self) {
+            let _ = self
+                .0
+                .send("the daemon reported the node detached".to_owned());
+        }
         async fn on_sessions(&self, _: String) -> bool {
             true
         }

@@ -251,73 +251,36 @@ impl Managed {
                 .map(|(id, _, _)| *id)
                 .chain(self.plan.denied.iter().copied())
                 .collect();
-            let deadline = match &self.guard {
-                computer::ComputerPolicyGuard::Deadline { deadline, .. } => *deadline,
-                computer::ComputerPolicyGuard::Current { change, .. } => change.apply_deadline(),
-            };
-            let change = match &self.guard {
-                computer::ComputerPolicyGuard::Current { change, .. } => Some(*change),
-                computer::ComputerPolicyGuard::Deadline { .. } => None,
-            };
-            if self.computer.binding_group().is_some() && !self.computer.current_revision_expired()
-            {
-                match change {
-                    Some(change) => {
-                        if !self.computer.bind_node_for_change(
-                            signer,
-                            &self.node_name,
-                            change,
-                            &self.transition,
-                        )? {
-                            return Err(Error::ComputerPolicySuperseded);
-                        }
-                    }
-                    None => self.computer.bind_node_until(
-                        signer,
-                        &self.node_name,
-                        deadline,
-                        &self.transition,
-                    )?,
-                }
-            }
-            let prepared = match change {
-                Some(change) => self.computer.prepare_application_for_change(
-                    self.node,
-                    self.plan.revision,
-                    self.plan.expired,
-                    &covered,
+            let change = self.guard.change;
+            let deadline = change.apply_deadline();
+            if self.computer.binding_group().is_some()
+                && !self.computer.current_revision_expired()
+                && !self.computer.bind_node_for_change(
+                    signer,
+                    &self.node_name,
                     change,
                     &self.transition,
-                )?,
-                None => self.computer.prepare_application_until(
-                    self.node,
-                    self.plan.revision,
-                    self.plan.expired,
-                    &covered,
-                    deadline,
-                    &self.transition,
-                )?,
-            };
+                )?
+            {
+                return Err(Error::ComputerPolicySuperseded);
+            }
+            let prepared = self.computer.prepare_application_for_change(
+                self.node,
+                self.plan.revision,
+                self.plan.expired,
+                &covered,
+                change,
+                &self.transition,
+            )?;
             if !prepared {
                 return Ok(false);
             }
-            let aliases_retained = match change {
-                Some(change) => self.computer.retain_aliases_for_change(
-                    self.node,
-                    &self.aliases,
-                    change,
-                    &self.transition,
-                )?,
-                None => {
-                    self.computer.retain_aliases_until(
-                        self.node,
-                        &self.aliases,
-                        deadline,
-                        Some(&self.transition),
-                    )?;
-                    true
-                }
-            };
+            let aliases_retained = self.computer.retain_aliases_for_change(
+                self.node,
+                &self.aliases,
+                change,
+                &self.transition,
+            )?;
             if !aliases_retained {
                 return Err(Error::ComputerPolicySuperseded);
             }

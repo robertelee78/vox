@@ -550,7 +550,7 @@ final class AppModel: ObservableObject {
                     guard ownsNodeRequest(client, generation), self.node === shown,
                           signedInAs == name else { return }
                     guard resumed else {
-                        throw VoxError.Detached(reason: "The node is unavailable after forgetting it. Try Again.")
+                        throw VoxError.Detached(reason: "The node has not resumed after forgetting it. Try Again.")
                     }
                     phase = .attached(node: name, fingerprint: fingerprint)
                 } else {
@@ -584,6 +584,15 @@ final class AppModel: ObservableObject {
             return shown.nodeStatus
         }
         return nodeList.first(where: { $0.name == name })?.status
+    }
+
+    var selectedNodeAvailabilityWords: String {
+        guard let name = signedInAs else { return "state unknown" }
+        if let shown = node {
+            guard shown.node == name else { return "state unknown" }
+            return shown.nodeAvailabilityWords
+        }
+        return nodeList.first(where: { $0.name == name })?.availabilityWords ?? "state unknown"
     }
 
     /// The sign-in's New Node…: make one here, as at first run.

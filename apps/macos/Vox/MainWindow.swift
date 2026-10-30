@@ -15,6 +15,9 @@ struct MainWindow: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if let started = model.controlReadStarted {
+                PendingDaemonAnswer(started: started)
+            }
             if model.ended != nil || !model.daemonReachable {
                 NodeStopped(model: model)
                 Divider()
@@ -183,7 +186,7 @@ private struct Sidebar: View {
             // + that makes a room or joins one, as Room > New Room… and Join Room… do.
             Section {
                 HStack {
-                    NodeIdentity(name: model.node, status: model.nodeStatus)
+                    NodeIdentity(name: model.node, status: model.nodeAvailabilityWords)
                         .copyMenu([("Copy Name", model.node)])
                         .accessibilityIdentifier(model.ended == nil ? "attached" : "detached")
                     Spacer()
@@ -440,9 +443,9 @@ private struct SelectionFill: NSViewRepresentable {
 /// attached", the dot in the accent because attached is live (L-3).
 private struct NodeIdentity: View {
     let name: String
-    /// The daemon supplies Ready or Locked; unavailable remains distinct.
+    /// Unknown communication is not a detached node.
     var status: String? = nil
-    private var state: String { status ?? "unavailable" }
+    private var state: String { status ?? "state unknown" }
 
     var body: some View {
         HStack(alignment: .center, spacing: Space.s8) {
@@ -487,10 +490,10 @@ private struct OnThisMachine: View {
                     HStack {
                         Text(node.name)
                         Spacer()
-                        Text(known ? (node.status ?? "unavailable") : "unavailable").secondaryText()
+                        Text(known ? node.availabilityWords : "state unknown").secondaryText()
                     }
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(node.name) \(known ? (node.status ?? "unavailable") : "unavailable")")
+                    .accessibilityLabel("\(node.name) \(known ? node.availabilityWords : "state unknown")")
                     .contextMenu {
                         Button("Copy Name") { Self.copy(node.name) }
                         if !node.fingerprint.isEmpty {
@@ -2202,6 +2205,26 @@ private struct MessageRow: View {
     private var author: String { NodeModel.author(message, me: me) }
 }
 
+/// The clock observes an in-flight read; it never changes node state or retires content.
+private struct PendingDaemonAnswer: View {
+    let started: ContinuousClock.Instant
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let seconds = max(0, started.duration(to: .now).components.seconds)
+            if seconds > 0 {
+                StateMark(kind: .attention,
+                          words: "Daemon slow to answer, \(seconds) s. Waiting for its answer.")
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("node-control-pending")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(Space.s12)
+                Divider()
+            }
+        }
+    }
+}
+
 /// The node stopped under the window (detached elsewhere, or the daemon stopped): said at the top,
 /// with the way back. The window and everything typed in it stay; attaching the same node again
 /// picks up where it was. Start Over goes back to reaching the daemon, as at launch.
@@ -2212,7 +2235,7 @@ private struct NodeStopped: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             StateMark(kind: .danger, words: model.daemonReachable
-                      ? (model.ended ?? "Node \(model.node) is unavailable.")
+                      ? (model.ended ?? "Node \(model.node) state is unknown. Checking again.")
                       : (model.daemonFailure ?? "The daemon cannot be reached. Node states and peers are unknown; Vox is reconnecting."))
                 .textSelection(.enabled)
                 .accessibilityIdentifier("node-stopped")

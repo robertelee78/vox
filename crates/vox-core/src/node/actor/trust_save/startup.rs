@@ -31,7 +31,7 @@ pub(in crate::node::actor) fn settle_startup_policy(
                 observation_end,
                 observation_end,
             );
-            let guard = computer::ComputerPolicyGuard::Current {
+            let guard = computer::ComputerPolicyGuard {
                 change,
                 superseded: Arc::new(computer::PolicySupersession::default()),
             };
@@ -137,7 +137,7 @@ pub(in crate::node::actor) fn settle_headless_startup_policy(
             observation_end,
             observation_end,
         );
-        let guard = computer::ComputerPolicyGuard::Current {
+        let guard = computer::ComputerPolicyGuard {
             change,
             superseded: Arc::new(computer::PolicySupersession::default()),
         };
@@ -180,28 +180,16 @@ pub(in crate::node::actor) fn apply_headless_policy(
         loop {
             guard.active(Some(computer))?;
             computer.storage_ready()?;
-            let deadline = match guard {
-                computer::ComputerPolicyGuard::Deadline { deadline, .. } => *deadline,
-                computer::ComputerPolicyGuard::Current { change, .. } => change.apply_deadline(),
-            };
+            let change = guard.change;
+            let deadline = change.apply_deadline();
             if computer.binding_group().is_some()
                 && (startup || !computer.current_revision_expired())
+                && !computer.bind_node_for_change(signer, name, change, transition)?
             {
-                match guard {
-                    computer::ComputerPolicyGuard::Current { change, .. } => {
-                        if !computer.bind_node_for_change(signer, name, *change, transition)? {
-                            return Err(Error::ComputerPolicySuperseded);
-                        }
-                    }
-                    computer::ComputerPolicyGuard::Deadline { .. } => {
-                        computer.bind_node_until(signer, name, deadline, transition)?
-                    }
-                }
+                return Err(Error::ComputerPolicySuperseded);
             }
             if startup {
-                if let computer::ComputerPolicyGuard::Current { change, .. } = guard {
-                    computer.require_startup_binding(node, change.target())?;
-                }
+                computer.require_startup_binding(node, change.target())?;
             }
             guard.active(Some(computer))?;
             let revision = computer.policy_revision();
@@ -218,9 +206,7 @@ pub(in crate::node::actor) fn apply_headless_policy(
             if receipt == crate::node::computer::ApplicationReceipt::Current {
                 committed = Some((revision, expired));
                 if startup {
-                    if let computer::ComputerPolicyGuard::Current { change, .. } = guard {
-                        computer.require_startup_binding(node, change.target())?;
-                    }
+                    computer.require_startup_binding(node, change.target())?;
                 }
                 return guard.active(Some(computer));
             }
