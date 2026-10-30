@@ -234,9 +234,10 @@ const PREPARE_WAIT: Duration = Duration::from_secs(1);
 
 /// Test-only: while the file this names exists, the node accepts no sender-key delivery: neither
 /// the ordinary logged-package worker, a package opened during room preparation, nor a live
-/// pairwise delivery. The first real attempt writes the same path with `.engaged` appended, so a
-/// proof can observe that the apparatus intercepted an acceptance rather than infer it from time.
-/// Logged work stays queued; live delivery answers not-accepted so the sender retains/retries it.
+/// pairwise delivery. The first real attempt creates the same path with `.engaged` appended.
+/// Committed recipient package bodies append raw room/author pairs to that receipt; an empty
+/// receipt proves only interception. Logged work stays queued; live delivery answers not-accepted
+/// so the sender retains/retries it.
 /// **For proofs; nothing in a real deployment sets it.** Not compiled in without the
 /// `test-knobs` feature (V210-105).
 #[cfg(feature = "test-knobs")]
@@ -254,7 +255,10 @@ fn held_packages_path() -> Option<std::path::PathBuf> {
 fn note_package_hold_engaged(path: &std::path::Path) {
     let mut engaged = path.as_os_str().to_owned();
     engaged.push(".engaged");
-    let _ = std::fs::write(std::path::PathBuf::from(engaged), b"");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::PathBuf::from(engaged));
 }
 
 /// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
@@ -12212,6 +12216,8 @@ impl Node {
                         // publication, rather than every network event or the one-second ticker,
                         // wakes its bounded settlement. A superseded current fact still settles
                         // its frontier but does not revise/invalidate the checked projection.
+                        #[cfg(feature = "test-knobs")]
+                        governance::ready_sweep_after(&channel_id);
                         self.governance_work.wake_room(channel_id);
                         self.refresh_reachers().await;
                         self.publish_channel_to_anchors(
