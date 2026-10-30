@@ -7631,6 +7631,9 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
 
     bob_daemon = daemon_env(&bob, "bob-repeated-grant", &package_knob);
     attached(&bob, "bob-repeated-grant");
+    // A responding daemon may still be reopening this room. Stage its shipped open state
+    // before asking the late-reset ordering question; preparation is not that claim's verdict.
+    wait_room_open(&bob, &rooms[0], "bob-repeated-grant");
     // Sparse catch-up must first expose the newest grant2 while the older Presence reset is still
     // absent. This is the apparatus boundary that makes the later reset genuinely late rather than
     // merely asserting an eventual set. If reset arrives first, this run did not stage the claim.
@@ -7691,6 +7694,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     bob_daemon.stop();
     bob_daemon = daemon_env(&bob, "bob-repeated-grant-restarted", &package_knob);
     attached(&bob, "bob-repeated-grant-restarted");
+    wait_room_open(&bob, &rooms[0], "bob-repeated-grant-restarted");
     wait_governance_current(
         &bob,
         "bob",
@@ -7713,6 +7717,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     );
     alice_restarted = daemon_env(&alice, "alice-after-repeated-grant", &fold_knob);
     attached(&alice, "alice-after-repeated-grant");
+    wait_room_open(&alice, &rooms[0], "alice-after-repeated-grant");
     // Keep both shipped daemons alive for the remaining user journey.
     let _running_after_repeated_grant = (&alice_restarted, &bob_daemon);
 
