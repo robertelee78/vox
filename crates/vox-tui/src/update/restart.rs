@@ -404,16 +404,19 @@ async fn gone_within(pid: u32, bound: Duration) -> bool {
         );
         #[cfg(target_os = "macos")]
         if alive {
-            let stopped = match libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(raw_pid, 0) {
+            let stopped = match libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(raw_pid, 0)
+            {
                 Ok(info) => info.pbi_status == nix::libc::SZOMB,
                 // The pinned libproc wrapper captures return code and numeric errno in this format.
                 // A zombie can return ESRCH here while kill(pid, 0) still sees its retained PID.
                 // Never interpret an unavailable/permission-denied/unknown query as an exit.
-                Err(error) => error
-                    .strip_prefix("return code = 0, errno = ")
-                    .and_then(|value| value.split_once(", message = "))
-                    .and_then(|(code, _)| code.parse::<i32>().ok())
-                    == Some(nix::libc::ESRCH),
+                Err(error) => {
+                    error
+                        .strip_prefix("return code = 0, errno = ")
+                        .and_then(|value| value.split_once(", message = "))
+                        .and_then(|(code, _)| code.parse::<i32>().ok())
+                        == Some(nix::libc::ESRCH)
+                }
             };
             if stopped {
                 return true;

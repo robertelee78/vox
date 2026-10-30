@@ -1888,36 +1888,66 @@ impl LaunchServicesCleanup {
 #[cfg(all(target_os = "macos", feature = "optional-proofs"))]
 impl Drop for LaunchServicesCleanup {
     fn drop(&mut self) {
-        self.extensions.sort(); self.extensions.dedup();
-        self.bundles.sort(); self.bundles.dedup();
+        self.extensions.sort();
+        self.extensions.dedup();
+        self.bundles.sort();
+        self.bundles.dedup();
         for extension in &self.extensions {
-            let _ = Command::new("/usr/bin/pluginkit").arg("-r").arg(extension).output();
+            let _ = Command::new("/usr/bin/pluginkit")
+                .arg("-r")
+                .arg(extension)
+                .output();
         }
-        for bundle in &self.bundles { let _ = lsregister("-u", bundle); }
+        for bundle in &self.bundles {
+            let _ = lsregister("-u", bundle);
+        }
         // Both tools return nonzero for an already absent path. Determine cleanup from their
         // databases rather than treating that exit status as evidence a registration remains.
-        let plugins = Command::new("/usr/bin/pluginkit").args(["-m", "-A", "-D", "-v"]).output();
+        let plugins = Command::new("/usr/bin/pluginkit")
+            .args(["-m", "-A", "-D", "-v"])
+            .output();
         let records = Command::new(LSREGISTER).arg("-dump").output();
-        let check = |out: std::io::Result<Output>, paths: &[PathBuf], label: &str| -> Result<(), String> {
-            let out = out.map_err(|e| format!("{label}: {e}"))?;
-            if !out.status.success() { return Err(format!("{label}: query exited {}", out.status)); }
-            let text = String::from_utf8(out.stdout).map_err(|_| format!("{label}: non-UTF-8 output"))?;
-            for path in paths {
-                let logical = path.to_string_lossy();
-                let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
-                    let value = logical.as_ref();
-                    if value.starts_with("/var/") { PathBuf::from(format!("/private{value}")) } else { path.clone() }
-                });
-                if text.lines().any(|line| line.contains(logical.as_ref()) || line.contains(canonical.to_string_lossy().as_ref())) {
-                    return Err(format!("{label}: scratch path {} remains registered", path.display()));
+        let check =
+            |out: std::io::Result<Output>, paths: &[PathBuf], label: &str| -> Result<(), String> {
+                let out = out.map_err(|e| format!("{label}: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!("{label}: query exited {}", out.status));
                 }
-            }
-            Ok(())
-        };
-        let problems = [check(plugins, &self.extensions, "pluginkit"), check(records, &self.bundles, "LaunchServices")];
+                let text = String::from_utf8(out.stdout)
+                    .map_err(|_| format!("{label}: non-UTF-8 output"))?;
+                for path in paths {
+                    let logical = path.to_string_lossy();
+                    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| {
+                        let value = logical.as_ref();
+                        if value.starts_with("/var/") {
+                            PathBuf::from(format!("/private{value}"))
+                        } else {
+                            path.clone()
+                        }
+                    });
+                    if text.lines().any(|line| {
+                        line.contains(logical.as_ref())
+                            || line.contains(canonical.to_string_lossy().as_ref())
+                    }) {
+                        return Err(format!(
+                            "{label}: scratch path {} remains registered",
+                            path.display()
+                        ));
+                    }
+                }
+                Ok(())
+            };
+        let problems = [
+            check(plugins, &self.extensions, "pluginkit"),
+            check(records, &self.bundles, "LaunchServices"),
+        ];
         for problem in problems.into_iter().filter_map(Result::err) {
             let message = format!("APPARATUS: cleanup not confirmed: {problem}");
-            if std::thread::panicking() { eprintln!("{message}"); } else { panic!("{message}"); }
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
         }
     }
 }
@@ -2337,24 +2367,44 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
             .args(owned_paths)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .spawn().expect("APPARATUS: start native launch observer");
-        let mut lines = std::io::BufReader::new(observer.stdout.take().expect("APPARATUS: observer stdout"));
+            .spawn()
+            .expect("APPARATUS: start native launch observer");
+        let mut lines =
+            std::io::BufReader::new(observer.stdout.take().expect("APPARATUS: observer stdout"));
         let mut line = String::new();
-        lines.read_line(&mut line).expect("APPARATUS: observer readiness");
-        assert_eq!(line.trim(), "READY", "APPARATUS: observer did not subscribe");
+        lines
+            .read_line(&mut line)
+            .expect("APPARATUS: observer readiness");
+        assert_eq!(
+            line.trim(),
+            "READY",
+            "APPARATUS: observer did not subscribe"
+        );
         let opened = Command::new("/usr/bin/open")
             .args(["-n", "--env"])
             .arg(format!("VOX_DATA_DIR={}", home.join("data").display()))
-            .arg("--env").arg(format!("VOX_CONFIG_DIR={}", home.join("config").display()))
-            .arg("--env").arg(format!("HOME={}", home.display()))
+            .arg("--env")
+            .arg(format!("VOX_CONFIG_DIR={}", home.join("config").display()))
+            .arg("--env")
+            .arg(format!("HOME={}", home.display()))
             .arg(active)
-            .output().expect("APPARATUS: open installed scratch application by path");
-        assert!(opened.status.success(), "PRODUCT: installed app path launch refused: {}", said(&opened));
+            .output()
+            .expect("APPARATUS: open installed scratch application by path");
+        assert!(
+            opened.status.success(),
+            "PRODUCT: installed app path launch refused: {}",
+            said(&opened)
+        );
         line.clear();
-        lines.read_line(&mut line).expect("APPARATUS: exact native launch event");
+        lines
+            .read_line(&mut line)
+            .expect("APPARATUS: exact native launch event");
         let path = PathBuf::from(line.trim());
         let app = Self { observer, path };
-        assert_eq!(app.path, active, "PRODUCT: path launch selected the wrong Vox.app");
+        assert_eq!(
+            app.path, active,
+            "PRODUCT: path launch selected the wrong Vox.app"
+        );
         app
     }
 
@@ -2363,8 +2413,15 @@ withExtendedLifetime(launchToken) { RunLoop.main.run() }
         if let Some(mut input) = self.observer.stdin.take() {
             let _ = writeln!(input, "QUIT");
         }
-        let status = self.observer.wait().expect("APPARATUS: observe graceful app termination");
-        assert!(status.success(), "PRODUCT: scratch Vox did not quit gracefully: {status}, launched {:?}", self.path);
+        let status = self
+            .observer
+            .wait()
+            .expect("APPARATUS: observe graceful app termination");
+        assert!(
+            status.success(),
+            "PRODUCT: scratch Vox did not quit gracefully: {status}, launched {:?}",
+            self.path
+        );
     }
 }
 
@@ -2392,24 +2449,39 @@ impl Drop for ScratchDaemonCleanup {
             let config = self.0.join("config");
             let account = vox_core::node::paths::Account::of(Some(&data), Some(&config))
                 .map_err(|e| e.to_string())?;
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .map_err(|e| e.to_string())?;
-            let hello = match rt.block_on(vox_core::node::daemonipc::DaemonClient::observe(&account.socket())) {
+            let hello = match rt.block_on(vox_core::node::daemonipc::DaemonClient::observe(
+                &account.socket(),
+            )) {
                 Ok(hello) => hello,
-                Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable { .. })) => return Ok(()),
+                Err(vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Unreachable {
+                    ..
+                })) => return Ok(()),
                 Err(e) => return Err(e.to_string()),
             };
-            Command::new("/bin/kill").args(["-TERM", &hello.pid.to_string()]).status()
+            Command::new("/bin/kill")
+                .args(["-TERM", &hello.pid.to_string()])
+                .status()
                 .map_err(|e| e.to_string())?;
             // The daemon owns this lock for its physical lifetime, including store shutdown.
-            let lock = std::fs::OpenOptions::new().read(true).write(true).open(account.lock_file())
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(account.lock_file())
                 .map_err(|e| e.to_string())?;
             rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
                 .map_err(|e| e.to_string())
         };
         if let Err(error) = stop() {
             let message = format!("APPARATUS: scratch daemon cleanup not confirmed: {error}");
-            if std::thread::panicking() { eprintln!("{message}"); } else { panic!("{message}"); }
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
         }
     }
 }
@@ -2423,24 +2495,41 @@ impl Drop for ScratchDaemonCleanup {
 fn an_update_and_rollback_leave_one_launchable_vox() {
     use std::io::BufRead as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let model = Command::new("/usr/sbin/sysctl").args(["-n", "hw.model"]).output()
+    let model = Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.model"])
+        .output()
         .expect("APPARATUS: query guest hardware");
-    assert!(String::from_utf8_lossy(&model.stdout).trim().starts_with("VirtualMac"),
-        "APPARATUS: this identifier proof runs only in the dedicated macOS guest");
-    let prior = PathBuf::from(std::env::var_os("VOX_PROOF_PREVIOUS_SHIPPED_APP")
-        .expect("APPARATUS: missing exact signed prior artifact"));
-    let candidate = PathBuf::from(std::env::var_os("VOX_PROOF_SHIPPED_APP")
-        .expect("APPARATUS: missing exact signed candidate artifact"));
+    assert!(
+        String::from_utf8_lossy(&model.stdout)
+            .trim()
+            .starts_with("VirtualMac"),
+        "APPARATUS: this identifier proof runs only in the dedicated macOS guest"
+    );
+    let prior = PathBuf::from(
+        std::env::var_os("VOX_PROOF_PREVIOUS_SHIPPED_APP")
+            .expect("APPARATUS: missing exact signed prior artifact"),
+    );
+    let candidate = PathBuf::from(
+        std::env::var_os("VOX_PROOF_SHIPPED_APP")
+            .expect("APPARATUS: missing exact signed candidate artifact"),
+    );
     let before_version = plist_value(&prior, "CFBundleShortVersionString")
         .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     let after_version = plist_value(&candidate, "CFBundleShortVersionString")
         .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     let prior_semver = semver::Version::parse(&before_version).expect("APPARATUS: prior SemVer");
-    let candidate_semver = semver::Version::parse(&after_version).expect("APPARATUS: candidate SemVer");
-    assert!(candidate_semver > prior_semver, "APPARATUS: candidate must be newer than prior");
+    let candidate_semver =
+        semver::Version::parse(&after_version).expect("APPARATUS: candidate SemVer");
+    assert!(
+        candidate_semver > prior_semver,
+        "APPARATUS: candidate must be newer than prior"
+    );
     for app in [&prior, &candidate] {
-        assert_eq!(plist_value(app, "CFBundleIdentifier").as_deref(), Ok("us.vox.app"),
-            "APPARATUS: artifact identifier is not the real app identifier");
+        assert_eq!(
+            plist_value(app, "CFBundleIdentifier").as_deref(),
+            Ok("us.vox.app"),
+            "APPARATUS: artifact identifier is not the real app identifier"
+        );
         shipped_notarized(app).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
     }
     let mut extension_names = Vec::new();
@@ -2459,24 +2548,54 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         "APPARATUS: dedicated guest already has us.vox.app registrations; do not clear another run's paths");
     let prior_tree = tmpdir();
     let candidate_tree = tmpdir();
-    bundle_release_app(prior_tree.path(), &before_version, &prior, &[("stable", None)]);
-    bundle_release_app(candidate_tree.path(), &after_version, &candidate, &[("stable", None)]);
-    let prior_release = release_server::serve(prior_tree.path()).expect("APPARATUS: serve prior signed artifact");
-    let release = release_server::serve(candidate_tree.path()).expect("APPARATUS: serve signed candidate");
+    bundle_release_app(
+        prior_tree.path(),
+        &before_version,
+        &prior,
+        &[("stable", None)],
+    );
+    bundle_release_app(
+        candidate_tree.path(),
+        &after_version,
+        &candidate,
+        &[("stable", None)],
+    );
+    let prior_release =
+        release_server::serve(prior_tree.path()).expect("APPARATUS: serve prior signed artifact");
+    let release =
+        release_server::serve(candidate_tree.path()).expect("APPARATUS: serve signed candidate");
     let mut claims = Vec::new();
     let mut receipts = BTreeMap::new();
-    let prior_build = plist_value(&prior, "CFBundleVersion").expect("APPARATUS: prior build number");
-    let candidate_build = plist_value(&candidate, "CFBundleVersion").expect("APPARATUS: candidate build number");
-    let components = |value: &str| value.split('.').map(str::parse::<u64>).collect::<Result<Vec<_>, _>>();
-    claims.push(claim("bundle.signed_build_numbers_follow_release_versions",
+    let prior_build =
+        plist_value(&prior, "CFBundleVersion").expect("APPARATUS: prior build number");
+    let candidate_build =
+        plist_value(&candidate, "CFBundleVersion").expect("APPARATUS: candidate build number");
+    let components = |value: &str| {
+        value
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>()
+    };
+    claims.push(claim(
+        "bundle.signed_build_numbers_follow_release_versions",
         expected_build_version(&before_version).as_deref() == Ok(prior_build.as_str())
             && expected_build_version(&after_version).as_deref() == Ok(candidate_build.as_str())
-            && components(&candidate_build).expect("PRODUCT: candidate build number is not numeric")
+            && components(&candidate_build)
+                .expect("PRODUCT: candidate build number is not numeric")
                 > components(&prior_build).expect("PRODUCT: prior build number is not numeric"),
-        format!("prior={before_version}/{prior_build}, candidate={after_version}/{candidate_build}")));
+        format!(
+            "prior={before_version}/{prior_build}, candidate={after_version}/{candidate_build}"
+        ),
+    ));
 
-    for scenario in ["update-and-rollback", "interrupted-publish", "read-only-and-live-retirement"] {
-        let scratch = tempfile::Builder::new().prefix("vox-m29a-").tempdir_in("/Users/Shared")
+    for scenario in [
+        "update-and-rollback",
+        "interrupted-publish",
+        "read-only-and-live-retirement",
+    ] {
+        let scratch = tempfile::Builder::new()
+            .prefix("vox-m29a-")
+            .tempdir_in("/Users/Shared")
             .expect("APPARATUS: visible dedicated scratch root");
         let home = scratch.path();
         let apps = home.join("Applications");
@@ -2494,47 +2613,90 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         for path in [&active, &previous, &partial, &journal_bundle] {
             cleanup.remember(path);
             for name in &extension_names {
-                cleanup.extensions.push(path.join("Contents/PlugIns").join(name));
+                cleanup
+                    .extensions
+                    .push(path.join("Contents/PlugIns").join(name));
             }
         }
-        let install = Command::new("/bin/sh").arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"))
-            .env_clear().env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("HOME", home).env("SHELL", "/bin/zsh")
-            .env("VOX_DATA_DIR", home.join("data")).env("VOX_CONFIG_DIR", home.join("config"))
-            .env("VOX_APPLICATIONS_DIR", &apps).env("VOX_INSTALL_DIR", home.join("bin"))
-            .env("VOX_RELEASE_BASE", &prior_release.base).env("VOX_PROOF_APPLE_VERIFY", "1")
-            .env("VOX_NO_SHELL_SETUP", "1").env("VOX_NO_SKILL_INSTALL", "1")
-            .output().expect("APPARATUS: launch real scratch installer");
+        let install = Command::new("/bin/sh")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../install.sh"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", home)
+            .env("SHELL", "/bin/zsh")
+            .env("VOX_DATA_DIR", home.join("data"))
+            .env("VOX_CONFIG_DIR", home.join("config"))
+            .env("VOX_APPLICATIONS_DIR", &apps)
+            .env("VOX_INSTALL_DIR", home.join("bin"))
+            .env("VOX_RELEASE_BASE", &prior_release.base)
+            .env("VOX_PROOF_APPLE_VERIFY", "1")
+            .env("VOX_NO_SHELL_SETUP", "1")
+            .env("VOX_NO_SKILL_INSTALL", "1")
+            .output()
+            .expect("APPARATUS: launch real scratch installer");
         println!("{scenario} install {}: {}", install.status, said(&install));
-        assert!(install.status.success(), "PRODUCT: signed scratch install failed: {}", said(&install));
+        assert!(
+            install.status.success(),
+            "PRODUCT: signed scratch install failed: {}",
+            said(&install)
+        );
         cleanup.remember(&active);
-        let env = [("VOX_TEST_RELEASE_BASE", release.base.as_str()), ("VOX_TEST_APPLE_VERIFY", "1"),
-            ("VOX_NO_SHELL_SETUP", "1"), ("VOX_NO_SKILL_INSTALL", "1")];
+        let env = [
+            ("VOX_TEST_RELEASE_BASE", release.base.as_str()),
+            ("VOX_TEST_APPLE_VERIFY", "1"),
+            ("VOX_NO_SHELL_SETUP", "1"),
+            ("VOX_NO_SKILL_INSTALL", "1"),
+        ];
 
         if scenario == "interrupted-publish" {
-            let mut daemon = vox_command(&helper, home, &["daemon", "--listen", "127.0.0.1:0"], &env)
-                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit())
-                .spawn().expect("APPARATUS: start scratch foreground daemon");
+            let mut daemon =
+                vox_command(&helper, home, &["daemon", "--listen", "127.0.0.1:0"], &env)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .expect("APPARATUS: start scratch foreground daemon");
             let mut ready = String::new();
             std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: daemon stdout"))
-                .read_line(&mut ready).expect("APPARATUS: daemon startup event");
-            assert!(ready.starts_with("vox daemon: control socket "), "APPARATUS: daemon did not start: {ready}");
-            let cut_env: Vec<_> = env.iter().copied().chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")]).collect();
+                .read_line(&mut ready)
+                .expect("APPARATUS: daemon startup event");
+            assert!(
+                ready.starts_with("vox daemon: control socket "),
+                "APPARATUS: daemon did not start: {ready}"
+            );
+            let cut_env: Vec<_> = env
+                .iter()
+                .copied()
+                .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
+                .collect();
             let cut = vox(&helper, home, &["update"], &cut_env);
-            assert!(!cut.status.success() && partial.is_dir(), "APPARATUS: real publish did not reach the cut-after-swap boundary: {}", said(&cut));
-            let inode = std::fs::metadata(&active).expect("APPARATUS: published inode").ino();
+            assert!(
+                !cut.status.success() && partial.is_dir(),
+                "APPARATUS: real publish did not reach the cut-after-swap boundary: {}",
+                said(&cut)
+            );
+            let inode = std::fs::metadata(&active)
+                .expect("APPARATUS: published inode")
+                .ino();
             let repaired = vox(&helper, home, &["update"], &env);
             let text = said(&repaired);
             println!("interrupted publish repair {}: {text}", repaired.status);
             let last = text.lines().last().unwrap_or("");
-            claims.push(claim("bundle.recovery_finishes_a_real_cut_without_another_swap",
+            claims.push(claim(
+                "bundle.recovery_finishes_a_real_cut_without_another_swap",
                 repaired.status.success()
-                    && inode == std::fs::metadata(&active).expect("APPARATUS: repaired inode").ino()
+                    && inode
+                        == std::fs::metadata(&active)
+                            .expect("APPARATUS: repaired inode")
+                            .ino()
                     && kept_app_says(&previous) == before_version
                     && !apps.join(".Vox.app.publishing").exists()
-                    && text.contains(&format!("the vox daemon was restarted and runs vox {after_version}"))
-                    && last.contains("without swapping Vox.app") && last.contains("cut short"),
-                text.clone()));
+                    && text.contains(&format!(
+                        "the vox daemon was restarted and runs vox {after_version}"
+                    ))
+                    && last.contains("without swapping Vox.app")
+                    && last.contains("cut short"),
+                text.clone(),
+            ));
             let _ = daemon.kill();
             let _ = daemon.wait();
             receipts.insert(scenario.to_owned(), text);
@@ -2544,93 +2706,214 @@ fn an_update_and_rollback_leave_one_launchable_vox() {
         let old_app = HeldApp::launch(home, &active, &cleanup.bundles);
         let updated = vox(&helper, home, &["update"], &env);
         println!("{scenario} update {}: {}", updated.status, said(&updated));
-        claims.push(claim("bundle.kept_bundle_is_not_an_application",
+        claims.push(claim(
+            "bundle.kept_bundle_is_not_an_application",
             updated.status.success() && kept_app_says(&previous) == before_version,
-            format!("update={}, kept version {:?}: {}", updated.status, kept_app_says(&previous), said(&updated))));
+            format!(
+                "update={}, kept version {:?}: {}",
+                updated.status,
+                kept_app_says(&previous),
+                said(&updated)
+            ),
+        ));
         // A failed product prerequisite must reach its own verdict before later apparatus
         // depends on the retained plist. Unwinding still owns the running scratch app.
         if kept_app_says(&previous) != before_version || !updated.status.success() {
-            dispose("signed one-launchable-app journey", &claims, &receipts, false);
+            dispose(
+                "signed one-launchable-app journey",
+                &claims,
+                &receipts,
+                false,
+            );
         }
         old_app.quit();
-        claims.push(claim("bundle.quitting_the_renamed_app_does_not_register_it",
-            !launch_services_paths("us.vox.app").expect("APPARATUS: records after graceful quit").contains(&previous),
-            format!("records={:?}", launch_services_paths("us.vox.app"))));
+        claims.push(claim(
+            "bundle.quitting_the_renamed_app_does_not_register_it",
+            !launch_services_paths("us.vox.app")
+                .expect("APPARATUS: records after graceful quit")
+                .contains(&previous),
+            format!("records={:?}", launch_services_paths("us.vox.app")),
+        ));
         let opened = opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
             .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-        claims.push(claim("bundle.identifier_launches_the_signed_updated_bundle",
-            opened.ok && opened.path.as_deref() == Some(active.as_path())
-                && app_says(&active) == after_version && shipped_notarized(&active).is_ok(),
-            format!("selected={:?}, error={:?}", opened.path, opened.error)));
+        claims.push(claim(
+            "bundle.identifier_launches_the_signed_updated_bundle",
+            opened.ok
+                && opened.path.as_deref() == Some(active.as_path())
+                && app_says(&active) == after_version
+                && shipped_notarized(&active).is_ok(),
+            format!("selected={:?}, error={:?}", opened.path, opened.error),
+        ));
 
         // Hold the genuinely signed candidate across rollback. The following real update must
         // retire it, not remove code from under the still-running application.
         let live_candidate = if scenario == "read-only-and-live-retirement" {
             Some(HeldApp::launch(home, &active, &cleanup.bundles))
-        } else { None };
+        } else {
+            None
+        };
         let rollback = vox(&helper, home, &["update", "--rollback"], &env);
-        println!("{scenario} rollback {}: {}", rollback.status, said(&rollback));
-        claims.push(claim("bundle.rollback_restores_the_signed_bundle_and_disarms_the_displaced_one",
-            rollback.status.success() && app_says(&active) == before_version
-                && shipped_notarized(&active).is_ok() && kept_app_says(&previous) == after_version,
-            said(&rollback)));
+        println!(
+            "{scenario} rollback {}: {}",
+            rollback.status,
+            said(&rollback)
+        );
+        claims.push(claim(
+            "bundle.rollback_restores_the_signed_bundle_and_disarms_the_displaced_one",
+            rollback.status.success()
+                && app_says(&active) == before_version
+                && shipped_notarized(&active).is_ok()
+                && kept_app_says(&previous) == after_version,
+            said(&rollback),
+        ));
         if scenario == "update-and-rollback" {
-            let opened = opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
-                .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            claims.push(claim("bundle.identifier_launches_the_signed_rollback",
+            let opened =
+                opened_bundle("us.vox.app", &home.join("data"), &home.join("config"), home)
+                    .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+            claims.push(claim(
+                "bundle.identifier_launches_the_signed_rollback",
                 opened.ok && opened.path.as_deref() == Some(active.as_path()),
-                format!("selected={:?}, error={:?}", opened.path, opened.error)));
+                format!("selected={:?}, error={:?}", opened.path, opened.error),
+            ));
         } else {
             let updated = vox(&helper, home, &["update"], &env);
-            assert!(updated.status.success(), "PRODUCT: second real update failed: {}", said(&updated));
-            let retired: Vec<_> = std::fs::read_dir(&apps).expect("APPARATUS: retired directory")
+            assert!(
+                updated.status.success(),
+                "PRODUCT: second real update failed: {}",
+                said(&updated)
+            );
+            let retired: Vec<_> = std::fs::read_dir(&apps)
+                .expect("APPARATUS: retired directory")
                 .map(|e| e.expect("APPARATUS: retired entry").path())
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".Vox.app.retired."))).collect();
-            assert_eq!(retired.len(), 1, "PRODUCT: real update removed the still-running retired bundle");
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(".Vox.app.retired."))
+                })
+                .collect();
+            assert_eq!(
+                retired.len(),
+                1,
+                "PRODUCT: real update removed the still-running retired bundle"
+            );
             let retired = &retired[0];
             cleanup.remember(retired);
             // Reproduce a legacy live application record, not a fabricated transition journal.
-            std::fs::rename(retired.join("Contents/Info.plist.kept"), retired.join("Contents/Info.plist"))
-                .expect("APPARATUS: restore original signed plist to reproduce failed legacy set-aside");
-            cleanup.register(retired).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            assert!(launch_services_paths("us.vox.app").expect("APPARATUS: seeded record").contains(retired),
-                "APPARATUS: exact retained registration was not staged");
-            let mode = std::fs::metadata(retired.join("Contents")).expect("APPARATUS: Contents mode").permissions().mode();
-            std::fs::set_permissions(retired.join("Contents"), std::fs::Permissions::from_mode(mode & !0o222))
-                .expect("APPARATUS: make Contents read-only");
+            std::fs::rename(
+                retired.join("Contents/Info.plist.kept"),
+                retired.join("Contents/Info.plist"),
+            )
+            .expect(
+                "APPARATUS: restore original signed plist to reproduce failed legacy set-aside",
+            );
+            cleanup
+                .register(retired)
+                .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+            assert!(
+                launch_services_paths("us.vox.app")
+                    .expect("APPARATUS: seeded record")
+                    .contains(retired),
+                "APPARATUS: exact retained registration was not staged"
+            );
+            let mode = std::fs::metadata(retired.join("Contents"))
+                .expect("APPARATUS: Contents mode")
+                .permissions()
+                .mode();
+            std::fs::set_permissions(
+                retired.join("Contents"),
+                std::fs::Permissions::from_mode(mode & !0o222),
+            )
+            .expect("APPARATUS: make Contents read-only");
             let refused = vox(&helper, home, &["update"], &env);
-            std::fs::set_permissions(retired.join("Contents"), std::fs::Permissions::from_mode(mode))
-                .expect("APPARATUS: remove the exact permission obstruction");
+            std::fs::set_permissions(
+                retired.join("Contents"),
+                std::fs::Permissions::from_mode(mode),
+            )
+            .expect("APPARATUS: remove the exact permission obstruction");
             // Unregister happened before the failed rename. Seed the exact record again so the
             // unregister inverse has its own causally staged, independent product assertion.
-            cleanup.register(retired).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-            assert!(launch_services_paths("us.vox.app").expect("APPARATUS: re-seeded record").contains(retired),
-                "APPARATUS: registration inverse was not staged before repair");
-            let inode = std::fs::metadata(&active).expect("APPARATUS: active inode").ino();
-            let ready = vox(&helper, home, &["daemon", "--detach", "--listen", "127.0.0.1:0"], &env);
+            cleanup
+                .register(retired)
+                .unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+            assert!(
+                launch_services_paths("us.vox.app")
+                    .expect("APPARATUS: re-seeded record")
+                    .contains(retired),
+                "APPARATUS: registration inverse was not staged before repair"
+            );
+            let inode = std::fs::metadata(&active)
+                .expect("APPARATUS: active inode")
+                .ino();
+            let ready = vox(
+                &helper,
+                home,
+                &["daemon", "--detach", "--listen", "127.0.0.1:0"],
+                &env,
+            );
             assert!(ready.status.success(),
                 "APPARATUS: authenticated scratch daemon was not ready before restart measurement: {}", said(&ready));
             let repaired = vox(&helper, home, &["update"], &env);
             let text = said(&repaired);
-            println!("read-only repair {}: {text}; refusal: {}", repaired.status, said(&refused));
-            let records = launch_services_paths("us.vox.app").expect("APPARATUS: records after retained repair");
-            claims.push(claim("bundle.kept_bundle_has_no_launchservices_record", !records.contains(retired),
-                format!("seeded exact path={}, records={records:?}", retired.display())));
-            claims.push(claim("bundle.recovery_repairs_read_only_and_live_retirement_without_a_swap",
-                !refused.status.success() && repaired.status.success() && retired.is_dir()
+            println!(
+                "read-only repair {}: {text}; refusal: {}",
+                repaired.status,
+                said(&refused)
+            );
+            let records = launch_services_paths("us.vox.app")
+                .expect("APPARATUS: records after retained repair");
+            claims.push(claim(
+                "bundle.kept_bundle_has_no_launchservices_record",
+                !records.contains(retired),
+                format!(
+                    "seeded exact path={}, records={records:?}",
+                    retired.display()
+                ),
+            ));
+            claims.push(claim(
+                "bundle.recovery_repairs_read_only_and_live_retirement_without_a_swap",
+                !refused.status.success()
+                    && repaired.status.success()
+                    && retired.is_dir()
                     && kept_app_says(retired) == after_version
-                    && inode == std::fs::metadata(&active).expect("APPARATUS: repaired active inode").ino()
-                    && text.contains(&format!("the vox daemon was restarted and runs vox {after_version}"))
-                    && text.lines().last().unwrap_or("").contains("without swapping Vox.app")
+                    && inode
+                        == std::fs::metadata(&active)
+                            .expect("APPARATUS: repaired active inode")
+                            .ino()
+                    && text.contains(&format!(
+                        "the vox daemon was restarted and runs vox {after_version}"
+                    ))
+                    && text
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .contains("without swapping Vox.app")
                     && text.lines().last().unwrap_or("").contains("retired bundle"),
-                format!("refusal={}; repair={text}", said(&refused))));
-            live_candidate.expect("APPARATUS: owned live candidate").quit();
+                format!("refusal={}; repair={text}", said(&refused)),
+            ));
+            live_candidate
+                .expect("APPARATUS: owned live candidate")
+                .quit();
             let swept = vox(&helper, home, &["update"], &env);
-            claims.push(claim("bundle.recovery_removes_retired_code_only_after_graceful_exit",
-                swept.status.success() && !retired.exists()
-                    && said(&swept).lines().last().unwrap_or("").contains("removed 1 retired bundle"), said(&swept)));
+            claims.push(claim(
+                "bundle.recovery_removes_retired_code_only_after_graceful_exit",
+                swept.status.success()
+                    && !retired.exists()
+                    && said(&swept)
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .contains("removed 1 retired bundle"),
+                said(&swept),
+            ));
         }
-        receipts.insert(scenario.to_owned(), format!("update={}\nrollback={}", said(&updated), said(&rollback)));
+        receipts.insert(
+            scenario.to_owned(),
+            format!("update={}\nrollback={}", said(&updated), said(&rollback)),
+        );
     }
-    dispose("signed one-launchable-app journey", &claims, &receipts, false);
+    dispose(
+        "signed one-launchable-app journey",
+        &claims,
+        &receipts,
+        false,
+    );
 }

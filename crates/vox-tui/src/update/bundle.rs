@@ -528,10 +528,16 @@ impl Recovery {
             print!(" made the kept previous bundle non-launchable again;");
         }
         if self.retired_set_aside > 0 {
-            print!(" made {} retired bundle(s) non-launchable;", self.retired_set_aside);
+            print!(
+                " made {} retired bundle(s) non-launchable;",
+                self.retired_set_aside
+            );
         }
         if self.retired_removed > 0 {
-            print!(" removed {} retired bundle(s) no process still used;", self.retired_removed);
+            print!(
+                " removed {} retired bundle(s) no process still used;",
+                self.retired_removed
+            );
         }
         println!();
     }
