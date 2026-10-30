@@ -6,6 +6,7 @@ use crate::node::history_stream::{
     runtime::{Flow, RetirementStep},
     Purpose, RequestId,
 };
+use crate::node::ports::{OutboundService, PhysicalSlot};
 use crate::node::store::Store;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -550,6 +551,8 @@ struct Returned {
 struct Running {
     room: Digest32,
     peer: Digest32,
+    service: crate::node::ports::OutboundService,
+    slot: crate::node::ports::PhysicalSlot,
     token: u64,
     generation: u64,
     request: u64,
@@ -587,16 +590,68 @@ impl Drop for RetirementWaiting {
         self.task.abort();
     }
 }
+type PortKey = (Digest32, Digest32, crate::node::ports::OutboundService);
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct WorkKey {
+    room: Digest32,
+    peer: Digest32,
+    service: crate::node::ports::OutboundService,
+    request: stream::RequestId,
+    instance: [u8; 16],
+    authorization: Digest32,
+}
+impl WorkKey {
+    fn of(flow: &Flow) -> Self {
+        Self {
+            room: flow.room,
+            peer: flow.peer,
+            service: flow.service,
+            request: flow.retirement_request(),
+            instance: flow.instance,
+            authorization: flow.generation,
+        }
+    }
+}
+
+fn foreground_index(
+    service: crate::node::ports::OutboundService,
+    lane: crate::node::history_budget::Lane,
+) -> usize {
+    service.index() * 4 + lane.index()
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct AdmissionWork {
     root: &'static str,
     lane: crate::node::history_budget::Lane,
+    service: crate::node::ports::OutboundService,
+    key: Option<WorkKey>,
+    /// Pre-Flow Public request and room generation; authorization is captured only by a Flow.
+    demand: Option<(u64, u64)>,
 }
 impl AdmissionWork {
+    fn unowned(
+        root: &'static str,
+        lane: crate::node::history_budget::Lane,
+        service: crate::node::ports::OutboundService,
+    ) -> Self {
+        Self {
+            root,
+            lane,
+            service,
+            key: None,
+            demand: None,
+        }
+    }
+
     fn from_flow(flow: &Flow) -> Self {
         Self {
             root: flow.root_name(),
             lane: flow.lane(),
+            service: flow.service,
+            key: Some(WorkKey::of(flow)),
+            demand: None,
         }
     }
 }
@@ -616,6 +671,9 @@ struct ForegroundAdmission {
     peer: Digest32,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
+    service: crate::node::ports::OutboundService,
+    key: Option<WorkKey>,
+    demand: Option<(u64, u64)>,
     ticket: crate::node::history_budget::Ticket,
     task: tokio::task::JoinHandle<()>,
 }
@@ -629,50 +687,28 @@ struct LocalAdmission {
     token: u64,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
+    key: Option<WorkKey>,
     task: tokio::task::JoinHandle<()>,
 }
 struct ByteAdmission {
     root: &'static str,
     lane: crate::node::history_budget::Lane,
-    owner: Option<ByteOwner>,
+    owner: Option<WorkKey>,
     /// Scheduling need captured by the ended worker, never the port's newer current need.
     port_request: Option<u64>,
     task: tokio::task::JoinHandle<()>,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ByteOwner {
-    request: stream::RequestId,
-    instance: [u8; 16],
-    generation: Digest32,
-}
-impl ByteOwner {
-    fn of(flow: &Flow) -> Self {
-        Self {
-            request: flow.retirement_request(),
-            instance: flow.instance,
-            generation: flow.generation,
-        }
-    }
-}
 struct ByteWait {
     wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-    owner: Option<ByteOwner>,
+    owner: Option<WorkKey>,
     port_request: Option<u64>,
-}
-impl ByteWait {
-    fn unowned(wake: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) -> Self {
-        Self {
-            wake,
-            owner: None,
-            port_request: None,
-        }
-    }
 }
 struct PoolAdmission {
     token: u64,
     gate: &'static str,
     root: &'static str,
     lane: crate::node::history_budget::Lane,
+    key: WorkKey,
     ticket: crate::node::history_budget::FlowReleaseTicket,
     /// Set only by the exact release handoff. Unrelated actor events cannot consume a granted
     /// continuation before this owner has received its causal edge.
@@ -681,9 +717,9 @@ struct PoolAdmission {
 #[derive(Clone, Copy)]
 struct PoolWait {
     gate: &'static str,
-    work: AdmissionWork,
-    request: stream::RequestId,
-    instance: [u8; 16],
+    root: &'static str,
+    lane: crate::node::history_budget::Lane,
+    key: WorkKey,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RequiredOwner {
@@ -839,16 +875,18 @@ impl RoomRetirement {
 #[derive(Default)]
 pub(super) struct Controller {
     running: [Option<Running>; crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS],
-    ready: [Option<Flow>; crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS],
+    ready: [Option<Flow>; 3],
+    background_next: Option<crate::node::ports::OutboundService>,
     /// The one queued archive turn for this node. The controller owns its daemon-wide fair-queue
     /// ticket; the task waits only for a wake, without an actor or room lock.
     archive_admission: Option<ArchiveAdmission>,
-    /// One retained ticket per startable foreground lane. A release wakes the exact waiting
-    /// port; the scheduler tick is neither its notifier nor a correctness fallback.
-    foreground_admission: [Option<ForegroundAdmission>; 4],
-    local_admission: BTreeMap<(Digest32, Digest32), LocalAdmission>,
-    byte_admission: BTreeMap<(Digest32, Digest32, u64), ByteAdmission>,
-    pool_admission: BTreeMap<(Digest32, Digest32), PoolAdmission>,
+    /// One retained ticket per logical service/lane. A release wakes the exact waiting
+    /// owner; ticket metadata does not add a worker or physical running position.
+    foreground_admission: [Option<ForegroundAdmission>; 12],
+    local_admission: BTreeMap<PortKey, LocalAdmission>,
+    byte_admission:
+        BTreeMap<(Digest32, Digest32, crate::node::ports::OutboundService, u64), ByteAdmission>,
+    pool_admission: BTreeMap<PortKey, PoolAdmission>,
     deferred: VecDeque<Flow>,
     body_slots: Arc<stream::runtime::BodySlots>,
     required: VecDeque<RequiredOwner>,
@@ -975,31 +1013,42 @@ impl Controller {
     /// Port request generations describe external wakes; an independent clean exchange may
     /// consume one while this continuation is between bounded slices. Do not let that scalar
     /// acknowledgement strand work whose ownership is still here.
-    pub(super) fn needs_port(&self, room: Digest32, peer: Digest32) -> bool {
+    pub(super) fn needs_port_for(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) -> bool {
         self.ready
             .iter()
             .flatten()
-            .any(|flow| flow.room == room && flow.peer == peer)
-            || self
-                .deferred
-                .iter()
-                .any(|flow| flow.room == room && flow.peer == peer)
-            || self
-                .required
-                .iter()
-                .any(|required| required.room == room && required.peer == peer)
+            .chain(self.deferred.iter())
+            .any(|flow| flow.room == room && flow.peer == peer && flow.service == service)
+            || (service == crate::node::ports::OutboundService::Public
+                && self
+                    .required
+                    .iter()
+                    .any(|owner| owner.room == room && owner.peer == peer))
             || self
                 .foreground_admission
                 .iter()
                 .flatten()
-                .any(|admission| admission.room == room && admission.peer == peer)
-            || self.local_admission.contains_key(&(room, peer))
+                .any(|a| a.room == room && a.peer == peer && a.service == service)
+            || self.local_admission.contains_key(&(room, peer, service))
             || self
                 .byte_admission
-                .range((room, peer, 0)..=(room, peer, u64::MAX))
+                .range((room, peer, service, 0)..=(room, peer, service, u64::MAX))
                 .next()
                 .is_some()
-            || self.pool_admission.contains_key(&(room, peer))
+            || self.pool_admission.contains_key(&(room, peer, service))
+    }
+
+    fn retains_work(&self, key: WorkKey) -> bool {
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .any(|flow| WorkKey::of(flow) == key)
     }
 
     fn cancel_archive_admission(&mut self) {
@@ -1025,10 +1074,18 @@ impl Controller {
             self.cancel_archive_admission();
         }
     }
-    pub(super) fn release_archive_admission(&mut self, token: u64, room: Digest32, peer: Digest32) {
-        if self.archive_admission.as_ref().is_some_and(|admission| {
-            admission.token == token && admission.room == room && admission.peer == peer
-        }) {
+    pub(super) fn release_archive_admission(
+        &mut self,
+        token: u64,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) {
+        if service == crate::node::ports::OutboundService::Archive
+            && self.archive_admission.as_ref().is_some_and(|admission| {
+                admission.token == token && admission.room == room && admission.peer == peer
+            })
+        {
             self.cancel_archive_admission();
         }
     }
@@ -1037,11 +1094,18 @@ impl Controller {
             admission.task.abort();
         }
     }
-    fn cancel_matching_control_admission(&mut self, room: Digest32, peer: Digest32) {
-        let index = crate::node::history_budget::Lane::Control.index();
+    fn cancel_matching_control_admission(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) {
+        let index = foreground_index(service, crate::node::history_budget::Lane::Control);
         if self.foreground_admission[index]
             .as_ref()
-            .is_some_and(|admission| admission.room == room && admission.peer == peer)
+            .is_some_and(|admission| {
+                admission.room == room && admission.peer == peer && admission.service == service
+            })
         {
             self.cancel_foreground_admission(index);
         }
@@ -1052,10 +1116,15 @@ impl Controller {
         node: Digest32,
         room: Digest32,
         peer: Digest32,
+        service: crate::node::ports::OutboundService,
     ) -> bool {
-        let index = crate::node::history_budget::Lane::Control.index();
+        let index = foreground_index(service, crate::node::history_budget::Lane::Control);
         match self.foreground_admission[index].as_ref() {
-            Some(admission) if admission.room == room && admission.peer == peer => {
+            Some(admission)
+                if admission.room == room
+                    && admission.peer == peer
+                    && admission.service == service =>
+            {
                 admission.ticket.would_admit()
             }
             Some(_) => false,
@@ -1065,42 +1134,60 @@ impl Controller {
     /// Give the daemon's retained fair-queue owner a runnable local lane before it tries to
     /// consume capacity. The displaced Flow remains whole and keeps the exact deque position
     /// this owner held; no root, cursor, context, announcement or backoff state is rebuilt.
-    fn prioritize_control_admission_owner(&mut self, room: Digest32, peer: Digest32) {
-        if self.running[0].is_some() {
+    fn prioritize_control_admission_owner(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) {
+        if self.running[service.slot().index()].is_some() {
             return;
         }
-        let index = crate::node::history_budget::Lane::Control.index();
-        if !self.foreground_admission[index]
+        let index = foreground_index(service, crate::node::history_budget::Lane::Control);
+        let Some(admission) = self.foreground_admission[index]
             .as_ref()
-            .is_some_and(|admission| admission.room == room && admission.peer == peer)
-        {
+            .filter(|a| a.room == room && a.peer == peer && a.service == service)
+        else {
             return;
-        }
-        if self.ready[0].as_ref().is_some_and(|flow| {
-            flow.room == room && flow.peer == peer && !self.record_bytes_blocked(flow)
+        };
+        let key = admission.key;
+        let ready_index = service.index();
+        if self.ready[ready_index].as_ref().is_some_and(|flow| {
+            flow.room == room
+                && flow.peer == peer
+                && !self.record_bytes_blocked(flow)
+                && key.is_none_or(|key| WorkKey::of(flow) == key)
         }) {
             return;
         }
         let Some(at) = self.deferred.iter().position(|flow| {
-            !flow.archive
+            flow.service == service
                 && flow.room == room
                 && flow.peer == peer
                 && !self.record_bytes_blocked(flow)
+                && key.is_none_or(|key| WorkKey::of(flow) == key)
         }) else {
             return;
         };
         let Some(flow) = self.deferred.remove(at) else {
             return;
         };
-        if let Some(displaced) = self.ready[0].replace(flow) {
+        if let Some(displaced) = self.ready[ready_index].replace(flow) {
             self.deferred.insert(at, displaced);
         }
     }
-    fn cancel_foreground_port(&mut self, room: Digest32, peer: Digest32) {
+    fn cancel_foreground_port(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) {
         for index in 0..self.foreground_admission.len() {
             if self.foreground_admission[index]
                 .as_ref()
-                .is_some_and(|admission| admission.room == room && admission.peer == peer)
+                .is_some_and(|admission| {
+                    admission.room == room && admission.peer == peer && admission.service == service
+                })
             {
                 self.cancel_foreground_admission(index);
             }
@@ -1111,12 +1198,17 @@ impl Controller {
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: crate::node::ports::OutboundService,
     ) {
         for index in 0..self.foreground_admission.len() {
             if self.foreground_admission[index]
                 .as_ref()
                 .is_some_and(|admission| {
-                    admission.token == token && admission.room == room && admission.peer == peer
+                    admission.token == token
+                        && admission.room == room
+                        && admission.peer == peer
+                        && admission.service == service
+                        && admission.key.is_none_or(|key| self.retains_work(key))
                 })
             {
                 self.cancel_foreground_admission(index);
@@ -1124,8 +1216,13 @@ impl Controller {
             }
         }
     }
-    fn cancel_local_admission(&mut self, room: Digest32, peer: Digest32) {
-        if let Some(admission) = self.local_admission.remove(&(room, peer)) {
+    fn cancel_local_admission(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) {
+        if let Some(admission) = self.local_admission.remove(&(room, peer, service)) {
             admission.task.abort();
         }
     }
@@ -1134,14 +1231,19 @@ impl Controller {
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: crate::node::ports::OutboundService,
         kind: LocalAdmissionKind,
     ) -> bool {
         if self
             .local_admission
-            .get(&(room, peer))
-            .is_some_and(|entry| entry.token == token && entry.kind == kind)
+            .get(&(room, peer, service))
+            .is_some_and(|entry| {
+                entry.token == token
+                    && entry.kind == kind
+                    && entry.key.is_none_or(|key| self.retains_work(key))
+            })
         {
-            self.cancel_local_admission(room, peer);
+            self.cancel_local_admission(room, peer, service);
             true
         } else {
             false
@@ -1152,8 +1254,9 @@ impl Controller {
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: crate::node::ports::OutboundService,
     ) -> bool {
-        self.release_local_admission_kind(token, room, peer, LocalAdmissionKind::Secret)
+        self.release_local_admission_kind(token, room, peer, service, LocalAdmissionKind::Secret)
     }
     pub(super) fn release_room_admission(
         &mut self,
@@ -1161,15 +1264,21 @@ impl Controller {
         room: Digest32,
         node: Digest32,
     ) -> bool {
-        self.release_local_admission_kind(token, room, node, LocalAdmissionKind::Room)
+        self.release_local_admission_kind(
+            token,
+            room,
+            node,
+            crate::node::ports::OutboundService::Archive,
+            LocalAdmissionKind::Room,
+        )
     }
     pub(super) fn cancel_own_recovery_admission(&mut self, room: Digest32, node: Digest32) {
         if self
             .local_admission
-            .get(&(room, node))
+            .get(&(room, node, crate::node::ports::OutboundService::Archive))
             .is_some_and(|entry| entry.kind == LocalAdmissionKind::Room)
         {
-            self.cancel_local_admission(room, node);
+            self.cancel_local_admission(room, node, crate::node::ports::OutboundService::Archive);
         }
     }
 
@@ -1222,7 +1331,7 @@ impl Controller {
         node: Digest32,
     ) -> bool {
         self.local_admission
-            .get(&(room, node))
+            .get(&(room, node, crate::node::ports::OutboundService::Archive))
             .is_some_and(|entry| {
                 entry.token == token
                     && entry.kind == LocalAdmissionKind::Room
@@ -1240,7 +1349,11 @@ impl Controller {
         released: impl Future<Output = ()> + Send + 'static,
     ) {
         let (room, node) = key;
-        if self.local_admission.contains_key(&(room, node)) {
+        if self.local_admission.contains_key(&(
+            room,
+            node,
+            crate::node::ports::OutboundService::Archive,
+        )) {
             return;
         }
         let token = *next_token;
@@ -1259,12 +1372,13 @@ impl Controller {
                 .await;
         });
         self.local_admission.insert(
-            (room, node),
+            (room, node, crate::node::ports::OutboundService::Archive),
             LocalAdmission {
                 kind: LocalAdmissionKind::Room,
                 token,
                 root,
                 lane: crate::node::history_budget::Lane::Control,
+                key: None,
                 task,
             },
         );
@@ -1279,7 +1393,10 @@ impl Controller {
         work: AdmissionWork,
         secret_work: Arc<tokio::sync::RwLock<()>>,
     ) {
-        if self.local_admission.contains_key(&(room, peer)) {
+        if self
+            .local_admission
+            .contains_key(&(room, peer, work.service))
+        {
             return;
         }
         let token = *next_token;
@@ -1289,85 +1406,95 @@ impl Controller {
             let guard = secret_work.read_owned().await;
             drop(guard);
             let _ = tx
-                .send(NetEvent::BoundedSecretReady { token, room, peer })
+                .send(NetEvent::BoundedSecretReady {
+                    token,
+                    room,
+                    peer,
+                    service: work.service,
+                })
                 .await;
         });
         self.local_admission.insert(
-            (room, peer),
+            (room, peer, work.service),
             LocalAdmission {
                 kind: LocalAdmissionKind::Secret,
                 token,
                 root: work.root,
                 lane: work.lane,
+                key: work.key,
                 task,
             },
         );
     }
-    fn cancel_byte_admission(&mut self, room: Digest32, peer: Digest32) {
-        self.byte_admission
-            .retain(|(waiting_room, waiting_peer, _), admission| {
-                let keep = *waiting_room != room || *waiting_peer != peer;
+    fn cancel_byte_admission(&mut self, room: Digest32, peer: Digest32, service: OutboundService) {
+        self.byte_admission.retain(
+            |(waiting_room, waiting_peer, waiting_service, _), admission| {
+                let keep =
+                    *waiting_room != room || *waiting_peer != peer || *waiting_service != service;
                 if !keep {
                     admission.task.abort();
                 }
                 keep
-            });
+            },
+        );
     }
     pub(super) fn release_byte_admission(
         &mut self,
         token: u64,
         room: Digest32,
         peer: Digest32,
+        service: crate::node::ports::OutboundService,
     ) -> Option<bool> {
-        let admission = self.byte_admission.remove(&(room, peer, token))?;
+        let admission = self.byte_admission.remove(&(room, peer, service, token))?;
         admission.task.abort();
         if let Some(owner) = admission.owner {
-            self.record_retained(room, peer, owner).then_some(true)
+            self.retains_work(owner).then_some(true)
         } else {
             Some(false)
         }
     }
-    fn record_retained(&self, room: Digest32, peer: Digest32, owner: ByteOwner) -> bool {
-        self.ready
-            .iter()
-            .filter_map(Option::as_ref)
-            .chain(self.deferred.iter())
-            .any(|flow| flow.room == room && flow.peer == peer && ByteOwner::of(flow) == owner)
-    }
     fn record_bytes_blocked(&self, flow: &Flow) -> bool {
         self.byte_admission
-            .range((flow.room, flow.peer, 0)..=(flow.room, flow.peer, u64::MAX))
-            .any(|(_, admission)| admission.owner == Some(ByteOwner::of(flow)))
+            .range(
+                (flow.room, flow.peer, flow.service, 0)
+                    ..=(flow.room, flow.peer, flow.service, u64::MAX),
+            )
+            .any(|(_, admission)| admission.owner == Some(WorkKey::of(flow)))
     }
-    fn prune_byte_admissions(&mut self, room: Digest32, peer: Digest32) {
+    fn prune_byte_admissions(&mut self, room: Digest32, peer: Digest32, service: OutboundService) {
         let ready = &self.ready;
         let deferred = &self.deferred;
-        self.byte_admission
-            .retain(|(waiting_room, waiting_peer, _), admission| {
+        self.byte_admission.retain(
+            |(waiting_room, waiting_peer, waiting_service, _), admission| {
                 let stale = *waiting_room == room
                     && *waiting_peer == peer
+                    && *waiting_service == service
                     && admission.owner.is_some_and(|owner| {
-                        !ready.iter().flatten().chain(deferred.iter()).any(|flow| {
-                            flow.room == room && flow.peer == peer && ByteOwner::of(flow) == owner
-                        })
+                        !ready
+                            .iter()
+                            .flatten()
+                            .chain(deferred.iter())
+                            .any(|flow| WorkKey::of(flow) == owner)
                     });
                 if stale {
                     admission.task.abort();
                 }
                 !stale
-            });
+            },
+        );
     }
     fn take_superseded_byte_hint(
         &mut self,
         room: Digest32,
         peer: Digest32,
+        service: crate::node::ports::OutboundService,
         inbox: &stream::HintInbox,
     ) -> Option<(Flow, u64)> {
-        let superseded = |flow: &Flow, owner: ByteOwner| {
+        let superseded = |flow: &Flow, owner: WorkKey| {
             flow.room == room
                 && flow.peer == peer
-                && ByteOwner::of(flow) == owner
-                && !flow.archive
+                && WorkKey::of(flow) == owner
+                && flow.service == crate::node::ports::OutboundService::Public
                 && flow.archive_request.is_none()
                 && flow.required_root.is_none()
                 && !flow.local_own_root()
@@ -1377,7 +1504,7 @@ impl Controller {
         };
         let (key, admission) = self
             .byte_admission
-            .range((room, peer, 0)..=(room, peer, u64::MAX))
+            .range((room, peer, service, 0)..=(room, peer, service, u64::MAX))
             .find(|(_, admission)| {
                 admission.owner.is_some_and(|owner| {
                     self.ready
@@ -1387,7 +1514,7 @@ impl Controller {
                         .any(|flow| superseded(flow, owner))
                 })
             })?;
-        let token = key.2;
+        let token = key.3;
         let owner = admission.owner?;
         let port_request = admission.port_request?;
         // Only the exact byte waiter's parked hinted owner can be replaced. Archive and
@@ -1408,7 +1535,7 @@ impl Controller {
         // No await occurs between identity selection and cancellation. A queued old ready
         // event cannot consume a future replacement, because its unique token no longer exists.
         self.byte_admission
-            .remove(&(room, peer, token))?
+            .remove(&(room, peer, service, token))?
             .task
             .abort();
         Some((flow, port_request))
@@ -1424,8 +1551,8 @@ impl Controller {
     ) {
         if self
             .byte_admission
-            .range((room, peer, 0)..=(room, peer, u64::MAX))
-            .any(|(_, admission)| admission.owner == waiting.owner)
+            .range((room, peer, work.service, 0)..=(room, peer, work.service, u64::MAX))
+            .any(|(_, admission)| admission.owner == waiting.owner.or(work.key))
         {
             return;
         }
@@ -1440,39 +1567,48 @@ impl Controller {
         let task = tokio::spawn(async move {
             wake.await;
             let _ = tx
-                .send(NetEvent::BoundedBytesReady { token, room, peer })
+                .send(NetEvent::BoundedBytesReady {
+                    token,
+                    room,
+                    peer,
+                    service: work.service,
+                })
                 .await;
         });
         self.byte_admission.insert(
-            (room, peer, token),
+            (room, peer, work.service, token),
             ByteAdmission {
                 root: work.root,
                 lane: work.lane,
-                owner,
+                owner: owner.or(work.key),
                 port_request,
                 task,
             },
         );
     }
 
-    pub(super) fn cancel_pool_admission(&mut self, room: Digest32, peer: Digest32) {
-        self.pool_admission.remove(&(room, peer));
+    pub(super) fn cancel_pool_admission_for(
+        &mut self,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) {
+        self.pool_admission.remove(&(room, peer, service));
     }
 
     /// A real connection-close edge retires every exact continuation for that peer before the
     /// scheduler publishes or considers other work. Return the rooms whose parked Flows remain
     /// owned and must be reconsidered after reach/reconnect.
     pub(super) fn cancel_peer_pool_admissions(&mut self, peer: Digest32) -> BTreeSet<Digest32> {
-        let waiting: Vec<(Digest32, Digest32)> = self
-            .pool_admission
-            .keys()
-            .filter(|(_, waiting_peer)| *waiting_peer == peer)
-            .copied()
-            .collect();
-        let rooms = waiting.iter().map(|(room, _)| *room).collect();
-        for (room, peer) in waiting {
-            self.cancel_pool_admission(room, peer);
-        }
+        let mut rooms = BTreeSet::new();
+        self.pool_admission.retain(|(room, waiting_peer, _), _| {
+            if *waiting_peer == peer {
+                rooms.insert(*room);
+                false
+            } else {
+                true
+            }
+        });
         rooms
     }
 
@@ -1480,7 +1616,22 @@ impl Controller {
         &mut self,
         release: crate::node::history_budget::FlowRelease,
     ) -> bool {
-        let Some(admission) = self.pool_admission.get_mut(&(release.room, release.peer)) else {
+        let Some((key, owner)) = self.pool_admission.iter().find_map(|(key, admission)| {
+            (key.0 == release.room
+                && key.1 == release.peer
+                && key.2.slot() == release.slot
+                && admission.token == release.token
+                && admission.ticket.sequence() == release.order
+                && admission.ticket.granted())
+            .then_some((*key, admission.key))
+        }) else {
+            return false;
+        };
+        if !self.retains_work(owner) {
+            self.pool_admission.remove(&key);
+            return false;
+        }
+        let Some(admission) = self.pool_admission.get_mut(&key) else {
             return false;
         };
         if admission.token != release.token
@@ -1490,12 +1641,34 @@ impl Controller {
             return false;
         }
         admission.handed_off = true;
+        let index = owner.service.index();
+        if self.ready[index]
+            .as_ref()
+            .is_none_or(|flow| WorkKey::of(flow) != owner)
+        {
+            if let Some(at) = self
+                .deferred
+                .iter()
+                .position(|flow| WorkKey::of(flow) == owner)
+            {
+                if let Some(flow) = self.deferred.remove(at) {
+                    if let Some(displaced) = self.ready[index].replace(flow) {
+                        self.deferred.insert(at, displaced);
+                    }
+                }
+            }
+        }
         true
     }
 
-    pub(super) fn pool_admission_blocked(&self, room: Digest32, peer: Digest32) -> bool {
+    pub(super) fn pool_admission_blocked_for(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        service: crate::node::ports::OutboundService,
+    ) -> bool {
         self.pool_admission
-            .get(&(room, peer))
+            .get(&(room, peer, service))
             .is_some_and(|admission| !admission.handed_off)
     }
 
@@ -1503,38 +1676,41 @@ impl Controller {
     /// the actor-owned half of the flow-state snapshot rendered under `lanes`; health diagnosis
     /// consumes the same ownership rather than inferring a cause from a pool count.
     pub(super) fn retained_pool_rooms(&self) -> std::collections::BTreeSet<Digest32> {
-        self.pool_admission.keys().map(|(room, _)| *room).collect()
+        self.pool_admission
+            .keys()
+            .map(|(room, _, _)| *room)
+            .collect()
     }
 
     fn wait_for_pool(
         &mut self,
         next_token: &mut u64,
-        room: Digest32,
-        peer: Digest32,
         waiting: PoolWait,
         job: &crate::node::history_budget::Job,
         refused_at: &crate::node::history_budget::FlowReleaseEdge,
     ) -> Result<(), crate::node::history_budget::FlowWaitError> {
-        if self.pool_admission.contains_key(&(room, peer)) {
+        let key = waiting.key;
+        let (room, peer, service) = (key.room, key.peer, key.service);
+        if self.pool_admission.contains_key(&(room, peer, service)) {
             return Ok(());
         }
         let token = *next_token;
         *next_token += 1;
         let ticket = job.flow_wait_ticket(
-            room,
-            peer,
-            waiting.request,
-            waiting.instance,
+            (room, peer, service.slot()),
+            key.request,
+            key.instance,
             token,
             refused_at,
         )?;
         self.pool_admission.insert(
-            (room, peer),
+            (room, peer, service),
             PoolAdmission {
                 token,
                 gate: waiting.gate,
-                root: waiting.work.root,
-                lane: waiting.work.lane,
+                root: waiting.root,
+                lane: waiting.lane,
+                key,
                 ticket,
                 handed_off: false,
             },
@@ -1553,6 +1729,44 @@ impl Controller {
     fn flow_count(&self) -> usize {
         self.local_flow_count() + self.detached_flows.load(Ordering::Acquire)
     }
+    fn can_retain_new(&self, service: OutboundService) -> bool {
+        let count = self.flow_count();
+        if count >= RETAINED_FLOW_LIMIT {
+            return false;
+        }
+        if count + 1 < RETAINED_FLOW_LIMIT {
+            return true;
+        }
+        // The last unowned retained position remains available to the other physical family.
+        // An opaque detached/cleanup owner is not evidence that its opportunity is available.
+        self.ready
+            .iter()
+            .flatten()
+            .chain(self.deferred.iter())
+            .chain(self.retiring.iter())
+            .any(|flow| flow.service.slot() != service.slot())
+            || self
+                .running
+                .iter()
+                .flatten()
+                .any(|running| running.slot != service.slot())
+    }
+    pub(super) fn physical_available(&self, service: OutboundService) -> bool {
+        self.running[service.slot().index()].is_none()
+    }
+
+    pub(super) fn background_preference(&self) -> OutboundService {
+        self.background_next.unwrap_or(OutboundService::Private)
+    }
+
+    pub(super) fn note_background_started(&mut self, service: OutboundService) {
+        match service {
+            OutboundService::Private => self.background_next = Some(OutboundService::Archive),
+            OutboundService::Archive => self.background_next = Some(OutboundService::Private),
+            OutboundService::Public => {}
+        }
+    }
+
     fn dispose(&mut self, flow: Flow) {
         // Exclusive ownership moves to the retirement queue. Its only permitted next work is
         // Flow::retire_slice's exact local cleanup; that slice cancels every capability before
@@ -1814,35 +2028,36 @@ impl Controller {
                 self.cancel_foreground_admission(index);
             }
         }
-        let waiting: Vec<(Digest32, Digest32)> = self
+        let waiting: Vec<PortKey> = self
             .local_admission
             .keys()
-            .filter(|(waiting_room, _)| *waiting_room == room)
+            .filter(|(waiting_room, _, _)| *waiting_room == room)
             .copied()
             .collect();
-        for (room, peer) in waiting {
-            self.cancel_local_admission(room, peer);
+        for (room, peer, service) in waiting {
+            self.cancel_local_admission(room, peer, service);
         }
         self.byte_admission
-            .retain(|(waiting_room, _, _), admission| {
+            .retain(|(waiting_room, _, _, _), admission| {
                 let keep = *waiting_room != room;
                 if !keep {
                     admission.task.abort();
                 }
                 keep
             });
-        let waiting: Vec<(Digest32, Digest32)> = self
+        let waiting: Vec<PortKey> = self
             .pool_admission
             .keys()
-            .filter(|(waiting_room, _)| *waiting_room == room)
+            .filter(|(waiting_room, _, _)| *waiting_room == room)
             .copied()
             .collect();
-        for (room, peer) in waiting {
-            self.cancel_pool_admission(room, peer);
+        for (room, peer, service) in waiting {
+            self.cancel_pool_admission_for(room, peer, service);
         }
         let mut retired = Self {
             running: std::array::from_fn(|_| None),
             ready: std::array::from_fn(|_| None),
+            background_next: None,
             archive_admission: None,
             foreground_admission: std::array::from_fn(|_| None),
             local_admission: BTreeMap::new(),
@@ -1983,10 +2198,16 @@ impl Controller {
         {
             self.cancel_archive_admission();
         }
-        self.cancel_foreground_port(room, peer);
-        self.cancel_local_admission(room, peer);
-        self.cancel_byte_admission(room, peer);
-        self.cancel_pool_admission(room, peer);
+        for service in [
+            OutboundService::Public,
+            OutboundService::Private,
+            OutboundService::Archive,
+        ] {
+            self.cancel_foreground_port(room, peer, service);
+            self.cancel_local_admission(room, peer, service);
+            self.cancel_byte_admission(room, peer, service);
+            self.cancel_pool_admission_for(room, peer, service);
+        }
         for slot in &mut self.ready {
             if slot
                 .as_ref()
@@ -2104,6 +2325,39 @@ impl Controller {
         }
     }
 
+    fn cancel_work_admissions(&mut self, key: WorkKey) {
+        for index in 0..self.foreground_admission.len() {
+            if self.foreground_admission[index]
+                .as_ref()
+                .is_some_and(|admission| admission.key == Some(key))
+            {
+                self.cancel_foreground_admission(index);
+            }
+        }
+        let port = (key.room, key.peer, key.service);
+        if self
+            .local_admission
+            .get(&port)
+            .is_some_and(|admission| admission.key == Some(key))
+        {
+            self.cancel_local_admission(key.room, key.peer, key.service);
+        }
+        self.byte_admission.retain(|_, admission| {
+            let keep = admission.owner != Some(key);
+            if !keep {
+                admission.task.abort();
+            }
+            keep
+        });
+        if self
+            .pool_admission
+            .get(&port)
+            .is_some_and(|admission| admission.key == key)
+        {
+            self.cancel_pool_admission_for(key.room, key.peer, key.service);
+        }
+    }
+
     pub(super) fn cancel_archive(
         &mut self,
         room: Digest32,
@@ -2115,22 +2369,48 @@ impl Controller {
         }) {
             self.cancel_archive_admission();
         }
-        if self.ready[1].as_ref().is_some_and(|flow| {
-            flow.room == room && flow.instance == instance && flow.archive_request == Some(request)
-        }) {
-            self.cancel_archive_admission();
-            if let Some(flow) = self.ready[1].take() {
+        if self.ready[OutboundService::Archive.index()]
+            .as_ref()
+            .is_some_and(|flow| {
+                flow.service == OutboundService::Archive
+                    && flow.room == room
+                    && flow.instance == instance
+                    && flow.archive_request == Some(request)
+            })
+        {
+            if let Some(flow) = self.ready[OutboundService::Archive.index()].take() {
+                self.cancel_work_admissions(WorkKey::of(&flow));
                 self.dispose(flow);
             }
         }
-        if let Some(work) = self.running[1].as_ref().filter(|work| {
-            work.room == room
-                && work
-                    .archive
-                    .is_some_and(|(running_request, _)| running_request == request)
-        }) {
+        let mut keep = VecDeque::new();
+        while let Some(flow) = self.deferred.pop_front() {
+            if flow.service == OutboundService::Archive
+                && flow.room == room
+                && flow.instance == instance
+                && flow.archive_request == Some(request)
+            {
+                self.cancel_work_admissions(WorkKey::of(&flow));
+                self.retiring.push_back(flow);
+            } else {
+                keep.push_back(flow);
+            }
+        }
+        self.deferred = keep;
+        if let Some(work) = self.running[PhysicalSlot::Background.index()]
+            .as_ref()
+            .filter(|work| {
+                work.service == OutboundService::Archive
+                    && work.room == room
+                    && work.retirement_key.instance == instance
+                    && work
+                        .archive
+                        .is_some_and(|(running_request, _)| running_request == request)
+            })
+        {
             work.fence.retire();
         }
+        self.poll_cleanup();
     }
 
     // The queue ticket binds one exact node, room, peer and retained request.
@@ -2173,10 +2453,11 @@ impl Controller {
             admission.task = tokio::spawn(async move {
                 wake.await;
                 let _ = tx
-                    .send(NetEvent::ArchiveAdmissionReady {
+                    .send(NetEvent::BoundedAdmissionReady {
                         token: wake_token,
                         room,
                         peer,
+                        service: OutboundService::Archive,
                     })
                     .await;
             });
@@ -2195,10 +2476,11 @@ impl Controller {
         let task = tokio::spawn(async move {
             wake.await;
             let _ = tx
-                .send(NetEvent::ArchiveAdmissionReady {
+                .send(NetEvent::BoundedAdmissionReady {
                     token: wake_token,
                     room,
                     peer,
+                    service: OutboundService::Archive,
                 })
                 .await;
         });
@@ -2227,16 +2509,32 @@ impl Controller {
         node: Digest32,
         room: Digest32,
         peer: Digest32,
-        root: &'static str,
-        lane: crate::node::history_budget::Lane,
+        work: AdmissionWork,
     ) -> ForegroundTurn {
-        let index = lane.index();
+        let AdmissionWork {
+            root,
+            lane,
+            service,
+            key,
+            demand,
+        } = work;
+        let index = foreground_index(service, lane);
         if let Some(admission) = self.foreground_admission[index].as_ref() {
             if admission.room != room || admission.peer != peer || admission.lane != lane {
                 return ForegroundTurn::Waiting;
             }
+            if admission
+                .key
+                .zip(key)
+                .is_some_and(|(old, current)| old != current)
+            {
+                self.cancel_foreground_admission(index);
+            }
         }
         if let Some(mut admission) = self.foreground_admission[index].take() {
+            if key.is_some() {
+                admission.key = key;
+            }
             let wake = admission.ticket.wake();
             if let Some(job) = admission.ticket.try_admit() {
                 admission.task.abort();
@@ -2250,10 +2548,11 @@ impl Controller {
             admission.task = tokio::spawn(async move {
                 wake.await;
                 let _ = tx
-                    .send(NetEvent::ForegroundAdmissionReady {
+                    .send(NetEvent::BoundedForegroundReady {
                         token: wake_token,
                         room,
                         peer,
+                        service,
                     })
                     .await;
             });
@@ -2272,10 +2571,11 @@ impl Controller {
         let task = tokio::spawn(async move {
             wake.await;
             let _ = tx
-                .send(NetEvent::ForegroundAdmissionReady {
+                .send(NetEvent::BoundedForegroundReady {
                     token: wake_token,
                     room,
                     peer,
+                    service,
                 })
                 .await;
         });
@@ -2285,6 +2585,9 @@ impl Controller {
             peer,
             root,
             lane,
+            service,
+            key,
+            demand,
             ticket,
             task,
         });
@@ -2367,7 +2670,7 @@ impl Node {
                 && port.own_recovery_parked.take().is_some()
             {
                 ready.woken.insert(*peer);
-                port.raise();
+                port.own_recovery_checked = false;
                 woken = true;
             }
         }
@@ -2379,32 +2682,35 @@ impl Node {
     /// Name the exact bounded root whose next attempt is stopped before a `Flow` exists. This
     /// mirrors the starter's selection order so status can identify a retained admission rather
     /// than reporting only that some port is waiting.
-    pub(super) fn bounded_pending_identity(&self, room: Digest32, peer: Digest32) -> AdmissionWork {
+    pub(super) fn bounded_pending_identity(
+        &self,
+        room: Digest32,
+        peer: Digest32,
+        service: OutboundService,
+    ) -> AdmissionWork {
+        use crate::node::history_budget::Lane;
         if let Some(flow) = self
             .bounded_sync
             .ready
             .iter()
             .flatten()
             .chain(self.bounded_sync.deferred.iter())
-            .find(|flow| flow.room == room && flow.peer == peer)
+            .find(|flow| flow.room == room && flow.peer == peer && flow.service == service)
         {
             return AdmissionWork::from_flow(flow);
+        }
+        if service == OutboundService::Private {
+            return AdmissionWork::unowned("required", Lane::Control, service);
+        }
+        if service == OutboundService::Archive {
+            return AdmissionWork::unowned("archive", Lane::Archive, service);
         }
         if self
             .ports
             .get(&(room, peer))
             .is_some_and(crate::node::ports::Port::announce_owed)
         {
-            return AdmissionWork {
-                root: "inventory",
-                lane: crate::node::history_budget::Lane::Control,
-            };
-        }
-        if self.history_demand.ready_binding(room, peer).is_some() {
-            return AdmissionWork {
-                root: "archive",
-                lane: crate::node::history_budget::Lane::Archive,
-            };
+            return AdmissionWork::unowned("inventory", Lane::Control, service);
         }
         if self
             .bounded_sync
@@ -2412,10 +2718,7 @@ impl Node {
             .iter()
             .any(|required| required.room == room && required.peer == peer)
         {
-            return AdmissionWork {
-                root: "required",
-                lane: crate::node::history_budget::Lane::Control,
-            };
+            return AdmissionWork::unowned("required", Lane::Control, service);
         }
         if self
             .leave_waiters
@@ -2428,21 +2731,12 @@ impl Node {
                         .is_some_and(|port| port.done_gen >= *generation)
             })
         {
-            return AdmissionWork {
-                root: "departure",
-                lane: crate::node::history_budget::Lane::Control,
-            };
+            return AdmissionWork::unowned("departure", Lane::Control, service);
         }
         if self.history_hints.pending(room, peer) {
-            return AdmissionWork {
-                root: "hint",
-                lane: crate::node::history_budget::Lane::Control,
-            };
+            return AdmissionWork::unowned("hint", Lane::Control, service);
         }
-        AdmissionWork {
-            root: "inventory",
-            lane: crate::node::history_budget::Lane::Control,
-        }
+        AdmissionWork::unowned("inventory", Lane::Control, service)
     }
 
     /// Retire every operation for a departed member except an already decoded
@@ -2465,9 +2759,7 @@ impl Node {
         self.history_hints.retire_port(room, peer);
         let mut retired = Vec::new();
         if let Some(port) = self.ports.get_mut(&(room, peer)) {
-            if let Some(attempt) = port.out.take() {
-                retired.push(attempt);
-            }
+            retired.extend(port.out.take_all().map(|out| out.attempt));
             let ordinary: Vec<_> = port
                 .inbound
                 .iter()
@@ -2478,13 +2770,15 @@ impl Node {
                     retired.push(attempt);
                 }
             }
-            port.queued = false;
+            port.queued = [false; 3];
             port.poisoned = true;
         }
         for attempt in retired {
             attempt.retire();
         }
-        self.port_queue.remove(&room, &peer);
+        for queue in &mut self.port_queue {
+            queue.remove(&room, &peer);
+        }
     }
 
     /// Detach exact physical owners before the existing lifecycle gate task waits for them.
@@ -2565,9 +2859,9 @@ impl Node {
                 if let Some(attempt) = self
                     .ports
                     .get_mut(&(owned.room, *peer))
-                    .and_then(|port| port.take(*token))
+                    .and_then(|port| port.out.take_token(*token))
                 {
-                    attempt.retire();
+                    attempt.attempt.retire();
                 }
             }
             if result.is_ok() && gate_retired {
@@ -2575,7 +2869,7 @@ impl Node {
                     if let Some(attempt) = self
                         .ports
                         .get_mut(&(owned.room, *peer))
-                        .and_then(|port| port.take(*token))
+                        .and_then(|port| port.inbound.remove(token))
                     {
                         attempt.retire();
                     }
@@ -2590,16 +2884,64 @@ impl Node {
     /// constructing it: an archive dispatch, required dependency, or scalar hint. Park it in its
     /// lane so the relevant admission/release event retries that same work; reconstructing only a
     /// hint loses the other two forms and can leave a shipped archive request marked running.
-    fn shelve_exact(&mut self, mut flow: Flow, index: usize) {
+    fn shelve_exact(&mut self, mut flow: Flow, _index: usize) {
         flow.park();
-        debug_assert!(self.bounded_sync.ready[index].is_none());
-        self.bounded_sync.ready[index] = Some(flow);
+        let key = WorkKey::of(&flow);
+        if self
+            .bounded_sync
+            .pool_admission
+            .get(&(key.room, key.peer, key.service))
+            .is_some_and(|admission| admission.key == key && admission.ticket.granted())
+        {
+            // This exact owner cannot use its promise at an earlier gate. Keep its Flow and
+            // real release waiter, but let another eligible Background owner take capacity.
+            self.bounded_sync
+                .cancel_pool_admission_for(key.room, key.peer, key.service);
+        }
+        let index = flow.service.index();
+        if self.bounded_sync.ready[index].is_none() {
+            self.bounded_sync.ready[index] = Some(flow);
+        } else {
+            self.bounded_sync.deferred.push_back(flow);
+        }
+    }
+
+    fn rearm_required(&mut self, flow: &Flow) {
+        let Some((head, seq)) = flow.required_root else {
+            return;
+        };
+        let live = self
+            .channels
+            .get(&flow.room)
+            .is_some_and(|room| Arc::ptr_eq(room, &flow.shared))
+            && self
+                .ports
+                .get(&(flow.room, flow.hint_peer))
+                .is_some_and(|port| !port.poisoned);
+        if !live {
+            return;
+        }
+        let need = RequiredOwner {
+            room: flow.room,
+            peer: flow.hint_peer,
+            head,
+            seq,
+            request: flow
+                .required_owner_request
+                .unwrap_or(flow.retirement_request()),
+            instance: flow.instance,
+        };
+        if !self.bounded_sync.required.contains(&need) {
+            self.bounded_sync.required.push_front(need);
+            self.sched_rooms.insert(flow.room);
+        }
     }
 
     /// Abandoning a flow retires its local capabilities, not the unauthoritative scalar hint it
     /// selected. Re-arm that exact hint while its inbox scope is still live; room/peer retirement
     /// removes it first, making this a no-op for teardown rather than leaving an in-flight orphan.
     fn dispose_rearming_hint(&mut self, mut flow: Flow) {
+        self.rearm_required(&flow);
         if let Some(hint) = flow.hint.take().filter(|_| !flow.local_own_root()) {
             self.history_hints
                 .retry(flow.room, flow.hint_peer, hint.author, hint.head);
@@ -2648,7 +2990,7 @@ impl Node {
     /// request identity from disk; routing that causal edge to the owner's port avoids both a
     /// room-wide wake storm and retrying the waiter while the only productive Flow sleeps.
     fn wake_publication_owner(&mut self, room: Digest32, owner: RequestId) {
-        let mut peer = None;
+        let mut target = None;
         if let Some(flow) = self
             .bounded_sync
             .ready
@@ -2657,7 +2999,7 @@ impl Node {
             .find(|flow| flow.room == room && flow.owns_request(owner))
         {
             flow.waiting = false;
-            peer = Some(flow.peer);
+            target = Some((flow.peer, flow.service));
         } else if let Some(at) = self
             .bounded_sync
             .deferred
@@ -2666,16 +3008,19 @@ impl Node {
         {
             if let Some(mut flow) = self.bounded_sync.deferred.remove(at) {
                 flow.waiting = false;
-                peer = Some(flow.peer);
-                if let Some(displaced) = self.bounded_sync.ready[0].replace(flow) {
+                target = Some((flow.peer, flow.service));
+                let index = flow.service.index();
+                if let Some(displaced) = self.bounded_sync.ready[index].replace(flow) {
                     self.bounded_sync.deferred.push_front(displaced);
                 }
             }
         }
-        if let Some(peer) = peer {
+        if let Some((peer, service)) = target {
             if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                port.raise();
-                port.clear_backoff();
+                if service == OutboundService::Public {
+                    port.raise();
+                }
+                port.clear_service_backoff(service);
             }
             crate::node::status::SyncBook::with(&self.sync_book, room, peer, |counts| {
                 counts.backoff = None;
@@ -2713,6 +3058,9 @@ impl Node {
                 continue;
             };
             let mut flow = flow;
+            debug_assert_eq!(work.slot.index(), index);
+            debug_assert_eq!(work.service.slot(), work.slot);
+            debug_assert_eq!(flow.service, work.service);
             // These facts were committed by the worker before it returned. Account for them
             // before deciding whether its attempt is still current: cancellation, retirement,
             // an error after the store callback, or a newer scalar head must not turn durable
@@ -2765,8 +3113,30 @@ impl Node {
             let current = self
                 .ports
                 .get_mut(&(work.room, work.peer))
-                .and_then(|port| port.take(work.token))
-                .is_some();
+                .is_some_and(|port| {
+                    if port
+                        .out
+                        .get_token_mut(work.token)
+                        .is_some_and(|out| out.service == work.service)
+                    {
+                        port.out.take_token(work.token).is_some()
+                    } else {
+                        false
+                    }
+                });
+            // The physical Background position is free on every returned outcome, including
+            // stale, failed and local-retry exits. Reconsider only the eligible opposite service;
+            // this is a capacity wake, not Public request or generation credit.
+            let background_sibling = match work.service {
+                OutboundService::Public => None,
+                OutboundService::Private => Some(OutboundService::Archive),
+                OutboundService::Archive => Some(OutboundService::Private),
+            };
+            if background_sibling.is_some_and(|service| {
+                self.port_eligible(&(work.room, work.peer), service, std::time::Instant::now())
+            }) {
+                self.sched_rooms.insert(work.room);
+            }
             let valid = current
                 && !work.fence.is_retired()
                 && self
@@ -2867,9 +3237,8 @@ impl Node {
                         rendered: flow.rendered,
                         governance: flow.governance,
                     });
-                    if let Some(archive) = self.bounded_sync.ready[1].as_mut() {
-                        archive.waiting = false;
-                        self.sched_rooms.insert(archive.room);
+                    if let Some(owner) = flow.required_owner_request {
+                        self.wake_publication_owner(work.room, owner);
                     }
                 }
                 if let Some((head, seq)) = flow.external.take() {
@@ -2932,7 +3301,9 @@ impl Node {
                         peer: flow.hint_peer,
                         head,
                         seq,
-                        request: flow.retirement_request(),
+                        request: flow
+                            .required_owner_request
+                            .unwrap_or(flow.retirement_request()),
                         instance: flow.instance,
                     };
                     if !self.bounded_sync.required.contains(&need) {
@@ -2950,8 +3321,10 @@ impl Node {
                     },
                 );
                 if let Some(port) = self.ports.get_mut(&(work.room, retry_peer)) {
-                    port.raise();
-                    port.clear_backoff();
+                    if work.service == OutboundService::Public {
+                        port.raise();
+                    }
+                    port.clear_service_backoff(work.service);
                 }
                 if let Some((request, instance)) = archive {
                     // `failed_current` retired the still-owned running generation. Retain the exact Resume as
@@ -2975,7 +3348,9 @@ impl Node {
                         peer: flow.hint_peer,
                         head,
                         seq,
-                        request: flow.retirement_request(),
+                        request: flow
+                            .required_owner_request
+                            .unwrap_or(flow.retirement_request()),
                         instance: flow.instance,
                     };
                     if !self.bounded_sync.required.contains(&need) {
@@ -2995,8 +3370,10 @@ impl Node {
                     // local failure, while peer Busy/Unreachable backoff would blame the wire.
                     // An archive request instead stays truthfully Paused under its durable request;
                     // only the person's explicit Resume may authorize another archive quantum.
-                    port.raise();
-                    port.clear_backoff();
+                    if work.service == OutboundService::Public {
+                        port.raise();
+                    }
+                    port.clear_service_backoff(work.service);
                 }
                 eprintln!("vox: {error}");
                 continue;
@@ -3010,7 +3387,10 @@ impl Node {
                 self.dispose_rearming_hint(flow);
                 continue;
             }
-            if let Some(receipt) = flow.take_announcement_receipt() {
+            if let Some(receipt) = (work.service == OutboundService::Public)
+                .then(|| flow.take_announcement_receipt())
+                .flatten()
+            {
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                     // Only this completed inventory response names what the peer actually saw.
                     // An append racing it remains greater and owes the next announcement.
@@ -3070,11 +3450,8 @@ impl Node {
                 });
                 flow.rendered = false;
                 flow.governance = false;
-                // A required control finished: the archive's next local slice can recheck its
-                // exact dependency. No archive wire request is created by this wake.
-                if let Some(flow) = self.bounded_sync.ready[1].as_mut() {
-                    flow.waiting = false;
-                    self.sched_rooms.insert(flow.room);
+                if let Some(owner) = flow.required_owner_request {
+                    self.wake_publication_owner(work.room, owner);
                 }
             }
             if let Some((head, seq)) = flow.external.take() {
@@ -3134,14 +3511,18 @@ impl Node {
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
                     // Consume only the scheduling request this attempt captured. A later raise
                     // remains greater, and retained work receives a new raise below.
-                    port.req_done = port.req_done.max(work.request);
-                    if more_for_peer {
-                        port.raise();
+                    if work.service == OutboundService::Public {
+                        port.req_done = port.req_done.max(work.request);
+                        if more_for_peer {
+                            port.raise();
+                        }
                     }
                 }
                 if let Some(port) = self.ports.get_mut(&(work.room, target)) {
-                    port.raise();
-                    port.clear_backoff();
+                    if work.service == OutboundService::Public {
+                        port.raise();
+                    }
+                    port.clear_service_backoff(work.service);
                 } else {
                     self.discover_rooms.insert(work.room);
                 }
@@ -3170,7 +3551,7 @@ impl Node {
                         },
                     );
                     if let Some(backoff) = backoff {
-                        self.enter_backoff(work.room, work.peer, backoff);
+                        self.enter_backoff(work.room, work.peer, work.service, backoff);
                     }
                     continue;
                 }
@@ -3178,12 +3559,7 @@ impl Node {
                     // The peer named a transient session collision or has not admitted this
                     // just-joined member yet. Keep the exact restored ResumeWire/local owner;
                     // rebuilding from inventory would discard its durable cursor and root.
-                    if index == 0 {
-                        self.bounded_sync.deferred.push_back(flow);
-                    } else {
-                        debug_assert!(self.bounded_sync.ready[index].is_none());
-                        self.bounded_sync.ready[index] = Some(flow);
-                    }
+                    self.shelve_exact(flow, work.service.index());
                     crate::node::status::SyncBook::with(
                         &self.sync_book,
                         work.room,
@@ -3194,7 +3570,7 @@ impl Node {
                         },
                     );
                     if let Some(backoff) = backoff {
-                        self.enter_backoff(work.room, work.peer, backoff);
+                        self.enter_backoff(work.room, work.peer, work.service, backoff);
                     }
                     continue;
                 }
@@ -3234,6 +3610,9 @@ impl Node {
                         );
                     }
                 }
+                if !cancelled {
+                    self.rearm_required(&flow);
+                }
                 self.bounded_sync.dispose(flow);
                 if cancelled {
                     self.sched_rooms.insert(work.room);
@@ -3243,6 +3622,7 @@ impl Node {
                     self.enter_backoff(
                         work.room,
                         work.peer,
+                        work.service,
                         crate::node::status::BackoffKind::Busy,
                     );
                     self.sched_rooms.insert(work.room);
@@ -3258,7 +3638,7 @@ impl Node {
                     },
                 );
                 if let Some(backoff) = backoff {
-                    self.enter_backoff(work.room, work.peer, backoff);
+                    self.enter_backoff(work.room, work.peer, work.service, backoff);
                 }
                 continue;
             }
@@ -3274,11 +3654,13 @@ impl Node {
                             required.room == work.room && required.peer == work.peer
                         });
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                    port.req_done = port.req_done.max(work.request);
-                    if more_for_target {
-                        port.raise();
+                    if work.service == OutboundService::Public {
+                        port.req_done = port.req_done.max(work.request);
+                        if more_for_target {
+                            port.raise();
+                        }
                     }
-                    port.clear_backoff();
+                    port.clear_service_backoff(work.service);
                 }
                 let reason = flow.reason;
                 crate::node::status::SyncBook::with(
@@ -3324,15 +3706,12 @@ impl Node {
                     continue;
                 }
                 flow.peer = origin;
-                debug_assert!(self.bounded_sync.ready[0].is_none());
-                if self.bounded_sync.ready[0].is_some() {
-                    self.dispose_rearming_hint(flow);
-                    continue;
-                }
-                self.bounded_sync.ready[0] = Some(flow);
+                self.shelve_exact(flow, work.service.index());
                 if let Some(port) = self.ports.get_mut(&(work.room, origin)) {
-                    port.raise();
-                    port.clear_backoff();
+                    if work.service == OutboundService::Public {
+                        port.raise();
+                    }
+                    port.clear_service_backoff(work.service);
                 }
                 crate::node::status::SyncBook::with(&self.sync_book, work.room, origin, |counts| {
                     counts.backoff = None
@@ -3357,9 +3736,11 @@ impl Node {
                 // which resumes the same live window instead of waiting behind up to 128 bodies.
                 self.dispose_rearming_hint(flow);
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                    port.req_done = port.req_done.max(work.request);
-                    port.raise();
-                    port.clear_backoff();
+                    if work.service == OutboundService::Public {
+                        port.req_done = port.req_done.max(work.request);
+                        port.raise();
+                    }
+                    port.clear_service_backoff(work.service);
                 }
                 crate::node::status::SyncBook::with(
                     &self.sync_book,
@@ -3379,20 +3760,19 @@ impl Node {
             // the exponential cap even though capacity has just made progress. Transport, policy
             // and no-progress backoffs retain their distinct meaning.
             if let Some(wake) = flow.slot_wait.take() {
-                let admission = AdmissionWork {
-                    root: flow.root_name(),
-                    lane: crate::node::history_budget::Lane::Control,
-                };
+                let mut admission = AdmissionWork::from_flow(&flow);
+                admission.lane = crate::node::history_budget::Lane::Control;
                 let waiting = ByteWait {
-                    owner: Some(ByteOwner::of(&flow)),
-                    port_request: Some(work.request),
+                    owner: Some(WorkKey::of(&flow)),
+                    port_request: (work.service == OutboundService::Public).then_some(work.request),
                     wake,
                 };
-                if index == 0 {
+                if work.service == OutboundService::Public {
                     self.bounded_sync.deferred.push_back(flow);
                 } else {
-                    self.bounded_sync.ready[index] = Some(flow);
+                    self.shelve_exact(flow, work.service.index());
                 }
+
                 self.bounded_sync.wait_for_bytes(
                     &self.net_tx,
                     &mut self.next_token,
@@ -3404,23 +3784,22 @@ impl Node {
                 continue;
             }
             if let Some(pressure) = flow.byte_pressure.take() {
-                let admission = AdmissionWork {
-                    root: flow.root_name(),
-                    lane: pressure.lane(),
-                };
+                let mut admission = AdmissionWork::from_flow(&flow);
+                admission.lane = pressure.lane();
                 let waiting = ByteWait {
-                    owner: Some(ByteOwner::of(&flow)),
-                    port_request: Some(work.request),
+                    owner: Some(WorkKey::of(&flow)),
+                    port_request: (work.service == OutboundService::Public).then_some(work.request),
                     wake: Box::pin(pressure.released()),
                 };
-                if index == 0 {
+                if work.service == OutboundService::Public {
                     self.bounded_sync.deferred.push_back(flow);
                 } else {
-                    self.bounded_sync.ready[index] = Some(flow);
+                    self.shelve_exact(flow, work.service.index());
                 }
                 // The worker has finished and parked: neither this future nor the retained
                 // Flow owns reconstruction buffers or a worker slot. Subscribe/recheck the
                 // full retry peak, without turning byte pressure into a timed Busy retry.
+
                 self.bounded_sync.wait_for_bytes(
                     &self.net_tx,
                     &mut self.next_token,
@@ -3437,10 +3816,13 @@ impl Node {
                     .ports
                     .get_mut(&(work.room, work.peer))
                     .is_some_and(|port| {
-                        if port.backoff.is_some_and(|backoff| {
-                            backoff.kind == crate::node::status::BackoffKind::Busy
-                        }) {
-                            port.clear_backoff();
+                        if port
+                            .backoff(crate::node::ports::BackoffScope::Service(work.service))
+                            .is_some_and(|backoff| {
+                                backoff.kind == crate::node::status::BackoffKind::Busy
+                            })
+                        {
+                            port.clear_service_backoff(work.service);
                             true
                         } else {
                             false
@@ -3455,6 +3837,9 @@ impl Node {
                 );
             }
             if flow.done() {
+                if let Some(owner) = flow.required_owner_request {
+                    self.wake_publication_owner(work.room, owner);
+                }
                 if let Some(token) = flow.key_availability_token.as_ref() {
                     if let Some(port) = self.ports.get_mut(&(work.room, flow.hint_peer)) {
                         if port
@@ -3502,10 +3887,9 @@ impl Node {
                 }
                 if flow.automatic_own_recovery {
                     if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                        port.req_done = port.req_done.max(work.request);
+                        port.own_recovery_checked = !flow.own_recovery_progress;
                         if flow.own_recovery_progress {
                             port.own_recovery_parked = None;
-                            port.raise();
                         } else {
                             port.own_recovery_parked = flow.own_recovery_trigger;
                         }
@@ -3549,7 +3933,7 @@ impl Node {
                         if self.net_tx.try_send(event).is_err() {
                             // Retain the charged completed flow and its in-flight hint until
                             // the actor can receive the exact completion; never lose this edge.
-                            self.bounded_sync.ready[index] = Some(flow);
+                            self.shelve_exact(flow, work.service.index());
                             self.sched_rooms.insert(work.room);
                             continue;
                         }
@@ -3581,44 +3965,42 @@ impl Node {
                 }
                 let mut raised = false;
                 if let Some(port) = self.ports.get_mut(&(work.room, work.peer)) {
-                    if flow.inventory {
+                    if work.service == OutboundService::Public && flow.inventory {
                         port.done_gen = port.done_gen.max(work.generation);
                     }
-                    if flow.inventory || flow.hint.is_some() {
+                    if work.service == OutboundService::Public
+                        && (flow.inventory || flow.hint.is_some())
+                    {
                         // This attempt consumed the request that selected its inventory or
                         // scalar hint. Leaving it outstanding immediately schedules another
                         // inventory and recreates the feedback churn the bounded inbox removed.
                         port.req_done = port.req_done.max(work.request);
                     }
-                    if flow.local_own_after_inventory {
+                    if work.service == OutboundService::Public && flow.local_own_after_inventory {
                         // This completed inventory was the producer that deferred an eligible
                         // local metadata root. Refused/equal roots never set this scalar, so
                         // ordinary inventories cannot turn parked debt into periodic reoffers.
                         port.raise();
                         raised = true;
                     }
-                    if self
-                        .bounded_sync
-                        .ready
-                        .iter()
-                        .flatten()
-                        .any(|flow| flow.room == work.room && flow.peer == work.peer)
-                        || self
+                    if work.service == OutboundService::Public
+                        && (self.bounded_sync.ready.iter().flatten().any(|flow| {
+                            flow.service == OutboundService::Public
+                                && flow.room == work.room
+                                && flow.peer == work.peer
+                        }) || self
                             .leave_waiters
                             .iter()
                             .any(|(r, _, _, _, _)| *r == work.room)
-                        || self.bounded_sync.required.iter().any(|required| {
-                            required.room == work.room && required.peer == work.peer
-                        })
+                            || self.bounded_sync.required.iter().any(|required| {
+                                required.room == work.room && required.peer == work.peer
+                            }))
                     {
                         port.raise();
                         raised = true;
                     }
                 }
-                // A completed inventory can reveal the next exact departure/receipt work.
-                // Raising the port changes its need, but `schedule` only examines touched
-                // rooms. Wake this room now instead of leaving the raised port asleep until
-                // the periodic all-ports tick consumes most of the leave deadline.
+                // A completed Public inventory can expose exact departure/receipt work.
                 if raised || self.history_hints.pending(work.room, work.peer) {
                     self.sched_rooms.insert(work.room);
                 }
@@ -3658,13 +4040,11 @@ impl Node {
                     // R2 b), and the flow's next round finds it ready.
                     self.governance_work.wake_room(work.room);
                 }
-                if index == 0 {
-                    // The controller-wide retained-flow permit already bounds this collection.
-                    // Never evict an exact required/hint/inventory root merely because some
-                    // arbitrary number of other ports are also deferred.
+                if work.service == OutboundService::Public {
+                    // The controller-wide retained-flow permit bounds this fair queue.
                     self.bounded_sync.deferred.push_back(flow);
                 } else {
-                    self.bounded_sync.ready[index] = Some(flow);
+                    self.shelve_exact(flow, work.service.index());
                 }
                 if waiting {
                     if body_progress {
@@ -3678,6 +4058,7 @@ impl Node {
                         self.enter_backoff(
                             work.room,
                             work.peer,
+                            work.service,
                             crate::node::status::BackoffKind::Busy,
                         );
                     }
@@ -3705,22 +4086,29 @@ impl Node {
 
     pub(super) async fn start_bounded_outbound(
         &mut self,
-        room: Digest32,
-        peer: Digest32,
+        port: PortKey,
         epoch: u64,
         shared: Arc<tokio::sync::Mutex<ChannelState>>,
         store: Arc<Store>,
         conn: Arc<VoxConnection>,
     ) -> bool {
+        let (room, peer, service) = port;
         if self.own_key_leave_pending.contains_key(&room)
             || self.own_key_ended_pending.contains_key(&room)
         {
             return false;
         }
         self.accept_bounded_sync();
+        if !self
+            .ports
+            .get(&(room, peer))
+            .is_some_and(|port| port.out.can_start(service))
+        {
+            return false;
+        }
         if let Some((flow, ended_request)) =
             self.bounded_sync
-                .take_superseded_byte_hint(room, peer, &self.history_hints)
+                .take_superseded_byte_hint(room, peer, service, &self.history_hints)
         {
             // The newer scalar head hint is already pending; it is the causal replacement
             // edge, not permission to retry the refused old allocation. Retirement preserves
@@ -3731,10 +4119,10 @@ impl Node {
                 port.req_done = port.req_done.max(ended_request);
                 port.raise();
                 if port
-                    .backoff
+                    .backoff(crate::node::ports::BackoffScope::Service(service))
                     .is_some_and(|backoff| backoff.kind == crate::node::status::BackoffKind::Busy)
                 {
-                    port.clear_backoff();
+                    port.clear_service_backoff(service);
                     cleared_busy = true;
                 }
             }
@@ -3748,14 +4136,17 @@ impl Node {
         }
         // Only the exact release handoff may make an impossible-path continuation runnable.
         // Generic actor traffic still evaluates queued ports, but cannot stand in for that edge.
-        if self.bounded_sync.pool_admission_blocked(room, peer) {
+        if self
+            .bounded_sync
+            .pool_admission_blocked_for(room, peer, service)
+        {
             return false;
         }
-        self.bounded_sync.prune_byte_admissions(room, peer);
+        self.bounded_sync.prune_byte_admissions(room, peer, service);
         let record_waiting = self
             .bounded_sync
             .byte_admission
-            .range((room, peer, 0)..=(room, peer, u64::MAX))
+            .range((room, peer, service, 0)..=(room, peer, service, u64::MAX))
             .any(|(_, admission)| admission.owner.is_some());
         // The release belongs to one retained record, not every continuation on its port.
         // A runnable sibling must drain: it can occupy the ready position needed by the
@@ -3764,16 +4155,40 @@ impl Node {
             return false;
         };
         let node = profile.fingerprint();
-        let pending_work = self.bounded_pending_identity(room, peer);
+        let ready_index = service.index();
+        let physical_index = service.slot().index();
+        if !self.bounded_sync.physical_available(service) {
+            return false;
+        }
+        let mut pending_work = self.bounded_pending_identity(room, peer, service);
+        if pending_work.key.is_none() && service == OutboundService::Public {
+            pending_work.demand = self.ports.get(&(room, peer)).map(|port| {
+                (
+                    port.req_gen,
+                    port.gen.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            });
+        }
+        let pending_public_request = (service == OutboundService::Public)
+            .then(|| self.ports.get(&(room, peer)).map(|port| port.req_gen))
+            .flatten();
         self.bounded_sync
-            .prioritize_control_admission_owner(room, peer);
-        if self.bounded_sync.ready[0].is_none() && self.bounded_sync.running[0].is_none() {
+            .prioritize_control_admission_owner(room, peer, service);
+        if self.bounded_sync.ready[ready_index]
+            .as_ref()
+            .is_none_or(|flow| self.bounded_sync.record_bytes_blocked(flow))
+        {
             if let Some(at) = self.bounded_sync.deferred.iter().position(|flow| {
-                flow.room == room
+                flow.service == service
+                    && flow.room == room
                     && flow.peer == peer
                     && !self.bounded_sync.record_bytes_blocked(flow)
             }) {
-                self.bounded_sync.ready[0] = self.bounded_sync.deferred.remove(at);
+                if let Some(flow) = self.bounded_sync.deferred.remove(at) {
+                    if let Some(displaced) = self.bounded_sync.ready[ready_index].replace(flow) {
+                        self.bounded_sync.deferred.insert(at, displaced);
+                    }
+                }
             }
         }
         // An own append is announced before the next hinted continuation (ADR-037 R7). The
@@ -3782,53 +4197,60 @@ impl Node {
         // backlog would otherwise be reused round after round, so the peer learned of this
         // node's post only when the drain ended (measured: 53–58 s for a 150-post window).
         // The hinted flow waits one round in the deferred queue and resumes after.
-        let announce_first = self.bounded_sync.running[0].is_none()
+        let announce_first = service == OutboundService::Public
+            && self.bounded_sync.running[PhysicalSlot::Public.index()].is_none()
             && self
                 .ports
                 .get(&(room, peer))
                 .is_some_and(crate::node::ports::Port::announce_owed);
         // Why a round would run now (ADR-038 FX-15, #996): read before the flow is chosen,
         // because choosing it consumes what it reads.
-        let (announce_owed, periodic_pending) = self
-            .ports
-            .get(&(room, peer))
-            .map_or((false, false), |port| {
-                (port.announce_owed(), port.periodic_pending())
-            });
+        let (announce_owed, periodic_pending) =
+            self.ports
+                .get(&(room, peer))
+                .map_or((false, false), |port| {
+                    (
+                        service == OutboundService::Public && port.announce_owed(),
+                        service == OutboundService::Public && port.periodic_pending(),
+                    )
+                });
         // A reader's page is served on its own stream (#996): a port whose only want is that
         // page runs the page, and no live round beside it. Before this the page's dispatch
         // raised the port, and the raise outlived the page, so every page a reader asked for
         // ran an inventory exchange after it that fetched nothing.
-        let page_only = self.history_demand.ready_binding(room, peer).is_some()
-            && !self.bounded_sync.needs_port(room, peer)
-            && !self.history_hints.pending(room, peer)
+        let page_only = service == OutboundService::Public
             && !self
                 .ports
                 .get(&(room, peer))
-                .is_some_and(crate::node::ports::Port::needs);
+                .is_some_and(|port| port.needs_public())
+            && !self.history_hints.pending(room, peer)
+            && !self.bounded_sync.needs_port_for(room, peer, service);
         // A retained hint/required flow prepends the announcement on that same owner. Parking it
         // and allocating a fresh inventory Flow deadlocks when all retained positions are full:
         // the inventory is the producer that would let those retained flows finish. A successful
         // prefix gives its ordinary root one real quantum before another append can preempt it.
-        let announcement_preempts = self.bounded_sync.ready[0].as_ref().is_some_and(|flow| {
-            flow.room == room
-                && flow.peer == peer
-                && !self.bounded_sync.record_bytes_blocked(flow)
-                && !flow.inventory
-                && flow.announcement_can_run()
-                && (flow.announcement_pending() || (announce_first && !flow.ordinary_turn_due()))
-        });
-        let existing = (0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS).find(|index| {
-            self.bounded_sync.running[*index].is_none()
-                && self.bounded_sync.ready[*index]
-                    .as_ref()
-                    .is_some_and(|flow| {
-                        flow.room == room
-                            && flow.peer == peer
-                            && !self.bounded_sync.record_bytes_blocked(flow)
-                            && (!flow.waiting || announcement_preempts)
-                    })
-        });
+        let announcement_preempts =
+            self.bounded_sync.ready[ready_index]
+                .as_ref()
+                .is_some_and(|flow| {
+                    flow.room == room
+                        && flow.peer == peer
+                        && !self.bounded_sync.record_bytes_blocked(flow)
+                        && !flow.inventory
+                        && flow.announcement_can_run()
+                        && (flow.announcement_pending()
+                            || (announce_first && !flow.ordinary_turn_due()))
+                });
+        let existing = self.bounded_sync.ready[ready_index]
+            .as_ref()
+            .filter(|flow| {
+                flow.service == service
+                    && flow.room == room
+                    && flow.peer == peer
+                    && !self.bounded_sync.record_bytes_blocked(flow)
+                    && (!flow.waiting || announcement_preempts)
+            })
+            .map(|_| ready_index);
         let mut admitted_archive = None;
         let mut admitted_control = None;
         let mut flow = if let Some(index) = existing {
@@ -3839,17 +4261,23 @@ impl Node {
         } else {
             // A retained waiting slice is retried by the existing bounded port backoff. It
             // cannot monopolize the other lane or cause an archive continuation to run.
-            if let Some(index) =
-                (0..crate::node::history_budget::BOUNDED_SYNC_RUNNING_SLOTS).find(|i| {
-                    !announcement_preempts
-                        && self.bounded_sync.running[*i].is_none()
-                        && self.bounded_sync.ready[*i].as_ref().is_some_and(|flow| {
-                            flow.room == room
-                                && flow.peer == peer
-                                && !self.bounded_sync.record_bytes_blocked(flow)
-                                && (!flow.archive || self.bounded_sync.required.is_empty())
-                        })
+            if let Some(index) = self.bounded_sync.ready[ready_index]
+                .as_ref()
+                .filter(|flow| {
+                    flow.service == service
+                        && flow.room == room
+                        && flow.peer == peer
+                        && !self.bounded_sync.record_bytes_blocked(flow)
+                        && !(flow.service == OutboundService::Archive
+                            && flow.waiting
+                            && self.bounded_sync.required.iter().any(|required| {
+                                required.room == flow.room
+                                    && required.peer == flow.peer
+                                    && required.instance == flow.instance
+                                    && flow.owns_request(required.request)
+                            }))
                 })
+                .map(|_| ready_index)
             {
                 let Some(flow) = self.bounded_sync.ready[index].take() else {
                     return false;
@@ -3859,40 +4287,29 @@ impl Node {
                 if record_waiting {
                     return false;
                 }
-                if self.bounded_sync.flow_count() >= RETAINED_FLOW_LIMIT {
+                if !self.bounded_sync.can_retain_new(service) {
                     // This is controller retention preflight, before a Flow/start attempt owns
                     // the port. Its release is driven by the exact retiring/completion owner;
                     // do not overwrite the last ended attempt with a start_reason ADR-038 does
                     // not define.
                     self.bounded_sync
-                        .cancel_matching_control_admission(room, peer);
+                        .cancel_matching_control_admission(room, peer, service);
                     return false;
                 }
-                let archive_dispatch = self.bounded_sync.ready[1].is_none()
-                    && self.bounded_sync.running[1].is_none()
-                    && (self.history_demand.ready_binding(room, peer).is_some()
-                        || self.own_recovery_rooms.contains_key(&room));
-                if !archive_dispatch
-                    && (page_only
-                        || self.bounded_sync.ready[0].is_some()
-                        || self.bounded_sync.running[0].is_some())
-                {
-                    // A locally impossible owner must not pin the daemon's fair Control FIFO.
-                    // Observe the documented first gate before withdrawing only this port's
-                    // retained ticket; another port's earlier owner remains untouched. The
-                    // logical request/hint stays in the port queue and the current Flow owner's
-                    // completion or dependency edge causes the next evaluation.
+                if page_only || self.bounded_sync.ready[ready_index].is_some() {
                     let control_ready = self.bounded_sync.control_would_admit(
                         &self.history_budget,
                         node,
                         room,
                         peer,
+                        service,
                     );
                     self.bounded_sync
-                        .cancel_matching_control_admission(room, peer);
+                        .cancel_matching_control_admission(room, peer, service);
                     self.note_start(
                         room,
                         peer,
+                        service,
                         if control_ready {
                             "live_lane_busy"
                         } else {
@@ -3901,7 +4318,7 @@ impl Node {
                     );
                     return false;
                 }
-                if self.bounded_sync.ready[1].is_none() && self.bounded_sync.running[1].is_none() {
+                if service == OutboundService::Archive {
                     if let Some((request, generation, instance)) =
                         self.history_demand.ready_binding(room, peer)
                     {
@@ -3918,7 +4335,7 @@ impl Node {
                         ) {
                             ArchiveTurn::Ready(job) => admitted_archive = Some(job),
                             ArchiveTurn::Waiting => {
-                                self.note_start(room, peer, "archive_budget_busy");
+                                self.note_start(room, peer, service, "archive_budget_busy");
                                 return false;
                             }
                         }
@@ -3945,12 +4362,14 @@ impl Node {
                     node,
                     room,
                     peer,
-                    pending_work.root,
-                    crate::node::history_budget::Lane::Control,
+                    AdmissionWork {
+                        lane: crate::node::history_budget::Lane::Control,
+                        ..pending_work
+                    },
                 ) {
                     ForegroundTurn::Ready(job) => job,
                     ForegroundTurn::Waiting => {
-                        self.note_start(room, peer, "control_budget_busy");
+                        self.note_start(room, peer, service, "control_budget_busy");
                         return false;
                     }
                 };
@@ -3959,13 +4378,14 @@ impl Node {
 
                 // Inventory must first advertise the new local departure. Once that fixed
                 // exchange completes, probe only our own exact head; no archive is followed.
-                let departure_hint = if self.leave_waiters.iter().any(|(r, generation, _, _, _)| {
-                    *r == room
-                        && self
-                            .ports
-                            .get(&(room, peer))
-                            .is_some_and(|p| p.done_gen >= *generation)
-                }) {
+                let departure_hint = if service == OutboundService::Public
+                    && self.leave_waiters.iter().any(|(r, generation, _, _, _)| {
+                        *r == room
+                            && self
+                                .ports
+                                .get(&(room, peer))
+                                .is_some_and(|p| p.done_gen >= *generation)
+                    }) {
                     let bytes_wake = state_job.bytes_wake();
                     let Some(_read_charge) = state_job.reserve(4 * 1024 * 1024) else {
                         self.bounded_sync.wait_for_bytes(
@@ -3974,9 +4394,13 @@ impl Node {
                             room,
                             peer,
                             pending_work,
-                            ByteWait::unowned(bytes_wake),
+                            ByteWait {
+                                owner: pending_work.key,
+                                port_request: pending_public_request,
+                                wake: bytes_wake,
+                            },
                         );
-                        self.note_start(room, peer, "control_budget_busy");
+                        self.note_start(room, peer, service, "control_budget_busy");
                         return false;
                     };
                     if let Ok(channel) = shared.try_lock() {
@@ -4013,10 +4437,11 @@ impl Node {
                     Ok(value) => Arc::new(value),
                     Err(_) => return false,
                 };
-                let needs_own_state = self.own_recovery_rooms.contains_key(&room)
-                    || self.ports.get(&(room, peer)).is_some_and(|port| {
-                        port.support_discovery_check || port.own_receipt_lower.is_some()
-                    });
+                let needs_own_state = service != OutboundService::Private
+                    && (self.own_recovery_rooms.contains_key(&room)
+                        || self.ports.get(&(room, peer)).is_some_and(|port| {
+                            port.support_discovery_check || port.own_receipt_lower.is_some()
+                        }));
                 let own_state =
                     if needs_own_state {
                         let bytes_wake = state_job.bytes_wake();
@@ -4027,7 +4452,11 @@ impl Node {
                                 room,
                                 peer,
                                 pending_work,
-                                ByteWait::unowned(bytes_wake),
+                                ByteWait {
+                                    owner: pending_work.key,
+                                    port_request: pending_public_request,
+                                    wake: bytes_wake,
+                                },
                             );
                             return false;
                         };
@@ -4101,9 +4530,11 @@ impl Node {
                                         probe.matches(scope, probe.head, probe_incarnations)
                                     })
                                     .map(|probe| probe.head);
-                                let page = if !self.bounded_sync.owns_archive_room(room)
+                                let page = if service == OutboundService::Archive
+                                    && !self.bounded_sync.owns_archive_room(room)
                                     && self.history_demand.ready_binding(room, peer).is_none()
-                                    && self.bounded_sync.ready[1].is_none()
+                                    && self.bounded_sync.ready[OutboundService::Archive.index()]
+                                        .is_none()
                                     && self.bounded_sync.running[1].is_none()
                                 {
                                     match channel.own_recovery_page(
@@ -4209,9 +4640,7 @@ impl Node {
                         Ok(flow) => flow,
                         Err(_) => return false,
                     }
-                } else if self.bounded_sync.ready[1].is_none()
-                    && self.bounded_sync.running[1].is_none()
-                {
+                } else if service == OutboundService::Archive {
                     if let Some(dispatch) = self
                         .trust
                         .is_trusted(&peer)
@@ -4239,201 +4668,16 @@ impl Node {
                         flow.archive_selected_author = Some(dispatch.selected_author);
                         flow
                     } else {
-                        if page_only
-                            || self.bounded_sync.ready[0].is_some()
-                            || self.bounded_sync.running[0].is_some()
+                        if self.own_recovery_rooms.contains_key(&room)
+                            && !self.bounded_sync.owns_archive_room(room)
                         {
-                            self.note_start(room, peer, "live_lane_busy");
-                            return false;
-                        }
-                        let live = match crate::node::history_demand::Context::current_unlocked(
-                            profile,
-                            Purpose::Live,
-                            lease.clone(),
-                        ) {
-                            Ok(value) => Arc::new(value),
-                            Err(_) => return false,
-                        };
-                        let required_at = (!announce_first)
-                            .then(|| {
-                                self.bounded_sync.required.iter().position(|required| {
-                                    required.room == room && required.peer == peer
-                                })
-                            })
-                            .flatten();
-                        let required = required_at
-                            .and_then(|at| self.bounded_sync.required.get(at))
-                            .map(|required| (required.head, required.seq));
-                        let key_candidate = if !announce_first
-                            && required.is_none()
-                            && departure_hint.is_none()
-                            && own_verification.is_none()
-                            && own_discovery.is_none()
-                        {
-                            self.ports.get(&(room, peer)).and_then(|port| {
-                                Some((
-                                    port.key_body?,
-                                    port.key_body_instance?,
-                                    port.key_body_token.clone()?,
-                                ))
-                            })
-                        } else {
-                            None
-                        };
-                        let availability_candidate = if !announce_first
-                            && required.is_none()
-                            && departure_hint.is_none()
-                            && own_verification.is_none()
-                            && own_discovery.is_none()
-                        {
-                            self.ports
-                                .get(&(room, peer))
-                                .and_then(|port| port.key_availability_request.clone())
-                        } else {
-                            None
-                        };
-                        let prefer_key = self
-                            .ports
-                            .get(&(room, peer))
-                            .is_some_and(|port| port.key_body_turn);
-                        let mut selected_key_body = None;
-                        let mut selected_key_availability = None;
-                        let mut chose_public_hint = false;
-                        let hint = if announce_first || required.is_some() {
-                            None
-                        } else if let Some(priority) =
-                            departure_hint.or(own_verification).or(own_discovery)
-                        {
-                            Some(priority)
-                        } else if prefer_key
-                            && (key_candidate.is_some() || availability_candidate.is_some())
-                        {
-                            selected_key_body = key_candidate;
-                            if selected_key_body.is_none() {
-                                selected_key_availability = availability_candidate.clone();
-                            }
-                            None
-                        } else {
-                            let hint = take_foreground_hint(
-                                &self.history_hints,
-                                room,
-                                peer,
-                                node,
-                                parked_receipt,
-                                self.net
-                                    .as_ref()
-                                    .and_then(|net| net.manager().existing(&peer))
-                                    .map(|conn| conn.serial()),
-                            );
-                            if hint.is_some() {
-                                chose_public_hint = true;
-                            } else {
-                                selected_key_body = key_candidate;
-                                if selected_key_body.is_none() {
-                                    selected_key_availability = availability_candidate;
-                                }
-                            }
-                            hint
-                        };
-                        let chose_key_body =
-                            selected_key_body.is_some() || selected_key_availability.is_some();
-                        if hint.is_none()
-                            && required.is_none()
-                            && selected_key_body.is_none()
-                            && !self
-                                .ports
-                                .get(&(room, peer))
-                                .is_some_and(crate::node::ports::Port::needs)
-                        {
-                            // No eligible hint remains, and no independent request, generation or
-                            // announcement owes inventory; return its actual admission instead of
-                            // manufacturing an exchange which can re-add the same hint.
-                            self.bounded_sync
-                                .cancel_matching_control_admission(room, peer);
-                            return false;
-                        }
-                        let reason = foreground_reason(
-                            node,
-                            hint,
-                            required.is_some()
-                                || selected_key_body.is_some()
-                                || selected_key_availability.is_some(),
-                            announce_owed,
-                            periodic_pending,
-                        );
-                        match Flow::foreground(
-                            room,
-                            peer,
-                            node,
-                            epoch,
-                            shared.clone(),
-                            live,
-                            control,
-                            hint,
-                            own_verification.is_some()
-                                && hint == own_verification
-                                && departure_hint.is_none()
-                                && required.is_none(),
-                            own_discovery.is_some()
-                                && hint == own_discovery
-                                && own_verification.is_none()
-                                && departure_hint.is_none()
-                                && required.is_none(),
-                            departure_hint.is_some() && required.is_none(),
-                            required,
-                            self.bounded_sync.body_slots.clone(),
-                            store.clone(),
-                            Arc::clone(&self.history_budget),
-                            actor_incarnation,
-                        ) {
-                            Ok(mut flow) => {
-                                if let Some((after, token, _, _)) = selected_key_availability {
-                                    flow = flow.with_key_availability(after, token);
-                                }
-                                if let Some((need, instance, token)) = selected_key_body {
-                                    let context = match crate::node::history_demand::Context::key_body_unlocked(profile, lease.clone()) {
-                                        Ok(value) => Arc::new(value),
-                                        Err(_) => return false,
-                                    };
-                                    flow = flow.with_key_body(need, instance, context, token);
-                                }
-                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                                    if chose_key_body {
-                                        port.key_body_turn = false;
-                                    } else if chose_public_hint {
-                                        port.key_body_turn = port.key_body.is_some()
-                                            || port.key_availability_request.is_some();
-                                    }
-                                }
-                                flow.reason = reason;
-                                flow.discovery_incarnations = probe_incarnations;
-                                flow.local_own_after_inventory = flow.inventory
-                                    && announce_first
-                                    && (own_verification.is_some() || own_discovery.is_some());
-                                if let Some(at) = required_at {
-                                    let _ = self.bounded_sync.required.remove(at);
-                                }
-                                flow
-                            }
-                            Err(_) => {
-                                if let Some(hint) = hint.filter(|_| {
-                                    departure_hint.is_some()
-                                        || (hint != own_verification && hint != own_discovery)
-                                }) {
-                                    self.history_hints.retry(room, peer, hint.author, hint.head);
-                                }
-                                return false;
+                            if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                                port.own_recovery_checked = true;
                             }
                         }
-                    }
-                } else {
-                    if page_only
-                        || self.bounded_sync.ready[0].is_some()
-                        || self.bounded_sync.running[0].is_some()
-                    {
-                        self.note_start(room, peer, "live_lane_busy");
                         return false;
                     }
+                } else {
                     let live = match crate::node::history_demand::Context::current_unlocked(
                         profile,
                         Purpose::Live,
@@ -4442,7 +4686,7 @@ impl Node {
                         Ok(value) => Arc::new(value),
                         Err(_) => return false,
                     };
-                    let required_at = (!announce_first)
+                    let required_at = (service == OutboundService::Public && !announce_first)
                         .then(|| {
                             self.bounded_sync
                                 .required
@@ -4453,57 +4697,41 @@ impl Node {
                     let required = required_at
                         .and_then(|at| self.bounded_sync.required.get(at))
                         .map(|required| (required.head, required.seq));
-                    let key_candidate = if !announce_first
-                        && required.is_none()
-                        && departure_hint.is_none()
-                        && own_verification.is_none()
-                        && own_discovery.is_none()
-                    {
-                        self.ports.get(&(room, peer)).and_then(|port| {
-                            Some((
-                                port.key_body?,
-                                port.key_body_instance?,
-                                port.key_body_token.clone()?,
-                            ))
+                    let required_owner_request = required_at
+                        .and_then(|at| self.bounded_sync.required.get(at))
+                        .map(|required| required.request);
+                    // Classify before any Entry future starts. Private may consume only its
+                    // addressed recipient-key debt/catalog; Public never consumes those roots.
+                    let selected_key_body = (service == OutboundService::Private)
+                        .then(|| {
+                            self.ports.get(&(room, peer)).and_then(|port| {
+                                Some((
+                                    port.key_body?,
+                                    port.key_body_instance?,
+                                    port.key_body_token.clone()?,
+                                ))
+                            })
                         })
-                    } else {
-                        None
-                    };
-                    let availability_candidate = if !announce_first
-                        && required.is_none()
-                        && departure_hint.is_none()
-                        && own_verification.is_none()
-                        && own_discovery.is_none()
-                    {
+                        .flatten();
+                    let selected_key_availability = (service == OutboundService::Private
+                        && selected_key_body.is_none())
+                    .then(|| {
                         self.ports
                             .get(&(room, peer))
                             .and_then(|port| port.key_availability_request.clone())
-                    } else {
-                        None
-                    };
-                    let prefer_key = self
-                        .ports
-                        .get(&(room, peer))
-                        .is_some_and(|port| port.key_body_turn);
-                    let mut selected_key_body = None;
-                    let mut selected_key_availability = None;
-                    let mut chose_public_hint = false;
-                    let hint = if announce_first || required.is_some() {
+                    })
+                    .flatten();
+                    let hint = if service != OutboundService::Public
+                        || announce_first
+                        || required.is_some()
+                    {
                         None
                     } else if let Some(priority) =
                         departure_hint.or(own_verification).or(own_discovery)
                     {
                         Some(priority)
-                    } else if prefer_key
-                        && (key_candidate.is_some() || availability_candidate.is_some())
-                    {
-                        selected_key_body = key_candidate;
-                        if selected_key_body.is_none() {
-                            selected_key_availability = availability_candidate.clone();
-                        }
-                        None
                     } else {
-                        let hint = take_foreground_hint(
+                        take_foreground_hint(
                             &self.history_hints,
                             room,
                             peer,
@@ -4513,32 +4741,21 @@ impl Node {
                                 .as_ref()
                                 .and_then(|net| net.manager().existing(&peer))
                                 .map(|conn| conn.serial()),
-                        );
-                        if hint.is_some() {
-                            chose_public_hint = true;
-                        } else {
-                            selected_key_body = key_candidate;
-                            if selected_key_body.is_none() {
-                                selected_key_availability = availability_candidate;
-                            }
-                        }
-                        hint
+                        )
                     };
-                    let chose_key_body =
-                        selected_key_body.is_some() || selected_key_availability.is_some();
-                    if hint.is_none()
-                        && required.is_none()
-                        && selected_key_body.is_none()
-                        && !self
-                            .ports
-                            .get(&(room, peer))
-                            .is_some_and(crate::node::ports::Port::needs)
-                    {
-                        // No eligible hint remains, and no independent request, generation or
-                        // announcement owes inventory; return its actual admission instead of
-                        // manufacturing an exchange which can re-add the same hint.
+                    let class_owed = if service == OutboundService::Private {
+                        selected_key_body.is_some() || selected_key_availability.is_some()
+                    } else {
+                        hint.is_some()
+                            || required.is_some()
+                            || self
+                                .ports
+                                .get(&(room, peer))
+                                .is_some_and(|port| port.needs_public())
+                    };
+                    if !class_owed {
                         self.bounded_sync
-                            .cancel_matching_control_admission(room, peer);
+                            .cancel_matching_control_admission(room, peer, service);
                         return false;
                     }
                     let reason = foreground_reason(
@@ -4576,6 +4793,7 @@ impl Node {
                         actor_incarnation,
                     ) {
                         Ok(mut flow) => {
+                            flow.required_owner_request = required_owner_request;
                             if let Some((after, token, _, _)) = selected_key_availability {
                                 flow = flow.with_key_availability(after, token);
                             }
@@ -4589,14 +4807,6 @@ impl Node {
                                         Err(_) => return false,
                                     };
                                 flow = flow.with_key_body(need, instance, context, token);
-                            }
-                            if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                                if chose_key_body {
-                                    port.key_body_turn = false;
-                                } else if chose_public_hint {
-                                    port.key_body_turn = port.key_body.is_some()
-                                        || port.key_availability_request.is_some();
-                                }
                             }
                             flow.reason = reason;
                             flow.discovery_incarnations = probe_incarnations;
@@ -4621,7 +4831,7 @@ impl Node {
                 }
             }
         };
-        let index = usize::from(flow.archive);
+        let index = flow.service.index();
         let announcement = flow.announcement_can_run()
             && (flow.announcement_pending()
                 || (announce_first && !flow.inventory && !flow.ordinary_turn_due()));
@@ -4653,7 +4863,7 @@ impl Node {
                 ) {
                     ArchiveTurn::Ready(job) => job,
                     ArchiveTurn::Waiting => {
-                        self.note_start(room, peer, "archive_budget_busy");
+                        self.note_start(room, peer, service, "archive_budget_busy");
                         self.shelve_exact(flow, index);
                         return false;
                     }
@@ -4670,12 +4880,14 @@ impl Node {
                     node,
                     room,
                     peer,
-                    flow.root_name(),
-                    lane,
+                    AdmissionWork {
+                        lane,
+                        ..AdmissionWork::from_flow(&flow)
+                    },
                 ) {
                     ForegroundTurn::Ready(job) => job,
                     ForegroundTurn::Waiting => {
-                        self.note_start(room, peer, "control_budget_busy");
+                        self.note_start(room, peer, service, "control_budget_busy");
                         self.shelve_exact(flow, index);
                         return false;
                     }
@@ -4689,13 +4901,15 @@ impl Node {
                 node,
                 room,
                 peer,
-                flow.root_name(),
-                lane,
+                AdmissionWork {
+                    lane,
+                    ..AdmissionWork::from_flow(&flow)
+                },
             ) {
                 ForegroundTurn::Ready(job) => job,
                 ForegroundTurn::Waiting => {
                     // The retained lane ticket wakes this exact port on a relevant release.
-                    self.note_start(room, peer, "control_budget_busy");
+                    self.note_start(room, peer, service, "control_budget_busy");
                     self.shelve_exact(flow, index);
                     return false;
                 }
@@ -4716,12 +4930,14 @@ impl Node {
                 node,
                 room,
                 peer,
-                flow.root_name(),
-                crate::node::history_budget::Lane::Control,
+                AdmissionWork {
+                    lane: crate::node::history_budget::Lane::Control,
+                    ..AdmissionWork::from_flow(&flow)
+                },
             ) {
                 ForegroundTurn::Ready(job) => job,
                 ForegroundTurn::Waiting => {
-                    self.note_start(room, peer, "control_budget_busy");
+                    self.note_start(room, peer, service, "control_budget_busy");
                     self.shelve_exact(flow, index);
                     return false;
                 }
@@ -4738,9 +4954,15 @@ impl Node {
                 room,
                 peer,
                 AdmissionWork::from_flow(&flow),
-                ByteWait::unowned(bytes_wake),
+                ByteWait {
+                    owner: Some(WorkKey::of(&flow)),
+                    port_request: (service == OutboundService::Public)
+                        .then(|| self.ports.get(&(room, peer)).map(|port| port.req_gen))
+                        .flatten(),
+                    wake: bytes_wake,
+                },
             );
-            self.note_start(room, peer, "control_budget_busy");
+            self.note_start(room, peer, service, "control_budget_busy");
             self.shelve_exact(flow, index);
             return false;
         };
@@ -4754,7 +4976,7 @@ impl Node {
                 });
             }),
         ) else {
-            self.note_start(room, peer, "no_outbound_slot");
+            self.note_start(room, peer, service, "no_outbound_slot");
             self.shelve_exact(flow, index);
             return false;
         };
@@ -4762,17 +4984,28 @@ impl Node {
         // round runs, and takes it here, in the step that makes the round run. A full fixed pool
         // parks the exact flow, gives back the lane job and slot, and wakes only from a running
         // charge's release; the port keeps its need.
+        let work_key = WorkKey::of(&flow);
+        if self
+            .bounded_sync
+            .pool_admission
+            .get(&(room, peer, service))
+            .is_some_and(|admission| admission.key != work_key)
+        {
+            self.bounded_sync
+                .cancel_pool_admission_for(room, peer, service);
+        }
         let resumed = {
             let waiter = self
                 .bounded_sync
                 .pool_admission
-                .get_mut(&(room, peer))
+                .get_mut(&(room, peer, service))
                 .map(|admission| &mut admission.ticket);
             flow.resume(&state_job, state_bytes, waiter)
         };
         let refused = match resumed {
             crate::node::history_stream::runtime::Resumed::Held => {
-                self.bounded_sync.cancel_pool_admission(room, peer);
+                self.bounded_sync
+                    .cancel_pool_admission_for(room, peer, service);
                 None
             }
             crate::node::history_stream::runtime::Resumed::PoolFull(edge) => {
@@ -4792,38 +5025,33 @@ impl Node {
             // Both refusals are impossible under the legal running-work bound, but they are
             // different first gates. Do not call two occupied source-owned slots a full
             // daemon pool: operators need the same cause here and on the retained admission.
-            self.note_start(room, peer, reason);
+            self.note_start(room, peer, service, reason);
             // This ordinary admission wait still owns all work consumed while constructing
             // the Flow: archive dispatch, exact required dependency, or scalar hint. Retain
             // it in its lane until a running completion releases capacity and wakes the
             // actor; never reconstruct only the hint and strand the other two forms.
-            let mut flow = flow;
-            let root = flow.root_name();
-            let retirement_request = flow.retirement_request();
-            let instance = flow.instance;
-            flow.park();
-            debug_assert!(self.bounded_sync.ready[index].is_none());
-            self.bounded_sync.ready[index] = Some(flow);
+            let waiting = PoolWait {
+                gate,
+                root: flow.root_name(),
+                lane,
+                key: WorkKey::of(&flow),
+            };
+            self.shelve_exact(flow, index);
             // A granted claim was consumed by this failed attempt, if one existed. Replace
             // its actor-owned record with the exact still-retained Flow and a later order.
-            self.bounded_sync.cancel_pool_admission(room, peer);
+            self.bounded_sync
+                .cancel_pool_admission_for(room, peer, service);
             if let Some(refused_at) = refused_at {
                 if let Err(error) = self.bounded_sync.wait_for_pool(
                     &mut self.next_token,
-                    room,
-                    peer,
-                    PoolWait {
-                        gate,
-                        work: AdmissionWork { root, lane },
-                        request: retirement_request,
-                        instance,
-                    },
+                    waiting,
                     &state_job,
                     &refused_at,
                 ) {
                     self.note_start(
                         room,
                         peer,
+                        service,
                         match error {
                             crate::node::history_budget::FlowWaitError::OwnerMissing => {
                                 "flow_state_owner_missing"
@@ -4849,22 +5077,22 @@ impl Node {
             self.dispose_rearming_hint(flow);
             return false;
         };
-        if flow.key_body_root.is_some() {
-            port.key_body_turn = false;
-        }
-        if flow.inventory {
-            // This exchange carries every own append so far; one landing after this mark
-            // makes the port owe the peer again, and the round after announces it.
-            port.announced_seq = port.own_seq;
-        }
         let token = self.next_token;
         self.next_token += 1;
         let fence = flow
             .request_fence
             .clone()
             .unwrap_or_else(crate::transport::stream_transport::Fence::new);
-        let generation = port.gen.load(std::sync::atomic::Ordering::Relaxed);
-        let request = port.req_gen;
+        let generation = if service == OutboundService::Public {
+            port.gen.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            0
+        };
+        let request = if service == OutboundService::Public {
+            port.req_gen
+        } else {
+            0
+        };
         let running = crate::node::status::Running::start(
             &self.sync_book,
             room,
@@ -4875,7 +5103,7 @@ impl Node {
         );
         // Fence-only retirement: aborting this async owner could detach a blocking worker and
         // release the port's actual-worker slot early. Every local helper is awaited to exit.
-        port.out = Some(crate::node::ports::Attempt {
+        let mut attempt = Some(crate::node::ports::Attempt {
             token,
             dir: crate::node::ports::Dir::Out,
             conn: conn.clone(),
@@ -4891,7 +5119,15 @@ impl Node {
                 flow.reason
             },
         });
-        if !flow.archive {
+        if !port.out.install(service, &mut attempt) {
+            drop(attempt);
+            self.shelve_exact(flow, index);
+            return false;
+        }
+        if service == OutboundService::Public && flow.inventory {
+            port.announced_seq = port.own_seq;
+        }
+        if service == OutboundService::Public {
             port.note_foreground_attempt(generation);
         }
         let archive = flow
@@ -4900,7 +5136,8 @@ impl Node {
         let running_retirement_key = retirement_key(&flow);
         // A key to this peer waiting on its bundle makes this round read the peer's board,
         // hinted or not (ADR-038 FX-35); once the bundle is held the fact is gone.
-        flow.wants_board = self.key_waiting.contains_key(&(room, peer));
+        flow.wants_board =
+            service == OutboundService::Public && self.key_waiting.contains_key(&(room, peer));
         flow.availability_connection = conn.serial();
         flow.availability_captured = self
             .ports
@@ -5031,9 +5268,11 @@ impl Node {
             }
             completion_wake.notify_one();
         });
-        self.bounded_sync.running[index] = Some(Running {
+        self.bounded_sync.running[physical_index] = Some(Running {
             room,
             peer,
+            service,
+            slot: service.slot(),
             token,
             generation,
             request,
@@ -5046,7 +5285,8 @@ impl Node {
             task,
             started: std::time::Instant::now(),
         });
-        self.note_start(room, peer, "started");
+        self.bounded_sync.note_background_started(service);
+        self.note_start(room, peer, service, "started");
         true
     }
 }
@@ -5089,7 +5329,7 @@ impl Controller {
         let flow = |f: &Flow| {
             let key = retirement_key(f);
             format!(
-                "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
+                "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"service\":\"{:?}\",\"slot\":{},\"archive\":{},\"waiting\":{},\"inventory\":{}}}",
                 key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
                 hex(&key.request),
                 hex(&key.instance),
@@ -5098,6 +5338,8 @@ impl Controller {
                 b32_encode(&f.peer),
                 f.root_name(),
                 lane_name(f.lane()),
+                f.service,
+                f.service.slot().index(),
                 f.archive,
                 f.waiting,
                 f.inventory
@@ -5116,7 +5358,7 @@ impl Controller {
                     || "null".to_owned(),
                     |r| {
                         format!(
-                            "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"token\":{},\"archive\":{},\"lane\":\"{}\",\"age_ms\":{},\"finished\":{}}}",
+                            "{{\"actor\":{},\"request\":\"{}\",\"instance\":\"{}\",\"generation\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"token\":{},\"archive\":{},\"lane\":\"{}\",\"service\":\"{:?}\",\"slot\":{},\"age_ms\":{},\"finished\":{}}}",
                             r.retirement_key.actor.map_or_else(|| "null".to_owned(), |actor| actor.to_string()),
                             hex(&r.retirement_key.request),
                             hex(&r.retirement_key.instance),
@@ -5126,6 +5368,8 @@ impl Controller {
                             r.token,
                             r.archive.is_some(),
                             lane_name(r.lane),
+                            r.service,
+                            r.slot.index(),
                             u64::try_from(r.started.elapsed().as_millis()).unwrap_or(u64::MAX),
                             r.task.is_finished()
                         )
@@ -5165,7 +5409,9 @@ impl Controller {
                          peer: Digest32,
                          root: &str,
                          lane: crate::node::history_budget::Lane,
+                         service: OutboundService,
                          request: Option<stream::RequestId>,
+                         demand: Option<(u64, u64)>,
                          wait_order: Option<u64>,
                          handed_off: Option<bool>| {
             let request = request.map_or_else(
@@ -5181,14 +5427,18 @@ impl Controller {
                 },
             );
             format!(
-                "{{\"admission\":{},\"gate\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"request\":{},\"wait_order\":{},\"handed_off\":{}}}",
+                "{{\"admission\":{},\"gate\":\"{}\",\"room\":\"{}\",\"peer\":\"{}\",\"root\":\"{}\",\"lane\":\"{}\",\"service\":\"{:?}\",\"slot\":{},\"request\":{},\"preflow_request\":{},\"preflow_generation\":{},\"wait_order\":{},\"handed_off\":{}}}",
                 token,
                 gate,
                 b32_encode(&room),
                 b32_encode(&peer),
                 root,
                 lane_name(lane),
+                service,
+                service.slot().index(),
                 request,
+                demand.map_or_else(|| "null".to_owned(), |(request, _)| request.to_string()),
+                demand.map_or_else(|| "null".to_owned(), |(_, generation)| generation.to_string()),
                 wait_order.map_or_else(|| "null".to_owned(), |order| order.to_string()),
                 handed_off.map_or_else(|| "null".to_owned(), |value| value.to_string())
             )
@@ -5202,7 +5452,9 @@ impl Controller {
                 waiting.peer,
                 "archive",
                 crate::node::history_budget::Lane::Archive,
+                OutboundService::Archive,
                 Some(waiting.request),
+                None,
                 None,
                 None,
             ));
@@ -5215,57 +5467,71 @@ impl Controller {
                 waiting.peer,
                 waiting.root,
                 waiting.lane,
-                None,
-                None,
-                None,
-            )
-        }));
-        admissions.extend(self.local_admission.iter().map(|((room, peer), waiting)| {
-            admission(
-                match waiting.kind {
-                    LocalAdmissionKind::Secret => "secret",
-                    LocalAdmissionKind::Room => "room",
-                },
-                waiting.token,
-                *room,
-                *peer,
-                waiting.root,
-                waiting.lane,
-                None,
+                waiting.service,
+                waiting.key.map(|key| key.request),
+                waiting.demand,
                 None,
                 None,
             )
         }));
         admissions.extend(
-            self.byte_admission
+            self.local_admission
                 .iter()
-                .map(|((room, peer, token), waiting)| {
+                .map(|((room, peer, _service), waiting)| {
                     admission(
-                        "bytes",
-                        *token,
+                        match waiting.kind {
+                            LocalAdmissionKind::Secret => "secret",
+                            LocalAdmissionKind::Room => "room",
+                        },
+                        waiting.token,
                         *room,
                         *peer,
                         waiting.root,
                         waiting.lane,
+                        *_service,
+                        waiting.key.map(|key| key.request),
                         None,
                         None,
                         None,
                     )
                 }),
         );
-        admissions.extend(self.pool_admission.iter().map(|((room, peer), waiting)| {
-            admission(
-                waiting.gate,
-                waiting.token,
-                *room,
-                *peer,
-                waiting.root,
-                waiting.lane,
-                None,
-                Some(waiting.ticket.sequence()),
-                Some(waiting.handed_off),
-            )
-        }));
+        admissions.extend(self.byte_admission.iter().map(
+            |((room, peer, _service, token), waiting)| {
+                admission(
+                    "bytes",
+                    *token,
+                    *room,
+                    *peer,
+                    waiting.root,
+                    waiting.lane,
+                    *_service,
+                    waiting.owner.map(|key| key.request),
+                    None,
+                    None,
+                    None,
+                )
+            },
+        ));
+        admissions.extend(
+            self.pool_admission
+                .iter()
+                .map(|((room, peer, _service), waiting)| {
+                    admission(
+                        waiting.gate,
+                        waiting.token,
+                        *room,
+                        *peer,
+                        waiting.root,
+                        waiting.lane,
+                        *_service,
+                        Some(waiting.key.request),
+                        None,
+                        Some(waiting.ticket.sequence()),
+                        Some(waiting.handed_off),
+                    )
+                }),
+        );
         format!(
             "{{\"ready\":[{}],\"running\":[{}],\"deferred\":[{}],\"retiring\":[{}],\"required\":[{}],\"admissions\":[{}],\"archive_admission\":{},\"foreground_admissions\":{},\"room_admissions\":{},\"secret_admissions\":{},\"byte_admissions\":{},\"pool_admissions\":{},\"cleanup\":{},\"cleanup_error\":{},\"cleanup_errors\":[{}]}}",
             ready.join(","),

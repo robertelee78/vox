@@ -3,19 +3,18 @@
 //! This module holds the port's state and the pure rules over it; the actor owns the ports and
 //! does everything that touches the network.
 //!
-//! - **D1.** A port holds at most one outbound attempt and up to [`INBOUND_PER_PORT`] inbound
-//!   ones, its backoff, and its requests and credit. It *needs a session* iff it is not poisoned,
-//!   and the room's generation has passed what was last credited to the peer, or a request was
-//!   raised that no clean completion has consumed yet. This replaced seven maps and a flag
+//! - **D1.** A port holds one Public and one shared Private/Archive outbound position and up to
+//!   [`INBOUND_PER_PORT`] inbound attempts. Public request credit and service-scoped pacing are
+//!   independent of the background operation.
+//!   This replaced seven maps and a flag
 //!   (`pushed_to`, `pending_push`, `owed_first`, `push_failures`, `syncing`, `push_now` and the
 //!   per-peer schedules), which past defects came from disagreeing.
-//! - **D1a.** An attempt carries its task's abort handle and its **fence**. Retiring one removes
-//!   it, aborts its task and retires its fence, so a worker already running on a blocking thread
-//!   stops at its next room step or transport operation. Its slot is held by the worker itself
-//!   and freed when the worker exits, so slots bound running workers. A result for a retired or
-//!   unknown token changes nothing but the `stale` counter.
-//! - **D4.** Full duplex: an inbound session is admitted beside this side's own outbound one; the
-//!   outbound decision ignores inbound attempts.
+//! - **D1a.** An attempt carries its task's abort handle when applicable and its **fence**.
+//!   Retirement removes it and retires its fence; bounded supervision awaits its real helpers
+//!   rather than aborting an outer owner that could detach a blocking tail. The worker holds its
+//!   slot until physical exit. A result for a retired or unknown token changes only `stale`.
+//! - **D4.** Full duplex: inbound sessions are admitted beside outbound positions; outbound
+//!   scheduling ignores inbound attempts.
 //! - **D5.** Backoff by kind, with its own wakeup.
 //! - **D6.** Outbound slots: [`OUTBOUND_SLOTS`] in all and [`OUTBOUND_PER_PEER`] per peer; ports
 //!   waiting for one are served round-robin across peers and FIFO within a peer, and a port that
@@ -33,9 +32,9 @@ use crate::transport::quic::VoxConnection;
 use crate::transport::stream_transport::Fence;
 use crate::wire::WireError;
 
-/// Inbound sessions a port admits at once (ADR-025 D4). A correct peer holds one outbound per
-/// port; the other two cover this side still applying the peer's previous sessions at turnover.
-/// Past it an inbound session is refused at once with `SessionBusy`, never held.
+/// Inbound sessions a port admits at once (ADR-025 D4). A correct peer may hold one Public plus
+/// one Background outbound; the third position covers a previous session still being applied.
+/// Beyond it an inbound session is refused at once with `SessionBusy`, never held.
 pub const INBOUND_PER_PORT: usize = 3;
 
 /// Outbound sessions in flight at once, across every peer (ADR-025 D6). Inbound sessions take
@@ -49,6 +48,139 @@ pub const OUTBOUND_PER_PEER: usize = 4;
 
 /// A session attempt's identity within this node's life.
 pub type Token = u64;
+/// Logical ownership of an outbound operation, independent of its wire budget lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum OutboundService {
+    Public,
+    Private,
+    Archive,
+}
+
+/// The fixed physical position occupied by an outbound operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PhysicalSlot {
+    Public,
+    Background,
+}
+
+impl OutboundService {
+    pub(crate) const fn slot(self) -> PhysicalSlot {
+        match self {
+            Self::Public => PhysicalSlot::Public,
+            Self::Private | Self::Archive => PhysicalSlot::Background,
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Public => 0,
+            Self::Private => 1,
+            Self::Archive => 2,
+        }
+    }
+}
+
+impl PhysicalSlot {
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::Public => 0,
+            Self::Background => 1,
+        }
+    }
+}
+
+pub(crate) struct OutboundAttempt {
+    pub(crate) service: OutboundService,
+    pub(crate) attempt: Attempt,
+}
+
+#[derive(Default)]
+pub(crate) struct OutboundAttempts {
+    public: Option<OutboundAttempt>,
+    background: Option<OutboundAttempt>,
+}
+
+impl OutboundAttempts {
+    fn position(&self, service: OutboundService) -> &Option<OutboundAttempt> {
+        match service.slot() {
+            PhysicalSlot::Public => &self.public,
+            PhysicalSlot::Background => &self.background,
+        }
+    }
+
+    fn position_mut(&mut self, service: OutboundService) -> &mut Option<OutboundAttempt> {
+        match service.slot() {
+            PhysicalSlot::Public => &mut self.public,
+            PhysicalSlot::Background => &mut self.background,
+        }
+    }
+
+    pub(crate) fn can_start(&self, service: OutboundService) -> bool {
+        self.position(service).is_none()
+    }
+
+    /// Takes ownership only after the physical position is free. A rejected attempt stays
+    /// with its caller; no boxed error or extra ownership transfer is needed.
+    pub(crate) fn install(
+        &mut self,
+        service: OutboundService,
+        attempt: &mut Option<Attempt>,
+    ) -> bool {
+        let position = self.position_mut(service);
+        if position.is_some() {
+            return false;
+        }
+        let Some(attempt) = attempt.take() else {
+            return false;
+        };
+        *position = Some(OutboundAttempt { service, attempt });
+        true
+    }
+
+    pub(crate) fn get_token_mut(&mut self, token: Token) -> Option<&mut OutboundAttempt> {
+        self.public
+            .iter_mut()
+            .chain(self.background.iter_mut())
+            .find(|a| a.attempt.token == token)
+    }
+
+    pub(crate) fn take_token(&mut self, token: Token) -> Option<OutboundAttempt> {
+        if self
+            .public
+            .as_ref()
+            .is_some_and(|a| a.attempt.token == token)
+        {
+            self.public.take()
+        } else if self
+            .background
+            .as_ref()
+            .is_some_and(|a| a.attempt.token == token)
+        {
+            self.background.take()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &OutboundAttempt> {
+        self.public.iter().chain(self.background.iter())
+    }
+
+    pub(crate) fn take_all(&mut self) -> impl Iterator<Item = OutboundAttempt> {
+        self.public.take().into_iter().chain(self.background.take())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.public.is_none() && self.background.is_none()
+    }
+}
+
+/// Reachability is shared; other pacing belongs to one logical service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackoffScope {
+    Transport,
+    Service(OutboundService),
+}
 
 /// Which end opened the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +246,8 @@ pub struct Backoff {
     pub until: Option<Instant>,
     /// Consecutive failures, which set the next wait.
     pub failures: u32,
+    /// Beginning of this scope's current failure streak.
+    pub since: Instant,
     /// Its kind.
     pub kind: BackoffKind,
     /// The wakeup armed for it; a wakeup carrying another is stale.
@@ -287,14 +421,15 @@ pub struct Port {
     /// Wire/history format of this room instance. The sparse marker is immutable after creation;
     /// keeping it with the port removes room-lock acquisition from the scheduler's start path.
     pub sparse: bool,
-    /// At most one outbound attempt.
-    pub out: Option<Attempt>,
+    /// One Public and one shared Private/Archive physical position.
+    pub(crate) out: OutboundAttempts,
     /// Up to [`INBOUND_PER_PORT`] inbound attempts.
     pub inbound: BTreeMap<Token, Attempt>,
-    /// Whether it is waiting for an outbound slot.
-    pub queued: bool,
-    /// Its backoff, if it has failed since its last progress.
-    pub backoff: Option<Backoff>,
+    /// Logical service queues waiting for an outbound slot.
+    pub(crate) queued: [bool; 3],
+    /// Shared transport and independently paced service failures.
+    pub(crate) transport_backoff: Option<Backoff>,
+    pub(crate) service_backoff: [Option<Backoff>; 3],
     /// The room is poisoned: no session until it is reopened.
     pub poisoned: bool,
     /// Requests raised.
@@ -304,6 +439,9 @@ pub struct Port {
     /// Exact automatic-recovery trigger which returned without body/cursor progress. Equal
     /// periodic scheduling is not a new producer; a real donor/authority/receipt change is.
     pub(crate) own_recovery_parked: Option<Digest32>,
+    /// A real automatic-recovery inspection found no new page/trigger. Causal producers clear
+    /// this bit; a periodic Public request alone does not make another recovery inspection.
+    pub(crate) own_recovery_checked: bool,
     /// A fresh port must inspect whether its restored room owes automatic support discovery.
     /// It is not a peer receipt; false only caches that this room needs no such operation.
     pub(crate) support_discovery_check: bool,
@@ -319,8 +457,6 @@ pub struct Port {
     pub(crate) key_body_instance: Option<[u8; 16]>,
     /// The exact scan that selected this body, distinct from a later dirty edge.
     pub(crate) key_body_token: Option<std::sync::Arc<()>>,
-    /// Alternate an available recipient body with public head work on this port.
-    pub(crate) key_body_turn: bool,
     /// Scanner continuation in the room's sealed obligations index.
     pub(crate) key_body_after: Option<[u8; 64]>,
     /// False until a causal room/connection edge requests a scan.
@@ -375,9 +511,9 @@ pub struct Port {
     /// request and unconsumed, a round the port runs for it is a `periodic` round in
     /// `vox status` (ADR-038 FX-15, #996).
     pub periodic_req: u64,
-    /// Why the last `start_outbound` for this port ended as it did, and when: what
-    /// `vox status --json` names under `lanes.ports[].last_start` (ADR-038 FX-16).
-    pub last_start: Option<(&'static str, Instant)>,
+    /// Service, outcome and time of the most recent start evaluation on this port. Another
+    /// service's preflight result is not the outcome of an already running attempt.
+    pub(crate) last_start: Option<(OutboundService, &'static str, Instant)>,
 }
 
 impl Port {
@@ -395,14 +531,16 @@ impl Port {
             gen,
             epoch,
             sparse,
-            out: None,
+            out: OutboundAttempts::default(),
             inbound: BTreeMap::new(),
-            queued: false,
-            backoff: None,
+            queued: [false; 3],
+            transport_backoff: None,
+            service_backoff: [None; 3],
             poisoned: false,
             req_gen: 1,
             req_done: 0,
             own_recovery_parked: None,
+            own_recovery_checked: false,
             support_discovery_check: true,
             support_discovery: None,
             support_discovery_unavailable: None,
@@ -411,7 +549,6 @@ impl Port {
             key_body: None,
             key_body_instance: None,
             key_body_token: None,
-            key_body_turn: false,
             key_body_after: None,
             key_body_initialized: false,
             key_body_scan_token: None,
@@ -458,30 +595,28 @@ impl Port {
                 && self.availability_acked != Some(self.availability.local()))
     }
 
-    /// Whether the port needs a session (ADR-025 D1).
-    #[must_use]
-    pub fn needs(&self) -> bool {
-        // An own append the peer has not been told of is a need of its own (ADR-037 R7). It
-        // used to ride along only when a hint from the peer started a round anyway; an append
-        // into a quiet room then woke nothing. Measured on the shipped binary: a Session opened
-        // after a room went quiet was never announced, and neither port ran a round for 90 s.
+    /// Public scheduling credit excludes independently owned private work.
+    pub(crate) fn needs_public(&self) -> bool {
         !self.poisoned
             && (self.gen.load(Ordering::Relaxed)
                 > self.done_gen.max(self.legacy_checked_gen.unwrap_or(0))
                 || self.req_gen > self.req_done
-                || self.key_body.is_some()
-                || self.key_availability_request.is_some()
                 || self.announce_owed())
+    }
+
+    pub(crate) fn needs_private(&self) -> bool {
+        !self.poisoned && (self.key_body.is_some() || self.key_availability_request.is_some())
     }
 
     /// Raise a request (ADR-025 D2).
     pub fn raise(&mut self) {
         self.req_gen = self.req_gen.saturating_add(1);
+        self.own_recovery_checked = false;
     }
 
     /// Raise the periodic request (ADR-025 D7), remembered as such for `vox status`.
     pub fn raise_periodic(&mut self) {
-        self.raise();
+        self.req_gen = self.req_gen.saturating_add(1);
         self.periodic_req = self.req_gen;
     }
 
@@ -500,18 +635,38 @@ impl Port {
     /// twice (V210-97: `queued 72, opened 80` for 40 posts).
     #[must_use]
     pub fn periodic_due(&self, now: Instant, fresh: Duration) -> bool {
-        self.out.is_none()
+        self.out.can_start(OutboundService::Public)
             && self
                 .last_clean_out
                 .is_none_or(|t| now.saturating_duration_since(t) >= fresh)
     }
 
-    /// Whether a backoff holds new outbound sessions back at `now`.
-    #[must_use]
-    pub fn backing_off(&self, now: Instant) -> bool {
-        self.backoff
-            .and_then(|b| b.until)
-            .is_some_and(|until| now < until)
+    pub(crate) fn backoff(&self, scope: BackoffScope) -> Option<Backoff> {
+        match scope {
+            BackoffScope::Transport => self.transport_backoff,
+            BackoffScope::Service(service) => self.service_backoff[service.index()],
+        }
+    }
+
+    pub(crate) fn backoff_mut(&mut self, scope: BackoffScope) -> &mut Option<Backoff> {
+        match scope {
+            BackoffScope::Transport => &mut self.transport_backoff,
+            BackoffScope::Service(service) => &mut self.service_backoff[service.index()],
+        }
+    }
+    /// Clear pacing for this service without disturbing transport or other services.
+    pub(crate) fn clear_service_backoff(&mut self, service: OutboundService) {
+        self.service_backoff[service.index()] = None;
+    }
+
+    pub(crate) fn backing_off_for(&self, service: OutboundService, now: Instant) -> bool {
+        [
+            self.transport_backoff,
+            self.service_backoff[service.index()],
+        ]
+        .into_iter()
+        .flatten()
+        .any(|b| b.until.is_some_and(|until| now < until))
     }
 
     /// Whether new published entries bypass a Busy backoff at `now`. The Busy backoff spaces
@@ -522,16 +677,21 @@ impl Port {
     /// unfinished generation is not another new event after a refusal. A transport (Unreachable)
     /// backoff still holds: a peer that cannot be reached gains nothing from an immediate retry.
     #[must_use]
-    pub fn busy_bypass(&self, now: Instant) -> bool {
-        self.backoff.is_some_and(|b| {
-            b.kind == BackoffKind::Busy
-                && !self.poisoned
-                && self.gen.load(Ordering::Relaxed)
-                    > self
-                        .done_gen
-                        .max(self.legacy_checked_gen.unwrap_or(0))
-                        .max(self.busy_attempt_gen)
-        }) && self.backing_off(now)
+    pub(crate) fn busy_bypass(&self, service: OutboundService, now: Instant) -> bool {
+        service == OutboundService::Public
+            && self
+                .transport_backoff
+                .is_none_or(|b| b.until.is_none_or(|until| now >= until))
+            && self.service_backoff[service.index()].is_some_and(|b| {
+                b.kind == BackoffKind::Busy
+                    && b.until.is_some_and(|until| now < until)
+                    && !self.poisoned
+                    && self.gen.load(Ordering::Relaxed)
+                        > self
+                            .done_gen
+                            .max(self.legacy_checked_gen.unwrap_or(0))
+                            .max(self.busy_attempt_gen)
+            })
     }
 
     /// Spend bypass credit only when a real foreground outbound attempt was installed. The
@@ -542,26 +702,27 @@ impl Port {
 
     /// Clear the backoff: a new connection, a new epoch, or a person's `vox room sync`.
     pub fn clear_backoff(&mut self) {
-        self.backoff = None;
+        self.transport_backoff = None;
+        self.service_backoff = [None; 3];
     }
 
     /// Whether it holds any attempt.
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.out.is_some() || !self.inbound.is_empty()
+        !self.out.is_empty() || !self.inbound.is_empty()
     }
 
     /// Take every attempt out, to be retired.
     pub fn take_attempts(&mut self) -> Vec<Attempt> {
-        let mut all: Vec<Attempt> = self.out.take().into_iter().collect();
+        let mut all: Vec<Attempt> = self.out.take_all().map(|a| a.attempt).collect();
         all.extend(std::mem::take(&mut self.inbound).into_values());
         all
     }
 
     /// Take the attempt with `token`, if the port still holds it.
     pub fn take(&mut self, token: Token) -> Option<Attempt> {
-        if self.out.as_ref().is_some_and(|a| a.token == token) {
-            return self.out.take();
+        if let Some(out) = self.out.take_token(token) {
+            return Some(out.attempt);
         }
         self.inbound.remove(&token)
     }

@@ -2041,9 +2041,23 @@ fn start_words(name: &str, v: &serde_json::Value) -> Vec<String> {
                 port["round_running"]
             ));
         }
-        // A round running on this port's attempt out (a port made anew while an earlier
-        // port's round still runs has no attempt out, and no outcome yet).
-        if running == Some(true) && port["out_age_ms"].is_u64() && outcome != Some("started") {
+        if outcome != Some("never_attempted")
+            && !matches!(
+                port["start_service"].as_str(),
+                Some("Public" | "Private" | "Archive")
+            )
+        {
+            broken.push(format!(
+                "{name}: port {id}: start evaluation omitted its service"
+            ));
+        }
+        // The latest evaluation may belong to Background while Public is already running.
+        // Compare a running Public attempt only with the diagnostic for that same service.
+        if running == Some(true)
+            && port["out_age_ms"].is_u64()
+            && port["start_service"] == "Public"
+            && outcome != Some("started")
+        {
             broken.push(format!("{name}: port {id}: a round runs, yet {said}"));
         }
     }

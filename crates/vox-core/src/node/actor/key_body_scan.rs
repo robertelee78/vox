@@ -167,7 +167,6 @@ impl Node {
                                         port.key_body_instance = Some(instance);
                                         port.key_body_token = Some(Arc::clone(&running.token));
                                         port.key_body_initialized = true;
-                                        port.raise();
                                         self.sched_rooms.insert(running.room);
                                     }
                                     KeyDebtPage::Frozen { serial } => {
@@ -195,7 +194,6 @@ impl Node {
                                                     tip,
                                                 ));
                                                 port.key_body_initialized = true;
-                                                port.raise();
                                                 self.sched_rooms.insert(running.room);
                                             } else {
                                                 port.key_body_initialized = true;
@@ -232,7 +230,6 @@ impl Node {
                                 port.key_body_instance = Some(room_instance);
                                 port.key_body_token = Some(Arc::clone(&running.token));
                                 port.key_body_initialized = true;
-                                port.raise();
                                 self.sched_rooms.insert(running.room);
                             }
                             ScanResult::Exhausted(instance, tip) => {

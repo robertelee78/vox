@@ -145,6 +145,79 @@ a passing full journey. Fresh message canaries must establish their first exact 
 hash/body with `owed: false` while the source is available, before the separate source-off
 restart assertions. The original held-input continuation assertion remains unchanged.
 
+## v0.4.10 Public/Background concurrency evidence boundary (#1047)
+
+The independently reviewed design fixes two physical positions, Public and Background, within
+the unchanged two-per-identity and `2 × active-or-retiring identities` daemon pool. Background
+arbitrates addressed recipient-key work and Archive at successful existing quantum boundaries.
+Design approval does not establish the required real-wire result.
+
+The retained preimplementation normal-feature 9ec CLI was SHA-256
+`0f0d7c0db1b9fdac0c3ef7e8a76f8080229c79cd4222fa32022012854972cd66`.
+An ordinary warm-publisher reference on the existing lossless R41 userspace WAN model
+(150 ms provider-to-requester one-way delay) read the original Public hash in 8.316707125 s:
+`/private/tmp/vox1047-warm-calibrated-normal-23b0tngg/normal-reference-result.json`.
+The same-model preimplementation sole-port arm identified a genuine addressed KeyBody WANT,
+6829-byte response and persisted ACK, but its original Public read also passed, in 6.358413 s:
+`/private/tmp/vox1047-warm-provider-baseline-wh2stn55/provider-overlap.jsonl`.
+That arm is not a discriminating inverse. Near-blackhole and disconnected calibration arms
+remain retained rejected apparatus, not evidence that a responsive public reference passed.
+
+The independently source-reviewed 4a040 concurrency candidate, including the accepted provider
+publication and public-Archive retry corrections, built with normal features and debug information.
+Its SHA-256 is `f7cd74fdd7cf77d64be59a54f40e1720d114ca315b6a1bc0778a2fc10b9750a8`;
+binary/dSYM UUID is `9A83DFD1-716C-3399-B171-6C9BAE9DC69A`. One actual scratch warm-publisher,
+key-complete reference on the unchanged calibrated link and same connection `1a505709` read the
+original Public hash `lhst4ewahcdnwzyexyyf3nqtymmds72wkktyaxhewzta6ag3vdcq` in 8.961846042 s.
+The exact original row and both Ready/cleanup brackets are retained in
+`/private/tmp/vox1047-candidate-reference-9jey9bh2/normal-reference-result.json`.
+Both owned daemons and the link exited cleanly. This is a normal reference only, not concurrent
+KeyBody progress or a discriminating inverse. The rejected percent-encoded IPv6 route attempt
+remains in its log; the corrected ordinary route admitted the existing room without replaying data.
+
+The final exercised normal-feature candidate, after removing exactly three Private-only Public
+raises, is SHA-256 `8dd7b12d42c27925dd4f2b4d6a6b3dbb504ce38a9560824b14af7a912ee76338`,
+binary/dSYM UUID `5D3BFFB1-0D7E-349D-8249-19CCB0526CC1`. The independently accepted source bridge
+retains the key-complete reference above; it does not relabel that reference as a private-debt run.
+The first actual pending-key arm is retained at
+`/private/tmp/vox1047-candidate-active-wire-xp4h4c2d/`: its consumer stopped at +3.66 s on the
+product's explicit CHANGED refresh instruction, so it has no original 10 s result. One authorized
+late read of the same accepted Public hash succeeded, without recovering the original deadline.
+The original legitimate Session was read once with all three original rows, including its exact
+prompt/reply. Both owned daemons, native observers and relay exited 0 with empty final ledgers.
+
+The one authorized apparatus-corrected arm, with the same binary, unchanged 25/150 ms R41 link,
+original post/read clock and ordinary explicit-refresh handling, is retained at
+`/private/tmp/vox1047-candidate-corrected-wire-mxq1k_ry/`. Its addressed KeyBody request
+`01e0454d9a6c6e243f0ee44369f1b874` genuinely crossed the wire on Private token 54: 6829 bytes
+were persisted and ACKed on the exact original driver/provider futures. Private lasted 407.990 ms;
+117 ms remained when the original Public post was accepted. Conservatively counted debugger
+stop plus capture work on both nodes was 11.901083 ms (2.917%). The first provider admission of
+a newer Carol head was 417.053 ms after Private ended, not inside that interval. The original
+Public hash `6eudnpsqucc6y36g2wlvu3cvzzaszypeuqzfs36z7heekvd5vueq` was not read by 10.104355583 s.
+This remains NORESULT for the required causal bracket, not an attributed scheduling regression.
+The raw packet also preserves two correlation limitations: encoded Inventory uses wire tag 6
+(native enum 0), and Carol's own feed advanced 5 to 7, not the assumed 6. Neither limitation
+changes the independently reviewed late-admission chronology. No further run or sole-port
+inverse was performed; original outcomes and all setup-failure records remain preserved.
+Both final ledgers were empty and all owned daemons, observers and relay exited 0.
+
+After that frozen receipt boundary, source review found a missing terminal Background-capacity
+wake for an eligible sibling. The source-only repair reuses `port_eligible` and touches the room
+without raising Public credit; `Review1047ServiceIsolation` accepted that exact branch at 0.95.
+It has not been rebuilt or exercised. The frozen candidate and its earlier source export remain
+separate from this repair and the lead-owned exact-flow byte-admission integration.
+
+The acceptance interval is the exact Private physical outbound token plus wire request. The
+requester queues its final persisted ACK and FIN and returns `ControlPending` without awaiting
+provider DONE; later reuse of the logical request, a local continuation or a delayed DONE cannot
+extend that wire interval. Productive authenticated Public wire progress must occur before that
+terminal, followed by the unchanged original-hash/body 10 s read and eventual legitimate original
+private Session readability. If the private operation ends before the Public read, that ordering
+must be reported explicitly. A same-setup sole-port inverse must fail that same consumer bound.
+Neither simultaneous charged owners nor the retained preimplementation runs establish #1047
+acceptance. The warm fixture also does not retire the separate cold/Dave and first-Session
+selector observations, whose source, commands and profiles remain preserved.
 
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 

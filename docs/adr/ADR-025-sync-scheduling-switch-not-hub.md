@@ -55,24 +55,56 @@ reconciliation for having no collision state.
   (S0b). Proofs MUST assert what a person sees, plus those counters.
 - **Decision 4.** Implementation-level findings MUST be settled in the code and checked by the
   independent verifier.
+- **Decision 5 (2026-10-29, #1047).** A port MAY retain one Public and one Background outbound
+  attempt within the existing limits. Background MUST serve recipient-key body work and Archive
+  fairly at existing quantum boundaries, without repeatedly cancelling a responsive private
+  operation. Private here means addressed KeyPackage/KeyBody work, not opaque Content-kind bodies;
+  the original private Session content MUST become readable after legitimate key completion.
+  The [reviewed design approval](https://github.com/robertelee78/vox/issues/1047#issuecomment-6513251519)
+  records this scope. Approval of this rule is not implementation or active-wire proof evidence.
 
 ### D1. One port per (room, peer)
 
 - **D1.1.** A node MUST keep one port per (room, peer). A port holds:
-  - at most one outbound attempt, and at most `INBOUND_PER_PORT` (3) inbound attempts;
-  - its queued state (D6) and its backoff (D5);
+  - at most one Public and one Background outbound attempt, and at most `INBOUND_PER_PORT` (3)
+    inbound attempts; Background is either recipient-key body work or Archive, never both;
+  - independently queued service demand (D6), shared transport backoff and service backoff (D5);
   - a `poisoned` flag (D3);
-  - its requests and credit (`req_gen`, `req_done`, `done_gen`; D2);
+  - Public requests and credit (`req_gen`, `req_done`, `done_gen`; D2), and each Background
+    operation's exact independent demand/receipt owner;
   - its epoch.
 - **D1.2.** The ports MUST replace `pushed_to`, `pending_push`, `owed_first`, `push_failures`,
   `syncing`, `syncing_with` and `push_now`.
 - **D1.3.** Each room MUST have a **generation**, a `u64` on its state that every stored entry bumps,
   whatever its source. It MUST be read in the same lock acquisition as the `HAVE` frontiers. It is
   in memory: a restart resets it, together with every port.
-- **D1.4.** A port **needs a session** iff it is not poisoned, and `room.gen > done_gen` or
-  `req_gen > req_done`.
-- **D1.5.** Per pair, per end, there MUST be at most 1 outbound session plus `INBOUND_PER_PORT`
-  inbound sessions unfinished.
+- **D1.4.** A port **needs Public work** iff it is not poisoned and `room.gen > done_gen`,
+  `req_gen > req_done`, an announcement is owed, or an exact retained Public root remains.
+  Private need is an exact current recipient-key body/catalog owner; Archive need is an exact
+  explicit-history/own-recovery owner. A port needs outbound work iff any service needs it.
+  Eligibility, queued state and service pacing MUST be evaluated independently; bare Background
+  demand MUST NOT manufacture Public inventory or consume Public credit.
+  Automatic own-recovery producers MUST schedule Archive directly. A checked no-page/parked
+  inspection may wait for a genuine producer, but a periodic Public request alone is not one.
+- **D1.5.** Per pair, per end, there MUST be at most one Public plus one Background outbound
+  session unfinished, and at most `INBOUND_PER_PORT` inbound sessions unfinished. The node's two
+  physical running positions MUST remain one Public opportunity and one Background opportunity;
+  Background MUST NOT borrow Public. Eligible Private and Archive work MUST alternate admitted
+  existing quanta fairly. Public arrivals MUST NOT cancel or restart a responsive Private owner.
+  Service classification MUST follow the authenticated operation root before a private Entry or
+  KeyBody starts, not its Control/Live/Archive budget lane. Public announcement prefixes MUST
+  attach only to Public owners. Running capacity remains two per fingerprint across active and
+  retiring actor generations; the daemon pool remains twice its distinct active-or-retiring
+  hosted identities. No outbound, worker, byte, staging or retained-Flow maximum is increased.
+  Admission waiters MUST be independent for each logical service and budget lane (twelve bounded
+  metadata records, not twelve workers). A newer Public request MUST NOT reset its retained fair
+  ticket. Under pool pressure, the existing exact continuation FIFO grants capacity; a service
+  without its matching promise is not yet capacity-eligible. The controller MUST NOT overtake that
+  FIFO by cancelling another service's ticket. An unusable granted promise MUST be withdrawn while
+  retaining the exact Flow and actual earlier-gate release waiter; only real Background installation
+  advances its arbitration cursor.
+  A terminal Background capacity release MUST reconsider a currently eligible opposite
+  Background service without minting Public credit or waiting for a periodic port sweep.
 
 ### D1a. Retirement is separate from ignoring a result
 
@@ -89,6 +121,12 @@ reconciliation for having no collision state.
 - **D1a.4.** Stores a retired worker made MUST stay: they are durable and idempotent. They MUST
   report themselves through a generation-bump event that is independent of `SyncDone`.
 - **D1a.5.** A `SyncDone` for a retired or unknown token MUST change nothing but the `stale` counter.
+- **D1a.6 (#1047).** Logical removal and fence retirement MUST NOT release either service's
+  physical position or worker Slot before its real local, wire and blocking helpers exit.
+  A replacement actor MUST NOT reserve the same occupied physical service position. Bounded
+  supervision MUST retain and await that owner rather than aborting an outer task which could
+  detach its physical tail; this is the lifetime requirement of D1a.1–D1a.3, not an early release.
+  Each attempt retains its own connection, request, authorization, response credit and cancellation.
 
 ### D2. Requests and credit
 
@@ -107,9 +145,11 @@ reconciliation for having no collision state.
 
   A failed reach MUST back that peer's unconnected ports off as `Unreachable` (D5). A successful one
   is a new connection.
-- **D2.3.** An attempt MUST capture `req_at_start` when it is admitted. A completion D3 calls
-  **clean** MUST set `req_done = max(req_done, req_at_start)`. A request raised after an attempt
-  started MUST NOT be consumed by it.
+- **D2.3.** A Public attempt MUST capture `req_at_start` when admitted. A completion D3 calls
+  **clean** MUST set `req_done = max(req_done, req_at_start)`. A request raised after admission
+  MUST NOT be consumed by it. Private and Archive completions MUST settle only their exact
+  demand/selection/request owner; they MUST NOT advance Public request, generation, announcement
+  or periodic credit. One attempt's response/ACK credit MUST NOT authorize another's stream.
 - **D2.4.** Credit MUST be monotonic within an epoch: `done_gen = max(done_gen, credit)`.
   - `credit` is `gH`, the generation read with this side's `HAVE`.
   - It is `gH + nP` instead when the attempt newly stored `nP` entries from the peer and, at
@@ -177,11 +217,15 @@ reconciliation for having no collision state.
 
 - **D5.2.** The kinds MUST be exhaustive: every hard-fail path (authentication, feed link, malformed
   frame, unsupported mode, local failure) maps to a kind.
-- **D5.3.** Entering backoff MUST arm a `BackoffExpired { room, peer, timer_token }` wakeup. The port
-  re-evaluates when it fires, and a stale `timer_token` MUST be ignored.
+- **D5.3.** Entering backoff MUST arm a
+  `BackoffExpired { room, peer, scope, timer_token }` wakeup. Transport `Unreachable` and its
+  reach owner remain shared; `Busy`, `NoProgress` and `Policy` pacing MUST be service-scoped.
+  The existing intervals above are unchanged. The matching scope re-evaluates when its wake
+  fires; a stale scope/token MUST be ignored. An unrelated service MUST NOT replace its waiter.
 - **D5.4.** `failures` MUST return to 0 on any completion that made progress. When completions run
   concurrently, progress wins over failure for `failures` and for credit, and a failure's backoff
-  MUST NOT cancel a newer attempt.
+  MUST NOT cancel a newer attempt or another running service. Private Busy pacing MUST NOT hold
+  a new Public announcement behind the private operation.
 - **D5.5.** A backoff MUST be cleared by a new epoch, a new connection, or a person's `vox room sync`.
   Ordinary triggers wait it out.
 - **D5.6.** The 20–100 ms jitter, `QUICK_PUSH_RETRIES`, the disjoint halves and `PushRetry` MUST NOT
@@ -255,10 +299,11 @@ feature, whose behaviour is chosen with `VOX_MUTANT_SENDER_MODE`. No shipped bui
 | P4 | `a_refused_entry_is_asked_again`: Carol joins through Alice and posts at once | Bob reads Carol's post ≤ 2 s after the `unadmitted` session ends | the `unadmitted` request removed (the mutant removes the retry itself) | not built |
 | P5 | `a_post_after_have_follows` | a post made after a session's `HAVE` arrives ≤ 250 ms after `vox room post` | `done_gen` taken at `SyncDone` instead of `HAVE` | not built |
 | P6 | `two_members_posting_at_once_are_never_refused`: 2 members, anchor stopped, 60 rounds | `busy-refused = 0`; every post within its bound | as P1 | built |
-| P7 | `a_retired_attempt_frees_its_port`: Bob frozen mid-session, filed dead, a new Bob starts | the new outbound opens ≤ 2 s after the new connection; never two unfinished outbound attempts on one port; the slot occupancy returns to its prior value | retirement removed; **and** the stale-result guard removed | not built (retires by the newcomer probe, not `SILENCE_IS_DEATH`) |
+| P7 | `a_retired_attempt_frees_its_port`: Bob frozen mid-session, filed dead, a new Bob starts | replacement eligible Public/Background opens ≤ 2 s after the corresponding old physical owner exits and the new connection is usable; never two unfinished Public or two unfinished Background attempts on a port, nor Private+Archive together in Background; stale old completion cannot clear a replacement; actual slot occupancy returns to its prior value | retirement removed; **and** the stale-result guard removed | not built (retires by the newcomer probe, not `SILENCE_IS_DEATH`); amended service assertion not yet exercised |
 | P8 | `a_backed_off_peer_is_retried_when_due`: Bob down, then back | Alice's own outbound completes clean ≤ 9 s after Bob returns; an `Unreachable` backoff was entered and expired | `BackoffExpired` removed (the backoff is taken with the connection held up) | built |
 | P9 | `an_entry_that_was_not_asked_for_is_refused`: mutant sender `serve-unasked` | the session fails with `ProtocolViolation`; the entry is absent from the store and from `vox room read` | the coverage check removed | built |
 | P10 | `a_peer_that_serves_nothing_is_paced`: mutant sender `serve-nothing` | ≤ 6 sessions to that peer in 30 s; `NoProgress` backoff entered | the no-progress backoff removed | deleted, V210-106 (#301); the mutant mode remains |
+| #1047 | a fresh Public SAY beside a genuinely active addressed KeyBody on the same room/peer connection | productive Public wire progress occurs inside the exact Private token/request's nonterminal wire interval; intended peer reads the original SAY hash/content within the unchanged 10 s bound; eventual original private Session readability, unchanged maxima and fair Private/Archive turns remain required | sole-Public/Background exclusion restored; fails that SAME Public-read assertion after causal active-wire staging, not setup or watchdog | not yet evidenced; design approval and simultaneous owners are not active-wire acceptance |
 | — | #202's proof, `a_sync_failure_names_its_reason` | a real failure is named on its pair, with no governance or malformed text; no collision is reported between correct members | the governance wrapper; the uninformative code for a room peer | built |
 | — | `a_member_relays_what_it_learned` (D1), `a_member_whose_connection_died_is_synced_again` (D2.2), `a_dead_member_does_not_stall_the_room`, R40, `a_new_member_is_seen_promptly` | unchanged | | built |
 | — | `two_backlogs_meet` (#212): a bilateral, concurrent-session, shared-connection backlog | both backlogs cross | | built, opt-in |
