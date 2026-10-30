@@ -618,6 +618,7 @@ fn assert_exact_read_rows(
 #[derive(Clone, Debug)]
 struct RoomStatus {
     log_entries: u64,
+    governance_revision: u64,
     members: Vec<String>,
     received_key_generations: u64,
     governance_pending: bool,
@@ -665,6 +666,11 @@ fn room_status(dir: &Path, reader: &str, room: &str) -> RoomStatus {
         return RoomStatus {
             log_entries: row["log_entries"].as_u64().unwrap_or_else(|| {
                 panic!("PRODUCT: {reader}'s room status has no numeric `log_entries`: {row}")
+            }),
+            governance_revision: row["governance_revision"].as_u64().unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: {reader}'s room status has no numeric `governance_revision`: {row}"
+                )
             }),
             members: row["members"]
                 .as_array()
@@ -7774,6 +7780,7 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         "APPARATUS: Alice did not retain Bob's exact positioning row {positioning} in room {}",
         rooms[0]
     );
+    let before_expiry = room_status(&alice, "alice", &rooms[0]).governance_revision;
     let (ok, active, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
     assert!(
         ok && active
@@ -7784,36 +7791,14 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
          achieved: {active}{err}",
         rooms[0]
     );
-    // The shipped authority page becomes refreshing when its exact source-owned deadline has
-    // fired. It may also move directly to the final absent answer when both bounded sweeps finish
-    // before the next observation. Once refreshing is observed, shipped status provides the
-    // causal terminal boundary: no governance maintenance remains queued. The behind-cursor
-    // second-sweep mutant reaches that boundary too, then the one-shot roster assertion below
-    // turns PRODUCT red instead of waiting forever for the desired state.
-    let expired_without_refresh = loop {
-        let (ok, out, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
-        let contains_bob = out
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some(fps[1].as_str()));
-        if ok && !contains_bob {
-            break true;
-        }
-        if ok {
-            std::thread::yield_now();
-            continue;
-        }
-        assert!(
-            err.contains("governance") && err.contains("refreshing"),
-            "PRODUCT: Alice's shipped admin page failed while its exact certificate expiry was \
-             becoming current in room {}: {out}{err}",
-            rooms[0]
-        );
-        break false;
-    };
-    if !expired_without_refresh {
-        while room_status(&alice, "alice", &rooms[0]).governance_pending {
-            std::thread::yield_now();
-        }
+    // Stage on the room's next published semantic meaning, not on the roster answer we are
+    // about to assert or a transient refreshing response that a fast fold may never expose.
+    // The certificate's own deadline is the only remaining semantic input in this quiet room.
+    while room_status(&alice, "alice", &rooms[0]).governance_revision == before_expiry {
+        std::thread::yield_now();
+    }
+    while room_status(&alice, "alice", &rooms[0]).governance_pending {
+        std::thread::yield_now();
     }
     let (ok, expired, err) = vox(&alice, &["room", "admin", "list", &rooms[0]], None);
     assert!(
