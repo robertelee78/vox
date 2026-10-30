@@ -3227,6 +3227,8 @@ impl Node {
                 if flow.published {
                     flow.published = false;
                     if flow.governance {
+                        #[cfg(feature = "test-knobs")]
+                        super::governance::ready_sweep_after(&work.room);
                         self.governance_work.wake_room(work.room);
                     } else {
                         self.governance_work.pending = true;
@@ -3434,6 +3436,8 @@ impl Node {
                 // Ordinary content publication has no governance work. The history worker's
                 // signed-kind result names the causal control publication that does.
                 if flow.governance {
+                    #[cfg(feature = "test-knobs")]
+                    super::governance::ready_sweep_after(&work.room);
                     self.governance_work.wake_room(work.room);
                 }
                 self.sched_rooms.insert(work.room);

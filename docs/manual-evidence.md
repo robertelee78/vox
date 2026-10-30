@@ -219,6 +219,36 @@ Neither simultaneous charged owners nor the retained preimplementation runs esta
 acceptance. The warm fixture also does not retire the separate cold/Dave and first-Session
 selector observations, whose source, commands and profiles remain preserved.
 
+The corrected journey next reached the forced expiry setup but did not engage its marker.
+Read-only shipped authority pages on both scratch peers already excluded the expired
+administrator, with both nodes Ready and governance idle. The native sample located the
+operator at the unengaged marker wait. Its only arming call was on legacy sync completion;
+sparse accepted-governance publication did not arm it. The run was stopped as APPARATUS
+NO RESULT, not a product expiry failure or a full pass. All original profiles were preserved,
+and no profile handles remained. The existing test-only marker must also arm at the two
+actual sparse published-governance boundaries; ordinary content and deadline wakes cannot
+arm it. No normal-product path, consumer assertion, knob or timing is changed.
+
+The next full run reported an explicit no-change refusal while staging the administrator
+grant immediately after Alice reopened: a preceding room change was still being applied.
+That run remains unaccepted. This setup must follow only that exact wait instruction, using
+the existing rename-staging pacing. An accepted grant is never replayed, and every other
+refusal still fails its assertion. This does not change the expiry claim or its deadline.
+
+The next run reached the final revocation-descendant check and remained structurally
+waiting: Alice held the exact new hash, while Bob did not and still reported mutual trust.
+Read-only inspection of that original process found a stable catalog-announcement token
+bound to connection serial 0 after the current primary became serial 1. Its exact ACK was
+correctly refused; repeated Inventory announcements displaced the missing-head work.
+The candidate correction is to rebind existing role/catalog state on primary adoption and
+on the close event that promotes a surviving connection, using the manager's current
+primary. ACK, authorization and physical-tail fences are unchanged. Both independent
+source reviews accepted the complete correction. A normal-feature explicit-restart
+recovery on copies of the retained profiles restored Bob's current revocation answer and
+the exact retained descendant without revealing its body; it is not an uninterrupted
+connection or full-journey result. The original stalled run and profiles remain retained.
+The diagnostic TempDir-retention line was removed before the next full journey.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at

@@ -11035,45 +11035,7 @@ impl Node {
                 // A fresh connection syncs at once (ADR-016): a request on every port it shares,
                 // with any backoff cleared (ADR-025 D2, D5).
                 self.connected.insert(peer);
-                let changed_connection = conn.as_ref().is_some_and(|conn| {
-                    self.role_connection_serials.insert(peer, conn.serial()) != Some(conn.serial())
-                });
-                if changed_connection {
-                    for room in self.channels.keys().copied() {
-                        if self.ports.contains_key(&(room, peer))
-                            && (self.own_key_active.keys().any(|(r, _)| *r == room)
-                                || self.own_key_credit_missing.contains_key(&room)
-                                || self.own_recovery_rooms.contains_key(&room))
-                        {
-                            self.governance_work.wake_room(room);
-                        }
-                        if let Some(owner) = self.role_wake.owner(room) {
-                            owner.on_connect(peer);
-                            if let Some(conn) = conn.as_ref() {
-                                if let Err(error) =
-                                    owner.key_catalog_on_connect(peer, conn.serial())
-                                {
-                                    eprintln!("vox: key catalog connection could not be initialized: {error}");
-                                }
-                                if let Some(port) = self.ports.get_mut(&(room, peer)) {
-                                    port.key_catalog_seen = None;
-                                    port.key_availability_exhausted = None;
-                                    port.key_availability_request = None;
-                                    port.key_availability_page = None;
-                                    port.key_remote_selected = None;
-                                    port.key_remote_advance = None;
-                                    port.raise();
-                                    self.sched_rooms.insert(room);
-                                }
-                            }
-                            if self.trust.is_trusted(&peer)
-                                && self.ports.contains_key(&(room, peer))
-                            {
-                                owner.mark_key_dirty(peer);
-                            }
-                        }
-                    }
-                }
+                self.note_role_connection(peer, conn.as_ref());
                 self.discover_peers.insert(peer);
                 self.probe_older(peer);
                 if let Some(conn) = conn {
@@ -11089,14 +11051,14 @@ impl Node {
                 }
             }
             NetEvent::ConnectionClosed { peer, serial } => {
-                let replacement_is_live = self
+                let current = self
                     .net
                     .as_ref()
-                    .and_then(|net| net.manager().existing(&peer))
-                    .is_some_and(|conn| {
-                        conn.serial() != serial && conn.quinn().close_reason().is_none()
-                    });
-                if replacement_is_live {
+                    .and_then(|net| net.manager().existing(&peer));
+                if current.as_ref().is_some_and(|conn| {
+                    conn.serial() != serial && conn.quinn().close_reason().is_none()
+                }) {
+                    self.note_role_connection(peer, current.as_ref());
                     return;
                 }
                 if self.role_connection_serials.get(&peer) == Some(&serial) {
@@ -13205,6 +13167,47 @@ impl Node {
         }
     }
 
+    /// Rebind connection-scoped role and catalog state to the manager's current primary.
+    /// An adopted path can replace that primary without emitting `Connected`.
+    fn note_role_connection(&mut self, peer: Digest32, conn: Option<&Arc<VoxConnection>>) {
+        let changed_connection = conn.is_some_and(|conn| {
+            self.role_connection_serials.insert(peer, conn.serial()) != Some(conn.serial())
+        });
+        if !changed_connection {
+            return;
+        }
+        for room in self.channels.keys().copied() {
+            if self.ports.contains_key(&(room, peer))
+                && (self.own_key_active.keys().any(|(r, _)| *r == room)
+                    || self.own_key_credit_missing.contains_key(&room)
+                    || self.own_recovery_rooms.contains_key(&room))
+            {
+                self.governance_work.wake_room(room);
+            }
+            if let Some(owner) = self.role_wake.owner(room) {
+                owner.on_connect(peer);
+                if let Some(conn) = conn {
+                    if let Err(error) = owner.key_catalog_on_connect(peer, conn.serial()) {
+                        eprintln!("vox: key catalog connection could not be initialized: {error}");
+                    }
+                    if let Some(port) = self.ports.get_mut(&(room, peer)) {
+                        port.key_catalog_seen = None;
+                        port.key_availability_exhausted = None;
+                        port.key_availability_request = None;
+                        port.key_availability_page = None;
+                        port.key_remote_selected = None;
+                        port.key_remote_advance = None;
+                        port.raise();
+                        self.sched_rooms.insert(room);
+                    }
+                }
+                if self.trust.is_trusted(&peer) && self.ports.contains_key(&(room, peer)) {
+                    owner.mark_key_dirty(peer);
+                }
+            }
+        }
+    }
+
     fn adopt_connection(&mut self, conn: Arc<VoxConnection>) {
         self.note_peer_endpoint(&conn);
         let peer = conn.peer_id();
@@ -13217,6 +13220,12 @@ impl Node {
                 spawn_stream_loop(net, conn, self.net_tx.clone());
             }
         }
+        // `conn` may be a retiring path; only the manager's primary owns catalog ACKs.
+        let primary = self
+            .net
+            .as_ref()
+            .and_then(|net| net.manager().existing(&peer));
+        self.note_role_connection(peer, primary.as_ref());
         // A new connection syncs at once, then on the interval (ADR-016; ADR-025 D2, D5).
         self.connected.insert(peer);
         self.discover_peers.insert(peer);
