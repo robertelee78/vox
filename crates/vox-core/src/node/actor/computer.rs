@@ -765,9 +765,8 @@ impl NodeHandle {
         let (_, identity) = self.startup_computer_boundary().ok_or(Error::Profile(
             "the selected node has no owned computer-trust identity",
         ))?;
-        let observed = crate::node::computer::ComputerChange::now(
-            computer.policy_target_after_writer()?,
-        );
+        let observed =
+            crate::node::computer::ComputerChange::now(computer.policy_target_after_writer()?);
         loop {
             if superseded.is_retired() {
                 return Err(Error::ComputerPolicySuperseded);
@@ -777,7 +776,10 @@ impl NodeHandle {
                 observed.apply_deadline(),
                 observed.return_deadline(),
             );
-            match self.reconcile_computer_current(change, Arc::clone(&superseded)).await {
+            match self
+                .reconcile_computer_current(change, Arc::clone(&superseded))
+                .await
+            {
                 Err(Error::ComputerPolicySuperseded) if !superseded.is_retired() => continue,
                 Err(error) => return Err(error),
                 Ok(()) => {}
@@ -838,7 +840,6 @@ impl NodeHandle {
         }
     }
 
-
     /// Keep the accepted live follower event alive past its observation boundary. Only exact
     /// policy movement, detach/shutdown, or a stopped actor can supersede this future.
     pub async fn reconcile_computer_current(
@@ -895,8 +896,10 @@ impl NodeHandle {
         };
         let (reply, rx) = oneshot::channel();
         let send = self.net_tx.send(NetEvent::ComputerPolicy {
-            guard: ComputerPolicyGuard { change,
-            superseded: Arc::clone(&superseded), },
+            guard: ComputerPolicyGuard {
+                change,
+                superseded: Arc::clone(&superseded),
+            },
             reply,
             permit,
         });

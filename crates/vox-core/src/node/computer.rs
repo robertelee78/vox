@@ -3308,7 +3308,6 @@ impl Computer {
     /// applied receipt: the actor must still save the keyring and finish its live or expired
     /// receipt. If the process ends between those writes, the retained preparation prevents an
     /// old live receipt from certifying an interrupted application or revocation.
-
     pub(crate) fn prepare_application_for_change(
         &self,
         node: Digest32,

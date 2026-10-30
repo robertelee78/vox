@@ -253,16 +253,16 @@ impl Managed {
                 .collect();
             let change = self.guard.change;
             let deadline = change.apply_deadline();
-            if self.computer.binding_group().is_some() && !self.computer.current_revision_expired()
-            {
-                if !self.computer.bind_node_for_change(
+            if self.computer.binding_group().is_some()
+                && !self.computer.current_revision_expired()
+                && !self.computer.bind_node_for_change(
                     signer,
                     &self.node_name,
                     change,
                     &self.transition,
-                )? {
-                    return Err(Error::ComputerPolicySuperseded);
-                }
+                )?
+            {
+                return Err(Error::ComputerPolicySuperseded);
             }
             let prepared = self.computer.prepare_application_for_change(
                 self.node,

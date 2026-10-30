@@ -9129,7 +9129,7 @@ async fn pump(
         // never reached its idle exit (L-8).
         let item = tokio::select! {
             item = events.next() => item,
-            () = subscriber_gone(&stream) => return Ok(()),
+            () = subscriber_gone(stream) => return Ok(()),
         };
         let Some(item) = item else {
             return Ok(());

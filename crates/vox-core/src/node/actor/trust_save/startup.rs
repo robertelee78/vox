@@ -31,8 +31,10 @@ pub(in crate::node::actor) fn settle_startup_policy(
                 observation_end,
                 observation_end,
             );
-            let guard = computer::ComputerPolicyGuard { change,
-            superseded: Arc::new(computer::PolicySupersession::default()), };
+            let guard = computer::ComputerPolicyGuard {
+                change,
+                superseded: Arc::new(computer::PolicySupersession::default()),
+            };
             let attempt = (|| -> crate::error::Result<(u64, bool)> {
                 // This is the original may_replace_expired=true startup binding, deliberately
                 // unlike ordinary live reconciliation's expired-binding refusal.
@@ -135,8 +137,10 @@ pub(in crate::node::actor) fn settle_headless_startup_policy(
             observation_end,
             observation_end,
         );
-        let guard = computer::ComputerPolicyGuard { change,
-        superseded: Arc::new(computer::PolicySupersession::default()), };
+        let guard = computer::ComputerPolicyGuard {
+            change,
+            superseded: Arc::new(computer::PolicySupersession::default()),
+        };
         let (committed, result) =
             apply_headless_policy(computer, signer, name, transition, &guard, true);
         match result {
@@ -180,10 +184,9 @@ pub(in crate::node::actor) fn apply_headless_policy(
             let deadline = change.apply_deadline();
             if computer.binding_group().is_some()
                 && (startup || !computer.current_revision_expired())
+                && !computer.bind_node_for_change(signer, name, change, transition)?
             {
-                if !computer.bind_node_for_change(signer, name, change, transition)? {
-                    return Err(Error::ComputerPolicySuperseded);
-                }
+                return Err(Error::ComputerPolicySuperseded);
             }
             if startup {
                 computer.require_startup_binding(node, change.target())?;

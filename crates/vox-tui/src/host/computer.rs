@@ -428,8 +428,7 @@ impl Router {
                             "the selected node has no authenticated identity".into(),
                         );
                     };
-                    let superseded =
-                        Arc::new(vox_core::node::actor::PolicySupersession::default());
+                    let superseded = Arc::new(vox_core::node::actor::PolicySupersession::default());
                     let application = handle.reconcile_computer(Arc::clone(&superseded));
                     tokio::pin!(application);
                     let result = tokio::select! {
