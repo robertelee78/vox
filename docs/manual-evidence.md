@@ -4,6 +4,139 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+
+## v0.4.10 provider-cursor publication diagnosis (#934)
+
+On 2026-10-30, an ordinary-feature release CLI at
+`c778fb2525689c0b2dcaa67e620a2845f89ae894`, with debug information only, reproduced an
+internal saved-read inconsistency during a fresh two-node room join and normal read-trust
+setup. Its SHA-256 was
+`a474193a852f0d23fbfc1947b14f196707f51156f41b05dfc86b78f0af68860e`.
+Both native daemons were observed from before entry, with separate scratch data/config
+directories. The source-bound debugger read fields and registers only; no product feature,
+deadline, authority check or guard was changed.
+
+The first Carol failure was not inferred from a generic refresh instruction. The actual
+provider-cursor writer sealed directory 12, physically committed Store transaction 19, then
+released its saved-view pin while the published directory remained 11. The next native
+`with_snapshot` comparison observed rendered 12 versus published 11 and no remaining pin.
+An Alice saved-history query independently observed rendered 33 versus published 31 while
+the client's requested publication revision 17 still equalled the saved revision 17.
+The raw producer, commit, pin, publication and consumer records, source/UUID/disassembly
+bindings and clean native exit receipts are retained under
+`/private/tmp/vox1047-active-wire-v87icea5/`. The earlier uninstrumented read-refresh result
+and rejected debugger launch-queue attempt remain separate, not overwritten.
+
+The `commit_provider_cursor` path is unchanged in clean
+`4a0405f7dd85feb2d897106e910cbe8ce8c6da25`; it is distinct from that composition's existing
+history `write_owned`/retirement publication repair. Its correction republishes the saved
+read under the same room lock after owned completion and pending release, before dropping
+the original MVCC pin. It reuses `PendingHistoryRead::retain_saved_read` if republication
+fails and preserves the original native commit error ahead of any publication error.
+The authorization CAS, owner, epoch and room-instance checks are unchanged. No generic
+`CHANGED`/`Profile` exemption, retry or old-index repair is introduced.
+
+After independent source/evidence review, a normal-feature release from clean 4a040 plus
+this narrow cursor correction built successfully. Its SHA-256 was
+`a7c4a879199073effe2eba6b0078e5b15215f1c7e880f3814f3cc13499f44e1a`.
+One fresh normal operator passed join/read-trust setup and exact original public messages
+in both directions. Four explicit read-refresh instructions were preserved and followed
+without replaying accepted posts or trust changes. The same online-opened Session accepted
+the original offline-drive prompt/reply hooks. Its first explicit selector still refused
+with “the room's Sessions changed while selecting; try again”; following that instruction
+on the same read returned the exact typed prompt, reply and turn-end rows. Both daemons
+exited 0, and the binary remained unchanged. The complete result is retained at
+`/private/tmp/vox1047-active-wire-7m1luh8k/provider-publication-fixed-result.json`.
+This is a bounded provider-publication result, not a correction of the first-Session refusal.
+
+The diagnosis establishes the producer of the recorded c778 inconsistency, not the cause
+of the earlier 9ec Dave/first-Session observations. It does not establish whole #934
+acceptance or requested-history other-room/control overlap.
+
+## v0.4.10 public archive retry audience (#934)
+
+The remaining history/other-room composition used the same normal cursor-fixed binary and
+immutable stopped 388-row fixture. Its first attempt delivered four exact primary/quiet-room
+messages and both Ready controls, but the same selected request was already Complete/0 at
+the closing observation; that attempt remains unmeasured. A separately reviewed apparatus
+correction reused stable operation IDs and real arrival-cursor reads, not a delayed worker,
+larger backlog or timing threshold. Its exact request
+`491092e91a8c3692e1d1cb75fec1e956`, instance
+`2a92f8675992bd06500e20185694f698`, remained Pending/64 while both quiet-room deliveries,
+both Ready controls and two new requested original old rows were observed. Neither primary
+receiver witness was established before the final status became Paused/64 with
+`node: history retry activation changed`. The final raw status must not be confused with the
+receipt's retained last successful Pending observation. Evidence and original outputs are
+retained at `/private/tmp/v934history-providerfixed-cursor-20261030-overlap/`; cleanup,
+unchanged binary and unchanged original profiles were recorded. This is partial evidence,
+not whole #934 acceptance or a requirement that one quantum remain uninterrupted.
+
+Source tracing identifies a preparation/retry contradiction: explicit public history creates
+an activation with zero audience, then passes it unchanged to `Flow::archive`. The resumed
+body guard instead expected the node's fingerprint unless automatic own recovery was set.
+Public Resume retains the same request, bounds, body offset, cursor and remaining selection;
+renewing its activation cannot correct that different expected audience. The correction
+expects the established zero audience only for History purpose in public archive or own
+recovery. Live/Control dependencies remain node-bound even inside an archive flow. Explicit
+private recovery remains on its separate donor-bound `PrivateDispatch` path; legacy refusal
+is unchanged.
+
+The guard still independently compares the flow's room, instance, epoch and authorization
+generation, and retains `active.matches(state)`, task request equality, cancellation, serial,
+nonterminal-progress and exact body checks. It does not substitute the activation's entire
+binding for the expected binding, suppress the refusal, renew authority or introduce a retry.
+The retained status identifies the actual refusal path, but no native capture of its compared
+activation values was taken; the audience contradiction is source-backed.
+
+After applied-patch authority review, a normal-feature release containing the cursor and
+audience corrections built successfully, SHA-256
+`b4853e0a3a64684d87a994e0cb8abb0cef5d8306a57a6fb5c3a4edbf8d11d42a`.
+One continuation restored the existing stopped scratch profiles and the same request/instance,
+now More/62. Full paged reads before Resume found both primary receiver messages already
+delivered; they are explicitly excluded from communication-during-history acceptance.
+One shipped Resume with the exact retained request/instance returned 0. The same selection
+became Pending/62, then Complete/0; 62 additional exact requested original rows became readable.
+No Newest/Older, new posts, quiet/control replay or trust changes were issued. Both daemons
+exited 0 and the binary remained unchanged. Complete baselines, command/status observations
+and results are retained under
+`/private/tmp/v934history-providerfixed-cursor-20261030-overlap/explicit-resume-continuation/`.
+This establishes corrected same-selection Resume progress, not communication-during-history
+credit for those already-delivered primary messages.
+
+One fresh remaining-criterion composition then used that same corrected normal binary and
+the unchanged stopped fixture. Its reviewed apparatus drained each real arrival cursor to
+EOF before Older and advanced it after every bounded observation; it did not repeat a fixed
+first-128-row window. Request `ac54b17602e978fbf74a0ac991d719d3`, with the same saved instance,
+was Pending/64 while both exact quiet-room deliveries, both Ready controls and 59 new exact
+requested original rows were observed. Its final raw status was Complete/0, with no retry
+activation refusal. All four posts were accepted, but none of the retained primary-room
+receiver NDJSON outputs contained either exact primary witness. Accepted posts are not
+receiver delivery evidence. The controller's stronger four-delivery predicate therefore
+remains unmeasured; its raw APPARATUS result is not relabelled, and missing receiver evidence
+is not a proven product delivery failure or timing violation. Outputs and exact
+hash/author/operation/body audit are retained under
+`/private/tmp/v934history-audiencefixed-arrival-20261030-overlap/`; cleanup, unchanged binary
+and unchanged original profiles were recorded.
+
+Independent full-composition review against the actual current #934 contract accepts the
+scoped technical criteria. L-11 asks for fresh message exchange during requested history
+work; it does not require primary and quiet-room delivery in one uninterrupted quantum.
+The final normal run directly supplies exact two-way fresh quiet-room exchange, other-room
+usability and Ready controls while 59 requested originals become readable. The already
+accepted normal-4a040 #996 result separately supplies exact primary-room opposite-reader
+delivery in both directions and 11 requested originals inside one Pending/62 request:
+`/Users/robert.lee/vox-coord/fx996-acceptance-result-20261029.json`.
+The reviewed source bridge from 4a040 changes only provider-cursor saved-read publication
+and the History/archive expected audience; ordinary Public Live/Control delivery policy is
+unchanged. That passing primary-room evidence is reused as L-11 explicitly permits, not
+claimed as a witness from the final controller attempt.
+
+Normal multi-kept restart, original identity/trust/room/message/repository/Session truth,
+the compact-selector reader reduction and the ADR scope amendment remain separately bound
+to `/private/tmp/fx934-final-candidate-handoff.json` and its accepted source/binary reviews.
+The retained #1023/#1024 outcomes are reused within their original boundaries, not rerun.
+This is a composed technical acceptance judgment, not one binary's complete re-execution,
+an assertion that every historical receipt passed, or a GitHub integration/release claim.
 ## v0.4.5 documentation continuation
 
 The current chapters describe the exact `v0.4.5` tag,
@@ -44,6 +177,72 @@ Validation for this continuation is source review, Markdown links/manifest consi
 frontmatter and Rust formatting of the help-only edit. Website rendering and publication remain
 the website owner's existing workflow, consuming all chapters from one resolved commit.
 
+
+## v0.4.10 current-version startup candidate (#934)
+
+This earlier candidate record retains its original observation boundary; the later composed
+technical acceptance and source bridge are recorded above.
+
+This is scoped candidate evidence for [#934](https://github.com/robertelee78/vox/issues/934),
+not a published-release or prior-release migration claim. ADR-026 F-3/F-4 reuse the approved
+`d76ed0e1a` compatibility amendment; L-9–L-11 distinguish supported interrupted work from an
+absent or unsupported sealed bootstrap. Current-version data/security integrity and unchanged
+unsupported-format refusal remain requirements.
+
+The candidate is based on `9ec3ed6993201a55cae3df0894e8ce06eca4c7fe`, with the compact-selector
+consolidation in `actor::detail_of` and `ChannelState::display_publication`. It reads display and
+receipt stamps, last arrival and history instance from one short-lived sealed snapshot instead
+of reopening that directory separately for each selector. No snapshot or new cache survives
+the call. Incarnation, display/read roots, body/order/Session revisions, retention and expiry
+inputs remain; current trust, governance, Session and committed-history authority checks still
+run through their existing paths. This is not arbitrary old-index reconstruction.
+
+The normal-feature binary SHA-256 is
+`d921c2ae6226974a78140542772c12ee550a621f6bc1c5eca3cd957e92cf9f81`.
+Its build/source-overlay binding is `/private/tmp/fx934-candidate-build.json`. The exercised
+shipped-CLI journey is `/private/tmp/v934-1kvjmo6f/receipt.json`: two file-kept identities share
+one daemon, a separate loopback peer communicates with both, and a normal daemon restart
+receives no new passphrase input. All six original message hashes/authors/plaintexts remain
+readable; fingerprints and read-trust records agree across restart. The owner's supported
+Session keeps its owner, opening time, open state and drive access; the read-only peer's
+Session discovery remains empty. A repository-bound hook resolves the second kept node's
+room after restart. Exact new messages are read in both directions for both kept nodes,
+including Bob's post read by restarted Alice (#986), followed by working-room exchange with
+quiet-room reads and daemon node listings. Supported refresh retries are recorded; this is
+not a claim that every command succeeded on its first attempt.
+
+The source-equivalent baseline functional receipt is
+`/private/tmp/v934-s4s584b1/receipt.json`. A separate stopped-fixture diagnostic replay retained
+append-only reader callbacks under `/private/tmp/v934diag-4eb369hj/`; the candidate retained
+them under `/private/tmp/v934-1kvjmo6f/`. Each directory's
+`publication-readers-retained-summary.json` binds its raw journal. In the unchanged quiet room,
+the baseline recorded 307 display, 307 read-summary, 307 arrival and 306 history-instance
+reader calls (the interval ended during its final publication); the candidate recorded 368
+combined-selector calls and no separate compact-selector calls. The measured selector shape
+is four sealed-index reader openings becoming one, not a comparison of totals across unequal
+intervals. The other three stable-detail reader paths remain. These are instrumented calls,
+not physical disk misses, CPU, latency, throughput or a universal bound on changed-state work.
+The first observer summary was reset on teardown and is not measurement evidence; the
+retained replay journals supersede that apparatus failure. Debuggers were explicitly
+terminated after interactive detach was unresponsive; no graceful debugger exit is claimed.
+The product assertions subsequently completed and all owned product daemons exited cleanly.
+
+Independent source, ADR/security and retained-evidence reviews accepted these scoped claims.
+The exercised trust/Session boundary is not a new proof of every revocation, Drive or retention
+scenario. Unaffected #1023 native-save and #1024 own-feed recovery acceptance is reused, not
+rerun or widened; local restart evidence does not discharge ADR-036 peer authentication.
+
+Active requested-history isolation is not accepted by these observations. A separate normal
+candidate composition, `/private/tmp/v934history-parallel-20261029-overlap/receipt.json`, began
+with the exact selected request Pending with 64 items owed. Four concurrently launched real
+CLI posts were read exactly in both directions across the history room and another ready
+room, and both daemon controls returned Ready. The same request was already Complete with
+zero remaining work at the final bracket, so the run is APPARATUS/UNMEASURED for delivery
+**while** history remained active, not whole-#934 acceptance. The stopped 388-message fixture
+and all raw outcomes are retained; no pacing, deadline tuning or artificial product hold was
+used to manufacture overlap. Earlier stale-frontier and trailing-whitespace expectation
+faults are retained with their source-backed apparatus adjudications, not treated as product
+corrections or inverse-control evidence. This remaining acceptance obligation is not waived.
 ## Baselines
 
 | Label | Exact source revision | Use |

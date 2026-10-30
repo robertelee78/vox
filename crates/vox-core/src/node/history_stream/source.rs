@@ -598,7 +598,7 @@ impl Source {
         let input_channel = room.channel_id();
         let pending = prepare(&mut room, &self.store)?;
         let owner = Arc::new(());
-        let pin =
+        let mut pin =
             room.reserve_pending_history_write(&self.store, Arc::clone(&owner), publication)?;
         drop(room);
         let source = self.clone();
@@ -688,7 +688,16 @@ impl Source {
             }
             room.release_pending_text(&owner, false);
             let publication = if owns {
-                room.history_write_released(&source.store)
+                let released = room.history_write_released(&source.store);
+                // A logical failure may follow committed evidence. Replace the saved
+                // publication under the room lock before dropping its old snapshot pin.
+                let published = room
+                    .publish_history_read(Arc::clone(&source.store))
+                    .map(|_| ());
+                if published.is_err() {
+                    pin.retain_saved_read();
+                }
+                released.and(published)
             } else {
                 Ok(())
             };

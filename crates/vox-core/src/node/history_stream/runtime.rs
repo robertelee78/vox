@@ -1443,7 +1443,8 @@ impl Flow {
             }
             let pending = channel.prepare_history_publication(&store, None, Some(request))?;
             let owner = Arc::new(());
-            let pin = channel.reserve_pending_history_write(&store, Arc::clone(&owner), true)?;
+            let mut pin =
+                channel.reserve_pending_history_write(&store, Arc::clone(&owner), true)?;
             drop(channel);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pending.cleanup(&store, &committed, None, Some((request, after)))
@@ -1468,7 +1469,12 @@ impl Flow {
             };
             channel.release_pending_text(&owner, false);
             let publication = if owns {
-                channel.history_write_released(&store)
+                let released = channel.history_write_released(&store);
+                let published = channel.publish_history_read(Arc::clone(&store)).map(|_| ());
+                if published.is_err() {
+                    pin.retain_saved_read();
+                }
+                released.and(published)
             } else {
                 Ok(())
             };
@@ -2490,11 +2496,12 @@ impl Flow {
                             .lock()
                             .map_err(|_| Error::Profile("history activation lock failed"))?;
                         let state = snapshot.state();
-                        // Own recovery has a private, donor-independent audience; ordinary
-                        // archive and live/control stages remain bound to this node.
+                        // Public archive and own-recovery History activations have a
+                        // donor-independent audience. Live/Control remains node-bound,
+                        // including those dependencies within an archive flow.
                         let expected_binding = Binding {
-                            audience: if self.automatic_own_recovery
-                                && task.purpose == Purpose::History
+                            audience: if task.purpose == Purpose::History
+                                && (self.archive || self.automatic_own_recovery)
                             {
                                 [0; 32]
                             } else {

@@ -434,13 +434,14 @@ fn detail_of(
         return Err(ch.save_failure());
     }
     let (frozen, refused_below_checkpoint) = ch.fork_watch();
-    let display_stamp = ch.display_stamp(store)?;
+    let publication = ch.display_publication(store)?;
+    let display_stamp = publication.display_stamp;
     let display_revision =
         match prev.filter(|p| ch.display_is_current(&p.display_stamp, &display_stamp)) {
             Some(p) => p.display_revision,
             None => sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
-    let read_summary_stamp = ch.read_summary_stamp(store)?;
+    let read_summary_stamp = publication.read_summary_stamp;
     let (read_by, held, unread) = match prev.filter(|p| {
         ch.display_is_current(&p.display_stamp, &display_stamp)
             && p.read_summary_stamp == read_summary_stamp
@@ -531,8 +532,8 @@ fn detail_of(
         name: ch.name().map(str::to_owned),
         epoch,
         members,
-        last_arrival: ch.last_arrival(store)?,
-        history_instance: ch.history_instance(store)?,
+        last_arrival: publication.last_arrival,
+        history_instance: publication.history_instance,
         display_stamp,
         read_summary_stamp,
         display_revision,
