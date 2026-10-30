@@ -358,10 +358,16 @@ impl Node {
         self.net.as_ref()?;
         let shared = self.channels.get(room).cloned()?;
         let context = shared.lock().await.join_context().ok()?;
-        let bundle = self
+        let bundle = match self
             .delivery_bundle_waiting(room, target, offline_to_signed)
             .await
-            .ok()?;
+        {
+            Ok(bundle) => bundle,
+            Err(wait) => {
+                self.say_key_waits(room, target, wait);
+                return None;
+            }
+        };
         self.reserve_owned_outbound(context, bundle, target)
     }
 

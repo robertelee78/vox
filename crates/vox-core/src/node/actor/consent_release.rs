@@ -450,13 +450,9 @@ impl Node {
             .reach_member(&room, target, asked)
             .await
             .ok_or(Fault::Unreachable)?;
+        // The frame selects and reserves its bundle once. A probe here would reset the
+        // signed-prekey grace before that selection and make it wait again.
         let modern = !matches!(self.older.get(&(room, target)), Some(false));
-        if modern {
-            if let Err(wait) = self.delivery_bundle_waiting(&room, target, false).await {
-                self.say_key_waits(&room, target, wait);
-                return Err(Fault::Unreachable);
-            }
-        }
         let history = self.trust.history(&target);
         let decision = self.trust_decision(&target);
         let (skdm, plan, hold) = {
