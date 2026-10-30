@@ -25,6 +25,8 @@ pub(crate) enum Saved {
         pending: bool,
         session_rendered: usize,
         placed: bool,
+        #[cfg(feature = "test-knobs")]
+        render_hold: Option<std::path::PathBuf>,
     },
     Contiguous {
         pending: bool,
@@ -531,6 +533,8 @@ impl Prepared {
                             pending: false,
                             session_rendered: 0,
                             placed: false,
+                            #[cfg(feature = "test-knobs")]
+                            render_hold: None,
                         });
                     }
                     let projection = projection
@@ -553,8 +557,6 @@ impl Prepared {
                     }
                     batch.commit()?;
                     committed = true;
-                    #[cfg(feature = "test-knobs")]
-                    engage_render_hold(&self.room, &projection.rows);
                     let rendered = projection.rows.len();
                     let session_rendered = projection
                         .sessions
@@ -562,6 +564,8 @@ impl Prepared {
                         .filter(|(row, _)| !crate::node::drive::is_key_changed(&row.session_id))
                         .count();
                     projection.after_commit_with(store, sek)?;
+                    #[cfg(feature = "test-knobs")]
+                    let render_hold = render_hold_candidate(&self.room, &projection.rows);
                     let pending =
                         *refreshing || index.render_view(store, sek, &self.room)?.has_backfill();
                     Ok(Saved::Backfill {
@@ -569,6 +573,8 @@ impl Prepared {
                         pending,
                         session_rendered,
                         placed: true,
+                        #[cfg(feature = "test-knobs")]
+                        render_hold,
                     })
                 }),
                 Native::Contiguous(None) => Ok(Saved::Contiguous { pending: false }),

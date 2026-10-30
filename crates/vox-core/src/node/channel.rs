@@ -576,10 +576,10 @@ pub const TEST_EXPIRING_ADMIN_LIFETIME: std::time::Duration = std::time::Duratio
 /// **Test-only**: an empty named marker retains every already durable render continuation without
 /// advancing it. A 96-byte marker names one room and two authors; that room remains held until it
 /// has both exact sender keys, when the marker is renamed with `.ready` appended. A 64-byte marker
-/// names one room and one author; the first bounded turn that commits a row by that author renames
-/// it with `.engaged` appended, and later turns for that room park until the engaged marker is
-/// removed. Proofs use shipped status/read commands at the causal boundary; marker states are
-/// apparatus, never verdicts or test-only counts.
+/// names one room and one author; after that author's bounded native turn commits its visible
+/// rows and publishes the saved-read view, the marker is renamed with `.engaged` appended.
+/// Later turns for that room park until it is removed. Proofs use shipped status/read commands;
+/// marker states are apparatus, never verdicts or test-only counts.
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_RENDER_ENV: &str = "VOX_TEST_HOLD_RENDER_FILE";
 
@@ -598,20 +598,21 @@ fn render_hold_suffixed_path(path: &std::path::Path, suffix: &str) -> std::path:
 }
 
 #[cfg(feature = "test-knobs")]
-fn engage_render_hold(room: &Digest32, rows: &[Rendered]) {
-    let Some(path) = render_hold_path() else {
-        return;
-    };
-    let Ok(marker) = std::fs::read(&path) else {
-        return;
-    };
+fn render_hold_candidate(room: &Digest32, rows: &[Rendered]) -> Option<std::path::PathBuf> {
+    let path = render_hold_path()?;
+    let marker = std::fs::read(&path).ok()?;
     if marker.len() != 64 || marker[..32] != room[..] {
-        return;
+        return None;
     }
     let author = &marker[32..];
-    if rows.iter().any(|row| row.author[..] == author[..]) {
-        let _ = std::fs::rename(&path, render_hold_suffixed_path(&path, ".engaged"));
-    }
+    rows.iter()
+        .any(|row| row.author[..] == author[..])
+        .then_some(path)
+}
+
+#[cfg(feature = "test-knobs")]
+pub(crate) fn engage_render_hold(path: &std::path::Path) {
+    let _ = std::fs::rename(path, render_hold_suffixed_path(path, ".engaged"));
 }
 
 /// **Test-only**: a smaller room, so a proof fills one with a few members rather than 1,024. Its
@@ -7529,8 +7530,6 @@ impl ChannelState {
         self.entries.committed();
         self.chains_advanced = false;
         let rendered = rows.len();
-        #[cfg(feature = "test-knobs")]
-        engage_render_hold(&self.channel_id, &rows);
         self.place_committed(store, rows, &expired)?;
         Ok(rendered)
     }
