@@ -69,6 +69,26 @@ pub(super) fn update(
     let target = target_triple();
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|_| usage("this binary's own version is not SemVer"))?;
+    // A local repair must not depend on GitHub being reachable, nor perform another exchange.
+    // Hold the same lock through recovery and any subsequent publication.
+    let _lock = if check_only {
+        None
+    } else {
+        Some(InstallLock::acquire(apps)?)
+    };
+    if !check_only {
+        let repaired = recover(apps)?;
+        if !repaired.is_empty() {
+            let active = apps.join(BUNDLE);
+            let now = app_version(&active)
+                .ok_or_else(|| usage("the repaired Vox.app has no readable version"))?;
+            let detached = super::restart::restart_daemon(&active.join(HELPER), &now);
+            shell_setup_from(apps, exe);
+            super::restart::say_next(&detached);
+            repaired.say_without_swap();
+            return Ok(());
+        }
+    }
     let vox = fetch_record(channel, target)?;
     let app = fetch_app_record(channel, target)?;
     if app.version != vox.version {
@@ -86,10 +106,6 @@ pub(super) fn update(
         // **An update still updates** (decider, v0.4.2): with nothing newer, completions and the
         // agent skill pack are refreshed on the Vox.app in place. `--check` changes nothing.
         if !check_only {
-            // A previous bundle left as an application (before M-29a, or by a set-aside that
-            // failed) is repaired here too, so a plain `vox update` finishes the job.
-            let _lock = InstallLock::acquire(apps)?;
-            recover(apps)?;
             shell_setup_from(apps, exe);
             println!("Vox {current} is current; {}", super::skill_said());
         }
@@ -103,9 +119,6 @@ pub(super) fn update(
         return Ok(());
     }
 
-    // The lock first: what is in `apps` is read only while no other transition changes it.
-    let _lock = InstallLock::acquire(apps)?;
-    recover(apps)?;
     let active = apps.join(BUNDLE);
     if !active.join(HELPER).is_file() {
         return Err(usage(format!(
@@ -362,10 +375,8 @@ fn restore(bundle: &Path) -> Result<(), AppError> {
 }
 
 /// Remove the retired bundles nothing runs from any more.
-fn sweep(apps: &Path) -> Result<(), AppError> {
-    let Ok(entries) = fs::read_dir(apps) else {
-        return Ok(());
-    };
+fn sweep(apps: &Path, repaired: &mut Recovery) -> Result<(), AppError> {
+    let entries = fs::read_dir(apps).map_err(AppError::Io)?;
     for entry in entries.filter_map(Result::ok) {
         let retired = entry
             .file_name()
@@ -374,9 +385,13 @@ fn sweep(apps: &Path) -> Result<(), AppError> {
         if retired {
             // Set aside first, again if an earlier attempt failed: the record goes and the
             // bundle is no application even if it then cannot be removed. One still in use stays.
-            set_aside(&entry.path())?;
+            let path = entry.path();
+            let was_application = path.join(INFO_PLIST).is_file();
+            set_aside(&path)?;
+            repaired.retired_set_aside += usize::from(was_application);
             if !in_use(&entry.path()) {
                 clear(&entry.path())?;
+                repaired.retired_removed += 1;
             }
         }
     }
@@ -424,8 +439,9 @@ fn in_use(bundle: &Path) -> bool {
 /// partial name holds the replaced bundle, which becomes [`PREVIOUS`]; otherwise the partial is
 /// the unpublished candidate, and goes. Either way the journal's earlier previous bundle comes
 /// back when nothing has taken its place.
-fn recover(apps: &Path) -> Result<(), AppError> {
-    sweep(apps)?;
+fn recover(apps: &Path) -> Result<Recovery, AppError> {
+    let mut repaired = Recovery::default();
+    sweep(apps, &mut repaired)?;
     let journal = apps.join(PUBLISHING);
     if fs::symlink_metadata(&journal).is_err() {
         // No publish was cut short. A previous bundle is set aside again under the lock: one an
@@ -433,13 +449,15 @@ fn recover(apps: &Path) -> Result<(), AppError> {
         // failed last time.
         let previous = apps.join(PREVIOUS);
         if fs::symlink_metadata(&previous).is_ok() {
+            repaired.previous_set_aside = previous.join(INFO_PLIST).is_file();
             set_aside(&previous)?;
         }
-        return Ok(());
+        return Ok(repaired);
     }
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
     let published = fs::read_to_string(journal.join(PUBLISHING_VERSION)).unwrap_or_default();
+    repaired.interrupted_publish = true;
     if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
         if app_version(&apps.join(BUNDLE)).as_deref() == Some(published.trim()) {
             fs::rename(&staged, &previous).map_err(AppError::Io)?;
@@ -456,15 +474,73 @@ fn recover(apps: &Path) -> Result<(), AppError> {
     }
     let kept = journal.join(BUNDLE);
     if fs::symlink_metadata(&previous).is_err() && fs::symlink_metadata(&kept).is_ok() {
+        // No exchange happened: restore the rollback bundle held by the journal.
         fs::rename(&kept, &previous).map_err(AppError::Io)?;
     }
     // The previous bundle is set aside again under the lock, before anything else reads `apps`:
     // one an earlier release left as an application, or one whose record removal failed.
     if fs::symlink_metadata(&previous).is_ok() {
+        repaired.previous_set_aside |= previous.join(INFO_PLIST).is_file();
         set_aside(&previous)?;
     }
+    // Recovery has the same live-code retention obligation as an uninterrupted publish.
+    if fs::symlink_metadata(&kept).is_ok() {
+        if in_use(&kept) {
+            retire(apps, &kept)?;
+            repaired.retired_set_aside += 1;
+        } else {
+            set_aside(&kept)?;
+            clear(&kept)?;
+            repaired.retired_removed += 1;
+        }
+    }
+    if let Err(said) = launch_services(true, &apps.join(BUNDLE)) {
+        println!("note: {said}; the current Vox.app is in place and opens by path");
+    }
     sync_dir(apps)?;
-    clear(&journal)
+    clear(&journal)?;
+    Ok(repaired)
+}
+
+/// Work left by an earlier transition, reported after the active daemon has been restarted.
+#[derive(Default)]
+struct Recovery {
+    interrupted_publish: bool,
+    previous_set_aside: bool,
+    retired_set_aside: usize,
+    retired_removed: usize,
+}
+
+impl Recovery {
+    fn is_empty(&self) -> bool {
+        !self.interrupted_publish
+            && !self.previous_set_aside
+            && self.retired_set_aside == 0
+            && self.retired_removed == 0
+    }
+
+    fn say_without_swap(&self) {
+        print!("vox: repaired an earlier app transition without swapping Vox.app:");
+        if self.interrupted_publish {
+            print!(" finished an update cut short;");
+        }
+        if self.previous_set_aside {
+            print!(" made the kept previous bundle non-launchable again;");
+        }
+        if self.retired_set_aside > 0 {
+            print!(
+                " made {} retired bundle(s) non-launchable;",
+                self.retired_set_aside
+            );
+        }
+        if self.retired_removed > 0 {
+            print!(
+                " removed {} retired bundle(s) no process still used;",
+                self.retired_removed
+            );
+        }
+        println!();
+    }
 }
 
 /// Unpack the downloaded zip beside the bundle, on its filesystem, and return the one Vox.app
@@ -525,9 +601,12 @@ fn verify(active: &Path, staged: &Path, vox: &Validated) -> Result<(), AppError>
     if apple_required() {
         verify_apple(active, staged)?;
     }
+    let probe = tempfile::tempdir().map_err(AppError::Io)?;
     let out = Command::new(&helper)
         .arg("--version")
         .env_clear()
+        .env("VOX_DATA_DIR", probe.path().join("data"))
+        .env("VOX_CONFIG_DIR", probe.path().join("config"))
         .output()
         .map_err(AppError::Io)?;
     if !out.status.success()

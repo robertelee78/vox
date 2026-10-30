@@ -390,12 +390,38 @@ pub(super) fn say_next(detached: &[NodeName]) {
 
 /// Whether process `pid` has ended within `bound`.
 async fn gone_within(pid: u32, bound: Duration) -> bool {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return true;
+    };
+    let Some(process) = rustix::process::Pid::from_raw(raw_pid) else {
+        return true;
+    };
     let t0 = Instant::now();
     loop {
-        let alive = i32::try_from(pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .is_some_and(|p| rustix::process::test_kill_process(p).is_ok());
+        let alive = !matches!(
+            rustix::process::test_kill_process(process),
+            Err(rustix::io::Errno::SRCH)
+        );
+        #[cfg(target_os = "macos")]
+        if alive {
+            let stopped = match libproc::proc_pid::pidinfo::<libproc::bsd_info::BSDInfo>(raw_pid, 0)
+            {
+                Ok(info) => info.pbi_status == nix::libc::SZOMB,
+                // The pinned libproc wrapper captures return code and numeric errno in this format.
+                // A zombie can return ESRCH here while kill(pid, 0) still sees its retained PID.
+                // Never interpret an unavailable/permission-denied/unknown query as an exit.
+                Err(error) => {
+                    error
+                        .strip_prefix("return code = 0, errno = ")
+                        .and_then(|value| value.split_once(", message = "))
+                        .and_then(|(code, _)| code.parse::<i32>().ok())
+                        == Some(nix::libc::ESRCH)
+                }
+            };
+            if stopped {
+                return true;
+            }
+        }
         if !alive {
             return true;
         }
