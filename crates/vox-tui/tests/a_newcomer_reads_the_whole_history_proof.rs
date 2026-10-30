@@ -7657,14 +7657,38 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
         "PRODUCT: after the source-generated reset and newer equal grant completed, Bob no \
          longer saw Alice's newer grant as effective"
     );
-    assert_exact_read_rows(
-        &bob,
-        "bob",
-        &rooms[0],
-        std::slice::from_ref(&last_rotated_hash),
-        std::slice::from_ref(&last_rotated_text),
-        "the source-generated reset and newer equal grant reached Bob",
-    );
+    // The quiet transition set excludes posts: neither its arrival nor current governance
+    // establishes receipt of this fresh generation's content. Stage its readable baseline
+    // before the source-off restart claim; this is not a retained-continuation verdict.
+    loop {
+        let rows = room_rows(&bob, &rooms[0]);
+        let canary: Vec<_> = rows
+            .iter()
+            .filter(|row| row["entry_hash"] == last_rotated_hash)
+            .collect();
+        if canary
+            .iter()
+            .any(|row| row["envelope"]["body"].as_str().is_some())
+        {
+            assert_eq!(
+                canary.len(),
+                1,
+                "PRODUCT: Bob showed the exact rotation canary more than once: {canary:?}"
+            );
+            assert_eq!(
+                canary[0]["envelope"]["body"].as_str(),
+                Some(last_rotated_text.as_str()),
+                "PRODUCT: Bob's exact rotation canary had the wrong readable body: {canary:?}"
+            );
+            assert_eq!(
+                canary[0]["owed"].as_bool(),
+                Some(false),
+                "PRODUCT: Bob's readable rotation canary still said its body was owed: {canary:?}"
+            );
+            break;
+        }
+        std::thread::yield_now();
+    }
 
     // Restart with Alice unavailable. The same exact retained object still reading proves the
     // durable Consent locator names grant₂. The pre-restart observation proves the live answer

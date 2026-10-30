@@ -135,6 +135,17 @@ exact final row was readable under its returned hash and body with `owed: false`
 action was replayed; the daemon stopped and no profile handles remained. The earlier full-run
 failure remains a failure; this focused smoke is not a full journey or negative-control verdict.
 
+The uncapped quiet-transition run subsequently reached mutual trust and current governance but
+reported a missing final rotation message. Its final status held 89 log entries; the fresh post
+was not among the control transitions whose arrival had been staged. A normal-binary restart
+on a clone of the retained recipient profile, with no source peer started, returned a complete
+`room read --hashes` successfully without that exact expected hash. The original failure data
+was not changed. This establishes missing input evidence at the caller, not a render defect or
+a passing full journey. Fresh message canaries must establish their first exact readable
+hash/body with `owed: false` while the source is available, before the separate source-off
+restart assertions. The original held-input continuation assertion remains unchanged.
+
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at
