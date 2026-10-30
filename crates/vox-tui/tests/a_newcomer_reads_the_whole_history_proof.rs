@@ -7728,7 +7728,20 @@ fn retained_rows_render_once_their_key_and_consent_arrive() {
     // invent a delay or use unrelated traffic as the trigger. The shipped admin page first
     // proves Bob has administrator authority. In the otherwise quiet room, the exact deadline
     // must then wake the fold and remove him without an unrelated command or network event.
-    let (ok, out, err) = vox(&alice, &["room", "admin", "add", &rooms[0], &fps[1]], None);
+    let (ok, out, err) = loop {
+        let result = vox(&alice, &["room", "admin", "add", &rooms[0], &fps[1]], None);
+        if !result.0
+            && result.2.starts_with(
+                "vox: cannot add the admin: a previous change to this room is still being applied; this request made no change",
+            )
+        {
+            // As with rename staging, follow only the explicit no-change wait instruction.
+            // Never repeat an accepted grant or retry any other refusal.
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        break result;
+    };
     assert!(
         ok,
         "PRODUCT: Alice's `vox room admin add` was refused: {out}{err}"

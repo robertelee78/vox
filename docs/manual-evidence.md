@@ -156,6 +156,12 @@ and no profile handles remained. The existing test-only marker must also arm at 
 actual sparse published-governance boundaries; ordinary content and deadline wakes cannot
 arm it. No normal-product path, consumer assertion, knob or timing is changed.
 
+The next full run reported an explicit no-change refusal while staging the administrator
+grant immediately after Alice reopened: a preceding room change was still being applied.
+That run remains unaccepted. This setup must follow only that exact wait instruction, using
+the existing rename-staging pacing. An accepted grant is never replayed, and every other
+refusal still fails its assertion. This does not change the expiry claim or its deadline.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at
