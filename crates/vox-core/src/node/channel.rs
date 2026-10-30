@@ -968,6 +968,16 @@ pub(crate) struct ReadSummaryStamp {
     members_held: Vec<(Digest32, Option<u64>)>,
 }
 
+/// One publication's compact selectors, read from the same short-lived sealed snapshot.
+/// This is not retained between publications and grants no read or Session authority.
+#[derive(Debug)]
+pub(crate) struct DisplayPublication {
+    pub(crate) display_stamp: DisplayStamp,
+    pub(crate) read_summary_stamp: ReadSummaryStamp,
+    pub(crate) last_arrival: Option<u64>,
+    pub(crate) history_instance: [u8; 16],
+}
+
 /// A rendered (decrypted, render-gated) message in the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rendered {
@@ -5870,8 +5880,11 @@ impl ChannelState {
         stamp == current && stamp.expires_at.is_none_or(|at| self.now_hint < at)
     }
 
-    /// Compact display invalidation facts, without collecting rendered rows or owed bodies.
-    pub(crate) fn display_stamp(&self, store: &Store) -> Result<DisplayStamp> {
+    /// Compact publication facts from one sealed view, without collecting rendered rows.
+    /// Whole-node publication also visits unchanged rooms: reopening the same directory for
+    /// each selector adds no freshness while the room is held. Drop this snapshot on return;
+    /// every later publication still reads current committed roots and authority separately.
+    pub(crate) fn display_publication(&self, store: &Store) -> Result<DisplayPublication> {
         if self.poisoned {
             return Err(self.save_failure());
         }
@@ -5879,18 +5892,32 @@ impl ChannelState {
             .entries
             .render_view(store, &self.sek, &self.channel_id)?;
         let owed_count = rendered.owed_before(None)?;
-        Ok(DisplayStamp {
-            incarnation: self.gen.clone(),
-            rewrite: self.display_rewrite,
-            rendered_roots: rendered.display_roots(),
-            rendered_count: rendered.count()?,
-            order_revision: self.dag.reorder_generation(),
-            body_revision: self.dag.body_generation(),
-            session_revision: self.legacy_sessions.display_revision(),
-            retention: (self.effective_retention(), self.effective_step_retention()),
-            expires_at: rendered.next_owed_expiry()?,
-            owed_count,
-            owed: owed_count != 0,
+        Ok(DisplayPublication {
+            display_stamp: DisplayStamp {
+                incarnation: self.gen.clone(),
+                rewrite: self.display_rewrite,
+                rendered_roots: rendered.display_roots(),
+                rendered_count: rendered.count()?,
+                order_revision: self.dag.reorder_generation(),
+                body_revision: self.dag.body_generation(),
+                session_revision: self.legacy_sessions.display_revision(),
+                retention: (self.effective_retention(), self.effective_step_retention()),
+                expires_at: rendered.next_owed_expiry()?,
+                owed_count,
+                owed: owed_count != 0,
+            },
+            read_summary_stamp: ReadSummaryStamp {
+                reads: rendered.read_roots()?,
+                members_held: self
+                    .members()
+                    .into_iter()
+                    .map(|member| (member, self.held.get(&member).copied()))
+                    .collect(),
+            },
+            last_arrival: rendered
+                .step(None, false, None, true)?
+                .map(|(_, fact)| fact.cache),
+            history_instance: rendered.history_instance(),
         })
     }
 
@@ -8754,25 +8781,6 @@ impl ChannelState {
         }
         out.reverse();
         Ok(out)
-    }
-
-    /// Exact sealed read roots and current members' held positions, without opening
-    /// any message bodies. Reusing indicators requires an unchanged timeline too.
-    pub(crate) fn read_summary_stamp(&self, store: &Store) -> Result<ReadSummaryStamp> {
-        if self.poisoned {
-            return Err(self.save_failure());
-        }
-        let rendered = self
-            .entries
-            .render_view(store, &self.sek, &self.channel_id)?;
-        Ok(ReadSummaryStamp {
-            reads: rendered.read_roots()?,
-            members_held: self
-                .members()
-                .into_iter()
-                .map(|member| (member, self.held.get(&member).copied()))
-                .collect(),
-        })
     }
 
     /// [`Self::read_by`] for this identity's own newest [`READ_BY_SHOWN`] messages here, those

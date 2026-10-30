@@ -75,7 +75,7 @@ fn commit_provider_cursor(
     let instance = guard.history_instance(store)?;
     let shared = Arc::clone(tokio::sync::OwnedMutexGuard::mutex(&guard));
     let owner = Arc::new(());
-    let pin = guard.reserve_pending_write(store, Arc::clone(&owner))?;
+    let mut pin = guard.reserve_pending_write(store, Arc::clone(&owner))?;
     drop(guard);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.commit(store)));
     let mut guard = shared.blocking_lock();
@@ -95,6 +95,18 @@ fn commit_provider_cursor(
         Err(_) => Err(Error::Profile("key cursor save worker stopped")),
     };
     guard.release_pending_text(&owner, false);
+    let publication = if owns {
+        // The cursor CAS changes sealed roots even without a room delta. Replace the saved
+        // publication before its original pin can be released, including commit-then-error.
+        let published = guard.publish_history_read(Arc::clone(store)).map(|_| ());
+        if published.is_err() {
+            pin.retain_saved_read();
+        }
+        published
+    } else {
+        Ok(())
+    };
+    let result = result.and_then(|committed| publication.map(|()| committed));
     drop(guard);
     drop(pin);
     result

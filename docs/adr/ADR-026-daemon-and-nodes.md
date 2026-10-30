@@ -136,7 +136,7 @@ network presence from the start: there is no interim design with one socket per 
   MUST run until stopped.
 
 - **L-9. Ready independently of archived messages** (decider requirements, 2026-10-15;
-  v0.4.6 implementation under review). A node MUST become Ready after its credentials and
+  current-version scope clarified 2026-10-29). A node MUST become Ready after its credentials and
   current local security state have been authenticated, independently of its rooms' archive
   sizes. A room needing essential control-state repair MUST say Preparing and refuse actions
   whose authority it cannot establish; it MUST NOT pretend to be empty, ready or locked.
@@ -144,11 +144,13 @@ network presence from the start: there is no interim design with one socket per 
   bounded accepted-state and index roots, without scanning, decrypting or rewriting archived
   message bodies. Authentication, fork evidence, current trust narrowing and pending durable
   revocations MUST remain effective before the affected room is exposed.
-- **L-10. Repair and history are separate.** A missing or obsolete derived index MAY require
-  bounded, resumable local repair. Such repair MUST use parent-first reconstruction, bounded
-  transactions and short-lived read snapshots; it MUST NOT repeatedly rewrite descendants,
-  commit empty work or monopolize node control. Completion MUST survive restart. Normal
-  startup and becoming Ready MUST NOT enqueue a whole remote archive, including delayed
+- **L-10. Repair and history are separate.** Supported current-version interrupted work MAY
+  require bounded, resumable local repair of a derived index. Such repair MUST use parent-first
+  reconstruction, bounded transactions and short-lived read snapshots; it MUST NOT repeatedly
+  rewrite descendants, commit empty work or monopolize node control. Completion MUST survive
+  restart. An absent or unsupported sealed restart bootstrap MUST be refused unchanged with its
+  reason, not reconstructed from arbitrary archive locators or treated as an empty room.
+  Normal startup and becoming Ready MUST NOT enqueue a whole remote archive, including delayed
   backfill. The distinct live/control and requested-history protocol is specified by ADR-036.
   Local accepted restart state MUST NOT be treated as a transferable peer authority proof.
   Volatile recovery scheduling MUST NOT turn an abandoned worker into durable missing history:
@@ -159,10 +161,12 @@ network presence from the start: there is no interim design with one socket per 
   governance facts, never from whether a volatile recovery queue happens to be empty. Restart
   MUST NOT make an otherwise unchanged room newly writable.
 - **L-11. Recovery evidence.** Extend the existing on-demand binary journeys to cover a normal
-  warm restart, the observed missing-index repair, fresh message exchange during requested
-  history work, and multiple kept nodes. Assert what the person can read and send and whether
-  control remains responsive. A failure MUST name PRODUCT or APPARATUS. Reuse unaffected
-  passing evidence; a new candidate alone does not require repeating a passed journey.
+  warm restart, supported interrupted work where repair is provided, fresh message exchange
+  during explicitly requested history work, and multiple kept nodes. Historical missing-index
+  evidence does not require adding reconstruction for an unsupported or absent sealed bootstrap.
+  Assert what the person can read and send and whether control and other ready rooms remain
+  responsive. A failure MUST name PRODUCT or APPARATUS. Reuse unaffected passing evidence; a new
+  candidate alone does not require repeating a passed journey.
 
 ### 4. Control plane
 
@@ -255,15 +259,24 @@ network presence from the start: there is no interim design with one socket per 
   from the same file in the account's config directory. The daemon's own settings (listen, metrics,
   relay limits) MUST be read from `.daemon/config`; the relay limits are `relay-circuits` and
   `relay-circuits-per-asker` (ADR-012 N-45).
-- **F-3. Current-release data and compatibility scope** (amended 2026-10-12). The decider:
+- **F-3. Current-release data and compatibility scope** (amended 2026-10-12 and 2026-10-27).
+  The decider:
   "we don't yet have to worry about backwards compat", "don't over engineer things", and
   "we have no users yet". For v0.4.5, the earlier requirement to upgrade every data root written
   since v0.4.0 and prove that upgrade before release is superseded. Prior-release data migration,
   mixed-version wire compatibility and their proofs are out of scope; there is no replacement
-  migration architecture or compatibility gate.
+  migration architecture or compatibility gate. For v0.4.10 the decider reiterated "I don't
+  want to over engineer backwards compat" and said old nodes and rooms may be torn down if
+  necessary. Prior-release data migration and its proofs, including the v0.4.5 recovery path
+  previously required by F-4, are not release requirements for v0.4.10.
   This supersedes the prior-release obligations in ADR-031 SA-5, SA-6, SA-10 and SA-11,
-  ADR-032 AN-14, ADR-034 UP-2's cross-version compatibility measurement, and ADR-035 CT-20's
-  shared-upgrade contribution. Their current-version feature and security requirements remain.
+  ADR-032 AN-14, and ADR-034 UP-2's mixed-version peer requirement and planned compatibility
+  measurement. UP-2's refusal of a mismatched client and its own daemon remains. ADR-035 CT-20's
+  current-data and unsupported-format protections remain, as do current-version feature and
+  security requirements.
+  - ADR-031 CW-3 and ADR-034 UP-1 still require remembered current-version nodes to return Ready.
+    For v0.4.10, an unsupported prior-release remembered node MAY instead be refused unchanged
+    with the reason; an update MUST report that outcome truthfully rather than claim it is Ready.
   - Current-version identities, keyrings, rooms, messages, repository bindings and supported
     Session records MUST retain their specified integrity and restart behavior. Trust decisions,
     revocations, drive restrictions and retention still apply.
@@ -271,23 +284,21 @@ network presence from the start: there is no interim design with one socket per 
     unsupported layout or format, including a future or malformed format marker, MUST be refused
     unchanged with the reason. Removing the compatibility requirement does not authorize an
     automatic reset, data deletion or silent reinterpretation of unsupported data.
-  - Existing compatibility code need not be removed merely because it is no longer a v0.4.5
+  - Existing compatibility code need not be removed merely because it is no longer an
     acceptance requirement. No new previous-release fixture or proof is required.
   - One node is one identity: a node holding a vault runs its anchor (`vox node`) as node
     `<name>-anchor`.
 
-- **F-4. v0.4.6 recovery installation** (2026-10-15; not yet delivered). Opening the existing
-  v0.4.5 node data MUST preserve identities, trust, rooms, messages, repository bindings and
-  supported Session records. Before writing an index representation v0.4.5 cannot read, the
-  daemon MUST advance `.daemon/format` under the account lock to a value v0.4.5 refuses.
-  Interrupted preparation MUST resume without resetting data. This is the observed recovery
-  path, not a requirement to support every historical release.
-  The update MUST install matching app, CLI and daemon helpers before restarting from the
+- **F-4. Update and recovery installation** (2026-10-15; amended 2026-10-27). The earlier
+  v0.4.5 data migration and compatibility proof are superseded for v0.4.10 by F-3. Supported
+  current-version data still has the integrity and restart guarantees in F-3; unsupported
+  formats are refused unchanged rather than reset or silently reinterpreted.
+  An update MUST install matching app, CLI and daemon helpers before restarting from the
   actual managed executable path, then verify the replacement daemon's reported version and
-  kept-node outcomes. A successful binary replacement with an incomplete restart MUST be
-  reported as that partial outcome. Replacing only a binary MUST NOT be described as a safe
-  rollback after newer-format data has been written. App helper processes MUST inherit the
-  actual user environment unless an explicit complete override is supplied.
+  outcomes for kept nodes supported by that release. A successful binary replacement with an
+  incomplete restart MUST be reported as that partial outcome. Replacing only a binary MUST NOT
+  be described as a safe rollback after newer-format data has been written. App helper processes
+  MUST inherit the actual user environment unless an explicit complete override is supplied.
 
 ### 8. Process-wide state
 
