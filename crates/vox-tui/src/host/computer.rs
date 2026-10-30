@@ -397,36 +397,67 @@ impl Router {
                 let selected = if node.is_empty() {
                     None
                 } else {
-                    let Some((name, handle)) = self
-                        .attached_handles()
-                        .into_iter()
-                        .find(|(name, _)| name == &node)
-                    else {
+                    // Retain this exact attachment, not a same-name replacement that may
+                    // appear while its accepted policy application is still completing.
+                    let accepted = {
+                        let slots = lock(&self.inner.slots);
+                        slots.iter().find_map(|(name, slot)| {
+                            if name.as_str() != node.as_str() {
+                                return None;
+                            }
+                            let Slot::Attached(attached) = slot else {
+                                return None;
+                            };
+                            Some((
+                                name.clone(),
+                                attached.handle.clone(),
+                                attached.generation,
+                                attached.fingerprint,
+                                attached.detached.subscribe(),
+                            ))
+                        })
+                    };
+                    let Some((name, handle, generation, identity, mut detached)) = accepted else {
                         return DaemonFrame::ComputerFailed(
                             "make the selected node Ready before choosing it as the personal node"
                                 .into(),
                         );
                     };
-                    let deadline = std::time::Instant::now()
-                        + vox_core::node::computer::COMPUTER_CHANGE_SHOWN_WITHIN;
-                    if let Err(e) = handle.reconcile_computer(deadline).await {
-                        return DaemonFrame::ComputerFailed(e.to_string());
-                    }
-                    let Some(info) = self
-                        .attached()
-                        .into_iter()
-                        .find(|info| info.name.as_str() == name)
-                    else {
-                        return DaemonFrame::ComputerFailed(
-                            "the selected node stopped; choose it again when Ready".into(),
-                        );
-                    };
-                    let Some(id) = info.fingerprint else {
+                    let Some(identity) = identity else {
                         return DaemonFrame::ComputerFailed(
                             "the selected node has no authenticated identity".into(),
                         );
                     };
-                    Some(id)
+                    let superseded =
+                        Arc::new(vox_core::node::actor::PolicySupersession::default());
+                    let application = handle.reconcile_computer(Arc::clone(&superseded));
+                    tokio::pin!(application);
+                    let result = tokio::select! {
+                        biased;
+                        _ = detached.wait_for(|gone| *gone) => {
+                            superseded.retire();
+                            return DaemonFrame::ComputerFailed(
+                                "the selected node stopped; choose it again when Ready".into(),
+                            );
+                        },
+                        result = &mut application => result,
+                    };
+                    if let Err(error) = result {
+                        return DaemonFrame::ComputerFailed(error.to_string());
+                    }
+                    let same_attachment = matches!(
+                        lock(&self.inner.slots).get(&name),
+                        Some(Slot::Attached(attached))
+                            if attached.generation == generation
+                                && attached.fingerprint == Some(identity)
+                    );
+                    if !same_attachment {
+                        superseded.retire();
+                        return DaemonFrame::ComputerFailed(
+                            "the selected node changed; choose it again when Ready".into(),
+                        );
+                    }
+                    Some(identity)
                 };
                 management
                     .computer

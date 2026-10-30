@@ -2898,23 +2898,6 @@ impl Computer {
         )
         .map(|_| ())
     }
-    pub(crate) fn bind_node_until(
-        &self,
-        signer: &dyn RootSigner,
-        name: &str,
-        deadline: std::time::Instant,
-        transition: &ComputerPublicationTransition,
-    ) -> Result<()> {
-        self.bind_node_guarded(
-            signer,
-            name,
-            ComputerChangeBoundary::Deadline(deadline),
-            Some(transition),
-        )
-        .map(|current| {
-            debug_assert!(current, "a deadline boundary cannot be superseded");
-        })
-    }
 
     /// Bind only while the accepted follower event still owns the exact policy projection.
     /// `false` means policy movement superseded this event; its own broadcast owns the successor.
@@ -3325,24 +3308,6 @@ impl Computer {
     /// applied receipt: the actor must still save the keyring and finish its live or expired
     /// receipt. If the process ends between those writes, the retained preparation prevents an
     /// old live receipt from certifying an interrupted application or revocation.
-    pub(crate) fn prepare_application_until(
-        &self,
-        node: Digest32,
-        revision: u64,
-        expected_expired: bool,
-        covered: &[Digest32],
-        deadline: std::time::Instant,
-        transition: &ComputerPublicationTransition,
-    ) -> Result<bool> {
-        self.prepare_application_guarded(
-            node,
-            revision,
-            expected_expired,
-            covered,
-            ComputerChangeBoundary::Deadline(deadline),
-            transition,
-        )
-    }
 
     pub(crate) fn prepare_application_for_change(
         &self,

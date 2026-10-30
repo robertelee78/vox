@@ -52,19 +52,12 @@ impl PolicySupersession {
     }
 }
 
-/// Ownership of one actor-side Computer application. A causal command deadline can still cancel
-/// its own command; the live follower instead owns an exact policy target until real policy or
-/// lifecycle supersession. Elapsed observation time is deliberately absent from `Current`.
+/// Ownership of an accepted Computer application. Only an exact policy or lifecycle
+/// supersession retires it; elapsed observation time never cancels its continuation.
 #[derive(Clone)]
-pub(super) enum ComputerPolicyGuard {
-    Deadline {
-        deadline: std::time::Instant,
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
-    },
-    Current {
-        change: crate::node::computer::ComputerChange,
-        superseded: Arc<PolicySupersession>,
-    },
+pub(super) struct ComputerPolicyGuard {
+    pub(super) change: crate::node::computer::ComputerChange,
+    pub(super) superseded: Arc<PolicySupersession>,
 }
 
 impl ComputerPolicyGuard {
@@ -72,53 +65,22 @@ impl ComputerPolicyGuard {
         &self,
         computer: Option<&Arc<crate::node::computer::Computer>>,
     ) -> crate::error::Result<()> {
-        match self {
-            Self::Deadline {
-                deadline,
-                cancelled,
-            } => {
-                if cancelled.load(std::sync::atomic::Ordering::Acquire)
-                    || std::time::Instant::now() >= *deadline
-                {
-                    Err(Error::Profile(
-                        "computer trust did not apply before its causal deadline",
-                    ))
-                } else {
-                    Ok(())
-                }
-            }
-            Self::Current { change, superseded } => {
-                if superseded.is_retired()
-                    || computer.is_some_and(|computer| !computer.policy_target_is(change.target()))
-                {
-                    Err(Error::ComputerPolicySuperseded)
-                } else {
-                    Ok(())
-                }
-            }
+        if self.superseded.is_retired()
+            || computer.is_some_and(|computer| !computer.policy_target_is(self.change.target()))
+        {
+            Err(Error::ComputerPolicySuperseded)
+        } else {
+            Ok(())
         }
     }
 
-    pub(super) fn causal_deadline(&self) -> Option<std::time::Instant> {
-        match self {
-            Self::Deadline { deadline, .. } => Some(*deadline),
-            Self::Current { .. } => None,
-        }
-    }
-
-    /// Proof mutant for the former defect: once the exact causally held live-follower event is
-    /// released after its original observation boundary, discard it instead of completing the
-    /// still-current work. Deadline-owned command work is deliberately unaffected; the proof's
-    /// one-shot arm is created only for this post-startup follower event.
+    /// The one-shot late-follower inverse remains confined to its explicit proof arm.
     #[cfg(feature = "test-knobs")]
     fn abandon_late_application_for_proof(&self) {
-        let Self::Current { change, superseded } = self else {
-            return;
-        };
         if crate::node::computer::fx28_mutant("late-application-abandons-work")
-            && std::time::Instant::now() >= change.apply_deadline()
+            && std::time::Instant::now() >= self.change.apply_deadline()
         {
-            superseded.retire();
+            self.superseded.retire();
         }
     }
 }
@@ -788,14 +750,47 @@ impl NodeHandle {
             .is_some_and(|(me, (applied, expired))| computer.policy_current(applied, expired, me))
     }
 
-    /// Ask the already attached node to sign its management binding and durably apply policy.
+    /// An authenticated selection waits for this exact actor's actual policy application.
+    /// Keep its original observation boundary across real target movement; only the
+    /// request's lifecycle owner may retire it, never an elapsed-time state transition.
     pub async fn reconcile_computer(
         &self,
-        deadline: std::time::Instant,
+        superseded: Arc<PolicySupersession>,
     ) -> crate::error::Result<()> {
-        #[cfg(feature = "test-knobs")]
-        self.hold_computer_reconcile_send_for_proof().await?;
-        self.reconcile_computer_inner(deadline).await
+        let Some(computer) = &self.computer else {
+            return Ok(());
+        };
+        // The authenticated host boundary includes headless actors, whose public view
+        // deliberately has no vault Profile identity.
+        let (_, identity) = self.startup_computer_boundary().ok_or(Error::Profile(
+            "the selected node has no owned computer-trust identity",
+        ))?;
+        let observed = crate::node::computer::ComputerChange::now(
+            computer.policy_target_after_writer()?,
+        );
+        loop {
+            if superseded.is_retired() {
+                return Err(Error::ComputerPolicySuperseded);
+            }
+            let change = crate::node::computer::ComputerChange::at(
+                computer.policy_target_after_writer()?,
+                observed.apply_deadline(),
+                observed.return_deadline(),
+            );
+            match self.reconcile_computer_current(change, Arc::clone(&superseded)).await {
+                Err(Error::ComputerPolicySuperseded) if !superseded.is_retired() => continue,
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
+            // Copy the projection and drop its watch borrow before taking Computer state.
+            let applied = self.view_rx.borrow().computer_policy;
+            let current = applied.is_some_and(|(revision, expired)| {
+                computer.policy_current(revision, expired, identity)
+            });
+            if computer.policy_target_is(change.target()) && current {
+                return Ok(());
+            }
+        }
     }
 
     /// Startup's final Ready fence may discover that policy moved after the actor opened its
@@ -843,57 +838,6 @@ impl NodeHandle {
         }
     }
 
-    async fn reconcile_computer_inner(
-        &self,
-        deadline: std::time::Instant,
-    ) -> crate::error::Result<()> {
-        let permit = tokio::time::timeout_at(
-            deadline.into(),
-            Arc::clone(&self.computer_policy_slots).acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            Error::Profile("computer trust did not enter the actor before its causal deadline")
-        })?
-        .map_err(|_| Error::Unreachable("the node has stopped"))?;
-        let (reply, rx) = oneshot::channel();
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let send = self.net_tx.send(NetEvent::ComputerPolicy {
-            guard: ComputerPolicyGuard::Deadline {
-                deadline,
-                cancelled: Arc::clone(&cancelled),
-            },
-            reply,
-            permit,
-        });
-        tokio::pin!(send);
-        tokio::select! {
-            result = &mut send => {
-                result.map_err(|_| Error::Unreachable("the node has stopped"))?;
-            }
-            () = tokio::time::sleep_until(deadline.into()) => {
-                cancelled.store(true, std::sync::atomic::Ordering::Release);
-                return Err(Error::Profile("computer trust did not enter the actor before its causal deadline"));
-            }
-        }
-        tokio::pin!(rx);
-        tokio::select! {
-            biased;
-            result = &mut rx => {
-                let result = result.map_err(|_| Error::Unreachable("the node has stopped"))?;
-                if std::time::Instant::now() >= deadline {
-                    cancelled.store(true, std::sync::atomic::Ordering::Release);
-                    Err(Error::Profile("computer trust did not apply before its causal deadline"))
-                } else {
-                    result
-                }
-            }
-            () = tokio::time::sleep_until(deadline.into()) => {
-                cancelled.store(true, std::sync::atomic::Ordering::Release);
-                Err(Error::Profile("computer trust did not apply before its causal deadline"))
-            }
-        }
-    }
 
     /// Keep the accepted live follower event alive past its observation boundary. Only exact
     /// policy movement, detach/shutdown, or a stopped actor can supersede this future.
@@ -951,10 +895,8 @@ impl NodeHandle {
         };
         let (reply, rx) = oneshot::channel();
         let send = self.net_tx.send(NetEvent::ComputerPolicy {
-            guard: ComputerPolicyGuard::Current {
-                change,
-                superseded: Arc::clone(&superseded),
-            },
+            guard: ComputerPolicyGuard { change,
+            superseded: Arc::clone(&superseded), },
             reply,
             permit,
         });

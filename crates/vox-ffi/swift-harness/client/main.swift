@@ -145,6 +145,10 @@ final class Listener: ClientListener, @unchecked Sendable {
         say("ENDED \(text)")
     }
 
+    func onDetached() {
+        say("DETACHED")
+    }
+
     func onSessions(room: String) {
         lock.lock()
         rooms[room, default: 0] += 1

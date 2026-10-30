@@ -855,41 +855,9 @@ impl Node {
                 .await;
                 return;
             }
-            // Keep the original causal deadline, covering asynchronous bundle preparation.
-            // A native package save, once admitted, always returns its real durable outcome.
-            let selected = if let Some(deadline) = chain
-                .guard
-                .as_ref()
-                .and_then(|guard| guard.causal_deadline())
-            {
-                match tokio::time::timeout_at(
-                    deadline.into(),
-                    self.select_owned_key_package(&room, release.member),
-                )
-                .await
-                {
-                    Ok(selected) => selected,
-                    Err(_) => {
-                        let continuation = SessionContinuation {
-                            instance,
-                            attachment,
-                            lifetime: Some(lifetime),
-                            after: After::Delivered { chain },
-                        };
-                        self.reject_owned_session(
-                            room,
-                            Error::Profile(
-                                "computer trust key publication crossed its causal deadline",
-                            ),
-                            continuation,
-                            reply,
-                        );
-                        return;
-                    }
-                }
-            } else {
-                self.select_owned_key_package(&room, release.member).await
-            };
+            // Native package work remains with the exact policy/lifecycle owner. Its
+            // continuation checks authority again before any irreversible publication.
+            let selected = self.select_owned_key_package(&room, release.member).await;
             let Some(selected) = selected else {
                 chain.retry_owed = true;
                 continue;

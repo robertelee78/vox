@@ -100,7 +100,7 @@ private struct NodeFacts: View {
 
     var body: some View {
         StateMark(kind: model.nodeStatus == "Ready" ? .live : .danger,
-                  words: "node \(model.node), \(model.nodeStatus ?? "unavailable")")
+                  words: "node \(model.node), \(model.nodeAvailabilityWords)")
         Text(model.keyring).font(Theme.mono).secondaryText()
         section("NEEDS YOU") {
             let rooms = model.group(.needsYou)

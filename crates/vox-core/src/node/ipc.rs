@@ -6722,9 +6722,22 @@ async fn serve_requests(
                     Frame::Event(crate::node::api::NodeEvent::ConnectionNote { peer, note });
                 write_frame(&mut stream, &frame.to_bytes()).await?;
             }
+            let writing = std::sync::atomic::AtomicBool::new(false);
             return tokio::select! {
-                r = pump(stream, events) => r,
-                () = node_detached(&mut watch) => Ok(()),
+                // Detach is signalled before the actor/event stream stops. Prefer that
+                // authoritative terminal fact when both have become ready.
+                biased;
+                () = node_detached(&mut watch) => {
+                    // Cancelling a partially written event must close the stream, not
+                    // append a terminal frame into the middle of that event's bytes.
+                    if !writing.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(body) = gone(&node) {
+                            let _ = write_frame(&mut stream, &body).await;
+                        }
+                    }
+                    Ok(())
+                },
+                r = pump(&mut stream, events, &writing) => r,
             };
         }
         let activity = match &request {
@@ -9104,7 +9117,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
 /// Forward a subscription to a client until the client goes away or the node
 /// stops. Any write failure ends **this** connection and nothing else — a client
 /// that died mid-stream shows up as `BrokenPipe` here (measured).
-async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
+async fn pump(
+    stream: &mut UnixStream,
+    mut events: EventStream,
+    writing: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
     loop {
         // **A subscriber that hangs up is noticed on a quiet node too**: waiting only on events
         // left its connection — and the hold it carries on its node (ADR-026 L-3) — open until
@@ -9121,9 +9138,11 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
             EventStreamItem::Event(ev) => Frame::Event(ev),
             EventStreamItem::Lagged(missed) => Frame::Lagged { missed },
         };
-        if write_frame(&mut stream, &frame.to_bytes()).await.is_err() {
+        writing.store(true, std::sync::atomic::Ordering::Relaxed);
+        if write_frame(stream, &frame.to_bytes()).await.is_err() {
             return Ok(());
         }
+        writing.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

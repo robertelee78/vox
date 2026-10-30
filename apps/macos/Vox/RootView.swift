@@ -143,8 +143,7 @@ struct RootView: View {
                 ProgressView("Opening the node…")
             case let .detached(node):
                 // E-4: this window is node <node>'s, attached or not. Attach it again, or quit.
-                Text(model.selectedNodeStatus == "Locked" ? "Node \(node) is Locked."
-                     : "Node \(node) is unavailable.").heading()
+                Text("Node \(node) is \(model.selectedNodeAvailabilityWords).").heading()
                 Text("This window acts only as node \(node). Your data is preserved.")
                     .secondaryText()
                     .accessibilityIdentifier("detached-why")
