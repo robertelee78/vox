@@ -28,6 +28,33 @@ fn pair(left: &Digest32, right: &Digest32) -> [u8; 64] {
     key
 }
 
+// A blocking task can be rejected or cancelled when its runtime shuts down. If that happens,
+// its captured value must still leave the caller's critical section before it is destroyed.
+struct Retire<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> Retire<T> {
+    fn release(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl<T: Send + 'static> Drop for Retire<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            drop(std::thread::spawn(move || drop(value)));
+        }
+    }
+}
+
+fn retire_native<T: Send + 'static>(value: T) {
+    let retired = Retire(Some(value));
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        drop(runtime.spawn_blocking(move || retired.release()));
+    } else {
+        drop(retired);
+    }
+}
+
 /// No historical event list, no snapshot and no Store reference survives in the
 /// Channel's last-good display. Names and bootstrap addresses have wire bounds.
 #[derive(Clone, Debug)]
@@ -66,6 +93,18 @@ pub(in crate::node::channel) struct ConsentFacts {
     consent: imbl::OrdMap<Digest32, imbl::OrdMap<Digest32, Consent>>,
     resets: imbl::OrdMap<Digest32, u64>,
     revoked: imbl::OrdSet<[u8; 64]>,
+}
+
+impl Drop for ConsentFacts {
+    fn drop(&mut self) {
+        if !self.consent.is_empty() || !self.resets.is_empty() || !self.revoked.is_empty() {
+            retire_native((
+                std::mem::take(&mut self.consent),
+                std::mem::take(&mut self.resets),
+                std::mem::take(&mut self.revoked),
+            ));
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -202,6 +241,18 @@ pub(in crate::node::channel) struct SemanticFacts {
     admin_clock: Option<u64>,
 }
 
+impl Drop for SemanticFacts {
+    fn drop(&mut self) {
+        if !self.authority.is_empty() || !self.shares.is_empty() || !self.fingerprints.is_empty() {
+            retire_native((
+                std::mem::take(&mut self.authority),
+                std::mem::take(&mut self.shares),
+                std::mem::take(&mut self.fingerprints),
+            ));
+        }
+    }
+}
+
 #[derive(Default)]
 pub(in crate::node::channel) struct SemanticState {
     source: Option<(u64, u64)>,
@@ -296,10 +347,10 @@ impl SemanticState {
             return false;
         }
         if work.completed {
-            let Some(build) = work.building.take() else {
+            let Some(mut build) = work.building.take() else {
                 return false;
             };
-            self.facts = build.facts;
+            std::mem::swap(&mut self.facts, &mut build.facts);
             self.source = work.source;
         }
         if let Some(clock) = work.admin_clock {
@@ -345,14 +396,13 @@ impl SemanticWork {
             .as_ref()
             .is_none_or(|build| build.source != source)
         {
+            let mut facts = SemanticFacts::default();
+            facts.admin_clock = view.admin_clock();
             self.building = Some(SemanticBuild {
                 source,
                 phase: 0,
                 after: None,
-                facts: SemanticFacts {
-                    admin_clock: view.admin_clock(),
-                    ..SemanticFacts::default()
-                },
+                facts,
             });
         }
         let build = self

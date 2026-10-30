@@ -65,6 +65,37 @@ from the actual typed command's exit. Temporary diagnostics were removed before 
 build. This focused repair smoke is not whole-#1007 acceptance or a replacement for the
 retained-history and semantic-query evidence.
 
+## v0.4.10 integrated semantic-governance smoke (#1007)
+
+The normal-feature release CLI built from integration candidate
+`0d4f152c640aa8188e7a0694369f0d9c86ac6aa6`, SHA-256
+`fc41be8a42fcf97e1a49b9c71feb3ba57e9beef36eae11766c567f35c7a61fac`, ran against two
+fresh scratch profiles with separate data/config directories and no proof knobs. Actual trust,
+room creation and direct joining succeeded. Each node read both accepted messages with their
+exact hashes, envelope bodies and `owed:false`; accepted posts were not replayed.
+
+A same-name authenticated rename remained absent from the notices page by its exact action
+hash, while the preceding exact message remained readable. The creator then granted the other
+member administrator authority, observed that fingerprint in the shipped administrator list,
+removed it, and observed its absence.
+
+The spike's initial plain-text and single-row assumptions were corrected against retained JSON:
+`text` carries the serialized envelope, and `--notices` can include earlier notices alongside a
+message page. Those were apparatus mistakes, not product failures. The receipt is
+`/private/tmp/vox1007-final-normal-3jai5a5j/normal-operator-result.json`. Frontends and the actual
+auto-started scratch owners were stopped; profiles and output were preserved.
+
+This is focused normal operator use, not a whole retained-history, restart, late-reset or
+authority-expiry acceptance result. The later paging-refresh parser correction changes only
+the proof; it does not rebind this binary receipt to another source.
+
+Source review subsequently found that replacing the completed semantic cache could destroy
+unbounded authority, share and fingerprint maps on the actor while holding the room mutex.
+Displaced maps, discarded partial builds and final immutable consent roots now transfer their
+destruction to native work, including cancellation and runtime-shutdown paths. This ownership
+repair does not change the revision, deadline, serial or readiness fences. The normal smoke
+above predates this repair; it is not runtime evidence for the changed destruction path.
+
 ## v0.4.10 provider-cursor publication diagnosis (#934)
 
 On 2026-10-30, an ordinary-feature release CLI at
