@@ -1,6 +1,6 @@
 # The Vox app on a Mac
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.10.
 
 This page says where each thing is in Vox.app. The app does what the `vox` commands do. The other
 chapters explain nodes, rooms, trust, services and files. The app runs on Macs with Apple Silicon
