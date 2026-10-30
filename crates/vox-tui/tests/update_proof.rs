@@ -730,7 +730,7 @@ fn bundle_release_app(root: &Path, version: &str, app: &Path, channels: &[(&str,
     let zip = work.path().join(&zip_name);
     let zipped = Command::new("/usr/bin/ditto")
         .args(["-c", "-k", "--keepParent"])
-        .arg(&app)
+        .arg(app)
         .arg(&zip)
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: could not run ditto: {e}"));
