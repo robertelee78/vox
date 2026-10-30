@@ -243,7 +243,9 @@ The hosted journey reached member reads after admitting its joins and posts, the
 the explicit `room changed while reading; refresh and retry` instruction. Its convergence
 caller is to follow the existing `room_rows` convention: discard that refused observation,
 keep the reader incomplete, and refresh; every other refusal remains a PRODUCT failure.
-The corrected hosted journey is running; no full hosted pass is claimed.
+The old-candidate run was subsequently stopped after its shipped status exposed the same
+self-sealing saved-read errors in the cleanup ledger. Its profiles were retained; it is not
+a full hosted pass.
 
 The separate fresh cold-recipient run exposed a saved-read publication mismatch that Session
 queries classified as a storage failure, poisoning the room and preventing later refreshes.
@@ -257,6 +259,23 @@ query preceded Session metadata and returned `no Session`; only the later, metad
 body operation succeeded. Both doctors' drain checks passed and both owned daemons stopped
 with no open profile handles. Receipts: `/private/tmp/vox1047-active-wire-d1mw1skh/`.
 This is focused saved-read smoke, not causal concurrency, inverse or full-release acceptance.
+
+Final lifetime review found a parked Private continuation blocking construction on another
+Private port. The correction moves that whole nonrunning owner into the existing bounded
+deferred queue before matching-port promotion; no ownership, admission or numerical limit
+changes. The applied correction passed independent source review and strict Clippy/build.
+Normal binary `9c50cb849a631bb0b415d5aa0b9a6335b7ad9e2ac83a6bb4d48f889bbf5c6731`
+then recovered copies of the failed hosted profiles: all 16 original identities read every
+other member's exact original message in both rooms, 480/480 consumer observations, with no
+reposts or data reset. All 16 final statuses were Ready without preparation, unhealthy or
+cleanup errors. Both original and copied profiles were preserved; all owned daemons and
+foreground clients stopped with no open copy-profile handles.
+`/private/tmp/vox1047-hosted-normal-recovery-8naevljl/consumer-matrix.json` records this
+separate ordinary-binary restart recovery, not a relabeling of the stopped optional proof.
+Its separate three-donor journey read Bob's original private prompt/reply, but Alice's
+metadata-ready Session remained empty. Native records show both exact Private owners and
+KeyBody receipts, not the exact corrected rotation seam or full two-donor delivery.
+That unresolved result remains under `/private/tmp/vox1047-three-donor-port-fairness-verdict.md`.
 
 
 The corrected journey next reached the forced expiry setup but did not engage its marker.

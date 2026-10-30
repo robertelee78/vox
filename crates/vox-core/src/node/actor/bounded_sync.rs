@@ -4178,6 +4178,17 @@ impl Node {
             .flatten();
         self.bounded_sync
             .prioritize_control_admission_owner(room, peer, service);
+        // A parked Private continuation owns its exact port, not every Private port.
+        // Keep it whole in the bounded queue before selecting this port's retained owner.
+        if service == OutboundService::Private
+            && self.bounded_sync.ready[ready_index]
+                .as_ref()
+                .is_some_and(|flow| flow.room != room || flow.peer != peer)
+        {
+            if let Some(flow) = self.bounded_sync.ready[ready_index].take() {
+                self.bounded_sync.deferred.push_back(flow);
+            }
+        }
         if self.bounded_sync.ready[ready_index]
             .as_ref()
             .is_none_or(|flow| self.bounded_sync.record_bytes_blocked(flow))
