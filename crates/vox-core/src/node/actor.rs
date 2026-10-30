@@ -581,12 +581,14 @@ fn detail_of(
     })
 }
 
-/// A pending bounded Session fold is not an I/O failure. Keep the last good
-/// display while exact Session queries refuse; real local failures still poison.
+/// A pending Session fold or replaced read publication is not an I/O failure.
+/// Keep the last good display; real local failures still poison.
 fn detail_failed(ch: &mut ChannelState, error: &Error) {
     if !matches!(
         error,
-        Error::StreamRefused("Session control facts are refreshing")
+        Error::StreamRefused(
+            "Session control facts are refreshing" | crate::node::channel::history::CHANGED
+        )
     ) {
         ch.poison(error);
     }
@@ -8891,6 +8893,7 @@ impl Node {
                 return Ok(None);
             };
             channel.require_governance_ready(profile.store(), self.now_ms())?;
+            channel.publish_history_read_trusted(profile.store_handle(), &self.trust.trusted())?;
             let view = self.view_tx.borrow();
             let previous = view
                 .open_channels

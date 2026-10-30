@@ -246,7 +246,7 @@ impl From<Error> for Failure {
     }
 }
 type Answer<T> = std::result::Result<T, Failure>;
-const CHANGED: &str = "the room changed while reading; refresh and retry";
+pub(crate) const CHANGED: &str = "the room changed while reading; refresh and retry";
 
 struct View<'a> {
     ch: &'a ReadFacts,

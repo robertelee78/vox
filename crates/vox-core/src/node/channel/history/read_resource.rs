@@ -305,7 +305,7 @@ impl ReadResource {
         self.sek.with(|sek| {
             let rendered = publication.render(&store, sek)?;
             if rendered.directory_revision() != publication.directory_revision {
-                return Err(Error::Profile(CHANGED));
+                return Err(Error::StreamRefused(CHANGED));
             }
             let answer = read(
                 sek,
@@ -339,7 +339,7 @@ impl ReadResource {
         let result = self.sek.with(|sek| {
             let rendered = publication.render(&store, sek)?;
             if rendered.directory_revision() != publication.directory_revision {
-                return Err(Error::Profile(CHANGED));
+                return Err(Error::StreamRefused(CHANGED));
             }
             let view = View {
                 ch: &publication.facts,

@@ -245,6 +245,19 @@ caller is to follow the existing `room_rows` convention: discard that refused ob
 keep the reader incomplete, and refresh; every other refusal remains a PRODUCT failure.
 The corrected hosted journey is running; no full hosted pass is claimed.
 
+The separate fresh cold-recipient run exposed a saved-read publication mismatch that Session
+queries classified as a storage failure, poisoning the room and preventing later refreshes.
+The correction preserves the exact directory-revision guard but makes its refusal
+non-poisoning, and refreshes the read publication before open-room detail selection.
+Strict workspace/all-target Clippy and an ordinary-feature release build passed. Binary
+`f36111dd3aa9d91524b19b7715982a68b0991a97c62a8b4a2daec6a4c144e9f9`
+read both exact fresh Public messages, kept the pre-grant prompt private, and showed a new
+authorized Session's exact original prompt and reply locally and remotely. The first remote
+query preceded Session metadata and returned `no Session`; only the later, metadata-ready
+body operation succeeded. Both doctors' drain checks passed and both owned daemons stopped
+with no open profile handles. Receipts: `/private/tmp/vox1047-active-wire-d1mw1skh/`.
+This is focused saved-read smoke, not causal concurrency, inverse or full-release acceptance.
+
 
 The corrected journey next reached the forced expiry setup but did not engage its marker.
 Read-only shipped authority pages on both scratch peers already excluded the expired

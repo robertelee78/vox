@@ -457,6 +457,9 @@ impl ChannelState {
         match result {
             Ok(reply) => Ok(reply),
             Err(Failure::Request(why)) => Err(why.into()),
+            Err(Failure::Storage(error @ Error::StreamRefused(super::super::history::CHANGED))) => {
+                Err(error.to_string())
+            }
             Err(Failure::Storage(error)) => {
                 self.poison(&error);
                 Err(error.to_string())
