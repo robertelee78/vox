@@ -219,6 +219,33 @@ Neither simultaneous charged owners nor the retained preimplementation runs esta
 acceptance. The warm fixture also does not retire the separate cold/Dave and first-Session
 selector observations, whose source, commands and profiles remain preserved.
 
+The composed candidate next exposed delayed seat handling during the hosted journey.
+The revised candidate fences seat decisions against their own actor-admitted roster save
+and background room reservation, then rechecks the reservation under the decision lock.
+Deferred decisions retain their original event and channel permit; fresh receipt requires
+every parked event to retain credit. Two independent source reviews accepted those
+authority and admission boundaries. This is not a native attribution of the earlier delay.
+
+Strict workspace/all-target Clippy and an ordinary-feature release build passed for the
+revised source. The normal binary's SHA-256 is
+`d00f8ff993dea03bf6e987bdd4b5e1121093c0b701f82a30455af26b35e254ba`.
+Its fresh two-member journey read both exact warm Public messages, then the original
+authorized offline Session prompt and reply; the remote read did not disclose the pre-grant
+prompt. Its first causal arm read the original Public hash/body in 9.431272583 s, but the
+6829-byte Private response ended after 0.228208 s: no causal overlap acceptance follows.
+The separately recorded 32 kbit/s generic return-link calibration lengthened that response
+to 5.719011 s, but missed the original Public read bound at 10.186836458 s and still supplied
+no accepted original-head receipt inside the Private interval. Neither arm qualifies an
+inverse. Original profiles, metadata and source-bound receipts remain under
+`/private/tmp/vox1047-seat-normal-final/` and their referenced scratch case directories.
+
+The hosted journey reached member reads after admitting its joins and posts, then reported
+the explicit `room changed while reading; refresh and retry` instruction. Its convergence
+caller is to follow the existing `room_rows` convention: discard that refused observation,
+keep the reader incomplete, and refresh; every other refusal remains a PRODUCT failure.
+The corrected hosted journey is running; no full hosted pass is claimed.
+
+
 The corrected journey next reached the forced expiry setup but did not engage its marker.
 Read-only shipped authority pages on both scratch peers already excluded the expired
 administrator, with both nodes Ready and governance idle. The native sample located the

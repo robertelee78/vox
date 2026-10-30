@@ -459,6 +459,14 @@ pub(super) struct Pending {
 }
 
 impl Pending {
+    fn changes_roster(&self) -> bool {
+        let mut next = &self.continuation;
+        while let Continuation::AfterMigration(migration) = next {
+            next = &migration.next;
+        }
+        matches!(next, Continuation::Roster(_))
+    }
+
     pub(super) fn owe_governance(&mut self, instance: &SharedChannel, attachment: u64) {
         if attachment == self.epoch && Arc::ptr_eq(instance, &self.instance) {
             self.governance_owed = true;
@@ -549,6 +557,27 @@ fn outcome(result: &crate::error::Result<Saved>) -> Outcome {
 }
 
 impl Node {
+    pub(super) fn seat_waits_for_install(&self, event: &NetEvent) -> Option<bool> {
+        let room = match event {
+            NetEvent::SeatReserve { channel_id, .. } => channel_id,
+            NetEvent::SeatAsk { ask, .. } => &ask.channel_id,
+            _ => return None,
+        };
+        let admitted = matches!(
+            self.pending_posts.get(room),
+            Some(post_save::Pending::Maintenance(pending)) if pending.changes_roster()
+        );
+        // Background board exchange owns the same room reservation outside pending_posts.
+        // A busy room is fenced conservatively, without awaiting it on the actor.
+        Some(
+            admitted
+                || self
+                    .channels
+                    .get(room)
+                    .is_some_and(|room| room.try_lock().map_or(true, |room| room.post_pending())),
+        )
+    }
+
     pub(super) fn store_save_pending(&self) -> bool {
         !self.pending_posts.is_empty()
             || self.policy_save_pending()

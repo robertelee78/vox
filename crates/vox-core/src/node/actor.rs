@@ -2037,6 +2037,9 @@ impl NetEvent {
                 | Self::LocalTrustBlacklist(_)
                 | Self::AppDial(_)
                 | Self::Stream { .. }
+                // Retiring an actor-owned seat promise does not touch the store.
+                | Self::SeatRelease { .. }
+                | Self::SeatAbort { .. }
                 // Original physical owners must retire without waiting behind their own save.
                 | Self::OwnKeyWriterInterrupted(..)
                 | Self::OwnKeyComputerCancelled { .. }
@@ -3391,6 +3394,13 @@ async fn seat_round(
 
 /// The room's epoch, and the members to ask for a newcomer's place, each with its connection.
 type SeatsToAsk = (u64, Vec<(Digest32, Arc<VoxConnection>)>);
+
+/// A seat decision either completes under its room lock or retains the original queue admission.
+enum SeatEvent {
+    Unhandled(NetEvent),
+    Handled,
+    Deferred(NetEvent),
+}
 
 /// A place promised in a room to a newcomer (V030-30, #366): by whom it was asked, this node or
 /// another member, and until when it counts.
@@ -7069,10 +7079,18 @@ impl Node {
         )> = std::collections::VecDeque::new();
         loop {
             let save_pending = self.store_save_pending();
-            let receive_net = !save_pending
-                || saved_events
-                    .back()
-                    .is_none_or(|(_, credit)| credit.is_some());
+            let saved_ready = if !save_pending {
+                saved_events
+                    .iter()
+                    .position(|(event, _)| self.seat_waits_for_install(event) != Some(true))
+            } else {
+                // A seat can pass blocked Store events once its own roster is installed.
+                // Ordinary Store events keep FIFO order and their original admission credit.
+                saved_events
+                    .iter()
+                    .position(|(event, _)| self.seat_waits_for_install(event) == Some(false))
+            };
+            let receive_net = saved_events.iter().all(|(_, credit)| credit.is_some());
             let journal_busy = self.deferred_commands.front().is_some_and(|deferred| {
                 Self::command_needs_journal(&deferred.command.0)
                     && self
@@ -7470,20 +7488,26 @@ impl Node {
                     let _ = reply.send(outcome);
                     self.schedule().await;
                 }
-                Some(event) = async {
-                    if !save_pending {
-                        if let Some((event, credit)) = saved_events.pop_front() {
-                            drop(credit);
-                            return Some(event);
+                Some((event, credit, parked)) = async {
+                    if let Some(index) = saved_ready {
+                        if let Some((event, credit)) = saved_events.remove(index) {
+                            return Some((event, credit, true));
                         }
                     }
-                    net_rx.recv().await
-                }, if receive_net => {
-                    if save_pending && (event.waits_for_store()
-                        || matches!(&event, NetEvent::LocalTrustBlacklist(_)
-                            if !self.trust.local_history_imported()))
+                    net_rx.recv().await.map(|event| (event, None, false))
+                }, if receive_net || saved_ready.is_some() => {
+                    let waits_for_store = self.seat_waits_for_install(&event).unwrap_or_else(|| {
+                        save_pending && (event.waits_for_store()
+                            || matches!(&event, NetEvent::LocalTrustBlacklist(_)
+                                if !self.trust.local_history_imported()))
+                    });
+                    if waits_for_store
                     {
-                        let credit = self.net_tx.clone().try_reserve_owned().ok();
+                        let credit = if parked {
+                            credit
+                        } else {
+                            self.net_tx.clone().try_reserve_owned().ok()
+                        };
                         saved_events.push_back((event, credit));
                         continue;
                     }
@@ -7491,7 +7515,22 @@ impl Node {
                     self.publication_again |= !self.publish_waiters.is_empty();
                     let name = net_event_name(&event);
                     let started = std::time::Instant::now();
-                    self.handle_net(event).await;
+                    match self.handle_seat_event(event) {
+                        SeatEvent::Unhandled(event) => {
+                            drop(credit);
+                            self.handle_net(event).await;
+                        }
+                        SeatEvent::Handled => drop(credit),
+                        SeatEvent::Deferred(event) => {
+                            let credit = if parked {
+                                credit
+                            } else {
+                                self.net_tx.clone().try_reserve_owned().ok()
+                            };
+                            saved_events.push_back((event, credit));
+                            continue;
+                        }
+                    }
                     self.note_if_stalled(name, started);
                     self.publish().await;
                     self.schedule().await;
@@ -10201,13 +10240,8 @@ impl Node {
                     });
                 });
             }
-            NetEvent::SeatReserve {
-                channel_id,
-                joiner,
-                ack,
-            } => {
-                let held = self.reserve_seat(channel_id, joiner).await;
-                let _ = ack.send(held);
+            NetEvent::SeatReserve { .. } | NetEvent::SeatAsk { .. } => {
+                unreachable!("seat decisions retain admission in the actor loop")
             }
             NetEvent::SeatRelease { channel_id, joiner } => {
                 let me = self.profile.as_ref().map(Profile::fingerprint);
@@ -10219,12 +10253,6 @@ impl Node {
                     self.seat_promises.remove(&(channel_id, joiner));
                 }
             }
-            NetEvent::SeatAsk {
-                peer,
-                ask,
-                send,
-                recv,
-            } => self.answer_seat(peer, ask, send, recv).await,
             NetEvent::SeatAbort { peer, abort } => {
                 if self
                     .seat_promises
@@ -16513,21 +16541,68 @@ impl Node {
         Ok(())
     }
 
+    fn handle_seat_event(&mut self, event: NetEvent) -> SeatEvent {
+        match event {
+            NetEvent::SeatReserve {
+                channel_id,
+                joiner,
+                ack,
+            } => {
+                let held = match self.reserve_seat(channel_id, joiner) {
+                    Ok(Some(held)) => Ok(held),
+                    Err(error) => Err(error),
+                    Ok(None) => {
+                        return SeatEvent::Deferred(NetEvent::SeatReserve {
+                            channel_id,
+                            joiner,
+                            ack,
+                        })
+                    }
+                };
+                let _ = ack.send(held);
+                SeatEvent::Handled
+            }
+            NetEvent::SeatAsk {
+                peer,
+                ask,
+                send,
+                recv,
+            } => {
+                if let Some((send, recv)) = self.answer_seat(peer, ask, send, recv) {
+                    SeatEvent::Deferred(NetEvent::SeatAsk {
+                        peer,
+                        ask,
+                        send,
+                        recv,
+                    })
+                } else {
+                    SeatEvent::Handled
+                }
+            }
+            event => SeatEvent::Unhandled(event),
+        }
+    }
+
     /// **The asker's first step** (V030-30, #366): hold a place for `joiner` under this node's own
     /// name, and say which members to ask: every other member of the room this node holds a
     /// connection to. A joiner already an author needs no place and no one asked.
-    async fn reserve_seat(
+    fn reserve_seat(
         &mut self,
         channel_id: Digest32,
         joiner: Digest32,
-    ) -> crate::error::Result<SeatsToAsk> {
+    ) -> crate::error::Result<Option<SeatsToAsk>> {
         let Some(me) = self.profile.as_ref().map(Profile::fingerprint) else {
             return Err(crate::error::Error::Profile("locked"));
         };
         let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
             return Err(Error::Profile("no such room on this node"));
         };
-        let c = shared.lock().await;
+        let Ok(c) = shared.try_lock() else {
+            return Ok(None);
+        };
+        if c.post_pending() {
+            return Ok(None);
+        }
         if c.ended((self.millis_clock)()).is_some() {
             return Err(Error::JoinRoomEnded);
         }
@@ -16540,7 +16615,7 @@ impl Node {
             ));
         }
         if c.is_author(&joiner) {
-            return Ok((c.epoch(), Vec::new()));
+            return Ok(Some((c.epoch(), Vec::new())));
         }
         self.seat_count(&c, &channel_id, &joiner)?;
         self.seat_promises.insert(
@@ -16562,22 +16637,27 @@ impl Node {
                 .collect(),
             None => Vec::new(),
         };
-        Ok((c.epoch(), members))
+        Ok(Some((c.epoch(), members)))
     }
 
     /// **A member's answer to another's newcomer** (V030-30, #366): a place promised, or why not.
     /// A promised place waits, off the actor, for the asker's abort, which frees it.
-    async fn answer_seat(
+    fn answer_seat(
         &mut self,
         peer: Digest32,
         ask: crate::node::seatstream::Ask,
         send: quinn::SendStream,
         recv: quinn::RecvStream,
-    ) {
+    ) -> Option<(quinn::SendStream, quinn::RecvStream)> {
         use crate::node::seatstream::{answer_and_wait, Answer};
         let answer = match self.channels.get(&ask.channel_id).map(Arc::clone) {
             Some(shared) => {
-                let c = shared.lock().await;
+                let Ok(c) = shared.try_lock() else {
+                    return Some((send, recv));
+                };
+                if c.post_pending() {
+                    return Some((send, recv));
+                }
                 if c.epoch() != ask.epoch || !c.is_member(&peer) {
                     Answer::NotHeld
                 } else if c.is_author(&ask.joiner) {
@@ -16609,7 +16689,7 @@ impl Node {
                 let _held = (send, recv);
                 tokio::time::sleep(crate::node::seatstream::PROMISE_TTL).await;
             });
-            return;
+            return None;
         }
         let tx = self.net_tx.clone();
         tokio::spawn(async move {
@@ -16617,6 +16697,7 @@ impl Node {
                 let _ = tx.send(NetEvent::SeatAbort { peer, abort }).await;
             }
         });
+        None
     }
 
     async fn answer_agree(

@@ -1865,6 +1865,20 @@ fn converged(staged: &Staged) {
         for room in rooms {
             for (dir, node, reader, _) in everyone {
                 let (ok, out, err) = vox(dir, &as_node(&["room", "read", room], *node), None);
+                if !ok
+                    && err.lines().any(|line| {
+                        matches!(
+                            line.trim(),
+                            "vox: the room changed while reading; refresh and retry"
+                                | "vox: node: the room changed while reading; refresh and retry"
+                        )
+                    })
+                {
+                    // Follow the same explicit refresh instruction as room_rows; a refused
+                    // observation supplies no delivery evidence and cannot complete this journey.
+                    unread.push(format!("{reader} must refresh its read of {room}"));
+                    continue;
+                }
                 assert!(
                     ok,
                     "PRODUCT: {reader}'s `vox room read` refused: {out}{err}"
