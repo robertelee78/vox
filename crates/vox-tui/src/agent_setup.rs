@@ -27,7 +27,7 @@ use crate::app::AppError;
 use crate::client::NodeArgs;
 use crate::setup::{Harness, Wiring, HARNESSES};
 
-/// The harness `key` names (`claude`, `codex`, `opencode`; `claude-code` too).
+/// The harness `key` names (`claude`, `codex`, `opencode`, `omp`; `claude-code` too).
 ///
 /// # Errors
 /// A name that is none of them.
@@ -38,7 +38,7 @@ fn harness(key: &str) -> Result<&'static Harness, AppError> {
     };
     HARNESSES.iter().find(|h| h.key == key).ok_or_else(|| {
         AppError::Usage(format!(
-            "no harness {key:?}; known: claude, codex, opencode"
+            "no harness {key:?}; known: claude, codex, opencode, omp"
         ))
     })
 }
@@ -296,7 +296,9 @@ pub async fn setup(args: &NodeArgs, key: &str, name: Option<&str>) -> Result<(),
         eprintln!("vox: {}", crate::ident::NO_BACKUP);
         passphrase
     };
-    if wired.is_none() {
+    // Generated OMP extensions must be refreshed even when already wired to this node;
+    // the installer verifies the recorded digest before replacing an older asset.
+    if wired.is_none() || h.key == "omp" {
         for line in wiring.install(&name)? {
             println!("  {line}");
         }
@@ -327,6 +329,7 @@ pub(crate) async fn finish(
     key: &str,
     name: &str,
     check_only: bool,
+    omp_agent_dir: Option<&str>,
 ) -> Result<(), AppError> {
     if crate::coord::agent_marked() {
         return Err(AppError::Usage(
@@ -336,7 +339,20 @@ pub(crate) async fn finish(
     let h = harness(key)?;
     let name = NodeName::parse(name)?;
     let account = args.account()?;
-    let wiring = Wiring::of(h.key)?;
+    let wiring = if h.key == "omp" {
+        Wiring::omp_at(omp_agent_dir.ok_or_else(|| {
+            AppError::Usage(
+                "OMP setup needs the approved agent directory; request setup again".into(),
+            )
+        })?)?
+    } else {
+        if omp_agent_dir.is_some() {
+            return Err(AppError::Usage(
+                "OMP agent directory is only valid for OMP setup".into(),
+            ));
+        }
+        Wiring::of(h.key)?
+    };
     if let Some(wired) = crate::setup::connected(&account, &wiring) {
         if wired != name {
             return Err(AppError::Usage(format!(

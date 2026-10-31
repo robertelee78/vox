@@ -1014,8 +1014,8 @@ enum AgentCmd {
     /// Print a node's harness integration, or install missing light hooks with `--install`.
     ///
     /// Whatever the harness wants, this prints it: Claude Code and Codex take a
-    /// hook entry in their own settings, so they get a JSON snippet; OpenCode has
-    /// no hook command and loads JavaScript plugins, so it gets a plugin file.
+    /// hook entry in their own settings, so they get a JSON snippet; OpenCode gets
+    /// a JavaScript plugin and Oh My Pi gets a native TypeScript extension.
     ///
     /// For example:
     ///
@@ -1036,7 +1036,7 @@ enum AgentCmd {
     /// Install the agent skill pack for every harness here, or print its entry.
     ///
     /// The pack is what an agent reads to work in a room: rooms, Sessions, trust, files and
-    /// setup, as `SKILL.md` and the reference files it points to. Claude Code, Codex and OpenCode
+    /// setup, as `SKILL.md` and the reference files it points to. Claude Code, Codex, OpenCode and Oh My Pi
     /// each load it from their own skills folder, at user scope, beside the drain.
     ///
     /// Installing Vox, and `vox update`, run `vox agent skill --install` for you: it installs or
@@ -1086,7 +1086,7 @@ enum AgentCmd {
     ///
     /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
     /// the room resolves; Claude Code's hook entries exist once at user scope; Codex's hook is
-    /// trusted; the OpenCode plugin is this build's; the drain can read the room and record its
+    /// trusted; the OpenCode plugin and Oh My Pi extension are this build's; the drain can read the room and record its
     /// place; each session's record (first seen, last drained, idle or busy, wake endpoint
     /// alive); trust in each direction with every member; and the members' versions. `warn` is
     /// something not set up, `fail` something set up that will not work. Exits 1 on any `fail`.
@@ -1116,7 +1116,7 @@ enum AgentCmd {
 pub struct AgentStatusArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
-    /// The harness this session runs in: `claude`, `codex` or `opencode`.
+    /// The harness this session runs in: `claude`, `codex`, `opencode` or `omp`.
     #[arg(long)]
     pub harness: String,
     /// The directory the session started in; else the current directory.
@@ -1129,7 +1129,7 @@ pub struct AgentStatusArgs {
 pub struct AgentSetupArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
-    /// The harness to wire: `claude`, `codex` or `opencode`.
+    /// The harness to wire: `claude`, `codex`, `opencode` or `omp`.
     pub harness: String,
     /// The node's name; defaults to <harness>-<host>, folded to a valid node name.
     #[arg(long)]
@@ -1140,6 +1140,9 @@ pub struct AgentSetupArgs {
     /// Check app setup's name and harness before making its node; writes nothing.
     #[arg(long, hide = true, requires = "finish")]
     pub check: bool,
+    /// The resolved OMP agent directory approved in the app.
+    #[arg(long, hide = true, requires = "finish")]
+    pub omp_agent_dir: Option<String>,
 }
 
 /// `vox agent doctor`
@@ -1176,8 +1179,8 @@ pub struct RoomPingArgs {
 /// `vox agent skill`
 #[derive(Args, Debug, Clone)]
 pub struct AgentSkillArgs {
-    /// The harness to say where the skill goes for: `claude`, `codex` or `opencode`.
-    /// Without one, all three are listed. The skill itself is the same for each.
+    /// The harness to say where the skill goes for: `claude`, `codex`, `opencode` or `omp`.
+    /// Without one, all four are listed. The skill itself is the same for each.
     pub harness: Option<String>,
     /// Install or refresh the pack for every harness present here (its program on `PATH`, or
     /// its settings folder), keeping any file you changed.
@@ -1198,6 +1201,9 @@ fn skill_dir(harness: &str) -> Option<&'static str> {
         "claude" | "claude-code" => Some("~/.claude/skills/vox-agent-comms"),
         "codex" => Some("${CODEX_HOME:-~/.codex}/skills/vox-agent-comms"),
         "opencode" => Some("${XDG_CONFIG_HOME:-~/.config}/opencode/skills/vox-agent-comms"),
+        "omp" => {
+            Some("${PI_CODING_AGENT_DIR:-~/.omp/agent}/skills/vox-agent-comms (active OMP profile)")
+        }
         _ => None,
     }
 }
@@ -1221,7 +1227,7 @@ pub struct AgentTrustArgs {
 #[derive(Args, Debug, Clone)]
 pub struct AgentPluginArgs {
     /// The harness: `claude` or `codex` prints hook JSON; `opencode` prints its
-    /// server plugin. Use setup for OpenCode's complete server/client installation.
+    /// server plugin; `omp` prints its native extension.
     #[arg(required_unless_present = "install", conflicts_with = "install")]
     pub harness: Option<String>,
     /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`).
@@ -1284,7 +1290,7 @@ pub struct AgentHookArgs {
     #[arg(long, required_unless_present = "light", conflicts_with = "light")]
     pub node: Option<String>,
     /// A quiet onboarding hook: no node, no daemon, and no room drain.
-    #[arg(long, value_parser = ["claude", "codex", "opencode"])]
+    #[arg(long, value_parser = ["claude", "codex", "opencode", "omp"])]
     pub light: Option<String>,
     /// Drain only this room (its id, or a unique prefix). Without it the hook drains every
     /// room the node holds, each under its own heading.
@@ -1304,6 +1310,9 @@ pub struct AgentHookArgs {
     /// Claude's fail-closed automatic-notice hook; ordinary prompts return without daemon IPC.
     #[arg(long, conflicts_with_all = ["light", "attention_register", "session"])]
     pub native_attention: bool,
+    /// Prepare OMP context without acknowledging it until the extension commits.
+    #[arg(long, hide = true, requires = "session", conflicts_with_all = ["light", "attention_register", "native_attention"])]
+    pub omp_prepare: bool,
     /// The harness session this drain is for, overriding the one on stdin.
     ///
     /// The session id is the cursor key: it is what stops two agent sessions on
@@ -2402,7 +2411,7 @@ enum Cmd {
     Status(StatusArgs),
     /// Every retained decision by this node, newest first; --json prints one event per line.
     Decisions(StatusArgs),
-    /// Wire an agent session into a room — Claude Code, Codex and OpenCode.
+    /// Wire an agent session into a room — Claude Code, Codex, OpenCode and Oh My Pi.
     ///
     /// The room settles who does what: an agent claims work there, asks there who is
     /// on what, and answers there, briefly, when asked about its own work; it is also
@@ -2455,7 +2464,7 @@ enum Cmd {
     Tunnel(TunnelCmd),
     /// Set up this machine: a node for each harness installed here, and one for you.
     ///
-    /// Looks for Claude Code, Codex and OpenCode (their programs on `PATH`) and offers each
+    /// Looks for Claude Code, Codex, OpenCode and Oh My Pi (their programs on `PATH`) and offers each
     /// a node of its own, `<harness>-<host>` or a name you type (`skip` makes none), with a
     /// passphrase you type, its hook installed
     /// in the harness's settings and the agent skill beside it. On macOS it also offers a
@@ -2480,7 +2489,7 @@ enum Cmd {
     ///
     /// It stops the daemon and Vox.app, unregisters Vox's login item and LAN helper (on a Mac),
     /// removes the Keychain items it stored for kept nodes, the `vox agent hook` entries, plugin
-    /// and skill it installed for Claude Code, Codex and OpenCode (only what is still as it wrote
+    /// and skill it installed for Claude Code, Codex, OpenCode and Oh My Pi (only what is still as it wrote
     /// it; anything edited is named and left), the shell completions and startup-file block, and
     /// Vox.app or the `vox` binary with its link. Your nodes, their keys and rooms are kept, and
     /// it says where; a node has no backup. `--purge` removes them too.
@@ -3321,7 +3330,7 @@ pub fn run() -> ExitCode {
                 .build()
             else {
                 // Ordinary hooks cannot fail a turn; registration-only callers need a truthful ACK.
-                return if args.attention_register || args.native_attention {
+                return if args.attention_register || args.native_attention || args.omp_prepare {
                     ExitCode::FAILURE
                 } else {
                     ExitCode::SUCCESS
@@ -3333,7 +3342,9 @@ pub fn run() -> ExitCode {
                 args.room.as_deref(),
                 format,
                 args.session.as_deref(),
-                if args.native_attention {
+                if args.omp_prepare {
+                    crate::agent_hook::HookMode::OmpPrepare
+                } else if args.native_attention {
                     crate::agent_hook::HookMode::NativeAttention
                 } else if args.attention_register {
                     crate::agent_hook::HookMode::AttentionRegister
@@ -3341,7 +3352,7 @@ pub fn run() -> ExitCode {
                     crate::agent_hook::HookMode::Normal
                 },
             ));
-            if args.attention_register || args.native_attention {
+            if args.attention_register || args.native_attention || args.omp_prepare {
                 return match result {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => {
@@ -3408,11 +3419,13 @@ pub fn run() -> ExitCode {
             // user scope, beside the drain, so every repository gets both.
             let named: Vec<&str> = match &args.harness {
                 Some(h) if skill_dir(h).is_none() => {
-                    eprintln!("vox: no integration for {h:?}. Known: claude, codex, opencode.");
+                    eprintln!(
+                        "vox: no integration for {h:?}. Known: claude, codex, opencode, omp."
+                    );
                     return ExitCode::FAILURE;
                 }
                 Some(h) => vec![h.as_str()],
-                None => vec!["claude", "codex", "opencode"],
+                None => vec!["claude", "codex", "opencode", "omp"],
             };
             print!("{}", crate::agent_hook::AGENT_SKILL);
             if named.len() == 1 {
@@ -3455,6 +3468,7 @@ pub fn run() -> ExitCode {
                     &args.harness,
                     args.node.as_deref().unwrap_or_default(),
                     args.check,
+                    args.omp_agent_dir.as_deref(),
                 )
                 .await;
             }
@@ -3497,7 +3511,7 @@ pub fn run() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            "claude" | "claude-code" | "opencode" => {
+            "claude" | "claude-code" | "opencode" | "omp" => {
                 println!(
                     "vox: {} does not gate hooks on trust; nothing to do.",
                     args.harness
@@ -3505,7 +3519,9 @@ pub fn run() -> ExitCode {
                 ExitCode::SUCCESS
             }
             other => {
-                eprintln!("vox: no integration for {other:?}. Known: claude, codex, opencode.");
+                eprintln!(
+                    "vox: no integration for {other:?}. Known: claude, codex, opencode, omp."
+                );
                 ExitCode::FAILURE
             }
         },
@@ -3542,6 +3558,23 @@ pub fn run() -> ExitCode {
                 .to_ascii_lowercase()
                 .as_str()
             {
+                "omp" => {
+                    if args.tui {
+                        eprintln!("vox: --tui is available only for OpenCode");
+                        return ExitCode::FAILURE;
+                    }
+                    print!("{}", crate::agent_hook::omp_extension(&node));
+                    let path = crate::skill_pack::config_dir("omp")
+                        .map(|d| d.join("extensions").join("vox.ts").display().to_string())
+                        .unwrap_or_else(|| {
+                            "the active Oh My Pi agent directory's extensions/vox.ts".into()
+                        });
+                    eprintln!(
+                        "vox: save the native extension as {path}; install the skill beside it: {}",
+                        skill_install("omp", skill_dir("omp").unwrap_or_default())
+                    );
+                    ExitCode::SUCCESS
+                }
                 "opencode" => {
                     if args.tui {
                         print!("{}", crate::agent_hook::opencode_tui_plugin(&node));
@@ -3600,7 +3633,9 @@ pub fn run() -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 other => {
-                    eprintln!("vox: no integration for {other:?}. Known: claude, codex, opencode.");
+                    eprintln!(
+                        "vox: no integration for {other:?}. Known: claude, codex, opencode, omp."
+                    );
                     ExitCode::FAILURE
                 }
             }

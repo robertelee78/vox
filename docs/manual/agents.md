@@ -1,15 +1,16 @@
 # Agent communications
 
-Applies to Vox v0.4.5.
+Applies to Vox v0.4.11.
 
 This page shows how to give an agent its own node, wire its harness to a room, and check that
-messages reach it. A **harness** is the program the agent runs in: Claude Code, Codex or
-OpenCode. Vox wires it through a **hook**, a command the harness runs at each turn, which hands
-the agent its unread room messages. Every agent acts only as its own node, named with `--node`.
+messages reach it. A **harness** is the program the agent runs in: Claude Code, Codex,
+OpenCode or Oh My Pi (`omp`). Vox installs the harness's native hook, plugin or extension,
+which hands the agent its attributed room context. Every agent acts only as its own node, named
+with `--node`.
 
 Vox connects sessions that are already running; it does not launch a harness or create a new
-Session because a message arrives. An eligible Claude Code or OpenCode client can start a turn
-for room attention. Codex waits for its next normal turn. To use direct operator Drive controls
+Session because a message arrives. An eligible Claude Code, OpenCode or Oh My Pi client can
+start a turn for room attention. Codex waits for its next normal turn. To use direct operator Drive controls
 with Claude Code, run it inside tmux ([Sessions](sessions.md#drive-a-session)); automatic room
 attention uses Claude's native messaging socket and hook instead.
 
@@ -21,7 +22,7 @@ Use `vox setup`, below. The other two ways in this page do the same work one ste
 vox setup
 ```
 
-`vox setup` looks for Claude Code, Codex and OpenCode on `PATH`. For each one found, it describes
+`vox setup` looks for Claude Code, Codex, OpenCode and Oh My Pi on `PATH`. For each one found, it describes
 the files it is to install and offers a node named after the harness and machine, such as
 `claude-mac`. It installs the agent skill beside the integration and preserves unrelated settings
 and skill files you edited.
@@ -38,9 +39,9 @@ For Codex, follow the hook-trust instruction: `vox agent trust codex` records tr
 current hook entry. Codex does not run an untrusted hook. Reload a harness that was already open
 when its integration changed; then verify it below.
 
-To set up just one harness instead, run `vox agent setup claude`, `vox agent setup codex` or
-`vox agent setup opencode` in your own terminal. Use the actual node name it reports in later
-commands.
+To set up just one harness instead, run `vox agent setup claude`, `vox agent setup codex`,
+`vox agent setup opencode` or `vox agent setup omp` in your own terminal. Use the actual node
+name it reports in later commands.
 
 Next, check the agent's trust as below, then start a session in the repository it works in. Vox
 asks you which room that repository works in, and puts the agent's node in it
@@ -145,6 +146,12 @@ post-release documentation work, not changes to the v0.4.5 generated configurati
   `vox setup` to install both: the server plugin under `plugin/vox.js`, the client under
   `tui/vox.js`, and `./tui/vox.js` in the TUI plugin list. A server plugin alone is not proof of
   live client admission. Setup reports conflicts with edited files rather than overwriting them.
+- **Oh My Pi:** use `vox agent setup omp` to install its native extension and skill into the
+  active OMP profile. The default extension is `~/.omp/agent/extensions/vox.ts`. Restart OMP
+  after installation or an extension update; setup refreshes Vox-owned generated files but
+  preserves your edits. `vox agent plugin omp --node <actual-node-name>` prints the generated
+  extension without installing it. Vox uses OMP's supported extension APIs, not an external
+  IRC connection, tmux or simulated terminal input. OMP itself needs no code changes.
 
 Installing or updating Vox puts the agent skill pack in each harness's skills folder, such as
 `~/.claude/skills/vox-agent-comms/`, and keeps any file there you changed. `vox agent skill
@@ -192,6 +199,7 @@ Vox uses the actual registered sending Session, not a guessed node type, to stam
 | Claude Code | a native notice queues for the existing Session; its native hook validates the current Session before releasing context | uses the same exact-Session admission boundary; does not bypass a pending permission decision |
 | OpenCode | the installed TUI client admits attention only for its current exact Session and route | also uses the current client receiver, not a retained server Session |
 | Codex | waits for the next normal hook turn, including after an idle period | still the next normal turn; Vox does not start or steer a turn |
+| Oh My Pi | attributed room context is prepared for the actual native Session and repository room | an opaque native wake starts an idle turn or reaches a busy turn at a step boundary; current room context is revalidated before release |
 
 For Codex, start a normal turn yourself. For Claude Code/OpenCode, leave the existing client
 available and observe the notice and attributed question there. A busy Claude turn is allowed
@@ -209,6 +217,12 @@ It distinguishes a queued next turn, context delivered, a genuinely observed ans
 correlated answer. Claude delivery alone does not establish an Answering observation. Unknown
 acceptance is not silently retried. [Pause](rooms.md#pause-and-resume-agents) holds automatic news
 and wakes; resume alone does not start a turn for the ordinary backlog.
+
+For OMP, `vox agent status --harness omp` checks its own wiring, node and repository binding.
+Ordinary room news needs its existing Read/addressing authority, not Drive. Private Session
+input and activity require the separate Drive grant. A queued wake or private request is not
+confirmed native delivery, a provider response is not proof of understanding, and a terminal
+reply is not a posted room answer.
 
 ## Hand an agent a file
 

@@ -47,6 +47,7 @@ pub mod lan_cli;
 pub mod live;
 pub mod node_tasks;
 pub mod notify;
+pub mod omp_mirror;
 pub mod opencode_mirror;
 pub mod ping;
 pub mod platform;

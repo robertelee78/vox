@@ -73,11 +73,18 @@ struct HookInput {
     prompt: String,
     /// Retained exact automatic admission; never reselect a replacement during this drain.
     native_notice: Option<crate::wake::NativeNotice>,
+    /// Exact OMP registration captured before selecting any room content.
+    omp_registration: Option<crate::wake::Session>,
+    omp_recipient: Option<vox_core::node::attention::Recipient>,
+    omp_note_marker: Option<std::path::PathBuf>,
 }
 
 fn parse_input(raw: &str) -> HookInput {
     let v: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
     HookInput {
+        omp_registration: None,
+        omp_recipient: None,
+        omp_note_marker: None,
         native_notice: None,
         prompt: v
             .get("prompt")
@@ -137,9 +144,15 @@ async fn check_native_notice(
             .attention
             .as_ref()
             .is_none_or(|route| route.route != notice.route)
-        || crate::wake::AttentionRoute::claude(&saved).as_ref() != saved.attention.as_ref()
-        || std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").as_deref() != Ok(saved.endpoint.as_str())
-        || std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").as_deref() != Ok(saved.token.as_str())
+        || if saved.harness == "omp" {
+            !omp_route_matches(&saved)
+        } else {
+            crate::wake::AttentionRoute::claude(&saved).as_ref() != saved.attention.as_ref()
+                || std::env::var("CLAUDE_CODE_MESSAGING_SOCKET").as_deref()
+                    != Ok(saved.endpoint.as_str())
+                || std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").as_deref()
+                    != Ok(saved.token.as_str())
+        }
     {
         return Err(AppError::Usage("Vox attention registration changed".into()));
     }
@@ -170,6 +183,235 @@ async fn check_native_notice(
         return Err(AppError::Usage("Vox attention registration changed".into()));
     }
     Ok(())
+}
+
+fn omp_route_matches(saved: &crate::wake::Session) -> bool {
+    let route = crate::wake::Session::from_env(&saved.session, false);
+    saved.harness == "omp"
+        && route.harness == "omp"
+        && !route.endpoint.is_empty()
+        && !route.token.is_empty()
+        && route.endpoint == saved.endpoint
+        && route.token == saved.token
+        && route.attention.is_some()
+        && route.attention == saved.attention
+        && std::env::var("VOX_SESSION").as_deref() == Ok(saved.session.as_str())
+        && std::env::var("VOX_OPENCODE_MIRROR_SOCKET").as_deref() == Ok(saved.mirror.as_str())
+}
+
+async fn check_omp_registration(
+    paths: &Paths,
+    saved: &crate::wake::Session,
+) -> Result<(), AppError> {
+    if !omp_route_matches(saved)
+        || !crate::wake::pause_registration(paths, &saved.session)
+            .map_err(AppError::Usage)?
+            .is_some_and(|current| current.same(saved))
+    {
+        return Err(AppError::Usage("Vox OMP registration changed".into()));
+    }
+    Ok(())
+}
+
+async fn check_omp_opening(paths: &Paths, input: &HookInput) -> Result<(), AppError> {
+    let Some(saved) = &input.omp_registration else {
+        return Ok(());
+    };
+    check_omp_registration(paths, saved).await?;
+    if let Some(recipient) = &input.omp_recipient {
+        let at = crate::client::one_shot(paths)?;
+        let mut client = crate::client::open(&at).await?;
+        let owner = client
+            .me()
+            .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
+        match client.rooms().await {
+            Ok(Frame::Rooms { rooms })
+                if rooms
+                    .iter()
+                    .any(|r| r.0 == recipient.room && r.2 && !r.4 && r.6.is_none()) => {}
+            _ => return Err(AppError::Usage("Vox OMP room is no longer open".into())),
+        }
+        let reply = vox_core::node::attention::local(
+            &at,
+            owner,
+            recipient.room,
+            Some(recipient.instance),
+            vox_core::node::attention::Operation::Resolve {
+                session: recipient.session.clone(),
+            },
+        )
+        .await
+        .map_err(AppError::Usage)?;
+        if !matches!(reply, vox_core::node::attention::Reply::Resolved { recipient: current, .. } if current == *recipient)
+        {
+            return Err(AppError::Usage("Vox OMP opening changed".into()));
+        }
+        check_omp_registration(paths, saved).await?;
+    }
+    Ok(())
+}
+
+async fn omp_prepare(
+    paths: &Paths,
+    daemon: &Daemon,
+    room_arg: Option<&str>,
+    format: Format,
+    session: Option<&str>,
+) -> Result<(), AppError> {
+    let session = session
+        .filter(|s| !s.trim().is_empty() && *s == s.trim())
+        .ok_or_else(|| AppError::Usage("OMP preparation requires an exact Session".into()))?;
+    if format != Format::OpenCode || std::env::var("VOX_HARNESS").as_deref() != Ok("omp") {
+        return Err(AppError::Usage(
+            "OMP preparation requires its native route and opencode format".into(),
+        ));
+    }
+    let saved = crate::wake::pause_registration(paths, session)
+        .map_err(AppError::Usage)?
+        .ok_or_else(|| AppError::Usage("Vox OMP conversation is no longer registered".into()))?;
+    check_omp_registration(paths, &saved).await?;
+    let mut input = parse_input("");
+    input.session_id = session.to_owned();
+    let notice = match std::env::var("VOX_OMP_NOTICE") {
+        Ok(value) => Some(
+            crate::wake::NativeNotice::parse(&value)
+                .map_err(AppError::Usage)?
+                .ok_or_else(|| AppError::Usage("invalid Vox OMP attention notice".into()))?,
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err(AppError::Usage("invalid Vox OMP attention notice".into())),
+    };
+    if let Some(room) = &saved.room {
+        let room = b32_decode(room, "attention room")?;
+        let at = crate::client::one_shot(paths)?;
+        let client = crate::client::open(&at).await?;
+        let owner = client
+            .me()
+            .ok_or_else(|| AppError::Usage("Vox node is locked".into()))?;
+        use vox_core::node::attention::{local, Operation, Reply};
+        let recipient = match local(
+            &at,
+            owner,
+            room,
+            None,
+            Operation::Resolve {
+                session: session.into(),
+            },
+        )
+        .await
+        .map_err(AppError::Usage)?
+        {
+            Reply::Resolved { recipient, .. }
+                if recipient.room == room && recipient.session == session =>
+            {
+                recipient
+            }
+            _ => {
+                return Err(AppError::Usage(
+                    "unexpected OMP attention selection answer".into(),
+                ))
+            }
+        };
+        check_omp_registration(paths, &saved).await?;
+        if let Some(notice_id) = notice {
+            let route = saved
+                .attention
+                .as_ref()
+                .ok_or_else(|| AppError::Usage("Vox OMP route changed".into()))?
+                .route;
+            let reply = local(
+                &at,
+                owner,
+                room,
+                Some(recipient.instance),
+                Operation::Admit {
+                    recipient: recipient.clone(),
+                    notice_id,
+                    route,
+                },
+            )
+            .await
+            .map_err(AppError::Usage)?;
+            if !matches!(reply, Reply::Done) {
+                return Err(AppError::Usage(
+                    "unexpected OMP attention admission answer".into(),
+                ));
+            }
+            input.native_notice = Some(crate::wake::NativeNotice {
+                recipient: recipient.clone(),
+                notice_id,
+                route,
+            });
+        }
+        input.omp_recipient = Some(recipient);
+    } else if notice.is_some() {
+        return Err(AppError::Usage(
+            "Vox OMP conversation has no saved room".into(),
+        ));
+    }
+    input.omp_registration = Some(saved.clone());
+    let marker = under_cursors(paths, "omp", session, "omp-room-note");
+    let pending = under_cursors(paths, "omp", session, "omp-room-joining");
+    let joining = match std::fs::read(&pending) {
+        Ok(bytes) => {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| AppError::Usage(format!("invalid OMP room notice: {e}")))?;
+            if value.get("room").and_then(serde_json::Value::as_str) == saved.room.as_deref() {
+                value
+                    .get("joining")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(AppError::Usage(format!(
+                "could not read OMP room notice: {e}"
+            )))
+        }
+    };
+    let note = crate::room_map::note(
+        saved.room.as_deref(),
+        !marker.exists(),
+        if marker.exists() {
+            None
+        } else {
+            joining.as_deref()
+        },
+        &daemon.account.data_root,
+        std::path::Path::new(&input.cwd),
+        daemon.node.as_str(),
+        Some(session),
+    );
+    if note.is_some() && !marker.exists() {
+        input.omp_note_marker = Some(marker);
+    }
+    drain(
+        paths,
+        room_arg,
+        saved.room.as_deref(),
+        &input,
+        "",
+        format,
+        note,
+    )
+    .await
+}
+
+fn omp_decision() -> Result<bool, AppError> {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| AppError::Usage(format!("OMP commit input failed: {e}")))?;
+    match line.as_str() {
+        "commit\n" => Ok(true),
+        "cancel\n" => Ok(false),
+        _ => Err(AppError::Usage("OMP commit outcome is unknown".into())),
+    }
 }
 
 /// A sealed attention notice, rather than a timeout, selects the existing urgent-ahead path.
@@ -1595,6 +1837,8 @@ pub enum HookMode {
     AttentionRegister,
     /// Claude's native automatic-notice admission, without ordinary prompt handling.
     NativeAttention,
+    /// OMP's source-bound, explicitly committed context preparation.
+    OmpPrepare,
 }
 
 /// Run the hook: read stdin, then act on the harness's event.
@@ -1621,6 +1865,9 @@ pub async fn run(
 ) -> Result<(), AppError> {
     let attention_register = matches!(mode, HookMode::AttentionRegister);
     let native_attention = matches!(mode, HookMode::NativeAttention);
+    if matches!(mode, HookMode::OmpPrepare) {
+        return omp_prepare(paths, daemon, room_arg, format, session).await;
+    }
     let mut raw = String::new();
     // A harness always provides stdin; a person testing by hand may not — and
     // OpenCode's plugin cannot, so it passes `--session` instead.
@@ -1803,10 +2050,31 @@ pub async fn run(
         input.event = "VoxAttentionRegister".into();
         input.codex = false;
         input.claude = false;
-        daemon
+        let registered = daemon
             .register(&input, room_arg)
             .await
             .map_err(|error| AppError::Usage(error.said(&input, &daemon.account)))?;
+        if route.harness == "omp" {
+            if let Some(joining) = registered.joining {
+                let marker = under_cursors(paths, "omp", &input.session_id, "omp-room-note");
+                let pending = under_cursors(paths, "omp", &input.session_id, "omp-room-joining");
+                if !marker.exists() && !pending.exists() {
+                    let body = serde_json::json!({ "room": registered.room, "joining": joining })
+                        .to_string();
+                    let dir = paths.cursor_dir().join("omp-room-joining");
+                    vox_core::node::paths::create_private_dir(&dir)
+                        .and_then(|()| {
+                            vox_core::node::paths::write_private_file_unique(
+                                &pending,
+                                body.as_bytes(),
+                            )
+                        })
+                        .map_err(|e| {
+                            AppError::Usage(format!("could not retain OMP room notice: {e}"))
+                        })?;
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -1999,6 +2267,8 @@ fn harness_name(input: &HookInput) -> &'static str {
         "Codex"
     } else if input.claude {
         "Claude Code"
+    } else if std::env::var("VOX_HARNESS").as_deref() == Ok("omp") {
+        "Oh My Pi"
     } else {
         "OpenCode"
     }
@@ -2009,6 +2279,8 @@ fn harness_key(input: &HookInput) -> &'static str {
         "codex"
     } else if input.claude {
         "claude"
+    } else if std::env::var("VOX_HARNESS").as_deref() == Ok("omp") {
+        "omp"
     } else {
         "opencode"
     }
@@ -2516,7 +2788,13 @@ impl RoomDrain {
 
     /// Record only after output. Pending share evidence is sealed before moving the read
     /// cursor, so a failed write repeats output instead of forgetting a pending copy.
-    fn commit(&self, paths: &Paths, session: &str, shown: usize) {
+    fn commit(
+        &self,
+        paths: &Paths,
+        session: &str,
+        shown: usize,
+        strict: bool,
+    ) -> Result<(), AppError> {
         let add = self.fresh[..shown]
             .iter()
             .filter(|r| {
@@ -2527,7 +2805,11 @@ impl RoomDrain {
             .collect();
         if let Err(e) = self.pulling.commit(paths, &self.key, session, &add) {
             eprintln!("vox agent hook: could not record the shares still being pulled: {e}");
-            return;
+            return if strict {
+                Err(AppError::Usage(e.to_string()))
+            } else {
+                Ok(())
+            };
         }
         let (cursor, add, remove) = self.read_to(shown);
         if let Err(e) = save_read(
@@ -2540,12 +2822,19 @@ impl RoomDrain {
             &remove,
         ) {
             eprintln!("vox agent hook: could not record the cursor: {e}");
+            if strict {
+                return Err(AppError::Usage(e.to_string()));
+            }
         }
         if let Some(now) = &self.held_now {
             if let Err(e) = save_held(paths, &self.key, session, now) {
                 eprintln!("vox agent hook: could not record held claims: {e}");
+                if strict {
+                    return Err(AppError::Usage(e.to_string()));
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -2557,9 +2846,9 @@ struct NewOffers {
     shown: Option<String>,
 }
 impl NewOffers {
-    fn commit(&self, paths: &Paths, session: &str) {
+    fn commit(&self, paths: &Paths, session: &str, strict: bool) -> Result<(), AppError> {
         let Some(body) = &self.shown else {
-            return;
+            return Ok(());
         };
         let file = offers_shown_file(paths, session);
         if let Err(error) = vox_core::node::paths::create_private_dir(
@@ -2569,7 +2858,11 @@ impl NewOffers {
         {
             // The notice was emitted. A failed acknowledgement repeats it next turn.
             eprintln!("vox agent hook: could not record the offers shown: {error}");
+            if strict {
+                return Err(AppError::Usage(error.to_string()));
+            }
         }
+        Ok(())
     }
 }
 
@@ -2647,6 +2940,7 @@ async fn drain(
     format: Format,
     note: Option<String>,
 ) -> Result<(), AppError> {
+    check_omp_opening(paths, input).await?;
     if let Some(notice) = &input.native_notice {
         if working_room != Some(b32_encode(&notice.recipient.room).as_str()) {
             return Err(AppError::Usage(
@@ -2693,9 +2987,12 @@ async fn drain(
     // No hook cursor advances while it is held. The person's prompt itself still reaches
     // the harness: this only supplies (or withholds) Vox's extra context.
     let selected_room = rooms.first().filter(|r| r.2 && !r.4).map(|r| r.0);
+    if input.omp_registration.is_some() && working_room.is_some() && selected_room.is_none() {
+        return Err(AppError::Usage("Vox OMP room is not open".into()));
+    }
     if let (Some(room), Some(me)) = (selected_room, me) {
         if pause_holds(paths, room, me).await? {
-            if input.native_notice.is_some() {
+            if input.native_notice.is_some() || input.omp_registration.is_some() {
                 return Err(AppError::Usage("Vox room attention is paused".into()));
             }
             return Ok(());
@@ -2708,7 +3005,7 @@ async fn drain(
     let mut unread: Vec<String> = Vec::new();
     for (channel_id, name, open, _, preparing, _, open_failure) in rooms {
         if let Some(reason) = open_failure {
-            if input.native_notice.is_some() {
+            if input.native_notice.is_some() || input.omp_registration.is_some() {
                 return Err(AppError::Usage(reason));
             }
             unread.push(format!(
@@ -2737,6 +3034,9 @@ async fn drain(
         match read_room(&mut client, paths, channel_id, &name, input, me).await {
             Ok(d) => drains.push(d),
             Err(e) => {
+                if input.omp_registration.is_some() {
+                    return Err(e);
+                }
                 let label: String = b32_encode(&channel_id).chars().take(12).collect();
                 eprintln!("vox agent hook: room {label}: {e}");
                 unread.push(format!(
@@ -2764,16 +3064,39 @@ async fn drain(
         && offered.fresh.is_empty()
         && joined.is_empty()
     {
-        let NewsPublication::Ready(_publication) =
+        let NewsPublication::Ready(publication) =
             news_publication(paths, selected_room, me).await?
         else {
+            if input.omp_registration.is_some() {
+                return Err(AppError::Usage("Vox OMP publication is held".into()));
+            }
             return Ok(());
         };
+        if input.omp_registration.is_some() {
+            check_omp_opening(paths, input).await?;
+            emit_receipts(format, raw_input, &input.event, "", "", &[]);
+            std::io::Write::flush(&mut std::io::stdout())
+                .map_err(|e| AppError::Usage(format!("OMP output is unconfirmed: {e}")))?;
+            drop(publication);
+            if !omp_decision()? {
+                return Ok(());
+            }
+            let NewsPublication::Ready(_publication) =
+                news_publication(paths, selected_room, me).await?
+            else {
+                return Err(AppError::Usage("Vox OMP publication is held".into()));
+            };
+            check_omp_opening(paths, input).await?;
+            for d in &drains {
+                d.commit(paths, &input.session_id, 0, true)?;
+            }
+            return Ok(());
+        }
         // Nothing new: emit nothing at all rather than "no new messages". An
         // agent's context is not the place for a heartbeat, and a quiet room
         // should cost zero tokens per turn.
         for d in &drains {
-            d.commit(paths, &input.session_id, 0);
+            d.commit(paths, &input.session_id, 0, false)?;
         }
         return Ok(());
     }
@@ -2886,7 +3209,7 @@ async fn drain(
     // No actor IPC runs while the pause publication file lock is held.
     let mut attention_receipts = Vec::new();
     let mut prepared_source = false;
-    let native_input = if format == Format::OpenCode {
+    let native_input = if format == Format::OpenCode && input.omp_registration.is_none() {
         match std::env::var("VOX_OPENCODE_INPUT_ID") {
             Ok(id) => Some(
                 vox_core::node::attention::opencode_input(&input.session_id, &id)
@@ -2926,6 +3249,13 @@ async fn drain(
                     ));
                 }
                 notice.recipient.clone()
+            } else if let Some(recipient) = &input.omp_recipient {
+                if d.channel_id != recipient.room {
+                    return Err(AppError::Usage(
+                        "Vox OMP room changed during reading".into(),
+                    ));
+                }
+                recipient.clone()
             } else {
                 match local(
                     &at,
@@ -3010,7 +3340,7 @@ async fn drain(
             if let Some(owner) = me {
                 cancel_attention_receipts(paths, owner, &attention_receipts).await;
             }
-            if input.native_notice.is_some() {
+            if input.native_notice.is_some() || input.omp_registration.is_some() {
                 return Err(AppError::Usage("Vox attention publication is held".into()));
             }
             return held.map(|_| ());
@@ -3025,6 +3355,13 @@ async fn drain(
             return Err(error);
         }
     }
+    if let Err(error) = check_omp_opening(paths, input).await {
+        drop(publication);
+        if let Some(owner) = me {
+            cancel_attention_receipts(paths, owner, &attention_receipts).await;
+        }
+        return Err(error);
+    }
     emit_receipts(
         format,
         raw_input,
@@ -3037,24 +3374,63 @@ async fn drain(
         // Publication may be partial. Keep its reservations uncertain, and never append
         // a second envelope through run()'s pre-publication error reporter.
         eprintln!("vox agent hook: context output is unconfirmed: {error}");
-        if input.native_notice.is_some() {
+        if input.native_notice.is_some() || input.omp_registration.is_some() {
             return Err(AppError::Usage(
                 "Vox attention output is unconfirmed".into(),
             ));
         }
         return Ok(());
     }
-    offered.commit(paths, &input.session_id);
+    let publication = if input.omp_registration.is_some() {
+        drop(publication);
+        if !omp_decision()? {
+            if let Some(owner) = me {
+                if !cancel_attention_receipts(paths, owner, &attention_receipts).await {
+                    return Err(AppError::Usage(
+                        "Vox OMP reservation cancellation was not confirmed".into(),
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        let NewsPublication::Ready(publication) =
+            news_publication(paths, selected_room, me).await?
+        else {
+            return Err(AppError::Usage("Vox OMP publication is held".into()));
+        };
+        check_omp_opening(paths, input).await?;
+        if let Some(notice) = &input.native_notice {
+            check_native_notice(paths, notice).await?;
+        }
+        publication
+    } else {
+        publication
+    };
+    if let Some(marker) = &input.omp_note_marker {
+        let dir = paths.cursor_dir().join("omp-room-note");
+        vox_core::node::paths::create_private_dir(&dir)
+            .and_then(|()| vox_core::node::paths::write_private_file_unique(marker, b""))
+            .map_err(|e| AppError::Usage(format!("could not record OMP room notice: {e}")))?;
+    }
+    offered.commit(paths, &input.session_id, input.omp_registration.is_some())?;
 
     for (file, _) in joined {
         let saved = vox_core::node::paths::create_private_dir(&paths.cursor_dir().join("joined"))
             .and_then(|()| vox_core::node::paths::write_private_file_unique(&file, b""));
         if let Err(e) = saved {
             eprintln!("vox agent hook: could not record the joining notice: {e}");
+            if input.omp_registration.is_some() {
+                return Err(AppError::Usage(e.to_string()));
+            }
         }
     }
     for (d, shown) in drains.iter().zip(&shown_in) {
-        d.commit(paths, &input.session_id, *shown);
+        d.commit(
+            paths,
+            &input.session_id,
+            *shown,
+            input.omp_registration.is_some(),
+        )?;
     }
     drop(publication);
     if let Some(owner) = me {
@@ -3075,6 +3451,9 @@ async fn drain(
                     .await
                     {
                         eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
+                        if input.omp_registration.is_some() {
+                            return Err(AppError::Usage(reason));
+                        }
                     }
                 }
             }
@@ -3082,6 +3461,9 @@ async fn drain(
                 // The one output is already public. Reporting its receipt failure must
                 // not append another JSON envelope or repeat the context.
                 eprintln!("vox agent hook: attributed context was emitted, but its receipt is unconfirmed: {reason}");
+                if input.omp_registration.is_some() {
+                    return Err(AppError::Usage(reason.to_string()));
+                }
             }
         }
     }
@@ -3101,29 +3483,37 @@ async fn cancel_attention_receipts(
         Vec<Digest32>,
         [u8; 16],
     )],
-) {
+) -> bool {
+    if receipts.is_empty() {
+        return true;
+    }
     let Ok(at) = crate::client::one_shot(paths) else {
-        return;
+        return false;
     };
+    let mut confirmed = true;
     for (recipient, sources, ticket) in receipts {
-        if let Err(reason) = vox_core::node::attention::local(
-            &at,
-            owner,
-            recipient.room,
-            Some(recipient.instance),
-            vox_core::node::attention::Operation::CancelPrepared {
-                recipient: recipient.clone(),
-                sources: sources.clone(),
-                ticket: *ticket,
-            },
-        )
-        .await
-        {
-            eprintln!(
-                "vox agent hook: cancelled context reservation remains unconfirmed: {reason}"
-            );
+        for chunk in sources.chunks(64) {
+            let result = vox_core::node::attention::local(
+                &at,
+                owner,
+                recipient.room,
+                Some(recipient.instance),
+                vox_core::node::attention::Operation::CancelPrepared {
+                    recipient: recipient.clone(),
+                    sources: chunk.to_vec(),
+                    ticket: *ticket,
+                },
+            )
+            .await;
+            if !matches!(&result, Ok(vox_core::node::attention::Reply::Done)) {
+                eprintln!(
+                    "vox agent hook: cancelled context reservation remains unconfirmed: {result:?}"
+                );
+                confirmed = false;
+            }
         }
     }
+    confirmed
 }
 
 enum NewsPublication {
@@ -3770,6 +4160,24 @@ pub fn codex_hooks(node: &vox_core::node::paths::NodeName) -> String {
 pub fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> String {
     OPENCODE_PLUGIN.replace("@VOX_NODE@", node.as_str())
 }
+
+/// Native Oh My Pi extension, bound to this node.
+#[must_use]
+pub fn omp_extension(node: &vox_core::node::paths::NodeName) -> String {
+    include_str!("../assets/omp-extension.ts").replace("@VOX_NODE@", node.as_str())
+}
+
+/// A node-free extension does not attach a room or observe private activity.
+pub const LIGHT_OMP_EXTENSION: &str = r#"export default function vox(pi) {
+  pi.on("before_agent_start", async (_event, ctx) => {
+    try {
+      const result = await pi.exec(process.env.VOX_BIN || "vox", ["agent", "hook", "--light", "omp", "--session", ctx.sessionManager.getSessionId()])
+      const line = result.stdout.split(/\r?\n/).find(s => s.trim())
+      if (line) return { message: { customType: "vox-onboarding", content: line, display: false, attribution: "agent" } }
+    } catch {}
+  })
+}
+"#;
 
 /// Client-owned OpenCode attention receiver, installed beside the server plugin.
 #[must_use]

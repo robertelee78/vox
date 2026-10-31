@@ -18,6 +18,8 @@ pub(crate) struct Request {
     pub id: String,
     pub sessions: Vec<String>,
     pub explicit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp_agent_dir: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -34,6 +36,7 @@ pub(crate) fn key(harness: &str) -> Option<&'static str> {
         "claude" | "claude-code" => Some("claude"),
         "codex" => Some("codex"),
         "opencode" => Some("opencode"),
+        "omp" => Some("omp"),
         _ => None,
     }
 }
@@ -85,17 +88,58 @@ fn request_lock(account: &Account, harness: &str) -> Result<std::fs::File, AppEr
     Ok(lock)
 }
 
-/// Record a harness the app may offer to set up. A prior answer/request is never overwritten by
-/// a light hook, even when a second session arrives while the person is deciding.
+/// Only the resolved OMP directory crosses the handoff, never its process environment.
+fn omp_target(harness: &str, wiring: &crate::setup::Wiring) -> Result<Option<String>, AppError> {
+    if harness != "omp" {
+        return Ok(None);
+    }
+    let dir = if wiring.dir.is_absolute() {
+        wiring.dir.clone()
+    } else {
+        std::env::current_dir()?.join(&wiring.dir)
+    };
+    let target = dir
+        .to_str()
+        .ok_or_else(|| AppError::Usage("OMP agent directory is not UTF-8".into()))?;
+    validate_omp_target(target)?;
+    Ok(Some(target.to_owned()))
+}
+
+pub(crate) fn validate_omp_target(target: &str) -> Result<(), AppError> {
+    use std::path::Component;
+    let path = Path::new(target);
+    if target.len() > 4096
+        || target.chars().any(char::is_control)
+        || !path.is_absolute()
+        || path == Path::new("/")
+        || path.components().any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(AppError::Usage(
+            "invalid OMP agent directory; use an absolute path without parent components".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Record a harness the app may offer to set up. Explicit requests are never overwritten by
+/// a light hook; an OMP offer follows the active session's resolved agent directory.
 pub(crate) fn offer(account: &Account, harness: &'static str, dir: &Path) -> Result<(), AppError> {
     let _lock = request_lock(account, harness)?;
     if declined(account, harness) {
         return Ok(());
     }
     if let Some(mut previous) = request(account, harness) {
-        if !previous.explicit && previous.dir.is_empty() && !dir.as_os_str().is_empty() {
-            previous.dir = dir.display().to_string();
-            write_request(account, &previous)?;
+        if !previous.explicit && !dir.as_os_str().is_empty() {
+            let target = if harness == "omp" {
+                omp_target(harness, &crate::setup::Wiring::of(harness)?)?
+            } else {
+                previous.omp_agent_dir.clone()
+            };
+            if previous.dir.is_empty() || previous.omp_agent_dir != target {
+                previous.dir = dir.display().to_string();
+                previous.omp_agent_dir = target;
+                write_request(account, &previous)?;
+            }
         }
         return Ok(());
     }
@@ -112,6 +156,7 @@ pub(crate) fn offer(account: &Account, harness: &'static str, dir: &Path) -> Res
             id: "offer".into(),
             sessions: Vec::new(),
             explicit: false,
+            omp_agent_dir: omp_target(harness, &wiring)?,
         },
     )
 }
@@ -197,6 +242,11 @@ pub(crate) fn request_in_app(
     };
     let dir = std::env::current_dir()?;
     let session = crate::coord::session_if_named();
+    let target = if harness == "omp" {
+        omp_target(harness, &crate::setup::Wiring::of(harness)?)?
+    } else {
+        None
+    };
     let lock = request_lock(&account, harness)?;
     let current = request(&account, harness);
     let waiting = current.filter(|r| {
@@ -210,6 +260,11 @@ pub(crate) fn request_in_app(
                 "Vox is already asking about node {}; answer that request first",
                 waiting.node
             )));
+        }
+        if waiting.omp_agent_dir != target {
+            return Err(AppError::Usage(
+                "Vox is already asking about a different OMP agent directory; answer that request first".into(),
+            ));
         }
         if let Some(session) = session.filter(|s| !waiting.sessions.contains(s)) {
             if waiting.sessions.len() >= 64 {
@@ -231,6 +286,7 @@ pub(crate) fn request_in_app(
                 id: format!("{}-{}", std::process::id(), crate::wake::now_millis()),
                 sessions: session.into_iter().collect(),
                 explicit: true,
+                omp_agent_dir: target,
             },
         )?;
     }

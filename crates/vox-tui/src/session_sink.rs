@@ -89,6 +89,7 @@ pub type Poster = Arc<
             vox_core::hash::Digest32,
             Vec<String>,
             Option<SourceEffects>,
+            Option<Arc<crate::wake::Session>>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Posted> + Send>>
         + Send
         + Sync,
@@ -357,7 +358,8 @@ impl Sink {
         session: &str,
         bodies: Vec<String>,
     ) -> Posted {
-        self.post_with_effects(node, session, bodies, None).await
+        self.post_with_effects(node, session, bodies, None, None)
+            .await
     }
 
     async fn post_with_effects(
@@ -366,6 +368,7 @@ impl Sink {
         session: &str,
         bodies: Vec<String>,
         mut effects: Option<SourceEffects>,
+        expected: Option<Arc<crate::wake::Session>>,
     ) -> Posted {
         use vox_core::node::session_ingress::{MAX_BATCH_BYTES, MAX_BATCH_ITEMS};
         let invalid = bodies.iter().find_map(|body| {
@@ -397,6 +400,7 @@ impl Sink {
                     room,
                     std::mem::take(&mut batch),
                     effects.take(),
+                    expected.clone(),
                 )
                 .await;
                 fresh |= next.fresh;
@@ -413,7 +417,15 @@ impl Sink {
             batch.push(body);
         }
         if !batch.is_empty() {
-            let next = (self.post)(node.clone(), session.to_owned(), room, batch, effects).await;
+            let next = (self.post)(
+                node.clone(),
+                session.to_owned(),
+                room,
+                batch,
+                effects,
+                expected,
+            )
+            .await;
             fresh |= next.fresh;
             result = combine(result, next.admission);
         }
@@ -429,8 +441,20 @@ impl Sink {
         self: &Arc<Self>,
         node: &NodeName,
         session: &str,
+        bodies: Vec<String>,
+        echo: Option<&str>,
+    ) -> Posted {
+        self.source_activity_expected(node, session, bodies, echo, None)
+            .await
+    }
+
+    async fn source_activity_expected(
+        self: &Arc<Self>,
+        node: &NodeName,
+        session: &str,
         mut bodies: Vec<String>,
         echo: Option<&str>,
+        expected: Option<Arc<crate::wake::Session>>,
     ) -> Posted {
         let Some(first) = bodies
             .first()
@@ -520,6 +544,7 @@ impl Sink {
                     expire,
                     echo,
                 }),
+                expected,
             )
             .await;
         if suppressed {
@@ -585,6 +610,35 @@ impl Sink {
         bodies: Vec<String>,
         call: Option<ToolCall>,
     ) -> SessionAdmission {
+        self.activity_expected(node, session, bodies, call, None)
+            .await
+    }
+
+    /// Admit native OMP activity only for its captured registration.
+    pub(crate) async fn omp_activity(
+        self: &Arc<Self>,
+        node: &NodeName,
+        expected: Arc<crate::wake::Session>,
+        bodies: Vec<String>,
+    ) -> SessionAdmission {
+        self.activity_expected(
+            node,
+            &expected.session,
+            bodies,
+            None,
+            Some(Arc::clone(&expected)),
+        )
+        .await
+    }
+
+    async fn activity_expected(
+        self: &Arc<Self>,
+        node: &NodeName,
+        session: &str,
+        bodies: Vec<String>,
+        call: Option<ToolCall>,
+        expected: Option<Arc<crate::wake::Session>>,
+    ) -> SessionAdmission {
         // The public daemon request can name any session. Do not create correlation state for
         // an unregistered/unbound session before the later durable-admission check rejects it.
         if (self.room_of)(node, session).is_none() {
@@ -614,7 +668,7 @@ impl Sink {
                 })
                 .and_then(|value| value.get("text").and_then(Value::as_str).map(str::to_owned));
             return self
-                .source_activity(node, session, bodies, echo.as_deref())
+                .source_activity_expected(node, session, bodies, echo.as_deref(), expected)
                 .await
                 .admission;
         }
@@ -702,7 +756,9 @@ impl Sink {
         if turn_end {
             bodies.extend(self.expired_entries(node, session));
         }
-        self.post_numbered(node, session, bodies).await
+        self.post_with_effects(node, session, bodies, None, expected)
+            .await
+            .admission
     }
 
     /// Reserve a driver's text before delivering it to `session` (#544): its `drive` entry already

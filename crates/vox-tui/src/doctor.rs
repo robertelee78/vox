@@ -198,6 +198,10 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
                 Some(w) => checks.push(theirs("opencode-plugin", "OpenCode", &w)),
                 None => checks.push(opencode_plugin(node)),
             }
+            match elsewhere("omp") {
+                Some(w) => checks.push(theirs("omp-extension", "Oh My Pi", &w)),
+                None => checks.push(omp_extension(node)),
+            }
         }
         None => checks.push(fail(
             "node-name",
@@ -729,6 +733,49 @@ fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> Check {
                     .join(", ")
             ),
             "keep one, and remove the others",
+        ),
+    }
+}
+
+fn omp_extension(node: &vox_core::node::paths::NodeName) -> Check {
+    let id = "omp-extension";
+    let Some(dir) = crate::skill_pack::config_dir("omp") else {
+        return warn(
+            id,
+            "Oh My Pi's configuration cannot be found",
+            "check HOME and the active OMP profile",
+        );
+    };
+    let path = dir.join("extensions").join("vox.ts");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text == crate::agent_hook::omp_extension(node) => ok(
+            id,
+            format!(
+                "{} is this build's Oh My Pi extension for node {node}",
+                path.display()
+            ),
+        ),
+        Ok(_) => fail(
+            id,
+            format!(
+                "{} is an edited, older, light, or differently bound extension",
+                path.display()
+            ),
+            "inspect the extension; preserve any edits and run `vox agent setup omp --node <node>`",
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !dir.exists() => ok(
+            id,
+            format!("Oh My Pi is not set up here (no {})", dir.display()),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => warn(
+            id,
+            format!("no Vox extension in {}", path.display()),
+            "run `vox agent setup omp --node <node>`",
+        ),
+        Err(e) => fail(
+            id,
+            format!("cannot read {}: {e}", path.display()),
+            "make the extension readable",
         ),
     }
 }
