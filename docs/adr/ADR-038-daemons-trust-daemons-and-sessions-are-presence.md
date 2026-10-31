@@ -1,7 +1,7 @@
 # ADR-038: Daemons Trust Daemons, and Sessions Are Presence
 
 - **Status**: Proposed, after v0.4.6. The decider's product rulings of 2026-10-19 (one question
-  at a time, quoted below) are the accepted product requirements; undecided presentation details
+  at a time, quoted below) and the 2026-10-31 FX-18 local-leave correction are accepted product requirements; undecided presentation details
   remain proposed. Execution, acceptance and delivery are recorded on the source-bound GitHub
   issues, separately from decision status. Each requirement MUST land with its proof (ADR-018)
   in a small release (FX-19).
@@ -17,7 +17,8 @@
   registration handoff); amended 2026-10-23 (FX-35: the decider approved exact running capacity
   per active-or-retiring hosted identity, with no fixed floor); amended 2026-10-24 (FX-35:
   resource ownership, fair admission selection, Busy attempt credit, legal proof staging and
-  exact accepted Resume capacity ownership)
+  exact accepted Resume capacity ownership); amended 2026-10-31 (FX-18: a refused unsupported
+  room must remain locally removable, without bypassing global ending authority)
 - **Deciders**: Robert E. Lee
 - **Tags**: trust, daemon identity, sessions, presence, agent comms, sync, health, releases
 - **Related**: ADR-018, ADR-020, ADR-026, ADR-029, ADR-031, ADR-033, ADR-034, ADR-035, ADR-036,
@@ -208,12 +209,24 @@ lessons. It changes neither this record's decision status nor any requirement or
   MUST be deleted, with its prompts, states and proofs. A supported format 3 room whose requested
   history is unavailable keeps ADR-036's live and requested-history journeys (H-1–H-8) unchanged.
   An unsupported room MUST be refused with one sentence naming what to do (leave it and create a
-  new one). Vox MUST NOT delete or reset stored data, and current-format data integrity, restart,
-  trust and access rules remain in force.
+  new one). The refusal MUST NOT automatically delete or reset stored data, and current-format
+  data integrity, restart, trust and access rules remain in force.
   The decider's v0.4.10 baseline decision also permits recreating existing format 3 rooms:
   sparse roots with 20, 21, 22 or 23 fields are unsupported and MUST be refused before mutation,
   with the same recreation guidance. Their stored files remain intact. New 25-field roots MUST
   retain current-format data integrity, restart, trust and access rules.
+  After that refusal, an explicit, confirmed Leave MUST remove only this node's retained copy,
+  including its room keys, history and local service/session references, even though the room
+  cannot be opened and no peer is reachable. It MUST NOT require opening or decoding the
+  unsupported history, publishing a departure in that format, or receiving a peer acknowledgement.
+  Success MUST mean local deletion completed; a storage or cleanup failure MUST remain an error.
+  The other nodes' copies continue; Vox MUST NOT claim that they received a departure or that the
+  room ended globally. Ordinary supported-room departure and its acknowledgement remain unchanged.
+  End for Everyone MUST still require verified creator/admin authority (ADR-007 G-5/G-6).
+  When this build cannot establish that authority, its sheet MUST explain why ending is unavailable
+  and offer the separately confirmed local Leave action; it MUST NOT offer a force-end or claim
+  global success. This is an explicit local-deletion exception, not prior-format migration or
+  permission to reset a node, delete unrelated rooms, or remove refused data automatically.
 
 ### 6. How this ships
 
