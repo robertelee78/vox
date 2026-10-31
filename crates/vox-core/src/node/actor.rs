@@ -408,6 +408,7 @@ fn summary_of(ch: &ChannelState, rows: u64) -> ChannelSummary {
         name: ch.name().map(str::to_owned),
         open: true,
         preparing: false,
+        open_failure: None,
         waiting: None,
         entries: rows,
         log_entries: ch.entry_count() as u64,
@@ -6045,6 +6046,8 @@ pub struct Node {
     /// Rooms being reopened off the actor at unlock (#208). A room leaves this set when it is
     /// held, closed, or the identity locks; a reopened room not in it is dropped, not held.
     reopening: std::collections::BTreeSet<Digest32>,
+    /// Failed automatic reopens remain visible until another open or the identity locks.
+    reopen_failures: BTreeMap<Digest32, String>,
     /// The reopening task, aborted at lock: it holds room keys, and a locked node holds none
     /// (ADR-015).
     reopen_task: Option<tokio::task::JoinHandle<()>>,
@@ -6711,6 +6714,7 @@ impl Node {
             joining: std::collections::BTreeSet::new(),
             joins_answered: BTreeMap::new(),
             reopening: std::collections::BTreeSet::new(),
+            reopen_failures: BTreeMap::new(),
             reopen_task: None,
             preparing_rooms: BTreeMap::new(),
             preparation_after: None,
@@ -10139,10 +10143,11 @@ impl Node {
             }
             NetEvent::ReopenGone { channel_id } => {
                 self.reopening.remove(&channel_id);
+                self.reopen_failures.remove(&channel_id);
                 self.begin_metadata_forget_gone(channel_id);
             }
             NetEvent::ReopenFailed { channel_id, why } => {
-                self.reopening.remove(&channel_id);
+                let current = self.reopening.remove(&channel_id);
                 let _ = self.event_tx.send(NodeEvent::NodeNote {
                     note: format!(
                         "room {} did not reopen: {why}; it stays closed",
@@ -10152,6 +10157,12 @@ impl Node {
                             .collect::<String>()
                     ),
                 });
+                if current
+                    && !self.channels.contains_key(&channel_id)
+                    && self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                {
+                    self.reopen_failures.insert(channel_id, why);
+                }
             }
             NetEvent::LockSettled => self.settle_lock().await,
             NetEvent::StoreReopened {
@@ -17991,6 +18002,7 @@ impl Node {
             task.abort();
         }
         self.reopening.clear();
+        self.reopen_failures.clear();
         // An aborted joiner never reports back, so nothing is being joined any more, and what was
         // held for the join goes with the network.
         self.joining.clear();
@@ -18503,6 +18515,7 @@ impl Node {
         reopening: bool,
     ) {
         let id = channel.channel_id();
+        self.reopen_failures.remove(&id);
         if let Some(pending) = self.preparing_rooms.get_mut(&id) {
             pending.reopening |= reopening;
             if pending.reply.is_none() {
@@ -21835,6 +21848,7 @@ impl Node {
                 name: None,
                 open: false,
                 preparing: false,
+                open_failure: None,
                 waiting: None,
                 entries: 0,
                 log_entries: 0,
@@ -22168,27 +22182,36 @@ impl Node {
                             name: None,
                             open: true,
                             preparing: false,
+                            open_failure: None,
                             waiting: None,
                             entries: 0,
                             log_entries: 0,
                             over: None,
                         }),
                 },
-                None => ChannelSummary {
-                    channel_id: *id,
-                    name: None,
-                    open: false,
-                    preparing: self.reopening.contains(id)
+                None => {
+                    let preparing = self.reopening.contains(id)
                         || self.opening_rooms.contains_key(id)
-                        || self.preparing_rooms.contains_key(id),
-                    waiting: self
-                        .preparing_rooms
-                        .get(id)
-                        .and_then(|prepared| prepared.waiting.clone()),
-                    entries: 0,
-                    log_entries: 0,
-                    over: None,
-                },
+                        || self.preparing_rooms.contains_key(id);
+                    ChannelSummary {
+                        channel_id: *id,
+                        name: None,
+                        open: false,
+                        preparing,
+                        open_failure: if preparing {
+                            None
+                        } else {
+                            self.reopen_failures.get(id).cloned()
+                        },
+                        waiting: self
+                            .preparing_rooms
+                            .get(id)
+                            .and_then(|prepared| prepared.waiting.clone()),
+                        entries: 0,
+                        log_entries: 0,
+                        over: None,
+                    }
+                }
             });
         }
         let (relayed_peers, relaying) = self.path_view();

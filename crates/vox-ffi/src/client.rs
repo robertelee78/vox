@@ -282,6 +282,8 @@ pub struct RoomSummary {
     pub open: bool,
     /// The saved room is preparing; it does not need another passphrase.
     pub preparing: bool,
+    /// The daemon's reason an automatic reopen failed; absent while open or preparing.
+    pub open_failure: Option<String>,
     /// While preparing, what the room waits for, in words; empty when it has not said.
     pub waiting: String,
     /// Since when it waits for that, unix milliseconds; 0 when it has not said.
@@ -3785,18 +3787,21 @@ impl VoxClient {
     pub async fn rooms(&self) -> Result<Vec<RoomSummary>, VoxError> {
         Ok(on_held!(self, |c| room_ids(c).await)?
             .into_iter()
-            .map(|(id, name, open, over, preparing, waiting)| RoomSummary {
-                id: b32_encode(&id),
-                name: shown_name(&name),
-                open,
-                preparing,
-                waiting: waiting
-                    .as_ref()
-                    .map(|(what, _)| what.clone())
-                    .unwrap_or_default(),
-                waiting_since_ms: waiting.map_or(0, |(_, since)| since),
-                over,
-            })
+            .map(
+                |(id, name, open, over, preparing, waiting, open_failure)| RoomSummary {
+                    id: b32_encode(&id),
+                    name: shown_name(&name),
+                    open,
+                    preparing,
+                    open_failure,
+                    waiting: waiting
+                        .as_ref()
+                        .map(|(what, _)| what.clone())
+                        .unwrap_or_default(),
+                    waiting_since_ms: waiting.map_or(0, |(_, since)| since),
+                    over,
+                },
+            )
             .collect())
     }
 
@@ -4604,9 +4609,7 @@ impl VoxClient {
             room_ids(c)
                 .await?
                 .into_iter()
-                .find(|(id, held, _, _, _, _)| {
-                    held == &name && !before.iter().any(|(old, ..)| old == id)
-                })
+                .find(|(id, held, ..)| held == &name && !before.iter().any(|(old, ..)| old == id))
                 .map(|(id, ..)| b32_encode(&id))
                 .ok_or_else(|| {
                     failed("the room was created, but it is not listed on the creating node")
@@ -7612,7 +7615,7 @@ impl VoxClient {
             h.mend().await?;
             let mut cursors = HashMap::new();
             let seen = session_revisions(&mut h.client).await?;
-            for (id, _, open, _, _, _) in room_ids(&mut h.client).await? {
+            for (id, _, open, ..) in room_ids(&mut h.client).await? {
                 if !open {
                     continue;
                 }
@@ -7648,7 +7651,7 @@ impl VoxClient {
             let reanchor = room_ids(&mut h.client)
                 .await?
                 .into_iter()
-                .any(|(id, _, open, _, _, _)| open && !cursors.contains_key(&id));
+                .any(|(id, _, open, ..)| open && !cursors.contains_key(&id));
             let task_held = Arc::clone(&held);
             // The start signal is only an installation barrier, never a delivery queue. It
             // keeps even the immediate terminal callback outside the setup's Slot guard.

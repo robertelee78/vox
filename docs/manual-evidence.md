@@ -4,6 +4,39 @@ Updated: 2026-10-15 for the v0.4.5 source/documentation pass. Prior walkthrough 
 remain historical evidence at their stated revisions. Scope: ADR-027 M27.1 / work item #421. This is maintainer evidence, not a chapter in the public navigation manifest. Source
 inspection is not an execution test.
 
+## v0.4.11 room-reopen failure candidate (#629)
+
+The candidate retains the daemon's automatic-reopen refusal in closed room summaries and
+snapshots, carries it through IPC and FFI, and presents that same reason instead of a
+passphrase prompt or an empty member-loading timeline. Accepted close/leave, preparation,
+successful reopening and identity lock clear the retained failure at their existing lifecycle
+boundaries. This is failure reporting, not a prior-format conversion or a data reset.
+
+The existing shipped-binary `a_room_that_does_not_reopen_says_why` journey passed once in the
+release profile with `optional-proofs,test-knobs`. Its assertions require the original reason in
+the log, room listing and refused read. A separate source mutant removed the closed summary's
+reason; the same journey failed on its own `PRODUCT: the closed room listing lost the daemon's
+reopen failure` assertion, not on staging. The obsolete `[closed]` wording assertion was deleted.
+
+The actual SwiftUI app was exercised in the isolated `vox-app-proofs` macOS guest with a
+normal-feature release CLI and scratch data/config/HOME. A genuine room produced by released
+v0.4.4 refused reopening. Selecting it displayed the complete unsupported-format sentence,
+without a composer, passphrase prompt or member-loading timeline. A healthy room beside it
+posted and displayed its exact original message, member and composer; switching back restored
+the refusal and removed the composer. The TUI likewise reported the refusal and navigated to
+the healthy room. Original producer data was preserved and accepted posts were not replayed.
+
+Receipts, actual accessibility surfaces and screenshots are retained under
+`/private/tmp/vox629-reopen-real-g8vyu2jt/`; source reviews and the bounded native smoke record
+are under `/private/tmp/vox1007-practical-42qu344_/v0411-629-native-smoke.md`.
+The frozen normal CLI's pre-guest-signing SHA-256 is
+`7ac900d0c6be99d5250b00429d4ab15158e3f2b281b7ad02e35c87f562f00fd1`.
+These are local candidate observations, not a merge or notarized-release claim. The old
+producer also lacked current anchor-observation inventory; that separate status diagnostic was
+retained, not called a room-fix result. An unsupported `room close` command was refused before
+changing anything; no close/reopen recovery is inferred from it.
+
+
 ## v0.4.10 catch-up integration (#996)
 
 The standalone integration removes an online-consent preflight that queried the signed-prekey

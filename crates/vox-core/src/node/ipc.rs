@@ -3108,8 +3108,16 @@ pub struct SharedService {
 }
 
 /// One room as the daemon lists it: id, local name, open, over (words or empty), preparing,
-/// and while preparing what it waits for and since when (unix ms).
-pub type RoomRow = (Digest32, String, bool, String, bool, Option<(String, u64)>);
+/// what preparation waits for and since when (unix ms), and the automatic reopen failure.
+pub type RoomRow = (
+    Digest32,
+    String,
+    bool,
+    String,
+    bool,
+    Option<(String, u64)>,
+    Option<String>,
+);
 
 /// What the node sends.
 ///
@@ -3731,16 +3739,19 @@ impl Frame {
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
-                for (id, name, open, over, preparing, waiting) in rooms {
-                    let (what, since) = waiting.clone().unwrap_or_default();
-                    e.array(7)
+                for (id, name, open, over, preparing, waiting, open_failure) in rooms {
+                    let (what, since) = waiting
+                        .as_ref()
+                        .map_or(("", 0), |(what, since)| (what.as_str(), *since));
+                    e.array(8)
                         .bytes(id)
                         .text(name)
                         .uint(u64::from(*open))
                         .text(over)
                         .uint(u64::from(*preparing))
-                        .text(&what)
-                        .uint(since);
+                        .text(what)
+                        .uint(since)
+                        .text(open_failure.as_deref().unwrap_or(""));
                 }
             }
             Frame::Presented { entries } => {
@@ -4823,8 +4834,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rooms = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc room"))?;
-                // 3..=5 as earlier daemons wrote a row; 7 with what a preparing room waits for.
-                if !matches!(arity, 3..=5 | 7) {
+                if arity != 8 {
                     return Err(Error::MalformedIpc("ipc room arity"));
                 }
                 let id = digest(d)?;
@@ -4833,33 +4843,29 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc room name"))?
                     .to_owned();
                 let open = d.uint().map_err(|_| Error::MalformedIpc("ipc room open"))? != 0;
-                let over = if arity >= 4 {
-                    d.text()
-                        .map_err(|_| Error::MalformedIpc("ipc room over"))?
-                        .to_owned()
-                } else {
-                    String::new()
-                };
-                let preparing = arity >= 5
-                    && d.uint()
-                        .map_err(|_| Error::MalformedIpc("ipc room preparing"))?
-                        != 0;
-                let waiting = if arity >= 7 {
-                    let what = d
-                        .text()
-                        .map_err(|_| Error::MalformedIpc("ipc room waiting"))?
-                        .to_owned();
-                    let since = d
-                        .uint()
-                        .map_err(|_| Error::MalformedIpc("ipc room waiting since"))?;
-                    (!what.is_empty()).then_some((what, since))
-                } else {
-                    None
-                };
-                if open && preparing {
+                let over = d
+                    .text()
+                    .map_err(|_| Error::MalformedIpc("ipc room over"))?
+                    .to_owned();
+                let preparing = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room preparing"))?
+                    != 0;
+                let what = d
+                    .text()
+                    .map_err(|_| Error::MalformedIpc("ipc room waiting"))?;
+                let since = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room waiting since"))?;
+                let waiting = (!what.is_empty()).then(|| (what.to_owned(), since));
+                let failure = d
+                    .text()
+                    .map_err(|_| Error::MalformedIpc("ipc room open failure"))?;
+                let open_failure = (!failure.is_empty()).then(|| failure.to_owned());
+                if open && preparing || open_failure.is_some() && (open || preparing) {
                     return Err(Error::MalformedIpc("ipc room availability"));
                 }
-                rooms.push((id, name, open, over, preparing, waiting));
+                rooms.push((id, name, open, over, preparing, waiting, open_failure));
             }
             return Ok(Frame::Rooms { rooms });
         }
@@ -7551,6 +7557,20 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         | Request::Agree { channel_id, .. } => Some(channel_id),
         _ => None,
     };
+    if !matches!(
+        request,
+        Request::OpenRoom { .. } | Request::Leave { .. } | Request::CheckRoomPassphrase { .. }
+    ) {
+        let view = handle.view();
+        if let Some(failure) = room
+            .and_then(|id| view.channels.iter().find(|c| c.channel_id == *id))
+            .and_then(|channel| channel.open_failure.as_ref())
+        {
+            return Frame::Error {
+                reason: failure.clone(),
+            };
+        }
+    }
     if room.is_some_and(|id| {
         handle
             .view()
@@ -9094,16 +9114,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         c.over.clone().unwrap_or_default(),
                         c.preparing,
                         c.waiting.clone(),
+                        c.open_failure.clone(),
                     )
                 })
                 .collect();
             Frame::Rooms {
-                rooms: page(rooms, after, |(id, name, _, over, _, waiting)| {
+                rooms: page(rooms, after, |(id, name, _, over, _, waiting, failure)| {
                     (
                         *id,
                         name.len()
                             + over.len()
-                            + waiting.as_ref().map_or(0, |(what, _)| what.len() + 8),
+                            + waiting.as_ref().map_or(0, |(what, _)| what.len() + 8)
+                            + failure.as_ref().map_or(0, String::len),
                     )
                 }),
             }

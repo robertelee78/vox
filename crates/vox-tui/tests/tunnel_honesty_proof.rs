@@ -1470,7 +1470,7 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
     let room = match rt.block_on(client.rooms()) {
         Ok(vox_core::node::ipc::Frame::Rooms { rooms }) => rooms
             .iter()
-            .map(|(id, _, _, _, _, _)| *id)
+            .map(|(id, ..)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(&w.room))
             .unwrap_or_else(|| {
                 panic!(
